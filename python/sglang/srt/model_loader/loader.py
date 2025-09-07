@@ -1,5 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/model_loader/loader.py
 
+from __future__ import annotations
+
 # ruff: noqa: SIM117
 import collections
 import concurrent
@@ -14,7 +16,17 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    cast,
+)
 
 import huggingface_hub
 import numpy as np
@@ -26,9 +38,7 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.connector import (
     ConnectorType,
     create_remote_connector,
@@ -39,9 +49,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
+    post_load_weights,
     set_default_torch_dtype,
 )
 from sglang.srt.model_loader.weight_utils import (
@@ -68,6 +78,11 @@ from sglang.srt.utils import (
     is_pin_memory_available,
     set_weight_attrs,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.device_config import DeviceConfig
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
 
@@ -600,18 +615,7 @@ class DummyModelLoader(BaseModelLoader):
             # random values to the weights.
             initialize_dummy_weights(model)
 
-            # Model weight loading consists of two stages:
-            # 1. Initial weight loading.
-            # 2. Post-processing of weights, including assigning specific member variables.
-            # For `dummy_init`, only the second stage is required.
-            if hasattr(model, "post_load_weights"):
-                if (
-                    model_config.hf_config.architectures[0]
-                    == "DeepseekV3ForCausalLMNextN"
-                ):
-                    model.post_load_weights(is_nextn=True)
-                else:
-                    model.post_load_weights()
+            post_load_weights(model, model_config)
 
         return model.eval()
 
@@ -751,6 +755,9 @@ class ShardedStateLoader(BaseModelLoader):
                         state_dict.pop(key)
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+            post_load_weights(model, model_config)
+
         return model.eval()
 
     @staticmethod
@@ -1421,18 +1428,16 @@ class RemoteModelLoader(BaseModelLoader):
                     # ignore hidden files
                     if file_name.startswith("."):
                         continue
-                    if os.path.splitext(file_name)[1] not in (
-                        ".bin",
-                        ".pt",
-                        ".safetensors",
-                    ):
+                    if os.path.splitext(file_name)[1] in (".json", ".py"):
                         file_path = os.path.join(root, file_name)
                         with open(file_path, encoding="utf-8") as file:
                             file_content = file.read()
                             f_key = f"{model_name}/files/{file_name}"
                             client.setstr(f_key, file_content)
 
-    def _load_model_from_remote_kv(self, model: nn.Module, client):
+    def _load_model_from_remote_kv(
+        self, model: nn.Module, model_config: ModelConfig, client
+    ):
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -1459,6 +1464,8 @@ class RemoteModelLoader(BaseModelLoader):
             state_dict.pop(key)
         if state_dict:
             raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+        post_load_weights(model, model_config)
 
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
@@ -1501,15 +1508,13 @@ class RemoteModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config)
-                for _, module in model.named_modules():
-                    quant_method = getattr(module, "quant_method", None)
-                    if quant_method is not None:
-                        quant_method.process_weights_after_loading(module)
 
-            with create_remote_connector(model_weights, device_config.device) as client:
+            with create_remote_connector(
+                model_weights, device=device_config.device
+            ) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.KV:
-                    self._load_model_from_remote_kv(model, client)
+                    self._load_model_from_remote_kv(model, model_config, client)
                 elif connector_type == ConnectorType.FS:
                     self._load_model_from_remote_fs(
                         model, client, model_config, device_config

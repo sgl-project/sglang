@@ -20,7 +20,7 @@ class ConnectorType(str, enum.Enum):
     KV = "KV"
 
 
-def create_remote_connector(url, device="cpu") -> BaseConnector:
+def create_remote_connector(url, **kwargs) -> BaseConnector:
     connector_type = parse_connector_type(url)
     if connector_type == "redis":
         return RedisConnector(url)

@@ -4,7 +4,6 @@
 //! similar to HuggingFace transformers' apply_chat_template method.
 
 use anyhow::{anyhow, Result};
-#[cfg(feature = "huggingface")]
 use minijinja::{context, Environment, Value};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -38,14 +37,12 @@ impl ChatMessage {
 }
 
 /// Chat template processor using Jinja2
-#[cfg(feature = "huggingface")]
 pub struct ChatTemplateProcessor {
     template: String,
     bos_token: Option<String>,
     eos_token: Option<String>,
 }
 
-#[cfg(feature = "huggingface")]
 impl ChatTemplateProcessor {
     /// Create a new chat template processor
     pub fn new(template: String, bos_token: Option<String>, eos_token: Option<String>) -> Self {
@@ -102,7 +99,6 @@ impl ChatTemplateProcessor {
 }
 
 /// Load chat template from tokenizer config JSON
-#[cfg(feature = "huggingface")]
 pub fn load_chat_template_from_config(config_path: &str) -> Result<Option<String>> {
     use std::fs;
 
@@ -136,7 +132,6 @@ mod tests {
         assert_eq!(assistant_msg.role, "assistant");
     }
 
-    #[cfg(feature = "huggingface")]
     #[test]
     fn test_simple_chat_template() {
         // Simple template that formats messages
@@ -162,7 +157,6 @@ assistant:
         assert!(result.contains("assistant:"));
     }
 
-    #[cfg(feature = "huggingface")]
     #[test]
     fn test_chat_template_with_tokens() {
         // Template that uses special tokens

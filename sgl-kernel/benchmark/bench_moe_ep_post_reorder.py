@@ -1,6 +1,5 @@
 import torch
 import triton
-from sgl_kernel import ep_moe_post_reorder
 
 from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
 
@@ -13,9 +12,9 @@ configs = [(bs,) for bs in batch_sizes]
         x_names=["batch_size"],
         x_vals=[list(_) for _ in configs],
         line_arg="provider",
-        line_vals=["cuda", "triton"],
-        line_names=["CUDA Kernel", "Triton Kernel"],
-        styles=[("green", "-"), ("orange", "-")],
+        line_vals=["triton"],
+        line_names=["Triton Kernel"],
+        styles=[("orange", "-")],
         ylabel="us",
         plot_name="ep-moe-post-reorder-performance",
         args={},
@@ -46,24 +45,7 @@ def benchmark(batch_size, provider):
 
     quantiles = [0.5, 0.2, 0.8]
 
-    if provider == "cuda":
-        d_out, out, s2d, tk_ids, tk_weights = alloc_tensors()
-
-        def run_cuda():
-            ep_moe_post_reorder(
-                d_out,
-                out,
-                s2d,
-                tk_ids,
-                tk_weights,
-                start_expert_id,
-                end_expert_id,
-                topk,
-            )
-
-        ms, min_ms, max_ms = triton.testing.do_bench(run_cuda, quantiles=quantiles)
-
-    elif provider == "triton":
+    if provider == "triton":
         d_out, out, s2d, tk_ids, tk_weights = alloc_tensors()
 
         def run_triton():

@@ -23,8 +23,13 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
 )
+from sglang.srt.layers.moe.token_dispatcher.standard import (
+    CombineInput,
+    StandardDispatcher,
+)
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -152,16 +157,6 @@ class FusedMoE(torch.nn.Module):
         self.expert_map_cpu = None
         self.expert_map_gpu = None
 
-        self.moe_runner_config = MoeRunnerConfig(
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            inplace=inplace,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
-            gemm1_alpha=gemm1_alpha,
-            gemm1_clamp_limit=gemm1_clamp_limit,
-        )
-
         enable_flashinfer_cutlass_moe = get_moe_runner_backend().is_flashinfer_cutlass()
 
         if enable_flashinfer_cutlass_moe and quant_config is None:
@@ -175,6 +170,8 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
         assert num_experts % self.moe_ep_size == 0
         self.num_local_experts = num_experts // self.moe_ep_size
+        self.start_expert_id = self.moe_ep_rank * self.num_local_experts
+        self.end_expert_id = self.start_expert_id + self.num_local_experts - 1
         if self.moe_ep_size > 1:
             # TODO(ch-wan): support shared experts fusion
             # Create a tensor of size num_experts filled with -1
@@ -194,13 +191,6 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
-        if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
-                self.use_triton_kernels
-            )
-        else:
-            self.quant_method = quant_config.get_quant_method(self, prefix)
-        assert self.quant_method is not None
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -211,12 +201,40 @@ class FusedMoE(torch.nn.Module):
             and self.use_flashinfer_mxfp4_moe
         ):
             hidden_size = round_up(hidden_size, 256)
+        self.hidden_size = hidden_size
+
+        self.moe_runner_config = MoeRunnerConfig(
+            num_experts=num_experts,
+            num_local_experts=self.num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=self.intermediate_size_per_partition,
+            layer_id=layer_id,
+            top_k=top_k,
+            num_fused_shared_experts=num_fused_shared_experts,
+            params_dtype=params_dtype,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            inplace=inplace,
+            no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+        )
+
+        if quant_config is None:
+            self.quant_method: FusedMoEMethodBase = UnquantizedFusedMoEMethod(
+                self.use_triton_kernels
+            )
+        else:
+            self.quant_method: FusedMoEMethodBase = quant_config.get_quant_method(
+                self, prefix
+            )
+        assert self.quant_method is not None
+
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
             hidden_size=hidden_size,
-            # FIXME: figure out which intermediate_size to use
-            intermediate_size=self.intermediate_size_per_partition,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=(
@@ -226,6 +244,9 @@ class FusedMoE(torch.nn.Module):
             ),
             with_bias=with_bias,
         )
+
+        self.quant_method.create_moe_runner(self, self.moe_runner_config)
+        self.dispatcher = StandardDispatcher()
 
     def _load_per_tensor_weight_scale(
         self,
@@ -593,8 +614,9 @@ class FusedMoE(torch.nn.Module):
 
             if (
                 "compressed" in self.quant_method.__class__.__name__.lower()
-                and param.data[expert_id] != 1
-                and (param.data[expert_id] - loaded_weight).abs() > 1e-5
+                or "w4afp8" in self.quant_config.get_name()
+                and (param.data[expert_id] != 1).any()
+                and ((param.data[expert_id] - loaded_weight).abs() > 1e-5).any()
             ):
                 raise ValueError(
                     "input_scales of w1 and w3 of a layer "
@@ -808,16 +830,17 @@ class FusedMoE(torch.nn.Module):
             elif TopKOutputChecker.format_is_triton_kernel(topk_output):
                 raise NotImplementedError()
 
-        # Matrix multiply.
-        with use_symmetric_memory(get_tp_group()) as sm:
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
 
-            final_hidden_states = self.quant_method.apply(
-                layer=self,
-                x=hidden_states,
-                topk_output=topk_output,
-                moe_runner_config=self.moe_runner_config,
-            )
-            sm.tag(final_hidden_states)
+        # TODO: consider using symmetric memory
+        combine_input = self.quant_method.apply(
+            layer=self,
+            dispatch_output=dispatch_output,
+        )
+
+        final_hidden_states = self.dispatcher.combine(combine_input)
 
         final_hidden_states = final_hidden_states[
             ..., :origin_hidden_states_dim
@@ -952,7 +975,6 @@ class FlashInferFusedMoE(FusedMoE):
             layer=self,
             x=hidden_states,
             topk_output=topk_output,
-            moe_runner_config=self.moe_runner_config,
         )
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
@@ -1052,16 +1074,3 @@ class FlashInferFP4MoE(FusedMoE):
         )[0]
 
         return result
-
-
-def get_fused_moe_impl_class():
-    """Factory function to get the appropriate FusedMoE implementation class."""
-    if should_use_flashinfer_trtllm_moe() and _is_fp4_quantization_enabled():
-        # Use FP4 variant when FP4 quantization is enabled
-        return FlashInferFP4MoE
-    elif should_use_flashinfer_trtllm_moe():
-        # Use regular FlashInfer variant for non-FP4 FlashInfer cases
-        return FlashInferFusedMoE
-    else:
-        # Default case
-        return FusedMoE

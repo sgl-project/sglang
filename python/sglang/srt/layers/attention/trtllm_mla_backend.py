@@ -46,12 +46,22 @@ global_zero_init_workspace_buffer = None
 
 
 @dataclass
+class TRTLLMMLAPrefillMetadata:
+    """Metadata for TRTLLM MLA prefill operations."""
+
+    max_seq_len: int
+    cum_seq_lens: torch.Tensor
+    seq_lens: torch.Tensor
+
+
+@dataclass
 class TRTLLMMLADecodeMetadata:
     """Metadata for TRTLLM MLA decode operations."""
 
     workspace: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
     seq_lens: Optional[torch.Tensor] = None
+    max_seq_len: Optional[int] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -101,7 +111,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
         self.decode_cuda_graph_kv_indices = None
-        self.forward_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
+        self.forward_prefill_metadata: Optional[TRTLLMMLAPrefillMetadata] = None
+        self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -211,8 +222,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens = spec_info.draft_token_num + seq_lens
 
         # Custom fast-path for decode/idle.
-        max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_seqlen_pad]
+        # Capture with full width so future longer sequences are safe during replay
+        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
 
         create_flashmla_kv_indices_triton[(bs,)](
             self.req_to_token,
@@ -221,16 +233,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             None,
             block_kv_indices,
             self.req_to_token.stride(0),
-            max_seqlen_pad,
+            max_blocks_per_seq,
             NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
             PAGED_SIZE=self.page_size,
         )
 
+        # Record the true maximum sequence length for this capture batch so that
+        # the kernel launch path (which requires an int not a tensor) can reuse
+        # it safely during both capture and replay.
+        max_seq_len_val = int(seq_lens.max().item())
+
         metadata = TRTLLMMLADecodeMetadata(
-            self.decode_cuda_graph_workspace, block_kv_indices, seq_lens
+            self.decode_cuda_graph_workspace,
+            block_kv_indices, seq_lens,
+            max_seq_len_val,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
-        self.forward_metadata = metadata
+        self.forward_decode_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -275,6 +294,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PAGED_SIZE=self.page_size,
         )
 
+        # Update stored max_seq_len so subsequent kernel calls use the correct value
+        # Prefer CPU tensor to avoid GPU synchronization when available.
+        if seq_lens_cpu is not None:
+            metadata.max_seq_len = int(seq_lens_cpu.max().item())
+        else:
+            metadata.max_seq_len = int(seq_lens.max().item())
+
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
@@ -283,22 +309,36 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Initialize the metadata for a forward pass."""
         # Delegate to parent for non-decode modes.
         if (
-            not forward_batch.forward_mode.is_decode_or_idle()
+            forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend()
         ):
-            return super().init_forward_metadata(forward_batch)
+            seq_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
+            cum_seq_lens_q = torch.cat(
+                (
+                    torch.tensor([0], device=forward_batch.seq_lens.device),
+                    torch.cumsum(seq_lens, dim=0),
+                )
+            ).int()
+            max_seq_len = max(forward_batch.extend_seq_lens_cpu)
+            self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
+                max_seq_len,
+                cum_seq_lens_q,
+                seq_lens,
+            )
+        elif forward_batch.forward_mode.is_decode_or_idle() or forward_batch.forward_mode.is_target_verify():
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens = forward_batch.spec_info.draft_token_num + forward_batch.seq_lens
+            else:
+                seq_lens = forward_batch.seq_lens
 
-        bs = forward_batch.batch_size
-        if forward_batch.forward_mode.is_target_verify():
-            seq_lens = forward_batch.spec_info.draft_token_num + forward_batch.seq_lens
-        else:
-            seq_lens = forward_batch.seq_lens
+            bs = forward_batch.batch_size
 
-        # Get maximum sequence length.
-        if getattr(forward_batch, "seq_lens_cpu", None) is not None:
-            max_seq = forward_batch.seq_lens_cpu.max().item()
-        else:
-            max_seq = forward_batch.seq_lens.max().item()
+            # Get maximum sequence length.
+            if getattr(forward_batch, "seq_lens_cpu", None) is not None:
+                max_seq = forward_batch.seq_lens_cpu.max().item()
+            else:
+                max_seq = forward_batch.seq_lens.max().item()
 
         max_seqlen_pad = self._calc_padded_blocks(max_seq)
         block_kv_indices = self._create_block_kv_indices(
@@ -309,10 +349,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.seq_lens.device,
         )
 
-        self.forward_metadata = TRTLLMMLADecodeMetadata(
-            self.workspace_buffer, block_kv_indices
-        )
-        forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
+            max_seq_len_val = int(max_seq)
+            self.forward_decode_metadata = TRTLLMMLADecodeMetadata(
+                self.workspace_buffer, block_kv_indices, max_seq_len_val
+            )
+            forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
+        else:
+            return super().init_forward_metadata(forward_batch)
+
+    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
+        super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
 
     def quantize_and_rope_for_fp8(
         self,
@@ -456,7 +502,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Get metadata
         metadata = (
             getattr(forward_batch, "decode_trtllm_mla_metadata", None)
-            or self.forward_metadata
+            or self.forward_decode_metadata
         )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
@@ -485,14 +531,61 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=metadata.block_kv_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
-            max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
+            max_seq_len=metadata.max_seq_len,
             bmm1_scale=bmm1_scale,
         )
 
-        # Extract value projection part and reshape
-        raw_out_v = raw_out[..., : layer.v_head_dim].contiguous()
-        output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        # Reshape output directly without slicing
+        output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return output
 
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
+
+        if not forward_batch.attn_attend_prefix_cache:
+            q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+            v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+            output = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=self.workspace_buffer,
+                seq_lens=self.forward_prefill_metadata.seq_lens,
+                max_q_len=self.forward_prefill_metadata.max_seq_len,
+                max_kv_len=self.forward_prefill_metadata.max_seq_len,
+                bmm1_scale=layer.scaling,
+                bmm2_scale=1.0,
+                o_sf_scale=1.0,
+                batch_size=forward_batch.batch_size,
+                window_left=-1,
+                cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
+                cum_seq_lens_kv=self.forward_prefill_metadata.cum_seq_lens,
+                enable_pdl=False,
+                is_causal=True,
+                return_lse=forward_batch.mha_return_lse,
+            )
+        else:
+            # replace with trtllm ragged attention once accuracy is resolved.
+            output = super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
         return output
 
     def forward_extend(
@@ -563,10 +656,57 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             bmm1_scale=bmm1_scale,
         )
 
-        # Extract value projection part and reshape
-        raw_out_v = raw_out[..., : layer.v_head_dim].contiguous()
-        output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        # Reshape output directly without slicing
+        output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return output
 
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
+
+        if not forward_batch.attn_attend_prefix_cache:
+            q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+            v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+            output = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=self.workspace_buffer,
+                seq_lens=self.forward_prefill_metadata.seq_lens,
+                max_q_len=self.forward_prefill_metadata.max_seq_len,
+                max_kv_len=self.forward_prefill_metadata.max_seq_len,
+                bmm1_scale=layer.scaling,
+                bmm2_scale=1.0,
+                o_sf_scale=1.0,
+                batch_size=forward_batch.batch_size,
+                window_left=-1,
+                cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
+                cum_seq_lens_kv=self.forward_prefill_metadata.cum_seq_lens,
+                enable_pdl=False,
+                is_causal=True,
+                return_lse=forward_batch.mha_return_lse,
+            )
+        else:
+            # replace with trtllm ragged attention once accuracy is resolved.
+            output = super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
         return output
 
 

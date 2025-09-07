@@ -13,12 +13,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Helper function to create AppContext for tests
 pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
-    Arc::new(AppContext::new(
-        config.clone(),
-        reqwest::Client::new(),
-        config.max_concurrent_requests,
-        config.rate_limit_tokens_per_second,
-    ))
+    Arc::new(
+        AppContext::new(
+            config.clone(),
+            reqwest::Client::new(),
+            config.max_concurrent_requests,
+            config.rate_limit_tokens_per_second,
+        )
+        .expect("Failed to create AppContext in test"),
+    )
 }
 
 // Tokenizer download configuration

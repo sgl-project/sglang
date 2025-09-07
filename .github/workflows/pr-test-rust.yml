@@ -27,6 +27,11 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-router
+
       - name: Run lint
         run: |
           source "$HOME/.cargo/env"
@@ -39,7 +44,7 @@ jobs:
           cd sgl-router/
           cargo fmt -- --check
 
-      - name: Run test
+      - name: Run Rust tests
         timeout-minutes: 20
         run: |
           source "$HOME/.cargo/env"
@@ -63,7 +68,7 @@ jobs:
   e2e-python:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: BM.A10.4
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -83,11 +88,28 @@ jobs:
           pip install setuptools-rust wheel build
           python3 -m build
           pip install --force-reinstall dist/*.whl
-      - name: Run e2e test
+
+
+      - name: Run Python unit tests
+        run: |
+          cd sgl-router
+          source "$HOME/.cargo/env"
+          pip install pytest pytest-cov pytest-xdist
+          pytest -q py_test/unit --cov=sglang_router --cov-report=term-missing --cov-fail-under=80
+
+      - name: Run Python integration tests
+        run: |
+          cd sgl-router
+          source "$HOME/.cargo/env"
+          # Integration tests use FastAPI/uvicorn for mock workers
+          pip install fastapi uvicorn orjson
+          pytest -q -m integration
+
+      - name: Run Python E2E tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
-          cd sgl-router/py_test
-          python3 run_suite.py
+          cd sgl-router
+          pytest -m e2e -s  -vv -o log_cli=true --log-cli-level=INFO
 
   finish:
     needs: [unit-test-rust, e2e-python]
