@@ -24,6 +24,7 @@ class MoeA2ABackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
+    MORI = "mori"
 
     @classmethod
     def _missing_(cls, value):
@@ -39,6 +40,9 @@ class MoeA2ABackend(Enum):
 
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP
+
+    def is_mori(self):
+        return self == MoeA2ABackend.MORI
 
 
 class MoeRunnerBackend(Enum):

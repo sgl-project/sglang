@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     is_cuda,
@@ -44,6 +45,9 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +269,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mori"] = "none"
     moe_runner_backend: Literal[
         "auto",
         "triton",
@@ -651,14 +655,26 @@ class ServerArgs:
                     "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
                 )
 
+        # TODO : support eplb/expert distribution recording when MoRI
+        if self.moe_a2a_backend == "mori":
+            if not _use_aiter:
+                self.moe_a2a_backend = "none"
+                logger.warning(
+                    "MoRI A2A backend requires aiter, but SGLANG_USE_AITER is not given. MoRI is disabled."
+                )
+            else:
+                self.expert_distribution_recorder_mode = None
+                self.enable_eplb = False
+                logger.warning("MoRI does not support EPLB for now.")
+
         # DeepEP MoE
-        if self.moe_a2a_backend == "deepep":
+        if self.moe_a2a_backend in ("deepep", "mori"):
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
             self.ep_size = self.tp_size
             logger.warning(
-                f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                f"DeepEP/MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -1564,7 +1580,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep"],
+            choices=["none", "deepep", "mori"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )

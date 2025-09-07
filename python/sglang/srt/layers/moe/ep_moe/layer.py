@@ -778,7 +778,7 @@ class DeepEPMoE(EPMoE):
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
-    if get_moe_a2a_backend().is_deepep():
+    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
         return DeepEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
