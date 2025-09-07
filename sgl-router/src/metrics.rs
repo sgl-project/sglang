@@ -144,10 +144,7 @@ pub fn init_metrics() {
     );
 
     // Embedding request specific metrics
-    describe_counter!(
-        "sgl_router_embeddings_total",
-        "Total embedding requests"
-    );
+    describe_counter!("sgl_router_embeddings_total", "Total embedding requests");
     describe_histogram!(
         "sgl_router_embeddings_duration_seconds",
         "Embedding request duration"

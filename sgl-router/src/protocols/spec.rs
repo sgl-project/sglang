@@ -2061,20 +2061,11 @@ impl GenerationRequest for EmbeddingRequest {
         // Best effort: extract text content for routing decisions
         match &self.input {
             serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Array(arr) => {
-                let mut texts = Vec::new();
-                for v in arr {
-                    match v {
-                        serde_json::Value::String(s) => texts.push(s.clone()),
-                        serde_json::Value::Array(inner) => {
-                            // token arrays or nested arrays: ignore for text extraction
-                            let _ = inner;
-                        }
-                        _ => {}
-                    }
-                }
-                texts.join(" ")
-            }
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
             _ => String::new(),
         }
     }

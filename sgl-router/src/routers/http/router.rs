@@ -6,12 +6,8 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
-<<<<<<< HEAD
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest, RerankRequest,
-    RerankResponse, RerankResult, ResponsesRequest,
-=======
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
->>>>>>> 9b46a891c (router: Add Embedding routing logic)
+    RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -28,7 +24,7 @@ use axum::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -1420,8 +1416,31 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
+<<<<<<< HEAD
         self.route_typed_request(headers, body, "/v1/responses", model_id)
+=======
+<<<<<<< HEAD
+        self.route_typed_request(headers, body, "/v1/responses")
+>>>>>>> b5c21104e (apply review comments)
             .await
+=======
+        // Record embeddings-specific metrics in addition to general request metrics
+        let start = Instant::now();
+        let res = self
+            .route_typed_request(headers, body, "/v1/embeddings")
+            .await;
+
+        // Embedding specific metrics
+        if res.status().is_success() {
+            RouterMetrics::record_embeddings_request();
+            RouterMetrics::record_embeddings_duration(start.elapsed());
+        } else {
+            let error_type = format!("http_{}", res.status().as_u16());
+            RouterMetrics::record_embeddings_error(&error_type);
+        }
+
+        res
+>>>>>>> 93e97e95e (apply review comments)
     }
 
     async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
