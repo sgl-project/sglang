@@ -319,7 +319,7 @@ class TokenizerManager:
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
+        self.bootstrap_server = start_disagg_service(self.server_args)
 
         # For load balancing
         self.current_load = 0

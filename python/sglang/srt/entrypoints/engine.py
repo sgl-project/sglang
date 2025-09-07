@@ -705,7 +705,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 
 def _init_tokenizer_manager(
-    server_args: ServerArgs, port_args: PortArgs, scheduler_info: Dict
+    server_args: ServerArgs, port_args: PortArgs
 ) -> TokenizerManager:
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
@@ -718,9 +718,6 @@ def _init_tokenizer_manager(
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
-
-    # Assume all schedulers have the same scheduler_info
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
     return tokenizer_manager, template_manager
 
@@ -838,6 +835,16 @@ def _launch_subprocesses(
     )
     detoken_proc.start()
 
+    # Init tokenizer manager first, as the bootstrap server is initialized here
+    if server_args.tokenizer_worker_num > 1:
+        # Launch multi-tokenizer router
+        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+        template_manager = None
+    else:
+        tokenizer_manager, template_manager = _init_tokenizer_manager(
+            server_args, port_args
+        )
+
     # Wait for the model to finish loading
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
@@ -856,15 +863,10 @@ def _launch_subprocesses(
                 "Initialization failed. Please see the error messages above."
             )
         scheduler_infos.append(data)
+
+    # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
 
-    if server_args.tokenizer_worker_num > 1:
-        # Launch multi-tokenizer router
-        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-        template_manager = None
-    else:
-        tokenizer_manager, template_manager = _init_tokenizer_manager(
-            server_args, port_args, scheduler_info
-        )
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
     return tokenizer_manager, template_manager, scheduler_info
