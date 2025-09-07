@@ -599,78 +599,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not forward_batch.forward_mode.is_target_verify():
-            return super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
-            )
-
-        if k is not None and save_kv_cache:
-            cache_loc = forward_batch.out_cache_loc
-            if k_rope is not None:
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, cache_loc, k, k_rope
-                )
-            elif v is not None:
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-
-        if q_rope is not None:
-            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            q_rope_reshaped = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-            )
-            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
-        else:
-            query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-
-        if query.dim() == 3:
-            query = query.view(
-                forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
-            )
-
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        pages = k_cache.view(-1, self.page_size, self.kv_cache_dim)
-        kv_cache = pages.unsqueeze(1)
-        metadata = self.forward_metadata
-
-        # TODO: Change once fp8 path is supported
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-
-        bmm1_scale = q_scale * k_scale * layer.scaling
-
-        # Call TRT-LLM kernel
-        raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_cache,
-            workspace_buffer=metadata.workspace,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=metadata.block_kv_indices,
-            seq_lens=metadata.seq_lens.to(torch.int32),
-            max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
-            bmm1_scale=bmm1_scale,
-        )
-
-        # Reshape output directly without slicing
-        output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-        return output
-
-    def forward_extend(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-        q_rope: Optional[torch.Tensor] = None,
-        k_rope: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
@@ -708,7 +636,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
         return output
-
 
 class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
