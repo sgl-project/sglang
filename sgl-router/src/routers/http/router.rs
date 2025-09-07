@@ -6,8 +6,12 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
+<<<<<<< HEAD
     ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest, RerankRequest,
     RerankResponse, RerankResult, ResponsesRequest,
+=======
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
+>>>>>>> 9b46a891c (router: Add Embedding routing logic)
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1431,7 +1435,8 @@ impl RouterTrait for Router {
     }
 
     async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
-        todo!()
+        // Not implemented for regular router in this branch
+        (StatusCode::NOT_IMPLEMENTED, "Embeddings not implemented").into_response()
     }
 
     async fn route_rerank(
