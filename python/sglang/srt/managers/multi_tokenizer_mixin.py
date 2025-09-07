@@ -23,6 +23,7 @@ import threading
 from multiprocessing import shared_memory
 from typing import Dict
 
+import setproctitle
 import zmq
 import zmq.asyncio
 
@@ -33,7 +34,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
     MultiTokenizerRegisterReq,
-    MultiTokenizerWarpper,
+    MultiTokenizerWrapper,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager, _Communicator
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -440,7 +441,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
 
     async def _distribute_result_to_workers(self, recv_obj):
         """Distribute result to corresponding workers based on rid"""
-        if isinstance(recv_obj, MultiTokenizerWarpper):
+        if isinstance(recv_obj, MultiTokenizerWrapper):
             worker_ids = [recv_obj.worker_id]
             recv_obj = recv_obj.obj
         else:
@@ -476,6 +477,9 @@ class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        setproctitle.setproctitle(
+            f"sglang::http_server/multi_tokenizer_manager:{os.getpid()}"
+        )
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
         server_args.disaggregation_mode = "null"
