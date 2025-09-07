@@ -347,6 +347,7 @@ class FlashAttentionBackend(AttentionBackend):
             device=model_runner.device,
             async_retrive=False,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
+            max_seq_len=self.max_context_len,
         )
         
         self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)
