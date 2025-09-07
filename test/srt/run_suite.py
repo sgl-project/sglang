@@ -189,7 +189,7 @@ suite_amd = {
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("lora/test_lora_cuda_graph.py", 250),
         TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("models/test_cross_encoder_models.py", 100),
+        TestFile("models/test_embedding_models.py", 73),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
