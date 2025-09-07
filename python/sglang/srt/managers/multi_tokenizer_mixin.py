@@ -13,15 +13,14 @@
 # ==============================================================================
 """MultiTokenizerMixin is a class that provides nesscary methods for MultiTokenizerManager and DetokenizerManager."""
 import asyncio
-import dataclasses
-import json
 import logging
 import multiprocessing as multiprocessing
 import os
+import pickle
 import sys
 import threading
 from multiprocessing import shared_memory
-from typing import Dict
+from typing import Any, Dict
 
 import setproctitle
 import zmq
@@ -535,42 +534,14 @@ async def print_exception_wrapper(func):
         sys.exit(1)
 
 
-def serialize_port_args(port_args: PortArgs) -> dict:
-    """Serialize PortArgs into a shareable dictionary"""
-    return {
-        "tokenizer_ipc_name": port_args.tokenizer_ipc_name,
-        "scheduler_input_ipc_name": port_args.scheduler_input_ipc_name,
-        "detokenizer_ipc_name": port_args.detokenizer_ipc_name,
-        "nccl_port": port_args.nccl_port,
-        "rpc_ipc_name": port_args.rpc_ipc_name,
-        "metrics_ipc_name": port_args.metrics_ipc_name,
-        "tokenizer_worker_ipc_name": port_args.tokenizer_worker_ipc_name,
-    }
+def get_main_process_id() -> int:
+    """Get the main process ID"""
+    return multiprocessing.current_process()._parent_pid
 
 
-def deserialize_data(port_args: dict, server_args: dict):
-    """Deserialize data from shared dictionaries"""
-    return PortArgs(**port_args), ServerArgs(**server_args)
-
-
-def serialize_server_args(server_args: ServerArgs) -> dict:
-    """Serialize ServerArgs into a shareable dictionary"""
-    return dataclasses.asdict(server_args)
-
-
-def serialize_scheduler_info(scheduler_info: Dict) -> dict:
-    """Serialize scheduler_info into a shareable dictionary"""
-    return scheduler_info
-
-
-def deserialize_scheduler_info(data: dict) -> Dict:
-    """Deserialize scheduler_info from a shared dictionary"""
-    return data
-
-
-def write_to_shared_memory(data: dict, name: str) -> shared_memory.SharedMemory:
+def write_to_shared_memory(obj, name: str) -> shared_memory.SharedMemory:
     """Write data to shared memory"""
-    serialized = json.dumps(data).encode("utf-8")
+    serialized = pickle.dumps(obj)
     size = len(serialized)
     try:
         # Try to open existing shared memory
@@ -588,20 +559,15 @@ def write_to_shared_memory(data: dict, name: str) -> shared_memory.SharedMemory:
     return shm
 
 
-def read_from_shared_memory(name: str) -> dict:
+def read_from_shared_memory(name: str) -> Any:
     """Read data from shared memory"""
     try:
         shm = shared_memory.SharedMemory(name=name)
-        data = json.loads(bytes(shm.buf).decode("utf-8"))
+        data = pickle.loads(bytes(shm.buf))
         shm.close()
         return data
     except FileNotFoundError:
         raise FileNotFoundError(f"Shared memory {name} not found")
-
-
-def get_main_process_id() -> int:
-    """Get the main process ID"""
-    return multiprocessing.current_process()._parent_pid
 
 
 def write_data_for_multi_tokenizer(
@@ -612,22 +578,8 @@ def write_data_for_multi_tokenizer(
     main_pid = get_main_process_id()
     current_pid = os.getpid()
     logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
+    args = (port_args, server_args, scheduler_info)
+    args_shm = write_to_shared_memory(args, f"multi_tokenizer_args_{current_pid}")
+    args_shm.close()
 
-    # Write port_args to shared memory
-    port_args_shm = write_to_shared_memory(
-        serialize_port_args(port_args), f"port_args_{current_pid}"
-    )
-    # Write server_args to shared memory
-    server_args_shm = write_to_shared_memory(
-        serialize_server_args(server_args), f"server_args_{current_pid}"
-    )
-    # Write scheduler_info to shared memory
-    scheduler_info_shm = write_to_shared_memory(
-        serialize_scheduler_info(scheduler_info), f"scheduler_info_{current_pid}"
-    )
-
-    port_args_shm.close()
-    server_args_shm.close()
-    scheduler_info_shm.close()
-
-    return port_args_shm, server_args_shm, scheduler_info_shm
+    return args_shm

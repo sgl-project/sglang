@@ -92,7 +92,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerManager,
-    deserialize_data,
     get_main_process_id,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
@@ -158,11 +157,10 @@ async def init_multi_tokenizer() -> ServerArgs:
     logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
 
     # Read configuration from shared memory
-    port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
-    server_args_data = read_from_shared_memory(f"server_args_{main_pid}")
-    scheduler_info_data = read_from_shared_memory(f"scheduler_info_{main_pid}")
-    port_args, server_args = deserialize_data(port_args_data, server_args_data)
-    scheduler_info = scheduler_info_data
+    port_args, server_args, scheduler_info = read_from_shared_memory(
+        f"multi_tokenizer_args_{main_pid}"
+    )
+    server_args: ServerArgs
 
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -1187,12 +1185,10 @@ def launch_server(
     )
 
     if server_args.tokenizer_worker_num > 1:
-        port_args_shm, server_args_shm, scheduler_info_shm = (
-            write_data_for_multi_tokenizer(
-                port_args,
-                server_args,
-                scheduler_info,
-            )
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args,
+            server_args,
+            scheduler_info,
         )
     else:
         # Add api key authorization
@@ -1249,9 +1245,7 @@ def launch_server(
             )
     finally:
         if server_args.tokenizer_worker_num > 1:
-            port_args_shm.unlink()
-            server_args_shm.unlink()
-            scheduler_info_shm.unlink()
+            multi_tokenizer_args_shm.unlink()
             _global_state.tokenizer_manager.clear_tokenizer_mapping()
         else:
             warmup_thread.join()
