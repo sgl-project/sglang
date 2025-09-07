@@ -26,6 +26,7 @@ import setproctitle
 import zmq
 import zmq.asyncio
 
+from python.sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
@@ -377,7 +378,7 @@ class MultiHttpWorkerDetokenizerMixin:
                     self.socket_mapping.send_output(worker_id, new_output)
 
 
-class MultiTokenizerRouter(TokenizerManager):
+class MultiTokenizerRouter:
     """A router to receive requests from MultiTokenizerManager"""
 
     def __init__(
@@ -406,7 +407,7 @@ class MultiTokenizerRouter(TokenizerManager):
         self._handle_task = asyncio.run_coroutine_threadsafe(
             print_exception_wrapper(self.handle_loop), self._loop
         )
-        self.init_disaggregation()
+        self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
 
     def _run_loop(self):
         self._loop.run_forever()
