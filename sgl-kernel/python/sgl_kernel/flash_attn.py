@@ -8,8 +8,6 @@ try:
 except:
     raise ImportError("Can not import sgl_kernel. Please check your installation.")
 
-import logging
-logger = logging.getLogger(__name__)
 
 def is_fa3_supported(device=None) -> bool:
     #  There some fa3 FYI
@@ -146,7 +144,6 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    logger.info("I am called")
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     if softmax_scale is None:
@@ -245,6 +242,7 @@ def flash_attn_varlen_func(
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
         )
+
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k,
