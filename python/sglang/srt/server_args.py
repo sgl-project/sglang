@@ -104,6 +104,8 @@ ATTENTION_BACKEND_CHOICES = [
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
+GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -120,6 +122,10 @@ def add_attention_backend_choices(choices):
 
 def add_disagg_transfer_backend_choices(choices):
     DISAGG_TRANSFER_BACKEND_CHOICES.extend(choices)
+
+
+def add_grammar_backend_choices(choices):
+    GRAMMAR_BACKEND_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -1475,7 +1481,7 @@ class ServerArgs:
         parser.add_argument(
             "--grammar-backend",
             type=str,
-            choices=["xgrammar", "outlines", "llguidance", "none"],
+            choices=GRAMMAR_BACKEND_CHOICES,
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
         )
