@@ -657,7 +657,9 @@ class Scheduler(
                     disable=server_args.disable_radix_cache,
                 )
             elif server_args.enable_lmcache:
-                from sglang.srt.mem_cache.lmc_radix_cache import LMCRadixCache
+                from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
+                    LMCRadixCache,
+                )
 
                 self.tree_cache = LMCRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
