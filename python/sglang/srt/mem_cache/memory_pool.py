@@ -452,6 +452,24 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
         end_layer: Optional[int] = None,
         enable_overlap_schedule: bool = True,
     ):
+        # Import the interface locally to avoid circular imports
+        from .elastic_mem_interface import (
+            is_elasticmem_available,
+            init_elasticmem,
+            create_elastic_kv_tensors,
+            get_elasticmem_cache_manager,
+            shutdown_elasticmem,
+        )
+        
+        if not is_elasticmem_available():
+            raise ImportError(
+                "ElasticMem is not available. Please install kvcached with "
+                "`pip install kvcached --no-build-isolation` and set "
+                "ENABLE_KVCACHED=true to use elastic KV cache."
+            )
+
+        # Call grandparent (KVCache) initializer because we redefine
+        # all member variables.
         super(MHATokenToKVPool, self).__init__(
             size=size,
             page_size=page_size,
@@ -462,30 +480,26 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
         )
+        
         self.head_num = head_num
         self.head_dim = head_dim
         self.custom_mem_pool = None
 
-        try:
-            import kvcached.integration.sglang.interfaces as kvcached_interfaces
+        # Initialize elasticmem backend
+        init_elasticmem(async_sched=enable_overlap_schedule)
 
-            self.kvcached_interfaces = kvcached_interfaces
-            self.kvcached_interfaces.init_kvcached(async_sched=enable_overlap_schedule)
+        # Per-token KV bytes
+        self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
 
-            # Initialize KV allocator based on per-token KV size (cell_size)
-            self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
+        # Get elastic memory cache manager (SGLang internal naming)
+        self.elasticmem_allocator = get_elasticmem_cache_manager(
+            self.size + self.page_size,
+            self.page_size,
+            self.cell_size,
+            num_layers=layer_num,
+        )
 
-            self.kvcached_allocator = kvcached_interfaces.get_kv_cache_manager(
-                self.size + self.page_size,
-                self.page_size,
-                self.cell_size,
-                num_layers=layer_num,
-            )
-        except ImportError as e:
-            raise ImportError(
-                "kvcached is not found. Please install kvcached with `pip install kvcached --no-build-isolation` to use elastic KV cache."
-            ) from e
-
+        # Create KV buffers via elasticmem interface
         self._create_buffers()
 
         self.layer_transfer_counter = None
@@ -499,17 +513,26 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
         self.mem_usage = (k_size + v_size) / GB
 
     def __del__(self):
-        self.kvcached_interfaces.shutdown_kvcached()
-        del self.kvcached_allocator
-        self.k_buffer = None
-        self.v_buffer = None
+        """Best-effort cleanup when object is destroyed."""
+        try:
+            from .elastic_mem_interface import shutdown_elasticmem
+            shutdown_elasticmem()
+        except Exception:
+            pass
 
     def _create_buffers(self):
+        """Create KV buffers using elasticmem interface."""
+        from .elastic_mem_interface import create_elastic_kv_tensors
+        
         if "cuda" not in self.device:
             raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
 
-        self.k_buffer, self.v_buffer = self.kvcached_interfaces.alloc_kv_cache(
-            kvcache_shape=(self.size + self.page_size, self.head_num, self.head_dim),
+        self.k_buffer, self.v_buffer = create_elastic_kv_tensors(
+            kvcache_shape=(
+                self.size + self.page_size,
+                self.head_num,
+                self.head_dim,
+            ),
             dtype=self.dtype,
             device=self.device,
             num_layers=self.layer_num,
