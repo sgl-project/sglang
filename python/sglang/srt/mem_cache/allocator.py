@@ -308,9 +308,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 
     def _is_elastic(self, alloc):
-        return hasattr(alloc, "kvcached_allocator")
-
-    def _is_elastic(self, alloc):
         return hasattr(alloc, "elasticmem_allocator")
 
     def free(self, free_index: torch.Tensor):
