@@ -450,23 +450,22 @@ class HiRadixCache(RadixCache):
             # unknown prefetch stop policy, just return True
             return True
 
-        operation_fail = operation.failed
+        operation_terminated = operation.is_terminated()
         if self.tp_world_size > 1:
-            can_terminate = torch.tensor(can_terminate, dtype=torch.int)
-            torch.distributed.all_reduce(
-                can_terminate,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
+            states = torch.tensor(
+                [1 - int(can_terminate), int(operation_terminated)],
+                dtype=torch.int,
             )
-            operation_fail = torch.tensor(operation.failed, dtype=torch.int)
             torch.distributed.all_reduce(
-                operation_fail,
+                states,
                 op=torch.distributed.ReduceOp.MAX,
                 group=self.tp_group,
             )
-            can_terminate = bool(can_terminate.item())
-            operation_fail = bool(operation_fail.item())
-        can_terminate = can_terminate or operation_fail
+            can_terminate = states[0].item() == 0
+            operation_terminated = states[1].item() == 1
+        # the operation should be terminated if it is already terminated on any TP worker
+        # or it meets the termination condition on all TP workers
+        can_terminate = can_terminate or operation_terminated
         return can_terminate
 
     def check_prefetch_progress(self, req_id: str) -> bool:
