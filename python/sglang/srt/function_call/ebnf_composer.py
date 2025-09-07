@@ -183,6 +183,10 @@ class EBNFComposer:
             key_value_rule_fmt: Optional custom format string for key-value pairs. It should define how each parameter is formatted,
                 with placeholders {key} for the parameter name and {valrule} for the value rule. If None, a default format
                 based on function_format will be used.
+            key_value_separator: Raw EBNF fragment inserted between key-value pairs.
+                This string is used verbatim (not auto-quoted). Pass:
+                - Quoted terminals when you need a literal token (e.g. '","' or '"\\n"').
+                - Raw/non-terminals when you need grammar tokens (e.g. 'ws "," ws').
         """
         # =================================================================
         # Step 1: Determine the root tool calls rule
