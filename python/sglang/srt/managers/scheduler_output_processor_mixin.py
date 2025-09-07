@@ -136,7 +136,7 @@ class SchedulerOutputProcessorMixin:
                             logger.error(
                                 f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                             )
-                            self.abort_request(AbortReq(req.rid))
+                            self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
@@ -283,7 +283,7 @@ class SchedulerOutputProcessorMixin:
                     logger.error(
                         f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                     )
-                    self.abort_request(AbortReq(req.rid))
+                    self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
         self.set_next_batch_sampling_info_done(batch)
