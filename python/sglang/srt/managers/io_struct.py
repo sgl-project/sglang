@@ -18,6 +18,7 @@ processes (TokenizerManager, DetokenizerManager, Scheduler).
 
 import copy
 import uuid
+from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -36,9 +37,18 @@ else:
 
 
 @dataclass
-class SessionParams:
+class BaseReq(ABC):
+    rid: Optional[Union[str, List[str]]] = None
+
+
+@dataclass
+class BaseBatchReq(ABC):
+    rids: Optional[List[str]] = None
+
+
+@dataclass
+class SessionParams(BaseReq):
     id: Optional[str] = None
-    rid: Optional[str] = None
     offset: Optional[int] = None
     replace: Optional[bool] = None
     drop_previous_output: Optional[bool] = None
@@ -62,7 +72,7 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput:
+class GenerateReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -82,8 +92,6 @@ class GenerateReqInput:
     audio_data: Optional[MultimodalDataInputFormat] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
-    # The request id.
-    rid: Optional[Union[List[str], str]] = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -483,9 +491,7 @@ class GenerateReqInput:
 
 
 @dataclass
-class TokenizedGenerateReqInput:
-    # The request id
-    rid: str
+class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
@@ -534,7 +540,7 @@ class TokenizedGenerateReqInput:
 
 
 @dataclass
-class BatchTokenizedGenerateReqInput:
+class BatchTokenizedGenerateReqInput(BaseBatchReq):
     # The batch of tokenized requests
     batch: List[TokenizedGenerateReqInput]
 
@@ -549,7 +555,7 @@ class BatchTokenizedGenerateReqInput:
 
 
 @dataclass
-class EmbeddingReqInput:
+class EmbeddingReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -565,8 +571,6 @@ class EmbeddingReqInput:
     audio_data: Optional[MultimodalDataInputFormat] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # The request id.
-    rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Dummy input embeds for compatibility
@@ -664,9 +668,7 @@ class EmbeddingReqInput:
 
 
 @dataclass
-class TokenizedEmbeddingReqInput:
-    # The request id
-    rid: str
+class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
@@ -684,7 +686,7 @@ class TokenizedEmbeddingReqInput:
 
 
 @dataclass
-class BatchTokenizedEmbeddingReqInput:
+class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
     # The batch of tokenized embedding requests
     batch: List[TokenizedEmbeddingReqInput]
 
@@ -699,9 +701,7 @@ class BatchTokenizedEmbeddingReqInput:
 
 
 @dataclass
-class BatchTokenIDOut:
-    # The request id
-    rids: List[str]
+class BatchTokenIDOut(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -740,9 +740,7 @@ class BatchTokenIDOut:
 
 
 @dataclass
-class BatchMultimodalDecodeReq:
-    # The request id
-    rids: List[str]
+class BatchMultimodalDecodeReq(BaseBatchReq):
     finished_reasons: List[BaseFinishReason]
 
     # Token counts
@@ -752,9 +750,7 @@ class BatchMultimodalDecodeReq:
 
 
 @dataclass
-class BatchStrOut:
-    # The request id
-    rids: List[str]
+class BatchStrOut(BaseBatchReq):
     # The finish reason
     finished_reasons: List[dict]
     # The output decoded strings
@@ -787,9 +783,7 @@ class BatchStrOut:
 
 
 @dataclass
-class BatchMultimodalOut:
-    # The request id
-    rids: List[str]
+class BatchMultimodalOut(BaseBatchReq):
     # The finish reason
     finished_reasons: List[dict]
     # The outputs
@@ -802,9 +796,7 @@ class BatchMultimodalOut:
 
 
 @dataclass
-class BatchEmbeddingOut:
-    # The request id
-    rids: List[str]
+class BatchEmbeddingOut(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
@@ -815,27 +807,27 @@ class BatchEmbeddingOut:
 
 
 @dataclass
-class ClearHiCacheReqInput:
+class ClearHiCacheReqInput(BaseReq):
     pass
 
 
 @dataclass
-class ClearHiCacheReqOutput:
+class ClearHiCacheReqOutput(BaseReq):
     success: bool
 
 
 @dataclass
-class FlushCacheReqInput:
+class FlushCacheReqInput(BaseReq):
     pass
 
 
 @dataclass
-class FlushCacheReqOutput:
+class FlushCacheReqOutput(BaseReq):
     success: bool
 
 
 @dataclass
-class UpdateWeightFromDiskReqInput:
+class UpdateWeightFromDiskReqInput(BaseReq):
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -847,7 +839,7 @@ class UpdateWeightFromDiskReqInput:
 
 
 @dataclass
-class UpdateWeightFromDiskReqOutput:
+class UpdateWeightFromDiskReqOutput(BaseReq):
     success: bool
     message: str
     # Number of paused requests during weight sync.
@@ -855,7 +847,7 @@ class UpdateWeightFromDiskReqOutput:
 
 
 @dataclass
-class UpdateWeightsFromDistributedReqInput:
+class UpdateWeightsFromDistributedReqInput(BaseReq):
     names: List[str]
     dtypes: List[str]
     shapes: List[List[int]]
@@ -870,13 +862,13 @@ class UpdateWeightsFromDistributedReqInput:
 
 
 @dataclass
-class UpdateWeightsFromDistributedReqOutput:
+class UpdateWeightsFromDistributedReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class UpdateWeightsFromTensorReqInput:
+class UpdateWeightsFromTensorReqInput(BaseReq):
     """Update model weights from tensor input.
 
     - Tensors are serialized for transmission
@@ -895,13 +887,13 @@ class UpdateWeightsFromTensorReqInput:
 
 
 @dataclass
-class UpdateWeightsFromTensorReqOutput:
+class UpdateWeightsFromTensorReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class InitWeightsUpdateGroupReqInput:
+class InitWeightsUpdateGroupReqInput(BaseReq):
     # The master address
     master_address: str
     # The master port
@@ -917,13 +909,13 @@ class InitWeightsUpdateGroupReqInput:
 
 
 @dataclass
-class InitWeightsUpdateGroupReqOutput:
+class InitWeightsUpdateGroupReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class UpdateWeightVersionReqInput:
+class UpdateWeightVersionReqInput(BaseReq):
     # The new weight version
     new_version: str
     # Whether to abort all running requests before updating
@@ -931,88 +923,81 @@ class UpdateWeightVersionReqInput:
 
 
 @dataclass
-class GetWeightsByNameReqInput:
+class GetWeightsByNameReqInput(BaseReq):
     name: str
     truncate_size: int = 100
 
 
 @dataclass
-class GetWeightsByNameReqOutput:
+class GetWeightsByNameReqOutput(BaseReq):
     parameter: list
 
 
 @dataclass
-class ReleaseMemoryOccupationReqInput:
+class ReleaseMemoryOccupationReqInput(BaseReq):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
 
 
 @dataclass
-class ReleaseMemoryOccupationReqOutput:
+class ReleaseMemoryOccupationReqOutput(BaseReq):
     pass
 
 
 @dataclass
-class ResumeMemoryOccupationReqInput:
+class ResumeMemoryOccupationReqInput(BaseReq):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
 
 
 @dataclass
-class ResumeMemoryOccupationReqOutput:
+class ResumeMemoryOccupationReqOutput(BaseReq):
     pass
 
 
 @dataclass
-class SlowDownReqInput:
+class SlowDownReqInput(BaseReq):
     forward_sleep_time: Optional[float]
 
 
 @dataclass
-class SlowDownReqOutput:
+class SlowDownReqOutput(BaseReq):
     pass
 
 
 @dataclass
-class AbortReq:
-    # The request id
-    rid: str = ""
+class AbortReq(BaseReq):
     # Whether to abort all requests
     abort_all: bool = False
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
-    # used in MultiTokenzierManager mode
-    rids: Optional[Union[List[str], str]] = None
-
-    def __post_init__(self):
-        self.rids = self.rid
 
 
 @dataclass
-class GetInternalStateReq:
+class GetInternalStateReq(BaseReq):
     pass
 
 
 @dataclass
-class GetInternalStateReqOutput:
+class GetInternalStateReqOutput(BaseReq):
     internal_state: Dict[Any, Any]
 
 
 @dataclass
-class SetInternalStateReq:
+class SetInternalStateReq(BaseReq):
     server_args: Dict[str, Any]
 
 
 @dataclass
-class SetInternalStateReqOutput:
+class SetInternalStateReqOutput(BaseReq):
     updated: bool
     server_args: Dict[str, Any]
 
 
 @dataclass
-class ProfileReqInput:
+class ProfileReqInput(BaseReq):
     # The output directory
     output_dir: Optional[str] = None
     # If set, it profile as many as this number of steps.
@@ -1032,7 +1017,7 @@ class ProfileReqType(Enum):
 
 
 @dataclass
-class ProfileReq:
+class ProfileReq(BaseReq):
     type: ProfileReqType
     output_dir: Optional[str] = None
     start_step: Optional[int] = None
@@ -1045,18 +1030,18 @@ class ProfileReq:
 
 
 @dataclass
-class ProfileReqOutput:
+class ProfileReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class FreezeGCReq:
+class FreezeGCReq(BaseReq):
     pass
 
 
 @dataclass
-class ConfigureLoggingReq:
+class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
     dump_requests_folder: Optional[str] = None
@@ -1064,24 +1049,24 @@ class ConfigureLoggingReq:
 
 
 @dataclass
-class OpenSessionReqInput:
+class OpenSessionReqInput(BaseReq):
     capacity_of_str_len: int
     session_id: Optional[str] = None
 
 
 @dataclass
-class CloseSessionReqInput:
+class CloseSessionReqInput(BaseReq):
     session_id: str
 
 
 @dataclass
-class OpenSessionReqOutput:
+class OpenSessionReqOutput(BaseReq):
     session_id: Optional[str]
     success: bool
 
 
 @dataclass
-class HealthCheckOutput:
+class HealthCheckOutput(BaseReq):
     pass
 
 
@@ -1092,7 +1077,7 @@ class ExpertDistributionReq(Enum):
 
 
 @dataclass
-class ExpertDistributionReqOutput:
+class ExpertDistributionReqOutput(BaseReq):
     pass
 
 
@@ -1110,7 +1095,7 @@ class Tool:
 
 
 @dataclass
-class ParseFunctionCallReq:
+class ParseFunctionCallReq(BaseReq):
     text: str  # The text to parse.
     tools: List[Tool] = field(
         default_factory=list
@@ -1121,31 +1106,31 @@ class ParseFunctionCallReq:
 
 
 @dataclass
-class SeparateReasoningReqInput:
+class SeparateReasoningReqInput(BaseReq):
     text: str  # The text to parse.
     reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
 
 
 @dataclass
-class VertexGenerateReqInput:
+class VertexGenerateReqInput(BaseReq):
     instances: List[dict]
     parameters: Optional[dict] = None
 
 
 @dataclass
-class RpcReqInput:
+class RpcReqInput(BaseReq):
     method: str
     parameters: Optional[Dict] = None
 
 
 @dataclass
-class RpcReqOutput:
+class RpcReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class LoadLoRAAdapterReqInput:
+class LoadLoRAAdapterReqInput(BaseReq):
     # The name of the lora module to newly loaded.
     lora_name: str
     # The path of loading.
@@ -1165,7 +1150,7 @@ class LoadLoRAAdapterReqInput:
 
 
 @dataclass
-class UnloadLoRAAdapterReqInput:
+class UnloadLoRAAdapterReqInput(BaseReq):
     # The name of lora module to unload.
     lora_name: str
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
@@ -1179,7 +1164,7 @@ class UnloadLoRAAdapterReqInput:
 
 
 @dataclass
-class LoRAUpdateResult:
+class LoRAUpdateResult(BaseReq):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
@@ -1189,8 +1174,7 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
 
 
 @dataclass
-class MultiTokenizerRegisterReq:
-    rids: Optional[Union[List[str], str]] = None
+class MultiTokenizerRegisterReq(BaseReq):
     ipc_name: Optional[str] = None
 
 
@@ -1206,5 +1190,5 @@ class BlockReqType(Enum):
 
 
 @dataclass
-class BlockReqInput:
+class BlockReqInput(BaseReq):
     type: BlockReqType
