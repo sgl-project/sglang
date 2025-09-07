@@ -124,6 +124,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.layers.attention.ascend_ops.mla_preprocess import AscendFusedMLAPreprocess, is_mla_preprocess_enabled
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1017,6 +1018,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.weight_block_size = (
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
+        if is_mla_preprocess_enabled():
+            assert quant_config.get_name() == "w8a8_int8", "MLA Preprocess only works with W8A8Int8"
+            self.mla_preprocess = None
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -1185,9 +1189,27 @@ class DeepseekV2AttentionMLA(nn.Module):
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
-            inner_state = self.forward_absorb_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
-            )
+            if is_mla_preprocess_enabled():
+                if not self.mla_preprocess:
+                    self.mla_preprocess = AscendFusedMLAPreprocess(
+                        self.fused_qkv_a_proj_with_mqa,
+                        self.q_a_layernorm,
+                        self.kv_a_layernorm,
+                        self.q_b_proj,
+                        self.w_kc,
+                        self.rotary_emb,
+                        self.layer_id,
+                        self.num_local_heads,
+                        self.qk_nope_head_dim,
+                        self.qk_rope_head_dim,
+                    )
+                inner_state = self.mla_preprocess.forward(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
+            else:
+                inner_state = self.forward_absorb_prepare(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
                 positions, hidden_states, forward_batch, zero_allocator

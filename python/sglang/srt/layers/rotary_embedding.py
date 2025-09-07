@@ -782,10 +782,15 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.layer.attention.ascend_ops.mla_preprocess import is_mla_preprocess_enabled
         # NOTE: now npu_mrope can only support `numQHeads*headSize <= 4096` pattern,
         # and generalization to more scenarios will be supported in the future.
         if query.shape[1] * query.shape[2] > 4096:
-            return self.forward_native(positions, query, key, offsets)
+            query, key = self.forward_native(positions, query, key, offsets)
+            if is_mla_preprocess_enabled():
+                query = torch.cat([query[..., ::2], query[..., 1::2]], dim=-1)
+                key = torch.cat([key[..., ::2], key[..., 1::2]], dim=-1)
+            return query, key
         num_tokens = query.shape[0]
         rotary_mode = "half" if self.is_neox_style else "interleave"
         self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
@@ -813,6 +818,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         else:
             query = query_rot
             key = key_rot
+        if is_mla_preprocess_enabled():
+            query = torch.cat([query[..., ::2], query[..., 1::2]], dim=-1)
+            key = torch.cat([key[..., ::2], key[..., 1::2]], dim=-1)
         return query, key
 
     def forward_cpu(
