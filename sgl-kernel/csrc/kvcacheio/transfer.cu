@@ -437,8 +437,8 @@ void transfer_kv_all_layer_mla_lf_pf(
 }
 
 inline void transfer_page_direct(
-    const at::Tensor& src_buffer,
-    at::Tensor& dst_buffer,
+    const at::Tensor src_buffer,
+    at::Tensor dst_buffer,
     int64_t src_page_index,
     int64_t dst_page_index,
     int64_t page_size) {
