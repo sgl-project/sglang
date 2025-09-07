@@ -3,12 +3,18 @@ use crate::core::WorkerRegistry;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::middleware::TokenBucket;
+<<<<<<< HEAD
 use crate::policies::PolicyRegistry;
+=======
+>>>>>>> b5c21104e (apply review comments)
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest,
-    V1RerankReqInput,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+    ResponsesRequest, V1RerankReqInput,
 };
+<<<<<<< HEAD
 use crate::protocols::worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse};
+=======
+>>>>>>> b5c21104e (apply review comments)
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::router_manager::{RouterId, RouterManager};
 use crate::routers::{RouterFactory, RouterTrait};
@@ -205,6 +211,17 @@ async fn v1_responses(
     state
         .router
         .route_responses(Some(&headers), &body, None)
+        .await
+}
+
+async fn v1_embeddings(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<EmbeddingRequest>,
+) -> Response {
+    state
+        .router
+        .route_embeddings(Some(&headers), &body, None)
         .await
 }
 
@@ -464,7 +481,8 @@ pub fn build_app(
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
-        .route("/v1/responses", post(v1_responses))
+.route("/v1/responses", post(v1_responses))
+        .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",
