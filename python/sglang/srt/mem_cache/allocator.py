@@ -228,19 +228,26 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: SWAKVPool,
         need_sort: bool,
         allocator_class: BaseTokenToKVPoolAllocator = TokenToKVPoolAllocator,
+        full_allocator_class: BaseTokenToKVPoolAllocator = None,
+        swa_allocator_class: BaseTokenToKVPoolAllocator = None,
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
-        self.full_attn_allocator = allocator_class(
+
+        # Use specific allocator classes if provided, otherwise fallback to allocator_class
+        full_alloc_class = full_allocator_class or allocator_class
+        swa_alloc_class = swa_allocator_class or allocator_class
+
+        self.full_attn_allocator = full_alloc_class(
             size,
             dtype,
             device,
             kvcache.full_kv_pool,
             need_sort,
         )
-        self.swa_attn_allocator = allocator_class(
+        self.swa_attn_allocator = swa_alloc_class(
             size_swa,
             dtype,
             device,
@@ -299,6 +306,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             torch.int64
         )
         return alloc_full_indices
+
+    def _is_elastic(self, alloc):
+        return hasattr(alloc, "kvcached_allocator")
 
     def _is_elastic(self, alloc):
         return hasattr(alloc, "elasticmem_allocator")
