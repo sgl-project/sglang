@@ -12,9 +12,10 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.mm_utils import TransportProxyTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import load_audio, load_image, load_video, logger
+from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
+
+_is_npu = is_npu()
 
 
 @dataclasses.dataclass
@@ -23,13 +24,19 @@ class BaseMultiModalProcessorOutput:
     input_text: str
 
     # frames loaded from image, in given order
-    images: Optional[list[Union[Image.Image, dict]]] = None
+    images: Optional[list[Union[Image.Image, dict]]] = dataclasses.field(
+        default_factory=list
+    )
 
     # videos
-    videos: Optional[list[Union[torch.Tensor, dict]]] = None
+    videos: Optional[list[Union[torch.Tensor, dict]]] = dataclasses.field(
+        default_factory=list
+    )
 
     # audios
-    audios: Optional[list[Union[np.ndarray, dict]]] = None
+    audios: Optional[list[Union[np.ndarray, dict]]] = dataclasses.field(
+        default_factory=list
+    )
 
     def organize_results(self) -> List[Tuple[Modality, Any]]:
         """
@@ -176,6 +183,8 @@ class BaseMultimodalProcessor(ABC):
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
             "aspect_ratio_mask": Modality.IMAGE,
+            "num_patches": Modality.IMAGE,
+            "patch_pixel_values": Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
@@ -192,11 +201,16 @@ class BaseMultimodalProcessor(ABC):
 
         # name of the feature filed
         # TODO: pass from processors
-        self.FEATURE_NAMES = ["pixel_values", "pixel_values_videos", "audio_features"]
+        self.FEATURE_NAMES = [
+            "pixel_values",
+            "pixel_values_videos",
+            "audio_features",
+            "input_features",
+        ]
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
-    ):
+    ) -> dict:
         """
         process multimodal data with transformers AutoProcessor
         """
@@ -205,22 +219,35 @@ class BaseMultimodalProcessor(ABC):
         if videos:
             kwargs["videos"] = videos
         if audios:
-            kwargs["audios"] = audios
-            if self.__class__.__name__ == "Gemma3nSGLangProcessor":
+            if self._processor.__class__.__name__ in {
+                "Gemma3nProcessor",
+                "Qwen2AudioProcessor",
+            }:
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
+            else:
+                kwargs["audios"] = audios
 
         processor = self._processor
-        if hasattr(processor, "image_processor") and isinstance(
-            processor.image_processor, BaseImageProcessorFast
+        if (
+            hasattr(processor, "image_processor")
+            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and not self.server_args.disable_fast_image_processor
         ):
-            kwargs["device"] = "cuda"
+            kwargs["device"] = "cuda" if not _is_npu else "npu"
         result = processor.__call__(
             text=[input_text],
             padding=True,
             return_tensors="pt",
             **kwargs,
         )
+        # move feature tensors to cpu
+        for feature_name in self.FEATURE_NAMES:
+            if feature_name in result and isinstance(
+                result[feature_name], torch.Tensor
+            ):
+                result[feature_name] = result[feature_name].to("cpu")
+
         return result
 
     @abstractmethod
@@ -586,12 +613,6 @@ class BaseMultimodalProcessor(ABC):
         all_collected_items: list[MultimodalDataItem] = []
         input_ids = None
 
-        # Handle dict items (already processed)
-        for dict_item in dict_items:
-            all_collected_items.extend(
-                self.collect_mm_items_from_processor_output(dict_item)
-            )
-
         # Handle raw items (need processing)
         if raw_images or raw_audios or raw_videos:
             collected_items, input_ids, ret = self._process_and_collect_mm_items(
@@ -601,9 +622,15 @@ class BaseMultimodalProcessor(ABC):
                 videos=raw_videos,
                 **kwargs,
             )
-            all_collected_items.extend(collected_items)
+            all_collected_items = collected_items
         else:
             ret = None
+
+        # Handle dict items (already processed)
+        for dict_item in dict_items:
+            all_collected_items.extend(
+                self.collect_mm_items_from_processor_output(dict_item)
+            )
 
         # Fallback tokenization if no raw items were processed
         if input_ids is None:
@@ -622,20 +649,5 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
-
-        # post-process
-        for item in all_collected_items:
-            # replace the feature tensor with a proxy
-            if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                item.feature = TransportProxyTensor(
-                    transport_mode=self.transport_mode, data=item.feature
-                )
-            elif (
-                isinstance(item.precomputed_embeddings, torch.Tensor)
-                and item.precomputed_embeddings.is_cuda
-            ):
-                item.precomputed_embeddings = TransportProxyTensor(
-                    transport_mode=self.transport_mode, data=item.precomputed_embeddings
-                )
 
         return all_collected_items, input_ids, ret
