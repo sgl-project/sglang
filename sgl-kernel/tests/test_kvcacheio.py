@@ -272,7 +272,7 @@ def test_transfer_kv(
     torch.set_default_dtype(original_dtype)
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("num_items_to_transfer", [128, 1024])
+@pytest.mark.parametrize("num_items_to_transfer", [128, 1024, 8192])
 @pytest.mark.parametrize("page_size", [16, 64, 128])
 @pytest.mark.parametrize("item_size", [256])
 @pytest.mark.parametrize("total_items_in_pool", [20480])
