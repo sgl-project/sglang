@@ -1,43 +1,41 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
-from ast import List
+import time
 from collections import deque
-from typing import TYPE_CHECKING, Deque, Generic, Optional, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Deque,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+)
+
+import fastapi
 
 from sglang.srt.managers.io_struct import (
-    AbortReq,
-    BatchEmbeddingOut,
-    BatchMultimodalOut,
-    BatchStrOut,
-    BatchTokenIDOut,
-    BatchTokenizedEmbeddingReqInput,
-    BatchTokenizedGenerateReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
-    CloseSessionReqInput,
-    ConfigureLoggingReq,
-    EmbeddingReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
-    FreezeGCReq,
-    GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
-    HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateResult,
     MultiTokenizerWrapper,
-    OpenSessionReqInput,
-    OpenSessionReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -45,29 +43,27 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
-    SessionParams,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
-    TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import LoRARef, ServerArgs
+from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 
 class _Communicator(Generic[T]):
