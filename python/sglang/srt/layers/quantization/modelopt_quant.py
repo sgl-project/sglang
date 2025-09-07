@@ -152,6 +152,9 @@ class ModelOptFp8Config(QuantizationConfig):
                 and kv_cache_bits == 8
             ):
                 kv_cache_quant_method = "FP8"
+
+            # Map 'ignore' field to 'exclude_modules'
+            exclude_modules = config.get("ignore")
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
             try:
