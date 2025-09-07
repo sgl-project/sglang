@@ -134,7 +134,6 @@ def create_hf3fs_client(
         logger.info(f"[Rank Using Hf3fsMockClient for testing")
         return Hf3fsMockClient(path, size, bytes_per_page, entries)
     else:
-        logger.info(f"[Rank Using Hf3fsUsrbioClient")
         from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import (
             Hf3fsUsrBioClient,
         )
@@ -235,19 +234,21 @@ class HiCacheHF3FS(HiCacheStorage):
             Hf3fsLocalMetadataClient,
         )
 
+        use_mock_client = False
         if storage_config is not None:
             rank, is_mla_model, is_page_first_layout = (
                 storage_config.tp_rank,
                 storage_config.is_mla_model,
                 storage_config.is_page_first_layout,
             )
-            use_mock_client = storage_config.extra_config.get(
-                "use_mock_hf3fs_client", False
-            )
+
+            if storage_config.extra_config is not None:
+                use_mock_client = storage_config.extra_config.get(
+                    "use_mock_hf3fs_client", False
+                )
         else:
-            rank, is_mla_model, is_page_first_layout, use_mock_client = (
+            rank, is_mla_model, is_page_first_layout = (
                 0,
-                False,
                 False,
                 False,
             )

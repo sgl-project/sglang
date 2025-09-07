@@ -64,8 +64,7 @@ class HiCacheStorageBaseMixin:
     @classmethod
     def _get_model_name(cls):
         """Get model name for the test configuration - override in subclasses"""
-        # return DEFAULT_MODEL_NAME_FOR_TEST
-        return "/sgl-workspace/mnt/Qwen-4B"
+        return DEFAULT_MODEL_NAME_FOR_TEST
 
     @classmethod
     def _get_base_server_args(cls):
@@ -78,7 +77,6 @@ class HiCacheStorageBaseMixin:
             "--enable-cache-report": True,
             "--hicache-storage-prefetch-policy": "wait_complete",
             "--hicache-storage-backend": "file",
-            "--log-level": "debug",
         }
 
     @classmethod

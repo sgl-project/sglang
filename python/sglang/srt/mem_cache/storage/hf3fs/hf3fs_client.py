@@ -73,9 +73,6 @@ class Hf3fsMockClient(Hf3fsClient):
         self.file = os.open(self.path, os.O_RDWR | os.O_CREAT)
         os.ftruncate(self.file, size)
 
-        self.rlock = threading.RLock()
-        self.wlock = threading.RLock()
-
         logger.info(
             f"Hf3fsMockClient initialized: path={path}, size={size}, "
             f"bytes_per_page={bytes_per_page}, entries={entries}"
