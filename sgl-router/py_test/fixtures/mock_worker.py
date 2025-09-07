@@ -44,6 +44,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--api-key", default=None)
     p.add_argument("--max-payload-bytes", type=int, default=10 * 1024 * 1024)
     p.add_argument("--stream", action="store_true")
+    p.add_argument("--dp-size", type=int, default=1)
     p.add_argument("--crash-on-request", action="store_true")
     p.add_argument("--health-fail-after-ms", type=int, default=0)
     return p.parse_args()
@@ -125,12 +126,15 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         return JSONResponse({"data": [{"id": "mock", "object": "model"}]})
 
     @app.get("/get_server_info")
-    async def get_server_info():
+    async def get_server_info(request: Request):
+        # Enforce API key on server info when required (used by dp_aware probing)
+        check_api_key(request)
         return JSONResponse(
             {
                 "worker_id": worker_id,
                 "load_in_flight": _inflight,
                 "cache": {"size": 0, "hit_rate": 0.0},
+                "dp_size": int(args.dp_size),
             }
         )
 
