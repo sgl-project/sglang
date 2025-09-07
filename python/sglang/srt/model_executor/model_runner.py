@@ -1537,7 +1537,7 @@ class ModelRunner:
             )
 
             return FlashAttentionBackend(self)
-        elif backend_str == "fa-cute":
+        elif backend_str == "fa4":
             assert torch.cuda.get_device_capability()[0] == 10, (
                 "FlashAttention v4 Backend requires SM>=100"
                 "With your setup, please use `--attention-backend flashinfer` instead."

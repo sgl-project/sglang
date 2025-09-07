@@ -487,12 +487,9 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.disable_radix_cache = True
 
-        if (
-            self.attention_backend == "fa-cute"
-            or self.prefill_attention_backend == "fa-cute"
-        ):
+        if self.attention_backend == "fa4" or self.prefill_attention_backend == "fa4":
             logger.warning(
-                "fa-cute only supports a page_size of 128, change page_size to 128."
+                "fa4 only supports a page_size of 128, change page_size to 128."
             )
             self.page_size = 128
 
@@ -1339,7 +1336,7 @@ class ServerArgs:
             # NVIDIA specific
             "cutlass_mla",
             "fa3",
-            "fa-cute",
+            "fa4",
             "flashinfer",
             "flashmla",
             "trtllm_mla",
@@ -2133,7 +2130,7 @@ class ServerArgs:
                     self.attention_backend = "fa3"
                 else:
                     self.attention_backend = "triton"
-            supported_backends = ["triton", "trtllm_mha", "fa3", "fa-cute"]
+            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4"]
             logger.info(
                 f"Use {self.attention_backend} as attention backend for GptOssForCausalLM"
             )
