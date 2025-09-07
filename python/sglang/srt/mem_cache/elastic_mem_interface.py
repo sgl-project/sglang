@@ -54,7 +54,7 @@ _contiguous_layout = CONTIGUOUS_LAYOUT if KVCACHED_AVAILABLE else True
 
 def is_elasticmem_available() -> bool:
     """Check if elasticmem (kvcached) backend is available."""
-    return KVCACHED_AVAILABLE and get_bool_env_var("ENABLE_KVCACHED", False)
+    return KVCACHED_AVAILABLE
 
 
 def init_elasticmem(

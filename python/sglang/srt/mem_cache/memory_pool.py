@@ -137,21 +137,21 @@ class KVCache(abc.ABC):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
         """
-        if isinstance(self, MLATokenToKVPool):
-            kv_size = self.get_kv_size_bytes()
-            kv_size_GB = kv_size / GB
-            logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
-            )
-            self.mem_usage = kv_size_GB
-        else:
-            k_size, v_size = self.get_kv_size_bytes()
+        kv_size_bytes = self.get_kv_size_bytes()
+        if isinstance(kv_size_bytes, tuple):
+            k_size, v_size = kv_size_bytes
             k_size_GB = k_size / GB
             v_size_GB = v_size / GB
             logger.info(
                 f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
             )
             self.mem_usage = k_size_GB + v_size_GB
+        else:
+            kv_size_GB = kv_size_bytes / GB
+            logger.info(
+                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+            )
+            self.mem_usage = kv_size_GB
 
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
@@ -369,7 +369,6 @@ class MHATokenToKVPool(KVCache):
         # same applies to get_value_buffer and get_kv_buffer
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
@@ -464,8 +463,7 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
         if not is_elasticmem_available():
             raise ImportError(
                 "ElasticMem is not available. Please install kvcached with "
-                "`pip install kvcached --no-build-isolation` and set "
-                "ENABLE_KVCACHED=true to use elastic KV cache."
+                "`pip install kvcached --no-build-isolation`"
             )
 
         # Call grandparent (KVCache) initializer because we redefine

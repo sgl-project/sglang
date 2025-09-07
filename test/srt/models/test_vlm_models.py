@@ -155,6 +155,7 @@ class TestVLMModels(CustomTestCase):
                     "--attention-backend",
                     "flashinfer",
                     "--disable-cuda-graph",
+                    "--enable-elastic-memory",
                     "--trust-remote-code",
                     "--cuda-graph-max-bs",
                     "32",
