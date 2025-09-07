@@ -67,7 +67,10 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FusedMoE,
+    _is_fp4_quantization_enabled,
+)
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -299,7 +302,9 @@ class MoEGate(nn.Module):
             and _device_sm >= 90
         ):
             # router gemm output float32
-            logits = dsv3_router_gemm(hidden_states, self.weight)
+            logits = dsv3_router_gemm(
+                hidden_states, self.weight, out_dtype=torch.float32
+            )
         elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
             logits = aiter_dsv3_router_gemm(
                 hidden_states, self.weight, gemm_output_zero_allocator
@@ -364,6 +369,9 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        correction_bias = self.gate.e_score_correction_bias
+        if _is_fp4_quantization_enabled():
+            correction_bias = correction_bias.to(torch.bfloat16)
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             renormalize=config.norm_topk_prob,
@@ -371,7 +379,7 @@ class DeepseekV2MoE(nn.Module):
             num_expert_group=config.n_group,
             num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
+            correction_bias=correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk(),
             force_topk=quant_config is None,
@@ -503,7 +511,9 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(hidden_states)
+        shared_output = self._forward_shared_experts(
+            hidden_states, gemm_output_zero_allocator
+        )
 
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
@@ -542,7 +552,9 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
@@ -664,9 +676,13 @@ class DeepseekV2MoE(nn.Module):
 
         return final_hidden_states
 
-    def _forward_shared_experts(self, hidden_states):
+    def _forward_shared_experts(
+        self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
+    ):
         if self.num_fused_shared_experts == 0:
-            return self.shared_experts(hidden_states)
+            return self.shared_experts(
+                hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+            )
         else:
             return None
 
@@ -1042,7 +1058,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             attention_backend == "flashinfer"
             or attention_backend == "fa3"
             or attention_backend == "flashmla"
-            or attention_backend == "trtllm_mla"
             or attention_backend == "cutlass_mla"
         ):
             # Use MHA with chunked KV cache when prefilling on long sequences.
@@ -1071,13 +1086,28 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return _dispatch_mla_subtype()
+        elif attention_backend == "trtllm_mla":
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+            ):
+                return AttnForwardMethod.MHA_CHUNKED_KV
+            else:
+                return _dispatch_mla_subtype()
         elif attention_backend == "aiter":
             if (
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
             ):
-                return AttnForwardMethod.MHA
+                if is_dp_attention_enabled():
+                    if sum(forward_batch.extend_prefix_lens_cpu) == 0:
+                        return AttnForwardMethod.MHA
+                    else:
+                        return AttnForwardMethod.MLA
+                else:
+                    return AttnForwardMethod.MHA
             else:
                 return AttnForwardMethod.MLA
         else:
@@ -1790,9 +1820,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
                 self.attn_mha.layer_id
             )
-            latent_cache = latent_cache_buf[
-                forward_batch.prefix_chunk_kv_indices[i]
-            ].contiguous()
+            latent_cache = (
+                latent_cache_buf[forward_batch.prefix_chunk_kv_indices[i]]
+                .contiguous()
+                .to(q.dtype)
+            )
 
             kv_a_normed, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -2014,8 +2046,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
+
+        if isinstance(self.mlp, DeepseekV2MLP):
+            gemm_output_zero_allocator = None
+
         hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+            hidden_states,
+            forward_batch,
+            should_allreduce_fusion,
+            use_reduce_scatter,
+            gemm_output_zero_allocator,
         )
 
         if should_allreduce_fusion:
@@ -2209,13 +2249,18 @@ class DeepseekV2Model(nn.Module):
             device=device,
         )
 
+        has_gemm_output_zero_allocator = hasattr(
+            self, "gemm_output_zero_allocator_size"
+        )
+
         gemm_output_zero_allocator = (
             BumpAllocator(
                 buffer_size=self.gemm_output_zero_allocator_size,
                 dtype=torch.float32,
                 device=device,
             )
-            if self.gemm_output_zero_allocator_size > 0
+            if has_gemm_output_zero_allocator
+            and self.gemm_output_zero_allocator_size > 0
             else None
         )
 

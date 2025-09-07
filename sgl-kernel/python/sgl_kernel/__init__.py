@@ -23,6 +23,7 @@ from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_
 from sgl_kernel.elementwise import (
     FusedSetKVBufferArg,
     apply_rope_with_cos_sin_cache_inplace,
+    copy_to_gpu_no_ce,
     downcast_fp8,
     fused_add_rmsnorm,
     gelu_and_mul,
@@ -76,9 +77,6 @@ from sgl_kernel.memory import set_kv_buffer_kernel
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
-    ep_moe_post_reorder,
-    ep_moe_pre_reorder,
-    ep_moe_silu_and_mul,
     fp8_blockwise_scaled_grouped_mm,
     moe_align_block_size,
     moe_fused_gate,
