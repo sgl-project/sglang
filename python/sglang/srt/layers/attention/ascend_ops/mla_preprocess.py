@@ -82,8 +82,8 @@ class AscendFusedMLAPreprocess(torch.nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        self.qkv_a_proj.input_offset = self.qkv_a_proj.input_offset.to(dtype=torch.int8)
-        self.q_b_proj.input_offset = self.q_b_proj.input_offset.to(dtype=torch.int8)
+        self.qkv_a_proj_input_offset = self.qkv_a_proj.input_offset.to(dtype=torch.int8)
+        self.q_b_proj_input_offset = self.q_b_proj.input_offset.to(dtype=torch.int8)
 
         # matmul_0 weight [7168, 2112]
         fused_qkv_a_proj_with_mqa_weight_q = self.qkv_a_proj.weight.data[
@@ -275,10 +275,10 @@ class AscendFusedMLAPreprocess(torch.nn.Module):
             self.v_cache,
             self.slot_mapping,
             quant_scale0=self.qkv_a_proj.input_scale,
-            quant_offset0=self.qkv_a_proj.input_offset,
+            quant_offset0=self.qkv_a_proj_input_offset,
             bias0=self.qkv_a_proj_quant_bias_kvq,
             quant_scale1=self.q_b_proj.input_scale,
-            quant_offset1=self.q_b_proj.input_offset,
+            quant_offset1=self.q_b_proj_input_offset,
             bias1=self.q_b_proj_quant_bias,
             cache_mode="krope_ctkv",
             quant_mode="per_tensor_quant_asymm",
