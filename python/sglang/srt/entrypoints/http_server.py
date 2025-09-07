@@ -181,8 +181,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    server_args = getattr(fast_api_app, "server_args", None)
-    if server_args is None:
+    if not getattr(fast_api_app, "is_single_tokenizer_mode", False):
         # Initialize multi-tokenizer support for worker processes
         fast_api_app.server_args: ServerArgs = await init_multi_tokenizer()
 
@@ -1230,6 +1229,7 @@ def launch_server(
                 workers=server_args.tokenizer_worker_num,
             )
         else:
+            app.is_single_tokenizer_mode = True
             uvicorn.run(
                 app,
                 host=server_args.host,
