@@ -81,7 +81,7 @@ FetchContent_Populate(repo-triton)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        018b551825c8e5579206e6eb9d3229fa679202b3
+    GIT_TAG        1a85c439a064c1609568675aa580a409a53fb183
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
