@@ -170,7 +170,10 @@ set(SGL_KERNEL_CUDA_FLAGS
 set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default 32")
 
 # When SGL_KERNEL_COMPILE_THREADS value is less than 1, set it to 1
-if (SGL_KERNEL_COMPILE_THREADS LESS 1)
+if (NOT SGL_KERNEL_COMPILE_THREADS MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "SGL_KERNEL_COMPILE_THREADS must be an integer, but was set to '${SGL_KERNEL_COMPILE_THREADS}'.")
+elseif (SGL_KERNEL_COMPILE_THREADS LESS 1)
+    message(STATUS "SGL_KERNEL_COMPILE_THREADS was set to a value less than 1. Using 1 instead.")
     set(SGL_KERNEL_COMPILE_THREADS 1)
 endif()
 
