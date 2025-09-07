@@ -1086,7 +1086,8 @@ class Scheduler(
                 input_ids=recv_req.cfg_params["cfg_input_ids"],
                 cfg_parent_rid=recv_req.rid,
             )
-            for recv_req in recv_reqs if recv_req.cfg_params
+            for recv_req in recv_reqs
+            if recv_req.cfg_params
         ]
         recv_reqs.extend(cfg_reqs)
 
