@@ -2582,6 +2582,8 @@ def run_scheduler_process(
             dp_rank,
             dp_balance_meta=balance_meta,
         )
+        # Configure the logger again to display decode batch metric log above all models
+        configure_logger(server_args, prefix=prefix)
         pipe_writer.send(
             {
                 "status": "ready",
