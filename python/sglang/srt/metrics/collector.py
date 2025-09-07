@@ -14,10 +14,12 @@
 """Utilities for Prometheus Metrics Collection."""
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
+from sglang.srt.metrics.utils import generate_buckets
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
@@ -309,6 +311,7 @@ class SchedulerMetricsCollector:
 class TokenizerMetricsCollector:
     def __init__(
         self,
+        server_args: ServerArgs,
         labels: Dict[str, str],
         bucket_time_to_first_token: Optional[List[float]] = None,
         bucket_inter_token_latency: Optional[List[float]] = None,
@@ -334,7 +337,7 @@ class TokenizerMetricsCollector:
         )
 
         if collect_tokens_histogram:
-            bucket_prompt_tokens = [
+            default_bucket_prompt_tokens = [
                 100,
                 300,
                 500,
@@ -363,9 +366,11 @@ class TokenizerMetricsCollector:
                 name="sglang:prompt_tokens_histogram",
                 documentation="Histogram of prompt token length.",
                 labelnames=labels.keys(),
-                buckets=bucket_prompt_tokens,
+                buckets=generate_buckets(
+                    server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+                ),
             )
-            bucket_generation_tokens = [
+            default_bucket_generation_tokens = [
                 100,
                 300,
                 500,
@@ -390,7 +395,10 @@ class TokenizerMetricsCollector:
                 name="sglang:generation_tokens_histogram",
                 documentation="Histogram of generation token length.",
                 labelnames=labels.keys(),
-                buckets=bucket_generation_tokens,
+                buckets=generate_buckets(
+                    server_args.generation_tokens_buckets,
+                    default_bucket_generation_tokens,
+                ),
             )
 
         self.cached_tokens_total = Counter(
@@ -551,3 +559,105 @@ class TokenizerMetricsCollector:
 
     def observe_one_aborted_request(self):
         self.num_aborted_requests_total.labels(**self.labels).inc(1)
+
+
+@dataclass
+class StorageMetrics:
+    prefetch_pgs: List[int] = field(default_factory=list)
+    backup_pgs: List[int] = field(default_factory=list)
+    prefetch_bandwidth: List[float] = field(default_factory=list)
+    backup_bandwidth: List[float] = field(default_factory=list)
+
+
+class StorageMetricsCollector:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+    ):
+        from prometheus_client import Counter, Histogram
+
+        self.labels = labels
+
+        self.prefetched_tokens_total = Counter(
+            name="sglang:prefetched_tokens_total",
+            documentation="Number of prefetched prompt tokens.",
+            labelnames=labels.keys(),
+        )
+
+        self.backuped_tokens_total = Counter(
+            name="sglang:backuped_tokens_total",
+            documentation="Number of backuped tokens.",
+            labelnames=labels.keys(),
+        )
+
+        bucket_io = [
+            1,
+            5,
+            10,
+            50,
+            100,
+        ]
+
+        bucket_bandwidth = [
+            0.1,
+            0.5,
+            1,
+            5,
+            10,
+            50,
+            100,
+        ]
+
+        self.histogram_prefetch_pgs = Histogram(
+            name="sglang:prefetch_pgs",
+            documentation="Histogram of prefetch pages of batches.",
+            labelnames=labels.keys(),
+            buckets=bucket_io,
+        )
+
+        self.histogram_backup_pgs = Histogram(
+            name="sglang:backup_pgs",
+            documentation="Histogram of backup pages of batches.",
+            labelnames=labels.keys(),
+            buckets=bucket_io,
+        )
+
+        self.histogram_prefetch_bandwidth = Histogram(
+            name="sglang:prefetch_bandwidth",
+            documentation="Histogram of prefetch bandwidth in GB/s.",
+            labelnames=labels.keys(),
+            buckets=bucket_bandwidth,
+        )
+
+        self.histogram_backup_bandwidth = Histogram(
+            name="sglang:backup_bandwidth",
+            documentation="Histogram of backup bandwidth in GB/s.",
+            labelnames=labels.keys(),
+            buckets=bucket_bandwidth,
+        )
+
+    def log_prefetched_tokens(self, prefetched_tokens: int):
+        if prefetched_tokens > 0:
+            self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
+
+    def log_backuped_tokens(self, backuped_tokens: int):
+        if backuped_tokens > 0:
+            self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def _log_histogram(self, histogram, data: Union[int, float]):
+        histogram.labels(**self.labels).observe(data)
+
+    def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
+        if storage_metrics is None:
+            return
+
+        assert isinstance(storage_metrics, StorageMetrics)
+
+        for v in storage_metrics.prefetch_pgs:
+            self._log_histogram(self.histogram_prefetch_pgs, v)
+        for v in storage_metrics.backup_pgs:
+            self._log_histogram(self.histogram_backup_pgs, v)
+        for v in storage_metrics.prefetch_bandwidth:
+            self._log_histogram(self.histogram_prefetch_bandwidth, v)
+        for v in storage_metrics.backup_bandwidth:
+            self._log_histogram(self.histogram_backup_bandwidth, v)
