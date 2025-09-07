@@ -3,7 +3,6 @@
 import os
 from typing import Type
 
-from python.sglang.srt.server_args import ServerArgs
 from sglang.srt.disaggregation.base import BaseKVBootstrapServer
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -11,6 +10,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
 )
+from sglang.srt.server_args import ServerArgs
 
 
 def start_disagg_service(
