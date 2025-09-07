@@ -223,9 +223,12 @@ class HiRadixCache(RadixCache):
                 self.write_backup_storage(backuped_node)
 
     def loading_check(self):
-        while not self.cache_controller.ack_load_queue.empty():
-            try:
-                ack_id = self.cache_controller.ack_load_queue.get_nowait()
+        remove_count = 0
+        for event, ack_list in self.cache_controller.ack_load_queue:
+            if not event.query():
+                break
+            remove_count += 1
+            for ack_id in ack_list:
                 start_node, end_node = self.ongoing_load_back[ack_id]
                 self.dec_lock_ref(end_node)
                 while end_node != start_node:
@@ -234,8 +237,9 @@ class HiRadixCache(RadixCache):
                     end_node = end_node.parent
                 # clear the reference
                 del self.ongoing_load_back[ack_id]
-            except Exception:
-                break
+
+        # ACK until all events are processed
+        del self.cache_controller.ack_load_queue[:remove_count]
 
     def evictable_size(self):
         return self.evictable_size_
@@ -394,10 +398,12 @@ class HiRadixCache(RadixCache):
             last_node,
         )
 
-    def ready_to_load_host_cache(self):
-        producer_index = self.cache_controller.layer_done_counter.next_producer()
-        self.load_cache_event.set()
-        return producer_index
+    def ready_to_load_host_cache(self) -> int:
+        """
+        Notify the cache controller to start the KV cache loading.
+        Return the consumer index for the schedule batch manager to track.
+        """
+        return self.cache_controller.start_loading()
 
     def check_hicache_events(self):
         self.writing_check()

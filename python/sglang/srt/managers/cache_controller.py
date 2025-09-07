@@ -18,7 +18,7 @@ import math
 import threading
 import time
 from queue import Empty, Full, PriorityQueue, Queue
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 import torch
 
@@ -43,39 +43,63 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 logger = logging.getLogger(__name__)
 
 
+class LayerEvent:
+    def __init__(self, num_layers: int):
+        self._num_layers = num_layers
+        self.load_events = [torch.cuda.Event() for _ in range(num_layers)]
+        self.start_event = torch.cuda.Event()  # start event on controller stream
+        self.wait_set: Set[int] = set()
+
+    def reset(self):
+        self.wait_set.clear()
+
+    def complete(self, layer_index: int):
+        assert 0 <= layer_index < self._num_layers
+        self.load_events[layer_index].record()
+
+    def wait(self, layer_index: int):
+        assert 0 <= layer_index < self._num_layers
+        if layer_index in self.wait_set:
+            return
+        self.wait_set.add(layer_index)
+        stream = torch.cuda.current_stream()
+        # make current stream wait for the load event of the layer
+        self.load_events[layer_index].wait(stream)
+
+    @property
+    def finish_event(self):
+        return self.load_events[-1]
+
+
 class LayerDoneCounter:
-    def __init__(self, num_layers):
+    def __init__(self, num_layers: int):
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
-        self.counters = [num_layers] * self.num_counters
-        self.conditions = [threading.Condition() for _ in range(self.num_counters)]
-        self.producer_index = 0
-        self.consumer_index = 0
-
-    def next_producer(self):
-        return (self.producer_index + 1) % self.num_counters
+        self.events = [LayerEvent(num_layers) for _ in range(self.num_counters)]
+        self.producer_index = -1
+        self.consumer_index = -1
 
     def update_producer(self):
-        self.producer_index = self.next_producer()
+        self.producer_index = (self.producer_index + 1) % self.num_counters
+        assert self.events[
+            self.producer_index
+        ].finish_event.query(), (
+            "Producer finish event should be ready before being reused."
+        )
         return self.producer_index
 
-    def set_consumer(self, index):
+    def set_consumer(self, index: int):
         self.consumer_index = index
 
-    def increment(self):
-        with self.conditions[self.producer_index]:
-            self.counters[self.producer_index] += 1
-            self.conditions[self.producer_index].notify_all()
-
-    def wait_until(self, threshold):
-        with self.conditions[self.consumer_index]:
-            while self.counters[self.consumer_index] <= threshold:
-                self.conditions[self.consumer_index].wait()
+    def wait_until(self, threshold: int):
+        if self.consumer_index < 0:
+            return
+        self.events[self.consumer_index].wait(threshold)
 
     def reset(self):
-        with self.conditions[self.producer_index]:
-            self.counters[self.producer_index] = 0
+        self.producer_index = -1
+        self.consumer_index = -1
 
 
 class CacheOperation:
@@ -106,7 +130,20 @@ class CacheOperation:
         self.priority = min(self.priority, other.priority)
         self.node_ids.extend(other.node_ids)
 
-    def split(self, factor) -> List["CacheOperation"]:
+    @staticmethod
+    def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
+        assert len(ops) > 0
+        host_indices = torch.cat([op.host_indices for op in ops])
+        device_indices = torch.cat([op.device_indices for op in ops])
+        node_ids = []
+        priority = min(op.priority for op in ops)
+        for op in ops:
+            node_ids.extend(op.node_ids)
+        merged_op = CacheOperation(host_indices, device_indices, -1, priority)
+        merged_op.node_ids = node_ids
+        return merged_op
+
+    def split(self, factor) -> List[CacheOperation]:
         # split an operation into smaller operations to reduce the size of intermediate buffers
         if factor <= 1:
             return [self]
@@ -118,7 +155,7 @@ class CacheOperation:
                 CacheOperation(
                     host_indices=self.host_indices[i : i + chunk_size],
                     device_indices=self.device_indices[i : i + chunk_size],
-                    node_id=0,
+                    node_id=-1,
                 )
             )
         # Inherit the node_ids on the final chunk
@@ -127,7 +164,7 @@ class CacheOperation:
 
         return split_ops
 
-    def __lt__(self, other: "CacheOperation"):
+    def __lt__(self, other: CacheOperation):
         return self.priority < other.priority
 
 
@@ -237,7 +274,7 @@ class HiCacheController:
         mem_pool_host: HostKVCache,
         page_size: int,
         tp_group: torch.distributed.ProcessGroup,
-        load_cache_event: threading.Event = None,
+        load_cache_event: threading.Event,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
@@ -341,8 +378,9 @@ class HiCacheController:
                 self.page_set_func = self._3fs_zero_copy_page_set
                 self.batch_exists_func = self._3fs_zero_copy_batch_exists
 
-        self.load_cache_event = load_cache_event
-        self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
+        self.device = self.mem_pool_device.device
+        self.layer_num = self.mem_pool_device.layer_num
+        self.layer_done_counter = LayerDoneCounter(self.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -352,11 +390,11 @@ class HiCacheController:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
-        self.write_queue = PriorityQueue()
-        self.load_queue = PriorityQueue()
+        self.write_queue = PriorityQueue[CacheOperation]()
+        self.load_queue: List[CacheOperation] = []
 
         self.ack_write_queue = Queue()
-        self.ack_load_queue = Queue()
+        self.ack_load_queue: List[Tuple[torch.cuda.Event, List[int]]] = []
 
         self.stop_event = threading.Event()
         self.write_buffer = TransferBuffer(self.stop_event)
@@ -370,12 +408,8 @@ class HiCacheController:
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
         )
-        self.load_thread = threading.Thread(
-            target=self.load_thread_func_layer_by_layer, daemon=True
-        )
 
         self.write_thread.start()
-        self.load_thread.start()
 
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
@@ -434,14 +468,13 @@ class HiCacheController:
     def reset(self):
         self.stop_event.set()
         self.write_thread.join()
-        self.load_thread.join()
 
         self.write_queue.queue.clear()
-        self.load_queue.queue.clear()
+        self.load_queue.clear()
         self.write_buffer.clear()
         self.load_buffer.clear()
         self.ack_write_queue.queue.clear()
-        self.ack_load_queue.queue.clear()
+        self.ack_load_queue.clear()
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
@@ -453,12 +486,8 @@ class HiCacheController:
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
         )
-        self.load_thread = threading.Thread(
-            target=self.load_thread_func_layer_by_layer, daemon=True
-        )
         self.stop_event.clear()
         self.write_thread.start()
-        self.load_thread.start()
 
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
@@ -474,7 +503,7 @@ class HiCacheController:
         self,
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
-        node_id: int = 0,
+        node_id: int = -1,
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
@@ -493,7 +522,7 @@ class HiCacheController:
         self,
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
-        node_id: int = 0,
+        node_id: int = -1,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
@@ -502,17 +531,20 @@ class HiCacheController:
         if device_indices is None:
             return None
         self.mem_pool_host.protect_load(host_indices)
-        # to ensure the device indices are ready before accessed by another CUDA stream
-        torch.cuda.current_stream().synchronize()
-        self.load_queue.put(
+        self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
         return device_indices
 
-    def move_indices(self, host_indices, device_indices):
+    def move_indices(self, op: CacheOperation):
+        host_indices, device_indices = op.host_indices, op.device_indices
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
-            return host_indices.to(self.mem_pool_device.device), device_indices
+            if not host_indices.is_cuda:
+                host_indices = host_indices.pin_memory().to(
+                    self.device, non_blocking=True
+                )
+            return host_indices, device_indices
         elif self.io_backend == "direct":
             device_indices = device_indices.cpu()
             host_indices, idx = host_indices.sort()
@@ -528,50 +560,35 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.write_queue.get(block=True, timeout=1)
-                host_indices, device_indices = self.move_indices(
-                    operation.host_indices, operation.device_indices
-                )
+                host_indices, device_indices = self.move_indices(operation)
                 self.mem_pool_host.backup_from_device_all_layer(
                     self.mem_pool_device, host_indices, device_indices, self.io_backend
                 )
                 self.write_stream.synchronize()
                 self.mem_pool_host.complete_io(operation.host_indices)
                 for node_id in operation.node_ids:
-                    if node_id != 0:
+                    if node_id != -1:
                         self.ack_write_queue.put(node_id)
             except Empty:
                 continue
             except Exception as e:
                 logger.error(e)
 
-    def load_thread_func_layer_by_layer(self):
-        """
-        Load KV caches from host memory to device memory layer by layer.
-        """
-        torch.cuda.set_stream(self.load_stream)
-        while not self.stop_event.is_set():
-            self.load_cache_event.wait(timeout=1)
-            if not self.load_cache_event.is_set():
-                continue
-            self.load_cache_event.clear()
-            self.layer_done_counter.update_producer()
+    def start_loading(self) -> int:
+        if len(self.load_queue) == 0:
+            return -1
 
-            batch_operation = None
-            while self.load_queue.qsize() > 0:
-                op = self.load_queue.get(block=True)
-                if batch_operation is None:
-                    batch_operation = op
-                else:
-                    batch_operation.merge(op)
-            if batch_operation is None:
-                continue
+        producer_id = self.layer_done_counter.update_producer()
+        op = CacheOperation.merge_ops(self.load_queue)
+        host_indices, device_indices = self.move_indices(op)
+        self.load_queue.clear()
+        producer_event = self.layer_done_counter.events[producer_id]
+        producer_event.reset()
+        producer_event.start_event.record()
 
-            # start layer-wise KV cache transfer from CPU to GPU
-            self.layer_done_counter.reset()
-            host_indices, device_indices = self.move_indices(
-                batch_operation.host_indices, batch_operation.device_indices
-            )
-            for i in range(self.mem_pool_host.layer_num):
+        with torch.cuda.stream(self.load_stream):
+            producer_event.start_event.wait(self.load_stream)
+            for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
                     host_indices,
@@ -579,13 +596,16 @@ class HiCacheController:
                     i,
                     self.io_backend,
                 )
-                self.load_stream.synchronize()
-                self.layer_done_counter.increment()
+                producer_event.complete(i)
+            self.mem_pool_host.complete_io(op.host_indices)
+            # NOTE: We must save the host indices and device indices here,
+            # this is because we need to guarantee that these tensors are
+            # still alive when the load stream is executing.
+            host_indices.record_stream(self.load_stream)
+            device_indices.record_stream(self.load_stream)
 
-            self.mem_pool_host.complete_io(batch_operation.host_indices)
-            for node_id in batch_operation.node_ids:
-                if node_id != 0:
-                    self.ack_load_queue.put(node_id)
+        self.ack_load_queue.append((producer_event.finish_event, op.node_ids))
+        return producer_id
 
     def evict_device(
         self, device_indices: torch.Tensor, host_indices: torch.Tensor
