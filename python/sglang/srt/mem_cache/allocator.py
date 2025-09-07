@@ -257,8 +257,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
     def available_size(self):
-        # 返回full和swa池的可用大小之和
-        return self.full_available_size() + self.swa_available_size()
+        raise NotImplementedError()
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
