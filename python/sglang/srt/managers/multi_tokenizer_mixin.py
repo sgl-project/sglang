@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MultiTokenizerMixin is a class that provides nesscary methods for MultiTokenizerManager and DetokenizerManager."""
+"""Mixin class and utils for multi-http-worker mode"""
 import asyncio
 import logging
 import multiprocessing as multiprocessing
@@ -333,7 +333,7 @@ def _handle_output_by_index(output, i):
 
 
 class MultiHttpWorkerDetokenizerMixin:
-    """Mixin class for MultiTokenizerManager and DetokenizerManager"""
+    """Mixin class for DetokenizerManager"""
 
     def get_worker_ids_from_req_rids(self, rids):
         if isinstance(rids, list):
@@ -372,7 +372,7 @@ class MultiHttpWorkerDetokenizerMixin:
 
 
 class MultiTokenizerRouter:
-    """A router to receive requests from MultiTokenizerManager"""
+    """A router to receive requests from TokenizerWorker"""
 
     def __init__(
         self,
@@ -440,17 +440,15 @@ class MultiTokenizerRouter:
                 self.socket_mapping.send_output(worker_id, new_recv_obj)
 
 
-class MultiTokenizerManager(TokenizerManager):
-    """Multi Process Tokenizer Manager that tokenizes the text."""
+class TokenizerWorker(TokenizerManager):
+    """Tokenizer Worker in multi-http-worker mode"""
 
     def __init__(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        setproctitle.setproctitle(
-            f"sglang::http_server/multi_tokenizer_manager:{os.getpid()}"
-        )
+        setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
         server_args.disaggregation_mode = "null"

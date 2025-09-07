@@ -91,7 +91,7 @@ from sglang.srt.managers.io_struct import (
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
-    MultiTokenizerManager,
+    TokenizerWorker,
     get_main_process_id,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
@@ -157,7 +157,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
-    tokenizer_manager = MultiTokenizerManager(server_args, port_args)
+    tokenizer_manager = TokenizerWorker(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
