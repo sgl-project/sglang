@@ -78,7 +78,7 @@ class SocketMapping:
         self._mapping[worker_id].send_pyobj(output)
 
 
-class MultiTokenizerMixin:
+class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for MultiTokenizerManager and DetokenizerManager"""
 
     def _handle_output_by_index(self, output, i):
@@ -377,7 +377,7 @@ class MultiTokenizerMixin:
                     self.socket_mapping.send_output(worker_id, new_output)
 
 
-class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
+class MultiTokenizerRouter(TokenizerManager):
     """A router to receive requests from MultiTokenizerManager"""
 
     def __init__(
@@ -446,7 +446,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
                 self.socket_mapping.send_output(worker_id, new_recv_obj)
 
 
-class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
+class MultiTokenizerManager(TokenizerManager):
     """Multi Process Tokenizer Manager that tokenizes the text."""
 
     def __init__(

@@ -34,7 +34,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     MultiTokenizerRegisterReq,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerMixin
+from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -69,7 +69,7 @@ class DecodeStatus:
     sent_offset: int = 0
 
 
-class DetokenizerManager(MultiTokenizerMixin):
+class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
