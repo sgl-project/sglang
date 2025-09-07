@@ -1,0 +1,19 @@
+FROM lmsysorg/sglang:blackwell
+
+# Sglang
+WORKDIR /sgl-workspace
+RUN git clone -b dev/support_sm120 https://github.com/bytedance-iaas/sglang.git sglang_sm120
+
+WORKDIR /sgl-workspace/sglang_sm120
+RUN pip install -v -e "python[all]"
+
+# sgl_kernel
+WORKDIR /sgl-workspace/sglang_sm120/sgl-kernel
+RUN sed -i 's/threads=32/threads=1/' CMakeLists.txt
+RUN CMAKE_BUILD_PARALLEL_LEVEL=4 \
+python -m uv build --wheel -Cbuild-dir=build \
+-Ccmake.define.ENABLE_BELOW_SM90=0 --color=always .
+RUN pip install dist/sgl_kernel-*.whl --force-reinstall
+
+
+WORKDIR /sgl-workspace/sglang_sm120
