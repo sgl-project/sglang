@@ -129,9 +129,10 @@ def _compute_overlap_args(dispatch_output, alt_stream):
             dtype=torch.int32,
             device=hidden_states.device,
         )
+        num_signal_per_expert = ceil_div(num_tokens_static, down_gemm_block_m)
         down_gemm_overlap_args = DownGemmOverlapArgs(
-            signal=combine_signal[:num_local_experts * ceil_div(num_tokens_static, down_gemm_block_m)].view(
-                num_local_experts, ceil_div(num_tokens_static, down_gemm_block_m)),
+            signal=combine_signal[:num_local_experts * num_signal_per_expert].view(
+                num_local_experts, num_signal_per_expert),
             start_event=combine_wait_event,
             num_sms=compute_num_sms,
         )
