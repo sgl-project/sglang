@@ -782,7 +782,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from sglang.srt.layer.attention.ascend_ops.mla_preprocess import (
+        from sglang.srt.layers.attention.ascend_ops.mla_preprocess import (
             is_mla_preprocess_enabled,
         )
 
