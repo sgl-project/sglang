@@ -40,10 +40,23 @@ else:
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = None
 
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
 
 @dataclass
 class BaseBatchReq(ABC):
     rids: Optional[List[str]] = None
+
+    def regenerate_rids(self):
+        """Generate new request IDs and return them."""
+        self.rids = [uuid.uuid4().hex for _ in range(len(self.rids))]
+        return self.rids
 
 
 @dataclass
@@ -437,11 +450,6 @@ class GenerateReqInput(BaseReq):
             ):
                 raise ValueError("Session params must be a dict or a list of dicts.")
 
-    def regenerate_rid(self):
-        """Generate a new request ID and return it."""
-        self.rid = uuid.uuid4().hex
-        return self.rid
-
     def __getitem__(self, i):
         return GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
@@ -635,10 +643,6 @@ class EmbeddingReqInput(BaseReq):
                 self.sampling_params = [self.sampling_params] * self.batch_size
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
-
-    def regenerate_rid(self):
-        self.rid = uuid.uuid4().hex
-        return self.rid
 
     def contains_mm_input(self) -> bool:
         return (
