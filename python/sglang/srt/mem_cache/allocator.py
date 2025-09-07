@@ -252,8 +252,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             dtype=torch.int64,
             device=device,
         )
-        # self.clear()
-
+        self.clear()
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
     def available_size(self):
@@ -336,8 +335,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         raise NotImplementedError
 
     def clear(self):
-        # self.swa_attn_allocator.clear()
-        # self.full_attn_allocator.clear()
+        self.swa_attn_allocator.clear()
+        self.full_attn_allocator.clear()
         self.full_to_swa_index_mapping.fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
