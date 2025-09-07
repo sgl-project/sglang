@@ -539,9 +539,9 @@ class HiCacheController:
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
             if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
+                host_indices.record_stream(self.write_stream)
             if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+                device_indices.record_stream(self.write_stream)
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
