@@ -3,11 +3,13 @@ use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
 use sglang_router_rs::core::{BasicWorker, Worker, WorkerType};
-use sglang_router_rs::openai_api_types::{
+use sglang_router_rs::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::routers::pd_types::{generate_room_id, get_hostname, RequestWithBootstrap};
+use sglang_router_rs::routers::http::pd_types::{
+    generate_room_id, get_hostname, RequestWithBootstrap,
+};
 
 fn create_test_worker() -> BasicWorker {
     BasicWorker::new(
@@ -22,7 +24,7 @@ fn create_test_worker() -> BasicWorker {
 fn get_bootstrap_info(worker: &BasicWorker) -> (String, Option<u16>) {
     let hostname = get_hostname(worker.url());
     let bootstrap_port = match worker.worker_type() {
-        WorkerType::Prefill { bootstrap_port } => bootstrap_port.clone(),
+        WorkerType::Prefill { bootstrap_port } => bootstrap_port,
         _ => None,
     };
     (hostname, bootstrap_port)
@@ -89,6 +91,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         session_params: None,
         separate_reasoning: true,
         stream_reasoning: true,
+        chat_template_kwargs: None,
         return_hidden_states: false,
     }
 }

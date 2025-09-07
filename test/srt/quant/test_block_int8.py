@@ -5,7 +5,7 @@ import torch
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -175,10 +175,13 @@ class TestW8A8BlockINT8FusedMoE(CustomTestCase):
         topk_output = select_experts(
             hidden_states=a,
             router_logits=score,
-            top_k=topk,
+            topk_config=TopKConfig(top_k=topk, renormalize=False),
         )
 
         with torch.inference_mode():
+            ref_out = torch_w8a8_block_int8_moe(
+                a, w1, w2, w1_s, w2_s, score, topk, block_size
+            )
             out = fused_moe(
                 a,
                 w1,
@@ -188,9 +191,6 @@ class TestW8A8BlockINT8FusedMoE(CustomTestCase):
                 w1_scale=w1_s,
                 w2_scale=w2_s,
                 block_shape=block_size,
-            )
-            ref_out = torch_w8a8_block_int8_moe(
-                a, w1, w2, w1_s, w2_s, score, topk, block_size
             )
 
         self.assertTrue(

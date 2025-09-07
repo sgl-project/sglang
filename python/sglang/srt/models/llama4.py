@@ -31,7 +31,6 @@ from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_local_attention_dp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -364,7 +363,6 @@ class Llama4DecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
-        self.local_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
@@ -424,6 +422,12 @@ class Llama4DecoderLayer(nn.Module):
         if self.config.interleave_moe_layer_step == 0:
             return self.config.num_local_experts > 0
         return (layer_id + 1) % self.config.interleave_moe_layer_step == 0
+
+    def get_intermediate_size(self) -> int:
+        if isinstance(self.feed_forward, Llama4MoE):
+            return self.config.intermediate_size
+        else:
+            return self.config.intermediate_size_mlp
 
     def forward(
         self,
@@ -541,6 +545,9 @@ class Llama4ForCausalLM(LlamaForCausalLM):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def get_layers(self):
+        return self.model.layers
 
     def _init_model(
         self,
