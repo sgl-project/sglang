@@ -52,7 +52,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.layers.moe import is_tbo_enabled
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -84,8 +83,10 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "chunked_prefill_size",
     "device",
     "disable_chunked_prefix_cache",
+    "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_radix_cache",
     "enable_dp_lm_head",
+    "flashinfer_mxfp4_moe_precision",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
@@ -105,6 +106,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_symm_mem",
     "quantization",
     "enable_custom_logit_processor",
+    "disaggregation_mode",
 ]
 
 # Put some global args for easy access

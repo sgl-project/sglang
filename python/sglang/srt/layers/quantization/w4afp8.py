@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -20,7 +22,10 @@ from sglang.srt.utils import set_weight_attrs
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.ep_moe.layer import EPMoE
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -91,12 +96,13 @@ class W4AFp8Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
-        elif isinstance(layer, EPMoE):
+        elif isinstance(layer, FusedMoE):
             return W4AFp8MoEMethod(self)
         return None
 
@@ -104,8 +110,24 @@ class W4AFp8Config(QuantizationConfig):
         return []
 
 
-class W4AFp8MoEMethod(FusedMoEMethodBase):
+def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
+    s_shape = scales.shape
+    # Reshape to separate groups of 4
+    alignment = 4 if s_shape[2] % 4 == 0 else 1
+    scales_interleaved = scales.reshape(
+        s_shape[0], s_shape[1], (s_shape[2] // alignment), alignment
+    )
+    # Permute dimensions to interleave
+    scales_interleaved = scales_interleaved.permute(0, 2, 1, 3)
+    # Reshape back to original dimensions but with interleaved values
+    scales_interleaved = scales_interleaved.reshape(
+        s_shape[0], s_shape[2] // alignment, s_shape[1] * alignment
+    )
+    return scales_interleaved.contiguous()
 
+
+class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
 
@@ -114,7 +136,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: EPMoE,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
@@ -126,7 +148,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                intermediate_size * 2,
+                intermediate_size_per_partition * 2,
                 hidden_size // 2,
                 dtype=torch.int8,
             ),
@@ -140,7 +162,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             torch.empty(
                 num_experts,
                 hidden_size,
-                intermediate_size // 2,
+                intermediate_size_per_partition // 2,
                 dtype=torch.int8,
             ),
             requires_grad=False,
@@ -154,7 +176,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
-                2 * intermediate_size,
+                2 * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
                 dtype=torch.float32,
             ),
@@ -167,7 +189,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             torch.zeros(
                 num_experts,
                 hidden_size,
-                intermediate_size // self.quant_config.group_size,
+                intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=torch.float32,
             ),
             requires_grad=False,
@@ -201,13 +223,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         self.c_strides1 = torch.full(
             (num_experts, 3),
-            2 * intermediate_size,
+            2 * intermediate_size_per_partition,
             device=device,
             dtype=torch.int64,
         )
         self.a_strides2 = torch.full(
             (num_experts, 3),
-            intermediate_size,
+            intermediate_size_per_partition,
             device=device,
             dtype=torch.int64,
         )
@@ -234,33 +256,18 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         return
 
-    def _interleave_scales(self, scales: torch.Tensor) -> torch.Tensor:
-        """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
-        s_shape = scales.shape
-        # Reshape to separate groups of 4
-        scales_interleaved = scales.reshape(
-            s_shape[0], s_shape[1], (s_shape[2] // 4), 4
-        )
-        # Permute dimensions to interleave
-        scales_interleaved = scales_interleaved.permute(0, 2, 1, 3)
-        # Reshape back to original dimensions but with interleaved values
-        scales_interleaved = scales_interleaved.reshape(
-            s_shape[0], s_shape[2] // 4, s_shape[1] * 4
-        )
-        return scales_interleaved.contiguous()
-
     def process_weights_after_loading(self, layer: Module) -> None:
         dtype = torch.bfloat16
         device = layer.w2_weight.device
 
         # Interleave w13_weight_scale (gate_up_proj)
         w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
-        w13_weight_scale = self._interleave_scales(w13_weight_scale)
+        w13_weight_scale = interleave_scales(w13_weight_scale)
         layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
 
         # Interleave w2_weight_scale (down_proj)
         w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
-        w2_weight_scale = self._interleave_scales(w2_weight_scale)
+        w2_weight_scale = interleave_scales(w2_weight_scale)
         layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
 
         # Process input scales
@@ -278,24 +285,31 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: EPMoE,
-        x: torch.Tensor,
-        topk_output: StandardTopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
 
-        # TODO(ch-wan): move it out of this class
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         topk_weights, topk_ids, _ = topk_output
         local_topk_ids = topk_ids
-        local_topk_ids = torch.where(
-            topk_ids == -1,
-            layer.num_experts,
-            topk_ids,
-        )
+        if get_moe_expert_parallel_world_size() > 1:
+            local_topk_ids = torch.where(
+                topk_ids == -1,
+                layer.num_experts,
+                topk_ids,
+            )
 
         output = cutlass_w4a8_moe(
             layer.start_expert_id,
@@ -323,6 +337,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
         )
-        if moe_runner_config.routed_scaling_factor is not None:
-            output *= moe_runner_config.routed_scaling_factor
-        return output
+        if self.moe_runner_config.routed_scaling_factor is not None:
+            output *= self.moe_runner_config.routed_scaling_factor
+        return StandardCombineInput(hidden_states=output)

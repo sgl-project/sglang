@@ -68,11 +68,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    ClearHiCacheReqInput,
+    ClearHiCacheReqOutput,
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -80,6 +85,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MultiTokenizerRegisterReq,
+    MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -135,7 +142,7 @@ from sglang.srt.mem_cache.lora_radix_cache import LoRARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
-from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -146,11 +153,13 @@ from sglang.srt.utils import (
     configure_gc_logger,
     configure_logger,
     disable_request_logging,
+    freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
     get_zmq_socket,
     is_cpu,
     kill_itself_when_parent_died,
+    numa_bind_to_node,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
     require_mlp_sync,
@@ -252,7 +261,6 @@ class Scheduler(
         # Init inter-process communication
         context = zmq.Context(2)
         self.idle_sleeper = None
-
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -482,7 +490,7 @@ class Scheduler(
             enable=server_args.enable_memory_saver
         )
         self.offload_tags = set()
-        self.init_profier()
+        self.init_profiler()
 
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
@@ -494,6 +502,7 @@ class Scheduler(
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
         self.init_kv_events(server_args.kv_events_config)
+        self.init_dp_balance(dp_balance_meta)
 
         # Init disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -509,7 +518,10 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
+                (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
+                (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -525,23 +537,16 @@ class Scheduler(
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
+                (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
             ]
         )
-
-        self.balance_meta = dp_balance_meta
-        if (
-            server_args.enable_dp_attention
-            and server_args.load_balance_method == "minimum_tokens"
-        ):
-            assert dp_balance_meta is not None
-
-        self.recv_dp_balance_id_this_term = []
 
         # CFG bookkeeping
         self.cfg_rid_to_uncond: Dict[str, Req] = {}
@@ -622,8 +627,11 @@ class Scheduler(
                     hicache_write_policy=server_args.hicache_write_policy,
                     hicache_io_backend=server_args.hicache_io_backend,
                     hicache_mem_layout=server_args.hicache_mem_layout,
+                    enable_metrics=self.enable_metrics,
                     hicache_storage_backend=server_args.hicache_storage_backend,
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
+                    model_name=server_args.served_model_name,
+                    storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -1019,14 +1027,26 @@ class Scheduler(
                     req
                     for req in recv_reqs
                     if isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            TokenizedEmbeddingReqInput,
+                            BatchTokenizedGenerateReqInput,
+                            BatchTokenizedEmbeddingReqInput,
+                        ),
                     )
                 ]
                 control_reqs = [
                     req
                     for req in recv_reqs
                     if not isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            TokenizedEmbeddingReqInput,
+                            BatchTokenizedGenerateReqInput,
+                            BatchTokenizedEmbeddingReqInput,
+                        ),
                     )
                 ]
             else:
@@ -1058,14 +1078,17 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
-        def _dispatch_request(recv_req: TokenizedGenerateReqInput):
-            output = self._request_dispatcher(recv_req)
-            if output is not None:
-                if isinstance(output, RpcReqOutput):
-                    if self.recv_from_rpc is not None:
-                        self.recv_from_rpc.send_pyobj(output)
-                else:
-                    self.send_to_tokenizer.send_pyobj(output)
+        # Create a corresponding request for all CFG requests and add to `recv_reqs`
+        cfg_reqs = [
+            replace(
+                recv_req,
+                rid=uuid.uuid4().hex,
+                input_ids=recv_req.cfg_params["cfg_input_ids"],
+                cfg_parent_rid=recv_req.rid,
+            )
+            for recv_req in recv_reqs if recv_req.cfg_params
+        ]
+        recv_reqs.extend(cfg_reqs)
 
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
@@ -1090,30 +1113,30 @@ class Scheduler(
                     )
                     self.send_to_tokenizer.send_pyobj(abort_req)
                     continue
-            _dispatch_request(recv_req)
 
-            # Create an unconditioned copy if `recv_req` is a CFG prompt
-            if not recv_req.cfg_params:
+            # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
+            if isinstance(recv_req, MultiTokenizerWrapper):
+                worker_id = recv_req.worker_id
+                recv_req = recv_req.obj
+                output = self._request_dispatcher(recv_req)
+                if output is not None:
+                    output = MultiTokenizerWrapper(worker_id, output)
+                    self.send_to_tokenizer.send_pyobj(output)
                 continue
 
-            cfg_req = replace(
-                recv_req,
-                rid=uuid.uuid4().hex,
-                input_ids=recv_req.cfg_params["cfg_input_ids"],
-                cfg_parent_rid=recv_req.rid,
-            )
-
-            _dispatch_request(cfg_req)
+            output = self._request_dispatcher(recv_req)
+            if output is not None:
+                if isinstance(output, RpcReqOutput):
+                    if self.recv_from_rpc is not None:
+                        self.recv_from_rpc.send_pyobj(output)
+                else:
+                    self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        if (
-            self.server_args.enable_dp_attention
-            and self.server_args.load_balance_method == "minimum_tokens"
-        ):
-            self.recv_dp_balance_id_this_term.append(recv_req.dp_balance_id)
+        self.maybe_update_dp_balance_data(recv_req)
 
         # Create a new request
         if (
@@ -1162,7 +1185,7 @@ class Scheduler(
                         f"boostrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    prepare_abort(req, error_msg)
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.stream_output([req], req.return_logprob)
                     return
 
@@ -1276,6 +1299,17 @@ class Scheduler(
         else:
             self._add_request_to_queue(req)
 
+    def handle_batch_generate_request(
+        self,
+        recv_req: BatchTokenizedGenerateReqInput,
+    ):
+        """Handle optimized batch generate request."""
+        logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
+
+        # Process each request in the batch
+        for tokenized_req in recv_req:
+            self.handle_generate_request(tokenized_req)
+
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1292,10 +1326,11 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
-            last_hash = req.last_host_node.get_last_hash_value()
-            matched_len = len(req.prefix_indices) + req.host_hit_length
-            # todo, free-form fetching, calculating hash keys on the fly
-            if (matched_len > 0 and last_hash is not None) or matched_len == 0:
+            if req.last_node.backuped:
+                # only to initiate the prefetch if the last node is backuped
+                # otherwise, the allocated GPU memory must be locked for integrity
+                last_hash = req.last_host_node.get_last_hash_value()
+                matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
                 self.tree_cache.prefetch_from_storage(
                     req.rid, req.last_host_node, new_input_tokens, last_hash
@@ -1357,6 +1392,19 @@ class Scheduler(
         # Copy more attributes
         req.logprob_start_len = len(req.origin_input_ids) - 1
         self._add_request_to_queue(req)
+
+    def handle_batch_embedding_request(
+        self,
+        recv_req: BatchTokenizedEmbeddingReqInput,
+    ):
+        """Handle optimized batch embedding request."""
+        logger.debug(
+            f"Processing batch embedding request with {len(recv_req)} requests"
+        )
+
+        # Process each request in the batch
+        for tokenized_req in recv_req:
+            self.handle_embedding_request(tokenized_req)
 
     def self_check_during_idle(self):
         self.check_memory()
@@ -1483,7 +1531,7 @@ class Scheduler(
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req)
+            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
             self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1532,11 +1580,7 @@ class Scheduler(
 
         # Handle DP attention
         if need_dp_attn_preparation:
-            if (
-                self.server_args.load_balance_method == "minimum_tokens"
-                and self.forward_ct % 40 == 0
-            ):
-                self.handle_dp_balance_data(ret)
+            self.maybe_handle_dp_balance_data()
             ret = self.prepare_mlp_sync_batch(ret)
 
         return ret
@@ -1904,86 +1948,6 @@ class Scheduler(
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )
 
-    def handle_dp_balance_data(self, local_batch: ScheduleBatch):
-        def gather_dp_balance_info(holding_tokens_list) -> Union[None, List[List[int]]]:
-            """gather recv_dp_balance_id_this_term and holding tokens per worker for dp balance"""
-            recv_list = self.recv_dp_balance_id_this_term
-            assert len(recv_list) <= 511, (
-                "The number of requests received this round is too large. "
-                "Please increase gather_tensor_size and onfly_info_size."
-            )
-            # The maximum size of the tensor used for gathering data from all workers.
-            gather_tensor_size = 512
-
-            # recv_tensor: | holding_tokens | len(recv_dp_balance_id) | recv_dp_balance_ids
-            recv_tensor = torch.zeros(gather_tensor_size, dtype=torch.int32)
-            recv_tensor[0] = holding_tokens_list
-            recv_tensor[1] = len(
-                recv_list
-            )  # The first element is the length of the list.
-            recv_tensor[2 : len(recv_list) + 2] = torch.tensor(
-                recv_list, dtype=torch.int32
-            )
-
-            if self.tp_rank == 0:
-                gathered_list = [
-                    torch.zeros(gather_tensor_size, dtype=torch.int32)
-                    for _ in range(self.balance_meta.num_workers)
-                ]
-            else:
-                gathered_list = None
-
-            torch.distributed.gather(
-                recv_tensor, gathered_list, group=self.tp_cpu_group
-            )
-
-            gathered_id_list_per_worker = None
-            if self.tp_rank == 0:
-                gathered_id_list_per_worker = []
-                holding_tokens_list = []
-                for tensor in gathered_list:
-                    holding_tokens_list.append(tensor[0].item())
-                    list_length = tensor[1].item()
-                    gathered_id_list_per_worker.append(
-                        tensor[2 : list_length + 2].tolist()
-                    )
-
-            return gathered_id_list_per_worker, holding_tokens_list
-
-        def write_shared_dp_balance_info(new_recv_rid_lists, local_tokens):
-            meta = self.balance_meta
-
-            with meta.mutex:
-                onfly_list: List[Dict[int, int]] = meta.get_shared_onfly()
-                assert len(new_recv_rid_lists) == len(
-                    onfly_list
-                ), "num_worker not equal"
-                # 1.Check if the rid received by each worker this round is present in onfly.
-                #   If it is, remove the corresponding onfly item.
-                worker_id = 0
-                for new_recv_rids, on_fly_reqs in zip(new_recv_rid_lists, onfly_list):
-                    for new_recv_rid in new_recv_rids:
-                        assert (
-                            new_recv_rid in on_fly_reqs
-                        ), f"{new_recv_rid=} not in {worker_id=} {on_fly_reqs=}, data consistency is wrong"
-                        del on_fly_reqs[new_recv_rid]
-                    worker_id += 1
-                # 2. Atomically write local_tokens and onfly into shm under the mutex
-                meta.set_shared_onfly_info(onfly_list)
-                meta.set_shared_local_tokens(local_tokens)
-
-        holding_tokens = self.get_load()
-
-        new_recv_dp_balance_id_list, holding_token_list = gather_dp_balance_info(
-            holding_tokens
-        )
-
-        self.recv_dp_balance_id_this_term.clear()
-        if self.tp_rank == 0:  # only first worker write info
-            write_shared_dp_balance_info(
-                new_recv_dp_balance_id_list, holding_token_list
-            )
-
     @staticmethod
     def prepare_mlp_sync_batch_raw(
         local_batch: ScheduleBatch,
@@ -2230,6 +2194,16 @@ class Scheduler(
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
 
+    def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
+        if self.enable_hierarchical_cache:
+            self.tree_cache.clear_storage_backend()
+            logger.info("Hierarchical cache cleared successfully!")
+            if_success = True
+        else:
+            logging.warning("Hierarchical cache is not enabled.")
+            if_success = False
+        return ClearHiCacheReqOutput(success=if_success)
+
     def flush_cache(self):
         """Flush the memory pool and cache."""
         if (
@@ -2400,7 +2374,14 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if self.enable_hicache_storage:
+                # to release prefetch events associated with the request
+                self.tree_cache.release_aborted_request(req.rid)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.tree_cache.cache_finished_req(req)
+
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -2480,6 +2461,10 @@ class Scheduler(
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
 
+    def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
+        self.send_to_detokenizer.send_pyobj(recv_req)
+        return recv_req
+
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
         if t is not None and t <= 0:
@@ -2538,6 +2523,12 @@ class Scheduler(
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
 
+    def handle_freeze_gc(self, recv_req: FreezeGCReq):
+        """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
+        freeze_gc("Scheduler")
+        self.send_to_detokenizer.send_pyobj(recv_req)
+        return None
+
 
 class IdleSleeper:
     """
@@ -2573,7 +2564,15 @@ def is_health_check_generate_req(recv_req):
 
 
 def is_work_request(recv_req):
-    return isinstance(recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+    return isinstance(
+        recv_req,
+        (
+            TokenizedGenerateReqInput,
+            TokenizedEmbeddingReqInput,
+            BatchTokenizedGenerateReqInput,
+            BatchTokenizedEmbeddingReqInput,
+        ),
+    )
 
 
 def run_scheduler_process(
@@ -2587,6 +2586,9 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
+    if (numa_node := server_args.numa_node) is not None:
+        numa_bind_to_node(numa_node[gpu_id])
+
     # Generate the prefix
     prefix = ""
     if dp_rank is not None:
@@ -2648,7 +2650,10 @@ def run_scheduler_process(
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_prefill()
             else:
-                scheduler.event_loop_normal_disagg_prefill()
+                if server_args.pp_size > 1:
+                    scheduler.event_loop_pp_disagg_prefill()
+                else:
+                    scheduler.event_loop_normal_disagg_prefill()
 
         elif disaggregation_mode == DisaggregationMode.DECODE:
             if scheduler.enable_overlap:

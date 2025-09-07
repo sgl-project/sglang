@@ -40,6 +40,7 @@ from typing import (
     List,
     Optional,
     Tuple,
+    Type,
     TypeVar,
     Union,
 )
@@ -53,6 +54,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.base import BaseKVBootstrapServer
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -71,6 +73,10 @@ from sglang.srt.managers.io_struct import (
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    ClearHiCacheReqInput,
+    ClearHiCacheReqOutput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -78,6 +84,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    FreezeGCReq,
     GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -89,6 +96,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateResult,
+    MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -122,8 +130,11 @@ from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    configure_gc_warning,
     dataclass_to_string_truncated,
+    freeze_gc,
     get_bool_env_var,
+    get_origin_rid,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -259,9 +270,15 @@ class TokenizerManager:
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-        )
+        if self.server_args.tokenizer_worker_num > 1:
+            # Use tokenizer_worker_ipc_name in multi-tokenizer mode
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
+            )
+        else:
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            )
 
         # Request states
         self.no_create_loop = False
@@ -298,42 +315,14 @@ class TokenizerManager:
         # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
         # serves as the source of truth for available adapters and maps user-friendly LoRA names
         # to internally used unique LoRA IDs.
-        self.lora_registry = LoRARegistry(self.server_args.lora_paths or {})
+        self.lora_registry = LoRARegistry(self.server_args.lora_paths)
         # Lock to serialize LoRA update operations.
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
         self.lora_update_lock = asyncio.Lock()
 
         # For PD disaggregtion
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
-        self.disaggregation_transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
-        )
-        # Start kv boostrap server on prefill
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # only start bootstrap server on prefill tm
-            kv_bootstrap_server_class = get_kv_class(
-                self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
-            )
-            self.bootstrap_server = kv_bootstrap_server_class(
-                self.server_args.disaggregation_bootstrap_port
-            )
-            is_create_store = (
-                self.server_args.node_rank == 0
-                and self.server_args.disaggregation_transfer_backend == "ascend"
-            )
-            if is_create_store:
-                try:
-                    from mf_adapter import create_config_store
-
-                    ascend_url = os.getenv("ASCEND_MF_STORE_URL")
-                    create_config_store(ascend_url)
-                except Exception as e:
-                    error_message = f"Failed create mf store, invalid ascend_url."
-                    error_message += f" With exception {e}"
-                    raise error_message
+        self.init_disaggregation()
 
         # For load balancing
         self.current_load = 0
@@ -342,6 +331,7 @@ class TokenizerManager:
         # Metrics
         if self.enable_metrics:
             self.metrics_collector = TokenizerMetricsCollector(
+                server_args=server_args,
                 labels={
                     "model_name": self.server_args.served_model_name,
                     # TODO: Add lora name/path in the future,
@@ -351,6 +341,10 @@ class TokenizerManager:
                 bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
                 collect_tokens_histogram=self.server_args.collect_tokens_histogram,
             )
+
+        # Configure GC warning
+        if self.server_args.gc_warning_threshold_secs > 0.0:
+            configure_gc_warning(self.server_args.gc_warning_threshold_secs)
 
         # Communicators
         self.init_weights_update_group_communicator = _Communicator(
@@ -375,6 +369,9 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
         self.flush_cache_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.profile_communicator = _Communicator(
@@ -439,6 +436,10 @@ class TokenizerManager:
                     self.slow_down_communicator.handle_recv,
                 ),
                 (
+                    ClearHiCacheReqOutput,
+                    self.clear_hicache_storage_communicator.handle_recv,
+                ),
+                (
                     FlushCacheReqOutput,
                     self.flush_cache_communicator.handle_recv,
                 ),
@@ -446,6 +447,10 @@ class TokenizerManager:
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
+                (
+                    FreezeGCReq,
+                    lambda x: None,
+                ),  # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
@@ -466,6 +471,38 @@ class TokenizerManager:
             ]
         )
 
+    def init_disaggregation(self):
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        self.disaggregation_transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+        # Start kv boostrap server on prefill
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # only start bootstrap server on prefill tm
+            kv_bootstrap_server_class: Type[BaseKVBootstrapServer] = get_kv_class(
+                self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            )
+            self.bootstrap_server: BaseKVBootstrapServer = kv_bootstrap_server_class(
+                host=self.server_args.host,
+                port=self.server_args.disaggregation_bootstrap_port,
+            )
+            is_create_store = (
+                self.server_args.node_rank == 0
+                and self.server_args.disaggregation_transfer_backend == "ascend"
+            )
+            if is_create_store:
+                try:
+                    from mf_adapter import create_config_store
+
+                    ascend_url = os.getenv("ASCEND_MF_STORE_URL")
+                    create_config_store(ascend_url)
+                except Exception as e:
+                    error_message = f"Failed create mf store, invalid ascend_url."
+                    error_message += f" With exception {e}"
+                    raise error_message
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -474,6 +511,15 @@ class TokenizerManager:
         created_time = time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
+
+        if self.server_args.tokenizer_worker_num > 1:
+            # Modify rid, add worker_id
+            if isinstance(obj.rid, list):
+                # If it's an array, add worker_id prefix to each element
+                obj.rid = [f"{self.worker_id}_{rid}" for rid in obj.rid]
+            else:
+                # If it's a single value, add worker_id prefix
+                obj.rid = f"{self.worker_id}_{obj.rid}"
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -577,14 +623,24 @@ class TokenizerManager:
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        # FIXME: unify the length validation logic with the one in the scheduler.
+        _max_req_len = self.context_len
 
         input_token_num = len(input_ids) if input_ids is not None else 0
-        # Check if input alone exceeds context length
         if input_token_num >= self.context_len:
-            raise ValueError(
-                f"The input ({input_token_num} tokens) is longer than the "
-                f"model's context length ({self.context_len} tokens)."
-            )
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    f"The input ({input_token_num} tokens) is longer than the "
+                    f"model's context length ({self.context_len} tokens). "
+                    "Truncating the input."
+                )
+                del input_ids[_max_req_len:]
+                input_token_num = len(input_ids)
+            else:
+                raise ValueError(
+                    f"The input ({input_token_num} tokens) is longer than the "
+                    f"model's context length ({self.context_len} tokens)."
+                )
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -596,17 +652,27 @@ class TokenizerManager:
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
             max_new_tokens is not None
-            and (max_new_tokens + input_token_num) >= self.context_len
+            and (max_new_tokens + input_token_num) >= _max_req_len
         ):
-            total_tokens = max_new_tokens + input_token_num
-            error_msg = (
-                f"Requested token count exceeds the model's maximum context length "
-                f"of {self.context_len} tokens. You requested a total of {total_tokens} "
-                f"tokens: {input_token_num} tokens from the input messages and "
-                f"{max_new_tokens} tokens for the completion. Please reduce the number "
-                f"of tokens in the input messages or the completion to fit within the limit."
-            )
-            raise ValueError(error_msg)
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
+                    f"exceeds the model's context length ({self.context_len} tokens). "
+                    "Truncating max_new_tokens."
+                )
+                obj.sampling_params["max_new_tokens"] = max(
+                    0, _max_req_len - input_token_num
+                )
+            else:
+                total_tokens = max_new_tokens + input_token_num
+                error_msg = (
+                    f"Requested token count exceeds the model's maximum context length "
+                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                    f"tokens: {input_token_num} tokens from the input messages and "
+                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
+                    f"of tokens in the input messages or the completion to fit within the limit."
+                )
+                raise ValueError(error_msg)
 
         if isinstance(obj, GenerateReqInput):
             if (
@@ -750,6 +816,30 @@ class TokenizerManager:
         self.rid_to_state[obj.rid] = state
         return state
 
+    def _send_batch_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        tokenized_objs: List[
+            Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+        ],
+        created_time: Optional[float] = None,
+    ):
+        """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
+            batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+        else:
+            batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
+
+        self.send_to_scheduler.send_pyobj(batch_req)
+
+        # Create states for each individual request in the batch
+        for i, tokenized_obj in enumerate(tokenized_objs):
+            tmp_obj = obj[i]
+            state = ReqState(
+                [], False, asyncio.Event(), tmp_obj, created_time=created_time
+            )
+            self.rid_to_state[tmp_obj.rid] = state
+
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -795,15 +885,17 @@ class TokenizerManager:
                     ):
                         raise ValueError(finish_reason["message"])
 
-                    if (
-                        finish_reason.get("type") == "abort"
-                        and finish_reason.get("status_code")
-                        == HTTPStatus.SERVICE_UNAVAILABLE
+                    if finish_reason.get("type") == "abort" and finish_reason.get(
+                        "status_code"
+                    ) in (
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
                     ):
                         # This is an abort request initiated by scheduler.
                         # Delete the key to prevent resending abort request to the scheduler and
                         # to ensure aborted request state is cleaned up.
-                        del self.rid_to_state[state.obj.rid]
+                        if state.obj.rid in self.rid_to_state:
+                            del self.rid_to_state[state.obj.rid]
 
                         # Mark ongoing LoRA request as finished.
                         if self.server_args.enable_lora and state.obj.lora_path:
@@ -850,10 +942,17 @@ class TokenizerManager:
 
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
 
-                for i, tokenized_obj in enumerate(tokenized_objs):
+                # Send as a single batched request
+                self._send_batch_request(obj, tokenized_objs, created_time)
+
+                # Set up generators for each request in the batch
+                for i in range(batch_size):
                     tmp_obj = obj[i]
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
+                    generators.append(
+                        self._wait_one_response(
+                            tmp_obj, self.rid_to_state[tmp_obj.rid], request
+                        )
+                    )
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -934,6 +1033,13 @@ class TokenizerManager:
 
     async def flush_cache(self) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+
+    async def clear_hicache_storage(self) -> ClearHiCacheReqOutput:
+        """Clear the hierarchical cache storage."""
+        # Delegate to the scheduler to handle HiCacheStorage clearing
+        return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
+            0
+        ]
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
@@ -1027,6 +1133,8 @@ class TokenizerManager:
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
+        if self.server_args.tokenizer_worker_num > 1:
+            obj = MultiTokenizerWrapper(self.worker_id, obj)
         self.send_to_scheduler.send_pyobj(obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
@@ -1246,6 +1354,8 @@ class TokenizerManager:
         elif obj.session_id in self.session_futures:
             return None
 
+        if self.server_args.tokenizer_worker_num > 1:
+            obj = MultiTokenizerWrapper(self.worker_id, obj)
         self.send_to_scheduler.send_pyobj(obj)
 
         self.session_futures[obj.session_id] = asyncio.Future()
@@ -1266,13 +1376,11 @@ class TokenizerManager:
         # Many DP ranks
         return [res.internal_state for res in responses]
 
-    async def set_internal_state(
-        self, obj: SetInternalStateReq
-    ) -> SetInternalStateReqOutput:
+    async def set_internal_state(self, obj: SetInternalStateReq) -> List[bool]:
         responses: List[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )
-        return [res.internal_state for res in responses]
+        return [res.updated for res in responses]
 
     async def get_load(self) -> dict:
         # TODO(lsyin): fake load report server
@@ -1349,6 +1457,12 @@ class TokenizerManager:
             self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
         self.log_request_metadata = self.get_log_request_metadata()
+
+    async def freeze_gc(self):
+        """Send a freeze_gc message to the scheduler first, then freeze locally."""
+        self.send_to_scheduler.send_pyobj(FreezeGCReq())
+        freeze_gc("Tokenizer Manager")
+        return None
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
@@ -1517,7 +1631,6 @@ class TokenizerManager:
 
     async def handle_loop(self):
         """The event loop that handles requests"""
-
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
@@ -1537,9 +1650,12 @@ class TokenizerManager:
                 )
                 continue
 
+            origin_rid = rid
+            if self.server_args.tokenizer_worker_num > 1:
+                origin_rid = get_origin_rid(rid)
             # Build meta_info and return value
             meta_info = {
-                "id": rid,
+                "id": origin_rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
@@ -1845,6 +1961,9 @@ class TokenizerManager:
         if is_health_check_generate_req(recv_obj):
             return
         state = self.rid_to_state[recv_obj.rid]
+        origin_rid = recv_obj.rid
+        if self.server_args.tokenizer_worker_num > 1:
+            origin_rid = get_origin_rid(origin_rid)
         state.finished = True
         if recv_obj.finished_reason:
             out = {
@@ -1857,7 +1976,7 @@ class TokenizerManager:
             out = {
                 "text": "",
                 "meta_info": {
-                    "id": recv_obj.rid,
+                    "id": origin_rid,
                     "finish_reason": {
                         "type": "abort",
                         "message": "Abort before prefill",
@@ -2043,6 +2162,8 @@ T = TypeVar("T")
 class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
 
+    enable_multi_tokenizer = False
+
     def __init__(self, sender, fan_out: int):
         self._sender = sender
         self._fan_out = fan_out
@@ -2059,6 +2180,8 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
+            if _Communicator.enable_multi_tokenizer:
+                obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()

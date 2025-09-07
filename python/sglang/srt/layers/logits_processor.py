@@ -61,7 +61,7 @@ class LogitsProcessorOutput:
     hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
-    # The logprobs of the next tokens.                              shape: [#seq]
+    # he log probs of output tokens, if RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
@@ -191,7 +191,11 @@ class LogitsMetadata:
         else:
             self.global_dp_buffer_len = self.global_dp_buffer_len
 
-        set_dp_buffer_len(self.global_dp_buffer_len, self.dp_local_num_tokens)
+        set_dp_buffer_len(
+            self.global_dp_buffer_len,
+            self.dp_local_num_tokens,
+            self.global_num_tokens_for_logprob_cpu,
+        )
 
 
 class LogitsProcessor(nn.Module):

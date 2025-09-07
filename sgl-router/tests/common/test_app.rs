@@ -8,22 +8,28 @@ use sglang_router_rs::{
 use std::sync::Arc;
 
 /// Create a test Axum application using the actual server's build_app function
+#[allow(dead_code)]
 pub fn create_test_app(
     router: Arc<dyn RouterTrait>,
     client: Client,
     router_config: &RouterConfig,
 ) -> Router {
     // Create AppContext
-    let app_context = Arc::new(AppContext::new(
-        router_config.clone(),
-        client,
-        router_config.max_concurrent_requests,
-    ));
+    let app_context = Arc::new(
+        AppContext::new(
+            router_config.clone(),
+            client,
+            router_config.max_concurrent_requests,
+            router_config.rate_limit_tokens_per_second,
+        )
+        .expect("Failed to create AppContext in test"),
+    );
 
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
         context: app_context,
+        concurrency_queue_tx: None, // No queue for tests
     });
 
     // Configure request ID headers (use defaults if not specified)

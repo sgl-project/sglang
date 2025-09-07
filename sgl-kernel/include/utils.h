@@ -254,6 +254,25 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
+inline bool isDeviceType(const std::string& device_type) {
+  int deviceCount;
+  CHECK_CUDA_SUCCESS(cudaGetDeviceCount(&deviceCount));
+
+  int device_id = -1;
+  if (deviceCount >= 1) {
+    CHECK_CUDA_SUCCESS(cudaGetDevice(&device_id));
+  } else {
+    return false;
+  }
+
+  cudaDeviceProp prop;
+  CHECK_CUDA_SUCCESS(cudaGetDeviceProperties(&prop, device_id));
+  if (device_type == std::string(prop.name)) {
+    return true;
+  }
+  return false;
+}
+
 inline bool getBoolEnv(char const* name) {
   char const* env = std::getenv(name);
   return env && env[0] == '1' && env[1] == '\0';
@@ -312,13 +331,17 @@ inline bool getEnvEnablePDL() {
 #ifndef USE_ROCM
 #define WARP_SIZE 32
 #else
-#define WARP_SIZE warpSize  // 64
+#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+#define WARP_SIZE 64
+#else
+#define WARP_SIZE 32
+#endif
 #endif
 
-#if defined(__HIP_PLATFORM_AMD__)
+#ifdef USE_ROCM
 
-#include "hip_math_def.h"
-#include "hip_vec_dtypes.h"
+#include "hip/hip_math_def.h"
+#include "hip/hip_vec_dtypes.h"
 
 #else
 
@@ -335,14 +358,11 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 #endif
 
 // add FP8 support
-
 #ifndef USE_ROCM
 #include <c10/util/Float8_e4m3fn.h>
 using FP8_TYPE = c10::Float8_e4m3fn;
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
-
 #else  // USE_ROCM
-
 #if HIP_FP8_TYPE_FNUZ
 #include <c10/util/Float8_e4m3fnuz.h>
 using FP8_TYPE = c10::Float8_e4m3fnuz;
