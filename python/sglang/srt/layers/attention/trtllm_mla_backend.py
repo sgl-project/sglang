@@ -60,6 +60,7 @@ class TRTLLMMLADecodeMetadata:
 
     workspace: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
+    seq_lens: Optional[torch.Tensor] = None
     max_seq_len: Optional[int] = None
 
 
@@ -206,7 +207,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Initialize metadata for CUDA graph capture."""
 
         # Delegate to parent for non-decode modes.
-        if not forward_mode.is_decode_or_idle():
+        if not forward_mode.is_decode_or_idle() and not forward_mode.is_target_verify():
             return super().init_forward_metadata_capture_cuda_graph(
                 bs,
                 num_tokens,
@@ -216,6 +217,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_mode,
                 spec_info,
             )
+
+        if forward_mode.is_target_verify():
+            seq_lens = spec_info.draft_token_num + seq_lens
 
         # Custom fast-path for decode/idle.
         # Capture with full width so future longer sequences are safe during replay
@@ -241,7 +245,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         metadata = TRTLLMMLADecodeMetadata(
             self.decode_cuda_graph_workspace,
-            block_kv_indices,
+            block_kv_indices, seq_lens,
             max_seq_len_val,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -260,7 +264,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Replay CUDA graph with new inputs."""
         # Delegate to parent for non-decode modes.
-        if not forward_mode.is_decode_or_idle():
+        if not forward_mode.is_decode_or_idle() and not forward_mode.is_target_verify():
             return super().init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -273,6 +277,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
+        if forward_mode.is_target_verify():
+            seq_lens = spec_info.draft_token_num + seq_lens
+        metadata.seq_lens.copy_(seq_lens)
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[(bs,)](
@@ -319,7 +326,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 cum_seq_lens_q,
                 seq_lens,
             )
-        elif forward_batch.forward_mode.is_decode_or_idle():
+        elif forward_batch.forward_mode.is_decode_or_idle() or forward_batch.forward_mode.is_target_verify():
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens = forward_batch.spec_info.draft_token_num + forward_batch.seq_lens
+            else:
+                seq_lens = forward_batch.seq_lens
+
             bs = forward_batch.batch_size
 
             # Get maximum sequence length.
@@ -328,14 +340,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             else:
                 max_seq = forward_batch.seq_lens.max().item()
 
-            max_seqlen_pad = self._calc_padded_blocks(max_seq)
-            block_kv_indices = self._create_block_kv_indices(
-                bs,
-                max_seqlen_pad,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens.device,
-            )
+        max_seqlen_pad = self._calc_padded_blocks(max_seq)
+        block_kv_indices = self._create_block_kv_indices(
+            bs,
+            max_seqlen_pad,
+            forward_batch.req_pool_indices,
+            seq_lens,
+            forward_batch.seq_lens.device,
+        )
 
             max_seq_len_val = int(max_seq)
             self.forward_decode_metadata = TRTLLMMLADecodeMetadata(
@@ -575,7 +587,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
         return output
-
 
 class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
