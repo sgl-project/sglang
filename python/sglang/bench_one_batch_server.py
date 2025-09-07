@@ -85,7 +85,10 @@ class BenchArgs:
         )
         parser.add_argument("--profile-by-stage", action="store_true")
         parser.add_argument(
-            "--dataset-path", type=str, default=BenchArgs.dataset_path, help="Path to the dataset."
+            "--dataset-path",
+            type=str,
+            default=BenchArgs.dataset_path,
+            help="Path to the dataset.",
         )
 
     @classmethod
@@ -350,7 +353,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             run_name="",
             result_filename="",
             tokenizer=tokenizer,
-            dataset_path=bench_args.dataset_path
+            dataset_path=bench_args.dataset_path,
         )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
