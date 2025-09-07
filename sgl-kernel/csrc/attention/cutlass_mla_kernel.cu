@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "cutlass_sm100_mla/device/sm100_mla.hpp"
 #include "cutlass_sm100_mla/kernel/sm100_mla_tile_scheduler.hpp"
+#include "utils.h"
 
 // clang-format off
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
@@ -217,6 +218,10 @@ void cutlass_mla_decode(
     torch::Tensor const& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
+  auto sm_version = getSMVersion();
+  // On SM103a, half of the accuracy tests are failing.
+  TORCH_CHECK(sm_version == 100, "cutlass_mla_decode is only supported on compute capability 10.0, but found sm version ", sm_version);
+
   auto in_dtype = q_nope.dtype();
   at::cuda::CUDAGuard device_guard{(char)q_nope.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope.get_device());
