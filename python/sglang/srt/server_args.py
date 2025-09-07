@@ -742,11 +742,6 @@ class ServerArgs:
                     raise ValueError(
                         "trtllm_mha backend only supports topk = 1 for speculative decoding."
                     )
-            # TODO(Qiaolin-Yu): Support topk > 1 for standalone speculative decoding.
-            if self.speculative_algorithm == "STANDALONE":
-                assert (
-                    self.speculative_eagle_topk == 1
-                ), "For standalone speculative decoding, topk must be 1"
 
             if (
                 self.speculative_eagle_topk == 1

@@ -1,55 +1,15 @@
 import logging
-import os
-import time
 from contextlib import contextmanager
 from typing import Optional
 
 import torch
 
-from sglang.srt.distributed import (
-    GroupCoordinator,
-    get_tp_group,
-    patch_tensor_parallel_group,
-)
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
-    get_last_loc,
-    global_server_args_dict,
-)
+from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
-from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
-    EAGLEDraftCudaGraphRunner,
-)
-from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
-    EAGLEDraftExtendCudaGraphRunner,
-)
-from sglang.srt.speculative.eagle_utils import (
-    EagleDraftInput,
-    EagleVerifyInput,
-    EagleVerifyOutput,
-    assign_draft_cache_locs,
-    fast_topk,
-    generate_token_bitmask,
-    select_top_k_tokens,
-)
 from sglang.srt.speculative.eagle_worker import EAGLEWorker, load_token_map
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import (
-    empty_context,
-    get_available_gpu_memory,
-    get_bool_env_var,
-    is_cuda,
-    next_power_of_2,
-)
+from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
     from sgl_kernel import segment_packbits

@@ -28,11 +28,11 @@ DEFAULT_SERVER_ARGS = [
     "--speculative-draft-model-path",
     DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST,
     "--speculative-num-steps",
-    "3",
-    "--speculative-eagle-topk",
-    "1",
-    "--speculative-num-draft-tokens",
     "4",
+    "--speculative-eagle-topk",
+    "2",
+    "--speculative-num-draft-tokens",
+    "7",
     "--mem-fraction-static",
     0.7,
 ]
@@ -43,8 +43,8 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
     model = DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST
     draft_model = DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
-    accuracy_threshold = 0.69  # derived tests need to override this
-    spec_decode_threshold = 2.5  # derived spec decoding tests need to override this
+    accuracy_threshold = 0.7  # derived tests need to override this
+    spec_decode_threshold = 3.6  # derived spec decoding tests need to override this
 
     @classmethod
     def get_server_args(cls):
