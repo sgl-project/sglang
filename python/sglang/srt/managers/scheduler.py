@@ -2512,7 +2512,8 @@ class IdleSleeper:
 
 
 def is_health_check_generate_req(recv_req):
-    return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
+    rid = getattr(recv_req, "rid", None)
+    return rid is not None and rid.startswith("HEALTH_CHECK")
 
 
 def is_work_request(recv_req):
