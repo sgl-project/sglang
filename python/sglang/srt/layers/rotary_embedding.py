@@ -782,7 +782,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from sglang.srt.layer.attention.ascend_ops.mla_preprocess import is_mla_preprocess_enabled
+        from sglang.srt.layer.attention.ascend_ops.mla_preprocess import (
+            is_mla_preprocess_enabled,
+        )
+
         # NOTE: now npu_mrope can only support `numQHeads*headSize <= 4096` pattern,
         # and generalization to more scenarios will be supported in the future.
         if query.shape[1] * query.shape[2] > 4096:

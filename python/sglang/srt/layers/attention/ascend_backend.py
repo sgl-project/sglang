@@ -8,9 +8,11 @@ import torch_npu
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention.ascend_ops.mla_preprocess import (
+    is_mla_preprocess_enabled,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
-from sglang.srt.layers.attention.ascend_ops.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_bool_env_var

@@ -43,6 +43,10 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.ascend_ops.mla_preprocess import (
+    AscendFusedMLAPreprocess,
+    is_mla_preprocess_enabled,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -124,7 +128,6 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
-from sglang.srt.layers.attention.ascend_ops.mla_preprocess import AscendFusedMLAPreprocess, is_mla_preprocess_enabled
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1019,7 +1022,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
         if is_mla_preprocess_enabled():
-            assert quant_config.get_name() == "w8a8_int8", "MLA Preprocess only works with W8A8Int8"
+            assert (
+                quant_config.get_name() == "w8a8_int8"
+            ), "MLA Preprocess only works with W8A8Int8"
             self.mla_preprocess = None
 
     def dispatch_attn_forward_method(

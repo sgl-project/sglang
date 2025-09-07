@@ -89,9 +89,9 @@ class AscendFusedMLAPreprocess(torch.nn.Module):
         fused_qkv_a_proj_with_mqa_weight_q = self.qkv_a_proj.weight.data[
             :, : self.q_lora_rank
         ].clone()  # [7168, 1536]
-        fused_qkv_a_proj_with_mqa_weight_kv = (
-            self.qkv_a_proj.weight.data[:, self.q_lora_rank :].clone()
-        )  # [7168, 576]
+        fused_qkv_a_proj_with_mqa_weight_kv = self.qkv_a_proj.weight.data[
+            :, self.q_lora_rank :
+        ].clone()  # [7168, 576]
         # rope fit
         fused_qkv_a_proj_with_mqa_weight_kv_t = (
             fused_qkv_a_proj_with_mqa_weight_kv.t().contiguous()
@@ -115,15 +115,17 @@ class AscendFusedMLAPreprocess(torch.nn.Module):
             .unsqueeze(0)
             .contiguous()
         )
-        self.qkv_a_proj_weight_nz = torch_npu.npu_format_cast(fused_qkv_a_proj_with_mqa_weight_nz, 29)
+        self.qkv_a_proj_weight_nz = torch_npu.npu_format_cast(
+            fused_qkv_a_proj_with_mqa_weight_nz, 29
+        )
 
         # matmul_0 deq_scale [2112]
-        fused_qkv_a_proj_with_mqa_deq_scale_q = (
-            self.qkv_a_proj.deq_scale.data[: self.q_lora_rank].clone()
-        )  # [7168, 1536]
-        fused_qkv_a_proj_with_mqa_deq_scale_kv = (
-            self.qkv_a_proj.deq_scale.data[self.q_lora_rank :].clone()
-        )  # [7168, 576]
+        fused_qkv_a_proj_with_mqa_deq_scale_q = self.qkv_a_proj.deq_scale.data[
+            : self.q_lora_rank
+        ].clone()  # [7168, 1536]
+        fused_qkv_a_proj_with_mqa_deq_scale_kv = self.qkv_a_proj.deq_scale.data[
+            self.q_lora_rank :
+        ].clone()  # [7168, 576]
         # rope fit
         fused_qkv_a_proj_with_mqa_deq_scale_kv = (
             fused_qkv_a_proj_with_mqa_deq_scale_kv.reshape(
@@ -147,12 +149,12 @@ class AscendFusedMLAPreprocess(torch.nn.Module):
         )
 
         # matmul_0 quant_bias [2112]
-        fused_qkv_a_proj_with_mqa_quant_bias_q = (
-            self.qkv_a_proj.quant_bias.data[: self.q_lora_rank].clone()
-        )  # [7168, 1536]
-        fused_qkv_a_proj_with_mqa_quant_bias_kv = (
-            self.qkv_a_proj.quant_bias.data[self.q_lora_rank :].clone()
-        )  # [7168, 576]
+        fused_qkv_a_proj_with_mqa_quant_bias_q = self.qkv_a_proj.quant_bias.data[
+            : self.q_lora_rank
+        ].clone()  # [7168, 1536]
+        fused_qkv_a_proj_with_mqa_quant_bias_kv = self.qkv_a_proj.quant_bias.data[
+            self.q_lora_rank :
+        ].clone()  # [7168, 576]
         # rope fit
         fused_qkv_a_proj_with_mqa_quant_bias_kv = (
             fused_qkv_a_proj_with_mqa_quant_bias_kv.reshape(
@@ -238,8 +240,8 @@ class AscendFusedMLAPreprocess(torch.nn.Module):
             self.dtype = hidden_states.dtype
 
         self.cos, self.sin = self.get_sin_cos(positions)
-        self.k_cache, self.v_cache, self.slot_mapping = (
-            self.get_kv_cache_and_cache_idx(forward_batch)
+        self.k_cache, self.v_cache, self.slot_mapping = self.get_kv_cache_and_cache_idx(
+            forward_batch
         )
 
         q_nope_out = torch.empty(
