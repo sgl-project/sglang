@@ -350,8 +350,8 @@ class MultiHttpWorkerDetokenizerMixin:
             worker_ids = []
         return worker_ids
 
-    def multi_tokenizer_manager_event_loop(self):
-        """The event loop that handles requests, for multi tokenizer manager mode only"""
+    def multi_http_worker_event_loop(self):
+        """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()

@@ -289,7 +289,7 @@ def run_detokenizer_process(
     try:
         manager = DetokenizerManager(server_args, port_args)
         if server_args.tokenizer_worker_num > 1:
-            manager.multi_tokenizer_manager_event_loop()
+            manager.multi_http_worker_event_loop()
         else:
             manager.event_loop()
     except Exception:
