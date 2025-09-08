@@ -133,7 +133,6 @@ class CommonKVReceiver(BaseKVReceiver):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
-        self.prefill_dp_rank = prefill_dp_rank
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (
@@ -201,11 +200,14 @@ class CommonKVReceiver(BaseKVReceiver):
             self.target_tp_rank = self.target_tp_ranks[0]
             self.required_dst_info_num = 1
 
-        if self.prefill_dp_rank is not None:
-            logger.debug(f"Targeting DP rank: {self.prefill_dp_rank}")
-            self.target_dp_group = self.prefill_dp_rank
+        if prefill_dp_rank is not None:
+            logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
+            self.prefill_dp_rank = prefill_dp_rank
         else:
-            self.target_dp_group = bootstrap_room % self.prefill_dp_size
+            self.prefill_dp_rank = bootstrap_room % self.prefill_dp_size
+
+        # FIXME: alias here: target_dp_group -> prefill_dp_rank
+        self.target_dp_group = self.prefill_dp_rank
 
         # NOTE: key distinguished by bootstrap_addr, target_dp_group, and target_tp_rank
         bootstrap_key = (
