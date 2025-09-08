@@ -151,6 +151,7 @@ if _is_cuda:
     from sgl_kernel import (
         awq_dequantize,
         bmm_fp8,
+        concat_mla_k,
         dsv3_fused_a_gemm,
         dsv3_router_gemm,
         merge_state_v2,
@@ -1243,8 +1244,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
-        k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+
+        if _is_cuda:
+            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
+        else:
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_pe
 
         if not _is_npu:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
