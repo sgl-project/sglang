@@ -350,7 +350,7 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
-    offload_mm_feature: bool = False
+    keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
@@ -1992,9 +1992,9 @@ class ServerArgs:
             help="Adopt base image processor instead of fast image processor.",
         )
         parser.add_argument(
-            "--offload-mm-feature",
+            "--keep-mm-feature-on-device",
             action="store_true",
-            help="Move multimodal feature tensors to host after processing to save device memory.",
+            help="Keep multimodal feature tensors on device after processing to save D2H copy.",
         )
         parser.add_argument(
             "--enable-return-hidden-states",
