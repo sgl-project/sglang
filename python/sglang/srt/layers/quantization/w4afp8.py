@@ -25,9 +25,10 @@ if not _is_npu:
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
-    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
+        DeepEPNormalOutput,
         StandardDispatchOutput,
     )
 
