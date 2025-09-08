@@ -46,7 +46,6 @@ class FunctionCallParser:
         "glm45": Glm4MoeDetector,
         "step3": Step3Detector,
         "gpt-oss": GptOssDetector,
-        "json": JsonDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str, tool_choice: Optional[Union[str, ToolChoice]] = None):
