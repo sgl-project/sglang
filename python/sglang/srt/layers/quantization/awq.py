@@ -977,6 +977,8 @@ class AWQMoEAscendMethod(AWQMoEMethod):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        
         assert (
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
@@ -987,7 +989,7 @@ class AWQMoEAscendMethod(AWQMoEMethod):
         topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
-        return npu_fused_experts(
+        output = npu_fused_experts(
             hidden_states=x,
             w13=layer.w13_qweight,
             w13_scale=layer.w13_scales,
@@ -999,3 +1001,4 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
         )
+        return StandardCombineInput(hidden_states=output)
