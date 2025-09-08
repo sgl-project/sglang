@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
@@ -190,7 +191,7 @@ class EAGLEWorker(TpModelWorker):
         # Initialize decode attention backend
         self.draft_attn_backend = self._create_decode_backend()
 
-        # Initialize prefill attention backend
+        # Initialize draft extend attention backend (respects speculative_attention_backend setting)
         self.draft_extend_attn_backend = self._create_draft_extend_backend()
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
@@ -233,11 +234,15 @@ class EAGLEWorker(TpModelWorker):
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
         }
-
+        backend_name = (
+            "decode_attention_backend"
+            if self.server_args.speculative_attention_backend == "decode"
+            else "prefill_attention_backend"
+        )
         return self._create_backend(
-            "prefill_attention_backend",
+            backend_name,
             backend_map,
-            "EAGLE is not supported in prefill attention backend {backend_type}",
+            "EAGLE is not supported in attention backend {backend_type}",
         )
 
     def _create_flashinfer_decode_backend(self):
@@ -729,6 +734,14 @@ class EAGLEWorker(TpModelWorker):
 
             # Set inputs
             forward_batch.input_ids = input_ids
+            # This is a temporary fix for the case that the user is using standalone
+            # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
+            # rope kernel needs cache_loc to be contiguous.
+            if (
+                self.server_args.speculative_algorithm == "STANDALONE"
+                and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
+            ):
+                out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
