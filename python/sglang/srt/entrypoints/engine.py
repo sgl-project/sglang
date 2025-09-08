@@ -702,6 +702,7 @@ def _launch_subprocesses(
     )
 
     scheduler_procs = []
+    print(f"111111111111111 server_args.dp_size {server_args.dp_size}")
     if server_args.dp_size == 1:
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver

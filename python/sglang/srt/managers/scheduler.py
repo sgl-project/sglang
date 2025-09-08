@@ -533,9 +533,6 @@ class Scheduler(
 
         self.recv_dp_balance_id_this_term = []
 
-        # self.cnt1 = 0
-        # self.cnt2 = 0
-
     def init_tokenizer(self):
         server_args = self.server_args
 
@@ -775,38 +772,43 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        # ## profiling 采集配置
-        # import torch_npu
-        # print(f"overlap 11111 self.cnt1: {self.cnt1}")
-        # self.cnt1 += 1
-        # torch_profiler_trace_dir = "/home/l00878165/sglang/data/profiling/stage2/generate_512_1024"
-        # logger.info("Profiling enabled. Traces will be saved to: %s",
-        #             torch_profiler_trace_dir)
-        # experimental_config = torch_npu.profiler._ExperimentalConfig(
-        #         export_type=torch_npu.profiler.ExportType.Text,
-        #         profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-        #         msprof_tx=False,
-        #         aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-        #         l2_cache=False,
-        #         op_attr=False,
-        #         data_simplification=False,
-        #         record_op_args=False,
-        #         gc_detect_threshold=None,
-        # )
-        # self_profiler = torch_npu.profiler.profile(
-        #         activities=[
-        #             torch_npu.profiler.ProfilerActivity.CPU,
-        #             torch_npu.profiler.ProfilerActivity.NPU,
-        #         ],
-        #         with_stack=False,
-        #         record_shapes=False,
-        #         profile_memory=False,
-        #         with_modules=False,
-        #         schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=18, repeat=1, skip_first=0),
-        #         experimental_config=experimental_config,
-        #         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_profiler_trace_dir))
-        # ## profiling 采集配置
-        # self_profiler.start() ## 采集新增代码
+        ## profiling 采集配置
+        import torch_npu
+        enable_profiling: bool = (
+            os.getenv("ENABLE_PROFILING", "0") == "1"
+        )
+        print(f"111111111  enable_profiling {enable_profiling}", flush=True)
+        if enable_profiling:
+            print(f"enable  profiling", flush=True)
+            torch_profiler_trace_dir = "/home/l00878165/sglang/data/profiling/stage2/generate_512_1024_stack"
+            logger.info("Profiling enabled. Traces will be saved to: %s",
+                        torch_profiler_trace_dir)
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                    export_type=torch_npu.profiler.ExportType.Text,
+                    profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                    msprof_tx=False,
+                    aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                    l2_cache=False,
+                    op_attr=False,
+                    data_simplification=False,
+                    record_op_args=False,
+                    gc_detect_threshold=None,
+            )
+            self_profiler = torch_npu.profiler.profile(
+                    activities=[
+                        torch_npu.profiler.ProfilerActivity.CPU,
+                        torch_npu.profiler.ProfilerActivity.NPU,
+                    ],
+                    with_stack=True,
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_modules=False,
+                    schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=18, repeat=1, skip_first=0),
+                    experimental_config=experimental_config,
+                    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_profiler_trace_dir))
+            ## profiling 采集配置
+            prof_start = 50
+            prof_cnt = 0
         self.result_queue = deque()
 
         while True:
@@ -819,6 +821,12 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                if enable_profiling:
+                    prof_cnt += 1
+                    if prof_cnt == prof_start:
+                        self_profiler.start()
+                    if prof_cnt == prof_start + 10:
+                        self_profiler.stop()
                 batch.launch_done = threading.Event()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
@@ -832,7 +840,12 @@ class Scheduler(
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
-
+                if (
+                    enable_profiling
+                    and prof_cnt > prof_start
+                    and prof_cnt < prof_start + 10
+                ):
+                    self_profiler.step() ## 采集新增代码
             if self.last_batch:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
@@ -848,7 +861,6 @@ class Scheduler(
                 self.self_check_during_idle()
 
             self.last_batch = batch
-            # self_profiler.step() ## 采集新增代码
 
     @DynamicGradMode()
     def event_loop_pp(self):
@@ -2571,6 +2583,7 @@ def run_scheduler_process(
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
 
+    print(f"111111 run_scheduler_process ", flush=True)
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(
@@ -2596,9 +2609,12 @@ def run_scheduler_process(
             if server_args.pp_size > 1:
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:
+                print(f"111111111 enable_overlap ", flush=True)
                 scheduler.event_loop_overlap()
             else:
                 scheduler.event_loop_normal()
+                print(f"222222222 event_loop_normal ", flush=True)
+
         elif disaggregation_mode == DisaggregationMode.PREFILL:
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_prefill()
