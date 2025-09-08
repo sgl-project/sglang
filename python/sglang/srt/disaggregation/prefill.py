@@ -919,7 +919,7 @@ class SchedulerDisaggregationPrefillMixin:
         model_runner.server_args = self.server_args
         if hasattr(self, "decode_graph_runner"):
             model_runner.graph_runner = self.decode_graph_runner
-            model_runner.cuda_graph_mem_usage = self.decode_cuda_graph_mem_usage
+            model_runner.graph_mem_usage = self.decode_graph_mem_usage
             del self.decode_graph_runner
         elif not self.server_args.disable_cuda_graph:
             model_runner.init_device_graphs()

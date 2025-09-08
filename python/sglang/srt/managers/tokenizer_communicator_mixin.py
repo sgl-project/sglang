@@ -19,9 +19,16 @@ from typing import (
 
 import fastapi
 
+from sglang.srt.disaggregation.convert_pd_mixin import (
+    check_idle,
+    convert_mode_str,
+    set_bootstrap_server,
+)
 from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    ConvertDisaggregationRoleReqInput,
+    ConvertDisaggregationRoleReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -155,6 +162,9 @@ class TokenizerCommunicatorMixin:
         self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.convert_pd_role_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -216,6 +226,10 @@ class TokenizerCommunicatorMixin:
                 (
                     LoRAUpdateResult,
                     self.update_lora_adapter_communicator.handle_recv,
+                ),
+                (
+                    ConvertDisaggregationRoleReqOutput,
+                    self.convert_pd_role_communicator.handle_recv,
                 ),
             ]
         )
@@ -489,3 +503,39 @@ class TokenizerCommunicatorMixin:
                 internal_state = await self.get_internal_state()
                 self.current_load = internal_state[0]["load"]
         return {"load": self.current_load}
+
+    async def convert_pd_role(
+        self, obj: ConvertDisaggregationRoleReqInput
+    ) -> Tuple[bool, str]:
+        if not self.server_args.enable_pd_convert:
+            return False, "PD role conversion is not enabled.", None
+
+        if obj.failed_bootstrap_addr is None:
+            obj.check_idle = True
+            check_count = 60
+            while not await check_idle(self, obj):
+                await asyncio.sleep(1)
+                check_count -= 1
+                logger.info("Waiting for all requests to finish...")
+                if check_count <= 0:
+                    return (
+                        False,
+                        "Maybe caused by: 1. Server stuck, 2. 60s is not enough",
+                        None,
+                    )
+            await self.flush_cache()
+            logger.info(
+                "All requests are finished and cache flushed, can convert p/d role"
+            )
+            obj.check_idle = False
+            if not self.server_args.tokenizer_worker_num > 1:
+                set_bootstrap_server(self, obj)
+            convert_mode_str(self)
+
+        responses: List[ConvertDisaggregationRoleReqOutput] = (
+            await self.convert_pd_role_communicator(obj)
+        )
+        if obj.failed_bootstrap_addr is None:
+            # wait scheduler event loop ready
+            await self.flush_cache()
+        return responses[0].success, responses[0].message, responses[0].bootstrap_port

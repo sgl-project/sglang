@@ -403,7 +403,7 @@ class MultiTokenizerRouter:
         self._handle_task = asyncio.run_coroutine_threadsafe(
             print_exception_wrapper(self.handle_loop), self._loop
         )
-        self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
+        self.bootstrap_server = start_disagg_service(self.server_args)
 
     def _run_loop(self):
         self._loop.run_forever()

@@ -42,7 +42,6 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.convert_pd_mixin import set_bootstrap_server
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hf_transformers_utils import (
     get_processor,
@@ -61,8 +60,6 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
-    ConvertDisaggregationRoleReqInput,
-    ConvertDisaggregationRoleReqOutput,
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
