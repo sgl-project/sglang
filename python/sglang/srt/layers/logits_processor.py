@@ -326,7 +326,7 @@ class LogitsProcessor(nn.Module):
         logits = self._get_logits(pruned_states, lm_head, logits_metadata)
         sampled_logits = (
             logits[sample_indices] if sample_indices is not None else logits
-        )
+        ).to(dtype=torch.float32)
 
         if self.debug_tensor_dump_output_folder:
             assert (
@@ -514,9 +514,10 @@ class LogitsProcessor(nn.Module):
             logits_buffer.copy_(logits[:, : self.config.vocab_size])
             logits = logits_buffer
         else:
-            logits = logits[:, : self.config.vocab_size].float()
+            logits = logits[:, : self.config.vocab_size]
 
         if self.final_logit_softcapping:
+            logits = logits.to(dtype=torch.float32)
             fused_softcap(logits, self.final_logit_softcapping)
 
         return logits
