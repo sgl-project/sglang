@@ -2,26 +2,21 @@ import pytest
 import torch
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
+    transfer_kv_all_layer_direct_lf_pf,
     transfer_kv_all_layer_mla,
     transfer_kv_direct,
     transfer_kv_per_layer,
+    transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
-    transfer_kv_all_layer_direct_lf_pf,
-    transfer_kv_per_layer_direct_pf_lf
 )
 
 
 def ref_copy_with_indices(src_pool, dst_pool, src_indices, dst_indices):
     dst_pool[dst_indices] = src_pool[src_indices].to(dst_pool.device)
 
+
 def ref_copy_with_indices_pf_direct(
-    src_pool,
-    dst_pool,
-    src_indices,
-    dst_indices,
-    page_size,
-    layer_id,
-    lf_to_pf=False
+    src_pool, dst_pool, src_indices, dst_indices, page_size, layer_id, lf_to_pf=False
 ):
     if lf_to_pf:
         for i in range(0, len(src_indices), page_size):
@@ -33,6 +28,7 @@ def ref_copy_with_indices_pf_direct(
             dst_pool[layer_id][dst_indices[i : i + page_size]] = src_pool[
                 src_indices[i] // page_size
             ][layer_id].to(dst_pool.device)
+
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_items_to_transfer", [1, 128, 1024])
@@ -271,6 +267,7 @@ def test_transfer_kv(
 
     torch.set_default_dtype(original_dtype)
 
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_items_to_transfer", [128, 1024, 8192])
 @pytest.mark.parametrize("page_size", [16, 64, 128])
@@ -320,9 +317,9 @@ def test_transfer_kv_pf_direct(
 
     if lf_to_pf:
         if is_mla:
-            src_pool = torch.randn(
-                num_layers, total_items_in_pool, item_size
-            ).to(device)
+            src_pool = torch.randn(num_layers, total_items_in_pool, item_size).to(
+                device
+            )
             src_pool_ptrs = [src_pool[i] for i in range(num_layers)]
             dst_pool_ref = torch.zeros(
                 total_pages_in_pool, num_layers, page_size, item_size
@@ -335,7 +332,7 @@ def test_transfer_kv_pf_direct(
                 [dst_pool_direct],
                 src_indices_host,
                 dst_indices_host,
-                page_size
+                page_size,
             )
             for i in range(num_layers):
                 ref_copy_with_indices_pf_direct(
@@ -345,19 +342,19 @@ def test_transfer_kv_pf_direct(
                     dst_indices_host,
                     page_size,
                     i,
-                    lf_to_pf=True
+                    lf_to_pf=True,
                 )
             torch.cuda.synchronize()
             torch.testing.assert_close(dst_pool_direct, dst_pool_ref)
 
         else:
-            src_k_pool = torch.randn(
-                num_layers, total_items_in_pool, item_size
-            ).to(device)
+            src_k_pool = torch.randn(num_layers, total_items_in_pool, item_size).to(
+                device
+            )
             src_k_pool_ptrs = [src_k_pool[i] for i in range(num_layers)]
-            src_v_pool = torch.randn(
-                num_layers, total_items_in_pool, item_size
-            ).to(device)
+            src_v_pool = torch.randn(num_layers, total_items_in_pool, item_size).to(
+                device
+            )
             src_v_pool_ptrs = [src_v_pool[i] for i in range(num_layers)]
             dst_k_pool_ref = torch.zeros(
                 total_pages_in_pool, num_layers, page_size, item_size
@@ -372,7 +369,7 @@ def test_transfer_kv_pf_direct(
                 [dst_k_pool_direct, dst_v_pool_direct],
                 src_indices_host,
                 dst_indices_host,
-                page_size
+                page_size,
             )
             for i in range(num_layers):
                 ref_copy_with_indices_pf_direct(
@@ -382,7 +379,7 @@ def test_transfer_kv_pf_direct(
                     dst_indices_host,
                     page_size,
                     i,
-                    lf_to_pf=True
+                    lf_to_pf=True,
                 )
                 ref_copy_with_indices_pf_direct(
                     src_v_pool,
@@ -391,7 +388,7 @@ def test_transfer_kv_pf_direct(
                     dst_indices_host,
                     page_size,
                     i,
-                    lf_to_pf=True
+                    lf_to_pf=True,
                 )
             torch.cuda.synchronize()
             torch.testing.assert_close(dst_k_pool_direct, dst_k_pool_ref)
@@ -402,22 +399,20 @@ def test_transfer_kv_pf_direct(
                 total_pages_in_pool, num_layers, page_size, item_size
             ).pin_memory()
 
-            dst_pool_ref = torch.zeros(
-                num_layers, total_items_in_pool, item_size
-            ).to(device)
+            dst_pool_ref = torch.zeros(num_layers, total_items_in_pool, item_size).to(
+                device
+            )
             dst_pool_direct = torch.zeros_like(dst_pool_ref)
             dst_pool_direct_ptrs = [dst_pool_direct[i] for i in range(num_layers)]
             torch.cuda.synchronize()
 
             transfer_kv_per_layer_direct_pf_lf(
                 [src_pool],
-                [
-                    dst_pool_direct_ptrs[layer_idx_to_test]
-                ],
+                [dst_pool_direct_ptrs[layer_idx_to_test]],
                 src_indices_host,
                 dst_indices_host,
                 layer_idx_to_test,
-                page_size
+                page_size,
             )
             ref_copy_with_indices_pf_direct(
                 src_pool,
@@ -426,7 +421,7 @@ def test_transfer_kv_pf_direct(
                 dst_indices_device,
                 page_size,
                 layer_idx_to_test,
-                lf_to_pf=False
+                lf_to_pf=False,
             )
             torch.cuda.synchronize()
             torch.testing.assert_close(dst_pool_direct, dst_pool_ref)
@@ -438,9 +433,9 @@ def test_transfer_kv_pf_direct(
                 total_pages_in_pool, num_layers, page_size, item_size
             ).pin_memory()
 
-            dst_k_pool_ref = torch.zeros(
-                num_layers, total_items_in_pool, item_size
-            ).to(device)
+            dst_k_pool_ref = torch.zeros(num_layers, total_items_in_pool, item_size).to(
+                device
+            )
             dst_k_pool_direct = torch.zeros_like(dst_k_pool_ref)
             dst_k_pool_direct_ptrs = [dst_k_pool_direct[i] for i in range(num_layers)]
 
@@ -458,7 +453,7 @@ def test_transfer_kv_pf_direct(
                 src_indices_host,
                 dst_indices_host,
                 layer_idx_to_test,
-                page_size
+                page_size,
             )
 
             ref_copy_with_indices_pf_direct(
@@ -468,7 +463,7 @@ def test_transfer_kv_pf_direct(
                 dst_indices_device,
                 page_size,
                 layer_idx_to_test,
-                lf_to_pf=False
+                lf_to_pf=False,
             )
             ref_copy_with_indices_pf_direct(
                 src_v_pool,
@@ -477,14 +472,12 @@ def test_transfer_kv_pf_direct(
                 dst_indices_device,
                 page_size,
                 layer_idx_to_test,
-                lf_to_pf=False
+                lf_to_pf=False,
             )
 
             torch.cuda.synchronize()
             torch.testing.assert_close(dst_k_pool_direct, dst_k_pool_ref)
             torch.testing.assert_close(dst_v_pool_direct, dst_v_pool_ref)
-
-
 
 
 if __name__ == "__main__":
