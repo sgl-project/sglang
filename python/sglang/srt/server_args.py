@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     is_cuda,
@@ -106,7 +107,7 @@ DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-MOE_RUNNER_BACKEND_CHOICES = ["auto", "triton", "triton_kernel", "flashinfer_trtllm", "flashinfer_cutlass", "flashinfer_mxfp4"]
+MOE_RUNNER_BACKEND_CHOICES = ["auto", "triton", "triton_kernel", "flashinfer_trtllm", "flashinfer_cutlass", "flashinfer_mxfp4", "cutlass_fp8"]
 
 
 # Allow external code to add more choices
@@ -652,6 +653,12 @@ class ServerArgs:
                 logger.warning(
                     "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
                 )
+
+        if get_bool_env_var("SGLANG_CUTLASS_MOE"):
+            logger.warning("SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass_fp8 instead")
+            self.moe_runner_backend = "cutlass_fp8"
+        if self.moe_runner_backend == "cutlass_fp8":
+            assert self.ep_size == 1, "cutlass_fp8 MoE is only supported with ep_size == 1"
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
