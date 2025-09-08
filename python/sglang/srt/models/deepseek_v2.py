@@ -2582,7 +2582,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
-            if _use_aiter_gfx95 and self.quant_config.get_name() == "quark":
+            if (
+                _use_aiter_gfx95
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "quark"
+            ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )
