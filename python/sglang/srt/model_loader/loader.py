@@ -1745,6 +1745,7 @@ class ModelOptModelLoader(DefaultModelLoader):
         quant_cfg,
         quantized_ckpt_restore_path: str | None = None,
         quantized_ckpt_save_path: str | None = None,
+        export_path: str | None = None,
     ) -> None:
         """
         Set up ModelOpt quantization for the given model.
@@ -1755,6 +1756,7 @@ class ModelOptModelLoader(DefaultModelLoader):
             quant_cfg: The quantization configuration
             quantized_ckpt_restore_path: Path to restore quantized checkpoint from
             quantized_ckpt_save_path: Path to save quantized checkpoint to
+            export_path: Path to export the quantized model in HuggingFace format
 
         Raises:
             ImportError: If ModelOpt is not available
@@ -1777,6 +1779,18 @@ class ModelOptModelLoader(DefaultModelLoader):
             try:
                 mto.restore(model, quantized_ckpt_restore_path)
                 print(f"Restored quantized model from {quantized_ckpt_restore_path}")
+
+                # Export model if path provided (even when restoring from checkpoint)
+                if export_path:
+                    try:
+                        self._export_modelopt_checkpoint(model, export_path)
+                        print(
+                            f"Quantized model exported to HuggingFace format at {export_path}"
+                        )
+                    except Exception as e:
+                        print(
+                            f"Warning: Failed to export quantized model to {export_path}: {e}"
+                        )
                 return
             except Exception as e:
                 print(
@@ -1821,8 +1835,46 @@ class ModelOptModelLoader(DefaultModelLoader):
                         f"Warning: Failed to save quantized checkpoint to {quantized_ckpt_save_path}: {e}"
                     )
 
+            # Export model if path provided
+            if export_path:
+                try:
+                    self._export_modelopt_checkpoint(model, export_path)
+                    print(
+                        f"Quantized model exported to HuggingFace format at {export_path}"
+                    )
+                except Exception as e:
+                    print(
+                        f"Warning: Failed to export quantized model to {export_path}: {e}"
+                    )
+
         except Exception as e:
             raise Exception(f"Failed to set up ModelOpt quantization: {e}") from e
+
+    def _export_modelopt_checkpoint(self, model, export_path: str) -> None:
+        """
+        Export the quantized model to HuggingFace format using ModelOpt export API.
+
+        Args:
+            model: The quantized model to export
+            export_path: Directory path to export the model to
+
+        Raises:
+            ImportError: If ModelOpt export functionality is not available
+            Exception: If export fails
+        """
+        try:
+            from modelopt.torch.export import export_hf_checkpoint
+        except ImportError as e:
+            raise ImportError(
+                "ModelOpt export functionality is not available. "
+                "Please ensure you have the latest version of modelopt installed."
+            ) from e
+
+        # Create export directory if it doesn't exist
+        os.makedirs(export_path, exist_ok=True)
+
+        # Export the quantized model
+        export_hf_checkpoint(model, export_dir=export_path)
 
     def load_model(
         self,
@@ -1873,6 +1925,7 @@ class ModelOptModelLoader(DefaultModelLoader):
 
         quantized_ckpt_restore_path = model_config.modelopt_checkpoint_restore_path
         quantized_ckpt_save_path = model_config.modelopt_checkpoint_save_path
+        export_path = model_config.modelopt_export_path
         tokenizer = AutoTokenizer.from_pretrained(
             model_config.model_path, use_fast=True
         )
@@ -1883,6 +1936,7 @@ class ModelOptModelLoader(DefaultModelLoader):
                 quant_cfg,
                 quantized_ckpt_restore_path=quantized_ckpt_restore_path,
                 quantized_ckpt_save_path=quantized_ckpt_save_path,
+                export_path=export_path,
             )
         except Exception as e:
             print(f"Warning: ModelOpt quantization failed: {e}")
