@@ -115,7 +115,15 @@ DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
+MOE_RUNNER_BACKEND_CHOICES = [
+    "auto",
+    "triton",
+    "triton_kernel",
+    "flashinfer_trtllm",
+    "flashinfer_cutlass",
+    "flashinfer_mxfp4",
+    "flashinfer_cutedsl",
+]
 
 
 # Allow external code to add more choices
@@ -286,6 +294,7 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
+    speculative_moe_runner_backend: Literal[*MOE_RUNNER_BACKEND_CHOICES] = "auto"
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -298,14 +307,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep"] = "none"
-    moe_runner_backend: Literal[
-        "auto",
-        "triton",
-        "triton_kernel",
-        "flashinfer_trtllm",
-        "flashinfer_cutlass",
-        "flashinfer_mxfp4",
-    ] = "auto"
+    moe_runner_backend: Literal[*MOE_RUNNER_BACKEND_CHOICES] = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
@@ -2015,6 +2017,13 @@ class ServerArgs:
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             default=ServerArgs.speculative_attention_mode,
         )
+        parser.add_argument(
+            "--speculative-moe-runner-backend",
+            type=str,
+            choices=MOE_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.speculative_moe_runner_backend,
+            help="Choose the runner backend for MoE in speculative decoding.",
+        )
         # Ngram speculative decoding
         parser.add_argument(
             "--speculative-ngram-min-match-window-size",
@@ -2079,15 +2088,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-runner-backend",
             type=str,
-            choices=[
-                "auto",
-                "triton",
-                "triton_kernel",
-                "flashinfer_trtllm",
-                "flashinfer_cutlass",
-                "flashinfer_mxfp4",
-                "flashinfer_cutedsl",
-            ],
+            choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
         )
