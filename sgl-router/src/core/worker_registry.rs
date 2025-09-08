@@ -147,7 +147,7 @@ impl WorkerRegistry {
 
     /// Get a worker by URL
     pub fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
-        self.url_to_id.get(url).and_then(|id| self.get(&id.clone()))
+        self.url_to_id.get(url).and_then(|id| self.get(&id))
     }
 
     /// Get all workers for a model

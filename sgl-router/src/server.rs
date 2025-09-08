@@ -2,11 +2,13 @@ use crate::config::RouterConfig;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::middleware::TokenBucket;
+use crate::protocols::worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest,
     V1RerankReqInput,
 };
 use crate::reasoning_parser::ParserFactory;
+use crate::routers::router_manager::RouterManager;
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use crate::tokenizer::{factory as tokenizer_factory, traits::Tokenizer};
@@ -36,6 +38,7 @@ pub struct AppContext {
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub reasoning_parser_factory: Option<ParserFactory>,
     pub tool_parser_registry: Option<&'static ParserRegistry>,
+    pub router_manager: Option<Arc<RouterManager>>, // Only present when enable_igw=true
 }
 
 impl AppContext {
@@ -75,6 +78,9 @@ impl AppContext {
                 (None, None, None)
             };
 
+        // Initialize RouterManager only when enable_igw is true
+        let router_manager = None; // Will be initialized in startup() based on config
+
         Ok(Self {
             client,
             router_config,
@@ -82,6 +88,7 @@ impl AppContext {
             tokenizer,
             reasoning_parser_factory,
             tool_parser_registry,
+            router_manager,
         })
     }
 }
@@ -232,6 +239,120 @@ async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Respons
     state.router.get_worker_loads().await
 }
 
+// New RESTful worker management endpoints (when enable_igw=true)
+
+/// POST /workers - Add a new worker with full configuration
+async fn create_worker(
+    State(state): State<Arc<AppState>>,
+    Json(config): Json<WorkerConfigRequest>,
+) -> Response {
+    // Check if RouterManager is available (enable_igw=true)
+    if let Some(router_manager) = &state.context.router_manager {
+        match router_manager.add_worker(config).await {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
+        }
+    } else {
+        // In single router mode, use the router's add_worker with basic config
+        match state.router.add_worker(&config.url).await {
+            Ok(message) => {
+                let response = WorkerApiResponse {
+                    success: true,
+                    message,
+                    worker: None,
+                };
+                (StatusCode::OK, Json(response)).into_response()
+            }
+            Err(error) => {
+                let error_response = WorkerErrorResponse {
+                    error,
+                    code: "ADD_WORKER_FAILED".to_string(),
+                };
+                (StatusCode::BAD_REQUEST, Json(error_response)).into_response()
+            }
+        }
+    }
+}
+
+/// GET /workers - List all workers with details
+async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(router_manager) = &state.context.router_manager {
+        let response = router_manager.list_workers();
+        Json(response).into_response()
+    } else {
+        // In single router mode, return simplified list
+        let urls = state.router.get_worker_urls();
+        let response = serde_json::json!({
+            "workers": urls.iter().map(|url| {
+                serde_json::json!({
+                    "url": url,
+                    "model_id": "unknown",
+                    "is_healthy": true
+                })
+            }).collect::<Vec<_>>(),
+            "total": urls.len()
+        });
+        Json(response).into_response()
+    }
+}
+
+/// GET /workers/{url} - Get specific worker info
+async fn get_worker(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(url): axum::extract::Path<String>,
+) -> Response {
+    if let Some(router_manager) = &state.context.router_manager {
+        if let Some(worker) = router_manager.get_worker(&url) {
+            Json(worker).into_response()
+        } else {
+            let error = WorkerErrorResponse {
+                error: format!("Worker {} not found", url),
+                code: "WORKER_NOT_FOUND".to_string(),
+            };
+            (StatusCode::NOT_FOUND, Json(error)).into_response()
+        }
+    } else {
+        // In single router mode, check if worker exists
+        let workers = state.router.get_worker_urls();
+        if workers.contains(&url) {
+            let worker_info = serde_json::json!({
+                "url": url,
+                "model_id": "unknown",
+                "is_healthy": true
+            });
+            Json(worker_info).into_response()
+        } else {
+            let error = WorkerErrorResponse {
+                error: format!("Worker {} not found", url),
+                code: "WORKER_NOT_FOUND".to_string(),
+            };
+            (StatusCode::NOT_FOUND, Json(error)).into_response()
+        }
+    }
+}
+
+/// DELETE /workers/{url} - Remove a worker
+async fn delete_worker(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(url): axum::extract::Path<String>,
+) -> Response {
+    if let Some(router_manager) = &state.context.router_manager {
+        match router_manager.remove_worker(&url) {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
+        }
+    } else {
+        // In single router mode, use router's remove_worker
+        state.router.remove_worker(&url);
+        let response = WorkerApiResponse {
+            success: true,
+            message: format!("Worker {} removed successfully", url),
+            worker: None,
+        };
+        (StatusCode::OK, Json(response)).into_response()
+    }
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -281,11 +402,19 @@ pub fn build_app(
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads));
 
+    // Worker management routes
+    let worker_routes = Router::new()
+        .route("/workers", post(create_worker))
+        .route("/workers", get(list_workers_rest))
+        .route("/workers/:url", get(get_worker))
+        .route("/workers/:url", axum::routing::delete(delete_worker));
+
     // Build app with all routes and middleware
     Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
+        .merge(worker_routes)
         // Request body size limiting
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -355,12 +484,26 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .expect("Failed to create HTTP client");
 
     // Create the application context with all dependencies
-    let app_context = Arc::new(AppContext::new(
+    let mut app_context = AppContext::new(
         config.router_config.clone(),
         client.clone(),
         config.router_config.max_concurrent_requests,
         config.router_config.rate_limit_tokens_per_second,
-    )?);
+    )?;
+
+    // Initialize RouterManager if enable_igw is true
+    if config.router_config.enable_igw {
+        info!("Multi-router mode enabled (enable_igw=true)");
+        let router_manager = Arc::new(RouterManager::new(
+            config.router_config.clone(),
+            client.clone(),
+        ));
+        app_context.router_manager = Some(router_manager);
+    } else {
+        info!("Single router mode (enable_igw=false)");
+    }
+
+    let app_context = Arc::new(app_context);
 
     // Create router with the context
     let router = RouterFactory::create_router(&app_context).await?;

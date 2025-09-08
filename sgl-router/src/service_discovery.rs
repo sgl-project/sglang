@@ -596,6 +596,7 @@ mod tests {
             tokenizer: None,                // HTTP mode doesn't need tokenizer
             reasoning_parser_factory: None, // HTTP mode doesn't need reasoning parser
             tool_parser_registry: None,     // HTTP mode doesn't need tool parser
+            router_manager: None,           // Test doesn't need router manager
         });
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Random);

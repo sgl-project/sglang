@@ -15,11 +15,6 @@ pub struct RouterFactory;
 impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
-        // Check if IGW mode is enabled
-        if ctx.router_config.enable_igw {
-            return Self::create_igw_router(ctx).await;
-        }
-
         // Check connection mode and route to appropriate implementation
         match ctx.router_config.connection_mode {
             ConnectionMode::Grpc => {
@@ -185,11 +180,5 @@ impl RouterFactory {
             OpenAIRouter::new(base_url, Some(ctx.router_config.circuit_breaker.clone())).await?;
 
         Ok(Box::new(router))
-    }
-
-    /// Create an IGW router (placeholder for future implementation)
-    async fn create_igw_router(_ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
-        // For now, return an error indicating IGW is not yet implemented
-        Err("IGW mode is not yet implemented".to_string())
     }
 }
