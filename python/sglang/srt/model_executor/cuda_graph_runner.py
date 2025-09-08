@@ -271,7 +271,10 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if model_runner.spec_algorithm.is_eagle():
+        if (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_standalone()
+        ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
@@ -827,7 +830,10 @@ class CudaGraphRunner:
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
-        if self.model_runner.spec_algorithm.is_eagle():
+        if (
+            self.model_runner.spec_algorithm.is_eagle()
+            or self.model_runner.spec_algorithm.is_standalone()
+        ):
             from sglang.srt.speculative.eagle_utils import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
