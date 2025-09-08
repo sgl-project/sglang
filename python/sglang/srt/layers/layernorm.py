@@ -18,6 +18,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from packaging.version import Version
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
@@ -38,18 +39,17 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 if _is_cuda:
-    from sgl_kernel import (
-        fused_add_rmsnorm,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
-    )
+    from flashinfer.norm import fused_add_rmsnorm as flashinfer_fused_add_rmsnorm
+    from sgl_kernel import gemma_fused_add_rmsnorm, gemma_rmsnorm, rmsnorm
 
 if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 elif _is_hip:
+    import vllm
     from vllm._custom_ops import fused_add_rms_norm, rms_norm
+
+    _vllm_version = Version(vllm.__version__)
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,9 @@ class RMSNorm(CustomOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
         if residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            flashinfer_fused_add_rmsnorm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
@@ -127,8 +129,21 @@ class RMSNorm(CustomOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
+            if _vllm_version < Version("0.9"):
+                fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+                return x, residual
+            else:
+                residual_out = torch.empty_like(x)
+                output = torch.empty_like(x)
+                fused_add_rms_norm(
+                    output,
+                    x,
+                    residual_out,
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                )
+                return output, residual_out
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
