@@ -46,7 +46,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         # Start metadata service
         try:
             cls.metadata_service_process = subprocess.Popen(
-                ["python", "-m", "mooncake.http_metadata_server"],
+                ["python3", "-m", "mooncake.http_metadata_server"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 preexec_fn=os.setsid  # Create new process group
