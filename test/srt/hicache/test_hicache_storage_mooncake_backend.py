@@ -103,8 +103,8 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             "local_hostname": "localhost",
             "metadata_server": "http://127.0.0.1:8080/metadata",
             "global_segment_size": 4 * 1024 * 1024 * 1024,  # 4 GiB
-            "protocol": "tcp",
-            "device_name": "auto",
+            "protocol": "rdma",
+            "device_name": "",
             "master_server_address": "127.0.0.1:50051",
         }
 
@@ -124,15 +124,15 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         env_vars = {
             "MOONCAKE_CONFIG_PATH": config_file,
             "MOONCAKE_MASTER": "127.0.0.1:50051",
-            "MOONCAKE_PROTOCOL": "tcp",
-            "MOONCAKE_DEVICE": "auto",
+            "MOONCAKE_PROTOCOL": "rdma",
+            "MOONCAKE_DEVICE": "",
             "MOONCAKE_TE_META_DATA_SERVER": "http://127.0.0.1:8080/metadata",
-            "LOCAL_HOSTNAME": "localhost",
         }
 
         return server_args, env_vars
 
 
+# Same as #10131, layer first layout test
 class TestMooncakeBackendLayerFirstLayout(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
@@ -146,7 +146,7 @@ class TestMooncakeBackendLayerFirstLayout(
         server_args["--hicache-io-backend"] = "direct"
         return server_args, env_vars
 
-
+# Same as #10131, page first layout test
 class TestMooncakeBackendPageFirstLayout(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
@@ -160,6 +160,7 @@ class TestMooncakeBackendPageFirstLayout(
         return server_args, env_vars
 
 
+# Same as #10131, accuracy test
 class TestMooncakeBackendAccuracy(HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase):
     """Accuracy tests for HiCache-Mooncake backend"""
 
