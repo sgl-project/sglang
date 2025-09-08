@@ -1,67 +1,156 @@
-# GB200 SGLang Docker environment  
-ARG CUDA_VERSION=12.9.1
-FROM sglang/base:${CUDA_VERSION}
+# Optimized GB200 SGLang Docker environment  
+# syntax=docker/dockerfile:1.4
 
+ARG CUDA_VERSION=12.9.1
+FROM sglang/base:${CUDA_VERSION} AS base
+
+# Build arguments
 ARG BUILD_TYPE=blackwell
 ARG DEEPEP_COMMIT=1b14ad661c7640137fcfe93cccb2694ede1220b0
+ARG CMAKE_BUILD_PARALLEL_LEVEL=4
+
+# Environment variables for GB200
 ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
     BUILD_TYPE=${BUILD_TYPE} \
-    TORCH_CUDA_ARCH_LIST="10.0 12.0"
+    TORCH_CUDA_ARCH_LIST="10.0 12.0" \
+    CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}
 
-# Install SGLang missing package for blackwell build type
-RUN python3 -m pip install openai httpx
+# ================================
+# Stage 1: GB200-Specific Packages
+# ================================
+FROM base AS gb200-deps
 
-# Clone and install SGLang
+# Install GB200-specific packages with cache
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-cache-dir \
+        openai==1.40.6 \
+        httpx==0.27.0
+
+# ================================
+# Stage 2: SGLang Installation
+# ================================
+FROM gb200-deps AS sglang-install
+
 WORKDIR /sgl-workspace
-RUN cd sglang \
- && case "$CUDA_VERSION" in \
-      12.9.1) CUINDEX=129 ;; \
-      *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
-    esac \
- && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
- && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps ; \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+
+# Install SGLang Blackwell build with pip cache
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd sglang \
+    && case "$CUDA_VERSION" in \
+         12.9.1) CUINDEX=129 ;; \
+         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+       esac \
+    && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
+
+# Install NVIDIA packages for GB200
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$CUDA_VERSION" = "12.9.1" ]; then \
+        python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps ; \
+        python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
     fi
 
-# Download source files
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    git clone https://github.com/fzyzcjy/DeepEP.git && \
-    cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. && \
-    tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    mv nvshmem_src nvshmem && \
-    rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+# ================================
+# Stage 3: Source Downloads
+# ================================
+FROM sglang-install AS source-deps
 
-# Build and install NVSHMEM
-RUN cd /sgl-workspace/nvshmem && \
-    NVSHMEM_SHMEM_SUPPORT=0 \
-    NVSHMEM_UCX_SUPPORT=0 \
-    NVSHMEM_USE_NCCL=0 \
-    NVSHMEM_MPI_SUPPORT=0 \
-    NVSHMEM_IBGDA_SUPPORT=1 \
-    NVSHMEM_PMIX_SUPPORT=0 \
-    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
-    NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="100;120" && \
-    cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
+# Download and extract NVSHMEM with caching
+RUN --mount=type=cache,target=/tmp/downloads \
+    if [ ! -f /tmp/downloads/nvshmem_src_cuda12-all-all-3.3.9.tar.gz ]; then \
+        wget -O /tmp/downloads/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+        https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz; \
+    fi \
+    && cp /tmp/downloads/nvshmem_src_cuda12-all-all-3.3.9.tar.gz . \
+    && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+    && mv nvshmem_src nvshmem \
+    && rm nvshmem_src_cuda12-all-all-3.3.9.tar.gz
 
-# Install DeepEP
-RUN cd /sgl-workspace/DeepEP && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
+# Clone DeepEP with cache (fzyzcjy fork for GB200)
+RUN --mount=type=cache,target=/tmp/git-cache \
+    git clone https://github.com/fzyzcjy/DeepEP.git \
+    && cd DeepEP \
+    && git checkout ${DEEPEP_COMMIT}
 
-# Install additional dependencies specific to GB200
-RUN python3 -m pip install --no-cache-dir \
-    mooncake-transfer-engine==0.3.5 \
-    nvidia-cudnn-cu12 \
-    nvidia-cudnn-frontend \
-    nixl
+# ================================
+# Stage 4: NVSHMEM Build (GB200 optimized)
+# ================================
+FROM source-deps AS nvshmem-build
 
-# Set up additional tools for GB200 environment
-RUN apt update -y \
-    && apt install -y --no-install-recommends gnupg \
+# Build NVSHMEM with GB200 architecture support
+RUN --mount=type=cache,target=/tmp/nvshmem-build \
+    cd /sgl-workspace/nvshmem \
+    && NVSHMEM_SHMEM_SUPPORT=0 \
+       NVSHMEM_UCX_SUPPORT=0 \
+       NVSHMEM_USE_NCCL=0 \
+       NVSHMEM_MPI_SUPPORT=0 \
+       NVSHMEM_IBGDA_SUPPORT=1 \
+       NVSHMEM_PMIX_SUPPORT=0 \
+       NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
+       NVSHMEM_USE_GDRCOPY=1 \
+       cmake -S . -B build/ \
+       -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} \
+       -DCMAKE_CUDA_ARCHITECTURES="100;120" \
+       -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
+
+# ================================
+# Stage 5: DeepEP Build (GB200 optimized)
+# ================================
+FROM nvshmem-build AS deepep-build
+
+# Install DeepEP with GB200 support
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/tmp/deepep-build \
+    cd /sgl-workspace/DeepEP \
+    && NVSHMEM_DIR=${NVSHMEM_DIR} \
+       MAX_JOBS=${CMAKE_BUILD_PARALLEL_LEVEL} \
+       pip install .
+
+# ================================
+# Stage 6: GB200-Specific Tools
+# ================================
+FROM deepep-build AS gb200-tools
+
+# Install additional dependencies for GB200
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-cache-dir \
+        mooncake-transfer-engine==0.3.5 \
+        nvidia-cudnn-cu12==9.1.0.70 \
+        nvidia-cudnn-frontend==1.5.2 \
+        nixl==0.2.1
+
+# Install nsight-systems for GB200 profiling
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    apt-get update \
+    && apt-get install -y --no-install-recommends gnupg \
     && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
     && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
-    && apt update -y \
-    && apt install nsight-systems-cli -y
+    && apt-get update \
+    && apt-get install -y nsight-systems-cli
+
+# ================================
+# Final Stage: Cleanup
+# ================================
+FROM gb200-tools AS final
+
+# Clean up build artifacts
+RUN rm -rf /tmp/* \
+    && rm -rf /sgl-workspace/nvshmem \
+    && rm -rf /sgl-workspace/DeepEP \
+    && apt-get autoremove -y \
+    && apt-get clean
 
 WORKDIR /sgl-workspace/sglang
+
+# Add health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python3 -c "import sglang; print('SGLang GB200 ready')" || exit 1
+
+# Label the image
+LABEL org.opencontainers.image.title="SGLang GB200 Environment" \
+      org.opencontainers.image.description="Blackwell/GB200 optimized SGLang environment" \
+      environment="gb200" \
+      cuda_version="${CUDA_VERSION}" \
+      build_type="${BUILD_TYPE}" \
+      cuda_architectures="10.0,12.0"

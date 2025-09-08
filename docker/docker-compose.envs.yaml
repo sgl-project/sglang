@@ -1,75 +1,183 @@
 version: '3.8'
 
+# SGLang Docker Compose with Performance Optimizations
+# This compose file includes build cache configuration, performance settings,
+# and optimized builds for all SGLang environments
+
+x-common-build: &common-build
+  context: ..
+  cache_from:
+    - ${CACHE_FROM:-type=registry,ref=sglang/cache:buildcache}
+  cache_to:
+    - ${CACHE_TO:-type=registry,ref=sglang/cache:buildcache,mode=max}
+  # Use BuildKit for advanced features
+  platforms:
+    - linux/amd64
+    - linux/arm64
+
+x-common-logging: &common-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-common-environment: &common-environment
+  # Performance optimizations
+  OMP_NUM_THREADS: ${OMP_NUM_THREADS:-auto}
+  MKL_NUM_THREADS: ${MKL_NUM_THREADS:-auto}
+  # Build optimization
+  CMAKE_BUILD_PARALLEL_LEVEL: ${CMAKE_BUILD_PARALLEL_LEVEL:-4}
+  # GPU optimization
+  CUDA_CACHE_PATH: /tmp/cuda-cache
+  # Memory optimization
+  MALLOC_ARENA_MAX: 4
+
+x-cuda-deploy: &cuda-deploy
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: ${GPU_COUNT:-all}
+          capabilities: [gpu]
+    limits:
+      memory: ${MEMORY_LIMIT:-32g}
+
+x-common-volumes: &common-volumes
+  - ${HOST_WORKSPACE:-./workspace}:/sgl-workspace/sglang
+  - ${HOST_MODELS:-./models}:/models
+  - ${HOST_CACHE:-./cache}:/cache
+  - /tmp:/tmp:cached
+
 services:
-  # Default SGLang service
-  sglang-default:
+  # Shared base image builder
+  sglang-base:
+    <<: *common-build
     build:
-      context: ..
+      dockerfile: docker/Dockerfile.base
+      target: build-ready
+      args:
+        - CUDA_VERSION=${CUDA_VERSION:-12.6.1}
+        - BRANCH_TYPE=${BRANCH_TYPE:-remote}
+        - CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-4}
+        - UBUNTU_VERSION=${UBUNTU_VERSION:-22.04}
+    image: sglang/base:${CUDA_VERSION:-12.6.1}
+    profiles:
+      - base
+    command: ["sleep", "infinity"]
+    logging: *common-logging
+
+  # Default SGLang service (optimized)
+  sglang-default:
+    <<: *common-build
+    build:
       dockerfile: docker/envs/Dockerfile.default
+      target: final
       args:
         - CUDA_VERSION=${CUDA_VERSION:-12.6.1}
         - BUILD_TYPE=${BUILD_TYPE:-all}
         - BRANCH_TYPE=${BRANCH_TYPE:-remote}
+        - CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-4}
+      cache_from:
+        - sglang/base:${CUDA_VERSION:-12.6.1}
+        - ${CACHE_FROM:-type=registry,ref=sglang/cache:default}
+      cache_to:
+        - ${CACHE_TO:-type=registry,ref=sglang/cache:default,mode=max}
     image: sglang:${CUDA_VERSION:-12.6.1}
     container_name: sglang-default
     profiles:
       - default
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    volumes:
-      - ${HOST_WORKSPACE:-./workspace}:/sgl-workspace/sglang
-      - ${HOST_MODELS:-./models}:/models
+    deploy: *cuda-deploy
+    volumes: *common-volumes
     environment:
-      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}
+      <<: *common-environment
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}
+      # SGLang specific
+      SGL_GLOBAL_SERVER_HOST: "0.0.0.0"
+      SGL_GLOBAL_SERVER_PORT: "30000"
     ports:
       - "${SGL_PORT:-30000}:30000"
+      - "${SGL_METRICS_PORT:-8080}:8080"  # Metrics endpoint
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import sglang; print(\"ready\")' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    logging: *common-logging
     stdin_open: true
     tty: true
+    # Security optimizations
+    read_only: false
+    tmpfs:
+      - /tmp:size=2G,mode=1777
+      - /dev/shm:size=2G,mode=1777
 
-  # GB200 environment
+  # GB200 environment (high-performance)
   sglang-gb200:
+    <<: *common-build
     build:
-      context: ..
       dockerfile: docker/envs/Dockerfile.gb200
+      target: final
       args:
         - CUDA_VERSION=${CUDA_VERSION:-12.9.1}
         - BUILD_TYPE=${BUILD_TYPE:-blackwell}
+        - BRANCH_TYPE=${BRANCH_TYPE:-remote}
+        - CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-6}
+      cache_from:
+        - sglang/base:${CUDA_VERSION:-12.9.1}
+        - ${CACHE_FROM:-type=registry,ref=sglang/cache:gb200}
+      cache_to:
+        - ${CACHE_TO:-type=registry,ref=sglang/cache:gb200,mode=max}
     image: sglang:gb200-${CUDA_VERSION:-12.9.1}
     container_name: sglang-gb200
     profiles:
       - gb200
     deploy:
+      <<: *cuda-deploy
       resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    volumes:
-      - ${HOST_WORKSPACE:-./workspace}:/sgl-workspace/sglang
-      - ${HOST_MODELS:-./models}:/models
+        limits:
+          memory: ${MEMORY_LIMIT:-64g}  # Higher memory for GB200
+    volumes: *common-volumes
     environment:
-      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}
-      - TORCH_CUDA_ARCH_LIST=10.0 12.0
+      <<: *common-environment
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}
+      TORCH_CUDA_ARCH_LIST: "10.0 12.0"
+      # GB200 specific optimizations
+      NCCL_TREE_THRESHOLD: 0
+      NCCL_IB_DISABLE: 0
+      NCCL_SOCKET_IFNAME: eth0
+      # Performance tuning
+      CMAKE_BUILD_PARALLEL_LEVEL: 6
     ports:
       - "${SGL_PORT:-30000}:30000"
+      - "${SGL_METRICS_PORT:-8080}:8080"
+      - "${NSIGHT_PORT:-3000}:3000"  # Nsight Systems
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import sglang; print(\"GB200 ready\")' || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    logging: *common-logging
     stdin_open: true
     tty: true
 
-  # NPU environment
+  # NPU environment (Ascend)
   sglang-npu:
+    <<: *common-build
     build:
-      context: ..
       dockerfile: docker/envs/Dockerfile.npu
       args:
         - CANN_VERSION=${CANN_VERSION:-8.2.rc1}
         - DEVICE_TYPE=${DEVICE_TYPE:-a3}
         - SGLANG_TAG=${SGLANG_TAG:-main}
+        - PYTHON_VERSION=${PYTHON_VERSION:-py3.11}
+      cache_from:
+        - ${CACHE_FROM:-type=registry,ref=sglang/cache:npu}
+      cache_to:
+        - ${CACHE_TO:-type=registry,ref=sglang/cache:npu,mode=max}
     image: sglang:npu
     container_name: sglang-npu
     profiles:
@@ -77,21 +185,43 @@ services:
     volumes:
       - ${HOST_WORKSPACE:-./workspace}:/workspace
       - ${HOST_MODELS:-./models}:/models
+      - ${HOST_CACHE:-./cache}:/cache
+      # NPU device access
+      - /usr/local/dcmi:/usr/local/dcmi
+      - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
+      - /usr/local/Ascend:/usr/local/Ascend
     environment:
-      - ASCEND_VISIBLE_DEVICES=${ASCEND_VISIBLE_DEVICES:-all}
+      <<: *common-environment
+      ASCEND_VISIBLE_DEVICES: ${ASCEND_VISIBLE_DEVICES:-all}
+      # Ascend specific
+      ASCEND_AICPU_PATH: /usr/local/Ascend/ascend-toolkit/latest
+      ASCEND_OPP_PATH: /usr/local/Ascend/ascend-toolkit/latest/opp
     ports:
       - "${SGL_PORT:-30000}:30000"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import torch_npu; print(\"NPU ready\")' || exit 1"]
+      interval: 45s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+    logging: *common-logging
     stdin_open: true
     tty: true
 
-  # ROCm environment
+  # ROCm environment (AMD GPUs)
   sglang-rocm:
+    <<: *common-build
     build:
-      context: ..
       dockerfile: docker/envs/Dockerfile.rocm
       args:
         - GPU_ARCH=${GPU_ARCH:-gfx950}
         - SGL_BRANCH=${SGL_BRANCH:-main}
+        - CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-4}
+      cache_from:
+        - ${CACHE_FROM:-type=registry,ref=sglang/cache:rocm}
+      cache_to:
+        - ${CACHE_TO:-type=registry,ref=sglang/cache:rocm,mode=max}
     image: sglang:rocm-${GPU_ARCH:-gfx950}
     container_name: sglang-rocm
     profiles:
@@ -109,42 +239,90 @@ services:
     volumes:
       - ${HOST_WORKSPACE:-./workspace}:/workspace/sglang
       - ${HOST_MODELS:-./models}:/models
+      - ${HOST_CACHE:-./cache}:/cache
+      # ROCm optimization
+      - /opt/rocm:/opt/rocm:ro
     environment:
-      - ROC_VISIBLE_DEVICES=${ROC_VISIBLE_DEVICES:-all}
-      - HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-all}
+      <<: *common-environment
+      ROC_VISIBLE_DEVICES: ${ROC_VISIBLE_DEVICES:-all}
+      HIP_VISIBLE_DEVICES: ${HIP_VISIBLE_DEVICES:-all}
+      # ROCm specific
+      HSA_OVERRIDE_GFX_VERSION: ${GPU_ARCH:-gfx950}
+      HCC_AMDGPU_TARGET: ${GPU_ARCH:-gfx950}
     ports:
       - "${SGL_PORT:-30000}:30000"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import torch; print(\"ROCm ready\")' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    logging: *common-logging
     stdin_open: true
     tty: true
 
-  # Router service
+  # Router service (lightweight, optimized)
   sglang-router:
+    <<: *common-build
     build:
-      context: ..
       dockerfile: docker/envs/Dockerfile.router
-      target: router-image
+      target: runtime
       args:
         - SGLANG_REPO_REF=${SGLANG_REPO_REF:-main}
         - PYTHON_VERSION=${PYTHON_VERSION:-3.12}
+        - UBUNTU_VERSION=${UBUNTU_VERSION:-24.04}
+      cache_from:
+        - ${CACHE_FROM:-type=registry,ref=sglang/cache:router}
+      cache_to:
+        - ${CACHE_TO:-type=registry,ref=sglang/cache:router,mode=max}
     image: sglang:router
     container_name: sglang-router
     profiles:
       - router
     ports:
       - "${ROUTER_PORT:-8080}:8080"
+      - "${ROUTER_METRICS_PORT:-9090}:9090"
     environment:
-      - ROUTER_HOST=${ROUTER_HOST:-0.0.0.0}
-      - ROUTER_PORT=${ROUTER_PORT:-8080}
+      # Router specific
+      ROUTER_HOST: ${ROUTER_HOST:-0.0.0.0}
+      ROUTER_PORT: ${ROUTER_PORT:-8080}
+      ROUTER_WORKERS: ${ROUTER_WORKERS:-4}
+      # Performance
+      RUST_LOG: ${RUST_LOG:-info}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-0}
+    # Resource limits for lightweight router
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '1.0'
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import sglang_router; print(\"Router ready\")' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
+    logging: *common-logging
+    # Security: run as non-root user
+    user: sglang:sglang
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M,mode=1777
 
-  # Xeon CPU environment
+  # Xeon CPU environment (Intel optimized)
   sglang-xeon:
+    <<: *common-build
     build:
-      context: ..
       dockerfile: docker/envs/Dockerfile.xeon
       args:
         - PYTHON_VERSION=${PYTHON_VERSION:-3.12}
         - SGLANG_TAG=${SGLANG_TAG:-main}
+      cache_from:
+        - ${CACHE_FROM:-type=registry,ref=sglang/cache:xeon}
+      cache_to:
+        - ${CACHE_TO:-type=registry,ref=sglang/cache:xeon,mode=max}
     image: sglang:xeon
     container_name: sglang-xeon
     profiles:
@@ -152,14 +330,86 @@ services:
     volumes:
       - ${HOST_WORKSPACE:-./workspace}:/workspace/sglang
       - ${HOST_MODELS:-./models}:/models
+      - ${HOST_CACHE:-./cache}:/cache
     environment:
-      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-auto}
-      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-auto}
+      <<: *common-environment
+      # Intel CPU optimizations
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-}  # Use all cores if not specified
+      MKL_NUM_THREADS: ${MKL_NUM_THREADS:-}
+      KMP_AFFINITY: granularity=fine,compact,1,0
+      KMP_BLOCKTIME: 1
+      # Intel oneDNN optimizations
+      ONEDNN_VERBOSE: ${ONEDNN_VERBOSE:-0}
     ports:
       - "${SGL_PORT:-30000}:30000"
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-16g}
+          cpus: ${CPU_LIMIT:-}  # Use all CPUs if not specified
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import sglang; print(\"Xeon ready\")' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    restart: unless-stopped
+    logging: *common-logging
     stdin_open: true
     tty: true
 
+# Performance monitoring stack (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: sglang-prometheus
+    profiles:
+      - monitoring
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"
+    volumes:
+      - ${HOST_PROMETHEUS_CONFIG:-./monitoring/prometheus.yml}:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    logging: *common-logging
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: sglang-grafana
+    profiles:
+      - monitoring
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-sglang}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    logging: *common-logging
+
+# Shared volumes for performance and caching
+volumes:
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# Optimized network configuration
 networks:
   default:
     name: sglang-network
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: sglang0
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.host_binding_ipv4: "0.0.0.0"
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1

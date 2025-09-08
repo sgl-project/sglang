@@ -1,0 +1,201 @@
+# SGLang Docker Build Context Optimization
+# This file excludes unnecessary files from the Docker build context to improve performance
+
+# Version control
+.git
+.gitignore
+.gitmodules
+.gitattributes
+
+# Documentation
+*.md
+docs/
+documentation/
+README*
+CHANGELOG*
+LICENSE*
+CONTRIBUTING*
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.coverage
+.tox/
+.nox/
+htmlcov/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.env
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Rust
+target/
+Cargo.lock
+
+# C/C++
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.log
+*.backup
+*.bak
+
+# Test files and directories (keep essential tests)
+tests/stress/
+tests/benchmark/
+tests/integration/large/
+**/test_data/
+**/testdata/
+**/*_test_large*
+
+# Model files and datasets (too large for build context)
+*.bin
+*.safetensors
+*.gguf
+*.ggml
+models/
+datasets/
+data/
+checkpoints/
+
+# Build artifacts
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# Docker files (don't include other dockerfiles in context)
+Dockerfile.old
+Dockerfile.backup
+docker-compose.override.yml
+.dockerignore.old
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+.circleci/
+.drone.yml
+
+# Package manager files (keep essential ones)
+package-lock.json
+yarn.lock
+poetry.lock
+Pipfile.lock
+
+# Large binary directories
+bin/
+obj/
+out/
+
+# Logs and databases
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment specific
+.env.local
+.env.development
+.env.test
+.env.production
+secrets/
+credentials/
+
+# Backup files
+*.backup
+*.bak
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Large media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.svg
+*.ico
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.rar
+*.7z
+
+# Keep essential files that might match patterns above
+!requirements.txt
+!pyproject.toml
+!setup.py
+!setup.cfg
+!CMakeLists.txt
+!Makefile
+!*.dockerfile
+!docker-compose*.yaml
+!build.sh

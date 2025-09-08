@@ -1,79 +1,168 @@
-# Default SGLang Docker environment
-ARG CUDA_VERSION=12.6.1
-FROM sglang/base:${CUDA_VERSION} as build-image
+# Optimized Default SGLang Docker environment
+# syntax=docker/dockerfile:1.4
 
+ARG CUDA_VERSION=12.6.1
+FROM sglang/base:${CUDA_VERSION} AS base
+
+# Build arguments
 ARG BUILD_TYPE=all
 ARG DEEPEP_COMMIT=b92d0d4860ce6866cd6d31bfbae937f9a7a3772b
-ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+ARG CMAKE_BUILD_PARALLEL_LEVEL=4
 
-# Install SGLang
+# Environment variables
+ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
+    CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}
+
+# ================================
+# Stage 1: SGLang Installation
+# ================================
+FROM base AS sglang-install
+
 WORKDIR /sgl-workspace
-RUN cd sglang \
- && case "$CUDA_VERSION" in \
-      12.6.1) CUINDEX=126 ;; \
-      12.8.1) CUINDEX=128 ;; \
-      12.9.1) CUINDEX=129 ;; \
-      *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
-    esac \
- && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
- && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
- && python3 -m flashinfer --download-cubin \
- && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu128-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+
+# Install SGLang with pip cache
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd sglang \
+    && case "$CUDA_VERSION" in \
+         12.6.1) CUINDEX=126 ;; \
+         12.8.1) CUINDEX=128 ;; \
+         12.9.1) CUINDEX=129 ;; \
+         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+       esac \
+    && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
+
+# Install NVIDIA packages with cache
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps
+
+# Download flashinfer cubins
+RUN --mount=type=cache,target=/root/.cache/flashinfer \
+    python3 -m flashinfer --download-cubin
+
+# Install CUDA version-specific kernels
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$CUDA_VERSION" = "12.8.1" ]; then \
+        python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu128-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi \
- && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu129-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+    && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
+        python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu129-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi
 
-# Download source files
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
-    cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-    cd .. && \
-    tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    mv nvshmem_src nvshmem && \
-    rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+# ================================
+# Stage 2: Source Downloads (Parallel)
+# ================================
+FROM sglang-install AS source-deps
 
-# Build and install NVSHMEM
-RUN cd /sgl-workspace/nvshmem && \
-    NVSHMEM_SHMEM_SUPPORT=0 \
-    NVSHMEM_UCX_SUPPORT=0 \
-    NVSHMEM_USE_NCCL=0 \
-    NVSHMEM_MPI_SUPPORT=0 \
-    NVSHMEM_IBGDA_SUPPORT=1 \
-    NVSHMEM_PMIX_SUPPORT=0 \
-    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
-    NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="90" && \
-    cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
+# Download source files with caching
+RUN --mount=type=cache,target=/tmp/downloads \
+    # Download NVSHMEM
+    if [ ! -f /tmp/downloads/nvshmem_src_cuda12-all-all-3.3.9.tar.gz ]; then \
+        wget -O /tmp/downloads/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+        https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz; \
+    fi \
+    && cp /tmp/downloads/nvshmem_src_cuda12-all-all-3.3.9.tar.gz . \
+    && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+    && mv nvshmem_src nvshmem \
+    && rm nvshmem_src_cuda12-all-all-3.3.9.tar.gz
 
-# Install DeepEP
-RUN cd /sgl-workspace/DeepEP && \
-    case "$CUDA_VERSION" in \
-      12.6.1) \
-        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
-        ;; \
-      12.8.1|12.9.1) \
-        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
-        ;; \
-      *) \
-        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
-        ;; \
-    esac && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
+# Clone DeepEP with cache
+RUN --mount=type=cache,target=/tmp/git-cache \
+    git clone https://github.com/deepseek-ai/DeepEP.git \
+    && cd DeepEP \
+    && git checkout ${DEEPEP_COMMIT} \
+    && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh
 
-# Install additional Python tools specific to default environment
-RUN python3 -m pip install --no-cache-dir \
-    mooncake-transfer-engine==0.3.5 \
-    nixl \
-    py-spy
+# ================================
+# Stage 3: NVSHMEM Build
+# ================================
+FROM source-deps AS nvshmem-build
 
-# Build and install sgl-router
-RUN python3 -m pip install --no-cache-dir setuptools-rust \
-    && cd /sgl-workspace/sglang/sgl-router \
+# Build NVSHMEM with parallel compilation
+RUN --mount=type=cache,target=/tmp/nvshmem-build \
+    cd /sgl-workspace/nvshmem \
+    && NVSHMEM_SHMEM_SUPPORT=0 \
+       NVSHMEM_UCX_SUPPORT=0 \
+       NVSHMEM_USE_NCCL=0 \
+       NVSHMEM_MPI_SUPPORT=0 \
+       NVSHMEM_IBGDA_SUPPORT=1 \
+       NVSHMEM_PMIX_SUPPORT=0 \
+       NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
+       NVSHMEM_USE_GDRCOPY=1 \
+       cmake -S . -B build/ \
+       -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} \
+       -DCMAKE_CUDA_ARCHITECTURES="90" \
+       -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
+
+# ================================
+# Stage 4: DeepEP Build
+# ================================
+FROM nvshmem-build AS deepep-build
+
+# Install DeepEP with parallel compilation
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/tmp/deepep-build \
+    cd /sgl-workspace/DeepEP \
+    && case "$CUDA_VERSION" in \
+         12.6.1) CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' ;; \
+         12.8.1|12.9.1) CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' ;; \
+         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+       esac \
+    && NVSHMEM_DIR=${NVSHMEM_DIR} \
+       TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" \
+       MAX_JOBS=${CMAKE_BUILD_PARALLEL_LEVEL} \
+       pip install .
+
+# ================================
+# Stage 5: Additional Tools
+# ================================
+FROM deepep-build AS additional-tools
+
+# Install additional Python tools with cache
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-cache-dir \
+        mooncake-transfer-engine==0.3.5 \
+        nixl==0.2.1 \
+        py-spy==0.3.14
+
+# ================================
+# Stage 6: SGL-Router Build
+# ================================
+FROM additional-tools AS router-build
+
+# Install setuptools-rust with cache
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-cache-dir setuptools-rust
+
+# Build sgl-router with Rust cache
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/sgl-workspace/sglang/sgl-router/target \
+    cd /sgl-workspace/sglang/sgl-router \
     && cargo build --release \
-    && python3 -m pip install --no-cache-dir . \
-    && rm -rf /root/.cache
+    && python3 -m pip install --no-cache-dir .
+
+# ================================
+# Final Stage: Cleanup
+# ================================
+FROM router-build AS final
+
+# Clean up build artifacts and caches
+RUN rm -rf /tmp/* \
+    && rm -rf /sgl-workspace/nvshmem \
+    && rm -rf /sgl-workspace/DeepEP \
+    && apt-get autoremove -y \
+    && apt-get clean
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
+
+# Add health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python3 -c "import sglang; print('SGLang is ready')" || exit 1
+
+# Label the image
+LABEL org.opencontainers.image.title="SGLang Default Environment" \
+      org.opencontainers.image.description="Full-featured SGLang environment with NVSHMEM and DeepEP" \
+      environment="default" \
+      cuda_version="${CUDA_VERSION}" \
+      build_type="${BUILD_TYPE}"
