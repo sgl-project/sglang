@@ -1395,7 +1395,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--prefill-round-robin-balance",
-            type=bool,
+            default=ServerArgs.prefill_round_robin_balance,
             action="store_true",
             help="Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank.",
         )
