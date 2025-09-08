@@ -142,7 +142,7 @@ class TestHybridAttnBackendSpeculativeDecodingPrefillBackend(TestHybridAttnBacke
         return DEFAULT_SERVER_ARGS + [
             "--speculative-algorithm",
             "EAGLE",
-            "--speculative-draft",
+            "--speculative-draft-model-path",
             DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
             "--speculative-num-steps",
             "3",
@@ -165,7 +165,7 @@ class TestHybridAttnBackendSpeculativeDecodingDecodeBackend(TestHybridAttnBacken
         return DEFAULT_SERVER_ARGS + [
             "--speculative-algorithm",
             "EAGLE",
-            "--speculative-draft",
+            "--speculative-draft-model-path",
             DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
             "--speculative-num-steps",
             "3",
