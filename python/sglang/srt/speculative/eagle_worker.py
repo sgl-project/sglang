@@ -13,6 +13,7 @@ from sglang.srt.distributed import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import (
@@ -123,7 +124,7 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        with empty_context():
+        with empty_context(), speculative_moe_backend_context():
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -748,9 +749,10 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output, _ = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            )
+            with speculative_moe_backend_context():
+                logits_output, _ = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                )
             self._detect_nan_if_needed(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -946,7 +948,8 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
-        logits_output, _ = self.draft_model_runner.forward(forward_batch)
+        with speculative_moe_backend_context():
+            logits_output, _ = self.draft_model_runner.forward(forward_batch)
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
@@ -1036,9 +1039,10 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.attn_backend.init_forward_metadata(
                     forward_batch
                 )
-            logits_output, _ = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            )
+            with speculative_moe_backend_context():
+                logits_output, _ = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                )
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         self._detect_nan_if_needed(logits_output)
