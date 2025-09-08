@@ -127,7 +127,9 @@ def initialize_moe_config(server_args: ServerArgs):
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
-    SPECULATIVE_MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.speculative_moe_runner_backend)
+    SPECULATIVE_MOE_RUNNER_BACKEND = MoeRunnerBackend(
+        server_args.speculative_moe_runner_backend
+    )
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
@@ -156,7 +158,9 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
 def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
     global SPECULATIVE_MOE_RUNNER_BACKEND
     if SPECULATIVE_MOE_RUNNER_BACKEND is None:
-        logger.warning("SPECULATIVE_MOE_RUNNER_BACKEND is not initialized, using auto backend")
+        logger.warning(
+            "SPECULATIVE_MOE_RUNNER_BACKEND is not initialized, using auto backend"
+        )
         SPECULATIVE_MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return SPECULATIVE_MOE_RUNNER_BACKEND
 

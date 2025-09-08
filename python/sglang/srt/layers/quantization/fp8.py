@@ -30,7 +30,12 @@ except ImportError:
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig, get_moe_runner_backend
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
 from sglang.srt.layers.parameter import (
@@ -526,7 +531,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = self.quant_config.weight_block_size is not None
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         if get_moe_runner_backend().is_cutlass_fp8():
-            assert cutlass_fp8_supported(), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            assert (
+                cutlass_fp8_supported()
+            ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert is_sm100_supported() or is_sm90_supported()
 
