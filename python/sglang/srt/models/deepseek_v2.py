@@ -1266,7 +1266,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
 
-        if _is_cuda:
+        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
+        if (
+            _is_cuda
+            and (self.num_local_heads == 128)
+            and (self.qk_nope_head_dim == 128)
+            and (self.qk_rope_head_dim == 64)
+        ):
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
         else:
             k[..., : self.qk_nope_head_dim] = k_nope
