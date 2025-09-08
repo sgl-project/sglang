@@ -23,8 +23,8 @@ from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_
 from sgl_kernel.elementwise import (
     FusedSetKVBufferArg,
     apply_rope_with_cos_sin_cache_inplace,
-    copy_to_gpu_no_ce,
     concat_mla_k,
+    copy_to_gpu_no_ce,
     downcast_fp8,
     fused_add_rmsnorm,
     gelu_and_mul,
