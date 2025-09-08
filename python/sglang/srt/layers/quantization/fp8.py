@@ -656,7 +656,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 self.c_strides2 = torch.full(
                     (num_experts,),
-                    intermediate_size_per_partition,
+                    hidden_size,
                     device=w2_weight.device,
                     dtype=torch.int64,
                 )

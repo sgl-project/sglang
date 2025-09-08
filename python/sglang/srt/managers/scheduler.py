@@ -656,6 +656,21 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                 )
+            elif server_args.enable_lmcache:
+                from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
+                    LMCRadixCache,
+                )
+
+                self.tree_cache = LMCRadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                    disable=server_args.disable_radix_cache,
+                    model_config=self.model_config,
+                    tp_size=self.tp_size,
+                    rank=self.tp_rank,
+                    tp_group=self.tp_group,
+                )
             else:
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
@@ -1411,9 +1426,11 @@ class Scheduler(
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
             memory_leak = (available_size + evictable_size) != (
+                # self.max_total_num_tokens
+                # if not self.enable_hierarchical_cache
+                # else self.max_total_num_tokens - protected_size
                 self.max_total_num_tokens
-                if not self.enable_hierarchical_cache
-                else self.max_total_num_tokens - protected_size
+                - protected_size
             )
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 

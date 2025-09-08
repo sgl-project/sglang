@@ -704,6 +704,24 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+def _init_tokenizer_manager(
+    server_args: ServerArgs, port_args: PortArgs
+) -> TokenizerManager:
+    # Launch tokenizer process
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+
+    # Initialize templates
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
+
+    return tokenizer_manager, template_manager
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
 ) -> Tuple[TokenizerManager, TemplateManager, Dict]:
@@ -816,23 +834,15 @@ def _launch_subprocesses(
         ),
     )
     detoken_proc.start()
+
+    # Init tokenizer manager first, as the bootstrap server is initialized here
     if server_args.tokenizer_worker_num > 1:
         # Launch multi-tokenizer router
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-
-        # Initialize templates
         template_manager = None
     else:
-        # Launch tokenizer process
-        tokenizer_manager = TokenizerManager(server_args, port_args)
-
-        # Initialize templates
-        template_manager = TemplateManager()
-        template_manager.initialize_templates(
-            tokenizer_manager=tokenizer_manager,
-            model_path=server_args.model_path,
-            chat_template=server_args.chat_template,
-            completion_template=server_args.completion_template,
+        tokenizer_manager, template_manager = _init_tokenizer_manager(
+            server_args, port_args
         )
 
     # Wait for the model to finish loading
@@ -856,5 +866,7 @@ def _launch_subprocesses(
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
+
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
     return tokenizer_manager, template_manager, scheduler_info
