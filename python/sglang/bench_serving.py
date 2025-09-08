@@ -701,12 +701,12 @@ def get_dataset(args, tokenizer):
         # For mooncake, we don't generate the prompts here.
         # We just load the raw trace data. The async generator will handle the rest.
         if not args.dataset_path:
-            local_path = os.path.join("/tmp", "conversation_trace.jsonl")
+            local_path = os.path.join("/tmp",  args.mooncake_workload + "_trace.jsonl")
         else:
             local_path = args.dataset_path
 
         if not os.path.exists(local_path):
-            download_and_cache_file(MOONCAKE_DATASET_URL, local_path)
+            download_and_cache_file(MOONCAKE_DATASET_URL[args.mooncake_workload], local_path)
 
         with open(local_path, "r") as f:
             all_requests_data = [json.loads(line) for line in f if line.strip()]
@@ -767,7 +767,12 @@ class BenchmarkMetrics:
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-MOONCAKE_DATASET_URL = "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl"
+MOONCAKE_DATASET_URL = {
+    "mooncake": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl",
+    "conversation": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl",
+    "synthetic": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/synthetic_trace.jsonl",
+    "toolagent": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/toolagent_trace.jsonl",
+}
 
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
@@ -2371,6 +2376,18 @@ if __name__ == "__main__":
         default=1,
         help="Number of conversation rounds for each session in the mooncake dataset. "
         "A value > 1 will enable true multi-turn session benchmarking.",
+    )
+    mooncake_group.add_argument(
+        "--mooncake-workload",
+        type=str,
+        default="conversation",
+        choices=[
+            "mooncake",
+            "conversation",
+            "synthetic",
+            "toolagent",
+        ],
+        help="Underlying workload for the mooncake dataset.",
     )
     args = parser.parse_args()
     run_benchmark(args)
