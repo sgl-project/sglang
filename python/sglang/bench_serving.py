@@ -701,12 +701,14 @@ def get_dataset(args, tokenizer):
         # For mooncake, we don't generate the prompts here.
         # We just load the raw trace data. The async generator will handle the rest.
         if not args.dataset_path:
-            local_path = os.path.join("/tmp",  args.mooncake_workload + "_trace.jsonl")
+            local_path = os.path.join("/tmp", args.mooncake_workload + "_trace.jsonl")
         else:
             local_path = args.dataset_path
 
         if not os.path.exists(local_path):
-            download_and_cache_file(MOONCAKE_DATASET_URL[args.mooncake_workload], local_path)
+            download_and_cache_file(
+                MOONCAKE_DATASET_URL[args.mooncake_workload], local_path
+            )
 
         with open(local_path, "r") as f:
             all_requests_data = [json.loads(line) for line in f if line.strip()]
