@@ -5,14 +5,17 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    parallel_state,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
@@ -22,7 +25,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, set_weight_attrs
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_compiler_backend,
+    is_cpu,
+    set_weight_attrs,
+)
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -30,44 +39,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
-
-
-class UnquantizedEmbeddingMethod(QuantizeMethodBase):
-    """Unquantized method for embeddings."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        """Create weights for embedding layer."""
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-        layer.register_parameter("weight", weight)
-        set_weight_attrs(weight, extra_weight_attrs)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return F.linear(x, layer.weight, bias)
-
-    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input_, layer.weight)
 
 
 def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
@@ -151,7 +122,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.jit.script
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,
@@ -160,7 +131,7 @@ def get_masked_input_and_mask(
     added_vocab_start_index: int,
     added_vocab_end_index: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # torch.jit.script will fuse all of the pointwise ops below
+    # torch.compile will fuse all of the pointwise ops below
     # into a single kernel, making it very fast
     org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
     added_vocab_mask = (input_ >= added_vocab_start_index) & (
@@ -502,7 +473,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
         # Get the embeddings.
-        output_parallel = self.quant_method.embedding(self, masked_input.long())
+        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            output_parallel = self.quant_method.embedding(self, masked_input.long())
+            sm.tag(output_parallel)
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
@@ -569,8 +542,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         if _is_cpu and _is_cpu_amx_available:
             if hasattr(self, "weight") and self.weight.dtype == torch.bfloat16:
                 self.quant_method = PackWeightMethod(weight_names=["weight"])
-        else:
-            logger.warning("The weight of LmHead is not packed")
 
         if bias:
             self.bias = Parameter(

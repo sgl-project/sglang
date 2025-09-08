@@ -102,14 +102,13 @@ def is_sm90_supported(device=None) -> bool:
     not (is_sm100_supported() or is_sm90_supported()),
     reason="fp8_blockwise_scaled_grouped_mm at sgl-kernel is only supported on sm100 or sm90",
 )
-@pytest.mark.parametrize("num_experts", [8, 16])
+@pytest.mark.parametrize("num_experts", [8, 16, 32, 64, 128])
 @pytest.mark.parametrize("out_dtype", [torch.half, torch.bfloat16])
 def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
-    cc = torch.cuda.get_device_capability(None)[0]
     device = "cuda"
-    alignment = 16
-    n_g = alignment * random.randint(1, 5) * 128
-    k_g = alignment * random.randint(1, 5) * 128
+    alignment = 128
+    n_g = random.randint(1, 64) * 128
+    k_g = random.randint(1, 64) * 128
 
     expert_offsets = torch.zeros((num_experts + 1), device=device, dtype=torch.int32)
     problem_sizes = torch.zeros((num_experts, 3), device=device, dtype=torch.int32)
@@ -123,7 +122,7 @@ def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
     baseline_tensors = []
 
     for g in range(num_experts):
-        m_g = alignment * random.randint(1, 64)
+        m_g = random.randint(1, 256)
         expert_offsets[g + 1] = expert_offsets[g] + m_g
         problem_sizes[g][:] = torch.tensor([m_g, n_g, k_g], device=device)
 
@@ -143,50 +142,35 @@ def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
 
         baseline = torch.mm(a, b)
         baseline_tensors.append(baseline)
-
     a_stack = torch.empty(
         (expert_offsets[-1], k_g), device=device, dtype=torch.float8_e4m3fn
     )
     b_stack = torch.empty(
         (num_experts, n_g, k_g), device=device, dtype=torch.float8_e4m3fn
     )
+    a_scale_stack = torch.empty(
+        (expert_offsets[-1], (k_g // 128)), device=device, dtype=torch.float32
+    )
+    b_scale_stack = torch.empty(
+        (num_experts, n_g // 128, k_g // 128), device=device, dtype=torch.float32
+    )
 
     for g in range(num_experts):
         # Matrix A is Row-Major.
-        a_stack[expert_offsets[g] : expert_offsets[g + 1]] = a_tensors[
+        a_stack[expert_offsets[g] : expert_offsets[g + 1], :] = a_tensors[
             g
-        ]  # a_stack[expert_offsets[g] : expert_offsets[g + 1]] -- (M, K):(K, 1)
+        ]  # a_stack[expert_offsets[g] : expert_offsets[g + 1], :] -- (M, K):(K, 1)
         b_stack[g] = b_tensors[g].t()  # b_stack[g] -- (N, K):(K, 1)
+
+        # We need K-Major scale factor
+        a_scale_stack[expert_offsets[g] : expert_offsets[g + 1], :] = a_scales_tensors[
+            g
+        ]
+        b_scale_stack[g] = b_scales_tensors[
+            g
+        ].t()  # b_scale_stack[g] -- (k, n):(n, 1), we need transpose & contiguous later
     b_stack = b_stack.transpose(1, 2)  # Transpose Matrix B to Column-Major.
-
-    a_scale_stack = torch.empty(
-        (expert_offsets[-1] * (k_g // 128)), device=device, dtype=torch.float32
-    )
-    b_scale_stack = torch.empty(
-        (num_experts, k_g // 128, n_g // 128), device=device, dtype=torch.float32
-    )
-
-    for g in range(num_experts):
-        if cc == 9:
-            # For SM90, we need MN-Major scale factor
-            # a_scales_tensors[g] -- (M, k):(k, 1)
-            # a_scales_tensors[g].t().contiguous() -- (k, M):(M, 1)
-            a_scale_stack[
-                expert_offsets[g] * (k_g // 128) : expert_offsets[g + 1] * (k_g // 128)
-            ] = (a_scales_tensors[g].t().contiguous().view(-1))
-            b_scale_stack[g] = b_scales_tensors[g]  # b_scale_stack[g] -- (k, n):(n, 1)
-        elif cc == 10:
-            # For SM100, we need K-Major scale factor
-            # a_scales_tensors[g] -- (M, k):(k, 1)
-            a_scale_stack[
-                expert_offsets[g] * (k_g // 128) : expert_offsets[g + 1] * (k_g // 128)
-            ] = a_scales_tensors[g].view(-1)
-            b_scale_stack[g] = b_scales_tensors[
-                g
-            ]  # b_scale_stack[g] -- (k, n):(n, 1), we need transpose & contiguous later
-    a_scale_stack = a_scale_stack.view(expert_offsets[-1], k_g // 128)
-    if cc == 10:
-        b_scale_stack = b_scale_stack.transpose(1, 2).contiguous()
+    b_scale_stack = b_scale_stack.transpose(1, 2)
 
     c_out = torch.empty((expert_offsets[-1], n_g), device=device, dtype=out_dtype)
     a_strides = torch.full(
@@ -229,7 +213,7 @@ def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
         diff = calc_diff(actual, baseline)
         assert diff < 0.001
         print(
-            f"cc={cc}0 num_experts={num_experts}, out_dtype={out_dtype}, diff={diff:.5f}: OK"
+            f"m_g={baseline.shape[0]} n_g={n_g} k_g={k_g} num_experts={num_experts}, out_dtype={out_dtype}, diff={diff:.5f}: OK"
         )
 
 
