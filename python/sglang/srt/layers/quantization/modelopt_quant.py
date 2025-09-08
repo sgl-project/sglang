@@ -13,8 +13,8 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
-    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -523,7 +523,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
-        if should_use_flashinfer_trtllm_moe():
+        if get_moe_runner_backend().is_flashinfer_trtllm():
             from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
 
             # 1) Swap W13 halves: [Up, Gate] -> [Gate, Up] expected by FI
@@ -565,7 +565,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         # Precompute and register per-expert output scaling factors for FI MoE
-        if should_use_flashinfer_trtllm_moe():
+        if get_moe_runner_backend().is_flashinfer_trtllm():
             # Note: w13_input_scale and w2_input_scale are scalar Parameters post-reduction
             assert (
                 hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
@@ -617,8 +617,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-        if should_use_flashinfer_trtllm_moe() and TopKOutputChecker.format_is_bypassed(
-            topk_output
+        if (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            and TopKOutputChecker.format_is_bypassed(topk_output)
         ):
             router_logits = topk_output.router_logits
             topk_config = topk_output.topk_config
@@ -1068,7 +1069,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " quantization. Please use Blackwell and"
                 " above."
             )
-        self.enable_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
+        self.enable_flashinfer_trtllm_moe = (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+        )
         self._cache_permute_indices = {}
 
     @property
