@@ -85,7 +85,7 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__()
-
+        self.first_init = True
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
@@ -281,33 +281,36 @@ class FlashInferAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        if kv_indices_buf is None:
-            cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len,),
-                dtype=torch.int32,
-                device="cuda",
-            )
-        else:
-            cuda_graph_kv_indices = kv_indices_buf
+        if self.first_init:
+            if kv_indices_buf is None:
+                cuda_graph_kv_indices = torch.zeros(
+                    (max_num_tokens * self.max_context_len,),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+            else:
+                cuda_graph_kv_indices = kv_indices_buf
 
-        self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
-            cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
-        ]
+            self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
+                cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
+            ]
 
-        # Ensure tensors are properly allocated
-        for i in range(self.num_wrappers):
-            # Force allocation by performing a small operation
-            if len(self.cuda_graph_kv_indices[i]) > 0:
-                self.cuda_graph_kv_indices[i][0] = 0
+            # Ensure tensors are properly allocated
+            for i in range(self.num_wrappers):
+                # Force allocation by performing a small operation
+                if len(self.cuda_graph_kv_indices[i]) > 0:
+                    self.cuda_graph_kv_indices[i][0] = 0
 
-        if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device="cuda",
-            )
-            self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
-            self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
+            if not self.skip_prefill:
+                self.cuda_graph_custom_mask = torch.zeros(
+                    (max_num_tokens * self.max_context_len),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
+                self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
+
+            self.first_init = False
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -318,6 +321,7 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        extend_prefix_lens: Optional[torch.Tensor] = None,
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
@@ -381,7 +385,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend() or forward_mode.is_extend():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
                 prefill_wrappers.append(
@@ -403,13 +407,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens,
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
-                prefix_lens=None,
+                prefix_lens=extend_prefix_lens if forward_mode.is_extend() else None,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            if forward_mode.is_extend():
+                if seq_lens_sum not in self.prefill_cuda_graph_metadata:
+                    self.prefill_cuda_graph_metadata[seq_lens_sum] = {}
+                self.prefill_cuda_graph_metadata[seq_lens_sum][bs] = prefill_wrappers
+            else:
+                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -424,6 +433,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        extend_prefix_lens: Optional[torch.Tensor] = None,
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -447,14 +457,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend() or forward_mode.is_extend():
+            if forward_mode.is_extend():
+                prefill_cuda_graph_metadata_tmp = self.prefill_cuda_graph_metadata[
+                    seq_lens_sum
+                ][bs]
+            else:
+                prefill_cuda_graph_metadata_tmp = self.prefill_cuda_graph_metadata[bs]
+            prefix_lens = extend_prefix_lens if forward_mode.is_extend() else None
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefix_lens=prefix_lens,
+                prefill_wrappers=prefill_cuda_graph_metadata_tmp,
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -1006,11 +1023,15 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + 256,
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
+            if wrapper_paged.is_cuda_graph_enabled:
+                # Directly write to the cuda graph input buffer
+                kv_indices = wrapper_paged._paged_kv_indices_buf
+            else:
+                kv_indices = torch.empty(
+                    paged_kernel_lens_sum + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
