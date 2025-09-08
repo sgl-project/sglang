@@ -260,6 +260,8 @@ class W8A8Int8Config(QuantizationConfig):
 
         if _is_npu:
             if isinstance(layer, LinearBase):
+                if "decoder" in prefix:
+                    prefix = prefix.replace("decoder", "layers.61")
                 key = "model"
                 if "vision_model" in prefix:
                     key = "vision_model"

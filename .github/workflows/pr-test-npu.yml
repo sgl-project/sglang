@@ -53,6 +53,7 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          STREAMS_PER_DEVICE: 32
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-1-ascend-npu
@@ -88,6 +89,7 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          STREAMS_PER_DEVICE: 32
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-2-ascend-npu
@@ -123,6 +125,7 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          STREAMS_PER_DEVICE: 32
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-4-ascend-npu --timeout-per-file 3600

@@ -802,9 +802,11 @@ class CudaGraphRunner:
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
+            raw_bs = forward_batch.batch_size
+            raw_num_token = raw_bs * self.num_tokens_per_bs
             # In speculative decoding, these two fields are still needed.
-            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+            self.positions[:raw_num_token].copy_(forward_batch.positions)
 
         # Replay
         self.graphs[self.bs].replay()

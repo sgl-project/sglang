@@ -246,6 +246,7 @@ class LogitsProcessor(nn.Module):
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
+            or logits_metadata.forward_mode.is_draft_extend_v2()
         ):
             pruned_states = hidden_states
             if aux_hidden_states is not None:
@@ -257,21 +258,22 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
-            if logits_metadata.padded_static_len < 0:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
-            else:
-                # If padding_static length is 5 and extended_seq_lens is [2, 3],
-                # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-                # and this retrieves t01 and t12, which are the valid last tokens
-                idx = torch.arange(
-                    len(logits_metadata.extend_seq_lens),
-                    device=logits_metadata.extend_seq_lens.device,
-                )
-                last_index = (
-                    idx * logits_metadata.padded_static_len
-                    + logits_metadata.extend_seq_lens
-                    - 1
-                )
+            # if logits_metadata.padded_static_len < 0:
+            #     last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            # else:
+            #     # If padding_static length is 5 and extended_seq_lens is [2, 3],
+            #     # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
+            #     # and this retrieves t01 and t12, which are the valid last tokens
+            #     idx = torch.arange(
+            #         len(logits_metadata.extend_seq_lens),
+            #         device=logits_metadata.extend_seq_lens.device,
+            #     )
+            #     last_index = (
+            #         idx * logits_metadata.padded_static_len
+            #         + logits_metadata.extend_seq_lens
+            #         - 1
+            #     )
+            last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]

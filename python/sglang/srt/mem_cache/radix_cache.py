@@ -493,6 +493,18 @@ class RadixCache(BasePrefixCache):
 
         return ret_list
 
+    def evictable_kv_indices(self):
+        # return a list of all kv indices stored in the tree
+        ret_list = []
+        stack = [self.root_node]
+
+        while stack:
+            cur_node = stack.pop()
+            if len(cur_node.value) > 0:
+                ret_list.extend(cur_node.value.tolist())
+            stack.extend(cur_node.children.values())
+        return ret_list
+
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
