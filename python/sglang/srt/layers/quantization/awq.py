@@ -117,11 +117,7 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        return (
-            [torch.float16]
-            if not _is_npu
-            else [torch.float16, torch.bfloat16]
-        )
+        return [torch.float16] if not _is_npu else [torch.float16, torch.bfloat16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -165,7 +161,7 @@ class AWQConfig(QuantizationConfig):
             elif isinstance(layer, FusedMoE):
                 return AWQMoEAscendMethod(self)
             return None
-        
+
         if isinstance(layer, LinearBase):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
@@ -593,6 +589,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
             bias=bias,
         )
 
+
 class AWQLinearAscendMethod(AWQLinearMethod):
     """Linear method for AWQ on Ascend.
 
@@ -607,11 +604,13 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         qzeros_list = []
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
 
-        for i in range(0,self.quant_config.pack_factor):
+        for i in range(0, self.quant_config.pack_factor):
             shift_num = shifts[i] * 4
             qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
-            qweight_tmp.bitwise_or_(((layer.qweight.data >> shift_num) * (2 ** (4*i))) & (0xF << (4*i)))
-        
+            qweight_tmp.bitwise_or_(
+                ((layer.qweight.data >> shift_num) * (2 ** (4 * i))) & (0xF << (4 * i))
+            )
+
         qweight_tmp.bitwise_xor_(0x88888888)
 
         qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
@@ -636,7 +635,7 @@ class AWQLinearAscendMethod(AWQLinearMethod):
 
         if bias is not None and bias.dtype == torch.bfloat16:
             bias = bias.float()
-        
+
         out = torch_npu.npu_weight_quant_batchmatmul(
             reshaped_x,
             qweight,
@@ -647,7 +646,8 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         )
 
         return out.reshape(out_shape)
-    
+
+
 class AWQMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: AWQMarlinConfig):
@@ -860,6 +860,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         ).to(orig_dtype)
         return StandardCombineInput(hidden_states=output)
 
+
 def npu_fused_experts(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -935,6 +936,7 @@ def npu_fused_experts(
         final_hidden_states = final_hidden_states.view(original_shape)
     return final_hidden_states
 
+
 class AWQMoEAscendMethod(AWQMoEMethod):
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
@@ -945,32 +947,54 @@ class AWQMoEAscendMethod(AWQMoEMethod):
         w13_qzeros_list = []
         w2_qzeros_list = []
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-        for i in range(0,self.quant_config.pack_factor):
+        for i in range(0, self.quant_config.pack_factor):
             shift_num = shifts[i] * 4
-            w13_qzeros_list.append((layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF)
-            w2_qzeros_list.append((layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF)
-            w13_qweight_tmp.bitwise_or_(((layer.w13_qweight.data >> shift_num) * (2 ** (4*i))) & (0xF << (4*i)))
-            w2_qweight_tmp.bitwise_or_(((layer.w2_qweight.data >> shift_num) * (2 ** (4*i))) & (0xF << (4*i)))
-        
+            w13_qzeros_list.append(
+                (layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
+            )
+            w2_qzeros_list.append(
+                (layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
+            )
+            w13_qweight_tmp.bitwise_or_(
+                ((layer.w13_qweight.data >> shift_num) * (2 ** (4 * i)))
+                & (0xF << (4 * i))
+            )
+            w2_qweight_tmp.bitwise_or_(
+                ((layer.w2_qweight.data >> shift_num) * (2 ** (4 * i)))
+                & (0xF << (4 * i))
+            )
+
         w13_qweight_tmp.bitwise_xor_(0x88888888)
         w2_qweight_tmp.bitwise_xor_(0x88888888)
 
-        w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1)
+        w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
+            layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
+        )
         w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
         w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
-        w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1)
+        w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
+            layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
+        )
         w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
         w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
 
-        layer.register_parameter("w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False))
-        layer.register_parameter("w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False))
-        layer.register_parameter("w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False))
-        layer.register_parameter("w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False))
+        layer.register_parameter(
+            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
+        )
+        layer.register_parameter(
+            "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
+        )
+        layer.register_parameter(
+            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
+        )
+        layer.register_parameter(
+            "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
+        )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        self.moe_runner_config = moe_runner_config  
+        self.moe_runner_config = moe_runner_config
 
     def apply(
         self,
@@ -980,7 +1004,7 @@ class AWQMoEAscendMethod(AWQMoEMethod):
         assert (
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
-        
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 

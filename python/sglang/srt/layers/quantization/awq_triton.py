@@ -338,6 +338,7 @@ def awq_gemm_triton(
 
     return result
 
+
 def awq_dequantize_decomposition(
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -352,7 +353,16 @@ def awq_dequantize_decomposition(
         shift_num = shifts[i] * 4
         qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
         qweight_list.append((qweight_tmp.reshape(-1, 1) >> shift_num) & 0xF)
-    qzeros_tmp = torch.cat(qzeros_list,dim=-1).reshape(qzeros_tmp.shape[0], -1).to(scales.dtype)
-    qweight_tmp = torch.cat(qweight_list,dim=-1).reshape(qweight_tmp.shape[0], -1).to(scales.dtype)
-    res = (qweight_tmp.reshape(qzeros_tmp.shape[0],-1,qzeros_tmp.shape[1]) - qzeros_tmp.unsqueeze(1)) * scales.unsqueeze(1)
-    return res.reshape(qweight_tmp.shape[0],-1)
+    qzeros_tmp = (
+        torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1).to(scales.dtype)
+    )
+    qweight_tmp = (
+        torch.cat(qweight_list, dim=-1)
+        .reshape(qweight_tmp.shape[0], -1)
+        .to(scales.dtype)
+    )
+    res = (
+        qweight_tmp.reshape(qzeros_tmp.shape[0], -1, qzeros_tmp.shape[1])
+        - qzeros_tmp.unsqueeze(1)
+    ) * scales.unsqueeze(1)
+    return res.reshape(qweight_tmp.shape[0], -1)

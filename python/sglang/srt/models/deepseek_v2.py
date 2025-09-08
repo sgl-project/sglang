@@ -165,7 +165,9 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 elif _is_npu:
-    from sglang.srt.layers.quantization.awq_triton import awq_dequantize_decomposition as awq_dequantize
+    from sglang.srt.layers.quantization.awq_triton import (
+        awq_dequantize_decomposition as awq_dequantize,
+    )
 else:
     from vllm._custom_ops import awq_dequantize
 
