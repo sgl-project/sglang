@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
@@ -729,6 +730,14 @@ class EAGLEWorker(TpModelWorker):
 
             # Set inputs
             forward_batch.input_ids = input_ids
+            # This is a temporary fix for the case that the user is using standalone
+            # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
+            # rope kernel needs cache_loc to be contiguous.
+            if (
+                self.server_args.speculative_algorithm == "STANDALONE"
+                and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
+            ):
+                out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
