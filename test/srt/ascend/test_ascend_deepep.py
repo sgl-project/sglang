@@ -44,8 +44,7 @@ class TestAscendDeepEP(CustomTestCase):
             "--disable-radix-cache",
             "--chunked-prefill-size",
             32768,
-            "--cuda-graph-max-bs",
-            32,
+            "--disable-cuda-graph",
             "--tp-size",
             16,
             "--dp-size",
@@ -72,7 +71,7 @@ class TestAscendDeepEP(CustomTestCase):
                 process = popen_launch_server(
                     model,
                     self.base_url,
-                    timeout=3600,
+                    timeout=1500,
                     other_args=[
                         *self.common_args,
                     ],
