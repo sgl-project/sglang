@@ -21,8 +21,10 @@ from sglang.srt.utils import is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
+        DeepEPNormalOutput,
         StandardDispatchOutput,
     )
 
