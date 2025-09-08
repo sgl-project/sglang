@@ -106,6 +106,8 @@ DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
+MOE_RUNNER_BACKEND_CHOICES = ["auto", "triton", "triton_kernel", "flashinfer_trtllm", "flashinfer_cutlass", "flashinfer_mxfp4"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -263,18 +265,12 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_backend: str = "prefill"
+    speculative_moe_runner_backend: Literal[*MOE_RUNNER_BACKEND_CHOICES] = "auto"
 
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep"] = "none"
-    moe_runner_backend: Literal[
-        "auto",
-        "triton",
-        "triton_kernel",
-        "flashinfer_trtllm",
-        "flashinfer_cutlass",
-        "flashinfer_mxfp4",
-    ] = "auto"
+    moe_runner_backend: Literal[*MOE_RUNNER_BACKEND_CHOICES] = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
@@ -1569,6 +1565,13 @@ class ServerArgs:
             help="Attention backend to use for speculative decoding operations (both target verify and draft extend). 'prefill' (default) or 'decode'.",
             default=ServerArgs.speculative_attention_backend,
         )
+        parser.add_argument(
+            "--speculative-moe-runner-backend",
+            type=str,
+            choices=MOE_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.speculative_moe_runner_backend,
+            help="Choose the runner backend for MoE in speculative decoding.",
+        )
 
         # Expert parallelism
         parser.add_argument(
@@ -1589,14 +1592,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-runner-backend",
             type=str,
-            choices=[
-                "auto",
-                "triton",
-                "triton_kernel",
-                "flashinfer_trtllm",
-                "flashinfer_cutlass",
-                "flashinfer_mxfp4",
-            ],
+            choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
@@ -102,6 +103,7 @@ class DeepEPMode(Enum):
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
+SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
@@ -112,6 +114,7 @@ DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 def initialize_moe_config(server_args: ServerArgs):
     global MOE_A2A_BACKEND
     global MOE_RUNNER_BACKEND
+    global SPECULATIVE_MOE_RUNNER_BACKEND
     global DEEPEP_MODE
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
@@ -120,6 +123,7 @@ def initialize_moe_config(server_args: ServerArgs):
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
+    SPECULATIVE_MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.speculative_moe_runner_backend)
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
@@ -143,6 +147,14 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
         logger.warning("MOE_RUNNER_BACKEND is not initialized, using triton backend")
         MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND
+
+
+def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
+    global SPECULATIVE_MOE_RUNNER_BACKEND
+    if SPECULATIVE_MOE_RUNNER_BACKEND is None:
+        logger.warning("SPECULATIVE_MOE_RUNNER_BACKEND is not initialized, using auto backend")
+        SPECULATIVE_MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
+    return SPECULATIVE_MOE_RUNNER_BACKEND
 
 
 def get_deepep_mode() -> DeepEPMode:
@@ -199,3 +211,18 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and is_dp_attention_enabled()
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
     )
+
+
+@contextmanager
+def speculative_moe_backend_context():
+    """
+    Context manager to temporarily use the speculative MoE backend for draft model operations.
+    This ensures that draft models in speculative decoding use the configured speculative backend.
+    """
+    global MOE_RUNNER_BACKEND
+    original_backend = MOE_RUNNER_BACKEND
+    try:
+        MOE_RUNNER_BACKEND = get_speculative_moe_runner_backend()
+        yield
+    finally:
+        MOE_RUNNER_BACKEND = original_backend
