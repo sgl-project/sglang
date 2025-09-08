@@ -72,6 +72,10 @@ DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE = "nytopop/Qwen3-30B-A3B.w8a8"
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
 DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
+DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
+    "meta-llama/Llama-3.1-8B-Instruct"
+)
+DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 
 # Other use cases
 DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
@@ -464,6 +468,25 @@ def _get_default_models():
 def try_cached_model(model_repo: str):
     model_dir = _use_cached_default_models(model_repo)
     return model_dir if model_dir else model_repo
+
+
+def popen_with_error_check(command: list[str], allow_exit: bool = False):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _run_and_check():
+        stdout, stderr = process.communicate()
+
+        while process.poll() is None:
+            time.sleep(5)
+
+        if not allow_exit or process.returncode != 0:
+            raise Exception(
+                f"{command} exited with code {process.returncode}\n{stdout=}\n{stderr=}"
+            )
+
+    t = threading.Thread(target=_run_and_check)
+    t.start()
+    return process
 
 
 def popen_launch_server(

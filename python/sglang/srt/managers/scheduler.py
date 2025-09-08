@@ -85,7 +85,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MultiTokenizerRegisterReq,
-    MultiTokenizerWarpper,
+    MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -158,6 +158,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     is_cpu,
     kill_itself_when_parent_died,
+    numa_bind_to_node,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
     require_mlp_sync,
@@ -348,6 +349,18 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+        elif self.spec_algorithm.is_standalone():
+            from sglang.srt.speculative.standalone_worker import StandaloneWorker
+
+            self.draft_worker = StandaloneWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
         else:
             self.draft_worker = None
 
@@ -401,7 +414,7 @@ class Scheduler(
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
-                f"available_gpu_mem={avail_mem:.2f} GB"
+                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
         # Init memory pool and cache
@@ -488,7 +501,7 @@ class Scheduler(
             enable=server_args.enable_memory_saver
         )
         self.offload_tags = set()
-        self.init_profier()
+        self.init_profiler()
 
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
@@ -500,6 +513,7 @@ class Scheduler(
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
         self.init_kv_events(server_args.kv_events_config)
+        self.init_dp_balance(dp_balance_meta)
 
         # Init disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -544,15 +558,6 @@ class Scheduler(
                 (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
             ]
         )
-
-        self.balance_meta = dp_balance_meta
-        if (
-            server_args.enable_dp_attention
-            and server_args.load_balance_method == "minimum_tokens"
-        ):
-            assert dp_balance_meta is not None
-
-        self.recv_dp_balance_id_this_term = []
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -630,6 +635,7 @@ class Scheduler(
                     hicache_write_policy=server_args.hicache_write_policy,
                     hicache_io_backend=server_args.hicache_io_backend,
                     hicache_mem_layout=server_args.hicache_mem_layout,
+                    enable_metrics=self.enable_metrics,
                     hicache_storage_backend=server_args.hicache_storage_backend,
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                     model_name=server_args.served_model_name,
@@ -661,6 +667,21 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                )
+            elif server_args.enable_lmcache:
+                from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
+                    LMCRadixCache,
+                )
+
+                self.tree_cache = LMCRadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                    disable=server_args.disable_radix_cache,
+                    model_config=self.model_config,
+                    tp_size=self.tp_size,
+                    rank=self.tp_rank,
+                    tp_group=self.tp_group,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -1104,13 +1125,13 @@ class Scheduler(
                     self.send_to_tokenizer.send_pyobj(abort_req)
                     continue
 
-            # If it is a MultiTokenizerWarpper, unwrap it and handle the inner request.
-            if isinstance(recv_req, MultiTokenizerWarpper):
+            # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
+            if isinstance(recv_req, MultiTokenizerWrapper):
                 worker_id = recv_req.worker_id
                 recv_req = recv_req.obj
                 output = self._request_dispatcher(recv_req)
                 if output is not None:
-                    output = MultiTokenizerWarpper(worker_id, output)
+                    output = MultiTokenizerWrapper(worker_id, output)
                     self.send_to_tokenizer.send_pyobj(output)
                 continue
 
@@ -1126,11 +1147,7 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        if (
-            self.server_args.enable_dp_attention
-            and self.server_args.load_balance_method == "minimum_tokens"
-        ):
-            self.recv_dp_balance_id_this_term.append(recv_req.dp_balance_id)
+        self.maybe_update_dp_balance_data(recv_req)
 
         # Create a new request
         if (
@@ -1421,9 +1438,11 @@ class Scheduler(
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
             memory_leak = (available_size + evictable_size) != (
+                # self.max_total_num_tokens
+                # if not self.enable_hierarchical_cache
+                # else self.max_total_num_tokens - protected_size
                 self.max_total_num_tokens
-                if not self.enable_hierarchical_cache
-                else self.max_total_num_tokens - protected_size
+                - protected_size
             )
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
@@ -1568,11 +1587,7 @@ class Scheduler(
 
         # Handle DP attention
         if need_dp_attn_preparation:
-            if (
-                self.server_args.load_balance_method == "minimum_tokens"
-                and self.forward_ct % 40 == 0
-            ):
-                self.handle_dp_balance_data(ret)
+            self.maybe_handle_dp_balance_data()
             ret = self.prepare_mlp_sync_batch(ret)
 
         return ret
@@ -1896,86 +1911,6 @@ class Scheduler(
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )
-
-    def handle_dp_balance_data(self, local_batch: ScheduleBatch):
-        def gather_dp_balance_info(holding_tokens_list) -> Union[None, List[List[int]]]:
-            """gather recv_dp_balance_id_this_term and holding tokens per worker for dp balance"""
-            recv_list = self.recv_dp_balance_id_this_term
-            assert len(recv_list) <= 511, (
-                "The number of requests received this round is too large. "
-                "Please increase gather_tensor_size and onfly_info_size."
-            )
-            # The maximum size of the tensor used for gathering data from all workers.
-            gather_tensor_size = 512
-
-            # recv_tensor: | holding_tokens | len(recv_dp_balance_id) | recv_dp_balance_ids
-            recv_tensor = torch.zeros(gather_tensor_size, dtype=torch.int32)
-            recv_tensor[0] = holding_tokens_list
-            recv_tensor[1] = len(
-                recv_list
-            )  # The first element is the length of the list.
-            recv_tensor[2 : len(recv_list) + 2] = torch.tensor(
-                recv_list, dtype=torch.int32
-            )
-
-            if self.tp_rank == 0:
-                gathered_list = [
-                    torch.zeros(gather_tensor_size, dtype=torch.int32)
-                    for _ in range(self.balance_meta.num_workers)
-                ]
-            else:
-                gathered_list = None
-
-            torch.distributed.gather(
-                recv_tensor, gathered_list, group=self.tp_cpu_group
-            )
-
-            gathered_id_list_per_worker = None
-            if self.tp_rank == 0:
-                gathered_id_list_per_worker = []
-                holding_tokens_list = []
-                for tensor in gathered_list:
-                    holding_tokens_list.append(tensor[0].item())
-                    list_length = tensor[1].item()
-                    gathered_id_list_per_worker.append(
-                        tensor[2 : list_length + 2].tolist()
-                    )
-
-            return gathered_id_list_per_worker, holding_tokens_list
-
-        def write_shared_dp_balance_info(new_recv_rid_lists, local_tokens):
-            meta = self.balance_meta
-
-            with meta.mutex:
-                onfly_list: List[Dict[int, int]] = meta.get_shared_onfly()
-                assert len(new_recv_rid_lists) == len(
-                    onfly_list
-                ), "num_worker not equal"
-                # 1.Check if the rid received by each worker this round is present in onfly.
-                #   If it is, remove the corresponding onfly item.
-                worker_id = 0
-                for new_recv_rids, on_fly_reqs in zip(new_recv_rid_lists, onfly_list):
-                    for new_recv_rid in new_recv_rids:
-                        assert (
-                            new_recv_rid in on_fly_reqs
-                        ), f"{new_recv_rid=} not in {worker_id=} {on_fly_reqs=}, data consistency is wrong"
-                        del on_fly_reqs[new_recv_rid]
-                    worker_id += 1
-                # 2. Atomically write local_tokens and onfly into shm under the mutex
-                meta.set_shared_onfly_info(onfly_list)
-                meta.set_shared_local_tokens(local_tokens)
-
-        holding_tokens = self.get_load()
-
-        new_recv_dp_balance_id_list, holding_token_list = gather_dp_balance_info(
-            holding_tokens
-        )
-
-        self.recv_dp_balance_id_this_term.clear()
-        if self.tp_rank == 0:  # only first worker write info
-            write_shared_dp_balance_info(
-                new_recv_dp_balance_id_list, holding_token_list
-            )
 
     @staticmethod
     def prepare_mlp_sync_batch_raw(
@@ -2317,10 +2252,9 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
         }
 
-        if not _is_cpu:
-            ret["memory_usage"]["cuda_graph"] = round(
-                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
-            )
+        ret["memory_usage"]["graph"] = round(
+            self.tp_worker.worker.model_runner.graph_mem_usage, 2
+        )
 
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
             ret["avg_spec_accept_length"] = (
@@ -2615,6 +2549,9 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
+    if (numa_node := server_args.numa_node) is not None:
+        numa_bind_to_node(numa_node[gpu_id])
+
     # Generate the prefix
     prefix = ""
     if dp_rank is not None:
