@@ -414,7 +414,7 @@ class Scheduler(
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
-                f"available_gpu_mem={avail_mem:.2f} GB"
+                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
         # Init memory pool and cache
@@ -2252,10 +2252,9 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
         }
 
-        if not _is_cpu:
-            ret["memory_usage"]["cuda_graph"] = round(
-                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
-            )
+        ret["memory_usage"]["graph"] = round(
+            self.tp_worker.worker.model_runner.graph_mem_usage, 2
+        )
 
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
             ret["avg_spec_accept_length"] = (
