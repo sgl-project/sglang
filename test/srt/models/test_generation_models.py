@@ -77,6 +77,7 @@ ALL_MODELS = [
         trust_remote_code=True,
         skip_long_prompt=True,
     ),
+    ModelCase("facebook/opt-125m", skip_long_prompt=True),
 ]
 
 TORCH_DTYPES = [torch.float16]
