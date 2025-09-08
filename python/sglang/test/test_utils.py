@@ -78,6 +78,11 @@ DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
 DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 
 # Other use cases
+DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
+    "OPEA/Llama-3.2-11B-Vision-Instruct-qvision-int4-sym-inc",  ## mllm auto_round:auto_gptq
+    "OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc",  ## auto_round:auto_gptq
+    "Intel/Qwen2-0.5B-Instruct-int4-sym-AutoRound",  ## auto_round:auto_awq
+)
 DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
     "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 )
