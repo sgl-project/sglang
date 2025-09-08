@@ -26,6 +26,14 @@ from sglang.srt.entrypoints.engine import Engine
 
 
 @dataclasses.dataclass
+class EmbeddingServerArgs(ServerArgs):
+    def __post_init__(self):
+        super().__post_init__()
+        # always setup embedding model engine
+        self.is_embedding = True
+
+
+@dataclasses.dataclass
 class BenchArgs:
     result_filename: str = ""
     dataset_name: str = "sharegpt"
@@ -354,7 +362,7 @@ if __name__ == "__main__":
                 print(f"ModelScope download failed: {str(e)}")
                 raise e
 
-    server_args = ServerArgs.from_cli_args(args)
+    server_args = EmbeddingServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 
     logging.basicConfig(
