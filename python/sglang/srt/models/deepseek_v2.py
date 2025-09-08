@@ -164,6 +164,8 @@ elif _is_hip:
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
+elif _is_npu:
+    from sglang.srt.layers.quantization.awq_triton import awq_dequantize_decomposition as awq_dequantize
 else:
     from vllm._custom_ops import awq_dequantize
 
@@ -2481,7 +2483,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             )
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # AWQ compatible
-                if _is_cuda or _is_hip:
+                if _is_cuda or _is_hip or _is_npu:
                     w = awq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,

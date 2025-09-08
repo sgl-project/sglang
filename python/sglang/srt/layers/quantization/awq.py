@@ -39,10 +39,15 @@ if TYPE_CHECKING:
         CombineInput,
     )
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
+
+if _is_npu:
+    import torch_npu
+
 if _is_cuda:
     from sgl_kernel import (
         awq_dequantize,
@@ -112,12 +117,21 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        return [torch.half]
+        return (
+            [torch.float16]
+            if not _is_npu
+            else [torch.float16, torch.bfloat16]
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
         # The AWQ kernel only supports Turing or newer GPUs.
-        return 75
+        if _is_npu:
+            raise NotImplementedError(
+                'NPU hardware does not support "get_min_capability" feature.'
+            )
+        else:
+            return 75
 
     @staticmethod
     def get_config_filenames() -> List[str]:
@@ -141,7 +155,17 @@ class AWQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
+        if _is_npu:
+            if isinstance(layer, LinearBase):
+                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                    return UnquantizedLinearMethod()
+                return AWQLinearAscendMethod(self)
+            elif isinstance(layer, FusedMoE):
+                return AWQMoEAscendMethod(self)
+            return None
+        
         if isinstance(layer, LinearBase):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
@@ -569,7 +593,61 @@ class AWQMarlinLinearMethod(LinearMethodBase):
             bias=bias,
         )
 
+class AWQLinearAscendMethod(AWQLinearMethod):
+    """Linear method for AWQ on Ascend.
 
+    Args:
+        quant_config: The AWQ quantization config.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+        qweight_tmp = torch.zeros_like(layer.qweight.data)
+        qzeros_tmp = layer.qzeros.data
+        qzeros_list = []
+        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+
+        for i in range(0,self.quant_config.pack_factor):
+            shift_num = shifts[i] * 4
+            qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
+            qweight_tmp.bitwise_or_(((layer.qweight.data >> shift_num) * (2 ** (4*i))) & (0xF << (4*i)))
+        
+        qweight_tmp.bitwise_xor_(0x88888888)
+
+        qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
+        qzeros_tmp = -(qzeros_tmp - 8)
+        qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
+
+        layer.qzeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
+        layer.qweight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        qweight = layer.qweight
+        scales = layer.scales
+        qzeros = layer.qzeros
+        pack_factor = self.quant_config.pack_factor
+        out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+        reshaped_x = x.reshape(-1, x.shape[-1])
+
+        if bias is not None and bias.dtype == torch.bfloat16:
+            bias = bias.float()
+        
+        out = torch_npu.npu_weight_quant_batchmatmul(
+            reshaped_x,
+            qweight,
+            antiquant_scale=scales,
+            antiquant_offset=qzeros,
+            antiquant_group_size=self.quant_config.group_size,
+            bias=bias,
+        )
+
+        return out.reshape(out_shape)
+    
 class AWQMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: AWQMarlinConfig):
@@ -672,7 +750,8 @@ class AWQMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
         device = layer.w13_qweight.device
-        layer.workspace = marlin_make_workspace(device, 4)
+        if not _is_npu:
+            layer.workspace = marlin_make_workspace(device, 4)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_qweight.shape[0]
@@ -780,3 +859,143 @@ class AWQMoEMethod(FusedMoEMethodBase):
             num_bits=self.quant_config.weight_bits,
         ).to(orig_dtype)
         return StandardCombineInput(hidden_states=output)
+
+def npu_fused_experts(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w13_offset: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w2_offset: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+):
+    original_shape = hidden_states.shape
+    original_dtype = hidden_states.dtype
+    scale_dtype = original_dtype if original_dtype == torch.bfloat16 else torch.float32
+    if len(original_shape) == 3:
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    num_tokens = hidden_states.shape[0]
+    num_experts = w13.shape[0]
+    row_idx_len = num_tokens * top_k
+    row_idx = (
+        torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
+        .view(top_k, -1)
+        .permute(1, 0)
+        .contiguous()
+    )
+    hidden_states, expanded_row_idx, expanded_expert_idx = (
+        torch_npu.npu_moe_init_routing(
+            hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+        )
+    )
+    expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
+        expanded_expert_idx, num_experts
+    )
+    expert_tokens = expert_tokens.to(torch.int64)
+    # gmm1: gate_up_proj
+    hidden_states = torch_npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w13],
+        antiquant_scale=[w13_scale],
+        antiquant_offset=[w13_offset],
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+    # act_fn: swiglu
+    hidden_states = torch_npu.npu_swiglu(hidden_states)
+    # gmm2: down_proj
+    hidden_states = torch_npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w2],
+        antiquant_scale=[w2_scale],
+        antiquant_offset=[w2_offset],
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+
+    final_hidden_states = torch_npu.npu_moe_finalize_routing(
+        hidden_states,
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights,
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=topk_ids,
+    )
+    if len(original_shape) == 3:
+        final_hidden_states = final_hidden_states.view(original_shape)
+    return final_hidden_states
+
+class AWQMoEAscendMethod(AWQMoEMethod):
+    def __init__(self, quant_config: AWQConfig):
+        self.quant_config = quant_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
+        w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
+        w13_qzeros_list = []
+        w2_qzeros_list = []
+        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+        for i in range(0,self.quant_config.pack_factor):
+            shift_num = shifts[i] * 4
+            w13_qzeros_list.append((layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF)
+            w2_qzeros_list.append((layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF)
+            w13_qweight_tmp.bitwise_or_(((layer.w13_qweight.data >> shift_num) * (2 ** (4*i))) & (0xF << (4*i)))
+            w2_qweight_tmp.bitwise_or_(((layer.w2_qweight.data >> shift_num) * (2 ** (4*i))) & (0xF << (4*i)))
+        
+        w13_qweight_tmp.bitwise_xor_(0x88888888)
+        w2_qweight_tmp.bitwise_xor_(0x88888888)
+
+        w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1)
+        w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
+        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
+        w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1)
+        w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
+        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+
+        layer.register_parameter("w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False))
+        layer.register_parameter("w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False))
+        layer.register_parameter("w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False))
+        layer.register_parameter("w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False))
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config  
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+        
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, _ = topk_output
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(x.dtype)
+        return npu_fused_experts(
+            hidden_states=x,
+            w13=layer.w13_qweight,
+            w13_scale=layer.w13_scales,
+            w13_offset=layer.w13_qzeros,
+            w2=layer.w2_qweight,
+            w2_scale=layer.w2_scales,
+            w2_offset=layer.w2_qzeros,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=topk_ids.shape[1],
+        )
