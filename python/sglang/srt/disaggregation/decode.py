@@ -944,8 +944,6 @@ class SchedulerDisaggregationDecodeMixin:
 
     def convert_decode_resources(self: Scheduler):
         """convert decode resources to prefill resources."""
-        if not self.server_args.enable_pd_convert:
-            return
         del self.stop_decode_event
 
         logger.info("Flushing decode resources...")

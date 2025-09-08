@@ -893,6 +893,7 @@ class ConvertDisaggregationRoleReqInput:
     # the server url to convert
     server_url: str
     failed_bootstrap_addr: Optional[str] = None
+    check_idle: bool = False
     # convert decode to prefill
     bootstrap_port: Optional[int] = None
     disaggregation_decode_tp: Optional[int] = None
@@ -928,6 +929,7 @@ class ConvertDisaggregationRoleReqOutput:
 
     success: bool
     message: str
+    bootstrap_port: Optional[int] = None
 
 
 @dataclass

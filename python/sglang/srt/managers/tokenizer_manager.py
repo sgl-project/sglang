@@ -53,6 +53,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.convert_pd_mixin import set_bootstrap_server
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -1381,18 +1382,20 @@ class TokenizerManager:
         if not self.server_args.enable_pd_convert:
             return False, "PD role conversion is not enabled.", None
 
-        def set_env_vars(env_vars: Optional[Dict[str, Any]]):
-            if env_vars:
-                for k, v in env_vars.items():
-                    if v is not None:
-                        os.environ[k] = v
-                    else:
-                        os.environ.pop(k, None)
+        async def check_idle():
+            if self.server_args.tokenizer_worker_num > 1:
+                # check scheduler state as other tokenizer manager may have requests
+                responses: List[ConvertDisaggregationRoleReqOutput] = (
+                    await self.convert_pd_role_communicator(obj)
+                )
+                return all(response.success for response in responses)
+            else:
+                return len(self.rid_to_state) == 0
 
-        bootstrap_port = None
         if obj.failed_bootstrap_addr is None:
+            obj.check_idle = True
             check_count = 60
-            while len(self.rid_to_state) > 0:
+            while not await check_idle():
                 await asyncio.sleep(1)
                 check_count -= 1
                 logger.info("Waiting for all requests to finish...")
@@ -1406,43 +1409,17 @@ class TokenizerManager:
             logger.info(
                 "All requests are finished and cache flushed, can convert p/d role"
             )
-
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                # start a bootstarp server first
-                kv_bootstrap_server_class = get_kv_class(
-                    self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
-                )
-                # find a free port
-                bootstrap_port = 8998
-                while True:
-                    if is_port_available(bootstrap_port):
-                        break
-                    else:
-                        bootstrap_port += 1
-                self.bootstrap_server = kv_bootstrap_server_class(
-                    bootstrap_port,
-                )
-                self.server_args.disaggregation_bootstrap_port = bootstrap_port
-                obj.bootstrap_port = bootstrap_port
-                set_env_vars(obj.disaggregation_prefill_envs)
-            else:
-                # stop the bootstrap server
-                self.bootstrap_server.close()
-                del self.bootstrap_server
-                set_env_vars(obj.disaggregation_decode_envs)
+            obj.check_idle = False
+            if not self.server_args.tokenizer_worker_num > 1:
+                set_bootstrap_server(self, obj)
 
         responses: List[ConvertDisaggregationRoleReqOutput] = (
             await self.convert_pd_role_communicator(obj)
         )
-
         if obj.failed_bootstrap_addr is None:
             # wait scheduler event loop ready
             await self.flush_cache()
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.disaggregation_mode = DisaggregationMode.DECODE
-            else:
-                self.disaggregation_mode = DisaggregationMode.PREFILL
-        return responses[0].success, responses[0].message, bootstrap_port
+        return responses[0].success, responses[0].message, responses[0].bootstrap_port
 
     async def get_load(self) -> dict:
         # TODO(lsyin): fake load report server

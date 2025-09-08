@@ -39,6 +39,9 @@ from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
 )
+from sglang.srt.disaggregation.convert_pd_mixin import (
+    SchedulerDisaggregationConvertMixin,
+)
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -203,6 +206,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerDisaggregationConvertMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -2455,32 +2459,12 @@ class Scheduler(
                 success=True,
                 message="clean connection pool successfully.",
             )
-
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # change server args for prefill mode
-            self.convert_prefill_server_args(recv_req)
-            # stop prefill event loop
-            self.stop_prefill_event.set()
+        if recv_req.check_idle:
             return ConvertDisaggregationRoleReqOutput(
-                success=True,
-                message="The role of this server is now DECODE.",
+                success=self.check_disaggregation_idle(),
+                message="check idle done.",
             )
-        else:
-            # change server args for prefill mode
-            self.convert_decode_server_args(recv_req)
-            # stop decode event loop
-            self.stop_decode_event.set()
-            return ConvertDisaggregationRoleReqOutput(
-                success=True,
-                message="The role of this server is now PREFILL.",
-            )
-
-    def convert_disaggregation_resources(self):
-        """convert the p/d resources to d/p resources."""
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.convert_prefill_resources()
-        else:
-            self.convert_decode_resources()
+        return self.convert_server_args(recv_req)
 
     def get_print_prefix(self):
         prefix = ""

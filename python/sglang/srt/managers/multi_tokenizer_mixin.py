@@ -27,12 +27,14 @@ import setproctitle
 import zmq
 import zmq.asyncio
 
+from sglang.srt.disaggregation.convert_pd_mixin import set_bootstrap_server
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+    ConvertDisaggregationRoleReqInput,
     MultiTokenizerRegisterReq,
     MultiTokenizerWrapper,
 )
@@ -430,6 +432,9 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
     async def router_worker_obj(self):
         while True:
             recv_obj = await self.receive_from_worker.recv_pyobj()
+            if isinstance(recv_obj, MultiTokenizerWrapper):
+                if isinstance(recv_obj.obj, ConvertDisaggregationRoleReqInput):
+                    set_bootstrap_server(self, recv_obj.obj)
             await self.send_to_scheduler.send_pyobj(recv_obj)
 
     async def handle_loop(self):
