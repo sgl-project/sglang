@@ -80,7 +80,6 @@ QUANTIZATION_CHOICES = [
     "qoq",
     "w4afp8",
     "mxfp4",
-    "auto-round",
 ]
 
 ATTENTION_BACKEND_CHOICES = [
