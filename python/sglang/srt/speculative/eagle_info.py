@@ -144,7 +144,7 @@ class EagleVerifyInput(SpecInput):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
-        page_size: int,
+        page_size: int = 1,
     ):
 
         device = req_to_token.device
@@ -185,7 +185,6 @@ class EagleVerifyInput(SpecInput):
             page_size,
         )
         return (
-            seq_lens_with_draft_tokens,
             kv_indices,
             kv_indptr,
             qo_indptr,
