@@ -412,7 +412,7 @@ class SchedulerDisaggregationPrefillMixin:
                     last_hidden_index = (
                         hidden_state_offset + extend_input_len_per_req[i] - 1
                     )
-                    if self.spec_algorithm.is_eagle():
+                    if self.spec_algorithm.is_eagle3():
                         req.hidden_states_tensor = (
                             batch.spec_info.hidden_states[i].cpu().clone()
                         )
