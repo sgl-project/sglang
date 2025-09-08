@@ -369,7 +369,6 @@ class MHATokenToKVPool(KVCache):
         # same applies to get_value_buffer and get_kv_buffer
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
