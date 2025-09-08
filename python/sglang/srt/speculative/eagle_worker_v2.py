@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -101,7 +102,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        with empty_context():
+        with empty_context(), speculative_moe_backend_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -127,7 +128,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(self.draft_runner.tp_group):
+        with self.draft_tp_context(
+            self.draft_runner.tp_group
+        ), speculative_moe_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 

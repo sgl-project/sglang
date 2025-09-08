@@ -78,8 +78,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
-    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -507,7 +507,7 @@ class MoEGate(nn.Module):
                 torch.bfloat16
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
-                and should_use_flashinfer_trtllm_moe()
+                and get_moe_runner_backend().is_flashinfer_trtllm()
                 else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
