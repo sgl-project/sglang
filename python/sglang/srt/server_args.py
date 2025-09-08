@@ -262,6 +262,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    speculative_attention_backend: str = "prefill"
 
     # Expert parallelism
     ep_size: int = 1
@@ -473,9 +474,14 @@ class ServerArgs:
                     # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
                     reserved_mem = 32 * 1024
 
+                # draft model and larger cuda graph buffers
                 if self.speculative_algorithm is not None:
-                    # draft model and larger cuda graph buffers
-                    reserved_mem += 2 * 1024
+                    if self.speculative_algorithm == "STANDALONE":
+                        # Standalone speculative decoding needs more memory than other speculative
+                        # decoding algorithms since the draft model is typically larger.
+                        reserved_mem += 6 * 1024
+                    else:
+                        reserved_mem += 2 * 1024
                 if self.enable_dp_attention:
                     reserved_mem += 4 * 1024
 
@@ -704,7 +710,12 @@ class ServerArgs:
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3"):
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+            if self.speculative_algorithm == "STANDALONE":
+                # TODO: support dp attention for standalone speculative decoding
+                assert (
+                    self.enable_dp_attention is False
+                ), "Currently standalone speculative decoding does not support dp attention."
             if self.max_running_requests is None:
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
@@ -1499,7 +1510,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -1550,6 +1561,13 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-attention-backend",
+            type=str,
+            choices=["prefill", "decode"],
+            help="Attention backend to use for speculative decoding operations (both target verify and draft extend). 'prefill' (default) or 'decode'.",
+            default=ServerArgs.speculative_attention_backend,
         )
 
         # Expert parallelism
@@ -2635,7 +2653,9 @@ def auto_choose_speculative_params(self: ServerArgs):
     """
     hf_config = self.get_hf_config()
     arch = hf_config.architectures[0]
-
+    if self.speculative_algorithm == "STANDALONE":
+        # The default value for standalone speculative decoding
+        return (3, 1, 4)
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
