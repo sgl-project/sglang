@@ -605,6 +605,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.partial_rotary_factor = config.partial_rotary_factor
         self.layer_id = layer_id
 
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
@@ -617,6 +618,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             max_position=self.max_position_embeddings,
             rope_scaling=self.rope_scaling,
             base=self.rope_theta,
+            partial_rotary_factor=self.partial_rotary_factor,
             is_neox_style=True,
             dtype=torch.get_default_dtype(),  # see impl of get_rope
         )
