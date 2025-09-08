@@ -283,7 +283,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
         self.full_to_swa_index_mapping.fill_(0)
-        self.is_in_free_group = False
+        self.is_not_in_free_group = True
         self.free_group = []
 
 
