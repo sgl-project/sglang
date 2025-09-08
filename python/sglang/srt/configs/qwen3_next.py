@@ -252,15 +252,12 @@ class Qwen3NextConfig(PretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
 
-
     @property
     def layers_block_type(self):
         layer_type_list = []
 
         for l in range(self.num_hidden_layers):
-            if (
-                l + 1
-            ) % self.full_attention_interval == 0:
+            if (l + 1) % self.full_attention_interval == 0:
                 layer_type_list.append(HybridLayerType.full_attention.value)
             else:
                 layer_type_list.append(HybridLayerType.linear_attention.value)

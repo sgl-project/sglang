@@ -273,18 +273,20 @@ class Qwen3GatedDeltaNet(nn.Module):
         projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
         projection_size_ba = self.num_v_heads * 2
 
-        self.in_proj_qkvz = ColumnParallelLinear(input_size=self.hidden_size,
-                                                 output_size=projection_size_qkvz,
-                                                 bias=False,
-                                                 tp_rank=self.attn_tp_rank,
-                                                 tp_size=self.attn_tp_size,
-                                                )
-        self.in_proj_ba = ColumnParallelLinear(input_size=self.hidden_size,
-                                               output_size=projection_size_ba,
-                                               bias=False,
-                                               tp_rank=self.attn_tp_rank,
-                                               tp_size=self.attn_tp_size,
-                                              )
+        self.in_proj_qkvz = ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=projection_size_qkvz,
+            bias=False,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+        )
+        self.in_proj_ba = ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=projection_size_ba,
+            bias=False,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+        )
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -343,11 +345,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
-    def fix_query_key_value_ordering(
-        self,
-        mixed_qkvz,
-        mixed_ba
-    ):
+    def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
         """
@@ -362,10 +360,10 @@ class Qwen3GatedDeltaNet(nn.Module):
             ),
         )
         new_tensor_shape_ba = mixed_ba.size()[:-1] + (
-            self.num_k_heads // self.attn_tp_size, 
-            2 * self.num_v_heads // self.num_k_heads
+            self.num_k_heads // self.attn_tp_size,
+            2 * self.num_v_heads // self.num_k_heads,
         )
-        
+
         mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
         mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
 
@@ -412,13 +410,12 @@ class Qwen3GatedDeltaNet(nn.Module):
         #         self.head_k_dim,
         #         self.head_v_dim,
         #     )
-        # TODO(caoyizhong): update fused_qkvzba_split_reshape_cat for splited qkvz and ba
+        # TODO(caoyizhong): update fused_qkvzba_split_reshape_cat for split qkvz and ba
         if False:
             raise NotImplementedError("Not implemented")
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                projected_states_qkvz,
-                projected_states_ba
+                projected_states_qkvz, projected_states_ba
             )
             query, key, value = map(
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)

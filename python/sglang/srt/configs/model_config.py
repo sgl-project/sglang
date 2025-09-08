@@ -147,10 +147,7 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "Qwen3NextForCausalLM"
-        ):
+        if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
 
         # Check model type
