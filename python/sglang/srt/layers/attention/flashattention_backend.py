@@ -332,6 +332,9 @@ class FlashAttentionBackend(AttentionBackend):
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
             )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.enable_overlap_schedule = (
+            not model_runner.server_args.disable_overlap_schedule
+        )
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -1894,7 +1897,10 @@ class FlashAttentionBackend(AttentionBackend):
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
             accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
+            if self.enable_overlap_schedule:
+                # EAGLE + Overlap scheduling code path
+                metadata.max_seq_len_q = self.speculative_num_steps + 1
+            elif spec_info.accept_length_cpu:
                 metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
             else:
                 metadata.max_seq_len_q = 1
