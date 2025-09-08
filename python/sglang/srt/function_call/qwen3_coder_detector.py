@@ -358,5 +358,5 @@ class Qwen3CoderDetector(BaseFormatDetector):
             function_format="xml",
             call_rule_fmt='"<function={name}>\\n" {arguments_rule} "\\n</function>"',
             key_value_rule_fmt='"<parameter={key}>\\n" {valrule} "\\n</parameter>"',
-            key_value_separator="\\n",
+            key_value_separator='"\\n"',
         )
