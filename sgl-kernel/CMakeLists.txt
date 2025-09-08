@@ -3,6 +3,7 @@ project(sgl-kernel LANGUAGES CXX CUDA)
 
 # CMake
 cmake_policy(SET CMP0169 OLD)
+cmake_policy(SET CMP0177 NEW)
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
@@ -50,14 +51,7 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-cutlass)
 
-FetchContent_Declare(
-    repo-fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-fmt)
-
+# DeepGEMM
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
@@ -65,6 +59,14 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
+
+FetchContent_Declare(
+    repo-fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt
+    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-fmt)
 
 # Triton
 FetchContent_Declare(
@@ -79,7 +81,7 @@ FetchContent_Populate(repo-triton)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        018b551825c8e5579206e6eb9d3229fa679202b3
+    GIT_TAG        1a85c439a064c1609568675aa580a409a53fb183
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -148,21 +150,40 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-extended-lambda"
     "--threads=32"
 
-    # Suppress warnings
-    "-Xcompiler=-Wconversion"
-    "-Xcompiler=-fno-strict-aliasing"
+    # Supress warnings
+    "-Xcompiler=-Wno-clang-format-violations"
+    "-Xcompiler=-Wno-conversion"
+    "-Xcompiler=-Wno-deprecated-declarations"
+    "-Xcompiler=-Wno-terminate"
+    "-Xcompiler=-Wfatal-errors"
+    "-Xcompiler=-ftemplate-backtrace-limit=1"
+    "-Xcudafe=--diag_suppress=177"  # variable was declared but never referenced
 
     # uncomment to debug
     # "--ptxas-options=-v"
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
 
-option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
-option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
+option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
+option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+
+if (SGL_KERNEL_ENABLE_BF16)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-DFLASHINFER_ENABLE_BF16"
+    )
+endif()
+
+if (SGL_KERNEL_ENABLE_FP8)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-DFLASHINFER_ENABLE_FP8"
+        "-DFLASHINFER_ENABLE_FP8_E4M3"
+        "-DFLASHINFER_ENABLE_FP8_E5M2"
+    )
+endif()
 
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -173,26 +194,20 @@ endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_120,code=sm_120"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
 
     # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
     if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_103,code=sm_103"
             "-gencode=arch=compute_103a,code=sm_103a"
-            "-gencode=arch=compute_110,code=sm_110"
             "-gencode=arch=compute_110a,code=sm_110a"
-            "-gencode=arch=compute_121,code=sm_121"
             "-gencode=arch=compute_121a,code=sm_121a"
             "--compress-mode=size"
         )
     else()
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_101,code=sm_101"
             "-gencode=arch=compute_101a,code=sm_101a"
         )
     endif()
@@ -210,30 +225,11 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
     )
 endif()
 
-if (SGL_KERNEL_ENABLE_BF16)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-DFLASHINFER_ENABLE_BF16"
-    )
-endif()
-
-if (SGL_KERNEL_ENABLE_FP8)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-DFLASHINFER_ENABLE_FP8"
-        "-DFLASHINFER_ENABLE_FP8_E4M3"
-        "-DFLASHINFER_ENABLE_FP8_E5M2"
-    )
-endif()
-
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DENABLE_NVFP4=1"
     )
 endif()
-
-string(REPLACE "-D__CUDA_NO_HALF_OPERATORS__"       "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-string(REPLACE "-D__CUDA_NO_HALF_CONVERSIONS__"     "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
@@ -245,6 +241,7 @@ set(SOURCES
     "csrc/attention/vertical_slash_index.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/cast.cu"
+    "csrc/elementwise/copy.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/common_extension.cc"
@@ -285,8 +282,6 @@ set(SOURCES
     "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
-    "csrc/moe/ep_moe_reorder_kernel.cu"
-    "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
 
     "csrc/memory/store.cu"
     "csrc/kvcacheio/transfer.cu"
