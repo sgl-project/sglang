@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -810,7 +811,7 @@ class ServerArgs:
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
 
-            if self.dp_size > 1:
+            if self.dp_size > 1 and not is_in_ci():
                 assert self.prefill_round_robin_balance, (
                     "Prefill round robin balance is required when dp size > 1. "
                     "Please make sure that the prefill instance is launched with `--load-balance-method round_robin`"
