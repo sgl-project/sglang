@@ -221,8 +221,6 @@ class StreamingXMLToolCallParser:
             return ""
 
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
-            # strip space and \n
-            converted_value = converted_value.strip()
             # String type, remove double quotes
             return json.dumps(converted_value, ensure_ascii=False)[1:-1]
         else:

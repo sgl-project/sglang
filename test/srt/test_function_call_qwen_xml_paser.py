@@ -590,26 +590,26 @@ hello world
     def test_parse_streaming_multiple_tools(self):
         """Test streaming with multiple tool calls."""
         model_output = """<tool_call>
-        <function=get_current_weather>
-        <parameter=city>
-        Dallas
-        </parameter>
-        <parameter=state>
-        TX
-        </parameter>
-        </function>
-        </tool_call>
-        Some text in between.
-        <tool_call>
-        <function=calculate_area>
-        <parameter=shape>
-        circle
-        </parameter>
-        <parameter=dimensions>
-        {"radius": 5}
-        </parameter>
-        </function>
-        </tool_call>"""
+<function=get_current_weather>
+<parameter=city>
+Dallas
+</parameter>
+<parameter=state>
+TX
+</parameter>
+</function>
+</tool_call>
+Some text in between.
+<tool_call>
+<function=calculate_area>
+<parameter=shape>
+circle
+</parameter>
+<parameter=dimensions>
+{"radius": 5}
+</parameter>
+</function>
+</tool_call>"""
 
         # Simulate streaming by chunks
         chunk_size = 20
