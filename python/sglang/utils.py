@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import random
-import signal
 import socket
 import subprocess
 import sys
@@ -458,7 +457,8 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
+                    To reduce the log length, we set the log level to warning for the server, the default log level is info.
+                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break
@@ -472,6 +472,10 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
+
+    def __iadd__(self, other: "TypeBasedDispatcher"):
+        self._mapping.extend(other._mapping)
+        return self
 
     def __call__(self, obj: Any):
         for ty, fn in self._mapping:

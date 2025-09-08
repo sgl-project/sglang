@@ -36,6 +36,28 @@ pub fn init_metrics() {
         "sgl_router_retries_total",
         "Total number of request retries by route"
     );
+    describe_histogram!(
+        "sgl_router_retry_backoff_duration_seconds",
+        "Backoff duration in seconds by attempt index"
+    );
+    describe_counter!(
+        "sgl_router_retries_exhausted_total",
+        "Total number of requests that exhausted retries by route"
+    );
+
+    // Circuit breaker metrics
+    describe_gauge!(
+        "sgl_router_cb_state",
+        "Circuit breaker state per worker (0=closed, 1=open, 2=half_open)"
+    );
+    describe_counter!(
+        "sgl_router_cb_state_transitions_total",
+        "Total number of circuit breaker state transitions by worker"
+    );
+    describe_counter!(
+        "sgl_router_cb_outcomes_total",
+        "Total number of circuit breaker outcomes by worker and outcome type (success/failure)"
+    );
 
     // Worker metrics
     describe_gauge!(
@@ -126,6 +148,94 @@ pub fn init_metrics() {
         "sgl_router_running_requests",
         "Number of running requests per worker"
     );
+
+    // Tokenizer metrics
+    describe_histogram!(
+        "sgl_tokenizer_encode_duration_seconds",
+        "Time to encode text to tokens"
+    );
+    describe_histogram!(
+        "sgl_tokenizer_decode_duration_seconds",
+        "Time to decode tokens to text"
+    );
+    describe_histogram!(
+        "sgl_tokenizer_encode_batch_duration_seconds",
+        "Time to encode a batch of texts"
+    );
+    describe_counter!(
+        "sgl_tokenizer_encode_requests_total",
+        "Total number of encode requests by tokenizer type"
+    );
+    describe_counter!(
+        "sgl_tokenizer_decode_requests_total",
+        "Total number of decode requests by tokenizer type"
+    );
+    describe_counter!(
+        "sgl_tokenizer_encode_errors_total",
+        "Total number of encode errors by error type"
+    );
+    describe_counter!(
+        "sgl_tokenizer_decode_errors_total",
+        "Total number of decode errors by error type"
+    );
+    describe_histogram!(
+        "sgl_tokenizer_tokens_per_encode",
+        "Number of tokens produced per encode operation"
+    );
+    describe_histogram!(
+        "sgl_tokenizer_chars_per_encode",
+        "Number of characters in input text per encode"
+    );
+    describe_histogram!(
+        "sgl_tokenizer_tokens_per_decode",
+        "Number of tokens decoded per operation"
+    );
+    describe_gauge!(
+        "sgl_tokenizer_vocab_size",
+        "Vocabulary size of the loaded tokenizer"
+    );
+
+    // Stop sequence detection metrics
+    describe_counter!(
+        "sgl_tokenizer_stop_sequences_detected_total",
+        "Total stop sequences detected by type"
+    );
+    describe_counter!(
+        "sgl_tokenizer_partial_matches_total",
+        "Total partial stop sequence matches (jailed text)"
+    );
+    describe_histogram!(
+        "sgl_tokenizer_stop_detection_duration_seconds",
+        "Time to check for stop sequences per token"
+    );
+
+    // Streaming decode metrics
+    describe_counter!(
+        "sgl_tokenizer_stream_tokens_total",
+        "Total tokens processed in streaming decode"
+    );
+    describe_counter!(
+        "sgl_tokenizer_stream_incomplete_utf8_total",
+        "Total incomplete UTF-8 sequences detected"
+    );
+    describe_histogram!(
+        "sgl_tokenizer_stream_step_duration_seconds",
+        "Time per streaming decode step"
+    );
+
+    // Factory metrics
+    describe_counter!(
+        "sgl_tokenizer_factory_loads_total",
+        "Total tokenizer loads by file type"
+    );
+    describe_counter!(
+        "sgl_tokenizer_factory_errors_total",
+        "Total tokenizer loading errors by type"
+    );
+    describe_histogram!(
+        "sgl_tokenizer_factory_load_duration_seconds",
+        "Time to load and initialize tokenizer"
+    );
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -155,6 +265,8 @@ pub fn start_prometheus(config: PrometheusConfig) {
 
 pub struct RouterMetrics;
 
+pub struct TokenizerMetrics;
+
 impl RouterMetrics {
     // Request metrics
     pub fn record_request(route: &str) {
@@ -181,6 +293,20 @@ impl RouterMetrics {
 
     pub fn record_retry(route: &str) {
         counter!("sgl_router_retries_total",
+            "route" => route.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_retry_backoff_duration(duration: Duration, attempt: u32) {
+        histogram!("sgl_router_retry_backoff_duration_seconds",
+            "attempt" => attempt.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn record_retries_exhausted(route: &str) {
+        counter!("sgl_router_retries_exhausted_total",
             "route" => route.to_string()
         )
         .increment(1);
@@ -321,6 +447,147 @@ impl RouterMetrics {
         )
         .set(count as f64);
     }
+
+    // Circuit breaker metrics
+    pub fn set_cb_state(worker: &str, state_code: u8) {
+        gauge!("sgl_router_cb_state",
+            "worker" => worker.to_string()
+        )
+        .set(state_code as f64);
+    }
+
+    pub fn record_cb_state_transition(worker: &str, from: &str, to: &str) {
+        counter!("sgl_router_cb_state_transitions_total",
+            "worker" => worker.to_string(),
+            "from" => from.to_string(),
+            "to" => to.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_cb_outcome(worker: &str, outcome: &str) {
+        counter!("sgl_router_cb_outcomes_total",
+            "worker" => worker.to_string(),
+            "outcome" => outcome.to_string()
+        )
+        .increment(1);
+    }
+}
+
+impl TokenizerMetrics {
+    // Encoding metrics
+    pub fn record_encode_request(tokenizer_type: &str) {
+        counter!("sgl_tokenizer_encode_requests_total",
+            "tokenizer_type" => tokenizer_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_encode_duration(duration: Duration) {
+        histogram!("sgl_tokenizer_encode_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    pub fn record_encode_error(error_type: &str) {
+        counter!("sgl_tokenizer_encode_errors_total",
+            "error_type" => error_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_tokens_per_encode(token_count: usize) {
+        histogram!("sgl_tokenizer_tokens_per_encode").record(token_count as f64);
+    }
+
+    pub fn record_chars_per_encode(char_count: usize) {
+        histogram!("sgl_tokenizer_chars_per_encode").record(char_count as f64);
+    }
+
+    // Decoding metrics
+    pub fn record_decode_request(tokenizer_type: &str) {
+        counter!("sgl_tokenizer_decode_requests_total",
+            "tokenizer_type" => tokenizer_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_decode_duration(duration: Duration) {
+        histogram!("sgl_tokenizer_decode_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    pub fn record_decode_error(error_type: &str) {
+        counter!("sgl_tokenizer_decode_errors_total",
+            "error_type" => error_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_tokens_per_decode(token_count: usize) {
+        histogram!("sgl_tokenizer_tokens_per_decode").record(token_count as f64);
+    }
+
+    // Batch encoding metrics
+    pub fn record_encode_batch_duration(duration: Duration, batch_size: usize) {
+        histogram!("sgl_tokenizer_encode_batch_duration_seconds",
+            "batch_size" => batch_size.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    // Stop sequence detection metrics
+    pub fn record_stop_sequence_detected(stop_type: &str) {
+        counter!("sgl_tokenizer_stop_sequences_detected_total",
+            "type" => stop_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_partial_match() {
+        counter!("sgl_tokenizer_partial_matches_total").increment(1);
+    }
+
+    pub fn record_stop_detection_duration(duration: Duration) {
+        histogram!("sgl_tokenizer_stop_detection_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    // Streaming decode metrics
+    pub fn record_stream_token() {
+        counter!("sgl_tokenizer_stream_tokens_total").increment(1);
+    }
+
+    pub fn record_incomplete_utf8() {
+        counter!("sgl_tokenizer_stream_incomplete_utf8_total").increment(1);
+    }
+
+    pub fn record_stream_step_duration(duration: Duration) {
+        histogram!("sgl_tokenizer_stream_step_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    // Factory metrics
+    pub fn record_factory_load(file_type: &str) {
+        counter!("sgl_tokenizer_factory_loads_total",
+            "file_type" => file_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_factory_error(error_type: &str) {
+        counter!("sgl_tokenizer_factory_errors_total",
+            "error_type" => error_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_factory_load_duration(duration: Duration) {
+        histogram!("sgl_tokenizer_factory_load_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    // Vocabulary metrics
+    pub fn set_vocab_size(tokenizer_type: &str, size: usize) {
+        gauge!("sgl_tokenizer_vocab_size",
+            "tokenizer_type" => tokenizer_type.to_string()
+        )
+        .set(size as f64);
+    }
 }
 
 #[cfg(test)]
@@ -450,24 +717,8 @@ mod tests {
     // ============= Duration Bucket Tests =============
 
     #[test]
-    fn test_duration_bucket_values() {
-        let expected_buckets = vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
-            60.0, 90.0, 120.0, 180.0, 240.0,
-        ];
-
-        // The buckets are defined in start_prometheus function
-        assert_eq!(expected_buckets.len(), 20);
-
-        // Verify proper ordering
-        for i in 1..expected_buckets.len() {
-            assert!(expected_buckets[i] > expected_buckets[i - 1]);
-        }
-    }
-
-    #[test]
     fn test_duration_bucket_coverage() {
-        let test_cases = vec![
+        let test_cases: [(f64, &str); 7] = [
             (0.0005, "sub-millisecond"),
             (0.005, "5ms"),
             (0.05, "50ms"),
@@ -477,7 +728,7 @@ mod tests {
             (240.0, "4m"),
         ];
 
-        let buckets = vec![
+        let buckets: [f64; 20] = [
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
             60.0, 90.0, 120.0, 180.0, 240.0,
         ];
@@ -485,7 +736,7 @@ mod tests {
         for (duration, label) in test_cases {
             let bucket_found = buckets
                 .iter()
-                .any(|&b| ((b - duration) as f64).abs() < 0.0001 || b > duration);
+                .any(|&b| (b - duration).abs() < 0.0001 || b > duration);
             assert!(bucket_found, "No bucket found for {} ({})", duration, label);
         }
     }
@@ -497,14 +748,13 @@ mod tests {
         let matcher = Matcher::Suffix(String::from("duration_seconds"));
 
         // Test matching behavior
-        let _matching_metrics = vec![
+        let _matching_metrics = [
             "request_duration_seconds",
             "response_duration_seconds",
             "sgl_router_request_duration_seconds",
         ];
 
-        let _non_matching_metrics =
-            vec!["duration_total", "duration_seconds_total", "other_metric"];
+        let _non_matching_metrics = ["duration_total", "duration_seconds_total", "other_metric"];
 
         // Note: We can't directly test Matcher matching without the internals,
         // but we can verify the matcher is created correctly
@@ -550,8 +800,8 @@ mod tests {
     #[test]
     fn test_custom_buckets_for_different_metrics() {
         // Test that we can create different bucket configurations
-        let request_buckets = vec![0.001, 0.01, 0.1, 1.0, 10.0];
-        let generate_buckets = vec![0.1, 0.5, 1.0, 5.0, 30.0, 60.0];
+        let request_buckets = [0.001, 0.01, 0.1, 1.0, 10.0];
+        let generate_buckets = [0.1, 0.5, 1.0, 5.0, 30.0, 60.0];
 
         assert_eq!(request_buckets.len(), 5);
         assert_eq!(generate_buckets.len(), 6);
@@ -600,6 +850,46 @@ mod tests {
         RouterMetrics::record_discovery_update(3, 1);
         RouterMetrics::record_generate_duration(Duration::from_secs(2));
         RouterMetrics::set_running_requests("http://worker1", 15);
+    }
+
+    #[test]
+    fn test_tokenizer_metrics_static_methods() {
+        // Test that all tokenizer metric methods can be called without panic
+
+        // Encoding metrics
+        TokenizerMetrics::record_encode_request("huggingface");
+        TokenizerMetrics::record_encode_duration(Duration::from_millis(10));
+        TokenizerMetrics::record_encode_error("invalid_input");
+        TokenizerMetrics::record_tokens_per_encode(100);
+        TokenizerMetrics::record_chars_per_encode(500);
+
+        // Decoding metrics
+        TokenizerMetrics::record_decode_request("huggingface");
+        TokenizerMetrics::record_decode_duration(Duration::from_millis(5));
+        TokenizerMetrics::record_decode_error("invalid_tokens");
+        TokenizerMetrics::record_tokens_per_decode(50);
+
+        // Batch encoding
+        TokenizerMetrics::record_encode_batch_duration(Duration::from_millis(100), 10);
+
+        // Stop sequence detection
+        TokenizerMetrics::record_stop_sequence_detected("token");
+        TokenizerMetrics::record_stop_sequence_detected("string");
+        TokenizerMetrics::record_partial_match();
+        TokenizerMetrics::record_stop_detection_duration(Duration::from_micros(100));
+
+        // Streaming decode
+        TokenizerMetrics::record_stream_token();
+        TokenizerMetrics::record_incomplete_utf8();
+        TokenizerMetrics::record_stream_step_duration(Duration::from_micros(50));
+
+        // Factory metrics
+        TokenizerMetrics::record_factory_load("json");
+        TokenizerMetrics::record_factory_error("unsupported_format");
+        TokenizerMetrics::record_factory_load_duration(Duration::from_millis(200));
+
+        // Vocabulary metrics
+        TokenizerMetrics::set_vocab_size("huggingface", 50000);
     }
 
     // ============= Port Availability Tests =============
@@ -669,9 +959,6 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-
-        // If we get here without panic, concurrent access works
-        assert!(true);
     }
 
     // ============= Edge Cases Tests =============
@@ -682,9 +969,6 @@ mod tests {
         RouterMetrics::record_request("");
         RouterMetrics::set_worker_health("", true);
         RouterMetrics::record_policy_decision("", "");
-
-        // If we get here without panic, empty strings are handled
-        assert!(true);
     }
 
     #[test]
@@ -693,14 +977,11 @@ mod tests {
 
         RouterMetrics::record_request(&long_label);
         RouterMetrics::set_worker_health(&long_label, false);
-
-        // If we get here without panic, long labels are handled
-        assert!(true);
     }
 
     #[test]
     fn test_special_characters_in_labels() {
-        let special_labels = vec![
+        let special_labels = [
             "test/with/slashes",
             "test-with-dashes",
             "test_with_underscores",
@@ -712,9 +993,6 @@ mod tests {
             RouterMetrics::record_request(label);
             RouterMetrics::set_worker_health(label, true);
         }
-
-        // If we get here without panic, special characters are handled
-        assert!(true);
     }
 
     #[test]
@@ -727,9 +1005,7 @@ mod tests {
         RouterMetrics::set_worker_load("worker", usize::MAX);
 
         RouterMetrics::record_request_duration("route", Duration::from_nanos(1));
-        RouterMetrics::record_request_duration("route", Duration::from_secs(86400)); // 24 hours
-
-        // If we get here without panic, extreme values are handled
-        assert!(true);
+        // 24 hours
+        RouterMetrics::record_request_duration("route", Duration::from_secs(86400));
     }
 }

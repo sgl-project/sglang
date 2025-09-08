@@ -18,6 +18,10 @@ jobs:
           - version: 12.8.1
             type: blackwell
             tag: blackwell
+          - version: 12.9.1
+            type: blackwell
+            tag: b200-cu129
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

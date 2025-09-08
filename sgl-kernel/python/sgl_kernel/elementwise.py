@@ -1,7 +1,8 @@
-from typing import Optional
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
-from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
+from sgl_kernel.utils import get_cuda_stream, is_arch_support_pdl
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -40,7 +41,7 @@ def rmsnorm(
     if out is None:
         out = torch.empty_like(input)
     if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
@@ -76,7 +77,7 @@ def fused_add_rmsnorm(
         If None, will be automatically enabled on Hopper architecture.
     """
     if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.fused_add_rmsnorm.default(
         input, residual, weight, eps, enable_pdl
     )
@@ -116,7 +117,7 @@ def gemma_rmsnorm(
     if out is None:
         out = torch.empty_like(input)
     if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
@@ -152,7 +153,7 @@ def gemma_fused_add_rmsnorm(
         If None, will be automatically enabled on Hopper architecture.
     """
     if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
         input, residual, weight, eps, enable_pdl
     )
@@ -237,6 +238,31 @@ if torch.version.hip is not None:
         return out
 
 
+@dataclass
+class FusedSetKVBufferArg:
+    """
+    value : Optional[torch.Tensor]
+        Value tensor, shape: ``(nnz, num_v_heads * head_size)``.
+    k_buffer : Optional[torch.Tensor]
+        Buffer for keys, shape: ``(nnz, num_k_heads * head_size)``.
+    v_buffer : Optional[torch.Tensor]
+        Buffer for values, shape: ``(nnz, num_v_heads * head_size)``.
+    k_scale : Optional[float]
+        Scale factor for keys.
+    v_scale : Optional[float]
+        Scale factor for values.
+    cache_loc : Optional[torch.Tensor]
+        Cache location tensor, used for indexing kv cache.
+    """
+
+    value: torch.Tensor
+    k_buffer: torch.Tensor
+    v_buffer: torch.Tensor
+    k_scale: Optional[float]
+    v_scale: Optional[float]
+    cache_loc: torch.Tensor
+
+
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -244,6 +270,8 @@ def apply_rope_with_cos_sin_cache_inplace(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
+    fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
@@ -270,6 +298,9 @@ def apply_rope_with_cos_sin_cache_inplace(
 
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+    fused_set_kv_buffer_arg : FusedSetKVBufferArg
+        Fuse the set-kv-buffer operation into this kernel
+
     Note
     ----
     The rotary dimension is determined by the cosine cache and sine cache.
@@ -277,13 +308,74 @@ def apply_rope_with_cos_sin_cache_inplace(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
+    if enable_pdl is None:
+        # the non-fused branch does not yet support PDL, but after we switch to our impl for that branch it will
+        enable_pdl = is_arch_support_pdl() and (fused_set_kv_buffer_arg is not None)
+
+    if (a := fused_set_kv_buffer_arg) is not None:
+        assert a.k_scale is None, "k_scale is not yet supported"
+        assert a.v_scale is None, "v_scale is not yet supported"
+        assert a.cache_loc.dtype == torch.int64, f"{a.cache_loc.dtype=}"
+
+    def _view_3d(x):
+        return x.view(x.shape[0], -1, head_size)
+
     torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
-        query.view(query.shape[0], -1, head_size),
-        key.view(key.shape[0], -1, head_size),
-        query.view(query.shape[0], -1, head_size),
-        key.view(key.shape[0], -1, head_size),
+        _view_3d(query),
+        _view_3d(key),
+        _view_3d(query),
+        _view_3d(key),
         cos_sin_cache,
         positions.long(),
         (not is_neox),
+        enable_pdl,
         get_cuda_stream(),
+        (
+            _view_3d(fused_set_kv_buffer_arg.value)
+            if fused_set_kv_buffer_arg is not None
+            else None
+        ),
+        (
+            _view_3d(fused_set_kv_buffer_arg.k_buffer)
+            if fused_set_kv_buffer_arg is not None
+            else None
+        ),
+        (
+            _view_3d(fused_set_kv_buffer_arg.v_buffer)
+            if fused_set_kv_buffer_arg is not None
+            else None
+        ),
+        (
+            fused_set_kv_buffer_arg.cache_loc
+            if fused_set_kv_buffer_arg is not None
+            else None
+        ),
     )
+
+
+def downcast_fp8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    loc: torch.Tensor,
+    mult: int = 1,
+    offset: int = 0,
+) -> None:
+    torch.ops.sgl_kernel.downcast_fp8(
+        k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset, get_cuda_stream()
+    )
+
+
+def copy_to_gpu_no_ce(input: List[int], output: torch.Tensor):
+    torch.ops.sgl_kernel.copy_to_gpu_no_ce(input, output)
+
+
+def concat_mla_k(
+    k: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+):
+    torch.ops.sgl_kernel.concat_mla_k(k, k_nope, k_rope)

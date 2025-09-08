@@ -23,7 +23,7 @@ import logging
 import threading
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
 
@@ -43,8 +43,13 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import require_mlp_sync
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.utils import (
+    DynamicGradMode,
+    broadcast_pyobj,
+    point_to_point_pyobj,
+    require_mlp_sync,
+)
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -107,6 +112,7 @@ class PrefillBootstrapQueue:
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
         kv_args.prefill_pp_size = self.pp_size
+        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -134,8 +140,10 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
-        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(
+        kv_manager_class: Type[BaseKVManager] = get_kv_class(
+            self.transfer_backend, KVClassType.MANAGER
+        )
+        kv_manager: BaseKVManager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
@@ -172,7 +180,7 @@ class PrefillBootstrapQueue:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
-            prepare_abort(req, message)
+            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
             return True
         return False
@@ -208,8 +216,8 @@ class PrefillBootstrapQueue:
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.queue], self.gloo_group
         )
-        for i, (req, poll) in enumerate(zip(self.queue, polls)):
 
+        for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None:
                 # if req not in reqs_info_to_check, skip
                 if req.rid not in rids_to_check:
@@ -232,6 +240,8 @@ class PrefillBootstrapQueue:
                 self.scheduler.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 continue
 
             # KV.WaitingForInput - init here
@@ -395,7 +405,10 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
-                if logits_output.hidden_states is not None:
+                if (
+                    logits_output is not None
+                    and logits_output.hidden_states is not None
+                ):
                     last_hidden_index = (
                         hidden_state_offset + extend_input_len_per_req[i] - 1
                     )
@@ -513,6 +526,8 @@ class SchedulerDisaggregationPrefillMixin:
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 done_reqs.append(req)
+                if self.enable_metrics:
+                    self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 assert False, f"Unexpected polling state {poll=}"
 
@@ -554,7 +569,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Move the chunked request out of the batch so that we can merge
                 # only finished requests to running_batch.
                 self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-                self.tree_cache.cache_unfinished_req(self.chunked_req)
+                self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
                 if self.enable_overlap:
                     # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                     self.chunked_req.tmp_end_idx = min(
@@ -603,3 +618,250 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         req.disagg_kv_sender.send(page_indices)
+
+    # PP
+    @DynamicGradMode()
+    def event_loop_pp_disagg_prefill(self: Scheduler):
+        """
+        An event loop for the prefill server in pipeline parallelism.
+
+        Rules:
+        1. Each stage runs in the same order and is notified by the previous stage.
+        2. Each send/recv operation is blocking and matched by the neighboring stage.
+
+        Regular Schedule:
+        ====================================================================
+        Stage i                   | Stage i+1
+        send ith req              | recv ith req
+        send ith proxy            | recv ith proxy
+        send prev (i+1)th carry   | recv prev (i+1)th carry
+        ====================================================================
+
+        Prefill Server Schedule:
+        ====================================================================
+        Stage i                        | Stage i+1
+        send ith req                   | recv ith req
+        send ith bootstrap req         | recv ith bootstrap req
+        send ith transferred req       | recv ith transferred req
+        send ith proxy                 | recv ith proxy
+        send prev (i+1)th carry        | recv prev (i+1)th carry
+        send prev (i+1)th release req  | recv prev (i+1)th release req
+        ====================================================================
+
+        There are two additional elements compared to the regular schedule:
+
+        1. Bootstrap Requests:
+            a. Instead of polling the status on the current workers, we should wait for the previous stage to notify to avoid desynchronization.
+            b. The first stage polls the status and propagates the bootstrapped requests down to all other stages.
+            c. If the first stage polls successfully, by nature, other ranks are also successful because they performed a handshake together.
+
+        2. Transferred Requests + Release Requests:
+            a. The first stage polls the transfer finished requests, performs an intersection with the next stage's finished requests, and propagates down to the last stage.
+            b. The last stage receives the requests that have finished transfer on all stages (consensus), then sends them to the first stage to release the memory.
+            c. The first stage receives the release requests, releases the memory, and then propagates the release requests down to the last stage.
+        """
+        from sglang.srt.managers.scheduler import GenerationBatchResult
+
+        mbs = [None] * self.pp_size
+        last_mbs = [None] * self.pp_size
+        self.running_mbs = [
+            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
+        ]
+        bids = [None] * self.pp_size
+        pp_outputs: Optional[PPProxyTensors] = None
+
+        # Either success or failed
+        bootstrapped_rids: List[str] = []
+        transferred_rids: List[str] = []
+        release_rids: Optional[List[str]] = None
+
+        # transferred microbatch
+        tmbs = [None] * self.pp_size
+
+        ENABLE_RELEASE = True  # For debug
+
+        while True:
+            server_is_idle = True
+
+            for mb_id in range(self.pp_size):
+                self.running_batch = self.running_mbs[mb_id]
+                self.last_batch = last_mbs[mb_id]
+
+                recv_reqs = self.recv_requests()
+
+                self.process_input_requests(recv_reqs)
+
+                if self.pp_group.is_first_rank:
+                    # First rank, pop the bootstrap reqs from the bootstrap queue
+                    bootstrapped_reqs, failed_reqs = (
+                        self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                            return_failed_reqs=True
+                        )
+                    )
+                    bootstrapped_rids = [req.rid for req in bootstrapped_reqs] + [
+                        req.rid for req in failed_reqs
+                    ]
+                    self.waiting_queue.extend(bootstrapped_reqs)
+                else:
+                    # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
+                    bootstrapped_rids = self.recv_pyobj_from_prev_stage()
+                    bootstrapped_reqs = (
+                        self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                            rids_to_check=bootstrapped_rids
+                        )
+                    )
+                    self.waiting_queue.extend(bootstrapped_reqs)
+
+                if self.pp_group.is_first_rank:
+                    transferred_rids = self.get_transferred_rids()
+                # if other ranks,
+                else:
+                    # 1. recv previous stage's transferred reqs info
+                    prev_transferred_rids = self.recv_pyobj_from_prev_stage()
+                    # 2. get the current stage's transferred reqs info
+                    curr_transferred_rids = self.get_transferred_rids()
+                    # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+                    transferred_rids = list(
+                        set(prev_transferred_rids) & set(curr_transferred_rids)
+                    )
+
+                tmbs[mb_id] = transferred_rids
+
+                self.process_prefill_chunk()
+                mbs[mb_id] = self.get_new_batch_prefill()
+                self.running_mbs[mb_id] = self.running_batch
+
+                self.cur_batch = mbs[mb_id]
+                if self.cur_batch:
+                    server_is_idle = False
+                    result = self.run_batch(self.cur_batch)
+
+                # send the outputs to the next step
+                if self.pp_group.is_last_rank:
+                    if self.cur_batch:
+                        next_token_ids, bids[mb_id] = (
+                            result.next_token_ids,
+                            result.bid,
+                        )
+                        pp_outputs = PPProxyTensors(
+                            {
+                                "next_token_ids": next_token_ids,
+                            }
+                        )
+                        # send the output from the last round to let the next stage worker run post processing
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+                if ENABLE_RELEASE:
+                    if self.pp_group.is_last_rank:
+                        # At the last stage, all stages has reached the consensus to release memory for transferred_rids
+                        release_rids = transferred_rids
+                        # send to the first rank
+                        self.send_pyobj_to_next_stage(release_rids)
+
+                # receive outputs and post-process (filter finished reqs) the coming microbatch
+                next_mb_id = (mb_id + 1) % self.pp_size
+                next_pp_outputs = None
+                next_release_rids = None
+
+                if mbs[next_mb_id] is not None:
+                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
+                        self.pp_group.recv_tensor_dict(
+                            all_gather_group=self.attn_tp_group
+                        )
+                    )
+                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+                    output_result = GenerationBatchResult(
+                        logits_output=None,
+                        pp_hidden_states_proxy_tensors=None,
+                        next_token_ids=next_pp_outputs["next_token_ids"],
+                        extend_input_len_per_req=None,
+                        extend_logprob_start_len_per_req=None,
+                        bid=bids[next_mb_id],
+                        can_run_cuda_graph=result.can_run_cuda_graph,
+                    )
+                    self.process_batch_result_disagg_prefill(
+                        mbs[next_mb_id], output_result
+                    )
+
+                    last_mbs[next_mb_id] = mbs[next_mb_id]
+
+                if ENABLE_RELEASE:
+                    if tmbs[next_mb_id] is not None:
+                        # recv consensus rids from the previous rank
+                        next_release_rids = self.recv_pyobj_from_prev_stage()
+                        self.process_disagg_prefill_inflight_queue(next_release_rids)
+
+                # carry the outputs to the next stage
+                if not self.pp_group.is_last_rank:
+                    if self.cur_batch:
+                        bids[mb_id] = result.bid
+                    if pp_outputs:
+                        # send the outputs from the last round to let the next stage worker run post processing
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+                    if ENABLE_RELEASE:
+                        if release_rids is not None:
+                            self.send_pyobj_to_next_stage(release_rids)
+
+                if not self.pp_group.is_last_rank:
+                    # send out reqs to the next stage
+                    self.send_pyobj_to_next_stage(recv_reqs)
+                    self.send_pyobj_to_next_stage(bootstrapped_rids)
+                    self.send_pyobj_to_next_stage(transferred_rids)
+
+                    # send out proxy tensors to the next stage
+                    if self.cur_batch:
+                        self.pp_group.send_tensor_dict(
+                            result.pp_hidden_states_proxy_tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+                pp_outputs = next_pp_outputs
+                release_rids = next_release_rids
+
+                self.running_batch.batch_is_full = False
+
+            if not ENABLE_RELEASE:
+                if len(self.disagg_prefill_inflight_queue) > 0:
+                    self.process_disagg_prefill_inflight_queue()
+
+            # When the server is idle, self-check and re-init some states
+            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
+                self.check_memory()
+                self.check_tree_cache()
+                self.new_token_ratio = self.init_new_token_ratio
+
+    def send_pyobj_to_next_stage(self, data):
+        if self.attn_tp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            point_to_point_pyobj(
+                data,
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.device_group,
+                self.pp_rank * self.tp_size + dp_offset,
+                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+            )
+
+    def recv_pyobj_from_prev_stage(self):
+        if self.attn_tp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            data = point_to_point_pyobj(
+                [],
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.device_group,
+                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + dp_offset,
+            )
+        else:
+            data = None
+
+        if self.tp_size != 1:
+            data = broadcast_pyobj(
+                data, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0]
+            )
+        return data
