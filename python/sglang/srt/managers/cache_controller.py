@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -206,26 +207,25 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
 
-        self._done_flag = False
         self._lock = threading.Lock()
-
+        self._terminated_flag = False
         self.start_time = time.monotonic()
 
         super().__init__(host_indices, token_ids, last_hash)
 
     def increment(self, num_tokens: int):
         with self._lock:
-            if self._done_flag:
+            if self._terminated_flag:
                 return False
             self.completed_tokens += num_tokens
             return True
 
-    def mark_done(self):
+    def mark_terminate(self):
         with self._lock:
-            self._done_flag = True
+            self._terminated_flag = True
 
-    def is_done(self) -> bool:
-        return self._done_flag
+    def is_terminated(self) -> bool:
+        return self._terminated_flag
 
 
 class HiCacheController:
@@ -324,6 +324,22 @@ class HiCacheController:
                     group_ranks, backend="gloo"
                 )
 
+            # Select the get and set functions
+            self.page_get_func = self._generic_page_get
+            self.page_set_func = self._generic_page_set
+            self.batch_exists_func = self.storage_backend.batch_exists
+            self.is_3fs_zerocopy = (
+                self.storage_backend_type == "hf3fs"
+                and self.mem_pool_host.layout == "page_first"
+            )
+            if self.storage_backend_type == "mooncake":
+                self.page_get_func = self._mooncake_page_get
+                self.page_set_func = self._mooncake_page_set
+            elif self.is_3fs_zerocopy:
+                self.page_get_func = self._3fs_zero_copy_page_get
+                self.page_set_func = self._3fs_zero_copy_page_set
+                self.batch_exists_func = self._3fs_zero_copy_batch_exists
+
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
@@ -386,9 +402,11 @@ class HiCacheController:
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
             self.tp_size = get_attention_tp_size()
+            self.dp_rank = get_attention_dp_rank()
         else:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
+            self.dp_rank = 0
 
         # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
@@ -407,6 +425,7 @@ class HiCacheController:
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             is_mla_model=is_mla_backend,
+            is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             extra_config=extra_config,
         )
@@ -608,7 +627,7 @@ class HiCacheController:
         return operation
 
     def terminate_prefetch(self, operation):
-        operation.mark_done()
+        operation.mark_terminate()
         return operation.completed_tokens, operation.hash_value
 
     def append_host_mem_release(self, host_indices: torch.Tensor):
@@ -616,13 +635,19 @@ class HiCacheController:
         for chunk in chunks:
             self.host_mem_release_queue.put(chunk)
 
+    def _3fs_zero_copy_batch_exists(self, batch_hashes):
+        _batch_hashes, _, factor = self.mem_pool_host.get_buffer_with_hash(batch_hashes)
+        hit_page_num = self.storage_backend.batch_exists(_batch_hashes) // factor
+        return hit_page_num
+
     def _3fs_zero_copy_page_get(self, operation, hash_values, host_indices):
-        hashes, dsts = self.mem_pool_host.get_buffer_with_hash(
+        hashes, dsts, factor = self.mem_pool_host.get_buffer_with_hash(
             hash_values, host_indices
         )
         page_data = self.storage_backend.batch_get(hashes, dsts)
         if page_data:
-            operation.increment(self.page_size * len(hashes))
+            inc = self.page_size * len(hashes) // factor
+            operation.increment(inc)
         else:
             logger.warning(
                 f"Prefetch operation {operation.request_id} failed to retrieve page {hashes}."
@@ -636,7 +661,7 @@ class HiCacheController:
         )
         get_result = self.storage_backend.batch_get(
             key_strs,
-            target_location=buffer_ptrs,
+            target_locations=buffer_ptrs,
             target_sizes=buffer_sizes,
         )
         if get_result != len(hash_values):
@@ -647,9 +672,9 @@ class HiCacheController:
             operation.increment(get_result * self.page_size)
 
     def _generic_page_get(self, operation, hash_values, host_indices):
-        dummy_page_dst = [self.mem_pool_host.get_dummy_flat_data_page()] * len(
-            hash_values
-        )
+        dummy_page_dst = [
+            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
+        ]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
             return
@@ -659,26 +684,16 @@ class HiCacheController:
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
                 break
-            if operation.increment(self.page_size):
-                self.mem_pool_host.set_from_flat_data_page(
-                    host_indices[i * self.page_size],
-                    page_data[i],
-                )
-            else:
-                break
+            # Must set the data before increasing the completed tokens.
+            # Otherwise this page may be read before being set.
+            self.mem_pool_host.set_from_flat_data_page(
+                host_indices[i * self.page_size],
+                page_data[i],
+            )
+            if not operation.increment(self.page_size):
+                break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
-        # Select the get function and batch size
-        if self.storage_backend_type == "mooncake":
-            get_func = self._mooncake_page_get
-        elif (
-            self.storage_backend_type == "hf3fs"
-            and self.mem_pool_host.layout == "page_first"
-        ):
-            get_func = self._3fs_zero_copy_page_get
-        else:
-            get_func = self._generic_page_get
-
         # Transfer batch by batch
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
@@ -687,12 +702,13 @@ class HiCacheController:
             ]
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
-            get_func(operation, batch_hashes, batch_host_indices)
+            self.page_get_func(operation, batch_hashes, batch_host_indices)
             # Check termination
             if (
                 operation.completed_tokens
                 != prev_completed_tokens + len(batch_hashes) * self.page_size
             ):
+                operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
         # release pre-allocated memory
         self.append_host_mem_release(
@@ -744,7 +760,7 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes)
+            hit_page_num = self.batch_exists_func(batch_hashes)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -830,30 +846,20 @@ class HiCacheController:
         )
         success = self.storage_backend.batch_set(
             key_strs,
-            target_location=buffer_ptrs,
+            target_locations=buffer_ptrs,
             target_sizes=buffer_sizes,
         )
         return success
 
     # zero copy
     def _3fs_zero_copy_page_set(self, hash_values, host_indices) -> bool:
-        hashes, dsts = self.mem_pool_host.get_buffer_with_hash(
+        hashes, dsts, _ = self.mem_pool_host.get_buffer_with_hash(
             hash_values, host_indices
         )
         return self.storage_backend.batch_set(hashes, dsts)
 
     # Backup batch by batch
     def _page_backup(self, operation):
-        # Select the set function and batch size
-        if self.storage_backend_type == "mooncake":
-            backup_set_func = self._mooncake_page_set
-        elif (
-            self.storage_backend_type == "hf3fs"
-            and self.mem_pool_host.layout == "page_first"
-        ):
-            backup_set_func = self._3fs_zero_copy_page_set
-        else:
-            backup_set_func = self._generic_page_set
         # Backup batch by batch
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
@@ -862,7 +868,7 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            success = backup_set_func(batch_hashes, batch_host_indices)
+            success = self.page_set_func(batch_hashes, batch_host_indices)
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
@@ -882,7 +888,7 @@ class HiCacheController:
 
                 if not self.backup_skip:
                     self._page_backup(operation)
-                self.ack_backup_queue.put(operation.id)
+                self.ack_backup_queue.put(operation)
 
             except Empty:
                 continue
