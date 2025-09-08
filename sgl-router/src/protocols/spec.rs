@@ -2869,7 +2869,7 @@ mod tests {
     fn test_embedding_request_serialization() {
         let request = EmbeddingRequest {
             input: EmbeddingInput::Text("test text".to_string()),
-            model: "text-embedding-ada-002".to_string(),
+            model: "text-embedding-model".to_string(),
             encoding_format: "float".to_string(),
             dimensions: Some(1536),
             user: Some("user-123".to_string()),
@@ -3132,7 +3132,7 @@ mod tests {
                     object: "embedding".to_string(),
                 },
             ],
-            model: "text-embedding-ada-002".to_string(),
+            model: "text-embedding-model".to_string(),
             object: "list".to_string(),
             usage: Some(UsageInfo {
                 prompt_tokens: 10,
@@ -3151,7 +3151,7 @@ mod tests {
         assert_eq!(deserialized.data[0].index, 0);
         assert_eq!(deserialized.data[1].embedding, vec![0.4, 0.5, 0.6]);
         assert_eq!(deserialized.data[1].index, 1);
-        assert_eq!(deserialized.model, "text-embedding-ada-002");
+        assert_eq!(deserialized.model, "text-embedding-model");
         assert_eq!(deserialized.object, "list");
         assert!(deserialized.usage.is_some());
     }
