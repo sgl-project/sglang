@@ -1,0 +1,165 @@
+version: '3.8'
+
+services:
+  # Default SGLang service
+  sglang-default:
+    build:
+      context: ..
+      dockerfile: docker/envs/Dockerfile.default
+      args:
+        - CUDA_VERSION=${CUDA_VERSION:-12.6.1}
+        - BUILD_TYPE=${BUILD_TYPE:-all}
+        - BRANCH_TYPE=${BRANCH_TYPE:-remote}
+    image: sglang:${CUDA_VERSION:-12.6.1}
+    container_name: sglang-default
+    profiles:
+      - default
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${HOST_WORKSPACE:-./workspace}:/sgl-workspace/sglang
+      - ${HOST_MODELS:-./models}:/models
+    environment:
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}
+    ports:
+      - "${SGL_PORT:-30000}:30000"
+    stdin_open: true
+    tty: true
+
+  # GB200 environment
+  sglang-gb200:
+    build:
+      context: ..
+      dockerfile: docker/envs/Dockerfile.gb200
+      args:
+        - CUDA_VERSION=${CUDA_VERSION:-12.9.1}
+        - BUILD_TYPE=${BUILD_TYPE:-blackwell}
+    image: sglang:gb200-${CUDA_VERSION:-12.9.1}
+    container_name: sglang-gb200
+    profiles:
+      - gb200
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${HOST_WORKSPACE:-./workspace}:/sgl-workspace/sglang
+      - ${HOST_MODELS:-./models}:/models
+    environment:
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}
+      - TORCH_CUDA_ARCH_LIST=10.0 12.0
+    ports:
+      - "${SGL_PORT:-30000}:30000"
+    stdin_open: true
+    tty: true
+
+  # NPU environment
+  sglang-npu:
+    build:
+      context: ..
+      dockerfile: docker/envs/Dockerfile.npu
+      args:
+        - CANN_VERSION=${CANN_VERSION:-8.2.rc1}
+        - DEVICE_TYPE=${DEVICE_TYPE:-a3}
+        - SGLANG_TAG=${SGLANG_TAG:-main}
+    image: sglang:npu
+    container_name: sglang-npu
+    profiles:
+      - npu
+    volumes:
+      - ${HOST_WORKSPACE:-./workspace}:/workspace
+      - ${HOST_MODELS:-./models}:/models
+    environment:
+      - ASCEND_VISIBLE_DEVICES=${ASCEND_VISIBLE_DEVICES:-all}
+    ports:
+      - "${SGL_PORT:-30000}:30000"
+    stdin_open: true
+    tty: true
+
+  # ROCm environment
+  sglang-rocm:
+    build:
+      context: ..
+      dockerfile: docker/envs/Dockerfile.rocm
+      args:
+        - GPU_ARCH=${GPU_ARCH:-gfx950}
+        - SGL_BRANCH=${SGL_BRANCH:-main}
+    image: sglang:rocm-${GPU_ARCH:-gfx950}
+    container_name: sglang-rocm
+    profiles:
+      - rocm
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ${HOST_WORKSPACE:-./workspace}:/workspace/sglang
+      - ${HOST_MODELS:-./models}:/models
+    environment:
+      - ROC_VISIBLE_DEVICES=${ROC_VISIBLE_DEVICES:-all}
+      - HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-all}
+    ports:
+      - "${SGL_PORT:-30000}:30000"
+    stdin_open: true
+    tty: true
+
+  # Router service
+  sglang-router:
+    build:
+      context: ..
+      dockerfile: docker/envs/Dockerfile.router
+      target: router-image
+      args:
+        - SGLANG_REPO_REF=${SGLANG_REPO_REF:-main}
+        - PYTHON_VERSION=${PYTHON_VERSION:-3.12}
+    image: sglang:router
+    container_name: sglang-router
+    profiles:
+      - router
+    ports:
+      - "${ROUTER_PORT:-8080}:8080"
+    environment:
+      - ROUTER_HOST=${ROUTER_HOST:-0.0.0.0}
+      - ROUTER_PORT=${ROUTER_PORT:-8080}
+    restart: unless-stopped
+
+  # Xeon CPU environment
+  sglang-xeon:
+    build:
+      context: ..
+      dockerfile: docker/envs/Dockerfile.xeon
+      args:
+        - PYTHON_VERSION=${PYTHON_VERSION:-3.12}
+        - SGLANG_TAG=${SGLANG_TAG:-main}
+    image: sglang:xeon
+    container_name: sglang-xeon
+    profiles:
+      - xeon
+    volumes:
+      - ${HOST_WORKSPACE:-./workspace}:/workspace/sglang
+      - ${HOST_MODELS:-./models}:/models
+    environment:
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-auto}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-auto}
+    ports:
+      - "${SGL_PORT:-30000}:30000"
+    stdin_open: true
+    tty: true
+
+networks:
+  default:
+    name: sglang-network

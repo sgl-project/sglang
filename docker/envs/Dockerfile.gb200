@@ -1,0 +1,67 @@
+# GB200 SGLang Docker environment  
+ARG CUDA_VERSION=12.9.1
+FROM sglang/base:${CUDA_VERSION}
+
+ARG BUILD_TYPE=blackwell
+ARG DEEPEP_COMMIT=1b14ad661c7640137fcfe93cccb2694ede1220b0
+ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
+    BUILD_TYPE=${BUILD_TYPE} \
+    TORCH_CUDA_ARCH_LIST="10.0 12.0"
+
+# Install SGLang missing package for blackwell build type
+RUN python3 -m pip install openai httpx
+
+# Clone and install SGLang
+WORKDIR /sgl-workspace
+RUN cd sglang \
+ && case "$CUDA_VERSION" in \
+      12.9.1) CUINDEX=129 ;; \
+      *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+    esac \
+ && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
+      python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+    fi
+
+# Download source files
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
+    git clone https://github.com/fzyzcjy/DeepEP.git && \
+    cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. && \
+    tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
+    mv nvshmem_src nvshmem && \
+    rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+
+# Build and install NVSHMEM
+RUN cd /sgl-workspace/nvshmem && \
+    NVSHMEM_SHMEM_SUPPORT=0 \
+    NVSHMEM_UCX_SUPPORT=0 \
+    NVSHMEM_USE_NCCL=0 \
+    NVSHMEM_MPI_SUPPORT=0 \
+    NVSHMEM_IBGDA_SUPPORT=1 \
+    NVSHMEM_PMIX_SUPPORT=0 \
+    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
+    NVSHMEM_USE_GDRCOPY=1 \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="100;120" && \
+    cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
+
+# Install DeepEP
+RUN cd /sgl-workspace/DeepEP && \
+    NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
+
+# Install additional dependencies specific to GB200
+RUN python3 -m pip install --no-cache-dir \
+    mooncake-transfer-engine==0.3.5 \
+    nvidia-cudnn-cu12 \
+    nvidia-cudnn-frontend \
+    nixl
+
+# Set up additional tools for GB200 environment
+RUN apt update -y \
+    && apt install -y --no-install-recommends gnupg \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
+    && apt update -y \
+    && apt install nsight-systems-cli -y
+
+WORKDIR /sgl-workspace/sglang

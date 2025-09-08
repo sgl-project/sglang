@@ -1,7 +1,6 @@
-######################## BASE IMAGE ##########################
-FROM ubuntu:24.04 AS base
-
+# Router SGLang Docker environment - Lightweight router service
 ARG PYTHON_VERSION=3.12
+FROM ubuntu:24.04 AS base
 
 # set the environment variables
 ENV PATH="/root/.local/bin:${PATH}"
@@ -13,7 +12,6 @@ ENV VIRTUAL_ENV="/opt/venv"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 ENV UV_LINK_MODE="copy"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-
 
 # install dependencies
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \

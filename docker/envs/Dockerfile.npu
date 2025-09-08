@@ -1,3 +1,4 @@
+# NPU SGLang Docker environment
 ARG CANN_VERSION=8.2.rc1
 ARG DEVICE_TYPE=a3
 ARG OS=ubuntu22.04

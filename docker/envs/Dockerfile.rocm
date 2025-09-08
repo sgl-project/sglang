@@ -1,0 +1,98 @@
+# ROCm SGLang Docker environment
+ARG GPU_ARCH=gfx950
+ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
+ARG BASE_IMAGE_942_ROCM700="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
+
+# Base image 942 with rocm630
+FROM $BASE_IMAGE_942 AS gfx942
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT="v0.1.4"
+ENV NO_DEPS_FLAG=""
+
+# Base image 942 with rocm700
+FROM $BASE_IMAGE_942_ROCM700 AS gfx942-rocm700
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT="v0.1.5"
+ENV NO_DEPS_FLAG=""
+
+# Base image 950
+FROM $BASE_IMAGE_950 AS gfx950
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT="v0.1.5"
+ENV NO_DEPS_FLAG="--no-deps"
+
+# Final stage based on selected GPU architecture
+FROM ${GPU_ARCH}
+
+ARG SGL_BRANCH=main
+ARG CMAKE_BUILD_PARALLEL_LEVEL=4
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /workspace
+
+# Install SGLang
+RUN git clone --depth 1 --branch ${SGL_BRANCH} https://github.com/sgl-project/sglang.git \
+    && cd sglang \
+    && if [ "$BUILD_VLLM" = "1" ]; then \
+        pip uninstall vllm -y && \
+        pip install -v -e "python[srt]" --no-build-isolation; \
+       else \
+        pip install -v -e "python[srt]" --no-build-isolation; \
+       fi
+
+# Install additional tools and libraries
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        git clone https://github.com/ROCm/triton.git && \
+        cd triton/python && \
+        pip install -v -e .; \
+        cd ../../; \
+        rm -rf triton; \
+    fi
+
+RUN if [ "$BUILD_LLVM" = "1" ]; then \
+        apt update && apt install -y ninja-build && \
+        git clone https://github.com/llvm/llvm-project.git && \
+        cd llvm-project && \
+        mkdir build && cd build && \
+        cmake ../llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" \
+            -DCMAKE_INSTALL_PREFIX=/opt/llvm && \
+        ninja -j${CMAKE_BUILD_PARALLEL_LEVEL} && \
+        ninja install && \
+        cd ../../ && rm -rf llvm-project; \
+    fi
+
+RUN if [ "$BUILD_AITER_ALL" = "1" ]; then \
+        git clone --depth=1 --branch ${AITER_COMMIT} https://github.com/ROCmSoftwarePlatform/aiter.git && \
+        cd aiter && \
+        if [ -n "$NO_DEPS_FLAG" ]; then \
+            pip install -v -e . $NO_DEPS_FLAG; \
+        else \
+            pip install -v -e .; \
+        fi && \
+        cd .. && rm -rf aiter; \
+    fi
+
+RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
+        pip install mooncake-transfer-engine==0.3.5; \
+    fi
+
+WORKDIR /workspace/sglang
+
+CMD ["/bin/bash"]
