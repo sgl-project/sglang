@@ -1137,8 +1137,8 @@ class ModelRunner:
     @property
     def is_hybrid_gdn(self):
         return self.model_config.hf_config.architectures[0] in [
-            "Qwen3HybridMoEForCausalLM",
-            "Qwen3HybridMoEForCausalLMMTP",
+            "Qwen3NextForCausalLM",
+            "Qwen3NextForCausalLMMTP",
         ]
 
     def set_num_token_hybrid(self):

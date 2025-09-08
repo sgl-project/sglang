@@ -36,7 +36,7 @@ class HybridLayerType(enum.Enum):
     mamba2 = "mamba"
 
 
-class Qwen3HybridMoeConfig(PretrainedConfig):
+class Qwen3NextConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3HybridModel`]. It is used to instantiate a
     Qwen3Hybrid model according to the specified arguments, defining the model architecture. Instantiating a configuration
@@ -168,7 +168,7 @@ class Qwen3HybridMoeConfig(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "qwen3_hybrid_moe"
+    model_type = "qwen3_next"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(

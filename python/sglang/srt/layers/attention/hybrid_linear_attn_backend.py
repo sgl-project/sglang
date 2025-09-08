@@ -21,7 +21,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.models.qwen3_hybrid_moe import (
+from sglang.srt.models.qwen3_next import (
     Qwen3HybridAttentionDecoderLayer,
     Qwen3HybridLinearDecoderLayer,
     fused_gdn_gating,

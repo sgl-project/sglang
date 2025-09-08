@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.configs.qwen3_hybrid_moe import Qwen3HybridMoeConfig
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
@@ -240,7 +240,7 @@ def fused_gdn_gating(
 
 
 class Qwen3GatedDeltaNet(nn.Module):
-    def __init__(self, config: Qwen3HybridMoeConfig, layer_id: int) -> None:
+    def __init__(self, config: Qwen3NextConfig, layer_id: int) -> None:
         super().__init__()
         self.config = config
         self.attn_tp_rank = get_attention_tp_rank()
@@ -484,7 +484,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3HybridMoeConfig,
+        config: Qwen3NextConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -494,7 +494,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self.config = config
         self.linear_attn = Qwen3GatedDeltaNet(config, layer_id)
 
-        # Qwen3HybridMoE all layers are sparse and have no nextn now
+        # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
         self.layer_id = layer_id
@@ -583,7 +583,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3HybridMoeConfig,
+        config: Qwen3NextConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -671,7 +671,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # Qwen3HybridMoE all layers are sparse and have no nextn now
+        # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
 
@@ -836,10 +836,10 @@ ALL_DECODER_LAYER_TYPES = {
 }
 
 
-class Qwen3HybridMoeModel(nn.Module):
+class Qwen3NextModel(nn.Module):
     def __init__(
         self,
-        config: Qwen3HybridMoeConfig,
+        config: Qwen3NextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -923,12 +923,12 @@ class HybridLayerType(enum.Enum):
     mamba2 = "mamba"
 
 
-class Qwen3HybridMoEForCausalLM(nn.Module):
+class Qwen3NextForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
         self,
-        config: Qwen3HybridMoeConfig,
+        config: Qwen3NextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -937,7 +937,7 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
         self.quant_config = quant_config
-        self.model = Qwen3HybridMoeModel(
+        self.model = Qwen3NextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -1083,4 +1083,4 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         )
 
 
-EntryClass = Qwen3HybridMoEForCausalLM
+EntryClass = Qwen3NextForCausalLM
