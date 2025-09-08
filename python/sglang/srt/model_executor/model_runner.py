@@ -318,6 +318,14 @@ class ModelRunner:
                     )
                 else:
                     self.server_args.max_mamba_cache_size = 512
+            self.server_args.max_mamba_cache_size = (
+                self.server_args.max_mamba_cache_size
+                // (
+                    self.server_args.dp_size
+                    if self.server_args.enable_dp_attention
+                    else 1
+                )
+            )
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
