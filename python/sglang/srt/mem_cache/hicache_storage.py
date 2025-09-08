@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import torch
@@ -9,13 +10,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-
-
-def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
+def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
     hasher = hashlib.sha256()
 
     if prior_hash:
@@ -25,6 +20,16 @@ def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
         hasher.update(t.to_bytes(4, byteorder="little", signed=False))
 
     return hasher.hexdigest()
+
+
+@dataclass
+class HiCacheStorageConfig:
+    tp_rank: int
+    tp_size: int
+    is_mla_model: bool
+    is_page_first_layout: bool
+    model_name: Optional[str]
+    extra_config: Optional[dict] = None
 
 
 class HiCacheStorage(ABC):
@@ -55,7 +60,7 @@ class HiCacheStorage(ABC):
         keys: List[str],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> List[torch.Tensor | None]:
+    ) -> List[torch.Tensor | None] | int:
         """
         Retrieve values for multiple keys.
         Returns a list of tensors or None for each key.
@@ -91,27 +96,53 @@ class HiCacheStorage(ABC):
         pass
 
     @abstractmethod
-    def exists(self, key: str) -> bool | dict:
+    def exists(self, key: str) -> bool:
         """
         Check if the key exists in the storage.
         Returns True if the key exists, False otherwise.
         """
         pass
 
+    def batch_exists(self, keys: List[str]) -> int:
+        """
+        Check if the keys exist in the storage.
+        return the number of consecutive existing keys from the start.
+        Can be overridden by subclasses for more efficient implementation.
+        """
+        for i in range(len(keys)):
+            if not self.exists(keys[i]):
+                return i
+        return len(keys)
+
+    def get_stats(self):
+        return None
+
 
 class HiCacheFile(HiCacheStorage):
 
-    def __init__(self, file_path: str = "/tmp/hicache"):
+    def __init__(
+        self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
+    ):
         self.file_path = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", file_path)
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-        self.tp_suffix = f"_{tp_rank}_{tp_size}" if tp_size > 1 else ""
+
+        tp_rank, tp_size, model_name, is_mla_model = (
+            storage_config.tp_rank,
+            storage_config.tp_size,
+            storage_config.model_name,
+            storage_config.is_mla_model,
+        )
+        model_name = "-".join(model_name.split("/")) if model_name else ""
+        if is_mla_model:
+            self.config_suffix = f"_{model_name}"
+        else:
+            self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
     def _get_suffixed_key(self, key: str) -> str:
-        return key + self.tp_suffix
+        return key + self.config_suffix
 
     def get(
         self,
@@ -122,13 +153,11 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
-            # Load directly into target_location's memory buffer
-            with open(tensor_path, "rb") as f:
-                target_location.set_(
-                    torch.frombuffer(f.read(), dtype=target_location.dtype)
-                    .reshape(target_location.shape)
-                    .untyped_storage()
-                )
+            expected = target_location.numel() * target_location.element_size()
+            with open(tensor_path, "rb", buffering=0) as f:
+                buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
+                if f.readinto(buf) != expected:
+                    raise IOError(f"Short read for {key}")
             return target_location
         except FileNotFoundError:
             logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
@@ -154,11 +183,12 @@ class HiCacheFile(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
             return True
+
+        key = self._get_suffixed_key(key)
+        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
             return True
@@ -183,21 +213,14 @@ class HiCacheFile(HiCacheStorage):
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
 
-    def delete(self, key: str) -> None:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        try:
-            os.remove(tensor_path)
-        except FileNotFoundError:
-            logger.warning(f"Key {key} does not exist. Cannot delete.")
-            return
-
-    def clear(self) -> None:
+    def clear(self) -> bool:
         try:
             for filename in os.listdir(self.file_path):
                 file_path = os.path.join(self.file_path, filename)
                 if os.path.isfile(file_path):
                     os.remove(file_path)
             logger.info("Cleared all entries in HiCacheFile storage.")
+            return True
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
+            return False

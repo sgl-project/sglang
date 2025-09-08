@@ -140,7 +140,6 @@ class TestLoRA(CustomTestCase):
                     lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
                     max_loras_per_batch=len(lora_adapter_paths) + 1,
                     lora_backend=backend,
-                    disable_radix_cache=True,
                 )
                 hf_runner = HFRunner(
                     base_path,

@@ -1,9 +1,13 @@
 use crate::config::RouterConfig;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
-use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
+use crate::middleware::TokenBucket;
+use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
+use crate::reasoning_parser::ParserFactory;
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
+use crate::tokenizer::{factory as tokenizer_factory, traits::Tokenizer};
+use crate::tool_parser::ParserRegistry;
 use axum::{
     extract::{Query, Request, State},
     http::StatusCode,
@@ -25,8 +29,10 @@ use tracing::{error, info, warn, Level};
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
-    pub concurrency_limiter: Arc<tokio::sync::Semaphore>,
-    // Future dependencies can be added here
+    pub rate_limiter: Arc<TokenBucket>,
+    pub tokenizer: Option<Arc<dyn Tokenizer>>,
+    pub reasoning_parser_factory: Option<ParserFactory>,
+    pub tool_parser_registry: Option<&'static ParserRegistry>,
 }
 
 impl AppContext {
@@ -34,13 +40,46 @@ impl AppContext {
         router_config: RouterConfig,
         client: Client,
         max_concurrent_requests: usize,
-    ) -> Self {
-        let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests));
-        Self {
+        rate_limit_tokens_per_second: Option<usize>,
+    ) -> Result<Self, String> {
+        let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
+        let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
+
+        // Initialize gRPC-specific components only when in gRPC mode
+        let (tokenizer, reasoning_parser_factory, tool_parser_registry) =
+            if router_config.connection_mode == crate::config::ConnectionMode::Grpc {
+                // Get tokenizer path (required for gRPC mode)
+                let tokenizer_path = router_config
+                    .tokenizer_path
+                    .clone()
+                    .or_else(|| router_config.model_path.clone())
+                    .ok_or_else(|| {
+                        "gRPC mode requires either --tokenizer-path or --model-path to be specified"
+                            .to_string()
+                    })?;
+
+                // Initialize all gRPC components
+                let tokenizer = Some(
+                    tokenizer_factory::create_tokenizer(&tokenizer_path)
+                        .map_err(|e| format!("Failed to create tokenizer: {}", e))?,
+                );
+                let reasoning_parser_factory = Some(ParserFactory::new());
+                let tool_parser_registry = Some(ParserRegistry::new());
+
+                (tokenizer, reasoning_parser_factory, tool_parser_registry)
+            } else {
+                // HTTP mode doesn't need these components
+                (None, None, None)
+            };
+
+        Ok(Self {
             client,
             router_config,
-            concurrency_limiter,
-        }
+            rate_limiter,
+            tokenizer,
+            reasoning_parser_factory,
+            tool_parser_registry,
+        })
     }
 }
 
@@ -48,6 +87,7 @@ impl AppContext {
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
+    pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<crate::middleware::QueuedRequest>>,
 }
 
 // Fallback handler for unmatched routes
@@ -186,7 +226,11 @@ pub fn build_app(
     let protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
-        .route("/v1/completions", post(v1_completions));
+        .route("/v1/completions", post(v1_completions))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            crate::middleware::concurrency_limit_middleware,
+        ));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -282,15 +326,33 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.clone(),
         client.clone(),
         config.router_config.max_concurrent_requests,
-    ));
+        config.router_config.rate_limit_tokens_per_second,
+    )?);
 
     // Create router with the context
-    let router = RouterFactory::create_router(&app_context)?;
+    let router = RouterFactory::create_router(&app_context).await?;
+
+    // Set up concurrency limiter with queue if configured
+    let (limiter, processor) = crate::middleware::ConcurrencyLimiter::new(
+        app_context.rate_limiter.clone(),
+        config.router_config.queue_size,
+        Duration::from_secs(config.router_config.queue_timeout_secs),
+    );
+
+    // Start queue processor if enabled
+    if let Some(processor) = processor {
+        tokio::spawn(processor.run());
+        info!(
+            "Started request queue with size: {}, timeout: {}s",
+            config.router_config.queue_size, config.router_config.queue_timeout_secs
+        );
+    }
 
     // Create app state with router and context
     let app_state = Arc::new(AppState {
         router: Arc::from(router),
         context: app_context.clone(),
+        concurrency_queue_tx: limiter.queue_tx.clone(),
     });
     let router_arc = Arc::clone(&app_state.router);
 

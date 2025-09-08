@@ -5,7 +5,7 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
-      - "scripts/**"
+      - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-xeon.yml"
@@ -13,7 +13,7 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
-      - "scripts/**"
+      - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-xeon.yml"
@@ -27,7 +27,9 @@ jobs:
   build-test:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: xeon-pvc
+    runs-on: xeon-gnr
+    env:
+      HF_HOME: /home/sdp/.cache/huggingface
     strategy:
       matrix:
         build_type: ['all']
@@ -46,6 +48,7 @@ jobs:
         run: |
           docker run -dt \
             -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
+            -v ${HF_HOME}:/root/.cache/huggingface \
             --name ci_sglang_xeon \
             sglang_xeon
 
@@ -67,13 +70,13 @@ jobs:
 
       - name: Run unit tests
         if: steps.check_amx.outcome == 'success'
-        timeout-minutes: 20
+        timeout-minutes: 36
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_xeon \
             bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-cpu"
 
       - name: Change permission
-        timeout-minutes: 20
+        timeout-minutes: 2
         run: |
           docker exec -u root ci_sglang_xeon bash -c "
             rm -rf /tmp/ci-home  &&

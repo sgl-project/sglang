@@ -20,6 +20,7 @@
 | [**Slides**](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides) |
 
 ## News
+- [2025/08] 🔔 SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
 - [2025/08] 🔥 SGLang provides day-0 support for OpenAI gpt-oss model ([instructions](https://github.com/sgl-project/sglang/issues/8833))
 - [2025/06] 🔥 SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
 - [2025/06] 🔥 Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
@@ -53,11 +54,11 @@ The core features include:
 - **Active Community**: SGLang is open-source and backed by an active community with wide industry adoption.
 
 ## Getting Started
-- [Install SGLang](https://docs.sglang.ai/start/install.html)
-- [Quick Start](https://docs.sglang.ai/backend/send_request.html)
-- [Backend Tutorial](https://docs.sglang.ai/backend/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.ai/frontend/frontend.html)
-- [Contribution Guide](https://docs.sglang.ai/references/contribution_guide.html)
+- [Install SGLang](https://docs.sglang.ai/get_started/install.html)
+- [Quick Start](https://docs.sglang.ai/basic_usage/send_request.html)
+- [Backend Tutorial](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
+- [Frontend Tutorial](https://docs.sglang.ai/references/frontend/frontend_tutorial.html)
+- [Contribution Guide](https://docs.sglang.ai/developer_guide/contribution_guide.html)
 
 ## Benchmark and Performance
 Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/).

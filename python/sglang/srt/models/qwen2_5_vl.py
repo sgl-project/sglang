@@ -31,7 +31,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
-from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLVisionConfig,
@@ -43,7 +42,12 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -62,7 +66,6 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen2_5_VLMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -73,19 +76,12 @@ class Qwen2_5_VLMLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(
-            in_features,
-            hidden_features,
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=in_features,
+            output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("gate_proj", prefix),
-        )
-        self.up_proj = ColumnParallelLinear(
-            in_features,
-            hidden_features,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("up_proj", prefix),
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
@@ -97,12 +93,11 @@ class Qwen2_5_VLMLP(nn.Module):
         self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_parallel_gate, _ = self.gate_proj(x)
-        x_parallel_gate = self.act(x_parallel_gate)
-        x_parallel_up, _ = self.up_proj(x)
-        x_parallel = x_parallel_gate * x_parallel_up
-        x, _ = self.down_proj(x_parallel)
-        return x
+        gate_up, _ = self.gate_up_proj(x)
+        gate, up = gate_up.chunk(2, dim=-1)
+        x = self.act(gate) * up
+        x_down, _ = self.down_proj(x)
+        return x_down
 
 
 class Qwen2_5_VisionBlock(nn.Module):
@@ -114,16 +109,23 @@ class Qwen2_5_VisionBlock(nn.Module):
         num_heads: int,
         hidden_act="silu",
         norm_layer: Type[nn.Module] = None,
-        attn_implementation: Optional[str] = "sdpa",
+        attn_implementation: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        num_dummy_heads: int = 0,
+        rms_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm1 = Qwen2RMSNorm(dim, eps=1e-6)
-        self.norm2 = Qwen2RMSNorm(dim, eps=1e-6)
-        if attn_implementation == "sdpa":
+        self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
+        self.norm2 = RMSNorm(dim, eps=rms_norm_eps)
+
+        if attn_implementation is None:
+            softmax_in_single_precision = False
+            qkv_backend = None
+            flatten_batch = True
+        elif attn_implementation == "sdpa":
             softmax_in_single_precision = False
             qkv_backend = "sdpa"
             flatten_batch = True
@@ -152,6 +154,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             flatten_batch=flatten_batch,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            num_dummy_heads=num_dummy_heads,
         )
         self.mlp = Qwen2_5_VLMLP(
             dim,
@@ -167,18 +170,29 @@ class Qwen2_5_VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.norm1(x)
-        hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
+        S, B, H = x.shape
+        # norm1: flatten to 2D -> [S*B, H], then reshape back
+        x2d = x.reshape(-1, H)
+        hidden_states = self.norm1(x2d).reshape(S, B, H)
+
+        # Attention expects [B, S, H]
+        hidden_states = rearrange(hidden_states, "s b h -> b s h")
         attn = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
-        attn = rearrange(attn, "b s ... -> s b ...")
-        x = x + attn
-        norm2 = self.norm2(x)
-        mlp = self.mlp(norm2)
-        x = x + mlp
+        attn = rearrange(attn, "b s h -> s b h")
+
+        # norm2 with fused residual-add: also 2D
+        attn2d = attn.reshape(-1, H)
+        x_norm_2d, x_after_add_2d = self.norm2(x2d, residual=attn2d)
+        x_norm = x_norm_2d.reshape(S, B, H)
+        x_after_add = x_after_add_2d.reshape(S, B, H)
+
+        # MLP and final residual
+        mlp_out = self.mlp(x_norm)
+        x = x_after_add + mlp_out
         return x
 
 
@@ -194,7 +208,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = Qwen2RMSNorm(context_dim, eps=1e-6)
+        self.ln_q = RMSNorm(context_dim, eps=1e-6)
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -216,11 +230,13 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ln_q(x)
-        x = x.view(-1, self.hidden_size)
-
+        # x expected shape: [S, B, context_dim]
+        S, B, D = x.shape
+        x2d = x.reshape(-1, D)
+        x2d = self.ln_q(x2d)  # RMSNorm expects 2D
+        x2d = x2d.view(-1, self.hidden_size)  # group into spatial_merge_unit
         mlp_fc1, mlp_act, mlp_fc2 = self.mlp
-        x_parallel, _ = mlp_fc1(x)
+        x_parallel, _ = mlp_fc1(x2d)
         x_parallel = mlp_act(x_parallel)
         out, _ = mlp_fc2(x_parallel)
         return out
@@ -268,7 +284,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
                     num_heads=num_heads,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="sdpa",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                 )
@@ -334,7 +349,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
     @property
     def device(self) -> torch.device:
-        return self.blocks[0].mlp.gate_proj.weight.device
+        return self.patch_embed.proj.weight.device
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         pos_ids = []
@@ -388,6 +403,12 @@ class Qwen2_5_VisionTransformer(nn.Module):
         )
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
 
+        # Move window_index to the same device as x before using it to index x
+        window_index = window_index.to(device=x.device)
+
+        # Ensure rotary_pos_emb is on the same device/dtype as x
+        rotary_pos_emb = rotary_pos_emb.to(device=x.device, dtype=x.dtype)
+
         seq_len, _ = x.size()
 
         x = x.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
@@ -400,12 +421,19 @@ class Qwen2_5_VisionTransformer(nn.Module):
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
+        # After building position_embeddings, make sure both cos and sin are on the same device/dtype as the attention input
+        position_embeddings = (
+            position_embeddings[0].to(x.device, x.dtype),
+            position_embeddings[1].to(x.device, x.dtype),
+        )
 
-        # compute cu_seqlens
+        # compute cu_seqlens - move cu_seqlens to GPU and make it int32
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], device=grid_thw.device),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
+                torch.tensor([0], device=x.device, dtype=torch.int32),
+                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                .cumsum(dim=0)
+                .to(device=x.device, dtype=torch.int32),
             ]
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
@@ -436,9 +464,8 @@ cached_get_processor = lru_cache(get_processor)
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
-        ".gate_proj.",
+        ".gate_up_proj.",
         ".down_proj.",
-        ".up_proj.",
         ".q_proj.",
         ".k_proj.",
         ".v_proj.",
@@ -491,6 +518,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -520,6 +550,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -560,9 +591,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             positions=positions,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -584,7 +619,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if "visual" in name:
+                if (
+                    "visual" in name
+                    and "up_proj" not in name
+                    and "gate_proj" not in name
+                ):
                     continue
                 name = name.replace(weight_name, param_name)
 
@@ -611,6 +650,22 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        self.model.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = [Qwen2_5_VLForConditionalGeneration]

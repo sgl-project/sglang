@@ -5,9 +5,9 @@ SGLang provides many optimizations specifically designed for the DeepSeek models
 This document outlines current optimizations for DeepSeek.
 For an overview of the implemented features see the completed [Roadmap](https://github.com/sgl-project/sglang/issues/2591).
 
-## Launch DeepSeek V3 with SGLang
+## Launch DeepSeek V3.1/V3/R1 with SGLang
 
-To run DeepSeek V3/R1 models, the requirements are as follows:
+To run DeepSeek V3.1/V3/R1 models, the recommended settings are as follows:
 
 | Weight Type | Configuration |
 |------------|-------------------|
@@ -24,6 +24,7 @@ To run DeepSeek V3/R1 models, the requirements are as follows:
 | **Quantized weights (int8)** | 16 x A100/800 |
 | | 32 x L40S |
 | | Xeon 6980P CPU |
+| | 2 x Atlas 800I A3 |
 
 <style>
 .md-typeset__table {
@@ -64,6 +65,7 @@ Detailed commands for reference:
 - [16 x A100 (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
 - [32 x L40S (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-32-l40s-with-int8-quantization)
 - [Xeon 6980P CPU](../platforms/cpu_server.md#example-running-deepseek-r1)
+- [2 x Atlas 800I A3 (int8)](../platforms/ascend_npu.md#running-deepseek-v3)
 
 ### Download Weights
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only) official guide to download the weights.
@@ -102,7 +104,7 @@ Overall, with these optimizations, we have achieved up to **7x** acceleration in
   <img src="https://lmsys.org/images/blog/sglang_v0_3/deepseek_mla.svg" alt="Multi-head Latent Attention for DeepSeek Series Models">
 </p>
 
-**Usage**: MLA optimization is enabled by default. For MLA models on Blackwell architecture (e.g., B200), the default backend is FlashInfer. To use the optimized TRTLLM MLA backend for decode operations, explicitly specify `--attention-backend trtllm_mla`. Note that TRTLLM MLA only optimizes decode operations - prefill operations (including multimodal inputs) will fall back to FlashInfer MLA.
+**Usage**: MLA optimization is enabled by default. For MLA models on Blackwell architecture (e.g., B200), the default backend is FlashInfer. To use the optimized TRTLLM MLA backend for prefill and decode operations, explicitly specify `--attention-backend trtllm_mla`.
 
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [Slides](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/lmsys_1st_meetup_deepseek_mla.pdf) for more details.
 
@@ -165,9 +167,9 @@ python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --spec
   - Set `--cuda-graph-bs`. It's a list of batch sizes for cuda graph capture. The default captured batch sizes for speculative decoding is set [here](https://github.com/sgl-project/sglang/blob/49420741746c8f3e80e0eb17e7d012bfaf25793a/python/sglang/srt/model_executor/cuda_graph_runner.py#L126). You can include more batch sizes into it.
 
 
-### Reasoning Content for DeepSeek R1
+### Reasoning Content for DeepSeek R1 & V3.1
 
-See [Separate Reasoning](https://docs.sglang.ai/backend/separate_reasoning.html).
+See [Reasoning Parser](https://docs.sglang.ai/advanced_features/separate_reasoning.html) and [Thinking Parameter for DeepSeek V3.1](https://docs.sglang.ai/basic_usage/openai_api_completions.html#Example:-DeepSeek-V3-Models).
 
 
 ### Function calling for DeepSeek Models

@@ -25,16 +25,31 @@ On the other hand, if you see `token usage` very high and you frequently see war
 `KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-conservativeness` to a value like 1.3.
 If you see `KV cache pool is full. Retract requests.` occasionally but not frequently, it is okay.
 
-### Tune `--mem-fraction-static` to increase the KV cache pool capacity
-GPU memory capacity = model weights + KV cache pool + activations + CUDA graph buffers
+### Tune `--mem-fraction-static` to increase KV cache pool capacity
+SGLang allocates memory as follows:
 
-mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
+Total memory usage = model weights + KV cache pool + CUDA graph buffers + activations
 
-We want to increase the KV cache pool capacity to support a larger concurrency, so
-we want `--mem-fraction-static` to be as large as possible but still have enough room
-for activations and CUDA graph buffers.
+The `--mem-fraction-static` parameter determines how much memory is allocated to the first two components:
 
-A simple strategy is to increase `--mem-fraction-static` by 0.01 each time until you encounter out-of-memory errors.
+mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity
+
+To support higher concurrency, you should maximize the KV cache pool capacity by setting `--mem-fraction-static` as high as possible while still reserving enough memory for activations and CUDA graph buffers.
+
+SGLang uses simple heuristics to set the default value of `--mem-fraction-static`, but you can optimize it for your use cases.
+As a rule of thumb, reserving 5–8 GB of memory for activations is typically sufficient. You can check this by inspecting the logs just before the server is ready.
+Look for log entries like this:
+
+```
+[2025-08-11 17:17:03] max_total_num_tokens=665690, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=4096, context_len=65536, available_gpu_mem=13.50 GB
+```
+
+Check the `available_gpu_mem` value.
+- If it is between 5–8 GB, the setting is good.
+- If it is too high (e.g., 10 - 20 GB), increase `--mem-fraction-static` to allocate more memory to the KV cache.
+- If it is too low, you risk out-of-memory (OOM) errors later, so decrease `--mem-fraction-static`.
+
+Another straightforward approach is to increase `--mem-fraction-static` in increments of 0.01 until you encounter OOM errors for your workloads.
 
 ### Avoid out-of-memory errors by tuning `--chunked-prefill-size`, `--mem-fraction-static`, and `--max-running-requests`
 
