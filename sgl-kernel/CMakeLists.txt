@@ -148,7 +148,10 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
-    "--threads=32"
+    # The following flag leads to the CMAKE_BUILD_PARALLEL_LEVEL breaking,
+    # it triggers OOM with low memory host. Extract the threads number to
+    # option named SGL_KERNEL_COMPILE_THREADS, default value 32.
+    # "--threads=32"
 
     # Supress warnings
     "-Xcompiler=-Wno-clang-format-violations"
@@ -162,6 +165,20 @@ set(SGL_KERNEL_CUDA_FLAGS
     # uncomment to debug
     # "--ptxas-options=-v"
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
+)
+
+set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default 32")
+
+# When SGL_KERNEL_COMPILE_THREADS value is less than 1, set it to 1
+if (NOT SGL_KERNEL_COMPILE_THREADS MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "SGL_KERNEL_COMPILE_THREADS must be an integer, but was set to '${SGL_KERNEL_COMPILE_THREADS}'.")
+elseif (SGL_KERNEL_COMPILE_THREADS LESS 1)
+    message(STATUS "SGL_KERNEL_COMPILE_THREADS was set to a value less than 1. Using 1 instead.")
+    set(SGL_KERNEL_COMPILE_THREADS 1)
+endif()
+
+list(APPEND SGL_KERNEL_CUDA_FLAGS
+    "--threads=${SGL_KERNEL_COMPILE_THREADS}"
 )
 
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
