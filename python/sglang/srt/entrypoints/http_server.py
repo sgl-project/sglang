@@ -1156,7 +1156,8 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     if server_args.tokenizer_worker_num > 1:
-        setproctitle.setproctitle(f"sglang::http_server/multi_tokenizer_router")
+        if not server_args.preserve_proctitle:
+            setproctitle.setproctitle(f"sglang::http_server/multi_tokenizer_router")
         port_args = PortArgs.init_new(server_args)
         port_args.tokenizer_worker_ipc_name = (
             f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -1165,7 +1166,8 @@ def launch_server(
             server_args=server_args, port_args=port_args
         )
     else:
-        setproctitle.setproctitle(f"sglang::http_server/tokenizer_manager")
+        if not server_args.preserve_proctitle:
+            setproctitle.setproctitle(f"sglang::http_server/tokenizer_manager")
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
         )
