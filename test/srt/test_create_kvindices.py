@@ -72,29 +72,14 @@ class TestCreateKvIndices(CustomTestCase):
             req_to_token.size(1),
             PAGE_SIZE,
         )
-        max_pages = max_context_len // PAGE_SIZE
-        kv_indices_flashmla = torch.empty(
-            batch, max_pages, dtype=torch.int32, device="cuda"
-        )
 
-        create_flashmla_kv_indices_triton[(batch,)](
-            req_to_token,
-            req_pool_indices,
-            seq_lens,
-            None,
-            kv_indices_flashmla,
-            req_to_token.size(1),
-            max_pages,
-            PAGE_SIZE,
-        )
-        # Check
         self.assertTrue(torch.equal(kv_indices_ref, kv_indices_triton))
 
     def test_create_kvindices(self):
-        BATCH = [4, 37, 512, 1786]
+        BATCH = [1, 4, 37, 512, 1786]
         MAX_BATCH = 4096
         MAX_CONTEXT_LEN = 4096
-        PAGE_SIZE = [1, 2, 16, 64]
+        PAGE_SIZE = [1, 16, 32, 64]
         # for debug
         # BATCH = [4]
         # MAX_BATCH = 4

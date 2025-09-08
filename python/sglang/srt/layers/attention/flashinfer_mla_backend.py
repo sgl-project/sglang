@@ -446,7 +446,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
             kv_len_arr_cpu = seq_lens_cpu[:bs]
-            num_pages_per_req = (seq_lens_cpu + self.page_size - 1) // self.page_size
+            num_pages_per_req = (kv_len_arr_cpu + self.page_size - 1) // self.page_size
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 num_pages_per_req, dim=0
             )

@@ -61,7 +61,7 @@ def create_flashinfer_kv_indices_triton(
                     Shape:[total-num-pages],
                     where total_num_pages = sum(seq_lens // PAGED_SIZE)
 
-    Example:
+    Example: FlashInfer:  https://docs.flashinfer.ai/tutorials/kv_layout.html
         If we have:
         - req_pool_indices = [0, 1] (request 0 uses pool 0, request 1 uses pool 1)
         - page_kernel_lens = [3, 2] (request 0 has 3 tokens, request 1 has 2 tokens)
@@ -70,10 +70,10 @@ def create_flashinfer_kv_indices_triton(
 
         The kernel will output:
         If PAGE_SIZE = 1:
-        packed
+        packed:
         - kv_indptr (passed in as input arg): [0,3,5]
         - kv_indices = [10, 11, 12, 20, 21]
-        padded - max_pages is 10 tokens per req
+        padded - max_pages is 10 tokens per req:
         - kv_indptr (passed in as input arg): [0,10, 20]
         - kv_indices = [10, 11, 12, -1, -1, -1, -1, -1, -1, -1,
                         20, 21, -1, -1, -1, -1, -1, -1, -1, -1]
