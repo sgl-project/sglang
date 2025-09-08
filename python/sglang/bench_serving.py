@@ -28,7 +28,17 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+)
 
 import aiohttp
 import numpy as np
@@ -72,8 +82,9 @@ class RequestFuncInput:
     prompt_len: int
     output_len: int
     model: str
-    lora_name: str
+    lora_name: Optional[str]
     image_data: Optional[List[str]]
+    audio_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
 
 
@@ -213,6 +224,7 @@ async def async_request_openai_completions(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
+        latency = 0.0
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -290,15 +302,31 @@ async def async_request_openai_chat_completions(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
-    if request_func_input.image_data:
-        # Build multi-image content: a list of image_url entries followed by the text
-        content_items = [
-            {
-                "type": "image_url",
-                "image_url": {"url": img_url},
-            }
-            for img_url in request_func_input.image_data
-        ]
+    # Build multimodal content (images and/or audio) followed by the text when present
+    images: List[str] = request_func_input.image_data or []
+    audios: List[str] = request_func_input.audio_data or []
+    content_items: List[Dict[str, Any]] = []
+    if images:
+        content_items.extend(
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": img_url},
+                }
+                for img_url in images
+            ]
+        )
+    if audios:
+        content_items.extend(
+            [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": aud_url},
+                }
+                for aud_url in audios
+            ]
+        )
+    if content_items:
         content_items.append({"type": "text", "text": request_func_input.prompt})
         messages = [
             {
@@ -327,6 +355,7 @@ async def async_request_openai_chat_completions(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
+        latency = 0.0
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -429,6 +458,7 @@ async def async_request_truss(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
+        latency = 0.0
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -515,6 +545,7 @@ async def async_request_sglang_generate(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
+        latency = 0.0
         last_output_len = 0
         try:
             async with session.post(
@@ -696,6 +727,11 @@ def get_dataset(args, tokenizer):
             apply_chat_template=args.apply_chat_template,
             random_sample=True,
         )
+    elif args.dataset_name == "asr":
+        assert not tokenize_prompt
+        input_requests = sample_asr_requests(
+            num_requests=args.num_prompts, tokenizer=tokenizer, args=args
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -808,6 +844,7 @@ class DatasetRow:
     prompt_len: int
     output_len: int
     image_data: Optional[List[str]] = None
+    audio_data: Optional[List[str]] = None
 
 
 def sample_mmmu_requests(
@@ -1256,6 +1293,144 @@ def sample_random_image_requests(
     return dataset
 
 
+def sample_asr_requests(
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    args: argparse.Namespace,
+) -> List[DatasetRow]:
+    """
+    Sample ASR requests from a HuggingFace dataset and build multimodal chat requests
+    carrying audio as data URLs, alongside a transcription prompt.
+
+    Notes:
+    - We avoid embedding base64 audio in the token counting path by using a placeholder
+      when applying a chat template (if enabled). The actual data URLs are only included
+      at request time via messages[].content[].audio_url.url in the client.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise ImportError("Please install datasets: pip install datasets") from e
+
+    # Load dataset (optional subset/config)
+    if getattr(args, "asr_subset", None):
+        ds = load_dataset(args.asr_dataset, args.asr_subset, split=args.asr_split)
+    else:
+        ds = load_dataset(args.asr_dataset, split=args.asr_split)
+
+    results: List[DatasetRow] = []
+    prompt_text = "Please transcribe the audio into text."
+
+    # Helper to encode to data URL, with optional resampling and mono conversion
+    def _encode_wav_data_url(y: np.ndarray, sr: int) -> str:
+        import io
+
+        import soundfile as sf
+
+        try:
+            from scipy.signal import resample as _resample
+        except Exception:
+            _resample = None
+
+        # Convert lists to ndarray
+        if isinstance(y, list):
+            y = np.asarray(y)
+
+        # Convert to mono if multi-channel
+        if hasattr(y, "ndim") and y.ndim > 1:
+            y = np.mean(y, axis=1)
+
+        target_sr = int(getattr(args, "asr_target_sr", 16000))
+        if _resample is not None and sr > 0 and sr != target_sr:
+            num_samples = int(len(y) * float(target_sr) / float(sr))
+            if num_samples > 0:
+                y = np.asarray(_resample(y, num_samples))
+                sr = target_sr
+
+        buf = io.BytesIO()
+        sf.write(buf, y, sr, format="WAV")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return f"data:audio/wav;base64,{b64}"
+
+    max_duration_s = float(getattr(args, "asr_max_duration_s", 30.0))
+
+    ds_any = cast(Any, ds)
+    for item in ds_any:
+        if len(results) >= num_requests:
+            break
+
+        audio = item.get("audio")
+        if not audio:
+            continue
+
+        y = None
+        sr = 0
+        try:
+            # Standard HF Audio column: dict with 'array' and 'sampling_rate'
+            if isinstance(audio, dict) and "array" in audio:
+                y = np.asarray(audio["array"])
+                sr = int(audio.get("sampling_rate", 0))
+            # Some HF variants may expose np.array-like objects
+            elif hasattr(audio, "array") and hasattr(audio, "sampling_rate"):
+                y = np.asarray(getattr(audio, "array"))
+                sr = int(getattr(audio, "sampling_rate"))
+        except Exception:
+            continue
+
+        if y is None or sr <= 0:
+            continue
+
+        # Filter by duration
+        try:
+            dur = float(len(y)) / float(sr)
+        except Exception:
+            dur = 0.0
+        if dur <= 0.0 or dur > max_duration_s:
+            continue
+
+        # Build audio data URL
+        data_url = _encode_wav_data_url(y, sr)
+
+        # Compute prompt text length only (avoid embedding base64 for token counting)
+        prompt_str = prompt_text
+        if getattr(args, "apply_chat_template", False):
+            try:
+                placeholder_audio = "data:audio/wav;base64,PLACEHOLDER"
+                prompt_str = tokenizer.apply_chat_template(
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "audio_url",
+                                    "audio_url": {"url": placeholder_audio},
+                                },
+                                {"type": "text", "text": prompt_text},
+                            ],
+                        }
+                    ],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except Exception:
+                # Some tokenizers do not support multimodal content in apply_chat_template
+                prompt_str = f"<audio>{prompt_text}"
+
+        prompt_token_len = len(tokenizer.encode(prompt_str))
+
+        results.append(
+            DatasetRow(
+                prompt=prompt_str,
+                prompt_len=prompt_token_len,
+                output_len=int(getattr(args, "asr_output_len", 128)),
+                audio_data=[data_url],
+            )
+        )
+
+    print(f"#ASR samples: {len(results)}")
+    return results
+
+
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = list(tokenizer.get_vocab().values())
@@ -1505,6 +1680,7 @@ async def benchmark(
         output_len=min(test_request.output_len, 32),
         lora_name=lora_name,
         image_data=test_request.image_data,
+        audio_data=getattr(test_request, "audio_data", None),
         extra_request_body=extra_request_body,
     )
 
@@ -1563,6 +1739,7 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
+            audio_data=getattr(request, "audio_data", None),
             extra_request_body=extra_request_body,
         )
 
@@ -1728,6 +1905,8 @@ async def benchmark(
                 f"{args.random_output_len}_{args.random_image_num_images}imgs_"
                 f"{args.random_image_resolution}.jsonl"
             )
+        elif args.dataset_name == "asr":
+            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_asr.jsonl"
         elif args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
@@ -1974,6 +2153,7 @@ if __name__ == "__main__":
             "random-ids",
             "generated-shared-prefix",
             "mmmu",
+            "asr",
             "random-image",
         ],
         help="Name of the dataset to benchmark on.",
@@ -2141,6 +2321,45 @@ if __name__ == "__main__":
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
+    )
+
+    # ASR dataset arguments
+    group_asr = parser.add_argument_group("asr dataset arguments")
+    group_asr.add_argument(
+        "--asr-dataset",
+        type=str,
+        default="openslr/librispeech_asr",
+        help="HF dataset repo for ASR (e.g., openslr/librispeech_asr)",
+    )
+    group_asr.add_argument(
+        "--asr-split",
+        type=str,
+        default="test",
+        help="Split name for the ASR dataset (e.g., test)",
+    )
+    group_asr.add_argument(
+        "--asr-subset",
+        type=str,
+        default="clean",
+        help="Subset/config name for the ASR dataset (e.g., clean). Leave empty if not required.",
+    )
+    group_asr.add_argument(
+        "--asr-target-sr",
+        type=int,
+        default=16000,
+        help="Target sampling rate for audio resampling",
+    )
+    group_asr.add_argument(
+        "--asr-max-duration-s",
+        type=float,
+        default=30.0,
+        help="Skip samples longer than this duration in seconds",
+    )
+    group_asr.add_argument(
+        "--asr-output-len",
+        type=int,
+        default=128,
+        help="Max generated tokens per ASR request",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
