@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         DeepEPNormalOutput,
+        DeepEPLLOutput,
         StandardDispatchOutput,
     )
 
@@ -325,9 +326,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
         )
-        if moe_runner_config.routed_scaling_factor is not None:
-            output *= moe_runner_config.routed_scaling_factor
-        return output
+        if self.moe_runner_config.routed_scaling_factor is not None:
+            output *= self.moe_runner_config.routed_scaling_factor
+        return StandardCombineInput(hidden_states=output)
 
     def apply_deepep_ll(
         self,
