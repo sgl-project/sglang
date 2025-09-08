@@ -259,10 +259,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_verify, False, False
             )
         else:
-            # Normal prefill
+            # prefill/mixed batch
             prefix_lens = forward_batch.extend_prefix_lens
             wrappers = self.prefill_wrappers_paged
             use_ragged = True
+            extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             if self.is_multimodal:
                 use_ragged = False
                 extend_no_prefix = False
@@ -271,9 +272,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 and not self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
             ):  # TODO(Wenxuan): support sliding window in flashinfer
                 wrappers = self.prefill_wrappers_mixed
-                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-            else:
-                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             self.forward_metadata = PrefillMetadata(
                 wrappers, use_ragged, extend_no_prefix
