@@ -408,6 +408,10 @@ class TestToolChoiceLlama32(CustomTestCase):
         available_names = [tool["function"]["name"] for tool in tools]
         expected_functions = {"get_weather", "get_tourist_attractions"}
 
+        for tool_call in tool_calls:
+            self.assertIsNotNone(tool_call.function.name)
+            self.assertIsNotNone(tool_call.function.arguments)
+
         if self._is_flaky_test():
             # For flaky tests, just ensure basic functionality works
             self.assertGreater(

@@ -7,6 +7,7 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.json_detector import JsonDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
@@ -2188,6 +2189,69 @@ class TestGlm4MoeDetector(unittest.TestCase):
             result2.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
         )
         self.assertEqual(self.detector._buffer, "")
+
+
+class TestJsonDetector(unittest.TestCase):
+    def setUp(self):
+        # Create sample tools for testing
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "Location to get weather for",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "description": "Temperature unit",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search for information",
+                    parameters={
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = JsonDetector()
+
+    def test_json_detector_ebnf(self):
+        """Test that the JsonDetector returns empty EBNF."""
+        ebnf = self.detector.build_ebnf(self.tools)
+        self.assertEqual(ebnf, "")
+
+    def test_has_tool_call(self):
+        """Test detection of JSON tool calls"""
+        # Test cases that should return True
+        self.assertTrue(self.detector.has_tool_call("["))
+        self.assertTrue(self.detector.has_tool_call("{"))
+        self.assertTrue(self.detector.has_tool_call("[{\"name\": \"test\"}]"))
+        self.assertTrue(self.detector.has_tool_call("{\"name\": \"test\"}"))
+        
+        # Test cases that should return False
+        self.assertFalse(self.detector.has_tool_call(""))
+        self.assertFalse(self.detector.has_tool_call("plain text"))
+        self.assertFalse(self.detector.has_tool_call("some other content"))
 
 
 if __name__ == "__main__":
