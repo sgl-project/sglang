@@ -258,12 +258,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.activation = config.hidden_act
         self.layer_norm_epsilon = config.rms_norm_eps
 
-        # FIXME:
-        self.time_step_limit = config.time_step_limit
-        self.time_step_min = config.time_step_min
-        self.time_step_max = config.time_step_max
-        self.time_step_floor = config.time_step_floor
-
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = ColumnParallelLinear(
@@ -276,15 +270,21 @@ class Qwen3GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
         # projection of the input hidden states
-        projection_size = self.key_dim * 2 + self.value_dim * 2 + self.num_v_heads * 2
+        projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
+        projection_size_ba = self.num_v_heads * 2
 
-        self.in_proj = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=projection_size,
-            bias=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-        )
+        self.in_proj_qkvz = ColumnParallelLinear(input_size=self.hidden_size,
+                                                 output_size=projection_size_qkvz,
+                                                 bias=False,
+                                                 tp_rank=self.attn_tp_rank,
+                                                 tp_size=self.attn_tp_size,
+                                                )
+        self.in_proj_ba = ColumnParallelLinear(input_size=self.hidden_size,
+                                               output_size=projection_size_ba,
+                                               bias=False,
+                                               tp_rank=self.attn_tp_rank,
+                                               tp_size=self.attn_tp_size,
+                                              )
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -324,34 +324,15 @@ class Qwen3GatedDeltaNet(nn.Module):
             self.dt_bias, {"weight_loader": sharded_weight_loader(0, self.attn_tp_rank)}
         )
 
-        self.share_norm = config.share_norm
-        self.norm_before_gate = config.norm_before_gate
-        self.output_norm_size = config.output_norm_size
-        if self.share_norm:  # original fla
-            self.norm = RMSNormGated(
-                self.head_v_dim,
-                eps=self.layer_norm_epsilon,
-                group_size=None,
-                norm_before_gate=self.norm_before_gate,
-                device=torch.cuda.current_device(),
-                dtype=config.torch_dtype,
-            )
-        else:  # mamba2 or hgrn2 style
-            norm_size_map = {
-                "head": self.head_v_dim,
-                "group": self.value_dim // self.num_k_heads,
-            }
-            self.norm_size = norm_size_map.get(self.output_norm_size, self.value_dim)
-            self.norm = RMSNormGated(
-                self.value_dim,
-                eps=self.layer_norm_epsilon,
-                group_size=self.norm_size,
-                norm_before_gate=self.norm_before_gate,
-                device=torch.cuda.current_device(),
-                dtype=config.torch_dtype,
-            )
+        self.norm = RMSNormGated(
+            self.head_v_dim,
+            eps=self.layer_norm_epsilon,
+            group_size=None,
+            norm_before_gate=True,
+            device=torch.cuda.current_device(),
+            dtype=config.torch_dtype,
+        )
 
-        # self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
         self.out_proj = RowParallelLinear(
             self.value_dim,
             self.hidden_size,
@@ -364,35 +345,45 @@ class Qwen3GatedDeltaNet(nn.Module):
 
     def fix_query_key_value_ordering(
         self,
-        mixed_qkvzba,
+        mixed_qkvz,
+        mixed_ba
     ):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
         """
-        new_tensor_shape = mixed_qkvzba.size()[:-1] + (
+        new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
             self.num_k_heads // self.attn_tp_size,
             (
                 self.head_k_dim
                 + self.head_k_dim
-                + (self.head_v_dim + self.head_v_dim + 2)
+                + (self.head_v_dim + self.head_v_dim)
                 * self.num_v_heads
                 // self.num_k_heads
             ),
         )
-        mixed_qkvzba = mixed_qkvzba.view(*new_tensor_shape)
+        new_tensor_shape_ba = mixed_ba.size()[:-1] + (
+            self.num_k_heads // self.attn_tp_size, 
+            2 * self.num_v_heads // self.num_k_heads
+        )
+        
+        mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
+        mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
 
-        split_arg_list = [
+        split_arg_list_qkvz = [
             self.head_k_dim,
             self.head_k_dim,
             (self.num_v_heads // self.num_k_heads * self.head_v_dim),
             (self.num_v_heads // self.num_k_heads * self.head_v_dim),
+        ]
+        split_arg_list_ba = [
             self.num_v_heads // self.num_k_heads,
             self.num_v_heads // self.num_k_heads,
         ]
 
         # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
         # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
-        (query, key, value, z, b, a) = torch.split(mixed_qkvzba, split_arg_list, dim=2)
+        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
+        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=2)
 
         # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
         value = value.reshape(value.size(0), -1, self.head_v_dim)
@@ -410,19 +401,24 @@ class Qwen3GatedDeltaNet(nn.Module):
         seq_len, _ = hidden_states.shape
         has_prefill = forward_batch.forward_mode.is_prefill()
 
-        projected_states, _ = self.in_proj(hidden_states)
+        projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        projected_states_ba, _ = self.in_proj_ba(hidden_states)
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not has_prefill:
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
-                projected_states,
-                triton.cdiv(self.num_k_heads, self.attn_tp_size),
-                triton.cdiv(self.num_v_heads, self.attn_tp_size),
-                self.head_k_dim,
-                self.head_v_dim,
-            )
+        # if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not has_prefill:
+        #     mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
+        #         projected_states,
+        #         triton.cdiv(self.num_k_heads, self.attn_tp_size),
+        #         triton.cdiv(self.num_v_heads, self.attn_tp_size),
+        #         self.head_k_dim,
+        #         self.head_v_dim,
+        #     )
+        # TODO(caoyizhong): update fused_qkvzba_split_reshape_cat for splited qkvz and ba
+        if False:
+            raise NotImplementedError("Not implemented")
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                projected_states,
+                projected_states_qkvz,
+                projected_states_ba
             )
             query, key, value = map(
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
@@ -463,18 +459,13 @@ class Qwen3GatedDeltaNet(nn.Module):
             **kwargs,
         )
 
-        if self.share_norm:
-            z_shape_og = z.shape
-            # reshape input data into 2D tensor
-            core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-            z = z.reshape(-1, z.shape[-1])
-            core_attn_out = self.norm(core_attn_out, z)
-            core_attn_out = core_attn_out.reshape(z_shape_og)
-            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
-        else:
-            z = z.reshape(*z.shape[:-2], -1)
-            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
-            core_attn_out = self.norm(core_attn_out, z)
+        z_shape_og = z.shape
+        # reshape input data into 2D tensor
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         output, _ = self.out_proj(core_attn_out)
         return output
@@ -591,9 +582,6 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.position_embedding_type = getattr(
-            config, "position_embedding_type", "none"
-        )
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_tp_size = get_attention_tp_size()
@@ -619,21 +607,13 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.rope_scaling = getattr(config, "rope_scaling", None)
         self.layer_id = layer_id
 
-        self.attn_output_gate = getattr(config, "attn_output_gate", False)
+        self.attn_output_gate = getattr(config, "attn_output_gate", True)
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
-        if hasattr(config, "rotary_percent"):
-            rotary_dim = int(self.head_dim * config.rotary_percent)
-        elif hasattr(config, "partial_rotary_factor"):
-            rotary_dim = int(self.head_dim * config.partial_rotary_factor)
-        elif hasattr(config, "attn_rotary_emb"):
-            rotary_dim = int(config.attn_rotary_emb)  # for backward compatibility
-        else:
-            rotary_dim = self.head_dim  # default
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            rotary_dim=rotary_dim,
+            rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
             rope_scaling=self.rope_scaling,
             base=self.rope_theta,
@@ -714,20 +694,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
-        if self.config.use_qk_norm:
-            if getattr(
-                config,
-                "use_gemma_rms_norm",
-                getattr(config, "apply_layernorm_1p", False),
-            ):
-                logger.warning_once(
-                    "Using Gemma RMSNorm for Q normalization and K normalization."
-                )
-                self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-                self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            else:
-                self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-                self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -780,11 +748,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if self.config.use_qk_norm:
-            q, k = self._apply_qk_norm(q, k)
+        q, k = self._apply_qk_norm(q, k)
 
-        if self.position_embedding_type == "rope":
-            q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
 
@@ -1009,6 +975,9 @@ class Qwen3NextForCausalLM(nn.Module):
             ]:
                 name = f"model.{name}"
 
+            if not is_mtp and "mtp" in name:
+                continue
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -1019,6 +988,7 @@ class Qwen3NextForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
 
+                # TODO(fix mtp loading)
                 if "mlp.experts" in name:
                     continue
 
