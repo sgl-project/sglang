@@ -152,6 +152,10 @@ def add_grammar_backend_choices(choices):
     GRAMMAR_BACKEND_CHOICES.extend(choices)
 
 
+def add_moe_runner_backend_choices(choices):
+    MOE_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
@@ -298,12 +302,12 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
-    speculative_moe_runner_backend: Literal[*MOE_RUNNER_BACKEND_CHOICES] = "auto"
+    speculative_moe_runner_backend: str = "auto"
 
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep"] = "none"
-    moe_runner_backend: Literal[*MOE_RUNNER_BACKEND_CHOICES] = "auto"
+    moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
@@ -726,10 +730,15 @@ class ServerArgs:
             )
 
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):
-            logger.warning("SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass_fp8 instead")
+            logger.warning(
+                "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass_fp8 and/or --speculative-moe-runner-backend=cutlass_fp8 instead"
+            )
             self.moe_runner_backend = "cutlass_fp8"
+            self.speculative_moe_runner_backend = "cutlass_fp8"
         if self.moe_runner_backend == "cutlass_fp8":
-            assert self.ep_size == 1, "cutlass_fp8 MoE is only supported with ep_size == 1"
+            assert (
+                self.ep_size == 1
+            ), "cutlass_fp8 MoE is only supported with ep_size == 1"
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
