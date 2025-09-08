@@ -76,21 +76,22 @@ export CONDA_ROOT=${CONDA_EXE}/../..
 export CONDA_PREFIX=${CONDA_ROOT}/envs/sgl-cpu
 export PATH=${PATH}:${CONDA_ROOT}/bin:${CONDA_ROOT}/condabin
 
-# Clone the SGLang code
+# Clone the SGLang code and specify the CPU .toml file
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 git checkout <YOUR-DESIRED-VERSION>
+cd python
+cp pyproject_cpu.toml pyproject.toml
 
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
-pip install intel-openmp
-pip install -e "python[all_cpu]"
+pip install .
 
 # Build the CPU backend kernels
-cd sgl-kernel
+cd ../sgl-kernel
 cp pyproject_cpu.toml pyproject.toml
-pip install -v .
+pip install .
 
 # Other required environment variables
 # Recommend to set these in ~/.bashrc in order not to set every time in a new terminal
@@ -175,7 +176,7 @@ python -m sglang.launch_server                 \
     --quantization w8a8_int8                   \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 65536                    \
+    --max-total-tokens 65536                   \
     --tp 6
 ```
 
@@ -189,7 +190,7 @@ python -m sglang.launch_server                 \
     --device cpu                               \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 65536                    \
+    --max-total-tokens 65536                   \
     --tp 6
 ```
 
