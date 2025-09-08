@@ -87,13 +87,10 @@ class BenchArgs:
     output_file: Optional[str] = None
     output_details: bool = False
     disable_tqdm: bool = False
-    disable_stream: bool = False
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
-    return_logprob: bool = False
     apply_chat_template: bool = False
     profile: bool = False
-    lora_name: Optional[List[str]] = None
     skip_warmup: bool = False
     do_not_exit: bool = False
     prompt_suffix: str = ""
@@ -259,18 +256,6 @@ class BenchArgs:
             default=BenchArgs.disable_tqdm,
             help="Specify to disable tqdm progress bar.",
         )
-        parser.add_argument(
-            "--disable-stream",
-            action="store_true",
-            default=BenchArgs.disable_stream,
-            help="Disable streaming mode.",
-        )
-        parser.add_argument(
-            "--return-logprob",
-            action="store_true",
-            default=BenchArgs.return_logprob,
-            help="Return logprob.",
-        )
         parser.add_argument("--seed", type=int, default=BenchArgs.seed, help="The random seed.")
         parser.add_argument(
             "--disable-ignore-eos",
@@ -297,14 +282,6 @@ class BenchArgs:
             action="store_true",
             default=BenchArgs.profile,
             help="Use Torch Profiler. The endpoint must be launched with SGLANG_TORCH_PROFILER_DIR to enable profiler.",
-        )
-        parser.add_argument(
-            "--lora-name",
-            type=str,
-            nargs="*",
-            action=LoRAPathAction,
-            default=BenchArgs.lora_name,
-            help="The names of LoRA adapters. You can provide a list of names in the format {name} {name} {name}...",
         )
         parser.add_argument(
             "--prompt-suffix",
@@ -391,13 +368,6 @@ class BenchArgs:
         self._default_port()
 
 
-class LoRAPathAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, [])
-        for lora_name in values:
-            getattr(namespace, self.dest).append(lora_name)
-
-
 @dataclass
 class RequestFuncInput:
     prompt: str
@@ -405,7 +375,6 @@ class RequestFuncInput:
     prompt_len: int
     output_len: int
     model: str
-    lora_name: str
     image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
 
@@ -555,10 +524,6 @@ async def async_request_sglang_embedding(
                 "max_new_tokens": request_func_input.output_len,
                 "ignore_eos": not args.disable_ignore_eos,
             },
-            "stream": not args.disable_stream,
-            "lora_path": request_func_input.lora_name,
-            "return_logprob": args.return_logprob,
-            "logprob_start_len": -1,
             **request_func_input.extra_request_body,
         }
 
@@ -805,11 +770,6 @@ async def benchmark(
     # Use the first request for all warmup iterations
     test_request = input_requests[0]
 
-    if args.lora_name is not None and len(args.lora_name) != 0:
-        lora_name = args.lora_name[0]
-    else:
-        lora_name = None
-
     # Create the test input once
     test_input = RequestFuncInput(
         model=model_id,
@@ -817,7 +777,6 @@ async def benchmark(
         api_url=api_url,
         prompt_len=test_request.prompt_len,
         output_len=min(test_request.output_len, 32),
-        lora_name=lora_name,
         image_data=test_request.image_data,
         extra_request_body=extra_request_body,
     )
@@ -856,19 +815,12 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, args.request_rate):
-        if args.lora_name is not None and len(args.lora_name) != 0:
-            idx = random.randint(0, len(args.lora_name) - 1)
-            lora_name = args.lora_name[idx]
-        else:
-            lora_name = None
-
         request_func_input = RequestFuncInput(
             model=model_id,
             prompt=request.prompt,
             api_url=api_url,
             prompt_len=request.prompt_len,
             output_len=request.output_len,
-            lora_name=lora_name,
             image_data=request.image_data,
             extra_request_body=extra_request_body,
         )
@@ -1043,14 +995,11 @@ def run_benchmark(args: BenchArgs):
     model_url = f"{args.base_url}/v1/models" if args.base_url else f"http://{args.host}:{args.port}/v1/models"
 
     if args.backend in ["sglang", "sglang-native"]:
-        api_url = f"{args.base_url}/generate" if args.base_url else f"http://{args.host}:{args.port}/generate"
+        api_url = f"{args.base_url}/encode" if args.base_url else f"http://{args.host}:{args.port}/encode"
     elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
-        api_url = f"{args.base_url}/v1/completions" if args.base_url else f"http://{args.host}:{args.port}/v1/completions"
-    elif args.backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
-        api_url = (
-            f"{args.base_url}/v1/chat/completions" if args.base_url else f"http://{args.host}:{args.port}/v1/chat/completions"
-        )
+        api_url = f"{args.base_url}/v1/embeddings" if args.base_url else f"http://{args.host}:{args.port}/v1/embeddings"
     elif args.backend == "trt":
+        # TODO: find tensorRT-llm's embedding model entrypoint
         api_url = (
             f"{args.base_url}/v2/models/ensemble/generate_stream"
             if args.base_url
@@ -1060,9 +1009,11 @@ def run_benchmark(args: BenchArgs):
             print("Please provide a model using `--model` when using `trt` backend.")
             sys.exit(1)
     elif args.backend == "gserver":
+        # TODO: find gserver's embedding model entrypoint
         api_url = args.base_url if args.base_url else f"{args.host}:{args.port}"
         args.model = args.model or "default"
     elif args.backend == "truss":
+        # TODO: find truss'es embedding model entrypoint
         api_url = (
             f"{args.base_url}/v1/models/model:predict"
             if args.base_url
