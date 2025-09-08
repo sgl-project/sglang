@@ -52,6 +52,7 @@ from sglang.bench_serving import (
     DatasetRow,
     check_chat_template,
     async_request_profile,
+    get_request,
 )
 
 ASSISTANT_SUFFIX = "Assistant:"
@@ -92,7 +93,7 @@ class BenchArgs:
     return_logprob: bool = False
     apply_chat_template: bool = False
     profile: bool = False
-    lora_name: Optional[str] = None
+    lora_name: Optional[List[str]] = None
     skip_warmup: bool = False
     do_not_exit: bool = False
     prompt_suffix: str = ""
@@ -301,8 +302,8 @@ class BenchArgs:
             "--lora-name",
             type=str,
             nargs="*",
-            default=BenchArgs.lora_name,
             action=LoRAPathAction,
+            default=BenchArgs.lora_name,
             help="The names of LoRA adapters. You can provide a list of names in the format {name} {name} {name}...",
         )
         parser.add_argument(
@@ -431,6 +432,7 @@ class RequestFuncOutput:
 # https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
 async def async_request_trt_llm_embedding(
     request_func_input: RequestFuncInput,
+    args: BenchArgs,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     raise NotImplementedError("async_request_trt_llm_embedding not implemented yet.")
@@ -439,6 +441,7 @@ async def async_request_trt_llm_embedding(
 # set ignore_eos True by default
 async def async_request_openai_embedding(
     request_func_input: RequestFuncInput,
+    args: BenchArgs,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     """Makes a request to the OpenAI Chat Completions API.
@@ -530,6 +533,7 @@ async def async_request_openai_embedding(
 
 async def async_request_truss_embedding(
     request_func_input: RequestFuncInput,
+    args: BenchArgs,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     raise NotImplementedError("async_request_truss_embedding not implemented yet.")
@@ -537,6 +541,7 @@ async def async_request_truss_embedding(
 
 async def async_request_sglang_embedding(
     request_func_input: RequestFuncInput,
+    args: BenchArgs,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
@@ -630,6 +635,7 @@ async def async_request_sglang_embedding(
 
 async def async_request_gserver(
     request_func_input: RequestFuncInput,
+    args: BenchArgs,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     raise NotImplementedError()
@@ -692,24 +698,6 @@ def is_file_valid_json(path):
     except JSONDecodeError as e:
         print(f"{path} exists but json loading fails ({e=}), thus treat as invalid file")
         return False
-
-
-async def get_request(
-    input_requests: List[DatasetRow],
-    request_rate: float,
-) -> AsyncGenerator[DatasetRow, None]:
-    input_requests = iter(input_requests)
-    for request in input_requests:
-        yield request
-
-        if request_rate == float("inf"):
-            # If the request rate is infinity, then we don't need to wait.
-            continue
-
-        # Sample the request interval from the exponential distribution.
-        interval = np.random.exponential(1.0 / request_rate)
-        # The next request will be sent after the interval.
-        await asyncio.sleep(interval)
 
 
 def calculate_metrics(
@@ -787,21 +775,14 @@ def calculate_metrics(
 
 
 async def benchmark(
+    args: BenchArgs,
     backend: str,
     api_url: str,
     base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
     input_requests: List[DatasetRow],
-    request_rate: float,
-    max_concurrency: Optional[int],
-    disable_tqdm: bool,
-    lora_names: List[str],
     extra_request_body: Dict[str, Any],
-    profile: bool,
-    pd_separated: bool = False,
-    flush_cache: bool = False,
-    warmup_requests: int = 1,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -810,22 +791,22 @@ async def benchmark(
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
-    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+    semaphore = asyncio.Semaphore(args.max_concurrency) if args.max_concurrency else None
 
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await request_func(request_func_input=request_func_input, args=args, pbar=pbar)
         async with semaphore:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await request_func(request_func_input=request_func_input, args=args, pbar=pbar)
 
     # Warmup
-    print(f"Starting warmup with {warmup_requests} sequences...")
+    print(f"Starting warmup with {args.warmup_requests} sequences...")
 
     # Use the first request for all warmup iterations
     test_request = input_requests[0]
 
-    if lora_names is not None and len(lora_names) != 0:
-        lora_name = lora_names[0]
+    if args.lora_name is not None and len(args.lora_name) != 0:
+        lora_name = args.lora_name[0]
     else:
         lora_name = None
 
@@ -843,13 +824,13 @@ async def benchmark(
 
     # Run warmup requests
     warmup_tasks = []
-    for _ in range(warmup_requests):
-        warmup_tasks.append(asyncio.create_task(request_func(request_func_input=test_input)))
+    for _ in range(args.warmup_requests):
+        warmup_tasks.append(asyncio.create_task(request_func(request_func_input=test_input, args=args)))
 
-    warmup_outputs = await asyncio.gather(*warmup_tasks)
+    warmup_outputs: List[RequestFuncOutput] = await asyncio.gather(*warmup_tasks)
 
     # Check if at least one warmup request succeeded
-    if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
+    if args.warmup_requests > 0 and not any(output.success for output in warmup_outputs):
         raise ValueError(
             f"Warmup failed - Please make sure benchmark arguments are correctly specified. Error: {warmup_outputs[0].error}"
         )
@@ -857,27 +838,27 @@ async def benchmark(
         print(f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run...")
 
     # Flush cache
-    if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
+    if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or args.flush_cache:
         requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)
 
     # Start profiler
-    if profile:
+    if args.profile:
         print("Starting profiler...")
         profile_output = await async_request_profile(api_url=base_url + "/start_profile")
         if profile_output.success:
             print("Profiler started")
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    pbar = None if args.disable_tqdm else tqdm(total=len(input_requests))
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate):
-        if lora_names is not None and len(lora_names) != 0:
-            idx = random.randint(0, len(lora_names) - 1)
-            lora_name = lora_names[idx]
+    async for request in get_request(input_requests, args.request_rate):
+        if args.lora_name is not None and len(args.lora_name) != 0:
+            idx = random.randint(0, len(args.lora_name) - 1)
+            lora_name = args.lora_name[idx]
         else:
             lora_name = None
 
@@ -896,7 +877,7 @@ async def benchmark(
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     # Stop profiler
-    if profile:
+    if args.profile:
         print("Stopping profiler...")
         profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
         if profile_output.success:
@@ -929,11 +910,11 @@ async def benchmark(
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
-    print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
+    print("{:<40} {:<10}".format("Traffic request rate:", args.request_rate))
     print(
         "{:<40} {:<10}".format(
             "Max request concurrency:",
-            max_concurrency if max_concurrency else "not set",
+            args.max_concurrency if args.max_concurrency else "not set",
         )
     )
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
@@ -968,8 +949,8 @@ async def benchmark(
             # Arguments
             "backend": args.backend,
             "dataset_name": args.dataset_name,
-            "request_rate": request_rate,
-            "max_concurrency": max_concurrency,
+            "request_rate": args.request_rate,
+            "max_concurrency": args.max_concurrency,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
@@ -1004,7 +985,7 @@ async def benchmark(
             "accept_length": accept_length,
         }
     else:
-        print(f"Error running benchmark for request rate: {request_rate}")
+        print(f"Error running benchmark for request rate: {args.request_rate}")
         print("-" * 30)
 
     # Determine output file name
@@ -1044,20 +1025,6 @@ async def benchmark(
 
 
 def run_benchmark(args: BenchArgs):
-    # Set default value for max_concurrency if not present
-    if not hasattr(args, "max_concurrency"):
-        args.max_concurrency = None
-
-    # Set default value for warmup_requests if not present
-    if not hasattr(args, "warmup_requests"):
-        args.warmup_requests = 1
-
-    if not hasattr(args, "output_details"):
-        args.output_details = False
-
-    if not hasattr(args, "tokenize_prompt"):
-        args.tokenize_prompt = False
-
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -1073,18 +1040,6 @@ def run_benchmark(args: BenchArgs):
         assert args.backend == "sglang", "`--tokenize-prompt` only compatible with `--backend sglang` currently"
 
     # Set url
-    if args.port is None:
-        args.port = {
-            "sglang": 30000,
-            "sglang-native": 30000,
-            "sglang-oai": 30000,
-            "lmdeploy": 23333,
-            "vllm": 8000,
-            "trt": 8000,
-            "gserver": 9988,
-            "truss": 8080,
-        }.get(args.backend, 30000)
-
     model_url = f"{args.base_url}/v1/models" if args.base_url else f"http://{args.host}:{args.port}/v1/models"
 
     if args.backend in ["sglang", "sglang-native"]:
@@ -1150,27 +1105,16 @@ def run_benchmark(args: BenchArgs):
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer)
 
-    # compatible with SimpleNamespace
-    if not hasattr(args, "flush_cache"):
-        args.flush_cache = False
-
     return asyncio.run(
         benchmark(
+            args=args,
             backend=backend,
             api_url=api_url,
             base_url=base_url,
             model_id=model_id,
             tokenizer=tokenizer,
             input_requests=input_requests,
-            request_rate=args.request_rate,
-            max_concurrency=args.max_concurrency,
-            disable_tqdm=args.disable_tqdm,
-            lora_names=args.lora_name,
             extra_request_body=extra_request_body,
-            profile=args.profile,
-            pd_separated=args.pd_separated,
-            flush_cache=args.flush_cache,
-            warmup_requests=args.warmup_requests,
         )
     )
 
