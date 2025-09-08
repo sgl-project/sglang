@@ -155,6 +155,67 @@ pub trait Worker: Send + Sync + fmt::Debug {
     fn can_handle(&self, _req: &serde_json::Value) -> bool {
         true
     }
+
+    // === Multi-router support ===
+
+    /// Get the model ID this worker serves
+    fn model_id(&self) -> &str {
+        self.metadata()
+            .labels
+            .get("model_id")
+            .map(|s| s.as_str())
+            .unwrap_or("unknown")
+    }
+
+    /// Get the priority of this worker (higher value = higher priority)
+    fn priority(&self) -> u32 {
+        self.metadata()
+            .labels
+            .get("priority")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50) // Default priority is 50 (mid-range)
+    }
+
+    /// Get the cost factor of this worker (1.0 = baseline)
+    fn cost(&self) -> f32 {
+        self.metadata()
+            .labels
+            .get("cost")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0)
+    }
+
+    /// Get the tokenizer path for this worker (gRPC mode only)
+    fn tokenizer_path(&self) -> Option<&str> {
+        self.metadata()
+            .labels
+            .get("tokenizer_path")
+            .map(|s| s.as_str())
+    }
+
+    /// Get the reasoning parser type for this worker (gRPC mode only)
+    fn reasoning_parser(&self) -> Option<&str> {
+        self.metadata()
+            .labels
+            .get("reasoning_parser")
+            .map(|s| s.as_str())
+    }
+
+    /// Get the tool parser type for this worker (gRPC mode only)
+    fn tool_parser(&self) -> Option<&str> {
+        self.metadata()
+            .labels
+            .get("tool_parser")
+            .map(|s| s.as_str())
+    }
+
+    /// Get the chat template for this worker (gRPC mode only)
+    fn chat_template(&self) -> Option<&str> {
+        self.metadata()
+            .labels
+            .get("chat_template")
+            .map(|s| s.as_str())
+    }
 }
 
 /// Connection mode for worker communication
@@ -724,6 +785,21 @@ impl WorkerFactory {
         )
     }
 
+    /// Create a regular worker with custom labels (for multi-router support)
+    pub fn create_regular_with_labels(
+        url: String,
+        labels: std::collections::HashMap<String, String>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        let mut worker = BasicWorker::new(url.clone(), WorkerType::Regular)
+            .with_circuit_breaker_config(circuit_breaker_config);
+
+        // Add labels to metadata
+        worker.metadata.labels = labels;
+
+        Box::new(worker)
+    }
+
     /// Create a DP-aware worker of specified type
     pub fn create_dp_aware(
         base_url: String,
@@ -986,7 +1062,7 @@ pub fn start_health_checker(
 
             // Periodically reset load counters to prevent drift
             // Only do this when we believe all workers should be idle
-            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
+            if check_count % LOAD_RESET_INTERVAL == 0 {
                 let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
                 // Only reset if load appears to be very low (likely drift)
                 if max_load <= 2 {
