@@ -1,20 +1,12 @@
 """CUTLASS based Fused MoE kernels."""
 
-import functools
-import json
-import logging
-import os
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
-from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    import sgl_kernel
     from sgl_kernel import (
         apply_shuffle_mul_sum,
         cutlass_fp4_group_mm,
@@ -157,10 +149,6 @@ def cutlass_fused_experts_fp8(
     rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
     rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
-    if not is_sm100_supported():
-        rep_a1_scales = per_group_transpose(rep_a1_scales, expert_offsets)
-        w1_scale = w1_scale.contiguous()
-
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
 
@@ -192,9 +180,6 @@ def cutlass_fused_experts_fp8(
     silu_and_mul(c1, intermediate)
 
     intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
-    if not is_sm100_supported():
-        a2_scale = per_group_transpose(a2_scale, expert_offsets)
-        w2_scale = w2_scale.contiguous()
 
     fp8_blockwise_scaled_grouped_mm(
         c2,

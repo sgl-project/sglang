@@ -121,7 +121,7 @@ ptxas --version
 
 ## Development Environment Setup
 
-Use Docker to set up the development environment. See [Docker setup guide](https://github.com/sgl-project/sglang/blob/main/docs/references/development_guide_using_docker.md#setup-docker-container).
+Use Docker to set up the development environment. See [Docker setup guide](https://github.com/sgl-project/sglang/blob/main/docs/developer_guide/development_guide_using_docker.md#setup-docker-container).
 
 Create and enter development container:
 ```bash

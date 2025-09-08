@@ -1,8 +1,8 @@
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import List, Optional
 
 import torch
-from sgl_kernel.utils import get_cuda_stream, is_hopper_or_later_arch
+from sgl_kernel.utils import get_cuda_stream, is_arch_support_pdl
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -12,7 +12,7 @@ def rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = is_hopper_or_later_arch(),
+    enable_pdl: Optional[bool] = is_arch_support_pdl(),
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
@@ -40,6 +40,8 @@ def rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
@@ -49,7 +51,7 @@ def fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: Optional[bool] = is_hopper_or_later_arch(),
+    enable_pdl: Optional[bool] = is_arch_support_pdl(),
 ) -> None:
     r"""Fused add root mean square normalization.
 
@@ -74,6 +76,8 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         Enabled by default on Hopper architecture.
     """
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.fused_add_rmsnorm.default(
         input, residual, weight, eps, enable_pdl
     )
@@ -84,7 +88,7 @@ def gemma_rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = is_hopper_or_later_arch(),
+    enable_pdl: Optional[bool] = is_arch_support_pdl(),
 ) -> torch.Tensor:
     r"""Gemma-style root mean square normalization.
 
@@ -112,6 +116,8 @@ def gemma_rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
@@ -121,7 +127,7 @@ def gemma_fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: Optional[bool] = is_hopper_or_later_arch(),
+    enable_pdl: Optional[bool] = is_arch_support_pdl(),
 ) -> None:
     r"""Gemma-style fused add root mean square normalization.
 
@@ -146,6 +152,8 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         Enabled by default on Hopper architecture.
     """
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
         input, residual, weight, eps, enable_pdl
     )
@@ -164,7 +172,7 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
 def silu_and_mul(
     input: torch.Tensor,
     out: torch.Tensor = None,
-    enable_pdl: bool = is_hopper_or_later_arch(),
+    enable_pdl: bool = is_arch_support_pdl(),
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
@@ -183,7 +191,7 @@ def silu_and_mul(
 def gelu_tanh_and_mul(
     input: torch.Tensor,
     out: torch.Tensor = None,
-    enable_pdl: bool = is_hopper_or_later_arch(),
+    enable_pdl: bool = is_arch_support_pdl(),
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
@@ -202,7 +210,7 @@ def gelu_tanh_and_mul(
 def gelu_and_mul(
     input: torch.Tensor,
     out: torch.Tensor = None,
-    enable_pdl: bool = is_hopper_or_later_arch(),
+    enable_pdl: bool = is_arch_support_pdl(),
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
@@ -275,6 +283,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
     fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
@@ -311,6 +320,10 @@ def apply_rope_with_cos_sin_cache_inplace(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
+    if enable_pdl is None:
+        # the non-fused branch does not yet support PDL, but after we switch to our impl for that branch it will
+        enable_pdl = is_arch_support_pdl() and (fused_set_kv_buffer_arg is not None)
+
     if (a := fused_set_kv_buffer_arg) is not None:
         assert a.k_scale is None, "k_scale is not yet supported"
         assert a.v_scale is None, "v_scale is not yet supported"
@@ -327,6 +340,7 @@ def apply_rope_with_cos_sin_cache_inplace(
         cos_sin_cache,
         positions.long(),
         (not is_neox),
+        enable_pdl,
         get_cuda_stream(),
         (
             _view_3d(fused_set_kv_buffer_arg.value)
@@ -349,3 +363,23 @@ def apply_rope_with_cos_sin_cache_inplace(
             else None
         ),
     )
+
+
+def downcast_fp8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    loc: torch.Tensor,
+    mult: int = 1,
+    offset: int = 0,
+) -> None:
+    torch.ops.sgl_kernel.downcast_fp8(
+        k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset, get_cuda_stream()
+    )
+
+
+def copy_to_gpu_no_ce(input: List[int], output: torch.Tensor):
+    torch.ops.sgl_kernel.copy_to_gpu_no_ce(input, output)
