@@ -79,6 +79,8 @@ class TpModelWorkerClient:
         )
 
         # Launch threads
+        self.input_queue_empty = threading.Event()
+        self.input_queue_empty.set()
         self.input_queue = Queue()
         self.output_queue = Queue()
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -204,6 +206,9 @@ class TpModelWorkerClient:
                 (copy_done, logits_output, next_token_ids, can_run_cuda_graph)
             )
 
+            if self.input_queue.empty():
+                self.input_queue_empty.set()  # allow weight update
+
     def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
         """
         This function is called to resolve the last batch result and
@@ -246,6 +251,7 @@ class TpModelWorkerClient:
 
         # Push a new batch to the queue
         self.input_queue.put((model_worker_batch, self.future_token_ids_ct, sync_event))
+        self.input_queue_empty.clear()
 
         # Allocate output future objects
         bs = len(model_worker_batch.seq_lens)
@@ -262,6 +268,8 @@ class TpModelWorkerClient:
         return None, future_next_token_ids, False
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        self.input_queue_empty.wait()
+
         success, message = self.worker.update_weights_from_disk(recv_req)
         return success, message
 
@@ -272,10 +280,14 @@ class TpModelWorkerClient:
     def update_weights_from_distributed(
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
+        self.input_queue_empty.wait()
+
         success, message = self.worker.update_weights_from_distributed(recv_req)
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        self.input_queue_empty.wait()
+
         success, message = self.worker.update_weights_from_tensor(recv_req)
         return success, message
 
