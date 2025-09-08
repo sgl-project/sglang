@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -32,6 +33,7 @@ from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
+    get_pp_group,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
@@ -88,6 +90,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
@@ -341,6 +344,14 @@ class ModelRunner:
         if server_args.enable_lora:
             self.init_lora_manager()
 
+        # Init Double Sparsity
+        if server_args.enable_double_sparsity:
+            if server_args.ds_heavy_channel_type is None:
+                raise ValueError(
+                    "Please specify the heavy channel type for double sparsity optimization."
+                )
+            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -351,12 +362,12 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             self.init_device_graphs()
-        elif self.device == "npu":
+        elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
         else:
             self.graph_runner = None
-            self.cuda_graph_mem_usage = 0
+            self.graph_mem_usage = 0
             self.init_attention_backend()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
@@ -506,11 +517,6 @@ class ModelRunner:
             )
             server_args.attention_backend = "triton"
             server_args.disable_cuda_graph = True
-            if server_args.ds_heavy_channel_type is None:
-                raise ValueError(
-                    "Please specify the heavy channel type for double sparsity optimization."
-                )
-            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
@@ -521,6 +527,17 @@ class ModelRunner:
                 )
 
         if not self.use_mla_backend:
+            server_args.disable_chunked_prefix_cache = True
+        # TODO(kaixih@nvidia): remove this once we have a better solution for DP attention.
+        #  For more details, see: https://github.com/sgl-project/sglang/issues/8616
+        elif (
+            self.dp_size > 1
+            and is_sm100_supported()
+            and server_args.attention_backend != "triton"
+        ):
+            logger.info(
+                "Disable chunked prefix cache when dp size > 1 and attention backend is not triton."
+            )
             server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
@@ -593,6 +610,11 @@ class ModelRunner:
                     # Set local size to hint SGLang to use shared memory based AllReduce
                     os.environ["LOCAL_SIZE"] = str(self.tp_size)
                     torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
+
+                    @torch.library.register_fake("sgl_kernel::shm_allgather")
+                    def _(data, dim):
+                        return torch.cat([data] * self.tp_size, dim=dim)
+
                 else:
                     logger.warning(
                         "init_cpu_threads_env and shared memory based AllReduce is disabled since intel amx backend is not available"
@@ -625,6 +647,7 @@ class ModelRunner:
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()
+        self.pp_group = get_pp_group()
         self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
@@ -1603,30 +1626,39 @@ class ModelRunner:
             )
 
     def init_device_graphs(self):
-        """Capture cuda graphs."""
+        """Capture device graphs."""
         self.graph_runner = None
-        self.cuda_graph_mem_usage = 0
+        self.graph_mem_usage = 0
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
-        if self.server_args.disable_cuda_graph:
+        if self.device != "cpu" and self.server_args.disable_cuda_graph:
+            return
+
+        if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.graph_runner = (
-            CudaGraphRunner(self) if not _is_npu else NPUGraphRunner(self)
+        graph_runners = defaultdict(
+            lambda: CudaGraphRunner,
+            {
+                "cpu": CPUGraphRunner,
+                "npu": NPUGraphRunner,
+            },
         )
+        self.graph_runner = graph_runners[self.device](self)
+
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.cuda_graph_mem_usage = before_mem - after_mem
+        self.graph_mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+            f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
     def init_threads_binding(self):
@@ -1771,18 +1803,24 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
-        can_run_cuda_graph = bool(
-            forward_batch.forward_mode.is_cuda_graph()
+        mode_check = (
+            forward_batch.forward_mode.is_cpu_graph
+            if self.device == "cpu"
+            else forward_batch.forward_mode.is_cuda_graph
+        )
+        can_run_graph = bool(
+            mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
-        if can_run_cuda_graph:
+
+        if can_run_graph:
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return ret, can_run_cuda_graph
+            return ret, can_run_graph
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
@@ -1811,10 +1849,13 @@ class ModelRunner:
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
-        if forward_batch.global_num_tokens_cpu is not None:
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and self.pp_group.is_last_rank
+        ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
-        return ret, can_run_cuda_graph
+        return ret, can_run_graph
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
