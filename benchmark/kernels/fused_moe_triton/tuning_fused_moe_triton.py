@@ -15,11 +15,13 @@ from transformers import AutoConfig
 from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe,
-    get_config_dtype_str,
+    get_config_dtype_str
+)
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
     get_config_file_name,
     get_default_config,
-    get_moe_configs,
-)
+    get_moe_configs    
+) 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.utils import is_hip
