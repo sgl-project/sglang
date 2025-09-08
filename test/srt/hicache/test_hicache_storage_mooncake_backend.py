@@ -99,34 +99,33 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
         # Create a temporary JSON config file for Mooncake
-        mooncake_config = {
-            "local_hostname": "localhost",
-            "metadata_server": "http://127.0.0.1:8080/metadata",
-            "global_segment_size": 4 * 1024 * 1024 * 1024,  # 4 GiB
-            "protocol": "rdma",
-            "device_name": "",
-            "master_server_address": "127.0.0.1:50051",
-        }
+        # mooncake_config = {
+        #     "local_hostname": "localhost",
+        #     "metadata_server": "http://127.0.0.1:8080/metadata",
+        #     "global_segment_size": 4 * 1024 * 1024 * 1024,  # 4 GiB
+        #     "protocol": "rdma",
+        #     "device_name": "",
+        #     "master_server_address": "127.0.0.1:50051",
+        # }
 
         # Write config to temporary file
-        config_file = os.path.join(cls.temp_dir, "mooncake_config.json")
-        with open(config_file, "w") as f:
-            json.dump(mooncake_config, f, indent=2)
+        # config_file = os.path.join(cls.temp_dir, "mooncake_config.json")
+        # with open(config_file, "w") as f:
+        #     json.dump(mooncake_config, f, indent=2)
 
         server_args = {
             "--tp-size": 1,
             "--hicache-ratio": 1.2,
             "--hicache-storage-backend": "mooncake",
-            "--hicache-storage-backend-extra-config": json.dumps(mooncake_config),
         }
 
         # Set the environment variables for Mooncake
         env_vars = {
-            "MOONCAKE_CONFIG_PATH": config_file,
             "MOONCAKE_MASTER": "127.0.0.1:50051",
             "MOONCAKE_PROTOCOL": "rdma",
             "MOONCAKE_DEVICE": "",
             "MOONCAKE_TE_META_DATA_SERVER": "http://127.0.0.1:8080/metadata",
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE": 4294967296,  # 4 GiB
         }
 
         return server_args, env_vars
