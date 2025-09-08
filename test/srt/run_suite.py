@@ -76,6 +76,7 @@ suites = {
         TestFile("test_harmony_parser.py", 20),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_hybrid_attn_backend.py", 100),
+        TestFile("test_standalone_speculative_decoding.py", 250),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
