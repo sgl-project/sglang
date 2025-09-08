@@ -500,20 +500,23 @@ class MHATokenToKVPoolHost(HostKVCache):
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
 
-    def get_buffer_with_hash(self, keys, indices):
+    def get_buffer_with_hash(self, keys, indices=None):
         assert self.layout == "page_first"
-        assert len(keys) == (len(indices) // self.page_size)
+        assert indices is None or (len(keys) == (len(indices) // self.page_size))
 
         key_list = []
         buf_list = []
 
-        for key, i in zip(keys, range(0, len(indices), self.page_size)):
+        for i in range(len(keys)):
+            key = keys[i]
             key_list.append(f"{key}-k")
-            buf_list.append(self.k_buffer[i : i + self.page_size])
             key_list.append(f"{key}-v")
-            buf_list.append(self.v_buffer[i : i + self.page_size])
+            if indices is not None:
+                index = indices[i * self.page_size]
+                buf_list.append(self.k_buffer[index : index + self.page_size])
+                buf_list.append(self.v_buffer[index : index + self.page_size])
 
-        return key_list, buf_list
+        return key_list, buf_list, 2
 
 
 class MLATokenToKVPoolHost(HostKVCache):
@@ -728,13 +731,15 @@ class MLATokenToKVPoolHost(HostKVCache):
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
 
-    def get_buffer_with_hash(self, keys, indices):
+    def get_buffer_with_hash(self, keys, indices=None):
         assert self.layout == "page_first"
-        assert len(keys) == (len(indices) // self.page_size)
+        assert indices is None or (len(keys) == (len(indices) // self.page_size))
 
         buf_list = []
 
-        for i in range(0, len(indices), self.page_size):
-            buf_list.append(self.kv_buffer[i : i + self.page_size])
+        if indices is not None:
+            for i in range(len(keys)):
+                index = indices[i * self.page_size]
+                buf_list.append(self.kv_buffer[index : index + self.page_size])
 
-        return keys, buf_list
+        return keys, buf_list, 1
