@@ -35,6 +35,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -65,8 +66,6 @@ def get_activation(name="relu"):
         return nn.ReLU()
     if name == "gelu":
         return nn.GELU()
-    if name == "swish":
-        return Swish()
     if name == "sigmoid":
         return torch.nn.Sigmoid()
     return nn.Identity()
@@ -309,7 +308,6 @@ class OPTDecoder(nn.Module):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
-            deferred_norm = None
 
         for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states = layer(
@@ -319,6 +317,7 @@ class OPTDecoder(nn.Module):
             return PPProxyTensors({"hidden_states": hidden_states})
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
+            # 没有经过这里
         if self.project_out is not None:
             hidden_states, _ = self.project_out(hidden_states)
         return hidden_states
@@ -334,6 +333,8 @@ class OPTModel(nn.Module):
     ) -> None:
         super().__init__()
 
+        # config = vllm_config.model_config.hf_config
+        # quant_config = vllm_config.quant_config
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -371,8 +372,8 @@ class OPTModel(nn.Module):
             self.config.num_hidden_layers,
             self.config.__class__.model_type,
         ):
-            if not isinstance(self.layers[layer_idx], nn.Identity):
-                layer_self_attn = self.layers[layer_idx].self_attn
+            if not isinstance(self.decoder.layers[layer_idx], nn.Identity):
+                layer_self_attn = self.decoder.layers[layer_idx].self_attn
 
             if hasattr(layer_self_attn.attn, "k_scale"):
                 layer_self_attn.attn.k_scale = scaling_factor
@@ -385,25 +386,8 @@ class OPTModel(nn.Module):
 
 class OPTForCausalLM(nn.Module):
     # BitandBytes specific attributes
-    default_bitsandbytes_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
     # in TP, these weights are partitioned along the column dimension (dim=-1)
     column_parallel_weights_modules = [".down_proj.", ".o_proj."]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        ".q_proj": (".qkv_proj", 0),
-        ".k_proj": (".qkv_proj", 1),
-        ".v_proj": (".qkv_proj", 2),
-        ".gate_proj": (".gate_up_proj", 0),
-        ".up_proj": (".gate_up_proj", 1),
-    }
 
     def __init__(
         self,
@@ -427,8 +411,15 @@ class OPTForCausalLM(nn.Module):
                 prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(config)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.capture_aux_hidden_states = False
         self.pp_group = get_pp_group()
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+        ]
 
     def forward(
         self,
@@ -452,28 +443,19 @@ class OPTForCausalLM(nn.Module):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
-                test_1 = self.logits_processor(
+                return self.logits_processor(
                     input_ids,
                     hidden_states,
                     self.lm_head,
                     forward_batch,
                     aux_hidden_states=aux_hidden_states,
                 )
-
-                # logits_processor有问题
-                return self.logits_processor(
-                    input_ids,
-                    hidden_states,
-                    self.lm_head,
-                    forward_batch,
-                    aux_hidden_states,
-                )
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -481,7 +463,7 @@ class OPTForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        # loaded_params: set[str] = set()
+
         for name, loaded_weight in weights:
             if name.startswith("decoder"):
                 name = name.replace("decoder.", "model.decoder.")
@@ -504,8 +486,6 @@ class OPTForCausalLM(nn.Module):
                     continue
                 # if is_pp_missing_parameter(name, self):
                 #     continue
-                if name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -526,7 +506,6 @@ class OPTForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
-        # return loaded_params
 
     @property
     def start_layer(self):
@@ -584,7 +563,7 @@ class OPTForCausalLM(nn.Module):
             if mapped_shard_id is not None:
                 if mapped_shard_id in ["q", "k", "v"]:
                     num_heads = self.config.num_attention_heads // tp_size
-                    num_kv_heads = self.config.num_key_value_heads // tp_size
+                    num_kv_heads = self.config.num_attention_heads // tp_size
                     head_dim = (
                         self.config.hidden_size // self.config.num_attention_heads
                     )
@@ -599,7 +578,7 @@ class OPTForCausalLM(nn.Module):
                         size = num_kv_heads * head_dim
                     weight = param.data.narrow(0, offset, size)
                 elif mapped_shard_id in [0, 1]:
-                    intermediate_size = self.config.intermediate_size
+                    intermediate_size = self.config.ffn_dim
                     slice_size = intermediate_size // tp_size
                     if mapped_shard_id == 0:  # gate_proj
                         offset = 0
@@ -621,7 +600,7 @@ class OPTForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in OPTForCausalLM: {get_exception_traceback()}"
             )
             return None
 
