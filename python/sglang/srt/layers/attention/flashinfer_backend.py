@@ -1064,7 +1064,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         use_sliding_window_kv_pool: bool = False,
-        causal: bool = True,
+        causal: bool = False,  # cached prefix should be attended to by all queries. Defaulting to True will cause wrong results for the persistent kernel.
     ):
         bs = len(seq_lens)
         if spec_info is None:
