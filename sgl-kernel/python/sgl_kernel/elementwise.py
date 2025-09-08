@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from sgl_kernel.utils import get_cuda_stream, is_arch_support_pdl
@@ -369,6 +369,8 @@ def downcast_fp8(
     )
 
 
+def copy_to_gpu_no_ce(input: List[int], output: torch.Tensor):
+    torch.ops.sgl_kernel.copy_to_gpu_no_ce(input, output)
 def concat_mla_k(
     k: torch.Tensor,
     k_nope: torch.Tensor,
