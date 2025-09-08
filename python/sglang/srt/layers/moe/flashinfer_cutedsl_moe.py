@@ -48,7 +48,7 @@ def flashinfer_cutedsl_moe_masked(
         masked_m (torch.Tensor): Masked dimension indices
 
     Notes:
-        - Assumes max(masked_m) == m.
+        - Assumes max(masked_m) <= m.
     """
 
     # === Assertions on dtypes ===
