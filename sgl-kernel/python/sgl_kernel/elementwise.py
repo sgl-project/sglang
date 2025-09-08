@@ -367,3 +367,11 @@ def downcast_fp8(
     torch.ops.sgl_kernel.downcast_fp8(
         k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset, get_cuda_stream()
     )
+
+
+def concat_mla_k(
+    k: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+):
+    torch.ops.sgl_kernel.concat_mla_k(k, k_nope, k_rope)
