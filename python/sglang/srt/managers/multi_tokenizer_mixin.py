@@ -38,7 +38,8 @@ from sglang.srt.managers.io_struct import (
     MultiTokenizerRegisterReq,
     MultiTokenizerWrapper,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager, _Communicator
+from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
