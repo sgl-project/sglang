@@ -125,8 +125,8 @@ suites = {
         TestFile("test_dp_attention.py", 277),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 127),
-        TestFile("hicache/test_hicache_storage_e2e.py", 400),
-        TestFile("hicache/test_hicache_storage_benchmark.py", 400),
+        TestFile("hicache/test_hicache_storage_file_backend.py", 400),
+        TestFile("hicache/test_hicache_storage_3fs_backend.py", 400),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 600),
