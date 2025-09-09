@@ -108,9 +108,6 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "quantization",
     "enable_custom_logit_processor",
     "disaggregation_mode",
-    "enable_triton_kernel_moe",
-    "max_running_requests",
-    "disable_cuda_graph",
 ]
 
 # Put some global args for easy access

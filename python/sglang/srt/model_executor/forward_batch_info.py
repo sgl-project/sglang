@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -91,9 +91,6 @@ class ForwardMode(IntEnum):
 
     def is_prefill(self):
         return self.is_extend()
-
-    def is_prefill_or_idle(self):
-        return self.is_extend() or self.is_idle()
 
     def is_extend(self):
         return (

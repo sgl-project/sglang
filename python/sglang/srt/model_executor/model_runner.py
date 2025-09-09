@@ -42,7 +42,6 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.distributed.utils import divide
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -75,15 +74,14 @@ from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
 )
-from sglang.srt.mem_cache.allocator import (  # MambaTokenToKVPoolAllocator,
+from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import (  # MambaHybridPool,
-    GB,
+from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
@@ -1129,7 +1127,7 @@ class ModelRunner:
             rest_memory -= (
                 self.server_args.max_mamba_cache_size
                 * self.model_config.hf_config.mamba_cache_per_req
-                / GB
+                / (1 << 30)
             )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
