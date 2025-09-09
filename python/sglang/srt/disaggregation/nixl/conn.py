@@ -437,7 +437,7 @@ class NixlKVManager(CommonKVManager):
 
             notif = "_".join([str(req.room), "kv", str(chunk_id), str(int(is_last))])
             decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
-            
+
             if decode_tp_size == self.tp_size:
                 kv_xfer_handle = self.send_kvcache(
                     req.agent_name,
@@ -457,8 +457,12 @@ class NixlKVManager(CommonKVManager):
                     notif,
                     prefill_tp_size=self.tp_size,
                     decode_tp_size=decode_tp_size,
-                    decode_tp_rank=self.decode_kv_args_table[req.agent_name].decode_tp_rank,
-                    dst_kv_item_len=self.decode_kv_args_table[req.agent_name].dst_kv_item_len,
+                    decode_tp_rank=self.decode_kv_args_table[
+                        req.agent_name
+                    ].decode_tp_rank,
+                    dst_kv_item_len=self.decode_kv_args_table[
+                        req.agent_name
+                    ].dst_kv_item_len,
                 )
 
             handles.append(kv_xfer_handle)
