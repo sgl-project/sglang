@@ -66,8 +66,8 @@ def _chunked_lora_shrink_kernel(
     seg_start = tl.load(seg_indptr + pid_s)
     seg_end = tl.load(seg_indptr + pid_s + 1)
 
-    # Adjust N (stack_num * max_rank) according to the specific LoRA adapter
-    actual_n = tl.minimum(N, rank * NUM_SLICES)
+    # Adjust N dim according to the specific LoRA adapter
+    cur_n = tl.minimum(N, rank * NUM_SLICES)
 
     # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_S) + seg_start
@@ -92,7 +92,7 @@ def _chunked_lora_shrink_kernel(
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < actual_n),
+            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < cur_n),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -105,10 +105,10 @@ def _chunked_lora_shrink_kernel(
     output_ptr = output  + (
         s_offset_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = (s_offset_logical[:, None] < seg_end) & (n_offset[None, :] < actual_n)
+    output_mask = (s_offset_logical[:, None] < seg_end) & (n_offset[None, :] < cur_n)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
-def chunked_lora_shrink_forward(
+def chunked_sgmv_lora_shrink_forward(
     x: torch.Tensor,
     weights: torch.Tensor,
     batch_info: LoRABatchInfo,
@@ -136,9 +136,10 @@ def chunked_lora_shrink_forward(
     K = weights.shape[2]
     assert x.shape[-1] == K
 
+    num_segments = batch_info.num_segments
     grid = (
         triton.cdiv(N, BLOCK_N),
-        batch_info.bs if batch_info.use_cuda_graph else batch_info.num_segments,
+        batch_info.bs if batch_info.use_cuda_graph else num_segments,
     )
 
     output = torch.empty((S, N), device=x.device, dtype=x.dtype)
@@ -157,7 +158,7 @@ def chunked_lora_shrink_forward(
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
         permutation=batch_info.permutation,
-        num_segs=batch_info.num_segments,
+        num_segs=num_segments,
         # constants
         N=N,
         K=K,

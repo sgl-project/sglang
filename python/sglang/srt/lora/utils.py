@@ -17,10 +17,10 @@ class LoRABatchInfo:
     use_cuda_graph: bool
 
     # Number of segments. 
-    num_segments: int
+    num_segments: Optional[int]
 
     # Lengths of each segments in shape (num_segments,)
-    seg_lens: torch.Tensor
+    seg_lens: Optional[torch.Tensor]
 
     # Indice pointers of each sequence in shape (num_segments + 1, )
     seg_indptr: torch.Tensor

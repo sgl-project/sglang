@@ -66,10 +66,10 @@ def _chunked_lora_expand_kernel(
     # which starts from row seg_start of x with length seg_len.
     # qkv_id decides which of q,k,v to compute (0: q, 1: k, 2: v)
     w_index = tl.load(weight_indices + pid_s)
-    rank = tl.load(lora_ranks + w_index)
+    cur_rank = tl.load(lora_ranks + w_index)
 
     # If rank is 0, this kernel is a no-op.
-    if rank == 0:
+    if cur_rank == 0:
         return
 
     seg_start = tl.load(seg_indptr + pid_s)
@@ -81,7 +81,7 @@ def _chunked_lora_expand_kernel(
 
     scaling = tl.load(scalings + w_index)
     # Adjust K (rank) according to the specific LoRA adapter
-    rank = tl.minimum(MAX_RANK, rank)
+    cur_rank = tl.minimum(MAX_RANK, cur_rank)
 
     # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_S) + seg_start
@@ -96,7 +96,7 @@ def _chunked_lora_expand_kernel(
 
     x_ptrs = (
         x
-        + slice_id * rank * x_stride_1
+        + slice_id * cur_rank * x_stride_1
         + (s_offset_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
     )
     w_ptrs = (weights + w_index * w_stride_0) + (
@@ -105,15 +105,15 @@ def _chunked_lora_expand_kernel(
 
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(rank, BLOCK_K)):
+    for k in range(0, tl.cdiv(cur_rank, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset_logical[:, None] < seg_end) & (k_offset[None, :] < rank - k * BLOCK_K),
+            mask=(s_offset_logical[:, None] < seg_end) & (k_offset[None, :] < cur_rank - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < rank - k * BLOCK_K)
+            mask=(k_offset[:, None] < cur_rank - k * BLOCK_K)
             & (n_offset[None, :] < slice_end),
             other=0.0,
         )
@@ -134,7 +134,7 @@ def _chunked_lora_expand_kernel(
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
-def chunked_lora_expand_forward(
+def chunked_sgmv_lora_expand_forward(
     x: torch.Tensor,
     lora_weight_b: torch.Tensor,
     batch_info: LoRABatchInfo,
@@ -165,17 +165,18 @@ def chunked_lora_expand_forward(
     num_slices = len(slice_offsets) - 1
     assert input_dim == num_slices * r
 
-    # TODO: customize per operation
+    # TODO (lifuhuang): fine-tune per operation
     BLOCK_M = 16
     BLOCK_K = 16
     BLOCK_N = 64
 
+    num_segments = batch_info.num_segments
 
-    # TODO: reconsider grid shape to reduce specializations
+    # TODO (lifuhuang): reconsider grid shape to reduce specializations
     grid = (
         triton.cdiv(max_slice_size, BLOCK_N),
-        num_slices,  # this dimension decides current block computes on q, k or v
-        batch_info.bs if batch_info.use_cuda_graph else batch_info.num_segments,
+        num_slices,  # qkv=3, gate_up=2, others=1
+        batch_info.bs if batch_info.use_cuda_graph else num_segments,
     )
 
     if base_output is None:
@@ -198,7 +199,7 @@ def chunked_lora_expand_forward(
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
         permutation=batch_info.permutation,
-        num_segs=batch_info.num_segments,
+        num_segs=num_segments,
         scalings=batch_info.scalings,
         # constants
         slice_offsets=slice_offsets,

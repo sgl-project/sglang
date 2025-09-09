@@ -4,23 +4,23 @@ import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
-    chunked_lora_shrink_forward,
-    chunked_lora_expand_forward,
+    chunked_sgmv_lora_shrink_forward,
+    chunked_sgmv_lora_expand_forward,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
-class ChunkedLoRABackend(BaseLoRABackend):
-    name = "chunked"
+class ChunkedSgmvLoRABackend(BaseLoRABackend):
+    name = "csgmv"
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         super().__init__(max_loras_per_batch, device)
-        self.segment_size = 16  # TODO: make it configurable?
+        self.segment_size = 16  # TODO (lifuhuang): make it configurable?
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:
-        return chunked_lora_shrink_forward(
+        return chunked_sgmv_lora_shrink_forward(
             x,
             weights,
             self.batch_info,
@@ -38,7 +38,7 @@ class ChunkedLoRABackend(BaseLoRABackend):
         # For simple lora B, we use slice offsets [0, output_dim]
         output_dim = weights.shape[-2]
         max_slice_size = output_dim
-        return chunked_lora_expand_forward(
+        return chunked_sgmv_lora_expand_forward(
             x=x,
             lora_weight_b=weights,
             batch_info=self.batch_info,
@@ -64,13 +64,13 @@ class ChunkedLoRABackend(BaseLoRABackend):
         # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
-        lora_a_output = chunked_lora_shrink_forward(
+        lora_a_output = chunked_sgmv_lora_shrink_forward(
             x,
             qkv_lora_a,
             self.batch_info,
             num_slices=3,
         )
-        lora_output = chunked_lora_expand_forward(
+        lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
             lora_weight_b=qkv_lora_b,
             batch_info=self.batch_info,
@@ -98,13 +98,13 @@ class ChunkedLoRABackend(BaseLoRABackend):
         output_dim = gate_up_lora_b.shape[-2] // 2
 
         # lora_a_output: (s, 2 * r)
-        lora_a_output = chunked_lora_shrink_forward(
+        lora_a_output = chunked_sgmv_lora_shrink_forward(
             x,
             gate_up_lora_a,
             self.batch_info,
             num_slices=2,
         )
-        lora_output = chunked_lora_expand_forward(
+        lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
             lora_weight_b=gate_up_lora_b,
             batch_info=self.batch_info,
@@ -122,11 +122,11 @@ class ChunkedLoRABackend(BaseLoRABackend):
         scalings: list[float],
         batch_info: Optional[LoRABatchInfo] = None,
     ):
-        permutation, weight_indices_reordered = ChunkedLoRABackend._get_permutation(
+        permutation, weight_indices_reordered = ChunkedSgmvLoRABackend._get_permutation(
             weight_indices, forward_batch
         )
 
-        seg_weight_indices, seg_lens, seg_indptr = self._get_segments_info(
+        seg_weight_indices, seg_indptr = self._get_segments_info(
             weight_indices_reordered
         )
         num_segments = len(seg_weight_indices)
@@ -150,9 +150,11 @@ class ChunkedLoRABackend(BaseLoRABackend):
                 num_segments=num_segments,
                 max_len=max_len,
                 use_cuda_graph=False,
-                seg_lens=torch.empty(
-                    (num_segments,), dtype=torch.int32, device=self.device
-                ),
+                seg_lens=None, 
+                # TODO (lifu): technically we do not need seg_lens in triton either, we can convenge this logic later.
+                # seg_lens=torch.empty(
+                #     (num_segments,), dtype=torch.int32, device=self.device
+                # ),
                 seg_indptr=torch.empty(
                     (num_segments + 1,), dtype=torch.int32, device=self.device
                 ),
@@ -183,7 +185,6 @@ class ChunkedLoRABackend(BaseLoRABackend):
         batch_info.weight_indices[:num_segments].copy_(
             seg_weight_indices, non_blocking=True
         )
-        batch_info.seg_lens[:num_segments].copy_(seg_lens, non_blocking=True)
         batch_info.seg_indptr[: num_segments + 1].copy_(seg_indptr, non_blocking=True)
         batch_info.permutation[: len(permutation)].copy_(
             permutation, non_blocking=True
@@ -217,31 +218,30 @@ class ChunkedLoRABackend(BaseLoRABackend):
             return permutation, weights_reordered
 
     def _get_segments_info(self, weights_reordered: torch.Tensor):
-        unique_weights, counts = torch.unique_consecutive(
-            weights_reordered, return_counts=True
-        )
+        with torch.device("cpu"):
+            unique_weights, counts = torch.unique_consecutive(
+                weights_reordered, return_counts=True
+            )
 
-        weight_indices_list = []
-        seg_lens_list = []
+            weight_indices_list = []
+            seg_lens_list = []
 
-        for weight_idx, group_len in zip(unique_weights, counts):
-            group_len = group_len.item()
-            num_segs = (group_len + self.segment_size - 1) // self.segment_size
+            for weight_idx, group_len in zip(unique_weights, counts):
+                group_len = group_len.item()
+                num_segs = (group_len + self.segment_size - 1) // self.segment_size
 
-            weight_indices_list.extend([weight_idx.item()] * num_segs)
-            seg_lens_list.extend([self.segment_size] * (num_segs - 1))
-            seg_lens_list.append(group_len - (num_segs - 1) * self.segment_size)
+                weight_indices_list.extend([weight_idx.item()] * num_segs)
+                seg_lens_list.extend([self.segment_size] * (num_segs - 1))
+                seg_lens_list.append(group_len - (num_segs - 1) * self.segment_size)
 
-        weight_indices_list = torch.tensor(
-            weight_indices_list, dtype=torch.int32, pin_memory=True, device="cpu"
-        )
-        seg_lens = torch.tensor(
-            seg_lens_list, dtype=torch.int32, pin_memory=True, device="cpu"
-        )
-        seg_indptr = torch.empty(
-            (len(seg_lens) + 1,), dtype=torch.int32, pin_memory=True, device="cpu"
-        )
-        seg_indptr[0] = 0
-        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+            seg_lens = torch.tensor( seg_lens_list, dtype=torch.int32)
 
-        return weight_indices_list, seg_lens, seg_indptr
+            weight_indices_list = torch.tensor(
+                weight_indices_list, dtype=torch.int32, pin_memory=True)
+
+            seg_indptr = torch.empty(
+                (len(seg_lens) + 1,), dtype=torch.int32, pin_memory=True)
+            seg_indptr[0] = 0
+            seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+
+            return weight_indices_list, seg_indptr

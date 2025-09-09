@@ -97,6 +97,8 @@ class LoRAManager:
                 permutation=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
             )
 
+        self.lora_backend.init_cuda_graph_batch_info(self.cuda_graph_batch_info, max_bs_in_cuda_graph)
+
     def create_lora_update_result(
         self, success: bool, error_message: str = ""
     ) -> LoRAUpdateResult:
