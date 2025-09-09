@@ -846,22 +846,26 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
         """Process tool calls in the response"""
 
-        # Handle required tool choice
-        if tool_choice == "required" or (isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"):
+        def get_tool_id(name: str, index: int) -> str:
+            if tool_call_parser == "kimi_k2" and name is not None:
+                return f"functions.{name}:{index}"
+            else:
+                return f"call_{uuid.uuid4().hex[:24]}"
+
+        def set_finish_reason_tool_calls():
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
+
+        # Handle required or named tool choice
+        if tool_choice == "required" or (isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"):
+            set_finish_reason_tool_calls()
             try:
                 # For required tool choice, we expect a JSON array of tool calls
                 tool_call_data = json.loads(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
-                    # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
-                    if tool_call_parser == "kimi_k2" and tool['name'] is not None:
-                        tool_id = f"functions.{tool['name']}:0"
-                    else:
-                        tool_id = f"call_{uuid.uuid4().hex[:24]}"
-
+                    tool_id = get_tool_id(tool.get("name"), i)
                     tool_calls.append(
                         ToolCall(
                             id=tool_id,
@@ -877,21 +881,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 logger.error(f"Tool call parsing error: {e}")
                 return None, text, finish_reason
         
+        # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, tool_call_parser, tool_choice)
         if parser.has_tool_call(text):
-            if finish_reason["type"] == "stop":
-                finish_reason["type"] = "tool_calls"
-                finish_reason["matched"] = None
+            set_finish_reason_tool_calls()
             try:
                 text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = []
                 for call_info in call_info_list:
-                    # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
-                    if tool_call_parser == "kimi_k2" and call_info.name is not None:
-                        tool_id = f"functions.{call_info.name}:{call_info.tool_index}"
-                    else:
-                        tool_id = f"call_{uuid.uuid4().hex[:24]}"
-
+                    tool_id = get_tool_id(call_info.name, call_info.tool_index)
                     tool_calls.append(
                         ToolCall(
                             id=tool_id,

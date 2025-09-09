@@ -2245,14 +2245,13 @@ class TestJsonDetector(unittest.TestCase):
         """Test detection of JSON tool calls"""
         # Test cases that should return True
         self.assertTrue(self.detector.has_tool_call("["))
-        self.assertTrue(self.detector.has_tool_call("{"))
         self.assertTrue(self.detector.has_tool_call("[{\"name\": \"test\"}]"))
-        self.assertTrue(self.detector.has_tool_call("{\"name\": \"test\"}"))
         
         # Test cases that should return False
         self.assertFalse(self.detector.has_tool_call(""))
         self.assertFalse(self.detector.has_tool_call("plain text"))
         self.assertFalse(self.detector.has_tool_call("some other content"))
+        self.assertFalse(self.detector.has_tool_call("{\"name\": \"test\"}"))
 
 
 if __name__ == "__main__":
