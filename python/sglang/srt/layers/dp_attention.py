@@ -30,6 +30,12 @@ _ATTN_DP_SIZE = None
 _LOCAL_ATTN_DP_SIZE = None
 _LOCAL_ATTN_DP_RANK = None
 
+broken_ranks_for_attn_tp = None
+
+
+def get_broken_ranks_for_attn_tp():
+    return broken_ranks_for_attn_tp
+
 
 class DPPaddingMode(IntEnum):
 
@@ -117,6 +123,11 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
+    global broken_ranks_for_attn_tp
+    broken_ranks_for_attn_tp = torch.zeros(
+        (_ATTN_TP_SIZE,), dtype=torch.int32, device="cuda"
+    )
+
     tp_group = get_tp_group()
     _ATTN_TP_GROUP = GroupCoordinator(
         [
@@ -132,6 +143,7 @@ def initialize_dp_attention(
         use_xpu_communicator=False,
         use_npu_communicator=False,
         group_name="attention_tp",
+        broken_ranks=broken_ranks_for_attn_tp,
     )
 
 

@@ -512,7 +512,10 @@ class ModelRunner:
             raise
 
         if self.device == "cuda":
-            backend = "nccl"
+            if get_bool_env_var("SGLANG_USE_MOONCAKE_BACKEND"):
+                backend = "mooncake"
+            else:
+                backend = "nccl"
         elif self.device == "xpu":
             backend = "xccl"
         elif self.device == "hpu":
@@ -695,11 +698,14 @@ class ModelRunner:
 
         # Handle the case where some ranks do not finish loading.
         try:
-            dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
+            if get_bool_env_var("SGLANG_USE_MOONCAKE_BACKEND"):
+                dist.barrier(group=get_tp_group().cpu_group)
+            else:
+                dist.monitored_barrier(
+                    group=get_tp_group().cpu_group,
+                    timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                    wait_all_ranks=True,
+                )
         except RuntimeError:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
@@ -1642,11 +1648,11 @@ class ModelRunner:
             )
 
             if not torch.equal(
-                get_global_expert_location_metadata().broken_nodes,
-                get_global_expert_location_metadata().last_broken_nodes,
+                get_global_expert_location_metadata().broken_ranks,
+                get_global_expert_location_metadata().last_broken_ranks,
             ):
-                get_global_expert_location_metadata().last_broken_nodes = (
-                    get_global_expert_location_metadata().broken_nodes.clone()
+                get_global_expert_location_metadata().last_broken_ranks = (
+                    get_global_expert_location_metadata().broken_ranks.clone()
                 )
                 logging.info(f"recompute _forward_raw")
                 gen = self.eplb_manager.rebalance()
@@ -1655,7 +1661,13 @@ class ModelRunner:
                         next(gen)
                     except StopIteration:
                         break
-
+                output = self._forward_raw(
+                    forward_batch,
+                    skip_attn_backend_init,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
             if self.eplb_manager is not None:
                 self.eplb_manager.on_forward_pass_end()
 

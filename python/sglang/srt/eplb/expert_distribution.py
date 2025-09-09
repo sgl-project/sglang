@@ -39,13 +39,6 @@ logger = logging.getLogger(__name__)
 
 _OutputMode = Literal["file", "object"]
 
-_global_deepep_buffer: Optional[Any] = None  # should be mxa_ep.Buffer
-
-
-def set_global_deepep_buffer(buffer):
-    global _global_deepep_buffer
-    _global_deepep_buffer = buffer
-
 
 class ExpertDistributionRecorder(ABC):
     """Global expert distribution recording"""
@@ -791,44 +784,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._first_dump = False
             torch.cuda.empty_cache()
 
-        if _global_deepep_buffer:
-            broken_nodes = get_global_expert_location_metadata().broken_nodes
-            num_ranks = broken_nodes.shape[0]
-            root = -1
-            for i in range(num_ranks):
-                if broken_nodes[i] == 0:
-                    root = i
-                    break
-            if self._rank == root:
-                requests = []
-                for i in range(num_ranks):
-                    if broken_nodes[i] == 0 and i != self._rank:
-                        temp_tensor = torch.zeros_like(logical_count_of_buffered_step)
-                        req = torch.distributed.irecv(tensor=temp_tensor, src=i)
-                        requests.append((req, temp_tensor))
-                for req, temp_tensor in requests:
-                    req.wait()
-                    logical_count_of_buffered_step += temp_tensor
-                requests = []
-                for i in range(num_ranks):
-                    if broken_nodes[i] == 0 and i != self._rank:
-                        req = torch.distributed.isend(
-                            logical_count_of_buffered_step, dst=i
-                        )
-                        requests.append(req)
-                for req in requests:
-                    req.wait()
-            else:
-                torch.distributed.isend(
-                    tensor=logical_count_of_buffered_step, dst=root
-                ).wait()
-                torch.distributed.irecv(
-                    tensor=logical_count_of_buffered_step, src=root
-                ).wait()
-        else:
-            torch.distributed.all_reduce(
-                logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
-            )
+        torch.distributed.all_reduce(
+            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+        )
 
         output = dict(
             rank=self._rank,

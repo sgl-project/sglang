@@ -388,28 +388,16 @@ class DeepEPMoE(EPMoE):
         expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
             layer_id=self.layer_id,
         )
-        broken_nodes = expert_location_dispatch_info.broken_nodes
+        broken_ranks = expert_location_dispatch_info.broken_ranks
         dispatch_output = self.dispatch(
-            hidden_states, topk_idx, topk_weights, broken_nodes, forward_batch
+            hidden_states, topk_idx, topk_weights, broken_ranks, forward_batch
         )
         hidden_states = self.moe_impl(dispatch_output)
-        broken_physical_experts = torch.zeros(
-            (expert_location_dispatch_info.num_physical_experts,),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        num_experts_per_rank = (
-            expert_location_dispatch_info.num_physical_experts // ep_size
-        )
-        broken_physical_experts.view(ep_size, num_experts_per_rank).copy_(
-            broken_nodes.unsqueeze(1)
-        )
-        gathered_experts = broken_physical_experts.clone()
         hidden_states = self.combine(
             hidden_states,
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
-            gathered_experts,
+            broken_ranks,
             forward_batch,
         )
         return hidden_states
@@ -419,14 +407,14 @@ class DeepEPMoE(EPMoE):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        broken_nodes: torch.Tensor,
+        broken_ranks: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
         return self.deepep_dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
-            broken_nodes=broken_nodes,
+            broken_ranks=broken_ranks,
             forward_batch=forward_batch,
         )
 
@@ -450,14 +438,14 @@ class DeepEPMoE(EPMoE):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        gathered_experts: torch.Tensor,
+        broken_ranks: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
         return self.deepep_dispatcher.combine(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
-            gathered_experts=gathered_experts,
+            broken_ranks=broken_ranks,
             forward_batch=forward_batch,
         )
 
