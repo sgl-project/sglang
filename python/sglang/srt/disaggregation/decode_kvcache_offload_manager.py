@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 
 import torch
 
@@ -59,7 +60,7 @@ class DecodeKVCacheOffloadManager:
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-        self.decode_cache_controller = HiCacheController(
+        self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
             page_size=self.page_size,
@@ -78,7 +79,7 @@ class DecodeKVCacheOffloadManager:
     def offload_kv_cache(self, req) -> bool:
         """Offload a finished request's KV cache to storage."""
 
-        if self.decode_cache_controller is None or self.decode_host_mem_pool is None:
+        if self.cache_controller is None or self.decode_host_mem_pool is None:
             return False
 
         if req.req_pool_idx == -1:
@@ -102,7 +103,7 @@ class DecodeKVCacheOffloadManager:
         # Asynchronously offload KV cache from device to host by cache controller
         self.request_counter += 1
         ack_id = self.request_counter
-        host_indices = self.decode_cache_controller.write(
+        host_indices = self.cache_controller.write(
             device_indices=token_indices.long(),
             node_id=ack_id,
         )
@@ -110,7 +111,7 @@ class DecodeKVCacheOffloadManager:
             logger.error(f"Not enough host memory for request {req.rid}")
             return False
 
-        self.ongoing_offload[ack_id] = (req, host_indices, tokens)
+        self.ongoing_offload[ack_id] = (req, host_indices, tokens, time.time())
         return True
 
     def check_offload_progress(self):
@@ -118,30 +119,37 @@ class DecodeKVCacheOffloadManager:
         self._check_backup_progress()
 
     def _check_offload_progress(self):
-        """Check the progress of offload from device to host, and trigger backup from host to storage."""
-        queue_size = torch.tensor(
-            self.decode_cache_controller.ack_write_queue.qsize(), dtype=torch.int
-        )
+        """Check the progress of offload from device to host."""
+
+        finish_count = 0
+        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         if self.tp_world_size > 1:
+            # synchronize TP workers to make the same update
             torch.distributed.all_reduce(
                 queue_size,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
 
-        for _ in range(queue_size.item()):
-            ack_id = self.decode_cache_controller.ack_write_queue.get()
-            req, host_indices, tokens = self.ongoing_offload[ack_id]
+        finish_count = int(queue_size.item())
+        while finish_count > 0:
+            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+            finish_event.synchronize()
+            for ack_id in ack_list:
+                req, host_indices, tokens, start_time = self.ongoing_offload.pop(ack_id)
 
-            # Release device
-            self.tree_cache.cache_finished_req(req)
+                # Release device
+                self.tree_cache.cache_finished_req(req)
 
-            # Trigger async backup from host to storage by cache controller
-            self._trigger_backup(req.rid, host_indices, tokens)
+                # Trigger async backup from host to storage by cache controller
+                self._trigger_backup(req.rid, host_indices, tokens, start_time)
+            finish_count -= 1
 
-            del self.ongoing_offload[ack_id]
-
-    def _trigger_backup(self, req_id, host_indices, tokens):
+    def _trigger_backup(self, req_id, host_indices, tokens, start_time):
         """Trigger async backup from host to storage by cache controller."""
 
         # Generate page hashes and write to storage
@@ -149,23 +157,21 @@ class DecodeKVCacheOffloadManager:
         last_hash = ""
         for offset in range(0, len(tokens), self.page_size):
             page_tokens = tokens[offset : offset + self.page_size]
-            last_hash = self.decode_cache_controller.get_hash_str(
-                page_tokens, last_hash
-            )
+            last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
             page_hashes.append(last_hash)
 
-        ack_id = self.decode_cache_controller.write_storage(
+        ack_id = self.cache_controller.write_storage(
             host_indices,
             tokens,
             hash_value=page_hashes,
         )
-        self.ongoing_backup[ack_id] = (req_id, host_indices)
+        self.ongoing_backup[ack_id] = (req_id, host_indices, start_time)
 
     def _check_backup_progress(self):
         """Check the progress of backup from host to storage."""
 
         queue_size = torch.tensor(
-            self.decode_cache_controller.ack_backup_queue.qsize(), dtype=torch.int
+            self.cache_controller.ack_backup_queue.qsize(), dtype=torch.int
         )
         if self.tp_world_size > 1:
             torch.distributed.all_reduce(
@@ -175,14 +181,13 @@ class DecodeKVCacheOffloadManager:
             )
 
         for _ in range(queue_size.item()):
-            storage_operation = self.decode_cache_controller.ack_backup_queue.get()
+            storage_operation = self.cache_controller.ack_backup_queue.get()
             ack_id = storage_operation.id
-            req_id, host_indices = self.ongoing_backup[ack_id]
+            req_id, host_indices, start_time = self.ongoing_backup.pop(ack_id)
 
             # Release host memory
             self.decode_host_mem_pool.free(host_indices)
-            del self.ongoing_backup[ack_id]
 
-            logger.debug(
-                f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}"
+            logger.info(
+                f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} ms."
             )
