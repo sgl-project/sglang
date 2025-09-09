@@ -729,10 +729,9 @@ async def destroy_weights_update_group(
         await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     )
     content = {"success": success, "message": message}
-    if success:
-        return ORJSONResponse(content, status_code=200)
-    else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/update_weights_from_tensor")

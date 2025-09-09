@@ -1040,7 +1040,9 @@ class ModelRunner:
             if group_name in self._model_update_group:
                 pg = self._model_update_group.pop(group_name)
                 torch.distributed.destroy_process_group(pg)
-            return True, "Succeeded to destroy custom process group."
+                return True, "Succeeded to destroy custom process group."
+            else:
+                return False, "The group to be destroyed does not exist."
         except Exception as e:
             message = f"Failed to destroy custom process group: {e}."
             logger.error(message)
