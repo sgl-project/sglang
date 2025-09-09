@@ -76,7 +76,7 @@ impl RouterFactory {
     }
 
     /// Create a regular router with injected policy
-    async fn create_regular_router(
+    pub async fn create_regular_router(
         worker_urls: &[String],
         policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
@@ -91,7 +91,7 @@ impl RouterFactory {
     }
 
     /// Create a PD router with injected policy
-    async fn create_pd_router(
+    pub async fn create_pd_router(
         prefill_urls: &[(String, Option<u16>)],
         decode_urls: &[String],
         prefill_policy_config: Option<&PolicyConfig>,

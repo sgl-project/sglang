@@ -8,7 +8,7 @@ use crate::protocols::spec::{
     V1RerankReqInput,
 };
 use crate::reasoning_parser::ParserFactory;
-use crate::routers::router_manager::RouterManager;
+use crate::routers::router_manager::{RouterId, RouterManager};
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use crate::tokenizer::{factory as tokenizer_factory, traits::Tokenizer};
@@ -484,29 +484,87 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .expect("Failed to create HTTP client");
 
     // Create the application context with all dependencies
-    let mut app_context = AppContext::new(
+    let app_context = AppContext::new(
         config.router_config.clone(),
         client.clone(),
         config.router_config.max_concurrent_requests,
         config.router_config.rate_limit_tokens_per_second,
     )?;
 
-    // Initialize RouterManager if enable_igw is true
-    if config.router_config.enable_igw {
-        info!("Multi-router mode enabled (enable_igw=true)");
-        let router_manager = Arc::new(RouterManager::new(
-            config.router_config.clone(),
-            client.clone(),
-        ));
-        app_context.router_manager = Some(router_manager);
-    } else {
-        info!("Single router mode (enable_igw=false)");
-    }
-
     let app_context = Arc::new(app_context);
 
-    // Create router with the context
-    let router = RouterFactory::create_router(&app_context).await?;
+    // Create the appropriate router based on enable_igw flag
+    let router: Box<dyn RouterTrait> = if config.router_config.enable_igw {
+        info!("Multi-router mode enabled (enable_igw=true)");
+
+        // Create RouterManager
+        let mut router_manager = RouterManager::new(config.router_config.clone(), client.clone());
+
+        // Create HTTP routers at startup (with empty worker lists)
+        // Workers will be added to these routers dynamically via RouterManager's worker registry
+
+        // 1. HTTP Regular Router
+        match RouterFactory::create_regular_router(
+            &[], // Empty worker list - workers added later
+            &config.router_config.policy,
+            &app_context,
+        )
+        .await
+        {
+            Ok(http_regular) => {
+                info!("Created HTTP Regular router");
+                router_manager.register_router(
+                    RouterId::new("http-regular".to_string()),
+                    Arc::from(http_regular),
+                    vec![], // Models will be determined by workers
+                );
+            }
+            Err(e) => {
+                warn!("Failed to create HTTP Regular router: {}", e);
+            }
+        }
+
+        // 2. HTTP PD Router
+        match RouterFactory::create_pd_router(
+            &[],  // Empty prefill URLs
+            &[],  // Empty decode URLs
+            None, // Use default prefill policy
+            None, // Use default decode policy
+            &config.router_config.policy,
+            &app_context,
+        )
+        .await
+        {
+            Ok(http_pd) => {
+                info!("Created HTTP PD router");
+                router_manager.register_router(
+                    RouterId::new("http-pd".to_string()),
+                    Arc::from(http_pd),
+                    vec![],
+                );
+            }
+            Err(e) => {
+                warn!("Failed to create HTTP PD router: {}", e);
+            }
+        }
+
+        // TODO: Add gRPC routers once we have dynamic tokenizer loading
+        // Currently gRPC routers require tokenizer to be initialized first,
+        // but each model needs its own tokenizer. Once we implement dynamic
+        // tokenizer loading per model, we can enable gRPC routers here:
+        // - RouterType::GrpcRegular (RouterId: "grpc-regular")
+        // - RouterType::GrpcPd (RouterId: "grpc-pd")
+
+        info!(
+            "RouterManager initialized with {} routers",
+            router_manager.router_count()
+        );
+        Box::new(router_manager)
+    } else {
+        info!("Single router mode (enable_igw=false)");
+        // Create single router with the context
+        RouterFactory::create_router(&app_context).await?
+    };
 
     // Set up concurrency limiter with queue if configured
     let (limiter, processor) = crate::middleware::ConcurrencyLimiter::new(

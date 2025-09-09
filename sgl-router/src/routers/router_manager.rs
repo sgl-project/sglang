@@ -5,12 +5,20 @@
 //! - Multi-Router Mode (enable_igw=true): RouterManager coordinates everything
 
 use crate::config::RouterConfig;
-use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
+use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry};
+use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::protocols::worker_spec::{
     ServerInfo, WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo,
     WorkerListResponse, WorkerStats, WorkerTypeStats,
 };
-use crate::routers::RouterTrait;
+use crate::routers::{RouterTrait, WorkerManagement};
+use async_trait::async_trait;
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -31,12 +39,6 @@ impl RouterId {
 
 /// Router Manager - Central coordinator for routers and workers
 /// Only created when enable_igw=true
-///
-/// Phase 2 will support exactly 4 routers:
-/// - HTTP Regular Router
-/// - HTTP PD Router (Prefill/Decode separation)
-/// - gRPC Regular Router  
-/// - gRPC PD Router (Prefill/Decode separation)
 pub struct RouterManager {
     /// Worker registry (single source of truth in multi-router mode)
     worker_registry: Arc<WorkerRegistry>,
@@ -56,7 +58,7 @@ pub struct RouterManager {
     client: reqwest::Client,
 
     /// Configuration
-    #[allow(dead_code)] // Will be used in future enhancements
+    #[allow(dead_code)] // May be used in future enhancements
     config: RouterConfig,
 }
 
@@ -101,6 +103,11 @@ impl RouterManager {
     /// Set the default router
     pub fn set_default_router(&mut self, id: RouterId) {
         self.default_router = Some(id);
+    }
+
+    /// Get the number of registered routers
+    pub fn router_count(&self) -> usize {
+        self.routers.len()
     }
 
     /// Get router for a specific model
@@ -261,7 +268,22 @@ impl RouterManager {
             .collect();
 
         let total = worker_infos.len();
-        let stats = self.calculate_stats(&workers);
+
+        // Get stats from the worker registry
+        let registry_stats = self.worker_registry.stats();
+
+        // Convert WorkerRegistryStats to WorkerStats
+        let stats = WorkerStats {
+            total_workers: registry_stats.total_workers,
+            healthy_workers: registry_stats.healthy_workers,
+            total_models: registry_stats.total_models,
+            total_load: registry_stats.total_load,
+            by_type: WorkerTypeStats {
+                regular: registry_stats.regular_workers,
+                prefill: registry_stats.prefill_workers,
+                decode: registry_stats.decode_workers,
+            },
+        };
 
         WorkerListResponse {
             workers: worker_infos,
@@ -318,41 +340,373 @@ impl RouterManager {
         }
     }
 
-    /// Calculate worker statistics
-    fn calculate_stats(&self, workers: &[Arc<dyn Worker>]) -> WorkerStats {
-        let total_workers = workers.len();
-        let healthy_workers = workers.iter().filter(|w| w.is_healthy()).count();
-        let total_models = self.worker_registry.get_models().len();
-        let total_load: usize = workers.iter().map(|w| w.load()).sum();
+    // Note: calculate_stats removed - using WorkerRegistry::stats() instead
 
-        let mut regular = 0;
-        let mut prefill = 0;
-        let mut decode = 0;
+    // === Phase 2: Router Management ===
+    // Note: Dynamic router creation removed - routers are created and registered externally
 
-        for worker in workers {
-            match worker.worker_type() {
-                WorkerType::Regular => regular += 1,
-                WorkerType::Prefill { .. } => prefill += 1,
-                WorkerType::Decode => decode += 1,
+    /// Get the appropriate router for a request based on headers and request content
+    pub fn select_router_for_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        model_id: Option<&str>,
+    ) -> Option<Arc<dyn RouterTrait>> {
+        // Extract priority and cost preferences from headers if available
+        let _priority_threshold = headers.and_then(|h| {
+            h.get("x-worker-priority")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u32>().ok())
+        });
+
+        let _max_cost = headers.and_then(|h| {
+            h.get("x-max-cost")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<f32>().ok())
+        });
+
+        // Check if PD (prefill-decode) mode is preferred from headers
+        let prefer_pd = headers
+            .and_then(|h| {
+                h.get("x-prefer-pd")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s == "true" || s == "1")
+            })
+            .unwrap_or(false);
+
+        // If model specified, find routers serving that model
+        let candidate_routers = if let Some(model) = model_id {
+            // Get routers for specific model
+            if let Some(router_ids) = self.model_routers.get(model) {
+                router_ids
+                    .iter()
+                    .filter_map(|id| self.routers.get(id).map(|r| r.clone()))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        } else {
+            // No model specified, consider all routers
+            self.routers
+                .iter()
+                .map(|entry| entry.value().clone())
+                .collect::<Vec<_>>()
+        };
+
+        if candidate_routers.is_empty() {
+            // No routers found for the specified model
+            return None;
+        }
+
+        // Score routers based on worker attributes and request preferences
+        let mut best_router = None;
+        let mut best_score = 0.0;
+
+        for router in candidate_routers {
+            let mut score = 1.0;
+
+            // Check if this is a PD router
+            let is_pd = router.is_pd_mode();
+            if prefer_pd && is_pd {
+                score += 2.0; // Bonus for matching PD preference
+            } else if !prefer_pd && !is_pd {
+                score += 1.0; // Bonus for matching regular preference
+            }
+
+            // Get workers for this router and evaluate based on priority/cost
+            // Note: This would require routers to expose their workers or stats
+            // For now, we'll use a simple selection based on router type
+
+            // TODO: Once routers expose worker stats, we can evaluate:
+            // - Average worker priority vs priority_threshold
+            // - Average worker cost vs max_cost
+            // - Current load and health status
+
+            if score > best_score {
+                best_score = score;
+                best_router = Some(router);
             }
         }
 
-        WorkerStats {
-            total_workers,
-            healthy_workers,
-            total_models,
-            total_load,
-            by_type: WorkerTypeStats {
-                regular,
-                prefill,
-                decode,
-            },
+        best_router
+    }
+}
+
+// Note: Default implementation removed as RouterManager now requires AppContext
+// which cannot be defaulted. RouterManager must be created with explicit context.
+
+// === Phase 2: RouterManager as RouterTrait ===
+
+/// RouterManager implements RouterTrait to act as a meta-router
+/// that delegates requests to the appropriate underlying router
+#[async_trait]
+impl WorkerManagement for RouterManager {
+    /// Add a worker - in multi-router mode, this adds to the registry
+    async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+        // Create a basic worker config request
+        let config = WorkerConfigRequest {
+            url: worker_url.to_string(),
+            model_id: None,
+            worker_type: None,
+            priority: None,
+            cost: None,
+            labels: std::collections::HashMap::new(),
+            bootstrap_port: None,
+            tokenizer_path: None,
+            reasoning_parser: None,
+            tool_parser: None,
+            chat_template: None,
+        };
+
+        match self.add_worker(config).await {
+            Ok(response) => Ok(response.message),
+            Err(e) => Err(e.error),
+        }
+    }
+
+    /// Remove a worker from the registry
+    fn remove_worker(&self, worker_url: &str) {
+        let _ = self.remove_worker(worker_url);
+    }
+
+    /// Get all worker URLs from the registry
+    fn get_worker_urls(&self) -> Vec<String> {
+        self.worker_registry.get_all_urls()
+    }
+}
+
+#[async_trait]
+impl RouterTrait for RouterManager {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    /// Health check - return 503 if no routers available
+    async fn health(&self, _req: Request<Body>) -> Response {
+        // Health check should succeed if RouterManager exists, even without routers
+        // Individual router health can be checked via specific endpoints
+        (StatusCode::OK, "RouterManager is healthy").into_response()
+    }
+
+    /// Health generate - check if any router can handle generate requests
+    async fn health_generate(&self, _req: Request<Body>) -> Response {
+        // Return 503 since we have no routers with workers
+        // TODO: Should check if any router has healthy workers
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No routers with healthy workers available",
+        )
+            .into_response()
+    }
+
+    /// Get server information - aggregate from all routers
+    async fn get_server_info(&self, _req: Request<Body>) -> Response {
+        // TODO: Aggregate info from all routers with healthy workers
+        // For now, return basic info about the RouterManager
+        (
+            StatusCode::OK,
+            serde_json::json!({
+                "router_manager": true,
+                "routers_count": self.routers.len(),
+                "workers_count": self.worker_registry.get_all().len()
+            })
+            .to_string(),
+        )
+            .into_response()
+    }
+
+    /// Get available models - aggregate from all routers
+    async fn get_models(&self, _req: Request<Body>) -> Response {
+        // Return models that have registered routers
+        let models = self
+            .model_routers
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+
+        if models.is_empty() {
+            (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
+        } else {
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "models": models
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
+    }
+
+    /// Get model information
+    async fn get_model_info(&self, _req: Request<Body>) -> Response {
+        // TODO: Extract model from request and route to appropriate router
+        // For now, return not implemented
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Model info endpoint not yet implemented in RouterManager",
+        )
+            .into_response()
+    }
+
+    /// Route a generate request
+    async fn route_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+    ) -> Response {
+        // Select router based on headers
+        // GenerateRequest doesn't have a model field
+        let router = self.select_router_for_request(headers, None);
+
+        if let Some(router) = router {
+            router.route_generate(headers, body).await
+        } else {
+            // Return 404 when no router is available for the request
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
+        }
+    }
+
+    /// Route a chat completion request
+    async fn route_chat(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+    ) -> Response {
+        // Select router based on headers and model
+        let router = self.select_router_for_request(headers, Some(&body.model));
+
+        if let Some(router) = router {
+            router.route_chat(headers, body).await
+        } else {
+            // Return 404 when the specified model is not found
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    /// Route a completion request
+    async fn route_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+    ) -> Response {
+        // Select router based on headers and model
+        let router = self.select_router_for_request(headers, Some(&body.model));
+
+        if let Some(router) = router {
+            router.route_completion(headers, body).await
+        } else {
+            // Return 404 when the specified model is not found
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    /// Route embeddings request
+    async fn route_embeddings(&self, headers: Option<&HeaderMap>, body: Body) -> Response {
+        // Try to select a router based on headers
+        let router = self.select_router_for_request(headers, None);
+
+        if let Some(router) = router {
+            router.route_embeddings(headers, body).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for embeddings request",
+            )
+                .into_response()
+        }
+    }
+
+    /// Route rerank request
+    async fn route_rerank(&self, headers: Option<&HeaderMap>, body: Body) -> Response {
+        // Try to select a router based on headers
+        let router = self.select_router_for_request(headers, None);
+
+        if let Some(router) = router {
+            router.route_rerank(headers, body).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for rerank request",
+            )
+                .into_response()
+        }
+    }
+
+    /// Flush cache on all routers and workers
+    async fn flush_cache(&self) -> Response {
+        // TODO: Call flush_cache on all routers that have workers
+        // For now, return success if we have any routers
+        if self.routers.is_empty() {
+            (StatusCode::SERVICE_UNAVAILABLE, "No routers configured").into_response()
+        } else {
+            // TODO: Actually flush cache on all routers
+            (StatusCode::OK, "Cache flush requested").into_response()
+        }
+    }
+
+    /// Get worker loads from all routers
+    async fn get_worker_loads(&self) -> Response {
+        // Return worker loads from the registry
+        let workers = self.worker_registry.get_all();
+        let loads: Vec<serde_json::Value> = workers
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "url": w.url(),
+                    "model": w.model_id(),
+                    "load": w.load(),
+                    "is_healthy": w.is_healthy()
+                })
+            })
+            .collect();
+
+        (
+            StatusCode::OK,
+            serde_json::json!({
+                "workers": loads
+            })
+            .to_string(),
+        )
+            .into_response()
+    }
+
+    /// Get router type name
+    fn router_type(&self) -> &'static str {
+        "manager"
+    }
+
+    /// Server readiness check - check if any router is ready
+    fn readiness(&self) -> Response {
+        if self.routers.is_empty() {
+            (StatusCode::SERVICE_UNAVAILABLE, "No routers configured").into_response()
+        } else {
+            // TODO: Check readiness of all routers
+            (StatusCode::OK, "Ready").into_response()
         }
     }
 }
 
-impl Default for RouterManager {
-    fn default() -> Self {
-        Self::new(RouterConfig::default(), reqwest::Client::new())
+// Note: get_first_available_router removed - we now properly handle
+// router selection based on model and worker availability
+
+impl std::fmt::Debug for RouterManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouterManager")
+            .field("routers_count", &self.routers.len())
+            .field("workers_count", &self.worker_registry.get_all().len())
+            .field("default_router", &self.default_router)
+            .finish()
     }
 }

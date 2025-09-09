@@ -968,7 +968,7 @@ impl Router {
                 .downcast_ref::<crate::policies::CacheAwarePolicy>()
             {
                 for dp_url in removed_workers.iter() {
-                    cache_aware.remove_worker(dp_url);
+                    cache_aware.remove_worker_by_url(dp_url);
                     info!("Removed worker from tree: {}", dp_url);
                 }
             }
@@ -989,7 +989,7 @@ impl Router {
                 .as_any()
                 .downcast_ref::<crate::policies::CacheAwarePolicy>()
             {
-                cache_aware.remove_worker(worker_url);
+                cache_aware.remove_worker_by_url(worker_url);
                 info!("Removed worker from tree: {}", worker_url);
             }
         }

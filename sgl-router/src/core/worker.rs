@@ -158,6 +158,21 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     // === Multi-router support ===
 
+    // TODO: - Enhanced Worker Discovery
+    // The Worker trait should handle async discovery of metadata from the worker itself
+    // rather than having service discovery or other components query /get_server_info.
+    // This keeps service discovery decoupled from worker-specific APIs.
+    //
+    // Proposed additions:
+    // - async fn discover_metadata(&mut self) -> Result<(), Error>
+    //   Query /get_server_info and populate metadata labels with model_id, priority, cost, etc.
+    // - async fn validate_configuration(&self) -> Result<(), Error>
+    //   Ensure worker has required configuration for its mode (e.g., tokenizer for gRPC)
+    // - Make worker creation async to allow metadata discovery during initialization
+    //
+    // This way service discovery just calls router.add_worker() and the worker
+    // handles its own metadata discovery internally.
+
     /// Get the model ID this worker serves
     fn model_id(&self) -> &str {
         self.metadata()

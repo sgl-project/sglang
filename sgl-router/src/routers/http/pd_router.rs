@@ -249,17 +249,17 @@ impl PDRouter {
             return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
         }
 
-        workers.push(worker);
-
-        // Update cache-aware policy if applicable
-        drop(workers); // Release write lock
+        // Update cache-aware policy if applicable (before pushing to workers)
         if let Some(cache_policy) = self
             .prefill_policy
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
-            cache_policy.add_worker(&url);
+            cache_policy.add_worker(worker.as_ref());
         }
+
+        workers.push(worker);
+        drop(workers); // Release write lock
 
         info!("Added prefill server: {}", url);
         Ok(format!("Successfully added prefill server: {}", url))
@@ -288,17 +288,17 @@ impl PDRouter {
             return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
         }
 
-        workers.push(worker);
-
-        // Update cache-aware policy if applicable
-        drop(workers); // Release write lock
+        // Update cache-aware policy if applicable (before pushing to workers)
         if let Some(cache_policy) = self
             .decode_policy
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
-            cache_policy.add_worker(&url);
+            cache_policy.add_worker(worker.as_ref());
         }
+
+        workers.push(worker);
+        drop(workers); // Release write lock
 
         info!("Added decode server: {}", url);
         Ok(format!("Successfully added decode server: {}", url))
@@ -328,7 +328,7 @@ impl PDRouter {
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
-            cache_policy.remove_worker(url);
+            cache_policy.remove_worker_by_url(url);
         }
 
         info!("Removed prefill server: {}", url);
@@ -359,7 +359,7 @@ impl PDRouter {
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
-            cache_policy.remove_worker(url);
+            cache_policy.remove_worker_by_url(url);
         }
 
         info!("Removed decode server: {}", url);
