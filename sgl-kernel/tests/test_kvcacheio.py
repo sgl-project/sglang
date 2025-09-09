@@ -478,7 +478,7 @@ def test_transfer_kv_pf_direct(
             torch.cuda.synchronize()
             torch.testing.assert_close(dst_k_pool_direct, dst_k_pool_ref)
             torch.testing.assert_close(dst_v_pool_direct, dst_v_pool_ref)
-
+    torch.set_default_dtype(original_dtype)
 
 if __name__ == "__main__":
     pytest.main([__file__])
