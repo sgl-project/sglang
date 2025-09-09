@@ -143,6 +143,7 @@ class TritonLoRABackend(BaseLoRABackend):
 
             batch_info = LoRABatchInfo(
                 bs=forward_batch.batch_size,
+                num_segments=forward_batch.batch_size,
                 max_len=max_len,
                 use_cuda_graph=False,
                 seg_lens=seg_lens,
