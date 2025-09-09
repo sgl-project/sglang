@@ -116,7 +116,7 @@ class TransferStatus:
         if self.num_kvs_expected == -1:
             return True  # Failed transfers are considered "done"
         return self.num_kvs_expected == len(self.received_kvs) and self.received_aux
-    
+
     def is_failed(self):
         return self.num_kvs_expected == -1
 
@@ -152,7 +152,7 @@ class NixlKVManager(CommonKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker = defaultdict(set)
             self.connection_lock = threading.Lock()
-            
+
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
@@ -563,8 +563,9 @@ class NixlKVManager(CommonKVManager):
 def _start_heartbeat_checker_thread(self):
         """
         Start the heartbeat checker thread for Decode worker.
-        TODO (smor): unite nixl heartbeat checker with mooncake's. 
+        TODO (smor): unite nixl heartbeat checker with mooncake's.
         """
+
         def heartbeat_checker():
             while True:
                 time.sleep(self.heartbeat_interval)
@@ -644,11 +645,14 @@ def _start_heartbeat_checker_thread(self):
         # Mark all pending transfers associated with the failed node as failed
         affected_rooms = []
         for room in possible_affected_rooms:
-            if room in self.transfer_statuses and not self.transfer_statuses[room].is_done():
+            if (
+                room in self.transfer_statuses
+                and not self.transfer_statuses[room].is_done()
+            ):
                 # Mark the transfer as failed by setting a special state
                 self.transfer_statuses[room].num_kvs_expected = -1  # Indicates failure
                 affected_rooms.append(room)
-        
+
         logger.error(
             f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
             f"{len(affected_rooms)} transfers affected"
@@ -717,10 +721,12 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = False
         self.conclude_state = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
-        
+
         # Track this room with its bootstrap address for heartbeat monitoring
-        if hasattr(self.kv_mgr, 'addr_to_rooms_tracker'):
-            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
+        if hasattr(self.kv_mgr, "addr_to_rooms_tracker"):
+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(
+                self.bootstrap_room
+            )
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         for bootstrap_info in self.bootstrap_infos:
@@ -759,7 +765,9 @@ class NixlKVReceiver(CommonKVReceiver):
             # Check if the transfer failed
             if self.kv_mgr.transfer_statuses[self.bootstrap_room].is_failed():
                 self.conclude_state = KVPoll.Failed
-                logger.error(f"Transfer for room {self.bootstrap_room} failed due to node failure")
+                logger.error(
+                    f"Transfer for room {self.bootstrap_room} failed due to node failure"
+                )
             else:
                 self.conclude_state = KVPoll.Success
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
