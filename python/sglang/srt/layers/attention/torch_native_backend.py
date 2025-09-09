@@ -218,7 +218,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
-        
+
         if layer.is_cross_attention:
             cache_loc = forward_batch.encoder_out_cache_loc
         else:
