@@ -105,11 +105,15 @@ def parse_args():
         action="store_true",
         help="If set, disable automatically testing with a range of request rates.",
     )
-
     parser.add_argument(
         "--disable-random-sample",
         action="store_true",
         help="If set, disable random sampling of requests from the ShareGPT dataset.",
+    )
+    parser.add_argument(
+        "--enable-round-barrier",
+        action="store_true",
+        help="If set, only send i-th turn requests after all (i-1)-th turn requests finished.",
     )
     parser.add_argument(
         "--sub-question-input-length",
@@ -335,6 +339,11 @@ class WorkloadGenerator:
             "cached_tokens": [],
             "generated_len": [],
         }
+        # Add round-based TTFT tracking
+        self.round_ttft = {i: [] for i in range(args.num_rounds)}
+        self.enable_round_barrier = args.enable_round_barrier
+        self.num_clients = args.num_clients
+
         self.num_rounds = args.num_rounds
         self.max_parallel = args.max_parallel
         self.output_length = args.output_length
@@ -383,6 +392,7 @@ class WorkloadGenerator:
         loop.close()
 
     def response_handler(self):
+        next_round_reqs = []
         while True:
             try:
                 client_id, response = self.response_queue.get(
@@ -391,12 +401,14 @@ class WorkloadGenerator:
                 if not response.success:
                     raise ValueError(f"Request failed with error: {response.error}")
                 self.client_records[client_id]["history"] += response.generated_text
+                current_round = self.client_records[client_id]["round"]
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
                 self.performance_metrics["latency"].append(response.latency)
                 self.performance_metrics["prompt_len"].append(response.prompt_len)
                 self.performance_metrics["cached_tokens"].append(response.cached_tokens)
                 self.performance_metrics["generated_len"].append(response.generated_len)
+                self.round_ttft[current_round].append(response.ttft)
                 self.completed_requests += 1
 
                 if self.client_records[client_id]["round"] < self.num_rounds:
@@ -404,16 +416,22 @@ class WorkloadGenerator:
                     self.client_records[client_id][
                         "history"
                     ] += self.sub_question_inputs.pop().prompt
-                    self.ready_queue.append(
-                        (
-                            client_id,
-                            gen_payload(
-                                self.client_records[client_id]["history"],
-                                self.output_length,
-                                args.lora_path,
-                            ),
-                        )
+                    new_req = (
+                        client_id,
+                        gen_payload(
+                            self.client_records[client_id]["history"],
+                            self.output_length,
+                            args.lora_path,
+                        ),
                     )
+                    if self.enable_round_barrier:
+                        next_round_reqs.append(new_req)
+                        if len(next_round_reqs) == self.num_clients:
+                            for req in next_round_reqs:
+                                self.ready_queue.append(req)
+                            next_round_reqs = []
+                    else:
+                        self.ready_queue.append(new_req)
             except queue.Empty:
                 if self.pbar.n == self.pbar.total:
                     break
@@ -469,6 +487,20 @@ class WorkloadGenerator:
                 ),
             },
         }
+        if self.enable_round_barrier:
+            performance_data["round"] = {
+                f"round_{round_num}": {
+                    "average_ttft": (
+                        sum(self.round_ttft[round_num])
+                        / len(self.round_ttft[round_num])
+                        if self.round_ttft[round_num]
+                        else 0
+                    ),
+                    "request_count": len(self.round_ttft[round_num]),
+                    "ttft_values": self.round_ttft[round_num],
+                }
+                for round_num in range(args.num_rounds)
+            }
         print("All requests completed")
         print("Performance metrics summary:")
         print(
@@ -492,6 +524,23 @@ class WorkloadGenerator:
             f"  Request Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
         print(f"  Cache Hit Rate: {performance_data['summary']['cache_hit_rate']:.6f}")
+
+        if self.enable_round_barrier:
+            # Print round-basedsummary
+            print("\nPer-round metrics:")
+            if "round" in performance_data:
+                for round_num in range(self.num_rounds):
+                    round_key = f"round_{round_num}"
+                    if round_key in performance_data["round"]:
+                        round_data = performance_data["round"][round_key]
+                        avg_ttft = round_data["average_ttft"]
+                        request_count = round_data["request_count"]
+                        print(
+                            f"  Round {round_num}: Average TTFT = {avg_ttft:.2f}s ({request_count} requests)"
+                        )
+                    else:
+                        print(f"  Round {round_num}: No requests completed")
+
         return performance_data
 
 
