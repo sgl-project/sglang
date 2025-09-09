@@ -2210,7 +2210,7 @@ def bind_or_assign(target, source):
 
 
 def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
-    if (interface or os.environ.get("SGLANG_LOCAL_IP_NIC", None)) is None:
+    if not (interface := interface or os.environ.get("SGLANG_LOCAL_IP_NIC", None)):
         return None
     try:
         import netifaces
