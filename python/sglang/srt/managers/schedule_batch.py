@@ -1292,6 +1292,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
+                elif isinstance(pixel_values, dict):
+                    assert (
+                        "pixel_values" in pixel_values
+                    ), "cache image mode should load image data directly"
+                    mm_item.feature = pixel_values["pixel_values"].to(
+                        self.device, non_blocking=True
+                    )
+
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
@@ -1422,8 +1430,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
-        while first_iter or (
-            not self.check_decode_mem(selected_indices=sorted_indices)
+        while (
+            _get_available_size() < get_required_tokens(len(sorted_indices))
+            or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
@@ -1476,6 +1485,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
                 else:
                     self.tree_cache.dec_lock_ref(req.last_node)
+
+                # NOTE(lsyin): we should use the newly evictable memory instantly.
+                num_tokens = len(sorted_indices) * global_config.retract_decode_steps
+                self._evict_tree_cache_if_needed(num_tokens)
 
             req.reset_for_retract()
 

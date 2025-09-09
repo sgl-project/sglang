@@ -592,7 +592,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if (
+            hasattr(self, "capture_aux_hidden_states")
+            and self.capture_aux_hidden_states
+        ):
             hidden_states, aux_hidden_states = hidden_states
 
         if not get_embedding:

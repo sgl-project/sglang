@@ -28,15 +28,124 @@ LLaVA-Onevision : https://arxiv.org/pdf/2408.03326
 
 """
 import ast
+import hashlib
 import math
 import re
 from io import BytesIO
+from typing import List
 
 import numpy as np
 import pybase64
+import torch
 from PIL import Image
 
 from sglang.srt.utils import flatten_nested_list
+
+
+def fast_image_hash(img: Image.Image, hash_type: str = "int") -> int | str:
+    small_img = img.resize((8, 8), Image.Resampling.BILINEAR).convert("L")
+    pixel_data = small_img.tobytes()
+    hash_obj = hashlib.md5(pixel_data)
+
+    if hash_type == "int":
+        return int.from_bytes(hash_obj.digest(), byteorder="little", signed=False)
+    else:
+        return hash_obj.hexdigest()
+
+
+def image_to_int(img: Image.Image) -> int:
+    img_bytes = img.tobytes()
+    hash_obj = hashlib.md5(img_bytes)
+    hash_bytes = hash_obj.digest()
+    return int.from_bytes(hash_bytes, byteorder="big")
+
+
+def generate_reconstruct_cudatensor_infos(tensor_list: List[torch.Tensor]):
+    if len(tensor_list) == 0:
+        return {}
+
+    ipc_handle_list = []
+    shape_list = []
+    stride_list = []
+    s_offset_list = []
+    device = tensor_list[0].device
+    dtype = tensor_list[0].dtype
+
+    for ts in tensor_list:
+        storage = ts.untyped_storage()
+        ipc_handle_list.append(storage._share_cuda_())
+        shape_list.append(ts.shape)
+        stride_list.append(ts.stride())
+        s_offset_list.append(ts.storage_offset())
+
+    rs_infos = {}
+    rs_infos["ipc_handle_list"] = ipc_handle_list
+    rs_infos["shape_list"] = shape_list
+    rs_infos["stride_list"] = stride_list
+    rs_infos["s_offset"] = s_offset_list
+    rs_infos["device"] = device
+    rs_infos["dtype"] = dtype
+    return rs_infos
+
+
+def operate_substrings(original_str, target_sub, indices, replace_str=""):
+
+    positions = []
+    start = 0
+    target_len = len(target_sub)
+    while True:
+        pos = original_str.find(target_sub, start)
+        if pos == -1:
+            break
+        positions.append(pos)
+        start = pos + target_len
+
+    for idx in indices:
+        if idx < 0 or idx >= len(positions):
+            raise ValueError(f"invalid {idx} idx can only be 0 ~ {len(positions)-1}")
+    unique_indices = sorted(list(set(indices)))
+
+    result = original_str
+    offset = 0
+    replace_len = len(replace_str)
+    delta = replace_len - target_len
+
+    for idx in unique_indices:
+        original_pos = positions[idx]
+        current_pos = original_pos + offset
+
+        if replace_str:
+            result = (
+                result[:current_pos] + replace_str + result[current_pos + target_len :]
+            )
+        else:
+            result = result[:current_pos] + result[current_pos + target_len :]
+
+        offset += delta
+
+    return result
+
+
+def insert_input_ids(input_ids, target_id, forbid_id_before_target, insert_ids):
+    # print("check input_ids {}".format(input_ids))
+    target_positions = (input_ids[0] == target_id).nonzero().squeeze(dim=1)
+    for pos in target_positions:
+        if pos == 0 or input_ids[0][pos - 1] != forbid_id_before_target:
+            new_length = len(input_ids[0]) + len(insert_ids) - 1
+            new_tensor = torch.empty(
+                1,
+                new_length,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            new_tensor[0][:pos] = input_ids[0][:pos]
+            new_tensor[0][pos : pos + len(insert_ids)] = torch.tensor(
+                insert_ids, dtype=input_ids.dtype, device=input_ids.device
+            )
+            new_tensor[0][pos + len(insert_ids) :] = input_ids[0][pos + 1 :]
+            return new_tensor
+
+    return input_ids
 
 
 def has_valid_data(data) -> bool:

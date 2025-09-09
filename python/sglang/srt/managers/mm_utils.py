@@ -35,6 +35,45 @@ _is_npu = is_npu()
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
 
+class FIFOTensorCache:
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+        self.hash_map = {}
+        self.order = []
+
+    def add(self, key: int, value):
+        if key in self.hash_map:
+            self.order.remove(key)
+        self.hash_map[key] = value
+        self.order.append(key)
+        if len(self.hash_map) > self.max_size:
+            oldest_key = self.order.pop(0)
+            return oldest_key
+        return None
+
+    def get(self, key: int):
+        return self.hash_map.get(key)
+
+    def size(self):
+        return len(self.hash_map)
+
+    def erase(self, key: int):
+        self.hash_map.pop(key)
+
+    def pop_until(self, limit_size):
+        while len(self.hash_map) > limit_size:
+            oldest_key = self.order.pop(0)
+            self.erase(oldest_key)
+
+    def print_infos(self):
+        for key in self.hash_map:
+            print(
+                "check key {} pixel_values_shape {}".format(
+                    key, self.hash_map[key]["pixel_values"].shape
+                )
+            )
+
+
 class TransportProxyTensor(torch.Tensor):
     """
     A convenient torch.Tensor subclass that carries extra metadata and supports
@@ -730,9 +769,48 @@ def get_multimodal_data_bounds(
     return valid_pairs_tensor
 
 
+def reconstruct_tensor_from_infos(ts_infos: dict):
+    device = ts_infos["device"]
+    dtype = ts_infos["dtype"]
+    ipc_handle_list = ts_infos["ipc_handle_list"]
+    shape_list = ts_infos["shape_list"]
+    stride_list = ts_infos["stride_list"]
+    s_offset_list = ts_infos["s_offset"]
+
+    ts_list = []
+    for idx in range(len(ipc_handle_list)):
+        ipc_handle = ipc_handle_list[idx]
+        shape = shape_list[idx]
+        stride = stride_list[idx]
+        s_offset = s_offset_list[idx]
+        with torch.cuda.device(device):
+            storage = torch.UntypedStorage._new_shared_cuda(*ipc_handle)
+            recreated_tensor = torch.empty(0, dtype=dtype, device=device).set_(
+                storage, storage_offset=s_offset, size=shape, stride=stride
+            )
+            ts_list.append(recreated_tensor)
+
+    return ts_list
+
+
 def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+    def list_to_hash(int_list):
+        return hash(tuple(int_list))
+
+    if isinstance(data, dict):
+        if data["cat_feature"]:
+            recons_ret = reconstruct_tensor_from_infos(data)
+            new_tensor = torch.cat(recons_ret)
+        else:
+            recons_ret = reconstruct_tensor_from_infos(data)
+            new_tensor = torch.stack(recons_ret)
+        data["pixel_values"] = new_tensor
+        assert "hash_keys" in data, "invalid dict data"
+        hash_keys = data["hash_keys"]
+        return list_to_hash(hash_keys)
+    else:
+        hash_bytes = hashlib.sha256(data).digest()[:8]
+        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
 def tensor_hash(tensor_list) -> int:
