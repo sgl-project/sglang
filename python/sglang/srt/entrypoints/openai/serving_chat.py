@@ -28,6 +28,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
+from sglang.srt.function_call.core_types import ToolCallProcessingResult
 from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
@@ -745,9 +746,10 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_calls = None
             if request.tool_choice != "none" and request.tools:
                 tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-                tool_calls, text, finish_reason = self._process_tool_calls(
+                result = self._process_tool_calls(
                     text, request.tools, tool_call_parser, finish_reason, request.tool_choice
                 )
+                tool_calls, text, finish_reason = result.tool_calls, result.remaining_text, result.finish_reason
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
@@ -843,7 +845,7 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_parser: Optional[str],
         finish_reason: Dict[str, Any],
         tool_choice: Optional[Union[str, ToolChoice]] = None,
-    ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
+    ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
         def get_tool_id(name: str, index: int) -> str:
@@ -876,10 +878,10 @@ class OpenAIServingChat(OpenAIServingBase):
                             ),
                         )
                     )
-                return tool_calls, "", finish_reason
+                return ToolCallProcessingResult(tool_calls, "", finish_reason)
             except json.JSONDecodeError as e:
                 logger.error(f"Tool call parsing error: {e}")
-                return None, text, finish_reason
+                return ToolCallProcessingResult(None, text, finish_reason)
         
         # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, tool_call_parser, tool_choice)
@@ -899,13 +901,13 @@ class OpenAIServingChat(OpenAIServingBase):
                             ),
                         )
                     )
-                return tool_calls, text, finish_reason
+                return ToolCallProcessingResult(tool_calls, text, finish_reason)
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
                 # Return error but don't fail the whole request
-                return None, text, finish_reason
+                return ToolCallProcessingResult(None, text, finish_reason)
 
-        return None, text, finish_reason
+        return ToolCallProcessingResult(None, text, finish_reason)
 
     def _process_streaming_logprobs(
         self, content: Dict[str, Any], n_prev_token: int

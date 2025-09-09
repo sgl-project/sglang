@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 from pydantic import BaseModel
 
@@ -24,6 +24,14 @@ class StructureInfo:
     begin: str
     end: str
     trigger: str
+
+
+class ToolCallProcessingResult(NamedTuple):
+    """Result of processing tool calls in a response."""
+    
+    tool_calls: Optional[List[Any]]  # List of ToolCall objects or None if parsing failed
+    remaining_text: str  # Text remaining after parsing tool calls
+    finish_reason: Dict[str, Any]  # Updated finish reason dictionary
 
 
 """
