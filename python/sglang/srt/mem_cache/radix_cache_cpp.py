@@ -145,7 +145,7 @@ class RadixCacheCpp(BasePrefixCache):
         evicted_device_indices = self.tree.evict(num_tokens)
         for indice in evicted_device_indices:
             self.token_to_kv_pool.free(indice)
-        if self.scheduler_metrics_collector is not None:
+        if evicted_device_indices and self.scheduler_metrics_collector is not None:
             self.scheduler_metrics_collector.observe_eviction_duration(time.perf_counter() - start_time)
 
     def evictable_size(self):
