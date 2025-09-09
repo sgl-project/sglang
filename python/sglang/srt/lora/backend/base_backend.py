@@ -10,13 +10,12 @@ class BaseLoRABackend:
        Each backend has its own implementation of Lora kernels.
 
     Args:
-        name: name of backend
         batch_info: information of current batch for use
     """
 
-    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
-        self.name = name
-        self.batch_info = batch_info
+    def __init__(self, max_loras_per_batch: int, device: torch.device):
+        self.max_loras_per_batch = max_loras_per_batch
+        self.device = device
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -93,9 +92,6 @@ class BaseLoRABackend:
         """
         pass
 
-    def set_batch_info(self, batch_info: LoRABatchInfo):
-        self.batch_info = batch_info
-
 
 def get_backend_from_name(name: str) -> BaseLoRABackend:
     """
@@ -105,6 +101,10 @@ def get_backend_from_name(name: str) -> BaseLoRABackend:
         from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 
         return TritonLoRABackend
+    elif name == "chunked":
+        from sglang.srt.lora.backend.chunked_backend import ChunkedLoRABackend
+
+        return ChunkedLoRABackend
     elif name == "flashinfer":
         raise ValueError(
             "FlashInfer LoRA backend has been deprecated, please use `triton` instead."

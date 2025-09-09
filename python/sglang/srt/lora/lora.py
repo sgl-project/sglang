@@ -156,7 +156,7 @@ class LoRAAdapter(nn.Module):
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
                 if up_name not in weights:
                     weights[up_name] = torch.zeros_like(weights[weight_name])
-                    assert self.lora_backend.name == "triton", (
+                    assert self.lora_backend.name == "triton" or self.lora_backend.name == "chunked", (
                         f"LoRA weight initialization currently only supported for 'triton' backend. "
                         f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
                         f"or consider implementing custom initialization logic for other backends."
