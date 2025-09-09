@@ -413,6 +413,121 @@ class TestChunkedLoRAOps(CustomTestCase):
 
         torch.testing.assert_close(final_output, expected_final, atol=1e-2, rtol=1e-2)
 
+    def test_specific_batch_info_case(self):
+        """Test shrink and expand operations with specific batch info case: bs=1, 3 segments, mixed ranks."""
+        # Create the specific batch info as provided
+        batch_info = LoRABatchInfo(
+            bs=1,
+            use_cuda_graph=False,
+            num_segments=3,
+            seg_lens=torch.tensor([16, 16, 12], device=self.device, dtype=torch.int32),
+            seg_indptr=torch.tensor([0, 16, 32, 44], device=self.device, dtype=torch.int32),
+            max_len=44,
+            weight_indices=torch.tensor([1, 1, 1], device=self.device, dtype=torch.int32),
+            lora_ranks=torch.tensor([0, 64, 0, 0, 0, 0, 0, 0], device=self.device),
+            scalings=torch.tensor([0.0000, 0.2500, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000], device=self.device),
+            permutation=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                                    18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+                                    36, 37, 38, 39, 40, 41, 42, 43], device=self.device, dtype=torch.int32)
+        )
+        
+        total_tokens = 44  # sum of seg_lens
+        rank = 64  # Only adapter 1 has non-zero rank
+        q_dim = 4096
+        kv_dim = 1024
+        total_output_dim = q_dim + 2 * kv_dim
+        input_dim = 2048  # Input dimension for shrink operation
+        num_slices = 3
+        
+        # Set seed for reproducible test
+        torch.manual_seed(123)
+        
+        # Test shrink operation first
+        x_input = torch.randn((total_tokens, input_dim), device=self.device, dtype=self.dtype)
+        lora_a_weights = torch.randn((8, num_slices * rank, input_dim), device=self.device, dtype=self.dtype)
+        
+        shrink_output = chunked_lora_shrink_forward(
+            x=x_input,
+            weights=lora_a_weights,
+            batch_info=batch_info,
+            num_slices=num_slices
+        )
+        
+        # Test shrink output shape and properties
+        self.assertEqual(shrink_output.shape, (total_tokens, num_slices * rank))
+        self.assertTrue(torch.isfinite(shrink_output).all(), "Shrink output contains NaN or Inf")
+        
+        # Compute shrink reference using PyTorch
+        # All segments use weight_indices = [1, 1, 1], so adapter 1 is used
+        adapter_idx = 1
+        expected_shrink = torch.mm(x_input, lora_a_weights[adapter_idx].T)
+        torch.testing.assert_close(shrink_output, expected_shrink, atol=1e-1, rtol=1e-1)
+        
+        # Now test expand operation using the shrink output
+        lora_b_weights = torch.randn((8, total_output_dim, rank), device=self.device, dtype=self.dtype)
+        slice_offsets = self.create_qkv_slice_offsets(q_dim, kv_dim)
+        max_qkv_out_dim = max(q_dim, kv_dim)
+        
+        
+        # Test expand operation with shrink output
+        expand_output = chunked_lora_expand_forward(
+            x=shrink_output,
+            lora_weight_b=lora_b_weights,
+            batch_info=batch_info,
+            slice_offsets=slice_offsets,
+            max_slice_size=max_qkv_out_dim
+        )
+        
+        # Test expand output shape and properties
+        self.assertEqual(expand_output.shape, (total_tokens, total_output_dim))
+        self.assertTrue(torch.isfinite(expand_output).all(), "Expand output contains NaN or Inf")
+        
+        # Compute expand reference using PyTorch
+        expected_expand = torch.zeros((total_tokens, total_output_dim), device=self.device, dtype=self.dtype)
+        # Q projection: shrink_output[:, :rank] @ lora_b_weights[1, :q_dim, :].T
+        expected_expand[:, :q_dim] = torch.mm(shrink_output[:, :rank], lora_b_weights[adapter_idx, :q_dim, :].T)
+        # K projection: shrink_output[:, rank:2*rank] @ lora_b_weights[1, q_dim:q_dim+kv_dim, :].T  
+        expected_expand[:, q_dim:q_dim+kv_dim] = torch.mm(shrink_output[:, rank:2*rank], lora_b_weights[adapter_idx, q_dim:q_dim+kv_dim, :].T)
+        # V projection: shrink_output[:, 2*rank:3*rank] @ lora_b_weights[1, q_dim+kv_dim:, :].T
+        expected_expand[:, q_dim+kv_dim:] = torch.mm(shrink_output[:, 2*rank:3*rank], lora_b_weights[adapter_idx, q_dim+kv_dim:, :].T)
+        # Apply scaling (adapter 1 has scaling 0.25)
+        expected_expand *= batch_info.scalings[adapter_idx]
+        torch.testing.assert_close(expand_output, expected_expand, atol=1e-1, rtol=1e-1)
+        
+        # Test with base output accumulation
+        base_output = torch.zeros((total_tokens, total_output_dim), device=self.device, dtype=self.dtype)
+        original_base = base_output.clone()
+        
+        expand_output_with_base = chunked_lora_expand_forward(
+            x=shrink_output,
+            lora_weight_b=lora_b_weights,
+            batch_info=batch_info,
+            slice_offsets=slice_offsets,
+            max_slice_size=max_qkv_out_dim,
+            base_output=base_output
+        )
+        
+        # Should modify base_output in-place
+        self.assertTrue(torch.equal(expand_output_with_base, base_output))
+        self.assertFalse(torch.equal(base_output, original_base))
+        
+        # Verify base output accumulation matches expected
+        expected_with_base = original_base + expected_expand
+        torch.testing.assert_close(base_output, expected_with_base, atol=1e-1, rtol=1e-1)
+        
+        # Test end-to-end pipeline: shrink -> expand
+        # This verifies the complete LoRA A -> LoRA B pipeline
+        end_to_end_output = chunked_lora_expand_forward(
+            x=shrink_output,
+            lora_weight_b=lora_b_weights,
+            batch_info=batch_info,
+            slice_offsets=slice_offsets,
+            max_slice_size=max_qkv_out_dim
+        )
+        
+        # Should equal the expand_output we computed earlier
+        torch.testing.assert_close(end_to_end_output, expand_output, atol=1e-6, rtol=1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()

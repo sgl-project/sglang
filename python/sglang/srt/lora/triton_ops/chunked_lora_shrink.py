@@ -67,17 +67,16 @@ def _chunked_lora_shrink_kernel(
     seg_end = tl.load(seg_indptr + pid_s + 1)
 
     # Adjust N (stack_num * max_rank) according to the specific LoRA adapter
-    N = tl.minimum(N, rank * NUM_SLICES)
-
+    actual_n = tl.minimum(N, rank * NUM_SLICES)
 
     # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_S) + seg_start
-    s_offset = tl.load(permutation + s_offset_logical, mask=s_offset_logical < seg_end)  
+    s_offset_physical = tl.load(permutation + s_offset_logical, mask=s_offset_logical < seg_end)  
 
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = tl.arange(0, BLOCK_K)
     x_ptrs = x + (
-        s_offset[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
+        s_offset_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
     )
     w_ptrs = (weights + w_index * w_stride_0) + (
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
@@ -88,12 +87,12 @@ def _chunked_lora_shrink_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_end) & (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset_logical[:, None] < seg_end) & (k_offset[None, :] < K - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < N),
+            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < actual_n),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -104,9 +103,9 @@ def _chunked_lora_shrink_kernel(
     # Store result to output matrix
     partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = output  + (
-        s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
+        s_offset_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = (s_offset[:, None] < seg_end) & (n_offset[None, :] < N)
+    output_mask = (s_offset_logical[:, None] < seg_end) & (n_offset[None, :] < actual_n)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 def chunked_lora_shrink_forward(

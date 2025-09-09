@@ -81,11 +81,11 @@ def _chunked_lora_expand_kernel(
 
     scaling = tl.load(scalings + w_index)
     # Adjust K (rank) according to the specific LoRA adapter
-    MAX_RANK = tl.minimum(MAX_RANK, rank)
+    rank = tl.minimum(MAX_RANK, rank)
 
     # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_S) + seg_start
-    s_offset = tl.load(permutation + s_offset_logical, mask=s_offset_logical < seg_end)
+    s_offset_physical = tl.load(permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=-1)
 
     # Create pointers for the first block of x and weights[batch_id][n_start: n_end][:]
     # The pointers will be advanced as we move in the K direction
@@ -96,8 +96,8 @@ def _chunked_lora_expand_kernel(
 
     x_ptrs = (
         x
-        + slice_id * MAX_RANK * x_stride_1
-        + (s_offset[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
+        + slice_id * rank * x_stride_1
+        + (s_offset_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
     )
     w_ptrs = (weights + w_index * w_stride_0) + (
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
@@ -105,15 +105,15 @@ def _chunked_lora_expand_kernel(
 
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(MAX_RANK, BLOCK_K)):
+    for k in range(0, tl.cdiv(rank, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_end) & (k_offset[None, :] < MAX_RANK - k * BLOCK_K),
+            mask=(s_offset_logical[:, None] < seg_end) & (k_offset[None, :] < rank - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < MAX_RANK - k * BLOCK_K)
+            mask=(k_offset[:, None] < rank - k * BLOCK_K)
             & (n_offset[None, :] < slice_end),
             other=0.0,
         )
@@ -127,10 +127,10 @@ def _chunked_lora_expand_kernel(
     partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = (
         output
-        + (s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
+        + (s_offset_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
     )
-    output_mask = (s_offset[:, None] < seg_end) & (n_offset[None, :] < slice_end)
-    partial_sum += tl.load(output_ptr, mask=output_mask)
+    output_mask = (s_offset_logical[:, None] < seg_end) & (n_offset[None, :] < slice_end)
+    partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
