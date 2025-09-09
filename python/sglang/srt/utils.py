@@ -1402,7 +1402,7 @@ def get_npu_memory_capacity():
 
 
 def get_xpu_memory_capacity():
-    assert torch.xpu.is_avaiable(), "XPU device is not available"
+    assert torch.xpu.is_available(), "XPU device is not available"
     memory_values = [
         torch.xpu.get_device_properties(i).total_memory
         for i in range(torch.xpu.device_count())
