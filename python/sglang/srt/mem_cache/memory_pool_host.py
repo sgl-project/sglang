@@ -114,18 +114,6 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_ksize_per_token(self):
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def get_buffer_with_hash(self, keys, indices=None):
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def get_buffer_meta(self, keys, indices, local_rank):
-        raise NotImplementedError()
-
-    @abc.abstractmethod
     def init_kv_buffer(self):
         raise NotImplementedError()
 

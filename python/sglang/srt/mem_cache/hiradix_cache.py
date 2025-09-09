@@ -205,11 +205,11 @@ class HiRadixCache(RadixCache):
                     finish_event.synchronize()
                     for ack_id in ack_list:
                         del self.ongoing_write_through[ack_id]
+                self.cache_controller.ack_write_queue.clear()
+                assert len(self.ongoing_write_through) == 0
             return
 
-        # NOTE: all ranks has the same ongoing_write_through
-        # as a result, if one rankd does not have ongoing write through,
-        # we can skip the check directly, and we can return safely
+        # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
         if len(self.ongoing_write_through) == 0:
             return
 
@@ -227,36 +227,28 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
 
-        finish_count = int(queue_size.item())  # to help typing, cast to int manually
-
-        common_ack_queue = self.cache_controller.ack_write_queue[:finish_count]
-        for _, finish_event, ack_list in common_ack_queue:
+        finish_count = int(queue_size.item())
+        while finish_count > 0:
+            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                backuped_node = self.ongoing_write_through[ack_id]
+                backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
-                del self.ongoing_write_through[ack_id]
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
-
-        # ACK until all events are processed
-        del self.cache_controller.ack_write_queue[:finish_count]
+            finish_count -= 1
 
     def loading_check(self):
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
             if not finish_event.query():
+                # the KV cache loading is still ongoing
                 break
             finish_count += 1
+            # no need to sync across TP workers as batch forwarding is synced
             for ack_id in ack_list:
-                start_node, end_node = self.ongoing_load_back[ack_id]
+                end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
-                while end_node != start_node:
-                    assert end_node.loading
-                    end_node.loading = False
-                    end_node = end_node.parent
-                # clear the reference
-                del self.ongoing_load_back[ack_id]
 
         # ACK until all events are processed
         del self.cache_controller.ack_load_queue[:finish_count]
@@ -384,12 +376,11 @@ class HiRadixCache(RadixCache):
             # no sufficient GPU memory to load back KV caches
             return None
 
-        self.ongoing_load_back[last_hit_node.id] = (ancester_node, last_hit_node)
+        self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)]
             offset += len(node.host_value)
-            node.loading = True
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
@@ -721,7 +712,6 @@ class HiRadixCache(RadixCache):
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
-        new_node.loading = child.loading
         new_node.hit_count = child.hit_count
 
         # split value and host value if exists
