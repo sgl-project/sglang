@@ -20,9 +20,9 @@ declare -A ENV_MAP=(
   [SGLANG_USE_AITER]=1
 )
 
-# Conditionally add GPU_ARCH only for mi35x
+# Conditionally add GPU_ARCHS only for mi35x
 if [[ "${GPU_FAMILY}" == "mi35x" ]]; then
-  ENV_MAP[GPU_ARCH]="gfx950"
+  ENV_MAP[GPU_ARCHS]="gfx950"
 fi
 
 # Parse -w/--workdir and -e ENV=VAL
