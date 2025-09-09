@@ -256,6 +256,7 @@ def chunk_local_cumsum_vector(
     )
     return g
 
+
 @input_guard
 def chunk_local_cumsum(
     g: torch.Tensor,

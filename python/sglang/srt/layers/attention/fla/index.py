@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.fla.utils import tensor_cache
 def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     return cu_seqlens[1:] - cu_seqlens[:-1]
 
+
 @tensor_cache
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor, chunk_size: int
