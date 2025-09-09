@@ -1852,8 +1852,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             k[..., self.qk_nope_head_dim :] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-			if forward_batch.num_prefix_chunks == 1:
-				return output
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
