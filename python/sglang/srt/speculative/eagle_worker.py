@@ -191,7 +191,7 @@ class EAGLEWorker(TpModelWorker):
         # Initialize decode attention backend
         self.draft_attn_backend = self._create_decode_backend()
 
-        # Initialize draft extend attention backend (respects speculative_attention_backend setting)
+        # Initialize draft extend attention backend (respects speculative_attention_mode setting)
         self.draft_extend_attn_backend = self._create_draft_extend_backend()
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
@@ -236,7 +236,7 @@ class EAGLEWorker(TpModelWorker):
         }
         backend_name = (
             "decode_attention_backend"
-            if self.server_args.speculative_attention_backend == "decode"
+            if self.server_args.speculative_attention_mode == "decode"
             else "prefill_attention_backend"
         )
         return self._create_backend(
