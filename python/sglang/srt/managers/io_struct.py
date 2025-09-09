@@ -22,6 +22,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from sglang.srt.disaggregation.convert_pd_mixin import (
+    DISAGGREGATION_DECODE_ENVS,
+    DISAGGREGATION_PREFILL_ENVS,
+)
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
@@ -875,19 +879,6 @@ class UpdateWeightsFromDistributedReqOutput:
     message: str
 
 
-DISAGGREGATION_PREFILL_ENVS = [
-    "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE",
-    "SGLANG_DISAGGREGATION_QUEUE_SIZE",
-    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT",
-    "SGLANG_MOONCAKE_CUSTOM_MEM_POOL",
-]
-DISAGGREGATION_DECODE_ENVS = [
-    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT",
-    "SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE",
-    "SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL",
-]
-
-
 @dataclass
 class ConvertDisaggregationRoleReqInput:
     # the server url to convert
@@ -925,8 +916,6 @@ class ConvertDisaggregationRoleReqInput:
 
 @dataclass
 class ConvertDisaggregationRoleReqOutput:
-    """Converse PD disaggregation identity"""
-
     success: bool
     message: str
     bootstrap_port: Optional[int] = None

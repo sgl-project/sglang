@@ -15,6 +15,18 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
+DISAGGREGATION_PREFILL_ENVS = [
+    "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE",
+    "SGLANG_DISAGGREGATION_QUEUE_SIZE",
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT",
+    "SGLANG_MOONCAKE_CUSTOM_MEM_POOL",
+]
+DISAGGREGATION_DECODE_ENVS = [
+    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT",
+    "SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE",
+    "SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL",
+]
+
 
 class SchedulerDisaggregationConvertMixin:
     """Mixin class for convert prefill/decode roles."""

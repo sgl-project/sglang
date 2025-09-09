@@ -530,7 +530,6 @@ class TokenizerCommunicatorMixin:
             obj.check_idle = False
             if not self.server_args.tokenizer_worker_num > 1:
                 set_bootstrap_server(self, obj)
-            convert_mode_str(self)
 
         responses: List[ConvertDisaggregationRoleReqOutput] = (
             await self.convert_pd_role_communicator(obj)
@@ -538,4 +537,5 @@ class TokenizerCommunicatorMixin:
         if obj.failed_bootstrap_addr is None:
             # wait scheduler event loop ready
             await self.flush_cache()
+            convert_mode_str(self)
         return responses[0].success, responses[0].message, responses[0].bootstrap_port
