@@ -9,7 +9,7 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
@@ -45,12 +45,19 @@ impl TestContext {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1087,12 +1094,19 @@ mod error_tests {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1438,12 +1452,19 @@ mod pd_mode_tests {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         // Create app context
@@ -1593,12 +1614,19 @@ mod request_id_tests {
             log_level: None,
             request_id_headers: Some(vec!["custom-id".to_string(), "trace-id".to_string()]),
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         let ctx = TestContext::new_with_config(
