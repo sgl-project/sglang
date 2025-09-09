@@ -339,9 +339,17 @@ class WorkloadGenerator:
             "cached_tokens": [],
             "generated_len": [],
         }
-        # Add round-based TTFT tracking
-        self.round_ttft = {i: [] for i in range(args.num_rounds)}
         self.enable_round_barrier = args.enable_round_barrier
+        if self.enable_round_barrier:
+            # Add round-specific metrics while preserving the original structure
+            for i in range(args.num_rounds):
+                self.performance_metrics[f"round_{i}"] = {
+                    "ttft": [],
+                    "latency": [],
+                    "prompt_len": [],
+                    "cached_tokens": [],
+                    "generated_len": [],
+                }
         self.num_clients = args.num_clients
 
         self.num_rounds = args.num_rounds
@@ -408,7 +416,22 @@ class WorkloadGenerator:
                 self.performance_metrics["prompt_len"].append(response.prompt_len)
                 self.performance_metrics["cached_tokens"].append(response.cached_tokens)
                 self.performance_metrics["generated_len"].append(response.generated_len)
-                self.round_ttft[current_round].append(response.ttft)
+                if self.enable_round_barrier:
+                    self.performance_metrics[f"round_{current_round}"]["ttft"].append(
+                        response.ttft
+                    )
+                    self.performance_metrics[f"round_{current_round}"][
+                        "latency"
+                    ].append(response.latency)
+                    self.performance_metrics[f"round_{current_round}"][
+                        "prompt_len"
+                    ].append(response.prompt_len)
+                    self.performance_metrics[f"round_{current_round}"][
+                        "cached_tokens"
+                    ].append(response.cached_tokens)
+                    self.performance_metrics[f"round_{current_round}"][
+                        "generated_len"
+                    ].append(response.generated_len)
                 self.completed_requests += 1
 
                 if self.client_records[client_id]["round"] < self.num_rounds:
@@ -488,19 +511,24 @@ class WorkloadGenerator:
             },
         }
         if self.enable_round_barrier:
-            performance_data["round"] = {
-                f"round_{round_num}": {
+            performance_data["round"] = {}
+            for round_num in range(args.num_rounds):
+                round_key = f"round_{round_num}"
+                round_metrics = self.performance_metrics[round_key]
+                performance_data["round"][round_key] = {
                     "average_ttft": (
-                        sum(self.round_ttft[round_num])
-                        / len(self.round_ttft[round_num])
-                        if self.round_ttft[round_num]
+                        sum(round_metrics["ttft"]) / len(round_metrics["ttft"])
+                        if round_metrics["ttft"]
                         else 0
                     ),
-                    "request_count": len(self.round_ttft[round_num]),
-                    "ttft_values": self.round_ttft[round_num],
+                    "cache_hit_rate": (
+                        0
+                        if sum(round_metrics["prompt_len"]) == 0
+                        else sum(round_metrics["cached_tokens"])
+                        / sum(round_metrics["prompt_len"])
+                    ),
+                    "request_count": len(round_metrics["ttft"]),
                 }
-                for round_num in range(args.num_rounds)
-            }
         print("All requests completed")
         print("Performance metrics summary:")
         print(
@@ -527,16 +555,19 @@ class WorkloadGenerator:
 
         if self.enable_round_barrier:
             # Print round-basedsummary
-            print("\nPer-round metrics:")
+            print("Per-round metrics:")
             if "round" in performance_data:
                 for round_num in range(self.num_rounds):
                     round_key = f"round_{round_num}"
                     if round_key in performance_data["round"]:
                         round_data = performance_data["round"][round_key]
                         avg_ttft = round_data["average_ttft"]
+                        cache_hit_rate = round_data["cache_hit_rate"]
                         request_count = round_data["request_count"]
                         print(
-                            f"  Round {round_num}: Average TTFT = {avg_ttft:.2f}s ({request_count} requests)"
+                            f"  Round {round_num}: Average TTFT = {avg_ttft:.2f}s, "
+                            f"Cache Hit Rate = {cache_hit_rate:.4f}, "
+                            f"({request_count} requests)"
                         )
                     else:
                         print(f"  Round {round_num}: No requests completed")
