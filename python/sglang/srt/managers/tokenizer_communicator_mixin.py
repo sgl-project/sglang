@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
 import time
@@ -18,6 +19,7 @@ from typing import (
 )
 
 import fastapi
+import zmq
 
 from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
@@ -71,14 +73,17 @@ class _Communicator(Generic[T]):
 
     enable_multi_tokenizer = False
 
-    def __init__(self, sender, fan_out: int):
+    def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
         self._sender = sender
         self._fan_out = fan_out
+        self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
         self._ready_queue: Deque[asyncio.Future] = deque()
 
-    async def __call__(self, obj):
+        assert mode in ["queueing", "watching"]
+
+    async def queueing_call(self, obj: T):
         ready_event = asyncio.Event()
         if self._result_event is not None or len(self._ready_queue) > 0:
             self._ready_queue.append(ready_event)
@@ -101,6 +106,28 @@ class _Communicator(Generic[T]):
             self._ready_queue.popleft().set()
 
         return result_values
+
+    async def watching_call(self, obj):
+        if self._result_event is None:
+            assert self._result_values is None
+            self._result_values = []
+            self._result_event = asyncio.Event()
+
+            if obj:
+                if _Communicator.enable_multi_tokenizer:
+                    obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
+                self._sender.send_pyobj(obj)
+
+        await self._result_event.wait()
+        result_values = copy.deepcopy(self._result_values)
+        self._result_event = self._result_values = None
+        return result_values
+
+    async def __call__(self, obj):
+        if self._mode == "queueing":
+            return await self.queueing_call(obj)
+        else:
+            return await self.watching_call(obj)
 
     def handle_recv(self, recv_obj: T):
         self._result_values.append(recv_obj)
