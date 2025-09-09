@@ -49,7 +49,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
                 ["python3", "-m", "mooncake.http_metadata_server"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                preexec_fn=os.setsid  # Create new process group
+                preexec_fn=os.setsid,  # Create new process group
             )
             print("Mooncake metadata service started")
         except (FileNotFoundError, subprocess.SubprocessError) as e:
@@ -62,7 +62,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
                 ["mooncake_master"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                preexec_fn=os.setsid  # Create new process group
+                preexec_fn=os.setsid,  # Create new process group
             )
             print("Mooncake master service started")
         except (FileNotFoundError, subprocess.SubprocessError) as e:
@@ -78,7 +78,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         print("Stopping Mooncake services...")
 
         # Stop metadata service
-        if hasattr(cls, 'metadata_service_process') and cls.metadata_service_process:
+        if hasattr(cls, "metadata_service_process") and cls.metadata_service_process:
             try:
                 os.killpg(os.getpgid(cls.metadata_service_process.pid), 9)
                 cls.metadata_service_process.wait(timeout=5)
@@ -87,7 +87,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
                 print(f"Warning: Could not stop Mooncake metadata service: {e}")
 
         # Stop master service
-        if hasattr(cls, 'master_service_process') and cls.master_service_process:
+        if hasattr(cls, "master_service_process") and cls.master_service_process:
             try:
                 os.killpg(os.getpgid(cls.master_service_process.pid), 9)
                 cls.master_service_process.wait(timeout=5)
@@ -131,6 +131,7 @@ class TestMooncakeBackendLayerFirstLayout(
         server_args["--hicache-io-backend"] = "direct"
         return server_args, env_vars
 
+
 # Same as #10131, page first layout test
 class TestMooncakeBackendPageFirstLayout(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
@@ -146,7 +147,9 @@ class TestMooncakeBackendPageFirstLayout(
 
 
 # Same as #10131, accuracy test
-class TestMooncakeBackendAccuracy(HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase):
+class TestMooncakeBackendAccuracy(
+    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
+):
     """Accuracy tests for HiCache-Mooncake backend"""
 
     @classmethod
