@@ -450,9 +450,7 @@ class MultiTokenizerManager(TokenizerManager):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        setproctitle.setproctitle(
-            f"sglang::http_server/multi_tokenizer_manager:{os.getpid()}"
-        )
+        setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
         server_args.disaggregation_mode = "null"
