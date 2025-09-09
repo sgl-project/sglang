@@ -1026,6 +1026,9 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+
+                if not recv_reqs:
+                    time.sleep(0.001)
             else:
                 recv_reqs = None
         else:
