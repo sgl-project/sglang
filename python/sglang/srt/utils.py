@@ -2271,7 +2271,7 @@ def get_local_ip_auto(fallback: str = None) -> str:
     """
     Automatically detect the local IP address using multiple fallback strategies.
 
-    This function attempts to obtain the local IP address through several methods。
+    This function attempts to obtain the local IP address through several methods.
     If all methods fail, it returns the specified fallback value or raises an exception.
 
     Args:
