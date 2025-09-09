@@ -44,6 +44,9 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+    DecodeKVCacheOffloadManager,
+)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -679,20 +682,24 @@ class Scheduler(
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                 )
-        if self.server_args.disaggregation_mode == "decode":
-            from sglang.srt.disaggregation.decode_kvcache_offload_worker import (
-                OffloadWorkerManager,
-            )
 
-            self.offload_worker_manager = OffloadWorkerManager(
-                storage_backend_type=server_args.hicache_storage_backend,
-                device_pool=self.token_to_kv_pool_allocator.get_kvcache(),
-                host_to_device_ratio=1.2,
-                host_size=server_args.hicache_size,
-                page_size=self.page_size,
-                layout="layer_first",
-                num_workers=1,
+        if (
+            server_args.disaggregation_mode == "decode"
+            and server_args.disaggregation_decode_enable_offload_kvcache
+        ):
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=(
+                    self.attn_tp_cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_cpu_group
+                ),
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
             )
+        else:
+            self.decode_offload_manager = None
 
         self.decode_mem_cache_buf_multiplier = (
             1

@@ -376,6 +376,7 @@ class ServerArgs:
     disaggregation_decode_dp: Optional[int] = None
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
+    disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
 
     # For model weight update
@@ -2093,6 +2094,11 @@ class ServerArgs:
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
             "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-enable-offload-kvcache",
+            action="store_true",
+            help="Enable async KV cache offloading on decode server (PD mode).",
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",
