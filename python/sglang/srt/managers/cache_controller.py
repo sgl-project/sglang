@@ -548,7 +548,6 @@ class HiCacheController:
         host_indices, device_indices = self.move_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
-        producer_event.reset()
         producer_event.start_event.record()
 
         with torch.cuda.stream(self.load_stream):
