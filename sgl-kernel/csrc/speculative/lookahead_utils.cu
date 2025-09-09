@@ -48,7 +48,6 @@ __global__ void reconstructIndicesFromTreeMask(
   retrive_index[token_idx + tid] = token_idx + tid;
   positions[token_idx + tid] = depth + verified_seq_len[bid];
 
-  // 按列查找第 tid 列 tid+1 行开始的第一个不为 false 的元素作为 next_token_idx
   int next_token_idx = -1;
   for (int i = tid + 1; i < draft_token_num; i++) {
     if (tree_mask[tree_mask_offset + i * draft_token_num + tid]) {
@@ -58,7 +57,6 @@ __global__ void reconstructIndicesFromTreeMask(
   }
   retrive_next_token[token_idx + tid] = next_token_idx;
 
-  // 根据 parent_idx 查找 next_sibling_idx
   int next_sibling_idx = -1;
   if (parent_idx != -1) {
     for (int i = tid + 1; i < draft_token_num; i++) {
