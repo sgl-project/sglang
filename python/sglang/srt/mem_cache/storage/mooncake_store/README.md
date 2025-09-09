@@ -66,7 +66,7 @@ python -m mooncake.http_metadata_server
 mooncake_master
 ```
 
-**Launch Mooncake `store service`:**
+**Launch Mooncake `store service` (Optional):**
 
 First, create and save a configuration file in JSON format. For example:
 
@@ -98,7 +98,7 @@ Then start the `store service`:
 python -m mooncake.mooncake_store_service --config=[config_path]
 ```
 
-Note: To get started quickly, if `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting the `SGLang server`, launching the `store service` can be skipped. In this case, the `SGLang server` also fulfills the role of the `store service`.
+Note: If `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting the `SGLang server`, launching the `store service` can be skipped. In this case, the `SGLang server` also takes on the role of the `store service`, which simplifies deployment but couples the two components together. Users can choose the deployment approach that best fits their needs.
 
 **Start the `SGLang server` with Mooncake enabled:**
 Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` layout (which optimizes memory access patterns for KV cache operations).
