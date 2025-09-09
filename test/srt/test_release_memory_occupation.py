@@ -200,7 +200,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
                 gpu_memory_usage_after_release_kv_cache,
             )
 
-            engine.release_memory_occupation(tags=["graph"])
+            engine.release_memory_occupation(tags=[GPU_MEMORY_CUDA_GRAPH])
 
             gpu_memory_usage_after_release_graph = get_gpu_memory_gb()
             print(
