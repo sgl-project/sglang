@@ -1221,3 +1221,8 @@ class GetLoadReqOutput:
     num_reqs: int
     num_waiting_reqs: int
     num_tokens: int
+
+
+@dataclass
+class WatchLoadUpdateReq:
+    loads: List[GetLoadReqOutput]
