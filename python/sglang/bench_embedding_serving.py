@@ -1,24 +1,17 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/backend_request_func.py
-# Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
-
 """
 Benchmark online serving with dynamic requests.
 
 Usage:
-python3 -m sglang.bench_serving --backend sglang --num-prompt 10
+python3 -m sglang.bench_embedding_serving --backend sglang --num-prompt 10
 
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
+python3 -m sglang.bench_embedding_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
 """
 
 import argparse
 import asyncio
-import base64
-import io
 import json
 import os
-import pickle
 import random
-import resource
 import sys
 import time
 import traceback
@@ -27,19 +20,12 @@ from argparse import ArgumentParser
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from json import JSONDecodeError
-from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
-import aiohttp
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
-from transformers import (
-    AutoTokenizer,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerBase,
-    PreTrainedTokenizerFast,
-)
+from transformers import PreTrainedTokenizerBase
 
 from sglang.bench_serving import (
     get_dataset,
@@ -91,8 +77,6 @@ class BenchArgs:
     extra_request_body: Optional[str] = None
     apply_chat_template: bool = False
     profile: bool = False
-    skip_warmup: bool = False
-    do_not_exit: bool = False
     prompt_suffix: str = ""
     pd_separated: bool = False
     flush_cache: bool = False
@@ -381,14 +365,11 @@ class RequestFuncInput:
 
 @dataclass
 class RequestFuncOutput:
-    generated_text: str = ""
     success: bool = False
     latency: float = 0.0
-    ttft: float = 0.0  # Time to first token
-    itl: List[float] = field(default_factory=list)  # List of inter-token latencies
     prompt_len: int = 0
-    error: str = ""
     output_len: int = 0
+    error: str = ""
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -535,12 +516,7 @@ async def async_request_sglang_embedding(
 
         output = RequestFuncOutput.init_new(request_func_input)
 
-        generated_text = ""
-        output_len = request_func_input.output_len
-        ttft = 0.0
         st = time.perf_counter()
-        most_recent_timestamp = st
-        last_output_len = 0
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
@@ -548,42 +524,13 @@ async def async_request_sglang_embedding(
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
+                        data = json.loads(chunk_bytes)
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                         latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
-                                generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
-
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
-                                else:
-                                    num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
-                                    adjust_itl = (timestamp - most_recent_timestamp) / num_new_tokens
-                                    output.itl.extend([adjust_itl] * num_new_tokens)
-
-                                most_recent_timestamp = timestamp
-                                last_output_len = output_len
-
-                    output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
-                    output.output_len = output_len
+                    output.output_len = len(data["embedding"])
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -630,20 +577,6 @@ class BenchmarkMetrics:
     output_throughput_retokenized: float
     total_throughput: float
     total_throughput_retokenized: float
-    mean_ttft_ms: float
-    median_ttft_ms: float
-    std_ttft_ms: float
-    p99_ttft_ms: float
-    mean_tpot_ms: float
-    median_tpot_ms: float
-    std_tpot_ms: float
-    p99_tpot_ms: float
-    mean_itl_ms: float
-    median_itl_ms: float
-    std_itl_ms: float
-    p95_itl_ms: float
-    p99_itl_ms: float
-    max_itl_ms: float
     mean_e2e_latency_ms: float
     median_e2e_latency_ms: float
     std_e2e_latency_ms: float
@@ -669,29 +602,17 @@ def calculate_metrics(
     input_requests: List[DatasetRow],
     outputs: List[RequestFuncOutput],
     dur_s: float,
-    tokenizer: PreTrainedTokenizerBase,
-    backend: str,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
     total_input = 0
     completed = 0
-    itls: List[float] = []
-    tpots: List[float] = []
-    ttfts: List[float] = []
     e2e_latencies: List[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_len
             output_lens.append(output_len)
-            retokenized_output_len = len(tokenizer.encode(outputs[i].generated_text, add_special_tokens=False))
-            retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i].prompt_len
-            if output_len > 1:
-                tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
-            itls += outputs[i].itl
-            ttfts.append(outputs[i].ttft)
-
             e2e_latencies.append(outputs[i].latency)
 
             completed += 1
@@ -715,20 +636,6 @@ def calculate_metrics(
         output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
         total_throughput=(total_input + sum(output_lens)) / dur_s,
         total_throughput_retokenized=(total_input + sum(retokenized_output_lens)) / dur_s,
-        mean_ttft_ms=np.mean(ttfts or 0) * 1000,  # ttfts is empty if streaming is not supported by backend
-        median_ttft_ms=np.median(ttfts or 0) * 1000,
-        std_ttft_ms=np.std(ttfts or 0) * 1000,
-        p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
-        mean_tpot_ms=np.mean(tpots or 0) * 1000,
-        median_tpot_ms=np.median(tpots or 0) * 1000,
-        std_tpot_ms=np.std(tpots or 0) * 1000,
-        p99_tpot_ms=np.percentile(tpots or 0, 99) * 1000,
-        mean_itl_ms=np.mean(itls or 0) * 1000,
-        median_itl_ms=np.median(itls or 0) * 1000,
-        std_itl_ms=np.std(itls or 0) * 1000,
-        p95_itl_ms=np.percentile(itls or 0, 95) * 1000,
-        p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
-        max_itl_ms=np.max(itls or 0) * 1000,
         mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
@@ -745,7 +652,6 @@ async def benchmark(
     api_url: str,
     base_url: str,
     model_id: str,
-    tokenizer: PreTrainedTokenizerBase,
     input_requests: List[DatasetRow],
     extra_request_body: Dict[str, Any],
 ):
@@ -856,8 +762,6 @@ async def benchmark(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
-        tokenizer=tokenizer,
-        backend=backend,
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -872,8 +776,8 @@ async def benchmark(
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
-    print("{:<40} {:<10}".format("Total generated tokens (retokenized):", metrics.total_output_retokenized))
+    print("{:<40} {:<10}".format("Total generated embeddings:", metrics.total_output))
+    print("{:<40} {:<10}".format("Total generated embeddings (retokenized):", metrics.total_output_retokenized))
     print("{:<40} {:<10.2f}".format("Request throughput (req/s):", metrics.request_throughput))
     print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", metrics.input_throughput))
     print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", metrics.output_throughput))
@@ -884,19 +788,9 @@ async def benchmark(
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms))
     print("{:<40} {:<10.2f}".format("Median E2E Latency (ms):", metrics.median_e2e_latency_ms))
-    print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
-    print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
-    print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
-    print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
-    print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
-    print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
-    print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
-    print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    if metrics.median_ttft_ms is not None and metrics.mean_itl_ms is not None and metrics.output_throughput is not None:
+    if metrics.mean_e2e_latency_ms is not None:
         result = {
             # Arguments
             "backend": args.backend,
@@ -911,8 +805,8 @@ async def benchmark(
             "duration": benchmark_duration,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
-            "total_output_tokens": metrics.total_output,
-            "total_output_tokens_retokenized": metrics.total_output_retokenized,
+            "total_generaged_embeddings": metrics.total_output,
+            "total_generaged_embeddings_retokenized": metrics.total_output_retokenized,
             "request_throughput": metrics.request_throughput,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
@@ -920,19 +814,6 @@ async def benchmark(
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
             "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
-            "mean_ttft_ms": metrics.mean_ttft_ms,
-            "median_ttft_ms": metrics.median_ttft_ms,
-            "std_ttft_ms": metrics.std_ttft_ms,
-            "p99_ttft_ms": metrics.p99_ttft_ms,
-            "mean_tpot_ms": metrics.mean_tpot_ms,
-            "median_tpot_ms": metrics.median_tpot_ms,
-            "std_tpot_ms": metrics.std_tpot_ms,
-            "p99_tpot_ms": metrics.p99_tpot_ms,
-            "mean_itl_ms": metrics.mean_itl_ms,
-            "median_itl_ms": metrics.median_itl_ms,
-            "std_itl_ms": metrics.std_itl_ms,
-            "p95_itl_ms": metrics.p95_itl_ms,
-            "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
         }
@@ -959,9 +840,6 @@ async def benchmark(
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": output_lens,
-        "ttfts": [output.ttft for output in outputs],
-        "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
 
@@ -1063,7 +941,6 @@ def run_benchmark(args: BenchArgs):
             api_url=api_url,
             base_url=base_url,
             model_id=model_id,
-            tokenizer=tokenizer,
             input_requests=input_requests,
             extra_request_body=extra_request_body,
         )
