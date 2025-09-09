@@ -454,11 +454,11 @@ class NixlKVReceiver(CommonKVReceiver):
         mgr: NixlKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        data_parallel_rank: Optional[int] = None,
+        prefill_dp_rank: Optional[int] = None,
     ):
         self.started_transfer = False
         self.conclude_state = None
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, data_parallel_rank)
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         for bootstrap_info in self.bootstrap_infos:
