@@ -209,6 +209,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-accept-threshold-single` | Accept a draft token if its probability in the target model is greater than this threshold. | 1.0 |
 | `--speculative-accept-threshold-acc` | The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc). | 1.0 |
 | `--speculative-token-map` | The path of the draft model's small vocab table. | None |
+| `--speculative-attention-mode` | Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'. | Prefill |
 
 ## Expert parallelism
 

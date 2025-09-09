@@ -76,6 +76,7 @@ suites = {
         TestFile("test_harmony_parser.py", 20),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_hybrid_attn_backend.py", 100),
+        TestFile("test_standalone_speculative_decoding.py", 250),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
@@ -124,8 +125,8 @@ suites = {
         TestFile("test_dp_attention.py", 277),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 127),
-        TestFile("hicache/test_hicache_storage_e2e.py", 400),
-        TestFile("hicache/test_hicache_storage_benchmark.py", 400),
+        TestFile("hicache/test_hicache_storage_file_backend.py", 400),
+        TestFile("hicache/test_hicache_storage_3fs_backend.py", 400),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 600),
@@ -275,6 +276,7 @@ suite_xeon = {
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
         TestFile("test_intel_amx_attention_backend.py"),
+        TestFile("test_cpu_graph.py"),
     ],
 }
 
@@ -292,6 +294,7 @@ suite_ascend = {
     ],
     "per-commit-4-ascend-npu": [
         TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
+        TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
 }
 

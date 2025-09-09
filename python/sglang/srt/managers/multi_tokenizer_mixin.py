@@ -19,6 +19,7 @@ import os
 import pickle
 import sys
 import threading
+from functools import partialmethod
 from multiprocessing import shared_memory
 from typing import Any, Dict
 
@@ -36,7 +37,8 @@ from sglang.srt.managers.io_struct import (
     MultiTokenizerRegisterReq,
     MultiTokenizerWrapper,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager, _Communicator
+from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
@@ -555,3 +557,17 @@ def write_data_for_multi_tokenizer(
     args_shm.close()
 
     return args_shm
+
+
+def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
+    """Monkey patch uvicorn multiprocessing is_alive timeout"""
+    # from default 5s -> 10s
+    try:
+        from uvicorn.supervisors.multiprocess import Process
+
+        Process.is_alive = partialmethod(Process.is_alive, timeout=timeout)
+
+    except ImportError:
+        logger.warning(
+            "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
+        )

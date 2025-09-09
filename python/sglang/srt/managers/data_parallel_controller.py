@@ -13,6 +13,7 @@
 # ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
 
+import faulthandler
 import logging
 import multiprocessing as mp
 import signal
@@ -39,7 +40,12 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.utils import DPBalanceMeta
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
+from sglang.srt.utils import (
+    bind_port,
+    configure_logger,
+    get_zmq_socket,
+    kill_itself_when_parent_died,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -343,7 +349,9 @@ def run_data_parallel_controller_process(
     port_args: PortArgs,
     pipe_writer,
 ):
+    kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::data_parallel_controller")
+    faulthandler.enable()
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
     balance_meta = DPBalanceMeta(server_args.dp_size)
