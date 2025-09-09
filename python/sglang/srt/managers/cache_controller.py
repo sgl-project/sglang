@@ -43,28 +43,18 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 logger = logging.getLogger(__name__)
 
 
-class LayerEvent:
+class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
         self.load_events = [torch.cuda.Event() for _ in range(num_layers)]
         self.start_event = torch.cuda.Event()  # start event on controller stream
-        self.wait_set: Set[int] = set()
-
-    def reset(self):
-        self.wait_set.clear()
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
-        assert 0 <= layer_index < self._num_layers
-        if layer_index in self.wait_set:
-            return
-        self.wait_set.add(layer_index)
-        stream = torch.cuda.current_stream()
-        # make current stream wait for the load event of the layer
-        self.load_events[layer_index].wait(stream)
+        torch.cuda.current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):
@@ -76,7 +66,7 @@ class LayerDoneCounter:
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
-        self.events = [LayerEvent(num_layers) for _ in range(self.num_counters)]
+        self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
 
@@ -123,13 +113,6 @@ class CacheOperation:
         # default priority is the order of creation
         self.priority = priority if priority is not None else self.id
 
-    def merge(self, other: "CacheOperation") -> None:
-        # multiple operations can be merged into a single operation for batch processing
-        self.host_indices = torch.cat([self.host_indices, other.host_indices])
-        self.device_indices = torch.cat([self.device_indices, other.device_indices])
-        self.priority = min(self.priority, other.priority)
-        self.node_ids.extend(other.node_ids)
-
     @staticmethod
     def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
         assert len(ops) > 0
@@ -145,27 +128,6 @@ class CacheOperation:
         merged_op = CacheOperation(host_indices, device_indices, -1, priority)
         merged_op.node_ids = node_ids
         return merged_op
-
-    def split(self, factor) -> List[CacheOperation]:
-        # split an operation into smaller operations to reduce the size of intermediate buffers
-        if factor <= 1:
-            return [self]
-
-        chunk_size = math.ceil(len(self.host_indices) / factor)
-        split_ops = []
-        for i in range(0, len(self.host_indices), chunk_size):
-            split_ops.append(
-                CacheOperation(
-                    host_indices=self.host_indices[i : i + chunk_size],
-                    device_indices=self.device_indices[i : i + chunk_size],
-                    node_id=-1,
-                )
-            )
-        # Inherit the node_ids on the final chunk
-        if split_ops:
-            split_ops[-1].node_ids = self.node_ids
-
-        return split_ops
 
     def __lt__(self, other: CacheOperation):
         return self.priority < other.priority
@@ -568,9 +530,7 @@ class HiCacheController:
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
-                host_indices = host_indices.pin_memory().to(
-                    self.device, non_blocking=True
-                )
+                host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
             device_indices = device_indices.cpu()
