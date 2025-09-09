@@ -1810,7 +1810,6 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none():
-
                 model_worker_batch = batch.get_model_worker_batch()
 
                 if self.pp_group.is_last_rank:
