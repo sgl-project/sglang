@@ -39,7 +39,7 @@ docker run --rm \
    export CMAKE_VERSION_MAJOR=3.31
    export CMAKE_VERSION_MINOR=1
    # Setting these flags to reduce OOM chance only on ARM
-   export CMAKE_BUILD_PARALLEL_LEVEL=$(( $(nproc)/2 < 64 ? $(nproc)/2 : 64 ))
+   export CMAKE_BUILD_PARALLEL_LEVEL=$(( $(nproc)/3 < 48 ? $(nproc)/3 : 48 ))
    if [ \"${ARCH}\" = \"aarch64\" ]; then
       export CUDA_NVCC_FLAGS=\"-Xcudafe --threads=2\"
       export MAKEFLAGS='-j2'
