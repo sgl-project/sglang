@@ -41,8 +41,8 @@ using MmaType = cutlass::float_e4m3_t;     // FP8 e4m3 type
 using QuantType = cutlass::int4b_t;        // 4-bit integer type
 using ElementAccumulator = float;          // Accumulator type
 using ElementScale = cutlass::bfloat16_t;  // Scale type
-using ElementC = cutlass::half_t;          // Default output type (FP16)
-using ElementD = ElementC;                 // Default output type (FP16)
+using ElementC = cutlass::bfloat16_t;      // Output type
+using ElementD = ElementC;                 // Output type
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
 // Architecture-specific configurations

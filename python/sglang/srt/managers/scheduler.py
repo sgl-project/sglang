@@ -349,6 +349,18 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+        elif self.spec_algorithm.is_standalone():
+            from sglang.srt.speculative.standalone_worker import StandaloneWorker
+
+            self.draft_worker = StandaloneWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
         else:
             self.draft_worker = None
 
@@ -402,7 +414,7 @@ class Scheduler(
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
-                f"available_gpu_mem={avail_mem:.2f} GB"
+                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
         # Init memory pool and cache
@@ -655,6 +667,21 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                )
+            elif server_args.enable_lmcache:
+                from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
+                    LMCRadixCache,
+                )
+
+                self.tree_cache = LMCRadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                    disable=server_args.disable_radix_cache,
+                    model_config=self.model_config,
+                    tp_size=self.tp_size,
+                    rank=self.tp_rank,
+                    tp_group=self.tp_group,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -1411,9 +1438,11 @@ class Scheduler(
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
             memory_leak = (available_size + evictable_size) != (
+                # self.max_total_num_tokens
+                # if not self.enable_hierarchical_cache
+                # else self.max_total_num_tokens - protected_size
                 self.max_total_num_tokens
-                if not self.enable_hierarchical_cache
-                else self.max_total_num_tokens - protected_size
+                - protected_size
             )
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
@@ -2223,10 +2252,9 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
         }
 
-        if not _is_cpu:
-            ret["memory_usage"]["cuda_graph"] = round(
-                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
-            )
+        ret["memory_usage"]["graph"] = round(
+            self.tp_worker.worker.model_runner.graph_mem_usage, 2
+        )
 
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
             ret["avg_spec_accept_length"] = (

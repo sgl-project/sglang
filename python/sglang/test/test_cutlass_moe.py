@@ -22,7 +22,7 @@ def calc_diff(x, y):
 
 def get_model_config(tp_size: int):
     config = AutoConfig.from_pretrained(
-        "deepseek-ai/deepseek-R1", trust_remote_code=True
+        "deepseek-ai/Deepseek-R1", trust_remote_code=True
     )
     E = config.n_routed_experts
     topk = config.num_experts_per_tok
@@ -163,11 +163,10 @@ def run_test(tp_size, batch_size, model_config, check=False):
 
     moe_runner_config = MoeRunnerConfig(
         num_experts=E,
-        topk=topk,
+        top_k=topk,
         hidden_size=H,
-        shard_intermediate_size=I,
-        dtype=dtype,
-        block_shape=block_shape,
+        intermediate_size_per_partition=I,
+        params_dtype=dtype,
         activation="silu",
         inplace=False,
     )

@@ -34,7 +34,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     MultiTokenizerRegisterReq,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerMixin
+from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -69,7 +69,7 @@ class DecodeStatus:
     sent_offset: int = 0
 
 
-class DetokenizerManager(MultiTokenizerMixin):
+class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -289,11 +289,11 @@ def run_detokenizer_process(
     try:
         manager = DetokenizerManager(server_args, port_args)
         if server_args.tokenizer_worker_num > 1:
-            manager.multi_tokenizer_manager_event_loop()
+            manager.multi_http_worker_event_loop()
         else:
             manager.event_loop()
     except Exception:
-        manager.clear_tokenizer_mapping()
+        manager.socket_mapping.clear_all_sockets()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)

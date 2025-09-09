@@ -497,6 +497,9 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat(
             [item.feature.squeeze(0) for item in items], dim=0

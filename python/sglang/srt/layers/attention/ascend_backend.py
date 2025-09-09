@@ -368,7 +368,7 @@ class AscendAttnBackend(AttentionBackend):
                 -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
             )
 
-            q_nope = q.view(-1, layer.tp_q_head_num, 1, self.kv_lora_rank)
+            q_nope = q.view(-1, layer.tp_q_head_num, 1, self.kv_lora_rank).contiguous()
             q_rope = q_rope.view(-1, layer.tp_q_head_num, 1, self.qk_rope_head_dim)
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
