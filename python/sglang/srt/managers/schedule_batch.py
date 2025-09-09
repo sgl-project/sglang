@@ -98,7 +98,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "sampling_backend",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
-    "speculative_attention_backend",
+    "speculative_attention_mode",
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
