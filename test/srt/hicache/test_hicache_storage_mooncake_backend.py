@@ -25,7 +25,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         """Set up test environment and launch Mooncake services before server setup"""
         # Start Mooncake services first
         cls._start_mooncake_services()
-        
+
         # Call parent setup
         super().setUpClass()
 
@@ -34,7 +34,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         """Clean up Mooncake services after server teardown"""
         # Call parent teardown first
         super().tearDownClass()
-        
+
         # Stop Mooncake services
         cls._stop_mooncake_services()
 
@@ -42,7 +42,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     def _start_mooncake_services(cls):
         """Start Mooncake metadata and master services"""
         print("Starting Mooncake services...")
-        
+
         # Start metadata service
         try:
             cls.metadata_service_process = subprocess.Popen(
@@ -55,7 +55,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         except (FileNotFoundError, subprocess.SubprocessError) as e:
             print(f"Warning: Could not start Mooncake metadata service: {e}")
             cls.metadata_service_process = None
-        
+
         # Start master service
         try:
             cls.master_service_process = subprocess.Popen(
@@ -68,7 +68,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         except (FileNotFoundError, subprocess.SubprocessError) as e:
             print(f"Warning: Could not start Mooncake master service: {e}")
             cls.master_service_process = None
-        
+
         # Give services time to start
         time.sleep(3)
 
@@ -76,7 +76,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     def _stop_mooncake_services(cls):
         """Stop Mooncake services"""
         print("Stopping Mooncake services...")
-        
+
         # Stop metadata service
         if hasattr(cls, 'metadata_service_process') and cls.metadata_service_process:
             try:
@@ -85,7 +85,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
                 print("Mooncake metadata service stopped")
             except (ProcessLookupError, subprocess.TimeoutExpired, OSError) as e:
                 print(f"Warning: Could not stop Mooncake metadata service: {e}")
-        
+
         # Stop master service
         if hasattr(cls, 'master_service_process') and cls.master_service_process:
             try:
@@ -98,20 +98,6 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     @classmethod
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
-        # Create a temporary JSON config file for Mooncake
-        # mooncake_config = {
-        #     "local_hostname": "localhost",
-        #     "metadata_server": "http://127.0.0.1:8080/metadata",
-        #     "global_segment_size": 4 * 1024 * 1024 * 1024,  # 4 GiB
-        #     "protocol": "rdma",
-        #     "device_name": "",
-        #     "master_server_address": "127.0.0.1:50051",
-        # }
-
-        # Write config to temporary file
-        # config_file = os.path.join(cls.temp_dir, "mooncake_config.json")
-        # with open(config_file, "w") as f:
-        #     json.dump(mooncake_config, f, indent=2)
 
         server_args = {
             "--tp-size": 1,
@@ -125,7 +111,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             "MOONCAKE_PROTOCOL": "rdma",
             "MOONCAKE_DEVICE": "",
             "MOONCAKE_TE_META_DATA_SERVER": "http://127.0.0.1:8080/metadata",
-            "MOONCAKE_GLOBAL_SEGMENT_SIZE": 4294967296,  # 4 GiB
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4294967296",  # 4 GiB
         }
 
         return server_args, env_vars
