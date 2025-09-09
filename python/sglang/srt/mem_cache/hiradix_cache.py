@@ -20,7 +20,10 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, StorageMetricsCollector
+from sglang.srt.metrics.collector import (
+    SchedulerMetricsCollector,
+    StorageMetricsCollector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -297,8 +300,10 @@ class HiRadixCache(RadixCache):
                 assert node.backuped
                 self._evict_backuped(node)
 
-        if num_evicted >0 and self.scheduler_metrics_collector is not None:
-            self.scheduler_metrics_collector.observe_eviction_duration(time.perf_counter() - start_time)
+        if num_evicted > 0 and self.scheduler_metrics_collector is not None:
+            self.scheduler_metrics_collector.observe_eviction_duration(
+                time.perf_counter() - start_time
+            )
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
@@ -393,7 +398,9 @@ class HiRadixCache(RadixCache):
         self.inc_lock_ref(last_hit_node)
 
         if self.scheduler_metrics_collector is not None:
-            self.scheduler_metrics_collector.observe_load_back_duration(time.perf_counter() - start_time)
+            self.scheduler_metrics_collector.observe_load_back_duration(
+                time.perf_counter() - start_time
+            )
 
         return device_indices
 

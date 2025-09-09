@@ -303,7 +303,9 @@ class SchedulerOutputProcessorMixin:
             if self.enable_metrics:
                 for req in batch.reqs:
                     if req.prefill_loop_count > 0:
-                        self.metrics_collector.observe_chunked_prefill_loop_count(req.prefill_loop_count)
+                        self.metrics_collector.observe_chunked_prefill_loop_count(
+                            req.prefill_loop_count
+                        )
                         req.prefill_loop_count = 0
 
     def add_input_logprob_return_values(

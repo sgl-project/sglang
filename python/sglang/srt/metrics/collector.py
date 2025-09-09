@@ -177,7 +177,7 @@ class SchedulerStats:
 class SchedulerMetricsCollector:
 
     def __init__(
-        self, 
+        self,
         labels: Dict[str, str],
         bucket_eviction_duration: Optional[List[float]] = None,
         bucket_load_back_duration: Optional[List[float]] = None,
