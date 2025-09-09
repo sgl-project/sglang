@@ -3,7 +3,11 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.constants import (
+    GPU_MEMORY_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -92,6 +96,9 @@ class SchedulerUpdateWeightsMixin:
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
+        if GPU_MEMORY_CUDA_GRAPH in tags:
+            self.memory_saver_adapter.pause(GPU_MEMORY_CUDA_GRAPH)
+
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
@@ -114,6 +121,9 @@ class SchedulerUpdateWeightsMixin:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+
+        if GPU_MEMORY_CUDA_GRAPH in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_CUDA_GRAPH)
 
         return ResumeMemoryOccupationReqOutput()
 

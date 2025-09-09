@@ -515,7 +515,12 @@ class CudaGraphRunner:
             logger.info(log_message)
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with self.device_module.graph(graph, pool=pool, stream=stream):
+        from torch_memory_saver import torch_memory_saver
+
+        ctx = torch_memory_saver.cuda_graph(
+            graph, pool=pool, stream=stream, tag="graph"
+        )
+        with ctx:
             out = run_once_fn()
         return out
 
