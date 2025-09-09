@@ -16,6 +16,7 @@ class CPUMoECompMethod(IntEnum):
     INT8_W8A8_GEMM = 1
     FP8_W8A16_GEMM = 2
     INT4_W4A16_GEMM = 3
+    INT4_W4A8_GEMM = 4
 
 
 def amx_process_weight_after_loading(weight):
@@ -83,13 +84,8 @@ def _amx_process_weight_after_loading(
         qweight_tensor = getattr(module, weight_names[0])
         qzeros_tensor = getattr(module, weight_names[1])
         scales_tensor = getattr(module, weight_names[2])
-        prefix_list = weight_names[0].split("_")
-        # MoE layers have prefix
-        has_prefix = len(prefix_list) != 1
-        # TODO: support MoE layers for W4A8 path
-        use_w4a8 = SGLANG_USE_CPU_INT4_W4A8 and not has_prefix
         qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-            qweight_tensor, qzeros_tensor, scales_tensor, use_w4a8
+            qweight_tensor, qzeros_tensor, scales_tensor, SGLANG_USE_CPU_INT4_W4A8
         )
         packed_qweight = torch.nn.Parameter(
             qweight.detach(),

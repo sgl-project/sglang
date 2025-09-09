@@ -802,7 +802,11 @@ class AWQMoEMethod(FusedMoEMethodBase):
                 topk_weights,
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
-                CPUMoECompMethod.INT4_W4A16_GEMM,
+                (
+                    CPUMoECompMethod.INT4_W4A16_GEMM
+                    if not SGLANG_USE_CPU_INT4_W4A8
+                    else CPUMoECompMethod.INT4_W4A8_GEMM
+                ),
                 layer.w13_scales,  # w1_scale
                 layer.w2_scales,  # w2_scale
                 layer.w13_qzeros,
