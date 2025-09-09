@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from sgl_kernel.flash_attn import flash_attn_varlen_func
+from utils import is_hopper
 
 flash_attn_varlen_func = partial(flash_attn_varlen_func, ver=4)
 
@@ -479,6 +480,10 @@ def attention_ref(
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
+@pytest.mark.skipif(
+    is_hopper(),
+    reason="skip on hopper",
+)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
