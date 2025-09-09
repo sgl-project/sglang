@@ -1893,16 +1893,30 @@ class ModelOptModelLoader(DefaultModelLoader):
                 model_config=model_config, device_config=device_config
             )
 
+        # Determine workflow based on quantize_and_serve flag
+        quantize_and_serve = getattr(model_config, "quantize_and_serve", False)
+
+        if quantize_and_serve:
+            logger.info("Quantize-and-serve mode: Will quantize and serve immediately")
+            return self._quantize_and_serve_workflow(model_config, device_config)
+        else:
+            logger.info("Standard quantization mode: Will quantize and export/save")
+            return self._standard_quantization_workflow(model_config, device_config)
+
+    def _standard_quantization_workflow(
+        self, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        """Standard quantization workflow: quantize, save checkpoint, export, then return model."""
         # Use shared method from parent class to load base model for quantization
         model = self._load_modelopt_base_model(model_config)
 
-        # Import ModelOpt modules (already done in _load_modelopt_base_model, but needed here for quantization)
+        # Import ModelOpt modules
         try:
             import modelopt.torch.quantization as mtq
         except ImportError:
             logger.error(
                 "NVIDIA Model Optimizer (modelopt) library not found. "
-                "Please install it to use 'modelopt_quant' feature."
+                "Please install it to use ModelOpt quantization."
             )
             raise
 
@@ -1917,10 +1931,8 @@ class ModelOptModelLoader(DefaultModelLoader):
         quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
         if not quant_cfg_name:
             raise ValueError(
-                f"Invalid modelopt_quant choice: '{quant_choice_str}'. "
-                f"Available choices in QUANT_CFG_CHOICES: {list(QUANT_CFG_CHOICES.keys())}. "
-                "Ensure QUANT_CFG_CHOICES is correctly defined with mappings to "
-                "attribute names of config objects in modelopt.torch.quantization."
+                f"Invalid quantization choice: '{quant_choice_str}'. "
+                f"Available choices: {list(QUANT_CFG_CHOICES.keys())}"
             )
 
         try:
@@ -1928,13 +1940,12 @@ class ModelOptModelLoader(DefaultModelLoader):
             quant_cfg = getattr(mtq, quant_cfg_name)
         except AttributeError:
             raise AttributeError(
-                f"ModelOpt quantization config attribute '{quant_cfg_name}' "
-                f"(from choice '{quant_choice_str}') not found in modelopt.torch.quantization module. "
-                "Please verify QUANT_CFG_CHOICES and the ModelOpt library."
+                f"ModelOpt quantization config '{quant_cfg_name}' not found. "
+                "Please verify the ModelOpt library installation."
             )
 
         logger.info(
-            f"Quantizing model with ModelOpt using config attribute: mtq.{quant_cfg_name}"
+            f"Quantizing model with ModelOpt using config: mtq.{quant_cfg_name}"
         )
 
         quantized_ckpt_restore_path = model_config.modelopt_checkpoint_restore_path
@@ -1943,6 +1954,7 @@ class ModelOptModelLoader(DefaultModelLoader):
         tokenizer = AutoTokenizer.from_pretrained(
             model_config.model_path, use_fast=True
         )
+
         try:
             self._setup_modelopt_quantization(
                 model,
@@ -1953,8 +1965,77 @@ class ModelOptModelLoader(DefaultModelLoader):
                 export_path=export_path,
             )
         except Exception as e:
-            print(f"Warning: ModelOpt quantization failed: {e}")
-            print("Proceeding without quantization...")
+            logger.warning(f"ModelOpt quantization failed: {e}")
+            logger.warning("Proceeding without quantization...")
+
+        return model.eval()
+
+    def _quantize_and_serve_workflow(
+        self, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        """Quantize-and-serve workflow: quantize in memory and serve immediately (no export)."""
+        logger.info("Starting quantize-and-serve workflow...")
+
+        # Validate that conflicting options are not set
+        if model_config.modelopt_export_path:
+            logger.warning(
+                "modelopt_export_path is ignored in quantize-and-serve mode. "
+                "Use standard quantization mode if you need to export the model."
+            )
+
+        # Use shared method from parent class to load base model for quantization
+        model = self._load_modelopt_base_model(model_config)
+
+        # Import ModelOpt modules
+        try:
+            import modelopt.torch.quantization as mtq
+        except ImportError:
+            logger.error(
+                "NVIDIA Model Optimizer (modelopt) library not found. "
+                "Please install it to use ModelOpt quantization."
+            )
+            raise
+
+        # Handle both old modelopt_quant and new unified quantization flags
+        if model_config.modelopt_quant:
+            quant_choice_str = model_config.modelopt_quant
+        else:
+            quant_choice_str = model_config._get_modelopt_quant_type()
+
+        quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
+        if not quant_cfg_name:
+            raise ValueError(
+                f"Invalid quantization choice: '{quant_choice_str}'. "
+                f"Available choices: {list(QUANT_CFG_CHOICES.keys())}"
+            )
+
+        try:
+            quant_cfg = getattr(mtq, quant_cfg_name)
+        except AttributeError:
+            raise AttributeError(
+                f"ModelOpt quantization config '{quant_cfg_name}' not found."
+            )
+
+        logger.info(f"Quantizing model for serving with config: mtq.{quant_cfg_name}")
+
+        # Set up quantization without export (in-memory only)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_config.model_path, use_fast=True
+        )
+
+        try:
+            self._setup_modelopt_quantization(
+                model,
+                tokenizer,
+                quant_cfg,
+                quantized_ckpt_restore_path=model_config.modelopt_checkpoint_restore_path,
+                quantized_ckpt_save_path=model_config.modelopt_checkpoint_save_path,
+                export_path=None,  # No export in quantize-and-serve mode
+            )
+            logger.info("✅ Model quantized successfully and ready to serve!")
+        except Exception as e:
+            logger.error(f"Quantize-and-serve failed: {e}")
+            raise
 
         return model.eval()
 
