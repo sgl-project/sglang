@@ -98,9 +98,11 @@ def get_backend_from_name(name: str) -> BaseLoRABackend:
     Get corresponding backend class from backend's name
     """
     if name == "triton":
-        from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+        from sglang.srt.lora.backend.chunked_backend import ChunkedLoRABackend
 
-        return TritonLoRABackend
+        return ChunkedLoRABackend
+        # from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+        # return TritonLoRABackend
     elif name == "chunked":
         from sglang.srt.lora.backend.chunked_backend import ChunkedLoRABackend
 
