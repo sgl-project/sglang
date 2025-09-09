@@ -175,6 +175,7 @@ class MooncakeKVManager(BaseKVManager):
         self.disaggregation_mode = disaggregation_mode
         self.init_engine()
         # for p/d multi node infer
+        self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
         self.attn_tp_size = get_attention_tp_size()
@@ -1020,6 +1021,7 @@ class MooncakeKVManager(BaseKVManager):
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
+            # multi node case: bootstrap server's host is dist_init_addr
             if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
                 if self.dist_init_addr.endswith("]"):
                     host = self.dist_init_addr
@@ -1028,7 +1030,8 @@ class MooncakeKVManager(BaseKVManager):
             else:
                 host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
         else:
-            host = get_ip()
+            # single node case: bootstrap server's host is same as http server's host
+            host = self.bootstrap_host
             host = maybe_wrap_ipv6_address(host)
 
         bootstrap_server_url = f"{host}:{self.bootstrap_port}"
@@ -1209,7 +1212,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        data_parallel_rank: Optional[int] = None,
+        prefill_dp_rank: Optional[int] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
@@ -1218,7 +1221,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         self.conclude_state = None
         self.init_time = None
-        self.data_parallel_rank = data_parallel_rank
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             (
@@ -1317,11 +1319,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
                 ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
 
-        if self.data_parallel_rank is not None:
-            logger.debug(f"Targeting DP rank: {self.data_parallel_rank}")
-            self.target_dp_group = self.data_parallel_rank
+        if prefill_dp_rank is not None:
+            logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
+            self.prefill_dp_rank = prefill_dp_rank
         else:
-            self.target_dp_group = bootstrap_room % self.prefill_dp_size
+            self.prefill_dp_rank = bootstrap_room % self.prefill_dp_size
+
+        # FIXME: alias here: target_dp_group -> prefill_dp_rank
+        self.target_dp_group = self.prefill_dp_rank
 
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
@@ -1545,7 +1550,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
 
 class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
-    def __init__(self, port: int):
+    def __init__(self, host: str, port: int):
+        self.host = host
         self.port = port
         self.app = web.Application()
         self.store = dict()
@@ -1673,7 +1679,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             self._runner = web.AppRunner(self.app, access_log=access_log)
             self._loop.run_until_complete(self._runner.setup())
 
-            site = web.TCPSite(self._runner, port=self.port)
+            site = web.TCPSite(self._runner, host=self.host, port=self.port)
             self._loop.run_until_complete(site.start())
             self._loop.run_forever()
         except Exception as e:
