@@ -264,10 +264,7 @@ set-window-option -g mouse on
 set -g history-limit 100000
 EOF
 
-# Configure Git and set locale
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
+# Configure Git
 RUN git config --global core.editor "vim" \
     && git config --global core.whitespace "fix,-indent-with-non-tab,trailing-space,cr-at-eol" \
     && git config --global core.pager "diff-so-fancy | less --tabs=4 -RFX" \
@@ -317,8 +314,44 @@ setopt HIST_FIND_NO_DUPS
 setopt INC_APPEND_HISTORY
 EOF
 
-# Install SGLang
+# Download and build NVSHMEM (moved before SGLang for better caching)
 WORKDIR /sgl-workspace
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+    && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+    && mv nvshmem_src nvshmem \
+    && rm -f nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+
+RUN cd /sgl-workspace/nvshmem \
+    && NVSHMEM_SHMEM_SUPPORT=0 \
+    NVSHMEM_UCX_SUPPORT=0 \
+    NVSHMEM_USE_NCCL=0 \
+    NVSHMEM_MPI_SUPPORT=0 \
+    NVSHMEM_IBGDA_SUPPORT=1 \
+    NVSHMEM_PMIX_SUPPORT=0 \
+    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
+    NVSHMEM_USE_GDRCOPY=1 \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="90" \
+    && cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
+
+# Download and install DeepEP (moved before SGLang for better caching)
+RUN git clone https://github.com/deepseek-ai/DeepEP.git \
+    && cd DeepEP \
+    && git checkout ${DEEPEP_COMMIT} \
+    && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh \
+    && case "$CUDA_VERSION" in \
+      12.6.1) \
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
+        ;; \
+      12.8.1|12.9.1) \
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
+        ;; \
+      *) \
+        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+        ;; \
+    esac \
+    && NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
+
+# Install SGLang
 ARG BRANCH_TYPE
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
@@ -342,46 +375,8 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.9.post2/sgl_kernel-0.3.9.post2+cu124-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi
 
-# Download source files
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
-    cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-    cd .. && \
-    tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    mv nvshmem_src nvshmem && \
-    rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
-
-# Build and install NVSHMEM
-RUN cd /sgl-workspace/nvshmem && \
-    NVSHMEM_SHMEM_SUPPORT=0 \
-    NVSHMEM_UCX_SUPPORT=0 \
-    NVSHMEM_USE_NCCL=0 \
-    NVSHMEM_MPI_SUPPORT=0 \
-    NVSHMEM_IBGDA_SUPPORT=1 \
-    NVSHMEM_PMIX_SUPPORT=0 \
-    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
-    NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="90" && \
-    cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
-
-# Install DeepEP
-RUN cd /sgl-workspace/DeepEP && \
-    case "$CUDA_VERSION" in \
-      12.6.1) \
-        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
-        ;; \
-      12.8.1|12.9.1) \
-        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
-        ;; \
-      *) \
-        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
-        ;; \
-    esac && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
-
 # Build and install sgl-router
-RUN python3 -m pip install --no-cache-dir setuptools-rust \
-    && cd /sgl-workspace/sglang/sgl-router \
+RUN cd /sgl-workspace/sglang/sgl-router \
     && cargo build --release \
     && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache
