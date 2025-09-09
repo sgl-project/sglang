@@ -277,6 +277,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_params(self, layer_id: int):
         assert layer_id in self.mamba_map
         return self.mamba_pool.get_mamba_params(self.mamba_map[layer_id])
+    
+    def get_mamba_params_all_layers(self):
+        return self.mamba_pool.get_mamba_params_all_layers()
 
     # For chunk prefill, we can not free mamba cache, we need use it in the future
     def free(self, free_index: Union[int, List[int]], free_mamba_cache: bool = True):

@@ -105,11 +105,22 @@ class MambaAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        mamba_indices = self.req_to_token_pool.get_mamba_indices(
-            req_pool_indices
-        )
-        self.state_indices_list[bs - 1][:len(mamba_indices)].copy_(mamba_indices)
-        self.query_start_loc_list[bs - 1].copy_(self._get_cached_arange(bs, "cuda"))
+        if forward_mode.is_decode_or_idle():
+            self.query_start_loc_list[bs - 1].copy_(self._get_cached_arange(bs, "cuda"))
+        elif forward_mode.is_target_verify():
+            self.query_start_loc_list[bs - 1].copy_(
+                torch.arange(
+                    0,
+                    bs * spec_info.draft_token_num + 1,
+                    step=spec_info.draft_token_num,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+            )
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_mode=}")
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         self.forward_metadata = ForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -126,11 +137,34 @@ class MambaAttnBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        mamba_indices = self.req_to_token_pool.get_mamba_indices(
-            req_pool_indices
-        )
-        self.state_indices_list[bs - 1][:len(mamba_indices)].copy_(mamba_indices)
-        self.query_start_loc_list[bs - 1].copy_(self._get_cached_arange(bs, "cuda"))
+        num_padding = torch.count_nonzero(
+            seq_lens == self.get_cuda_graph_seq_len_fill_value()
+        ).item()
+        # Make sure forward metadata is correctly handled for padding reqs
+        req_pool_indices[bs - num_padding :] = 0
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        mamba_indices[bs - num_padding :] = -1
+        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        if forward_mode.is_decode_or_idle():
+            self.query_start_loc_list[bs - 1].copy_(self._get_cached_arange(bs, "cuda"))
+            if num_padding > 0:
+                self.query_start_loc_list[bs - 1][bs - num_padding :] = bs - num_padding
+        elif forward_mode.is_target_verify():
+            self.query_start_loc_list[bs - 1].copy_(
+                torch.arange(
+                    0,
+                    bs * spec_info.draft_token_num + 1,
+                    step=spec_info.draft_token_num,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+            )
+            if num_padding > 0:
+                self.query_start_loc_list[bs - 1][bs - num_padding :] = (
+                    bs - num_padding
+                ) * spec_info.draft_token_num
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
         self.forward_metadata = ForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
