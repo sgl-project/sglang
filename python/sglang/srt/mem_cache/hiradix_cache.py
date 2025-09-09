@@ -253,7 +253,6 @@ class HiRadixCache(RadixCache):
 
     def evict(self, num_tokens: int):
         leaves = self._collect_leaves_device()
-        # counter = itertools.count()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
