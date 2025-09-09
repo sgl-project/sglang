@@ -28,10 +28,7 @@ class TorchFlexAttnBackend(AttentionBackend):
         torch.cuda.empty_cache()
 
     def _causal_mask(self, b, h, q_idx, kv_idx):
-        return q_idx >= kv_idx
-
-    def _decode_mask(self, b, h, q_idx, kv_idx):
-        return q_idx == q_idx
+        return self.q_offset + q_idx >= kv_idx
 
     def _run_flex_forward_extend(
         self,
@@ -80,7 +77,6 @@ class TorchFlexAttnBackend(AttentionBackend):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
             extend_seq_len_q = extend_seq_lens[seq_idx]
-            prefill_seq_len_q = extend_prefix_lens[seq_idx]
 
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q
@@ -96,13 +92,15 @@ class TorchFlexAttnBackend(AttentionBackend):
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
             if causal:
-                mask_mod = create_block_mask(
+                self.q_offset = extend_prefix_lens[seq_idx]
+                block_mask = create_block_mask(
                     self._causal_mask,
                     None,
                     None,
                     extend_seq_len_q,
                     seq_len_kv,
                     device=query.device,
+                    BLOCK_SIZE=128,
                     _compile=False,
                 )
             else:
@@ -113,7 +111,7 @@ class TorchFlexAttnBackend(AttentionBackend):
                     per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
-                    block_mask=mask_mod,
+                    block_mask=block_mask,
                     scale=scaling,
                     enable_gqa=enable_gqa,
                 )
@@ -176,13 +174,15 @@ class TorchFlexAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
+            self.q_offset = seq_len_kv - seq_len_q
             mask_mod = create_block_mask(
-                self._decode_mask,
+                self._causal_mask,
                 None,
                 None,
                 seq_len_q,
                 seq_len_kv,
                 device=query.device,
+                BLOCK_SIZE=128,
                 _compile=False,
             )
             per_req_out = (
