@@ -1403,7 +1403,7 @@ def get_npu_memory_capacity():
 
 def get_xpu_memory_capacity():
     assert torch.xpu.is_avaiable(), "XPU device is not available"
-    return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+    return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
 
 
 def get_device_memory_capacity(device: str = None):
