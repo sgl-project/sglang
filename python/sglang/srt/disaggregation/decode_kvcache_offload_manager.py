@@ -118,6 +118,7 @@ class DecodeKVCacheOffloadManager:
         self._check_backup_progress()
 
     def _check_offload_progress(self):
+        """Check the progress of offload from device to host, and trigger backup from host to storage."""
         queue_size = torch.tensor(
             self.decode_cache_controller.ack_write_queue.qsize(), dtype=torch.int
         )
@@ -141,7 +142,9 @@ class DecodeKVCacheOffloadManager:
             del self.ongoing_offload[ack_id]
 
     def _trigger_backup(self, req_id, host_indices, tokens):
-        # # Generate page hashes and write to storage
+        """Trigger async backup from host to storage by cache controller."""
+
+        # Generate page hashes and write to storage
         page_hashes = []
         last_hash = ""
         for offset in range(0, len(tokens), self.page_size):
@@ -159,6 +162,8 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_backup[ack_id] = (req_id, host_indices)
 
     def _check_backup_progress(self):
+        """Check the progress of backup from host to storage."""
+
         queue_size = torch.tensor(
             self.decode_cache_controller.ack_backup_queue.qsize(), dtype=torch.int
         )

@@ -169,9 +169,9 @@ class HostKVCache(abc.ABC):
 
     @synchronized()
     def alloc(self, need_size: int) -> torch.Tensor:
-        # assert (
-        #     need_size % self.page_size == 0
-        # ), "The requested size should be a multiple of the page size."
+        assert (
+            need_size % self.page_size == 0
+        ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
 
