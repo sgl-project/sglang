@@ -31,7 +31,7 @@ class JsonDetector(BaseFormatDetector):
             True if the text starts with a JSON array or object, False otherwise
         """
         stripped = text.strip()
-        return stripped.startswith("[") or stripped.startswith("{")
+        return stripped.startswith("[") 
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """

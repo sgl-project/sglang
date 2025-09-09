@@ -847,7 +847,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in the response"""
 
         # Handle required tool choice
-        if tool_choice == "required":
+        if tool_choice == "required" or (isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"):
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
@@ -855,10 +855,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 # For required tool choice, we expect a JSON array of tool calls
                 tool_call_data = json.loads(text)
                 tool_calls = []
-                for i, call_info in enumerate(tool_call_data):
+                for i, tool in enumerate(tool_call_data):
                     # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
-                    if tool_call_parser == "kimi_k2" and tool_choice.function.name is not None:
-                        tool_id = f"functions.{tool_choice.function.name}:0"
+                    if tool_call_parser == "kimi_k2" and tool['name'] is not None:
+                        tool_id = f"functions.{tool['name']}:0"
                     else:
                         tool_id = f"call_{uuid.uuid4().hex[:24]}"
 
@@ -867,8 +867,8 @@ class OpenAIServingChat(OpenAIServingBase):
                             id=tool_id,
                             index=i,
                             function=FunctionResponse(
-                                name=call_info['name'], 
-                                arguments=json.dumps(call_info['parameters'], ensure_ascii=False)
+                                name=tool['name'], 
+                                arguments=json.dumps(tool['parameters'], ensure_ascii=False)
                             ),
                         )
                     )
@@ -877,33 +877,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 logger.error(f"Tool call parsing error: {e}")
                 return None, text, finish_reason
         
-        # Hande a named tool choice
-        elif isinstance(tool_choice, ToolChoice) and tool_choice.type == "function":
-            if finish_reason["type"] == "stop":
-                finish_reason["type"] = "tool_calls"
-                finish_reason["matched"] = None
-            try:
-                # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
-                if tool_call_parser == "kimi_k2" and tool_choice.function.name is not None:
-                    tool_id = f"functions.{tool_choice.function.name}:0"
-                else:
-                    tool_id = f"call_{uuid.uuid4().hex[:24]}"
-
-                call_info = json.loads(text)
-                tool_calls = [
-                    ToolCall(
-                        id=tool_id,
-                        index=0, # only one tool call when a specific function is chosen
-                        function=FunctionResponse(
-                            name=tool_choice.function.name,
-                            arguments=json.dumps(call_info['parameters']),
-                        ),
-                    )
-                ]
-                return tool_calls, "", finish_reason
-            except json.JSONDecodeError as e:
-                logger.error(f"Tool call parsing error: {e}")
-                return None, text, finish_reason
         parser = FunctionCallParser(tools, tool_call_parser, tool_choice)
         if parser.has_tool_call(text):
             if finish_reason["type"] == "stop":

@@ -253,7 +253,12 @@ class FunctionCallParser:
                 fn_name = tool_choice["function"]["name"]
             for tool in self.tools:
                 if tool.function.name == fn_name:
-                    return get_tool_schema(tool)
+                    return {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "items": get_tool_schema(tool)
+                    }
             return None
         elif tool_choice == "required":
 
