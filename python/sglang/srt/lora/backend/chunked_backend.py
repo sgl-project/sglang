@@ -140,22 +140,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
 
         if batch_info is None:
-            max_len = (
-                # Calculate max_len from the CPU copy to avoid D2H transfer.
-                max(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.forward_mode.is_extend()
-                else 1
-            )
             batch_info = LoRABatchInfo(
                 bs=forward_batch.batch_size,
                 num_segments=num_segments,
-                max_len=max_len,
                 use_cuda_graph=False,
-                seg_lens=None,
-                # TODO (lifu): technically we do not need seg_lens in triton either, we can convenge this logic later.
-                # seg_lens=torch.empty(
-                #     (num_segments,), dtype=torch.int32, device=self.device
-                # ),
                 seg_indptr=torch.empty(
                     (num_segments + 1,), dtype=torch.int32, device=self.device
                 ),
@@ -171,6 +159,9 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 permutation=torch.empty(
                     (len(permutation),), dtype=torch.int32, device=self.device
                 ),
+                # Not used in chunked kernels
+                max_len=None,
+                seg_lens=None,
             )
         else:
             batch_info.bs = forward_batch.batch_size

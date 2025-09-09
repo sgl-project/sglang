@@ -26,7 +26,7 @@ class LoRABatchInfo:
     seg_indptr: torch.Tensor
 
     # Maximum sequence length of current batch
-    max_len: int
+    max_len: Optional[int]
 
     # The index of lora adapter used by each sequence, in shape (num_segments,)
     weight_indices: torch.Tensor

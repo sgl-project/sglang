@@ -32,8 +32,8 @@ def _chunked_lora_expand_kernel(
     scalings,
     # Offsets of q/k/v slice on output dimension
     slice_offsets,
-    NUM_SLICES: tl.constexpr,
     # Meta parameters
+    NUM_SLICES: tl.constexpr,
     MAX_RANK: tl.constexpr,  # K = R
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -166,10 +166,10 @@ def chunked_sgmv_lora_expand_forward(
     # Get dims
     s = x.shape[0]
     input_dim = x.shape[1]
-    r = lora_weight_b.shape[-1]
+    max_lora_rank = lora_weight_b.shape[-1]
     output_dim = lora_weight_b.shape[-2]
     num_slices = len(slice_offsets) - 1
-    assert input_dim == num_slices * r
+    assert input_dim == num_slices * max_lora_rank
 
     # TODO (lifuhuang): fine-tune per operation
     BLOCK_M = 16
@@ -178,7 +178,6 @@ def chunked_sgmv_lora_expand_forward(
 
     num_segments = batch_info.num_segments
 
-    # TODO (lifuhuang): reconsider grid shape to reduce specializations
     grid = (
         triton.cdiv(max_slice_size, BLOCK_N),
         num_slices,  # qkv=3, gate_up=2, others=1
@@ -207,10 +206,10 @@ def chunked_sgmv_lora_expand_forward(
         permutation=batch_info.permutation,
         num_segs=num_segments,
         scalings=batch_info.scalings,
-        # constants
         slice_offsets=slice_offsets,
+        # constants
         NUM_SLICES=num_slices,
-        MAX_RANK=r,
+        MAX_RANK=max_lora_rank,
         BLOCK_S=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,

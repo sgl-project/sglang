@@ -87,14 +87,14 @@ class LoRAManager:
             self.cuda_graph_batch_info = LoRABatchInfo(
                 bs=max_bs_in_cuda_graph,
                 use_cuda_graph=True,
-                num_segments=0,
+                num_segments=None,
                 seg_lens=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
                 max_len=1,
                 weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                permutation=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
-                permutation=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
             )
 
         self.lora_backend.init_cuda_graph_batch_info(
