@@ -55,6 +55,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.layers.attention.attn_backend_checker import check_attention_backend_support
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -219,6 +220,9 @@ class ModelRunner:
 
         # Model-specific adjustment
         self.model_specific_adjustment()
+
+        # Check compatibility of server args and attention backend
+        check_attention_backend_support(self.server_args)
 
         # Global vars
         global_server_args_dict.update(
