@@ -53,6 +53,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -172,10 +173,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             else:
                 tools = [item.function.model_dump() for item in request.tools]
-
-            tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-            parser = FunctionCallParser(request.tools, tool_call_parser)
-            tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+            if self.tool_call_parser:
+                parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -537,7 +537,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
-                if request.tool_choice != "none" and request.tools:
+                if request.tool_choice != "none" and request.tools and self.tool_call_parser:
                     async for chunk in self._process_tool_call_stream(
                         index,
                         delta,
@@ -727,11 +727,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle tool calls
             tool_calls = None
-            if request.tool_choice != "none" and request.tools:
-                tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-                tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, tool_call_parser, finish_reason
-                )
+            if request.tool_choice != "none" and request.tools and self.tool_call_parser:
+                tool_calls, text, finish_reason = self._process_tool_calls(text, request.tools, finish_reason)
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
@@ -824,11 +821,10 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         text: str,
         tools: List[Any],
-        tool_call_parser: Optional[str],
         finish_reason: Dict[str, Any],
     ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
         """Process tool calls in the response"""
-        parser = FunctionCallParser(tools, tool_call_parser)
+        parser = FunctionCallParser(tools, self.tool_call_parser)
         if parser.has_tool_call(text):
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
@@ -838,7 +834,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_calls = []
                 for call_info in call_info_list:
                     # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
-                    if tool_call_parser == "kimi_k2" and call_info.name is not None:
+                    if self.tool_call_parser == "kimi_k2" and call_info.name is not None:
                         tool_id = f"functions.{call_info.name}:{call_info.tool_index}"
                     else:
                         tool_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -933,7 +929,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in parser_dict:
             parser_dict[index] = FunctionCallParser(
                 tools=request.tools,
-                tool_call_parser=self.tokenizer_manager.server_args.tool_call_parser,
+                tool_call_parser=self.tool_call_parser,
             )
         parser = parser_dict[index]
 
@@ -962,7 +958,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Tool call ID should be generated only once per tool call
             if call_item.name:
                 # First chunk: include ID and function name
-                if self.tokenizer_manager.server_args.tool_call_parser == "kimi_k2":
+                if self.tool_call_parser == "kimi_k2":
                     # Align with Kimi-K2 format: functions.{name}:{index}
                     tool_call_id = f"functions.{call_item.name}:{call_item.tool_index}"
                 else:
