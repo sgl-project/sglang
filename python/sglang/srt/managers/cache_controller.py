@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -206,26 +207,25 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
 
-        self._done_flag = False
         self._lock = threading.Lock()
-
+        self._terminated_flag = False
         self.start_time = time.monotonic()
 
         super().__init__(host_indices, token_ids, last_hash)
 
     def increment(self, num_tokens: int):
         with self._lock:
-            if self._done_flag:
+            if self._terminated_flag:
                 return False
             self.completed_tokens += num_tokens
             return True
 
-    def mark_done(self):
+    def mark_terminate(self):
         with self._lock:
-            self._done_flag = True
+            self._terminated_flag = True
 
-    def is_done(self) -> bool:
-        return self._done_flag
+    def is_terminated(self) -> bool:
+        return self._terminated_flag
 
 
 class HiCacheController:
@@ -402,9 +402,11 @@ class HiCacheController:
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
             self.tp_size = get_attention_tp_size()
+            self.dp_rank = get_attention_dp_rank()
         else:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
+            self.dp_rank = 0
 
         # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
@@ -625,7 +627,7 @@ class HiCacheController:
         return operation
 
     def terminate_prefetch(self, operation):
-        operation.mark_done()
+        operation.mark_terminate()
         return operation.completed_tokens, operation.hash_value
 
     def append_host_mem_release(self, host_indices: torch.Tensor):
@@ -706,6 +708,7 @@ class HiCacheController:
                 operation.completed_tokens
                 != prev_completed_tokens + len(batch_hashes) * self.page_size
             ):
+                operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
         # release pre-allocated memory
         self.append_host_mem_release(
@@ -885,7 +888,7 @@ class HiCacheController:
 
                 if not self.backup_skip:
                     self._page_backup(operation)
-                self.ack_backup_queue.put(operation.id)
+                self.ack_backup_queue.put(operation)
 
             except Empty:
                 continue

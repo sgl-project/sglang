@@ -18,6 +18,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from packaging.version import Version
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
@@ -27,6 +28,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     supports_custom_op,
 )
 
@@ -36,20 +38,20 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 
 if _is_cuda:
-    from sgl_kernel import (
-        fused_add_rmsnorm,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
-    )
+    from flashinfer.norm import fused_add_rmsnorm as flashinfer_fused_add_rmsnorm
+    from sgl_kernel import gemma_fused_add_rmsnorm, gemma_rmsnorm, rmsnorm
 
 if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 elif _is_hip:
+    import vllm
     from vllm._custom_ops import fused_add_rms_norm, rms_norm
+
+    _vllm_version = Version(vllm.__version__)
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +84,9 @@ class RMSNorm(CustomOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
         if residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            flashinfer_fused_add_rmsnorm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
@@ -127,8 +131,21 @@ class RMSNorm(CustomOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
+            if _vllm_version < Version("0.9"):
+                fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+                return x, residual
+            else:
+                residual_out = torch.empty_like(x)
+                output = torch.empty_like(x)
+                fused_add_rms_norm(
+                    output,
+                    x,
+                    residual_out,
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                )
+                return output, residual_out
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
@@ -271,16 +288,11 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        orig_dtype = x.dtype
         if residual is not None:
             x = x + residual
             residual = x
 
-        x = x.float()
-        variance = torch_npu.mean(torch_npu.pow(x, 2), dim=-1, keepdim=True)
-        x = x * torch_npu.rsqrt(variance + self.variance_epsilon)
-        x = x * (1.0 + self.weight.float())
-        x = x.to(orig_dtype)
+        x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x if residual is None else (x, residual)
 
 
@@ -312,7 +324,9 @@ class Gemma3RMSNorm(CustomOp):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not (_is_cuda or _is_hip or _is_npu or (_is_cpu and _is_cpu_amx_available)):
+if not (
+    _is_cuda or _is_hip or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_xpu
+):
     logger.info(
         "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
     )
