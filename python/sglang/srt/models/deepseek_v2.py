@@ -2027,7 +2027,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         quant_format = (
             "mxfp4"
             if _is_gfx95_supported
-            and self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8
+            and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None) is not None
+            and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
+            is not None
+            and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
             else ""
         )
 
