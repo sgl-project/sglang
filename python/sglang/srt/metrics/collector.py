@@ -171,11 +171,18 @@ class SchedulerStats:
     # Engine startup
     engine_startup_time: float = 0.0
     engine_load_weights_time: float = 0.0
+    new_token_ratio: float = 0.0
 
 
 class SchedulerMetricsCollector:
 
-    def __init__(self, labels: Dict[str, str]) -> None:
+    def __init__(
+        self, 
+        labels: Dict[str, str],
+        bucket_eviction_duration: Optional[List[float]] = None,
+        bucket_load_back_duration: Optional[List[float]] = None,
+        bucket_chunked_prefill_loop_count: Optional[List[float]] = None,
+    ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Gauge, Histogram
 
@@ -521,6 +528,89 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["stage"],
         )
 
+        self.new_token_ratio = Gauge(
+            name="sglang:new_token_ratio",
+            documentation="The new token ratio.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        if bucket_eviction_duration is None:
+            bucket_eviction_duration = [
+                0.001,
+                0.002,
+                0.003,
+                0.004,
+                0.005,
+                0.006,
+                0.007,
+                0.008,
+                0.009,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+        if bucket_load_back_duration is None:
+            bucket_load_back_duration = [
+                0.001,
+                0.002,
+                0.003,
+                0.004,
+                0.005,
+                0.006,
+                0.007,
+                0.008,
+                0.009,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+        if bucket_chunked_prefill_loop_count is None:
+            bucket_chunked_prefill_loop_count = [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+            ]
+        self.eviction_duration_seconds = Histogram(
+            name="sglang:eviction_duration_seconds",
+            documentation="Time taken to evict memory from GPU to CPU in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_eviction_duration,
+        )
+
+        self.load_back_duration_seconds = Histogram(
+            name="sglang:load_back_duration_seconds",
+            documentation="Time taken to load memory from CPU to GPU in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_load_back_duration,
+        )
+
+        self.chunked_prefill_loop_count = Histogram(
+            name="sglang:chunked_prefill_loop_count",
+            documentation="The bucket of chunked prefill loop count.",
+            labelnames=labels.keys(),
+            buckets=bucket_chunked_prefill_loop_count,
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -533,6 +623,15 @@ class SchedulerMetricsCollector:
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def observe_eviction_duration(self, duration_seconds: float) -> None:
+        self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_load_back_duration(self, duration_seconds: float) -> None:
+        self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_chunked_prefill_loop_count(self, count: int) -> None:
+        self.chunked_prefill_loop_count.labels(**self.labels).observe(count)
 
     def observe_request_latency_seconds(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
@@ -590,6 +689,7 @@ class SchedulerMetricsCollector:
             self._log_gauge(
                 self.engine_load_weights_time, stats.engine_load_weights_time
             )
+        self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
 
         self.last_log_time = time.perf_counter()
 

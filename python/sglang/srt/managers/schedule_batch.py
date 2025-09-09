@@ -641,6 +641,9 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+        
+        # For prefill loop count
+        self.prefill_loop_count = 0
 
     @property
     def seqlen(self):

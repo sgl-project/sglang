@@ -217,6 +217,9 @@ class ServerArgs:
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
     collect_tokens_histogram: bool = False
+    bucket_eviction_duration: Optional[List[float]] = None
+    bucket_load_back_duration: Optional[List[float]] = None
+    bucket_chunked_prefill_loop_count: Optional[List[float]] = None
     prompt_tokens_buckets: Optional[List[str]] = None
     generation_tokens_buckets: Optional[List[str]] = None
     decode_log_interval: int = 40
@@ -1399,6 +1402,27 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.collect_tokens_histogram,
             help="Collect prompt/generation tokens histogram.",
+        )
+        parser.add_argument(
+            "--bucket-eviction-duration",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_eviction_duration,
+            help="The buckets of eviction duration, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--bucket-load-back-duration",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_load_back_duration,
+            help="The buckets of load back duration, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--bucket-chunked-prefill-loop-count",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_chunked_prefill_loop_count,
+            help="The buckets of chunked prefill loop count, specified as a list of floats.",
         )
         bucket_rule = (
             "Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' "

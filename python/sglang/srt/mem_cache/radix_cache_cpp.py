@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Set
+import time
+from typing import TYPE_CHECKING, List, Optional, Set
 
 import torch
 
@@ -13,6 +14,7 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     TreeNodeCpp,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -51,6 +53,7 @@ class RadixCacheCpp(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         hicache_oracle: bool = False,
         enable_write_cancel: bool = False,
+        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         self.disable = disable
         self.enable_write_cancel = enable_write_cancel
@@ -74,6 +77,7 @@ class RadixCacheCpp(BasePrefixCache):
         self.page_size = page_size
 
         self.tp_group = tp_cache_group
+        self.scheduler_metrics_collector = scheduler_metrics_collector
 
         if not use_hicache:
             self.tree = RadixTreeCpp(
@@ -137,9 +141,12 @@ class RadixCacheCpp(BasePrefixCache):
         self.tree.lock_ref(node, True)
 
     def evict(self, num_tokens: int):
+        start_time = time.perf_counter()
         evicted_device_indices = self.tree.evict(num_tokens)
         for indice in evicted_device_indices:
             self.token_to_kv_pool.free(indice)
+        if self.scheduler_metrics_collector is not None:
+            self.scheduler_metrics_collector.observe_eviction_duration(time.perf_counter() - start_time)
 
     def evictable_size(self):
         return self.tree.evictable_size()

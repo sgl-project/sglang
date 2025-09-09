@@ -440,6 +440,10 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
+        # Init metrics stats
+        self.init_metrics(tp_rank, pp_rank, dp_rank)
+        self.init_kv_events(server_args.kv_events_config)
+
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
 
@@ -538,9 +542,6 @@ class Scheduler(
             else None
         )
 
-        # Init metrics stats
-        self.init_metrics(tp_rank, pp_rank, dp_rank)
-        self.init_kv_events(server_args.kv_events_config)
         self.init_dp_balance(dp_balance_meta)
 
         # Init disaggregation
@@ -641,6 +642,7 @@ class Scheduler(
                 page_size=self.page_size,
             )
         else:
+            metric_collector = self.metrics_collector if self.enable_metrics else None
             if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -656,6 +658,7 @@ class Scheduler(
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
                     enable_kv_cache_events=self.enable_kv_cache_events,
+                    scheduler_metrics_collector=metric_collector,
                 )
             elif self.enable_hierarchical_cache:
                 self.tree_cache = HiRadixCache(
@@ -677,6 +680,7 @@ class Scheduler(
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                     model_name=server_args.served_model_name,
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
+                    metric_collector=metric_collector,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -691,6 +695,7 @@ class Scheduler(
                     sliding_window_size=self.sliding_window_size,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    scheduler_metrics_collector=metric_collector,
                 )
             elif self.enable_lora:
                 assert (
@@ -727,6 +732,7 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
+                    scheduler_metrics_collector=metric_collector,
                 )
 
         self.decode_mem_cache_buf_multiplier = (
@@ -1852,6 +1858,7 @@ class Scheduler(
             for req in can_run_list:
                 req.queue_time_end = time.perf_counter()
                 req.add_latency(RequestStage.PREFILL_WAITING)
+                req.prefill_loop_count += 1
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
