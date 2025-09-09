@@ -25,7 +25,7 @@ class TorchFlexAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        pass
+        torch.cuda.empty_cache()
 
     def _causal_mask(self, b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
@@ -87,13 +87,6 @@ class TorchFlexAttnBackend(AttentionBackend):
             end_kv = start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
-
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -103,12 +96,11 @@ class TorchFlexAttnBackend(AttentionBackend):
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
             if causal:
-                seq_len_q = seq_len_kv
                 mask_mod = create_block_mask(
                     self._causal_mask,
                     None,
                     None,
-                    seq_len_q,
+                    extend_seq_len_q,
                     seq_len_kv,
                     device=query.device,
                     _compile=False,
@@ -116,9 +108,9 @@ class TorchFlexAttnBackend(AttentionBackend):
             else:
                 raise ValueError("We only support causal attention for now.")
 
-            per_req_out_redudant = (
+            output[start_q:end_q, :, :] = (
                 self.flex_attention(
-                    per_req_query_redudant.unsqueeze(0),
+                    per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
                     block_mask=mask_mod,
@@ -128,7 +120,6 @@ class TorchFlexAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
 
