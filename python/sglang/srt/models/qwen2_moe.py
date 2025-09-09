@@ -105,11 +105,14 @@ class Qwen2MoeMLP(nn.Module):
     def forward(
         self,
         x,
+        should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, skip_all_reduce=use_reduce_scatter)
+        x, _ = self.down_proj(
+            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        )
         return x
 
 

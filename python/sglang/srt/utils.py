@@ -230,8 +230,16 @@ except:
     is_intel_amx_backend_available = False
 
 
+try:
+    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # to support torch compile
+    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+except:
+    is_amx_tile_supported = False
+
+
 def cpu_has_amx_support():
-    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+    return is_amx_tile_supported and is_intel_amx_backend_available
 
 
 def use_intel_amx_backend(layer):
@@ -2824,6 +2832,10 @@ def lru_cache_frozenset(maxsize=128):
     return decorator
 
 
+def get_origin_rid(rid):
+    return rid.split("_", 1)[1] if "_" in rid else rid
+
+
 def apply_module_patch(target_module, target_function, wrappers):
     original_module, original_function = parse_module_path(
         target_module, target_function, False
@@ -2923,6 +2935,18 @@ def parse_module_path(module_path, function_name, create_dummy):
 
 
 def mxfp_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx95_supported():
     """
     Returns whether the current platform supports MX types.
     """
@@ -3048,3 +3072,12 @@ def check_cuda_result(raw_output):
         raise Exception(f"CUDA error: {err}")
 
     return results
+
+
+def numa_bind_to_node(node: int):
+    libnuma = ctypes.CDLL("libnuma.so")
+    if libnuma.numa_available() < 0:
+        raise SystemError("numa not available on this system")
+
+    libnuma.numa_run_on_node(ctypes.c_int(node))
+    libnuma.numa_set_localalloc()

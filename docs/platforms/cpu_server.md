@@ -138,8 +138,13 @@ Notes:
     You may need to set proper `--mem-fraction-static` or `--max-total-tokens`
     to avoid out-of-memory error.
 
-3. A warmup step is automatically triggered when the service is started.
-The server is ready when you see the log `The server is fired up and ready to roll!`.
+3. For optimizing decoding with torch.compile, please add the flag `--enable-torch-compile`.
+    To specify the maximum batch size when using torch compile, set the flag `--torch-compile-max-bs`.
+    For example, `--enable-torch-compile --torch-compile-max-bs 4` means using torch compile and setting the
+    maximum batch size to 4.
+
+4. A warmup step is automatically triggered when the service is started.
+    The server is ready when you see the log `The server is fired up and ready to roll!`.
 
 ## Benchmarking with Requests
 
