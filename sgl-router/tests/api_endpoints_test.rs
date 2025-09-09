@@ -1852,47 +1852,6 @@ mod rerank_tests {
     }
 
     #[tokio::test]
-    async fn test_rerank_empty_documents() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
-            port: 18109,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        }])
-        .await;
-
-        let app = ctx.create_app().await;
-
-        let payload = json!({
-            "query": "test query",
-            "documents": [],
-            "model": "test-model"
-        });
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/rerank")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&payload).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        // Should return empty results for empty documents
-        let results = body_json["results"].as_array().unwrap();
-        assert_eq!(results.len(), 0);
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn test_v1_rerank_compatibility() {
         let ctx = TestContext::new(vec![MockWorkerConfig {
             port: 18110,
@@ -1948,6 +1907,91 @@ mod rerank_tests {
         for result in results {
             assert!(result.get("document").is_some());
         }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rerank_invalid_request() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18111,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        // Test empty query string (validation should fail)
+        let payload = json!({
+            "query": "",
+            "documents": ["Document 1", "Document 2"],
+            "model": "test-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Test query with only whitespace (validation should fail)
+        let payload = json!({
+            "query": "   ",
+            "documents": ["Document 1", "Document 2"],
+            "model": "test-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Test empty documents list (validation should fail)
+        let payload = json!({
+            "query": "test query",
+            "documents": [],
+            "model": "test-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Test invalid top_k (validation should fail)
+        let payload = json!({
+            "query": "test query",
+            "documents": ["Document 1", "Document 2"],
+            "model": "test-model",
+            "top_k": 0
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         ctx.shutdown().await;
     }

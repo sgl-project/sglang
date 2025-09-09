@@ -1236,6 +1236,9 @@ impl RouterTrait for Router {
     }
 
     async fn route_rerank(&self, headers: Option<&HeaderMap>, body: &RerankRequest) -> Response {
+        if let Err(e) = body.validate() {
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
         let response = self.route_typed_request(headers, body, "/v1/rerank").await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {
@@ -1244,7 +1247,7 @@ impl RouterTrait for Router {
                     error!("Failed to build rerank response: {}", e);
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to build rerank response: {}", e),
+                        "Failed to build rerank response".to_string(),
                     )
                         .into_response();
                 }
