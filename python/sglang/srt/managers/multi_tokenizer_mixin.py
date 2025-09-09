@@ -20,6 +20,7 @@ import pickle
 import signal
 import sys
 import threading
+from enum import Enum
 from functools import partialmethod
 from multiprocessing import shared_memory
 from typing import Any, Dict, List
@@ -53,15 +54,16 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+class RouterType(Enum):
+    TOKENIZER_ROUTER = "tokenizer router"
+    DETOKENIZER_MANAGER = "detokenizer manager"
+    DETOKENIZER_ROUTER = "detokenizer router"
+
+
 class SocketMapping:
     def __init__(self):
         self._zmq_context = zmq.Context()
         self._mapping: Dict[str, zmq.Socket] = {}
-        self.type_list = [
-            "tokenizer router",
-            "detokenizer manager",
-            "detokenizer router",
-        ]
 
     def clear_all_sockets(self):
         for socket in self._mapping.values():
@@ -69,16 +71,23 @@ class SocketMapping:
         self._mapping.clear()
 
     def register_ipc_mapping(
-        self, recv_obj: MultiTokenizerRegisterReq, worker_id: str, type_id: int
+        self,
+        recv_obj: MultiTokenizerRegisterReq,
+        worker_id: str,
+        router_type: RouterType,
     ):
-        type_str = self.type_list[type_id]
-        ipc_name = worker_id if type_id == 2 else recv_obj.ipc_name
+        type_str = router_type.value
+        ipc_name = (
+            worker_id
+            if router_type == RouterType.DETOKENIZER_ROUTER
+            else recv_obj.ipc_name
+        )
         if worker_id in self._mapping:
             logger.warning(
                 f"Worker {worker_id} already registered in {type_str}, skipping..."
             )
             return
-        logger.info(f"Worker {worker_id}  not registered in {type_str}, registering...")
+        logger.info(f"Worker {worker_id} not registered in {type_str}, registering...")
         socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
         self._mapping[worker_id] = socket
         self._mapping[worker_id].send_pyobj(recv_obj)
@@ -367,7 +376,7 @@ class MultiHttpWorkerDetokenizerMixin:
             for i, worker_id in enumerate(worker_ids):
                 if isinstance(recv_obj, MultiTokenizerRegisterReq):
                     self.socket_mapping.register_ipc_mapping(
-                        recv_obj, worker_id, type_id=1
+                        recv_obj, worker_id, router_type=RouterType.DETOKENIZER_MANAGER
                     )
                 else:
                     if detokenizer_worker_num > 1:
@@ -439,7 +448,9 @@ class MultiTokenizerRouter:
         # Distribute result to each worker
         for i, worker_id in enumerate(worker_ids):
             if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                self.socket_mapping.register_ipc_mapping(recv_obj, worker_id, type_id=0)
+                self.socket_mapping.register_ipc_mapping(
+                    recv_obj, worker_id, router_type=RouterType.TOKENIZER_ROUTER
+                )
             else:
                 new_recv_obj = _handle_output_by_index(recv_obj, i)
                 self.socket_mapping.send_output(worker_id, new_recv_obj)
@@ -516,7 +527,9 @@ class MultiDetokenizerRouter:
                         self.socket_mapping.send_output(ipc_name, recv_obj)
                     else:
                         self.socket_mapping.register_ipc_mapping(
-                            recv_obj, ipc_name, type_id=2
+                            recv_obj,
+                            ipc_name,
+                            router_type=RouterType.DETOKENIZER_ROUTER,
                         )
                     self.worker_id_to_ipc_mapping[worker_id] = ipc_name
                     self.ipc_name_index = (

@@ -2274,12 +2274,8 @@ class ServerArgs:
             self.tokenizer_worker_num > 0 and self.detokenizer_worker_num > 0
         ), "Tokenizer/Detokenizer worker num must >= 1"
         assert (
-            self.tokenizer_worker_num > 1 or self.detokenizer_worker_num == 1
-        ), "Detokenizer worker num need Tokenizer worker num > 1"
-        assert (
-            self.tokenizer_worker_num == 1
-            or self.tokenizer_worker_num % self.detokenizer_worker_num == 0
-        ), "Tokenizer worker num need to be divisible by Detokenizer worker num"
+            self.tokenizer_worker_num % self.detokenizer_worker_num == 0
+        ), "Tokenizer worker num must be multiple of Detokenizer worker num"
 
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
