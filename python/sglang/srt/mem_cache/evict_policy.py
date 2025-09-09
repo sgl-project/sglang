@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List, Tuple, Union
+from typing import Tuple, Union
 
 from sglang.srt.mem_cache.radix_cache import TreeNode
 
