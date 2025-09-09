@@ -77,6 +77,7 @@ ALL_MODELS = [
         trust_remote_code=True,
         skip_long_prompt=True,
     ),
+    ModelCase("facebook/opt-125m", skip_long_prompt=True),
     ModelCase(
         "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5",
         tp_size=2,
