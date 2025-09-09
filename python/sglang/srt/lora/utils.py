@@ -13,16 +13,19 @@ class LoRABatchInfo:
     # Batch size
     bs: int
 
-    # Lengths of each sequence in shape (bs,)
+    # The forward mode is using CUDA Graph.
+    use_cuda_graph: bool
+
+    # Lengths of each segments in shape (num_segments,)
     seg_lens: torch.Tensor
 
-    # Indice pointers of each sequence in shape (bs + 1, )
+    # Indice pointers of each sequence in shape (num_segments + 1, )
     seg_indptr: torch.Tensor
 
     # Maximum sequence length of current batch
     max_len: int
 
-    # The index of lora adapter used by each sequence, in shape (bs,)
+    # The index of lora adapter used by each sequence, in shape (num_segments,)
     weight_indices: torch.Tensor
 
     # ranks of each lora adapter, in shape (lora_num,)
@@ -30,6 +33,9 @@ class LoRABatchInfo:
 
     # scaling of each lora adapter, in shape (lora_num,)
     scalings: torch.Tensor
+
+    # The logical (re)ordering of sequences in the batch, in shape (num_segments,)
+    permutation: Optional[torch.Tensor]
 
 
 class LoRAType(Enum):
