@@ -2276,8 +2276,9 @@ def get_local_ip_auto(fallback: str = None) -> str:
 
     Args:
         fallback (str, optional): Fallback IP address to return if all detection
-            methods fail. For server applications, explicitly set this to "0.0.0.0"
-            (IPv4) or "::" (IPv6) to bind to all available interfaces. Defaults to None.
+            methods fail. For server applications, explicitly set this to
+            "0.0.0.0" (IPv4) or "::" (IPv6) to bind to all available interfaces.
+            Defaults to None.
 
     Returns:
         str: The detected local IP address, or the fallback value if detection fails.
@@ -2288,8 +2289,8 @@ def get_local_ip_auto(fallback: str = None) -> str:
     Note:
         The function tries detection methods in the following order:
         1. Direct IP detection via get_ip()
-        2. Remote connection method via get_local_ip_by_remote()
-        3. Network interface enumeration via get_local_ip_by_nic()
+        2. Network interface enumeration via get_local_ip_by_nic()
+        3. Remote connection method via get_local_ip_by_remote()
     """
     if ip := get_ip():
         return ip
