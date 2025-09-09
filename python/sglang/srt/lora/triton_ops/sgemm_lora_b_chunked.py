@@ -54,7 +54,7 @@ def _sgemm_lora_b_kernel(
 
     pid_s = tl.program_id(axis=1)
     if pid_s >= num_segs:
-        return 
+        return
 
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len
@@ -74,7 +74,7 @@ def _sgemm_lora_b_kernel(
 
     # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_S) + seg_start
-    s_offset = tl.load(permutation + s_offset_logical, mask=s_offset_logical < seg_end)  
+    s_offset = tl.load(permutation + s_offset_logical, mask=s_offset_logical < seg_end)
 
     # Create pointers for the first block of x and weights[batch_id]
     # The pointers will be advanced as we move in the K direction
@@ -82,9 +82,7 @@ def _sgemm_lora_b_kernel(
     pid_n = tl.program_id(0)
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = tl.arange(0, BLOCK_K)
-    x_ptrs = x  + (
-        s_offset[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
-    )
+    x_ptrs = x + (s_offset[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
     w_ptrs = (weights + w_index * w_stride_0) + (
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )

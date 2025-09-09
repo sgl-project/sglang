@@ -1,13 +1,14 @@
 from typing import Optional
+
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
-    chunked_sgmv_lora_shrink_forward,
     chunked_sgmv_lora_expand_forward,
+    chunked_sgmv_lora_shrink_forward,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class ChunkedSgmvLoRABackend(BaseLoRABackend):
@@ -150,7 +151,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 num_segments=num_segments,
                 max_len=max_len,
                 use_cuda_graph=False,
-                seg_lens=None, 
+                seg_lens=None,
                 # TODO (lifu): technically we do not need seg_lens in triton either, we can convenge this logic later.
                 # seg_lens=torch.empty(
                 #     (num_segments,), dtype=torch.int32, device=self.device
@@ -186,9 +187,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             seg_weight_indices, non_blocking=True
         )
         batch_info.seg_indptr[: num_segments + 1].copy_(seg_indptr, non_blocking=True)
-        batch_info.permutation[: len(permutation)].copy_(
-            permutation, non_blocking=True
-        )
+        batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
 
         self.batch_info = batch_info
 
@@ -234,13 +233,15 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 seg_lens_list.extend([self.segment_size] * (num_segs - 1))
                 seg_lens_list.append(group_len - (num_segs - 1) * self.segment_size)
 
-            seg_lens = torch.tensor( seg_lens_list, dtype=torch.int32)
+            seg_lens = torch.tensor(seg_lens_list, dtype=torch.int32)
 
             weight_indices_list = torch.tensor(
-                weight_indices_list, dtype=torch.int32, pin_memory=True)
+                weight_indices_list, dtype=torch.int32, pin_memory=True
+            )
 
             seg_indptr = torch.empty(
-                (len(seg_lens) + 1,), dtype=torch.int32, pin_memory=True)
+                (len(seg_lens) + 1,), dtype=torch.int32, pin_memory=True
+            )
             seg_indptr[0] = 0
             seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
 

@@ -1,4 +1,5 @@
 from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -85,7 +86,9 @@ def _chunked_lora_expand_kernel(
 
     # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_S) + seg_start
-    s_offset_physical = tl.load(permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=-1)
+    s_offset_physical = tl.load(
+        permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=-1
+    )
 
     # Create pointers for the first block of x and weights[batch_id][n_start: n_end][:]
     # The pointers will be advanced as we move in the K direction
@@ -108,7 +111,8 @@ def _chunked_lora_expand_kernel(
     for k in range(0, tl.cdiv(cur_rank, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset_logical[:, None] < seg_end) & (k_offset[None, :] < cur_rank - k * BLOCK_K),
+            mask=(s_offset_logical[:, None] < seg_end)
+            & (k_offset[None, :] < cur_rank - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
@@ -125,11 +129,13 @@ def _chunked_lora_expand_kernel(
     # Store result to output matrix
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
-    output_ptr = (
-        output
-        + (s_offset_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
+    output_ptr = output + (
+        s_offset_physical[:, None] * output_stride_0
+        + n_offset[None, :] * output_stride_1
     )
-    output_mask = (s_offset_logical[:, None] < seg_end) & (n_offset[None, :] < slice_end)
+    output_mask = (s_offset_logical[:, None] < seg_end) & (
+        n_offset[None, :] < slice_end
+    )
     partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 

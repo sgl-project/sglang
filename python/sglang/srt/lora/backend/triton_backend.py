@@ -1,7 +1,7 @@
 from typing import Optional
+
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
     gate_up_lora_b_fwd,
@@ -10,6 +10,7 @@ from sglang.srt.lora.triton_ops import (
     sgemm_lora_b_fwd,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class TritonLoRABackend(BaseLoRABackend):
@@ -90,16 +91,16 @@ class TritonLoRABackend(BaseLoRABackend):
         )
         return lora_output
 
-    def init_cuda_graph_batch_info(self, cuda_graph_batch_info: LoRABatchInfo, max_bs_in_cuda_graph: int):
+    def init_cuda_graph_batch_info(
+        self, cuda_graph_batch_info: LoRABatchInfo, max_bs_in_cuda_graph: int
+    ):
         # Initialize seg_lens and seg_indptr for CUDA graph as they remain constant
         # across batches.
-        cuda_graph_batch_info.seg_lens[: max_bs_in_cuda_graph].fill_(1)
+        cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph].fill_(1)
         torch.cumsum(
-            cuda_graph_batch_info.seg_lens[: max_bs_in_cuda_graph],
+            cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph],
             dim=0,
-            out=cuda_graph_batch_info.seg_indptr[
-                1 : max_bs_in_cuda_graph + 1
-            ],
+            out=cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
         )
 
     def prepare_lora_batch(
@@ -124,7 +125,9 @@ class TritonLoRABackend(BaseLoRABackend):
         bs = forward_batch.batch_size
 
         if batch_info is not None:
-            assert batch_info.use_cuda_graph, "batch_info.use_cuda_graph must be True when batch_info is provided"
+            assert (
+                batch_info.use_cuda_graph
+            ), "batch_info.use_cuda_graph must be True when batch_info is provided"
             batch_info.bs = forward_batch.batch_size
         else:
             max_len = (
@@ -167,9 +170,6 @@ class TritonLoRABackend(BaseLoRABackend):
         batch_info.scalings[: self.max_loras_per_batch].copy_(
             scalings_tensor, non_blocking=True
         )
-        batch_info.weight_indices[:bs].copy_(
-            weight_indices_tensor, non_blocking=True
-        )
+        batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
 
         self.batch_info = batch_info
-

@@ -1,9 +1,9 @@
-from typing import Optional, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class BaseLoRABackend:
@@ -93,7 +93,9 @@ class BaseLoRABackend:
         """
         pass
 
-    def init_cuda_graph_batch_info(self, cuda_graph_batch_info: LoRABatchInfo, max_bs_in_cuda_graph: int):
+    def init_cuda_graph_batch_info(
+        self, cuda_graph_batch_info: LoRABatchInfo, max_bs_in_cuda_graph: int
+    ):
         """Initialize the batch info for CUDA Graph mode.
 
         This method provides a hook for each backend to conduct its own initialization
@@ -128,12 +130,14 @@ class BaseLoRABackend:
         """
         pass
 
+
 def get_backend_from_name(name: str) -> BaseLoRABackend:
     """
     Get corresponding backend class from backend's name
     """
     if name == "triton":
         from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+
         return TritonLoRABackend
     elif name == "csgmv":
         from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend

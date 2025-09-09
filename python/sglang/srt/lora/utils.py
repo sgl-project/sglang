@@ -16,7 +16,7 @@ class LoRABatchInfo:
     # The forward mode is using CUDA Graph.
     use_cuda_graph: bool
 
-    # Number of segments. 
+    # Number of segments.
     num_segments: Optional[int]
 
     # Lengths of each segments in shape (num_segments,)

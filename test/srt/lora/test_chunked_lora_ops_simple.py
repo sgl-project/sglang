@@ -61,13 +61,19 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
         q_dim = 1024
         kv_dim = 128
         total_output_dim = q_dim + 2 * kv_dim
-        
+
         batch_info = self.create_simple_batch_info(bs, seq_len, rank)
         total_tokens = bs * seq_len
 
         x = torch.randn((total_tokens, 3 * rank), device=self.device, dtype=self.dtype)
-        lora_weight_b = torch.randn((1, total_output_dim, rank), device=self.device, dtype=self.dtype)
-        slice_offsets = torch.tensor([0, q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim], dtype=torch.int32, device=self.device)
+        lora_weight_b = torch.randn(
+            (1, total_output_dim, rank), device=self.device, dtype=self.dtype
+        )
+        slice_offsets = torch.tensor(
+            [0, q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim],
+            dtype=torch.int32,
+            device=self.device,
+        )
         max_qkv_out_dim = max(q_dim, kv_dim)
 
         output = chunked_lora_expand_forward(
@@ -75,7 +81,7 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
             lora_weight_b=lora_weight_b,
             batch_info=batch_info,
             slice_offsets=slice_offsets,
-            max_slice_size=max_qkv_out_dim
+            max_slice_size=max_qkv_out_dim,
         )
 
         # Check output shape
@@ -93,18 +99,17 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
         input_dim = 2048
         rank = 32
         num_slices = 3
-        
+
         batch_info = self.create_simple_batch_info(bs, seq_len, rank)
         total_tokens = bs * seq_len
 
         x = torch.randn((total_tokens, input_dim), device=self.device, dtype=self.dtype)
-        weights = torch.randn((1, num_slices * rank, input_dim), device=self.device, dtype=self.dtype)
+        weights = torch.randn(
+            (1, num_slices * rank, input_dim), device=self.device, dtype=self.dtype
+        )
 
         output = chunked_lora_shrink_forward(
-            x=x,
-            weights=weights,
-            batch_info=batch_info,
-            num_slices=num_slices
+            x=x, weights=weights, batch_info=batch_info, num_slices=num_slices
         )
 
         # Check output shape
@@ -123,25 +128,33 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
         q_dim = 512
         kv_dim = 64
         total_output_dim = q_dim + 2 * kv_dim
-        
+
         batch_info = self.create_simple_batch_info(bs, seq_len, rank)
         total_tokens = bs * seq_len
 
         # Zero input
         x = torch.zeros((total_tokens, 3 * rank), device=self.device, dtype=self.dtype)
-        lora_weight_b = torch.randn((1, total_output_dim, rank), device=self.device, dtype=self.dtype)
-        slice_offsets = torch.tensor([0, q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim], dtype=torch.int32, device=self.device)
+        lora_weight_b = torch.randn(
+            (1, total_output_dim, rank), device=self.device, dtype=self.dtype
+        )
+        slice_offsets = torch.tensor(
+            [0, q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim],
+            dtype=torch.int32,
+            device=self.device,
+        )
 
         output = chunked_lora_expand_forward(
             x=x,
             lora_weight_b=lora_weight_b,
             batch_info=batch_info,
             slice_offsets=slice_offsets,
-            max_slice_size=max(q_dim, kv_dim)
+            max_slice_size=max(q_dim, kv_dim),
         )
 
         # Output should be zero (since input is zero)
-        expected_zero = torch.zeros((total_tokens, total_output_dim), device=self.device, dtype=self.dtype)
+        expected_zero = torch.zeros(
+            (total_tokens, total_output_dim), device=self.device, dtype=self.dtype
+        )
         torch.testing.assert_close(output, expected_zero, atol=1e-6, rtol=1e-6)
 
     def test_chunked_lora_shrink_zero_input(self):
@@ -151,23 +164,24 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
         input_dim = 1024
         rank = 32
         num_slices = 2
-        
+
         batch_info = self.create_simple_batch_info(bs, seq_len, rank)
         total_tokens = bs * seq_len
 
         # Zero input
         x = torch.zeros((total_tokens, input_dim), device=self.device, dtype=self.dtype)
-        weights = torch.randn((1, num_slices * rank, input_dim), device=self.device, dtype=self.dtype)
+        weights = torch.randn(
+            (1, num_slices * rank, input_dim), device=self.device, dtype=self.dtype
+        )
 
         output = chunked_lora_shrink_forward(
-            x=x,
-            weights=weights,
-            batch_info=batch_info,
-            num_slices=num_slices
+            x=x, weights=weights, batch_info=batch_info, num_slices=num_slices
         )
 
         # Output should be zero (since input is zero)
-        expected_zero = torch.zeros((total_tokens, num_slices * rank), device=self.device, dtype=self.dtype)
+        expected_zero = torch.zeros(
+            (total_tokens, num_slices * rank), device=self.device, dtype=self.dtype
+        )
         torch.testing.assert_close(output, expected_zero, atol=1e-6, rtol=1e-6)
 
     def test_chunked_lora_expand_different_slice_sizes(self):
@@ -175,25 +189,31 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
         bs = 1
         seq_len = 8
         rank = 16
-        
+
         # Test case 1: Q larger than K/V
         q_dim = 512
         kv_dim = 64
         total_output_dim = q_dim + 2 * kv_dim
-        
+
         batch_info = self.create_simple_batch_info(bs, seq_len, rank)
         total_tokens = bs * seq_len
 
         x = torch.randn((total_tokens, 3 * rank), device=self.device, dtype=self.dtype)
-        lora_weight_b = torch.randn((1, total_output_dim, rank), device=self.device, dtype=self.dtype)
-        slice_offsets = torch.tensor([0, q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim], dtype=torch.int32, device=self.device)
+        lora_weight_b = torch.randn(
+            (1, total_output_dim, rank), device=self.device, dtype=self.dtype
+        )
+        slice_offsets = torch.tensor(
+            [0, q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim],
+            dtype=torch.int32,
+            device=self.device,
+        )
 
         output = chunked_lora_expand_forward(
             x=x,
             lora_weight_b=lora_weight_b,
             batch_info=batch_info,
             slice_offsets=slice_offsets,
-            max_slice_size=max(q_dim, kv_dim)
+            max_slice_size=max(q_dim, kv_dim),
         )
 
         self.assertEqual(output.shape, (total_tokens, total_output_dim))
@@ -207,16 +227,24 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
         q_dim = 256
         kv_dim = 32
         total_output_dim = q_dim + 2 * kv_dim
-        
+
         batch_info = self.create_simple_batch_info(bs, seq_len, rank)
         total_tokens = bs * seq_len
 
         x = torch.randn((total_tokens, 3 * rank), device=self.device, dtype=self.dtype)
-        lora_weight_b = torch.randn((1, total_output_dim, rank), device=self.device, dtype=self.dtype)
-        slice_offsets = torch.tensor([0, q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim], dtype=torch.int32, device=self.device)
+        lora_weight_b = torch.randn(
+            (1, total_output_dim, rank), device=self.device, dtype=self.dtype
+        )
+        slice_offsets = torch.tensor(
+            [0, q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim],
+            dtype=torch.int32,
+            device=self.device,
+        )
 
         # Test with base output
-        base_output = torch.randn((total_tokens, total_output_dim), device=self.device, dtype=self.dtype)
+        base_output = torch.randn(
+            (total_tokens, total_output_dim), device=self.device, dtype=self.dtype
+        )
         original_base = base_output.clone()
 
         output = chunked_lora_expand_forward(
@@ -225,12 +253,12 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
             batch_info=batch_info,
             slice_offsets=slice_offsets,
             max_slice_size=max(q_dim, kv_dim),
-            base_output=base_output
+            base_output=base_output,
         )
 
         # Should return the same tensor (modified in place)
         self.assertTrue(torch.equal(output, base_output))
-        
+
         # Should not be the same as the original base
         self.assertFalse(torch.equal(output, original_base))
 
@@ -241,7 +269,7 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
         input_dim = 512
         rank = 16
         num_slices = 2
-        
+
         # Use a different scaling value
         seg_lens = torch.full((bs,), seq_len, dtype=torch.int32, device="cpu")
         total_tokens = seg_lens.sum().item()
@@ -251,7 +279,7 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
 
         weight_indices = torch.zeros((bs,), dtype=torch.int32, device=self.device)
         lora_ranks = torch.tensor([rank], dtype=torch.int64, device=self.device)
-        
+
         # Different scaling - should not affect shrink output
         scalings = torch.tensor([2.0], dtype=torch.float, device=self.device)
         permutation = torch.arange(total_tokens, dtype=torch.int32, device=self.device)
@@ -270,23 +298,19 @@ class TestChunkedLoRAOpsSimple(CustomTestCase):
         )
 
         x = torch.randn((total_tokens, input_dim), device=self.device, dtype=self.dtype)
-        weights = torch.randn((1, num_slices * rank, input_dim), device=self.device, dtype=self.dtype)
+        weights = torch.randn(
+            (1, num_slices * rank, input_dim), device=self.device, dtype=self.dtype
+        )
 
         # Get output with scaling = 2.0
         output_scaled = chunked_lora_shrink_forward(
-            x=x,
-            weights=weights,
-            batch_info=batch_info,
-            num_slices=num_slices
+            x=x, weights=weights, batch_info=batch_info, num_slices=num_slices
         )
 
         # Get output with scaling = 1.0
         batch_info.scalings[0] = 1.0
         output_normal = chunked_lora_shrink_forward(
-            x=x,
-            weights=weights,
-            batch_info=batch_info,
-            num_slices=num_slices
+            x=x, weights=weights, batch_info=batch_info, num_slices=num_slices
         )
 
         # Shrink should not be affected by scaling (scaling is applied in expand)

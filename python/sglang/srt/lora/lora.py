@@ -25,11 +25,11 @@ from typing import Dict, List
 import torch
 from torch import nn
 
-from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
-from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.hf_transformers_utils import AutoConfig
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
+from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
 
@@ -158,7 +158,9 @@ class LoRAAdapter(nn.Module):
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
                 if up_name not in weights:
                     weights[up_name] = torch.zeros_like(weights[weight_name])
-                    assert isinstance(self.lora_backend, TritonLoRABackend) or isinstance(self.lora_backend, ChunkedSgmvLoRABackend), (
+                    assert isinstance(
+                        self.lora_backend, TritonLoRABackend
+                    ) or isinstance(self.lora_backend, ChunkedSgmvLoRABackend), (
                         f"LoRA weight initialization currently only supported for 'triton' backend and `csgmv`. "
                         f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
                         f"or consider implementing custom initialization logic for other backends."

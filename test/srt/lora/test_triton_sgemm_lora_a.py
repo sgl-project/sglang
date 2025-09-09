@@ -3,12 +3,12 @@ import unittest
 import torch
 import triton
 
+from sglang.srt.lora.triton_ops.sgemm_lora_a import (
+    _sgemm_lora_a_kernel as _sgemm_lora_a_kernel_non_chunked,
+)
 from sglang.srt.lora.triton_ops.sgemm_lora_a_chunked import (
     _sgemm_lora_a_kernel_chunked,
     sgemm_lora_a_fwd_chunked,
-)
-from sglang.srt.lora.triton_ops.sgemm_lora_a import (
-    _sgemm_lora_a_kernel as _sgemm_lora_a_kernel_non_chunked,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.test.test_utils import CustomTestCase
@@ -139,17 +139,14 @@ class TestTritonSgemmLoraA(CustomTestCase):
             (8, rank * stack_num, input_dim), device=self.device, dtype=self.dtype
         )
 
-        # Call the high-level chunked function 
-        output = sgemm_lora_a_fwd_chunked(
-            x, weights, batch_info, stack_num=stack_num
-        )
+        # Call the high-level chunked function
+        output = sgemm_lora_a_fwd_chunked(x, weights, batch_info, stack_num=stack_num)
 
         # Compute reference result using PyTorch
         expected = torch.mm(x, weights[0].T)
 
         # Check that kernel output matches reference
         torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
-
 
 
 if __name__ == "__main__":
