@@ -218,11 +218,12 @@ class TorchNativeAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
+        
+        if layer.is_cross_attention:
+            cache_loc = forward_batch.encoder_out_cache_loc
+        else:
+            cache_loc = forward_batch.out_cache_loc
+
         if save_kv_cache and k is not None and v is not None:
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
@@ -276,9 +277,13 @@ class TorchNativeAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
+        if layer.is_cross_attention:
+            cache_loc = forward_batch.encoder_out_cache_loc
+        else:
+            cache_loc = forward_batch.out_cache_loc
+
         if save_kv_cache:
-            if k is not None:
-                assert v is not None
+            if k is not None and v is not None:
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
