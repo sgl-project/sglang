@@ -238,6 +238,7 @@ def throughput_test_once(
     server_info = backend.get_server_info()
 
     measurement_results["total_latency"] = latency
+    measurement_results["total_output"] = sum(len(o["embedding"]) for o in gen_out)
     measurement_results["average_e2e_latency"] = sum(o["meta_info"]["e2e_latency"] for o in gen_out) / len(gen_out)
     measurement_results["request_throughput"] = measurement_results["successful_requests"] / latency
     measurement_results["input_throughput"] = measurement_results["total_input_tokens"] / latency
@@ -339,6 +340,7 @@ def throughput_test(
     print("{:<40} {:<10}".format("Successful requests:", result["successful_requests"]))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", result["total_latency"]))
     print("{:<40} {:<10}".format("Total input tokens:", result["total_input_tokens"]))
+    print("{:<40} {:<10}".format("Total generated embeddings:", result["total_output"]))
     print("{:<40} {:<10.2f}".format("Average e2e latency (s):", result["average_e2e_latency"]))
     print("{:<40} {:<10.2f}".format("Last generation throughput (tok/s):", result["last_gen_throughput"]))
     print("{:<40} {:<10.2f}".format("Request throughput (req/s):", result["request_throughput"]))
