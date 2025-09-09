@@ -746,10 +746,9 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_calls = None
             if request.tool_choice != "none" and request.tools:
                 tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-                result = self._process_tool_calls(
+                tool_calls, text, finish_reason = self._process_tool_calls(
                     text, request.tools, tool_call_parser, finish_reason, request.tool_choice
                 )
-                tool_calls, text, finish_reason = result.tool_calls, result.remaining_text, result.finish_reason
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,

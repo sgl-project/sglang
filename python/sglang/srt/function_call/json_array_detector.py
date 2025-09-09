@@ -5,7 +5,7 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 
 
-class JsonDetector(BaseFormatDetector):
+class JsonArrayDetector(BaseFormatDetector):
     """
     Detector for JSON array tool calls when JSON schema constraints are active.
     

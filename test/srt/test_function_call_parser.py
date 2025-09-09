@@ -7,7 +7,7 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
-from sglang.srt.function_call.json_detector import JsonDetector
+from sglang.srt.function_call.json_array_detector import JsonArrayDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
@@ -2191,7 +2191,7 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertEqual(self.detector._buffer, "")
 
 
-class TestJsonDetector(unittest.TestCase):
+class TestJsonArrayDetector(unittest.TestCase):
     def setUp(self):
         # Create sample tools for testing
         self.tools = [
@@ -2233,10 +2233,10 @@ class TestJsonDetector(unittest.TestCase):
                 ),
             ),
         ]
-        self.detector = JsonDetector()
+        self.detector = JsonArrayDetector()
 
     def test_json_detector_ebnf(self):
-        """Test that the JsonDetector returns NotImplementedError for EBNF."""
+        """Test that the JsonArrayDetector returns NotImplementedError for EBNF."""
         with self.assertRaises(NotImplementedError) as context:
             self.detector.build_ebnf(self.tools)
         self.assertIn("EBNF generation is not supported for JSON schema constraints", str(context.exception))
