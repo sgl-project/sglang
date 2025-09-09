@@ -549,7 +549,7 @@ class TestEBNFGeneration(unittest.TestCase):
         # Check that the EBNF contains expected patterns
         self.assertIn("<｜tool▁calls▁begin｜>", ebnf)
         self.assertIn("<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather", ebnf)
-        self.assertIn('\\"location\\"" ":" basic_string ', ebnf)
+        self.assertIn('\\"location\\"" ws ":" ws basic_string ', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -591,8 +591,8 @@ class TestEBNFGeneration(unittest.TestCase):
         self.assertIsNotNone(ebnf)
 
         # Check that the EBNF contains expected patterns
-        self.assertIn('\\"name\\"" ":" "\\"get_weather\\"', ebnf)
-        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+        self.assertIn('\\"name\\"" ws ":" ws "\\"get_weather\\"', ebnf)
+        self.assertIn('"\\"arguments\\"" ws ":"', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -609,7 +609,7 @@ class TestEBNFGeneration(unittest.TestCase):
         # Check that the EBNF contains expected patterns
         self.assertIn('"[TOOL_CALLS] ["', ebnf)
         self.assertIn("call_get_weather | call_search", ebnf)
-        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+        self.assertIn('"\\"arguments\\"" ws ":"', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -625,8 +625,8 @@ class TestEBNFGeneration(unittest.TestCase):
 
         # Check that the EBNF contains expected patterns
         self.assertIn("<tool_call>", ebnf)
-        self.assertIn('\\"name\\"" ":" "\\"get_weather\\"', ebnf)
-        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+        self.assertIn('\\"name\\"" ws ":" ws "\\"get_weather\\"', ebnf)
+        self.assertIn('"\\"arguments\\"" ws ":"', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -724,13 +724,13 @@ class TestEBNFGeneration(unittest.TestCase):
                     # Pythonic format: location="Paris" ( , ( unit=("celsius" | "fahrenheit") )?
                     self.assertIn('"location" "=" basic_string', ebnf)
                     # The comma should be inside the optional brackets for unit
-                    self.assertIn('( "," ( "unit" "=" ', ebnf)
+                    self.assertIn('( ws "," ws ( "unit" "=" ', ebnf)
                 else:
                     # JSON format: "location": "Paris" ( , ( "unit": ("celsius" | "fahrenheit") )?
-                    self.assertIn('"location\\"" ":" basic_string', ebnf)
+                    self.assertIn('"location\\"" ws ":" ws basic_string', ebnf)
                     # The comma should be part of the optional group
                     # This pattern ensures no trailing comma when unit is omitted
-                    self.assertIn('( "," ( "\\"unit\\"" ":"', ebnf)
+                    self.assertIn('( ws "," ws ( "\\"unit\\"" ws ":"', ebnf)
 
                 # Validate that the EBNF can be compiled
                 try:
@@ -788,7 +788,7 @@ class TestEBNFGeneration(unittest.TestCase):
                 )
 
                 # Check required field
-                self.assertIn('"required_field\\"" ":" basic_string', ebnf)
+                self.assertIn('"required_field\\"" ws ":" ws basic_string', ebnf)
 
                 # Check the structure for optional parameters
                 # The pattern should be: required_field ( "," ( opt1 ... | opt2 ... | opt3 ... ) )?
@@ -797,16 +797,16 @@ class TestEBNFGeneration(unittest.TestCase):
                 # Check that optional parameters are in a group with comma
                 if args_rule:  # Only check if args_rule was found
                     self.assertIn(
-                        '( ","',
+                        '( ws "," ws (',
                         args_rule,
                         f"{name} should have comma grouped with optional parameters",
                     )
 
                     # Check for the alternation pattern that allows flexible ordering
                     # Should contain patterns like: opt1 ... | opt2 ... | opt3
-                    self.assertIn('"opt1\\"" ":" basic_number', args_rule)
-                    self.assertIn('"opt2\\"" ":" basic_boolean', args_rule)
-                    self.assertIn('"opt3\\"" ":" basic_string', args_rule)
+                    self.assertIn('"opt1\\"" ws ":" ws basic_number', args_rule)
+                    self.assertIn('"opt2\\"" ws ":" ws basic_boolean', args_rule)
+                    self.assertIn('"opt3\\"" ws ":" ws basic_string', args_rule)
 
                     # Check for alternation (|) which allows skipping optional parameters
                     self.assertIn(
@@ -881,9 +881,9 @@ class TestEBNFGeneration(unittest.TestCase):
                     # This allows flexible ordering where any optional can appear first
 
                     # Check the structure
-                    self.assertIn('"opt1\\"" ":" basic_string', args_rule)
-                    self.assertIn('"opt2\\"" ":" basic_number', args_rule)
-                    self.assertIn('"opt3\\"" ":" basic_boolean', args_rule)
+                    self.assertIn('"opt1\\"" ws ":" ws basic_string', args_rule)
+                    self.assertIn('"opt2\\"" ws ":" ws basic_number', args_rule)
+                    self.assertIn('"opt3\\"" ws ":" ws basic_boolean', args_rule)
 
                     # The pattern SHOULD have alternation (|) for flexible ordering
                     self.assertIn(

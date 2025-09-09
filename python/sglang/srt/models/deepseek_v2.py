@@ -25,7 +25,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -34,9 +33,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
-)
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -249,7 +245,11 @@ class DeepseekV2MLP(nn.Module):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        if gemm_output_zero_allocator != None and x.shape[0] <= 256:
+        if (
+            gemm_output_zero_allocator is not None
+            and x.shape[0] <= 256
+            and self.gate_up_proj.weight.dtype == torch.uint8
+        ):
             y = gemm_output_zero_allocator.allocate(
                 x.shape[0] * self.gate_up_proj.output_size_per_partition
             ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
@@ -524,12 +524,8 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-            final_hidden_states_out = torch.empty_like(final_hidden_states)
+        final_hidden_states += shared_output
 
-        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-        final_hidden_states = final_hidden_states_out
-        sm.tag(final_hidden_states)
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -567,11 +563,8 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
-            with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-                final_hidden_states_out = torch.empty_like(final_hidden_states)
-            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-            final_hidden_states = final_hidden_states_out
-            sm.tag(final_hidden_states)
+            final_hidden_states = final_hidden_states + shared_output
+
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -1041,6 +1034,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         # Determine attention backend used by current forward batch
         if forward_batch.forward_mode.is_decode_or_idle():
             attention_backend = global_server_args_dict["decode_attention_backend"]
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
+            # Use the specified backend for speculative operations (both verify and draft extend)
+            if global_server_args_dict["speculative_attention_mode"] == "decode":
+                attention_backend = global_server_args_dict["decode_attention_backend"]
+            else:  # default to prefill
+                attention_backend = global_server_args_dict["prefill_attention_backend"]
         else:
             attention_backend = global_server_args_dict["prefill_attention_backend"]
         self.current_attention_backend = attention_backend

@@ -64,6 +64,9 @@ class GraphCaptureContext:
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+# use int value instead of ReduceOp.SUM to support torch compile
+REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
+
 
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]]
@@ -489,9 +492,7 @@ class GroupCoordinator:
 
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
-                torch.ops.sgl_kernel.shm_allreduce(
-                    input_, torch.distributed.ReduceOp.SUM
-                )
+                torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
@@ -508,17 +509,6 @@ class GroupCoordinator:
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
-
-        if (
-            self.pynccl_comm is not None
-            and hasattr(input_, "symmetric_memory")
-            and input_.symmetric_memory
-        ):
-            with self.pynccl_comm.change_state(
-                enable=True, stream=torch.cuda.current_stream()
-            ):
-                self.pynccl_comm.all_reduce(input_)
-                return input_
 
         outplace_all_reduce_method = None
         if (
