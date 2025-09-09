@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "cutlass_sm100_mla/device/sm100_mla.hpp"
 #include "cutlass_sm100_mla/kernel/sm100_mla_tile_scheduler.hpp"
+#include "utils.h"
 
 // clang-format off
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
@@ -162,7 +163,7 @@ typename T::Fmha::Arguments args_from_options(
       // TODO(trevor-m): Change split_kv back to -1 when
       // https://github.com/NVIDIA/cutlass/issues/2274 is fixed. Split_kv=1 will
       // perform worse with larger context length and smaller batch sizes.
-      num_kv_splits, // split_kv
+      static_cast<int>(num_kv_splits), // split_kv
       nullptr,       // is_var_split_kv
   };
   // TODO(kaixih@nvidia): When split_kv=-1 and is_var_split_kv=false, we compute
@@ -217,6 +218,10 @@ void cutlass_mla_decode(
     torch::Tensor const& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
+  auto sm_version = getSMVersion();
+  // On SM103a, half of the accuracy tests are failing.
+  TORCH_CHECK(sm_version == 100, "cutlass_mla_decode is only supported on compute capability 10.0, but found sm version ", sm_version);
+
   auto in_dtype = q_nope.dtype();
   at::cuda::CUDAGuard device_guard{(char)q_nope.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope.get_device());
@@ -259,7 +264,7 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
   // Assumes device 0 when getting sm_count.
   arguments.hw_info.sm_count =
       sm_count <= 0 ? cutlass::KernelHardwareInfo::query_device_multiprocessor_count(/*device_id=*/0) : sm_count;
-  arguments.split_kv = num_kv_splits;
+  arguments.split_kv = static_cast<int>(num_kv_splits);
   MlaSm100Type::Fmha::set_split_kv(arguments);
 
   return MlaSm100Type::Fmha::get_workspace_size(arguments);

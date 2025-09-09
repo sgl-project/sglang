@@ -43,11 +43,17 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sgl_kernel import (
-        sgl_per_tensor_quant_fp8,
-        sgl_per_token_group_quant_fp8,
-        sgl_per_token_quant_fp8,
-    )
+    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
+
+    # Temporary
+    try:
+        from sgl_kernel import sgl_per_token_group_quant_8bit
+
+        enable_sgl_per_token_group_quant_8bit = True
+    except ImportError:
+        from sgl_kernel import sgl_per_token_group_quant_fp8
+
+        enable_sgl_per_token_group_quant_8bit = False
 
 if _is_hip:
     if _use_aiter:
@@ -298,7 +304,7 @@ def _per_token_group_quant_8bit_raw(
         )
 
     if scale_ue8m0:
-        from deep_gemm.utils.layout import transform_sf_into_required_layout
+        from deep_gemm import transform_sf_into_required_layout
 
         assert group_size == 128
         x_s = transform_sf_into_required_layout(
@@ -338,7 +344,7 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
     #     scale_ue8m0=scale_ue8m0,
     # )
 
-    from deep_gemm.utils.layout import transform_sf_into_required_layout
+    from deep_gemm import transform_sf_into_required_layout
 
     from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
 
@@ -496,9 +502,24 @@ def sglang_per_token_group_quant_fp8(
     )
 
     if x.shape[0] > 0:
-        sgl_per_token_group_quant_fp8(
-            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
-        )
+        # Temporary
+        if enable_sgl_per_token_group_quant_8bit:
+            sgl_per_token_group_quant_8bit(
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                fuse_silu_and_mul,
+                masked_m,
+            )
+        else:
+            sgl_per_token_group_quant_fp8(
+                x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+            )
 
     return x_q, x_s
 
