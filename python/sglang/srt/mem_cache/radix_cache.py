@@ -240,7 +240,7 @@ class RadixCache(BasePrefixCache):
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
-        """Cache request when it is unfinished."""
+        """Cache request when it is unfinished, by creating a new node for previous + newly generated tokens."""
         if self.disable:
             return
 
