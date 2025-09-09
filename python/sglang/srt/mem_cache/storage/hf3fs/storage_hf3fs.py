@@ -13,7 +13,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
-from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
+from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
 from sglang.srt.metrics.collector import StorageMetrics
 
 logger = logging.getLogger(__name__)
@@ -114,6 +114,33 @@ def synchronized():
     return _decorator
 
 
+def create_hf3fs_client(
+    path: str, size: int, bytes_per_page: int, entries: int, use_mock: bool = False
+) -> Hf3fsClient:
+    """Factory function to create appropriate HF3FS client.
+
+    Args:
+        path: File path for storage
+        size: Total size of storage file
+        bytes_per_page: Bytes per page
+        entries: Number of entries for batch operations
+        use_mock: Whether to use mock client instead of real usrbio client
+
+    Returns:
+    """
+    if use_mock:
+        from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsMockClient
+
+        logger.info(f"[Rank Using Hf3fsMockClient for testing")
+        return Hf3fsMockClient(path, size, bytes_per_page, entries)
+    else:
+        from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import (
+            Hf3fsUsrBioClient,
+        )
+
+        return Hf3fsUsrBioClient(path, size, bytes_per_page, entries)
+
+
 class HiCacheHF3FS(HiCacheStorage):
     """HiCache backend that stores KV cache pages in HF3FS files."""
 
@@ -131,6 +158,7 @@ class HiCacheHF3FS(HiCacheStorage):
         metadata_client: Hf3fsMetadataInterface,
         is_mla_model: bool = False,
         is_page_first_layout: bool = False,
+        use_mock_client: bool = False,
     ):
         self.rank = rank
         self.file_path = file_path
@@ -159,8 +187,12 @@ class HiCacheHF3FS(HiCacheStorage):
 
         self.ac = AtomicCounter(self.numjobs)
         self.clients = [
-            Hf3fsClient(
-                self.file_path, self.file_size, self.bytes_per_page, self.entries
+            create_hf3fs_client(
+                self.file_path,
+                self.file_size,
+                self.bytes_per_page,
+                self.entries,
+                use_mock_client,
             )
             for _ in range(numjobs)
         ]
@@ -202,14 +234,24 @@ class HiCacheHF3FS(HiCacheStorage):
             Hf3fsLocalMetadataClient,
         )
 
+        use_mock_client = False
         if storage_config is not None:
             rank, is_mla_model, is_page_first_layout = (
                 storage_config.tp_rank,
                 storage_config.is_mla_model,
                 storage_config.is_page_first_layout,
             )
+
+            if storage_config.extra_config is not None:
+                use_mock_client = storage_config.extra_config.get(
+                    "use_mock_hf3fs_client", False
+                )
         else:
-            rank, is_mla_model, is_page_first_layout = 0, False, False
+            rank, is_mla_model, is_page_first_layout = (
+                0,
+                False,
+                False,
+            )
 
         mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
 
@@ -228,6 +270,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 dtype=dtype,
                 metadata_client=Hf3fsLocalMetadataClient(),
                 is_page_first_layout=is_page_first_layout,
+                use_mock_client=use_mock_client,
             )
 
         try:
@@ -277,6 +320,7 @@ class HiCacheHF3FS(HiCacheStorage):
             metadata_client=metadata_client,
             is_mla_model=is_mla_model,
             is_page_first_layout=is_page_first_layout,
+            use_mock_client=use_mock_client,
         )
 
     def get(
