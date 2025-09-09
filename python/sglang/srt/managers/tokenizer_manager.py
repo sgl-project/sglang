@@ -80,7 +80,7 @@ from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_regi
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs, is_port_available
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_gc_warning,
     dataclass_to_string_truncated,

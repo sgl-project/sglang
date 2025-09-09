@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, List, Optional, Type
 import torch
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
-from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
