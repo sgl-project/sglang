@@ -1406,7 +1406,7 @@ def get_xpu_memory_capacity():
     return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
 
 
-def (device: str = None):
+def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
