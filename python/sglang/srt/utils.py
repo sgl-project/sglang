@@ -384,12 +384,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
 
 
 def get_available_gpu_memory(
-    device,
-    gpu_id,
-    distributed=False,
-    empty_cache=True,
-    cpu_group=None,
-    cpu_cache_cleared=True,
+    device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
     """
     Get available memory for cuda:gpu_id device.
@@ -439,39 +434,9 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
-            logger.warning(
-                f"With SGLANG_CPU_OMP_THREADS_BIND set, the available memory amounts of the ranks cannot be determined in prior. "
-                f"Please set proper `--mem-fraction-static` or `--max-total-tokens` to eliminate the out-of-memory risk."
-            )
-            free_gpu_memory = psutil.virtual_memory().available
-        else:
-            libnuma = ctypes.CDLL(
-                "libnuma" + (".dylib" if platform.system() == "Darwin" else ".so"),
-                use_errno=True,
-            )
-            libnuma.numa_max_node.restype = ctypes.c_int
-            libnuma.numa_node_size64.argtypes = [
-                ctypes.c_int,
-                ctypes.POINTER(ctypes.c_longlong),
-            ]
-            libnuma.numa_node_size64.restype = ctypes.c_longlong
-            max_numa_index = libnuma.numa_max_node()
-            if 0 <= gpu_id <= max_numa_index:
-                free_size = ctypes.c_longlong()
-                numa_mem_size = libnuma.numa_node_size64(
-                    gpu_id, ctypes.byref(free_size)
-                )
-                # free_size is inaccurate if cache not cleared, use total numa memory size
-                free_gpu_memory = (
-                    free_size.value if cpu_cache_cleared else numa_mem_size
-                )
-            else:
-                raise ValueError(
-                    f"The rank index should be between 0-{max_numa_index} but {gpu_id} is detected. "
-                    "Please check your settings to correct it."
-                )
-
+        total_free_memory = psutil.virtual_memory().available
+        n_numa_node: int = len(get_cpu_ids_by_node())
+        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus

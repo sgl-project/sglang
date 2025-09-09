@@ -84,6 +84,7 @@ git checkout <YOUR-DESIRED-VERSION>
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
+pip install intel-openmp
 pip install -e "python[all_cpu]"
 
 # Build the CPU backend kernels
@@ -134,9 +135,8 @@ Notes:
     ```
 
     Please beware that with SGLANG_CPU_OMP_THREADS_BIND set,
-    the available memory amounts of the ranks cannot be determined in prior.
-    You may need to set proper `--mem-fraction-static` or `--max-total-tokens`
-    to avoid out-of-memory error.
+    the available memory amounts of the ranks may not be determined in prior.
+    You may need to set proper `--max-total-tokens` to avoid the out-of-memory error.
 
 3. For optimizing decoding with torch.compile, please add the flag `--enable-torch-compile`.
     To specify the maximum batch size when using torch compile, set the flag `--torch-compile-max-bs`.

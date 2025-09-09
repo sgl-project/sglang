@@ -210,7 +210,6 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
-        self.cpu_mem_cache_cleared = False
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -233,15 +232,6 @@ class ModelRunner:
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
-            if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND") is None:
-                try:
-                    os.system("echo 3 | tee /proc/sys/vm/drop_caches")
-                    self.cpu_mem_cache_cleared = True
-                except Exception:
-                    logger.warning(
-                        f"Failed to clear CPU memory caches. Available memory amount information might be inaccurate. "
-                        f"Please set proper `--mem-fraction-static` or `--max-total-tokens` to avoid out-of-memory error."
-                    )
             self.init_threads_binding()
 
         # Get memory before model loading
@@ -655,7 +645,6 @@ class ModelRunner:
             self.gpu_id,
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
-            cpu_cache_cleared=self.cpu_mem_cache_cleared,
         )
         self.tp_group = get_tp_group()
         self.pp_group = get_pp_group()
@@ -663,7 +652,7 @@ class ModelRunner:
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if self.tp_size > 1 and self.device != "cpu" and not self.is_draft_worker:
+        if self.tp_size > 1 and not self.is_draft_worker:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
                     logger.warning(
@@ -1084,7 +1073,6 @@ class ModelRunner:
             self.gpu_id,
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
-            cpu_cache_cleared=self.cpu_mem_cache_cleared,
         )
         if self.is_draft_worker:
             num_layers = getattr(
@@ -1685,10 +1673,9 @@ class ModelRunner:
 
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
+        cpu_ids_by_node = get_cpu_ids_by_node()
+        n_numa_node = len(cpu_ids_by_node)
         if omp_cpuids == "all":
-            cpu_ids_by_node = get_cpu_ids_by_node()
-            n_numa_node = len(cpu_ids_by_node)
-
             assert self.tp_size <= n_numa_node, (
                 f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
                 f"tp_size {self.tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
@@ -1706,6 +1693,12 @@ class ModelRunner:
             self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
         else:
             self.local_omp_cpuid = omp_cpuids.split("|")[self.tp_rank]
+            if self.tp_size > n_numa_node:
+                logger.warning(
+                    f"TP size ({self.tp_size})is larger than numa node number ({n_numa_node}), "
+                    f"in this case the available memory amount of each rank cannot be determined in prior. "
+                    f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
+                )
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
