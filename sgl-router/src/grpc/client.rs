@@ -37,20 +37,6 @@ impl SglangSchedulerClient {
         Ok(Self { client })
     }
 
-    /// Initialize the connection
-    pub async fn initialize(
-        &mut self,
-        client_id: String,
-    ) -> Result<proto::InitializeResponse, Box<dyn std::error::Error>> {
-        let request = Request::new(proto::InitializeRequest {
-            client_id,
-            client_version: "0.1.0".to_string(),
-            mode: proto::initialize_request::Mode::Regular as i32,
-        });
-
-        let response = self.client.initialize(request).await?;
-        Ok(response.into_inner())
-    }
 
     /// Submit a generation request (returns streaming response)
     pub async fn generate_stream(
@@ -111,14 +97,10 @@ mod tests {
     #[test]
     fn test_proto_types_compilation() {
         // Test that protobuf types can be constructed
-        let init_req = proto::InitializeRequest {
-            client_id: "test-client".to_string(),
-            client_version: "0.1.0".to_string(),
-            mode: 0,
+        let health_req = proto::HealthCheckRequest {
+            include_detailed_metrics: true,
         };
-        assert_eq!(init_req.client_id, "test-client");
-        assert_eq!(init_req.client_version, "0.1.0");
-        assert_eq!(init_req.mode, 0);
+        assert_eq!(health_req.include_detailed_metrics, true);
     }
 
     #[test]

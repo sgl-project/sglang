@@ -172,28 +172,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         logger.info("Standalone gRPC scheduler service initialized")
 
-    async def Initialize(
-        self,
-        request: sglang_scheduler_pb2.InitializeRequest,
-        context: grpc.aio.ServicerContext,
-    ) -> sglang_scheduler_pb2.InitializeResponse:
-        """Handle client initialization."""
-        logger.info(f"Client initialization: {request.client_id}")
-
-        try:
-            return sglang_scheduler_pb2.InitializeResponse(
-                success=True,
-                scheduler_version=self._get_version(),
-                model_info=self._create_model_info(),
-                capabilities=self._create_capabilities(),
-            )
-        except Exception as e:
-            logger.error(f"Initialize failed: {e}")
-            return sglang_scheduler_pb2.InitializeResponse(
-                success=False,
-                scheduler_version=self._get_version(),
-                error_message=str(e),
-            )
 
     async def Generate(
         self,
@@ -518,57 +496,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ),
         )
 
-    def _create_model_info(self) -> sglang_scheduler_pb2.ModelInfo:
-        """Create model info from server configuration."""
-        return sglang_scheduler_pb2.ModelInfo(
-            model_name=self.model_info.get("model_name", "unknown"),
-            max_context_length=self.model_info.get("max_context_length", 8192),
-            vocab_size=self.model_info.get("vocab_size", 128256),
-            supports_tool_calling=False,
-            supports_vision=self.model_info.get("supports_vision", False),
-            special_tokens=[],
-            model_type=self.model_info.get("model_type", "unknown"),
-            num_layers=self.model_info.get("num_layers", 32),
-            hidden_size=self.model_info.get("hidden_size", 4096),
-            num_attention_heads=self.model_info.get("num_attention_heads", 32),
-            num_key_value_heads=self.model_info.get("num_key_value_heads", 8),
-            tokenizer_type="unknown",
-            eos_token_ids=self.model_info.get("eos_token_ids", []),
-            pad_token_id=self.model_info.get("pad_token_id", 0),
-            bos_token_id=self.model_info.get("bos_token_id", 1),
-        )
-
-    def _create_capabilities(self) -> sglang_scheduler_pb2.ServerCapabilities:
-        """Create server capabilities."""
-        return sglang_scheduler_pb2.ServerCapabilities(
-            continuous_batching=True,
-            disaggregated_serving=False,
-            speculative_decoding=False,
-            max_batch_size=self.server_args.max_running_requests or 2048,
-            max_num_batched_tokens=self.server_args.max_total_tokens or 1000000,
-            max_prefill_tokens=self.server_args.max_prefill_tokens or 16384,
-            attention_backend=self.server_args.attention_backend or "flashinfer",
-            supports_lora=self.server_args.lora_paths is not None,
-            supports_grammar=True,
-            supports_multimodal=self.model_info.get("supports_vision", False),
-            supported_modalities=["image"] if self.model_info.get("supports_vision") else [],
-            supports_custom_logit_processor=True,
-            supports_session=True,
-            num_gpus=self.server_args.tp_size,
-            gpu_type="unknown",
-            total_gpu_memory=0,
-            tensor_parallel_size=self.server_args.tp_size,
-            pipeline_parallel_size=1,
-            data_parallel_size=self.server_args.dp_size or 1,
-        )
-
-    def _get_version(self) -> str:
-        """Get SGLang version."""
-        try:
-            import sglang
-            return getattr(sglang, "__version__", "0.3.0")
-        except:
-            return "0.3.0"
 
     async def shutdown(self):
         """Shutdown the service."""
