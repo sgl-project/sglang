@@ -8,10 +8,11 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_xpu
 
 _is_npu = is_npu()
-if not _is_npu:
+_is_xpu = is_xpu()
+if not (_is_npu or _is_xpu):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_lf_pf,
@@ -307,6 +308,9 @@ class MHATokenToKVPoolHost(HostKVCache):
 
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
+    def get_ksize_per_token(self):
+        return self.get_size_per_token() // 2
+
     def init_kv_buffer(self):
         if self.layout == "layer_first":
             dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
@@ -358,6 +362,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_v=device_pool.v_buffer[layer_id],
                     src_indices=host_indices,
                     dst_indices=device_indices,
+                    layer_id=layer_id,
                     item_size=self.token_stride_size,
                     src_layout_dim=self.layout_dim,
                 )
@@ -459,10 +464,11 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_buffer_meta(self, keys, indices):
+    def get_buffer_meta(self, keys, indices, local_rank):
         ptr_list = []
         key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        indices = indices.tolist()
         v_offset = (
             self.layer_num
             * self.size
@@ -471,30 +477,47 @@ class MHATokenToKVPoolHost(HostKVCache):
             * self.dtype.itemsize
         )
         for index in range(0, len(indices), self.page_size):
-            for layer_id in range(self.layer_num):
-                k_ptr = (
-                    kv_buffer_data_ptr
-                    + indices[index]
-                    * self.head_num
-                    * self.head_dim
-                    * self.dtype.itemsize
-                    + layer_id
-                    * self.size
-                    * self.head_num
-                    * self.head_dim
-                    * self.dtype.itemsize
-                )
-                v_ptr = k_ptr + v_offset
-                ptr_list.append(k_ptr)
-                ptr_list.append(v_ptr)
-                key_ = keys[index // self.page_size]
-                key_list.append(f"{key_}_{layer_id}_k")
-                key_list.append(f"{key_}_{layer_id}_v")
+            k_ptr = (
+                kv_buffer_data_ptr
+                + indices[index]
+                * self.layer_num
+                * self.head_num
+                * self.head_dim
+                * self.dtype.itemsize
+            )
+            v_ptr = k_ptr + v_offset
+            ptr_list.append(k_ptr)
+            ptr_list.append(v_ptr)
+            key_ = keys[index // self.page_size]
+            key_list.append(f"{key_}_{local_rank}_k")
+            key_list.append(f"{key_}_{local_rank}_v")
         element_size = (
-            self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
+            self.layer_num
+            * self.dtype.itemsize
+            * self.page_size
+            * self.head_num
+            * self.head_dim
         )
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
+
+    def get_buffer_with_hash(self, keys, indices=None):
+        assert self.layout == "page_first"
+        assert indices is None or (len(keys) == (len(indices) // self.page_size))
+
+        key_list = []
+        buf_list = []
+
+        for i in range(len(keys)):
+            key = keys[i]
+            key_list.append(f"{key}-k")
+            key_list.append(f"{key}-v")
+            if indices is not None:
+                index = indices[i * self.page_size]
+                buf_list.append(self.k_buffer[index : index + self.page_size])
+                buf_list.append(self.v_buffer[index : index + self.page_size])
+
+        return key_list, buf_list, 2
 
 
 class MLATokenToKVPoolHost(HostKVCache):
@@ -537,6 +560,9 @@ class MLATokenToKVPoolHost(HostKVCache):
             * self.dtype.itemsize
             * self.layer_num
         )
+
+    def get_ksize_per_token(self):
+        return self.get_size_per_token()
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":
@@ -585,6 +611,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                     dst=device_pool.kv_buffer[layer_id],
                     src_indices=host_indices,
                     dst_indices=device_indices,
+                    layer_id=layer_id,
                     item_size=self.token_stride_size,
                     src_layout_dim=self.layout_dim,
                 )
@@ -680,29 +707,40 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_buffer_meta(self, keys, indices):
+    def get_buffer_meta(self, keys, indices, local_rank):
         ptr_list = []
         key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        indices = indices.tolist()
         for index in range(0, len(indices), self.page_size):
-            for layer_id in range(self.layer_num):
-                k_ptr = (
-                    kv_buffer_data_ptr
-                    + indices[index]
-                    * (self.kv_lora_rank + self.qk_rope_head_dim)
-                    * self.dtype.itemsize
-                    + layer_id
-                    * self.size
-                    * (self.kv_lora_rank + self.qk_rope_head_dim)
-                    * self.dtype.itemsize
-                )
-                ptr_list.append(k_ptr)
-                key_ = keys[index // self.page_size]
-                key_list.append(f"{key_}_{layer_id}_k")
+            k_ptr = (
+                kv_buffer_data_ptr
+                + indices[index]
+                * self.layer_num
+                * (self.kv_lora_rank + self.qk_rope_head_dim)
+                * self.dtype.itemsize
+            )
+            ptr_list.append(k_ptr)
+            key_ = keys[index // self.page_size]
+            key_list.append(f"{key_}_k")
         element_size = (
-            self.dtype.itemsize
+            self.layer_num
+            * self.dtype.itemsize
             * self.page_size
             * (self.kv_lora_rank + self.qk_rope_head_dim)
         )
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
+
+    def get_buffer_with_hash(self, keys, indices=None):
+        assert self.layout == "page_first"
+        assert indices is None or (len(keys) == (len(indices) // self.page_size))
+
+        buf_list = []
+
+        if indices is not None:
+            for i in range(len(keys)):
+                index = indices[i * self.page_size]
+                buf_list.append(self.kv_buffer[index : index + self.page_size])
+
+        return keys, buf_list, 1

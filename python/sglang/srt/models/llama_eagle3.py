@@ -109,6 +109,16 @@ class LlamaModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+
+        self.is_mrope_enabled = (
+            hasattr(config, "rope_scaling")
+            and config.rope_scaling is not None
+            and "mrope_section" in config.rope_scaling
+        )
+        # fix rope_scaling for qwen2.5-vl
+        if self.is_mrope_enabled:
+            config.rope_scaling["rope_type"] = "default"
+
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -143,6 +153,9 @@ class LlamaModel(nn.Module):
             embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
+
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
@@ -185,9 +198,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         )
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
+        self.load_lm_head_from_target = False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
+            if config.draft_vocab_size is None:
+                self.load_lm_head_from_target = True
+                config.draft_vocab_size = config.vocab_size
             self.lm_head = ParallelLMHead(
                 config.draft_vocab_size,
                 config.hidden_size,

@@ -1,29 +1,49 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx942 -t v0.4.9.post1-rocm630-mi30x -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx950 -t v0.4.9.post1-rocm700-mi35x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.2rc2 --build-arg GPU_ARCH=gfx942 -t v0.5.2rc2-rocm630-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.2rc2 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.2rc2-rocm700-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.2rc2 --build-arg GPU_ARCH=gfx950 -t v0.5.2rc2-rocm700-mi35x -f Dockerfile.rocm .
+
 
 # Default base images
-ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.8.5_mi35X_prealpha"
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
+ARG BASE_IMAGE_942_ROCM700="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
 
 # ===============================
-# Base image 942 and args
+# Base image 942 with rocm630 and args
 FROM $BASE_IMAGE_942 AS gfx942
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.4"
+ENV NO_DEPS_FLAG=""
+
+# ===============================
+# Base image 942 and args
+FROM $BASE_IMAGE_942_ROCM700 AS gfx942-rocm700
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT="v0.1.5"
+ENV NO_DEPS_FLAG=""
 
 # ===============================
 # Base image 950 and args
 FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
-ENV AITER_COMMIT="v0.1.4"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT="v0.1.5"
+ENV NO_DEPS_FLAG="--no-deps"
 
 # ===============================
 # Chosen arch and args
@@ -31,7 +51,7 @@ FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
-ENV GPU_ARCH_LIST=${GPU_ARCH:-${PYTORCH_ROCM_ARCH}}
+ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
@@ -42,6 +62,13 @@ ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
+ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
+ARG LLVM_BRANCH="MainOpSelV2"
+ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
+
+ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
+ARG MOONCAKE_COMMIT="dcdf1c784b40aa6975a8ed89fe26321b028e40e8"
+
 USER root
 
 # Install some basic utilities
@@ -51,6 +78,21 @@ RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which
 WORKDIR /sgl-workspace
 
 # -----------------------
+# llvm
+RUN if [ "$BUILD_LLVM" = "1" ]; then \
+     ENV HIP_CLANG_PATH="/sgl-workspace/llvm-project/build/bin/" \
+     git clone --single-branch ${LLVM_REPO} -b ${LLVM_BRANCH} \
+     && cd llvm-project \
+     && git checkout ${LLVM_COMMIT} \
+     && mkdir build \
+     && cd build \
+     && cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=1 -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" -DLLVM_ENABLE_PROJECTS="clang;lld;" -DLLVM_ENABLE_RUNTIMES="compiler-rt" ../llvm \
+     && make -j$(nproc); \
+    fi
+
+# -----------------------
+
+# -----------------------
 # AITER
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
@@ -58,7 +100,9 @@ RUN git clone ${AITER_REPO} \
  && git checkout ${AITER_COMMIT} \
  && git submodule update --init --recursive
 RUN cd aiter \
-     && if [ "$BUILD_AITER_ALL" = "1" ]; then \
+     && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
+          HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+        elif [ "$BUILD_AITER_ALL" = "1" ]; then \
           PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
         else \
           GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
@@ -89,13 +133,37 @@ RUN if [ "$BUILD_VLLM" = "1" ]; then \
     fi
 
 # -----------------------
+# Build Mooncake
+ENV PATH=$PATH:/usr/local/go/bin
+
+RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
+     apt update && apt install -y zip unzip wget && \
+     apt install -y gcc make libtool autoconf  librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool  libibverbs-dev rdma-core && \
+     apt install -y openssh-server openmpi-bin openmpi-common libopenmpi-dev && \
+     git clone ${MOONCAKE_REPO} && \
+     cd Mooncake && \
+     git checkout ${MOONCAKE_COMMIT} && \
+     git submodule update --init --recursive && \
+     bash dependencies.sh -y && \
+     rm -rf /usr/local/go && \
+     wget https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
+     tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
+     rm go1.22.2.linux-amd64.tar.gz && \
+     mkdir -p build && \
+     cd build && \
+     cmake .. -DUSE_ETCD=ON && \
+     make -j "$(nproc)" && make install; \
+    fi
+
+
+# -----------------------
 # Build SGLang
 ARG BUILD_TYPE=all
 
 RUN pip install IPython \
     && pip install orjson \
     && pip install python-multipart \
-    && pip install torchao \
+    && pip install torchao==0.9.0 \
     && pip install pybind11
 
 RUN pip uninstall -y sgl_kernel sglang
@@ -114,9 +182,9 @@ RUN git clone ${SGL_REPO} \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
     && cd .. \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip]"; \
+         python -m pip --no-cache-dir install -e "python[srt_hip]" ${NO_DEPS_FLAG}; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip]"; \
+         python -m pip --no-cache-dir install -e "python[all_hip]" ${NO_DEPS_FLAG}; \
        fi
 
 RUN python -m pip cache purge

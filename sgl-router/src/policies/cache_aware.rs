@@ -112,12 +112,19 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Initialize the tree with worker URLs
+    /// Initialize the tree with worker URLs (used only during initial setup)
     pub fn init_workers(&self, workers: &[Box<dyn Worker>]) {
         if let Ok(tree) = self.tree.lock() {
             for worker in workers {
                 tree.insert("", worker.url());
             }
+        }
+    }
+
+    /// Add a single worker to the tree (incremental update)
+    pub fn add_worker(&self, url: &str) {
+        if let Ok(tree) = self.tree.lock() {
+            tree.insert("", url);
         }
     }
 
@@ -178,9 +185,17 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 .min_by_key(|&&idx| workers[idx].load())
                 .copied()?;
 
+            // Even in imbalanced mode, update the tree to maintain cache state
+            if let Some(text) = request_text {
+                if let Ok(tree) = self.tree.lock() {
+                    tree.insert(text, workers[min_load_idx].url());
+                }
+            }
+
             // Increment processed counter
             workers[min_load_idx].increment_processed();
             RouterMetrics::record_processed_request(workers[min_load_idx].url());
+            RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
             return Some(min_load_idx);
         }
@@ -205,21 +220,26 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             // Find the index of the selected worker
-            let selected_idx = workers.iter().position(|w| w.url() == selected_url)?;
+            if let Some(selected_idx) = workers.iter().position(|w| w.url() == selected_url) {
+                // Only proceed if the worker is healthy
+                if workers[selected_idx].is_healthy() {
+                    // Update the tree with this request
+                    tree.insert(text, &selected_url);
 
-            // Only proceed if the worker is healthy
-            if !workers[selected_idx].is_healthy() {
-                return healthy_indices.first().copied();
+                    // Increment processed counter
+                    workers[selected_idx].increment_processed();
+                    RouterMetrics::record_processed_request(&selected_url);
+
+                    return Some(selected_idx);
+                }
+            } else {
+                // Selected worker no longer exists, remove it from tree
+                tree.remove_tenant(&selected_url);
+                debug!("Removed stale worker {} from cache tree", selected_url);
             }
 
-            // Update the tree with this request
-            tree.insert(text, &selected_url);
-
-            // Increment processed counter
-            workers[selected_idx].increment_processed();
-            RouterMetrics::record_processed_request(&selected_url);
-
-            return Some(selected_idx);
+            // Fallback to first healthy worker
+            return healthy_indices.first().copied();
         }
 
         // Fallback to first healthy worker if tree operations fail
@@ -228,6 +248,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn name(&self) -> &'static str {
         "cache_aware"
+    }
+
+    fn needs_request_text(&self) -> bool {
+        true // Cache-aware policy needs request text for cache affinity
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {
