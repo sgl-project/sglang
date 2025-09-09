@@ -716,6 +716,29 @@ def e2e_router_only_rr():
 
 
 @pytest.fixture(scope="session")
+def e2e_embedding_model() -> str:
+    """Embedding model to use for E2E tests.
+
+    Defaults to an E5 Mistral model, can be overridden via E2E_EMBEDDING_MODEL env var.
+    """
+    import os
+
+    return os.getenv("E2E_EMBEDDING_MODEL", "intfloat/e5-mistral-7b-instruct")
+
+
+@pytest.fixture
+def e2e_primary_embedding_worker(e2e_embedding_model: str):
+    """Launch a single embedding worker using the specified model."""
+    port = _find_available_port()
+    base_url = f"http://127.0.0.1:{port}"
+    proc = _popen_launch_worker(e2e_embedding_model, base_url)
+    try:
+        yield SimpleNamespace(proc=proc, url=base_url)
+    finally:
+        _terminate(proc)
+
+
+@pytest.fixture(scope="session")
 def e2e_primary_worker(e2e_model: str):
     port = _find_available_port()
     base_url = f"http://127.0.0.1:{port}"
