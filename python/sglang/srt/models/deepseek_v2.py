@@ -25,7 +25,8 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from tqdm import tqdm
+from tqdm import tqdm, trange
+
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -69,7 +70,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers.quantization import deep_gemm_wrapper, Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -81,6 +82,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
+    transform_scale_ue8m0,
+    quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (
@@ -1896,6 +1899,17 @@ class DeepseekV2AttentionMLA(nn.Module):
         return output
 
 
+def get_self_attn_quant_config(quant_config):
+    if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+        # refer to real DeepSeek V3 quant config
+        return Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[128, 128],
+        )
+    else:
+        return quant_config
+
+
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
@@ -1916,6 +1930,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
         self.layer_id = layer_id
         self.is_nextn = is_nextn
+
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -1930,7 +1945,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
+            quant_config=get_self_attn_quant_config(quant_config),
             layer_id=layer_id,
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
@@ -2486,11 +2501,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
+                self_attn_quant_config = get_self_attn_quant_config(self.quant_config)
                 if (
-                    hasattr(self.quant_config, "weight_block_size")
-                    and self.quant_config.weight_block_size is not None
+                    hasattr(self_attn_quant_config, "weight_block_size")
+                    and self_attn_quant_config.weight_block_size is not None
                 ):
-                    weight_block_size = self.quant_config.weight_block_size
+                    weight_block_size = self_attn_quant_config.weight_block_size
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
                     if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
@@ -2616,6 +2632,14 @@ class DeepseekV2ForCausalLM(nn.Module):
         ):
             self._weight_requant_ue8m0(is_nextn)
 
+        # TODO move both weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN")
+        ):
+            self._transform_scale_ue8m0(is_nextn)
+
     def _weight_requant_ue8m0(self, is_nextn=False):
         weight_block_size = self.quant_config.weight_block_size
 
@@ -2681,6 +2705,31 @@ class DeepseekV2ForCausalLM(nn.Module):
                         module.weight, module.weight_scale_inv, weight_block_size
                     )
 
+    # TODO temporary code duplication before refactoring both to Fp8LinearMethod
+    def _transform_scale_ue8m0(self, is_nextn=False):
+        print("hi execute transform_scale_ue8m0")
+        assert not is_nextn, "is_nextn not supported yet"
+
+        for layer_id in range(self.config.num_hidden_layers):
+            layer = self.model.layers[layer_id]
+
+            module_list = [
+                layer.self_attn.kv_b_proj,
+                layer.self_attn.o_proj,
+            ]
+
+            if self.config.q_lora_rank is not None:
+                module_list.append(layer.self_attn.fused_qkv_a_proj_with_mqa)
+                module_list.append(layer.self_attn.q_b_proj)
+            else:
+                module_list.append(layer.self_attn.kv_a_proj_with_mqa)
+                module_list.append(layer.self_attn.q_proj)
+
+            for module in module_list:
+                out_s = transform_scale_ue8m0(module.weight_scale_inv.data, mn=module.weight.shape[-2])
+                module.weight_scale_inv.data = out_s
+
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
         if is_nextn:
@@ -2695,6 +2744,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
+
+        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+            weights = self._quant_attn_to_fp8_ue8m0(weights)
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2924,6 +2976,28 @@ class DeepseekV2ForCausalLM(nn.Module):
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+    def _quant_attn_to_fp8_ue8m0(self, weights):
+        weights_dict = dict(weights)
+
+        # temporarily only support DeepSeek V3/R1
+        weight_block_size = [128, 128]
+
+        for layer_id in trange(self.config.num_hidden_layers, desc="quant attn to fp8 ue8m0"):
+            for stem in [
+                "kv_a_proj_with_mqa",
+                "kv_b_proj",
+                "o_proj",
+                "q_a_proj",
+                "q_b_proj",
+            ]:
+                partial_name = f"model.layers.{layer_id}.self_attn.{stem}"
+                original_weight = weights_dict[f"{partial_name}.weight"]
+                out_w, out_s = quant_weight_ue8m0(original_weight, weight_block_size=weight_block_size)
+                weights_dict[f"{partial_name}.weight"] = out_w
+                weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
+
+        return list(weights_dict.items())
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
