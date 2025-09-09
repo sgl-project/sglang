@@ -649,13 +649,14 @@ class ModelOptFp4Config(QuantizationConfig):
             pattern_split = pattern.split(".")
             if re.fullmatch(regex_str, prefix):
                 return True
-            # Check if the last part of the excluded pattern is contained in the last part of the prefix
-            # This handles fused modules like fused_qkv_a_proj_with_mqa that contain q_a_proj and kv_a_proj_with_mqa
-            # e.g., model.layers.{i}.self_attn.{fused_weight_name}
-            elif len(prefix_split) == 5 and (
+            elif (
                 pattern_split[-1] in fused_patterns
                 and pattern_split[-1] in prefix_split[-1]
             ):
+                # Check if the last part of the excluded pattern is contained in the last part of the prefix
+                # This handles fused modules like fused_qkv_a_proj_with_mqa that contain q_a_proj and kv_a_proj_with_mqa
+                # e.g., model.layers.{i}.self_attn.{fused_weight_name}
+                assert len(prefix_split) == 5 and len(pattern_split) == 5
                 return True
         return False
 
