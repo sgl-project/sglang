@@ -610,7 +610,7 @@ class SWARadixCache(BasePrefixCache):
 
                 x = x_next
 
-        if self.scheduler_metrics_collector is not None:
+        if (full_num_evicted > 0 or swa_num_evicted > 0) and self.scheduler_metrics_collector is not None:
             self.scheduler_metrics_collector.observe_eviction_duration(time.perf_counter() - start_time)
 
     def inc_lock_ref(self, node: TreeNode) -> Optional[int]:

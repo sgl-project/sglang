@@ -320,7 +320,7 @@ class RadixCache(BasePrefixCache):
 
             self._record_remove_event(x)
 
-        if self.scheduler_metrics_collector is not None:
+        if num_evicted > 0 and self.scheduler_metrics_collector is not None:
             self.scheduler_metrics_collector.observe_eviction_duration(time.perf_counter() - start_time)
 
     def inc_lock_ref(self, node: TreeNode):
