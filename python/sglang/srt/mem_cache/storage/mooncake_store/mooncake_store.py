@@ -77,7 +77,7 @@ class MooncakeStoreConfig:
         """Load config from extra_config dictionary."""
         if "master_server_address" not in extra_config:
             raise ValueError("master_server_address is required in extra_config")
-        
+
         return MooncakeStoreConfig(
             local_hostname=extra_config.get("local_hostname", "localhost"),
             metadata_server=extra_config.get("metadata_server", "P2PHANDSHAKE"),
@@ -113,13 +113,22 @@ class MooncakeStore(HiCacheStorage):
 
         try:
             self.store = MooncakeDistributedStore()
-            
-            extra_config = getattr(storage_config, "extra_config", None) if storage_config else None
+
+            extra_config = (
+                getattr(storage_config, "extra_config", None)
+                if storage_config
+                else None
+            )
             # Load configuration with master_server_address prioritized from extra_config if available
-            if extra_config is not None and extra_config.get("master_server_address") is not None:
+            if (
+                extra_config is not None
+                and extra_config.get("master_server_address") is not None
+            ):
                 # Load from extra_config
                 self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
-                logger.info("Mooncake Configuration loaded from extra_config successfully.")
+                logger.info(
+                    "Mooncake Configuration loaded from extra_config successfully."
+                )
             else:
                 # Load from environment variables
                 self.config = MooncakeStoreConfig.load_from_env()
