@@ -14,6 +14,7 @@ class CPUMoECompMethod(IntEnum):
     INT8_W8A8_GEMM = 1
     FP8_W8A16_GEMM = 2
     INT4_W4A16_GEMM = 3
+    INT4_W4A8_GEMM = 4
 
 
 def amx_process_weight_after_loading(weight):

@@ -269,48 +269,6 @@ def make_non_contiguous(x: torch.Tensor) -> torch.Tensor:
     return x[..., : last_dim // 2] if x.is_contiguous() else x
 
 
-def autoawq_to_int4pack(
-    qweight: torch.Tensor,
-    qzeros: torch.Tensor,
-    scales: torch.Tensor,
-    SGLANG_USE_CPU_INT4_W4A8: bool,
-):
-    """Convert AutoAWQ weight format to sgl-kernel's CPU int4
-    Args:
-        qweight: (*, K, N / 8), int32
-        qzeros: (*, K / group_size, N / 8), int32
-        scales: (*, K / group_size, N), bfloat16
-    """
-    # unpack from AutoAWQ format
-    # https://github.com/casper-hansen/AutoAWQ/blob/23d584c2/awq/modules/triton/gemm.py#L73-L86
-    bitshifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32) * 4
-    qweight = (qweight.unsqueeze(-1) >> bitshifts) & 0xF
-    qweight = qweight.flatten(-2).transpose(-1, -2).to(torch.uint8)
-
-    qzeros = (qzeros.unsqueeze(-1) >> bitshifts) & 0xF
-    qzeros = qzeros.flatten(-2).to(torch.uint8)
-    if SGLANG_USE_CPU_INT4_W4A8:
-        qzeros = qzeros.T.contiguous()
-        scales = scales.T.contiguous()
-        qweight, scales, qzeros, compensation = (
-            torch.ops.sgl_kernel.convert_int4_weight_packed(qweight, scales, qzeros)
-        )
-        return qweight, qzeros, scales, compensation
-    else:
-        # TODO: unify below in convert_int4_weight_packed
-        # convert to VNNI format: (*, N/BLOCK_N, K/2, BLOCK_N, 2)
-        BLOCK_N = 32  # must match what's used in the kernel
-        *dims, N, K = qweight.shape
-        qweight = qweight.reshape(*dims, N // BLOCK_N, BLOCK_N, K // 2, 2)
-        qweight = qweight.transpose(-3, -2)
-        # bit packing
-        BIT_COUNT = 32
-        qweight = qweight.reshape(-1, BIT_COUNT * 2)
-        qweight = (qweight[:, BIT_COUNT:] << 4) | qweight[:, :BIT_COUNT]
-        qweight = qweight.reshape(*dims, N, K // 2)
-        return qweight, qzeros, scales
-
-
 def awq_reverse_reorder_int_tensor(int_tensor, bits: int):
     assert bits == 4
 

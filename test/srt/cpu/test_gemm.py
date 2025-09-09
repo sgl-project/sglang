@@ -6,7 +6,6 @@ import sgl_kernel
 import torch
 import torch.nn as nn
 from utils import (
-    autoawq_to_int4pack,
     convert_weight,
     native_w8a8_per_token_matmul,
     per_token_quant_int8,

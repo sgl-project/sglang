@@ -8,19 +8,6 @@ namespace {
 
 #define BLOCK_N block_size_n()
 
-static bool cpublas_checked = false;
-static bool cpublas_can_pack = false;
-
-bool cpublas_could_pack() {
-  // the could_pack check requires AMX support implicitly
-  if (cpublas_checked) {
-    return cpublas_can_pack;
-  }
-  cpublas_can_pack = at::native::cpublas::could_pack(at::kByte);
-  cpublas_checked = true;
-  return cpublas_can_pack;
-}
-
 template <bool sym_quant_a>
 struct ActDtype;
 template <>
@@ -276,7 +263,7 @@ void _dequant_gemm_accum_small_M(
   _dequant_gemm_accum_small_M<M, N, ldb, sym_quant_a>(C, A, scales_a, qzeros_a, B, scales_b, qzeros_b, K, lda, ldc);
 #endif
 
-template <bool cpublas_can_pack, int64_t N, int64_t ldb, bool sym_quant_a>
+template <int64_t N, int64_t ldb, bool sym_quant_a>
 void _dequant_gemm_accum(
     float* C,
     const uint8_t* A,
@@ -289,11 +276,12 @@ void _dequant_gemm_accum(
     int64_t M,
     int64_t K,
     int64_t lda,
-    int64_t ldc) {
+    int64_t ldc,
+    bool use_brgemm) {
   // Compute GEMM int8 * int8 -> int32
   // dequant result to float by applying scales/qzeros
 #if defined(CPU_CAPABILITY_AVX512)
-  if (M <= 4 && cpublas_can_pack) {
+  if (!use_brgemm) {
     switch (M) {
       case 1:
         call_dequant_gemm_accum_small_M(1);
@@ -307,16 +295,16 @@ void _dequant_gemm_accum(
       case 4:
         call_dequant_gemm_accum_small_M(4);
         return;
+      default:
+        TORCH_CHECK(false, "tinygemm_kernel: unexpected M for AVX path!");
     }
   }
-#endif
 
   int8_t dqB[K * N];
   _dequant_weight_zp_only<N, ldb>(B, dqB, qzeros_b, K);
   using Tin = typename ActDtype<sym_quant_a>::type;
   Tin* A_ptr = (Tin*)A;
-#if defined(CPU_CAPABILITY_AVX512)
-  if constexpr (cpublas_can_pack) {
+  if (use_brgemm) {
     int32_t C_i32[M * N];
     at::native::cpublas::brgemm(
         M, N, K, lda, N /*ldb*/, N /*ldc*/, false /* add_C */, A_ptr, dqB, C_i32, true /* is_vnni */);
@@ -327,19 +315,7 @@ void _dequant_gemm_accum(
   } else
 #endif
   {
-    for (int64_t i = 0; i < M; ++i) {
-      for (int64_t j = 0; j < N; ++j) {
-        float sum = 0;
-        for (int64_t k = 0; k < K; ++k) {
-          if constexpr (sym_quant_a) {
-            sum += ((int32_t)A_ptr[i * lda + k] * dqB[k * N + j]);
-          } else {
-            sum += ((int32_t)A_ptr[i * lda + k] - qzeros_a[i]) * (int32_t)dqB[k * N + j];
-          }
-        }
-        C[i * ldc + j] += sum * scales_a[i] * scales_b[j];
-      }
-    }
+    TORCH_CHECK(false, "tinygemm_kernel: scalar path not implemented!");
   }
 }
 
@@ -421,7 +397,7 @@ inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_
   }
 }
 
-template <typename out_dtype, bool cpublas_can_pack, bool sym_quant_a>
+template <typename out_dtype, bool sym_quant_a>
 void _da8w4_linear_impl(
     const at::Tensor& input,
     const at::Tensor& input_scales,
@@ -441,15 +417,13 @@ void _da8w4_linear_impl(
     TORCH_CHECK(input_scales.sizes() == input_qzeros.sizes(), "DA8W4: unexpected input qzeros shape");
   }
 
-  // weight + compensation shape = [Nc, Kc, block_n * block_k / 2 + block_n*sizeof(int32_t)]
-  // scales/qzeros shape = [Nc, G, block_n]
-
+  // weight + compensation shape = [Nc, Kc, BLOCK_N * BLOCK_K / 2 + BLOCK_N*sizeof(int32_t)]
+  // scales/qzeros shape = [Nc, G, BLOCK_N]
+  const bool use_brgemm = can_use_brgemm<int8_t>(M);
   int64_t Nc = weight.size(0);
   int64_t Kc = weight.size(1);
-  int64_t block_k = BLOCK_K;
-  constexpr int64_t block_n = BLOCK_N;
-  int64_t N = Nc * block_n;
-  TORCH_CHECK(K == Kc * block_k, "DA8W4: weight and input shapes mismatch");
+  int64_t N = Nc * BLOCK_N;
+  TORCH_CHECK(K == Kc * BLOCK_K, "DA8W4: weight and input shapes mismatch");
   int64_t block_m = [&]() -> long {
     if (M <= 48) {
       return M;
@@ -465,11 +439,11 @@ void _da8w4_linear_impl(
   bool parallel_on_M = M > 128;
   int64_t num_blocks = parallel_on_M ? Mc * Nc : Nc;
 
-  // scales/qzeros shape = [Nc, G, block_n]
+  // scales/qzeros shape = [Nc, G, BLOCK_N]
   int64_t num_groups = weight_scales.size(1);
   int64_t group_size = K / num_groups;
-  TORCH_CHECK(group_size % block_k == 0, "DA8W4 CPU: group_size should be divisible by block_k");
-  int64_t block_per_group = group_size / block_k;
+  TORCH_CHECK(group_size % BLOCK_K == 0, "DA8W4 CPU: group_size should be divisible by BLOCK_K");
+  int64_t block_per_group = group_size / BLOCK_K;
 
   using Tin = typename ActDtype<sym_quant_a>::type;
   const Tin* a_ptr = input_view.data_ptr<Tin>();
@@ -489,34 +463,35 @@ void _da8w4_linear_impl(
 
       for (int mci = mc; mci < mc_end; ++mci) {
         int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
-        alignas(64) float y_buf[m_size][block_n];
+        alignas(64) float y_buf[m_size][BLOCK_N];
         // copy bias to y_buf if bias is not None
-        auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
-        copy_bias<block_n>(bias_data, y_buf[0], m_size);
+        auto bias_data = bias_ptr ? bias_ptr + nc * BLOCK_N : nullptr;
+        copy_bias<BLOCK_N>(bias_data, y_buf[0], m_size);
         for (int kci = 0; kci < Kc; ++kci) {
           int32_t* compensation_ptr =
               sym_quant_a ? nullptr
-                          : (int32_t*)(void*)(b_ptr + (nc * Kc + kci) * (block_n * (block_k / 2 + sizeof(int32_t))) +
-                                              block_k * block_n / 2) /*Bcomp*/;
-          _dequant_gemm_accum<cpublas_can_pack, block_n, block_n / 2, sym_quant_a>(
+                          : (int32_t*)(void*)(b_ptr + (nc * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
+                                              BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
+          _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, sym_quant_a>(
               y_buf[0] /*C*/,
-              (uint8_t*)a_ptr + mci * block_m * K + kci * block_k /*A*/,
+              (uint8_t*)a_ptr + mci * block_m * K + kci * BLOCK_K /*A*/,
               a_scales_ptr + mci * block_m /*scales_a*/,
               a_qzeros_ptr + mci * block_m /*qzeros_a*/,
-              b_ptr + (nc * Kc + kci) * (block_n * (block_k / 2 + sizeof(int32_t))),
-              b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*scales_b*/,
-              b_qzeros_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*qzeros_b*/,
+              b_ptr + (nc * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))),
+              b_scales_ptr + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*scales_b*/,
+              b_qzeros_ptr + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*qzeros_b*/,
               compensation_ptr /*Bcomp*/,
               m_size /*M*/,
-              block_k /*K*/,
+              BLOCK_K /*K*/,
               K /*lda*/,
-              block_n /*ldc*/);
+              BLOCK_N /*ldc*/,
+              use_brgemm);
         }
         // store y_buf to output with dtype conversion
-        store_out<out_dtype, block_n>(y_buf[0], c_ptr + mci * block_m * N + nc * block_n, m_size, N /*lda*/);
+        store_out<out_dtype, BLOCK_N>(y_buf[0], c_ptr + mci * block_m * N + nc * BLOCK_N, m_size, N /*lda*/);
       }
     }
-    if constexpr (cpublas_can_pack) {
+    if (use_brgemm) {
       at::native::cpublas::brgemm_release();
     }
   });
@@ -545,32 +520,92 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   auto As = at::empty({M_a}, input.options().dtype(at::kFloat));
   auto Azp = at::ones({M_a}, input.options().dtype(at::kInt)).mul(128);
   bool sym_quant_a = false;  // sym_a s8s8 is unified to u8s8 with compensation (128)
-  static bool cpublas_can_pack = cpublas_could_pack();
+
   auto out_sizes = input.sizes().vec();
   int64_t N = weight_scales.size(0) * weight_scales.size(-1);
   out_sizes.back() = N;
   auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
 
-#define call__da8w4_linear_with_quant_impl(cpublas_can_pack, sym_quant_act)                                \
-  AT_DISPATCH_FLOATING_TYPES_AND2(                                                                         \
-      at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "int4_scaled_mm_cpu_with_quant", [&] { \
-        uint8_t* __restrict__ Aq_data = Aq.data_ptr<uint8_t>();                                            \
-        float* __restrict__ As_data = As.data_ptr<float>();                                                \
-        int32_t* __restrict__ Azp_data = Azp.data_ptr<int32_t>();                                          \
-        const scalar_t* __restrict__ A_data = input.data_ptr<scalar_t>();                                  \
-        at::parallel_for(0, M_a, 0, [&](int64_t begin, int64_t end) {                                      \
-          for (int64_t m = begin; m < end; ++m) {                                                          \
-            quantize_row_int8<scalar_t>(Aq_data + m * K_a, As_data[m], A_data + m * lda, K_a);             \
-          }                                                                                                \
-        });                                                                                                \
-        _da8w4_linear_impl<scalar_t, cpublas_can_pack, sym_quant_act>(                                     \
-            Aq, As, Azp, weight, weight_scales, weight_qzeros, bias, output);                              \
+#define call__da8w4_linear_with_quant_impl(sym_quant_act)                                                             \
+  AT_DISPATCH_FLOATING_TYPES_AND2(                                                                                    \
+      at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "int4_scaled_mm_cpu_with_quant", [&] {            \
+        uint8_t* __restrict__ Aq_data = Aq.data_ptr<uint8_t>();                                                       \
+        float* __restrict__ As_data = As.data_ptr<float>();                                                           \
+        int32_t* __restrict__ Azp_data = Azp.data_ptr<int32_t>();                                                     \
+        const scalar_t* __restrict__ A_data = input.data_ptr<scalar_t>();                                             \
+        at::parallel_for(0, M_a, 0, [&](int64_t begin, int64_t end) {                                                 \
+          for (int64_t m = begin; m < end; ++m) {                                                                     \
+            quantize_row_int8<scalar_t>(Aq_data + m * K_a, As_data[m], A_data + m * lda, K_a);                        \
+          }                                                                                                           \
+        });                                                                                                           \
+        _da8w4_linear_impl<scalar_t, sym_quant_act>(Aq, As, Azp, weight, weight_scales, weight_qzeros, bias, output); \
       });
 
-  if (cpublas_can_pack) {
-    call__da8w4_linear_with_quant_impl(true, false);
-  } else {
-    call__da8w4_linear_with_quant_impl(false, false);
-  }
+  call__da8w4_linear_with_quant_impl(false);
+
   return output;
 }
+template <typename scalar_t>
+inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
+  using Vec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+// no remainder
+#pragma GCC unroll 4
+  for (int64_t d = 0; d < size; d += Vec::size()) {
+    fVec x0 = fVec::loadu(input + d);
+    fVec x1 = fVec::loadu(input + d + fVec::size());
+    Vec res = convert_from_float_ext<scalar_t>(x0, x1);
+    res.store(out + d);
+  }
+}
+
+template <typename scalar_t>
+void tinygemm_kernel(
+    scalar_t* C,
+    float* C_temp,
+    const uint8_t* A,
+    const float* scales_a,
+    const int32_t* qzeros_a,
+    const uint8_t* B,
+    const float* scales_b,
+    const int8_t* qzeros_b,
+    const int32_t* compensation,
+    int64_t M,
+    int64_t K,
+    int64_t lda,
+    int64_t ldc_f,
+    int64_t ldc_s,
+    bool store_out,
+    bool use_brgemm) {
+  // TODO: add sym quant act, now only asym
+  _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, false>(
+      C_temp, A, scales_a, qzeros_a, B, scales_b, qzeros_b, compensation, M, K, lda, ldc_f, use_brgemm);
+  if (store_out) {
+    // copy from Ctmp to C
+    for (int64_t m = 0; m < M; ++m) {
+      copy_stub<scalar_t>(C + m * ldc_s, C_temp + m * ldc_f, BLOCK_N);
+    }
+  }
+}
+
+#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE) \
+  template void tinygemm_kernel<TYPE>(      \
+      TYPE * C,                             \
+      float* C_temp,                        \
+      const uint8_t* A,                     \
+      const float* scales_a,                \
+      const int32_t* qzeros_a,              \
+      const uint8_t* B,                     \
+      const float* scales_b,                \
+      const int8_t* qzeros_b,               \
+      const int32_t* compensation,          \
+      int64_t M,                            \
+      int64_t K,                            \
+      int64_t lda,                          \
+      int64_t ldc_f,                        \
+      int64_t ldc_s,                        \
+      bool store_out,                       \
+      bool use_brgemm)
+
+INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);

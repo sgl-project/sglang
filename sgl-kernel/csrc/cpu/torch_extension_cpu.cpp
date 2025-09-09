@@ -338,8 +338,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
       "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
       "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? "
-      "a1_scale, Tensor? a2_scale, bool "
-      "is_vnni) -> Tensor");
+      "a1_scale, Tensor? a2_scale,  bool is_vnni) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
   // weight absorption

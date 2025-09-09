@@ -636,7 +636,7 @@ void int4_w4a16_linear_kernel_impl(
   }
 
   // l2 cache block for n
-  int64_t cache_blocks_nb = get_cache_blocks<scalar_t>(BLOCK_N, K);
+  int64_t cache_blocks_nb = get_cache_blocks<scalar_t>(BLOCK_N * K);
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
     parallel_2d(MB, NB, [&](int64_t begin_mb, int64_t end_mb, int64_t begin_nb, int64_t end_nb) {
       // for brgemm, use float32 for accumulate
