@@ -679,6 +679,7 @@ multimodal_model_archs = [
     "Glm4vMoeForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
+    "Idefics3ForConditionalGeneration",
     "LlavaLlamaForCausalLM",
     "Llama4ForConditionalGeneration",
     "LlavaMistralForCausalLM",
@@ -697,6 +698,7 @@ multimodal_model_archs = [
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "SmolVLMForConditionalGeneration",
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
 ]
