@@ -46,7 +46,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
-from sglang.utils import get_exception_traceback
+from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,25 @@ class DataParallelController:
                 )
 
         self.max_req_input_len = None
+
+    def send_to_all_workers(self, obj):
+        for worker in self.workers:
+            worker.send_pyobj(obj)
+
+    def send_control_message(self, obj):
+        # Send control messages to first worker of tp group
+        for worker in self.workers[:: self.control_message_step]:
+            worker.send_pyobj(obj)
+
+    def init_dispatcher(self):
+        self._request_dispatcher = TypeBasedDispatcher(
+            [
+                (TokenizedGenerateReqInput, self.dispatching),
+                (TokenizedEmbeddingReqInput, self.dispatching),
+                (BlockReqInput, self.send_to_all_workers),
+            ]
+        )
+        self._request_dispatcher.add_fallback_fn(self.send_control_message)
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -333,22 +352,7 @@ class DataParallelController:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-
-                if isinstance(
-                    recv_req,
-                    (
-                        TokenizedGenerateReqInput,
-                        TokenizedEmbeddingReqInput,
-                    ),
-                ):
-                    self.dispatching(recv_req)
-                elif isinstance(recv_req, BlockReqInput):
-                    for worker in self.workers:
-                        worker.send_pyobj(recv_req)
-                else:
-                    # Send other control messages to first worker of tp group
-                    for worker in self.workers[:: self.control_message_step]:
-                        worker.send_pyobj(recv_req)
+                self._request_dispatcher(recv_req)
 
 
 def run_data_parallel_controller_process(
