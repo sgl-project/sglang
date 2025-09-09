@@ -1,0 +1,20 @@
+# SGLang Hathora Server Requirements
+
+# Core FastAPI and dependencies
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.0.0
+
+# HTTP client for health checks
+httpx>=0.24.0
+requests>=2.31.0
+
+# Essential for async operations
+asyncio-compat>=0.1.0
+
+# SGLang will be installed separately via pip install sglang[all]
+# Uncomment the line below if you want to install SGLang via requirements
+# sglang[all]
+
+# Additional utilities that might be useful
+python-multipart>=0.0.6
