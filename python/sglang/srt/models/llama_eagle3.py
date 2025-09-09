@@ -185,9 +185,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         )
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
+        self.load_lm_head_from_target = False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
+            if config.draft_vocab_size is None:
+                self.load_lm_head_from_target = True
+                config.draft_vocab_size = config.vocab_size
             self.lm_head = ParallelLMHead(
                 config.draft_vocab_size,
                 config.hidden_size,

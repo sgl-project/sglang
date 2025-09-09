@@ -36,7 +36,7 @@ jobs:
           filters: |
             src:
               - "python/**"
-              - "scripts/**"
+              - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test.yml"
 
@@ -90,6 +90,10 @@ jobs:
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 2-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -102,7 +106,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-gpu
+          python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-4-gpu:
     needs: [check-changes, unit-test-backend-2-gpu]
@@ -417,7 +421,7 @@ jobs:
       unit-test-deepep-4-gpu, unit-test-deepep-8-gpu,
       unit-test-backend-8-gpu-b200,
     ]
-    if: needs.check-changes.outputs.src == 'true'
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

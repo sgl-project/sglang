@@ -466,6 +466,25 @@ def try_cached_model(model_repo: str):
     return model_dir if model_dir else model_repo
 
 
+def popen_with_error_check(command: list[str], allow_exit: bool = False):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _run_and_check():
+        stdout, stderr = process.communicate()
+
+        while process.poll() is None:
+            time.sleep(5)
+
+        if not allow_exit or process.returncode != 0:
+            raise Exception(
+                f"{command} exited with code {process.returncode}\n{stdout=}\n{stderr=}"
+            )
+
+    t = threading.Thread(target=_run_and_check)
+    t.start()
+    return process
+
+
 def popen_launch_server(
     model: str,
     base_url: str,

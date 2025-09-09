@@ -9,6 +9,7 @@ on:
     branches: [ main ]
     paths:
       - "sgl-router/**"
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -19,8 +20,62 @@ permissions:
   pull-requests: write
   issues: write
 jobs:
-  benchmark-router:
+  # Quick check job that always runs on PRs
+  benchmark-compile-check:
+    name: Benchmark Compilation Check
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_rust.sh
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
+        continue-on-error: true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-router
+          # Share cache across all benchmark jobs
+          shared-key: "rust-cache"
+          # Save cache even on failure
+          save-if: true
+
+      - name: Check benchmarks compile
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          # Try to use sccache, but disable if it fails
+          if command -v sccache &> /dev/null; then
+            echo "Testing sccache availability..."
+            # Try to start sccache and check if it works
+            export RUSTC_WRAPPER=sccache
+            export SCCACHE_GHA_ENABLED="true"
+            if sccache --start-server 2>/dev/null && sccache --show-stats 2>/dev/null; then
+              echo "sccache is working, using it for compilation"
+            else
+              echo "sccache failed to start, falling back to regular cargo"
+              unset RUSTC_WRAPPER
+              unset SCCACHE_GHA_ENABLED
+            fi
+          else
+            echo "sccache not available, using regular cargo"
+          fi
+          cargo check --benches
+
+  # Full benchmark jobs that only run with label or on main branch
+  benchmark-request-processing:
+    name: Request Processing Benchmark
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       contains(github.event.pull_request.labels.*.name, 'benchmark'))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -33,77 +88,219 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
+        continue-on-error: true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            sgl-router/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          workspaces: sgl-router
+          # Share cache across all benchmark jobs
+          shared-key: "rust-cache"
+          # Save cache even on failure
+          save-if: true
 
-      - name: Build router in release mode
+      - name: Run request processing benchmark
+        timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          cargo build --release
-
-      - name: Run quick benchmarks
-        timeout-minutes: 15
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-router/
-          # Run quick benchmarks for PR validation using Python script
-          python3 scripts/run_benchmarks.py --quick --validate-thresholds --save-results
+          # Try to use sccache, but disable if it fails
+          if command -v sccache &> /dev/null; then
+            echo "Testing sccache availability..."
+            # Try to start sccache and check if it works
+            export RUSTC_WRAPPER=sccache
+            export SCCACHE_GHA_ENABLED="true"
+            if sccache --start-server 2>/dev/null && sccache --show-stats 2>/dev/null; then
+              echo "sccache is working, using it for compilation"
+            else
+              echo "sccache failed to start, falling back to regular cargo"
+              unset RUSTC_WRAPPER
+              unset SCCACHE_GHA_ENABLED
+            fi
+          else
+            echo "sccache not available, using regular cargo"
+          fi
+          # Run only the summary benchmark for quick validation in PRs
+          cargo bench --bench request_processing -- benchmark_summary --exact
 
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results-${{ github.sha }}
+          name: request-processing-results-${{ github.sha }}
           path: |
-            sgl-router/target/criterion/
+            sgl-router/target/criterion/benchmark_summary/
           retention-days: 30
 
-  benchmark-integration-test:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+  benchmark-tokenizer:
+    name: Tokenizer Benchmark
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       contains(github.event.pull_request.labels.*.name, 'benchmark'))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 100
 
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_rust.sh
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
+        continue-on-error: true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
+          workspaces: sgl-router
+          # Share cache across all benchmark jobs
+          shared-key: "rust-cache"
+          # Save cache even on failure
+          save-if: true
+
+      - name: Run tokenizer benchmark
+        timeout-minutes: 30
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          # Try to use sccache, but disable if it fails
+          if command -v sccache &> /dev/null; then
+            echo "Testing sccache availability..."
+            # Try to start sccache and check if it works
+            export RUSTC_WRAPPER=sccache
+            export SCCACHE_GHA_ENABLED="true"
+            if sccache --start-server 2>/dev/null && sccache --show-stats 2>/dev/null; then
+              echo "sccache is working, using it for compilation"
+            else
+              echo "sccache failed to start, falling back to regular cargo"
+              unset RUSTC_WRAPPER
+              unset SCCACHE_GHA_ENABLED
+            fi
+          else
+            echo "sccache not available, using regular cargo"
+          fi
+          cargo bench --bench tokenizer_benchmark
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenizer-results-${{ github.sha }}
           path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            sgl-router/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+            sgl-router/target/criterion/tokenizer*/
+          retention-days: 30
 
-      - name: Run benchmark integration tests
-        timeout-minutes: 10
+  benchmark-tool-parser:
+    name: Tool Parser Benchmark
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       contains(github.event.pull_request.labels.*.name, 'benchmark'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 100
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_rust.sh
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
+        continue-on-error: true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-router
+          # Share cache across all benchmark jobs
+          shared-key: "rust-cache"
+          # Save cache even on failure
+          save-if: true
+
+      - name: Run tool parser benchmark
+        timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          # Run integration tests to ensure benchmark code compiles and works
-          cargo test --test benchmark_integration
+          # Try to use sccache, but disable if it fails
+          if command -v sccache &> /dev/null; then
+            echo "Testing sccache availability..."
+            # Try to start sccache and check if it works
+            export RUSTC_WRAPPER=sccache
+            export SCCACHE_GHA_ENABLED="true"
+            if sccache --start-server 2>/dev/null && sccache --show-stats 2>/dev/null; then
+              echo "sccache is working, using it for compilation"
+            else
+              echo "sccache failed to start, falling back to regular cargo"
+              unset RUSTC_WRAPPER
+              unset SCCACHE_GHA_ENABLED
+            fi
+          else
+            echo "sccache not available, using regular cargo"
+          fi
+          cargo bench --bench tool_parser_benchmark
 
-      - name: Verify benchmark compilation
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tool-parser-results-${{ github.sha }}
+          path: |
+            sgl-router/target/criterion/tool_parser*/
+          retention-days: 30
+
+  benchmark-summary:
+    name: Benchmark Summary
+    needs: [benchmark-request-processing, benchmark-tokenizer, benchmark-tool-parser]
+    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-results-${{ github.sha }}'
+          path: benchmark-results
+
+      - name: Generate summary
         run: |
-          source "$HOME/.cargo/env"
-          cd sgl-router/
-          # Ensure all benchmarks compile without running them
-          cargo check --benches
+          echo "## Benchmark Results Summary" > summary.md
+          echo "" >> summary.md
+          echo "### Request Processing" >> summary.md
+          if [ -d "benchmark-results/request-processing-results-${{ github.sha }}" ]; then
+            echo "✅ Completed" >> summary.md
+          else
+            echo "❌ Failed or skipped" >> summary.md
+          fi
+          echo "" >> summary.md
+          echo "### Tokenizer" >> summary.md
+          if [ -d "benchmark-results/tokenizer-results-${{ github.sha }}" ]; then
+            echo "✅ Completed" >> summary.md
+          else
+            echo "❌ Failed or skipped" >> summary.md
+          fi
+          echo "" >> summary.md
+          echo "### Tool Parser" >> summary.md
+          if [ -d "benchmark-results/tool-parser-results-${{ github.sha }}" ]; then
+            echo "✅ Completed" >> summary.md
+          else
+            echo "❌ Failed or skipped" >> summary.md
+          fi
+          cat summary.md
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-summary-${{ github.sha }}
+          path: summary.md
+          retention-days: 30

@@ -8,6 +8,7 @@ The SGL Router tokenizer layer provides a unified interface for text tokenizatio
 
 **Key Components:**
 - **Factory Pattern**: Auto-detection and creation of appropriate tokenizer types from files or model names
+- **HuggingFace Hub Integration**: Automatic downloading of tokenizer files from HuggingFace Hub for model IDs
 - **Trait System**: `Encoder`, `Decoder`, and `Tokenizer` traits for implementation flexibility
 - **Streaming**: Incremental decoding with UTF-8 boundary handling and buffering
 - **Stop Sequences**: Complex pattern matching for stop tokens and sequences with "jail" buffering
@@ -16,7 +17,7 @@ The SGL Router tokenizer layer provides a unified interface for text tokenizatio
 - **Metrics Integration**: Comprehensive performance and error tracking across all operations
 
 **Data Flow:**
-1. Request → Factory (type detection) → Concrete Tokenizer Creation
+1. Request → Factory (type detection/HF download) → Concrete Tokenizer Creation
 2. Encode: Text → Tokenizer → Encoding (token IDs)
 3. Stream: Token IDs → DecodeStream → Incremental Text Chunks
 4. Stop Detection: Tokens → StopSequenceDecoder → Text/Held/Stopped
@@ -25,8 +26,9 @@ The SGL Router tokenizer layer provides a unified interface for text tokenizatio
 ### Architecture Highlights
 
 - **Extended Backend Support**: HuggingFace, Tiktoken (GPT models), and Mock for testing
+- **HuggingFace Hub Integration**: Automatic tokenizer downloads with caching
 - **Comprehensive Metrics**: Full TokenizerMetrics integration for observability
-- **Feature Gating**: Conditional compilation for tokenizer backends
+- **Unified Dependencies**: All tokenizer backends included by default (no feature gates)
 - **Stop Sequence Detection**: Sophisticated partial matching with jail buffer
 - **Chat Template Support**: Full Jinja2 rendering with HuggingFace compatibility
 - **Thread Safety**: Arc-based sharing with Send + Sync guarantees
@@ -92,9 +94,14 @@ sequenceDiagram
     participant SD as StopDecoder
     participant M as Metrics
 
-    C->>F: create_tokenizer(path)
+    C->>F: create_tokenizer(path_or_model_id)
     F->>F: detect_type()
-    F->>T: new HF/Tiktoken/Mock
+    alt local file
+        F->>T: new HF/Tiktoken/Mock
+    else HuggingFace model ID
+        F->>F: download_tokenizer_from_hf()
+        F->>T: new from downloaded files
+    end
     F->>M: record_factory_load()
     F-->>C: Arc<dyn Tokenizer>
 
@@ -287,11 +294,11 @@ impl Tokenizer {
 - Single field: `Arc<dyn traits::Tokenizer>` for polymorphic dispatch
 - Immutable after creation, Clone via Arc
 
-**Re-exports** (mod.rs:25-39):
-- Factory functions: `create_tokenizer`, `create_tokenizer_from_file`, `create_tokenizer_with_chat_template`
-- Types: `Sequence`, `StopSequenceConfig`, `DecodeStream`, `Encoding`
-- Chat template: `ChatMessage` (when huggingface feature enabled)
-- Conditional: `HuggingFaceTokenizer`, `TiktokenTokenizer` based on features
+**Re-exports** (mod.rs:26-43):
+- Factory functions: `create_tokenizer`, `create_tokenizer_async`, `create_tokenizer_from_file`, `create_tokenizer_with_chat_template`
+- Types: `Sequence`, `StopSequenceConfig`, `DecodeStream`, `Encoding`, `TokenizerType`
+- Chat template: `ChatMessage`
+- Tokenizer implementations: `HuggingFaceTokenizer`, `TiktokenTokenizer`
 
 ### 3.2 traits.rs (Trait Definitions)
 
@@ -350,6 +357,7 @@ pub fn create_tokenizer_with_chat_template(
     chat_template_path: Option<&str>
 ) -> Result<Arc<dyn traits::Tokenizer>>
 pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<dyn traits::Tokenizer>>
+pub async fn create_tokenizer_async(model_name_or_path: &str) -> Result<Arc<dyn traits::Tokenizer>>
 pub fn get_tokenizer_info(file_path: &str) -> Result<TokenizerType>
 ```
 
@@ -364,10 +372,16 @@ pub fn get_tokenizer_info(file_path: &str) -> Result<TokenizerType>
 - SentencePiece: Check for specific byte patterns
 - GGUF: Check magic number "GGUF"
 
-**Model Name Routing** (factory.rs:163-203):
+**Model Name Routing** (factory.rs:145-193):
 - GPT models → Tiktoken (gpt-4, gpt-3.5, davinci, curie, etc.)
 - File paths → file-based creation
-- HuggingFace Hub → Not implemented (returns error)
+- HuggingFace model IDs → Automatic download from Hub
+
+**HuggingFace Hub Integration**:
+- Downloads tokenizer files (tokenizer.json, tokenizer_config.json, etc.)
+- Respects HF_TOKEN environment variable for private models
+- Caches downloaded files using hf-hub crate
+- Async and blocking versions available
 
 **Metrics Integration:**
 - Records factory load/error events (factory.rs:56-57, 82-83)
@@ -613,7 +627,32 @@ pub enum TiktokenModel {
 - Decode: Join tokens with spaces
 - Skips special tokens when requested
 
-### 3.10 chat_template.rs (Chat Template Support)
+### 3.10 hub.rs (HuggingFace Hub Download)
+
+**Location**: `src/tokenizer/hub.rs`
+
+**Purpose:** Download tokenizer files from HuggingFace Hub when given a model ID.
+
+**Key Functions:**
+
+```rust
+pub async fn download_tokenizer_from_hf(model_id: impl AsRef<Path>) -> Result<PathBuf>
+pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> Result<PathBuf>
+```
+
+**Features:**
+- Downloads only tokenizer-related files by default
+- Filters out model weights, images, and documentation
+- Uses HF_TOKEN environment variable for authentication
+- Returns cached directory path for subsequent use
+- Progress indication during download
+
+**File Detection:**
+- Tokenizer files: tokenizer.json, tokenizer_config.json, special_tokens_map.json
+- Vocabulary files: vocab.json, merges.txt
+- SentencePiece models: *.model files
+
+### 3.11 chat_template.rs (Chat Template Support)
 
 **Location**: `src/tokenizer/chat_template.rs`
 
@@ -894,11 +933,11 @@ The `Encoding` enum must:
 ### Configuration
 
 **Environment Variables:**
-- None currently defined
+- `HF_TOKEN`: HuggingFace authentication token for private models
 
-**Feature Flags:**
-- `huggingface`: Enable HF tokenizer
-- `tiktoken`: Enable Tiktoken support
+**Dependencies:**
+- All tokenizer backends included by default
+- No feature flags required
 
 **Model Mapping:**
 - Hardcoded in factory.rs
@@ -961,26 +1000,22 @@ The `Encoding` enum must:
    - File: `src/tokenizer/traits.rs`
    - Symbol: `pub type Offsets = (usize, usize)`
 
-3. **TODO:** Implement HuggingFace Hub downloading
-   - File: `src/tokenizer/factory.rs:191`
-   - Symbol: `create_tokenizer()` function
-
-4. **TODO:** Support SentencePiece models
+3. **TODO:** Support SentencePiece models
    - File: `src/tokenizer/factory.rs:69-72`
    - Symbol: Extension match arm for "model"
 
-5. **TODO:** Support GGUF format
+4. **TODO:** Support GGUF format
    - File: `src/tokenizer/factory.rs:74-78`
    - Symbol: Extension match arm for "gguf"
 
-6. **TODO:** Add token↔ID mapping for Tiktoken
+5. **TODO:** Add token↔ID mapping for Tiktoken
    - File: `src/tokenizer/tiktoken.rs:151-161`
    - Symbol: `token_to_id()` and `id_to_token()` methods
 
-7. **TODO:** Fix `token_ids_ref()` for Tiktoken
+6. **TODO:** Fix `token_ids_ref()` for Tiktoken
    - File: `src/tokenizer/traits.rs:46-50`
    - Symbol: `Encoding::Tiktoken` match arm
 
-8. **TODO:** Make model→tokenizer mapping configurable
+7. **TODO:** Make model→tokenizer mapping configurable
    - File: `src/tokenizer/factory.rs:174-184`
    - Symbol: GPT model detection logic

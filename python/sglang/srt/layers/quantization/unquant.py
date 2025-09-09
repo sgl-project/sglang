@@ -9,6 +9,8 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -24,8 +26,10 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 
@@ -155,7 +159,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         with_bias: bool = False,
         **extra_weight_attrs,
@@ -163,7 +167,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.with_bias = with_bias
 
         # Fused gate_up_proj (column parallel)
-        w13_weight_n, w13_weight_k = 2 * intermediate_size, hidden_size
+        w13_weight_n, w13_weight_k = 2 * intermediate_size_per_partition, hidden_size
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         w13_weight = torch.nn.Parameter(
@@ -175,7 +179,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, 2 * intermediate_size, dtype=torch.float32),
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    dtype=torch.float32,
+                ),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
@@ -184,7 +192,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # down_proj (row parallel)
         w2_weight_n, w2_weight_k = (
             hidden_size,
-            intermediate_size,
+            intermediate_size_per_partition,
         )
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
@@ -222,33 +230,40 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         return
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
 
         return self.forward(
-            x=x,
             layer=layer,
-            topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+            dispatch_output=dispatch_output,
         )
 
     def forward_cuda(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        moe_runner_config = self.moe_runner_config
 
         if self.use_triton_kernels:
             if self.with_bias:
                 assert self.triton_kernel_moe_with_bias_forward is not None
-                return self.triton_kernel_moe_with_bias_forward(
+                output = self.triton_kernel_moe_with_bias_forward(
                     hidden_states=x,
                     w1=layer.w13_weight,
                     w2=layer.w2_weight,
@@ -261,13 +276,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 )
             else:
                 assert self.triton_kernel_moe_forward is not None
-                return self.triton_kernel_moe_forward(
+                output = self.triton_kernel_moe_forward(
                     hidden_states=x,
                     w1=layer.w13_weight,
                     w2=layer.w2_weight,
                     topk_output=topk_output,
                     moe_runner_config=moe_runner_config,
                 )
+            return StandardCombineInput(hidden_states=output)
         else:
             if _use_aiter:
                 assert not moe_runner_config.no_combine, "unsupported"
@@ -284,7 +300,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     topk_weights = torch.ones_like(
                         topk_weights, dtype=torch.float32
                     )  # topk_weights must be FP32 (float32)
-                return fused_moe(
+                output = fused_moe(
                     x,
                     layer.w13_weight,
                     layer.w2_weight,
@@ -296,28 +312,30 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                         else ActivationType.Gelu
                     ),
                 )
+                return StandardCombineInput(hidden_states=output)
             else:
-                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-                    fused_experts,
-                )
 
-                return fused_experts(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    b1=getattr(layer, "w13_weight_bias", None),
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    b13=getattr(layer, "w13_weight_bias", None),
                     b2=getattr(layer, "w2_weight_bias", None),
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
                 )
+                return self.runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        moe_runner_config = self.moe_runner_config
+
         assert (
             moe_runner_config.activation == "silu"
         ), f"activation = {moe_runner_config.activation} is not supported."
@@ -332,7 +350,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             x, topk_weights = apply_topk_weights_cpu(
                 moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
-            return torch.ops.sgl_kernel.fused_experts_cpu(
+            output = torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -348,33 +366,39 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 None,  # a2_scale
                 True,  # is_vnni
             )
+            return StandardCombineInput(hidden_states=output)
         else:
             from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 
-            return moe_forward_native(
+            output = moe_forward_native(
                 layer,
                 x,
                 topk_output,
                 moe_runner_config,
             )
+            return StandardCombineInput(hidden_states=output)
 
     def forward_npu(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
 
-        return moe_forward_native(
+        from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        output = moe_forward_native(
             layer,
             x,
             topk_output,
-            moe_runner_config,
+            self.moe_runner_config,
         )
+        return StandardCombineInput(hidden_states=output)
 
-    def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
+    def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
 
     forward_native = forward_cpu

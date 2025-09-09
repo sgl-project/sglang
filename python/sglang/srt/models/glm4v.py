@@ -93,9 +93,8 @@ class Glm4vVisionBlock(Qwen2_5_VisionBlock):
             quant_config=quant_config,
             prefix=prefix,
             num_dummy_heads=config.num_dummy_heads,
+            rms_norm_eps=config.rms_norm_eps,
         )
-        self.norm1 = Glm4vRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm2 = Glm4vRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.mlp = Glm4vVisionMLP(
             config.hidden_size,

@@ -32,6 +32,7 @@ from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
+    get_pp_group,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
@@ -66,7 +67,6 @@ from sglang.srt.layers.quantization import (
 )
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import (
@@ -121,6 +121,7 @@ from sglang.srt.utils import (
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
     is_npu,
+    is_sm100_supported,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cuda_arch,
@@ -307,7 +308,10 @@ class ModelRunner:
         model_num_layers = (
             self.model_config.num_nextn_predict_layers
             if self.is_draft_worker and model_has_mtp_layers
-            else self.model_config.num_hidden_layers
+            else max(
+                self.model_config.num_hidden_layers,
+                self.model_config.num_attention_layers,
+            )
         )
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
@@ -337,6 +341,14 @@ class ModelRunner:
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
+
+        # Init Double Sparsity
+        if server_args.enable_double_sparsity:
+            if server_args.ds_heavy_channel_type is None:
+                raise ValueError(
+                    "Please specify the heavy channel type for double sparsity optimization."
+                )
+            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         # Init memory pool and attention backends
         self.init_memory_pool(
@@ -503,11 +515,6 @@ class ModelRunner:
             )
             server_args.attention_backend = "triton"
             server_args.disable_cuda_graph = True
-            if server_args.ds_heavy_channel_type is None:
-                raise ValueError(
-                    "Please specify the heavy channel type for double sparsity optimization."
-                )
-            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
@@ -518,6 +525,17 @@ class ModelRunner:
                 )
 
         if not self.use_mla_backend:
+            server_args.disable_chunked_prefix_cache = True
+        # TODO(kaixih@nvidia): remove this once we have a better solution for DP attention.
+        #  For more details, see: https://github.com/sgl-project/sglang/issues/8616
+        elif (
+            self.dp_size > 1
+            and is_sm100_supported()
+            and server_args.attention_backend != "triton"
+        ):
+            logger.info(
+                "Disable chunked prefix cache when dp size > 1 and attention backend is not triton."
+            )
             server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
@@ -622,6 +640,7 @@ class ModelRunner:
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()
+        self.pp_group = get_pp_group()
         self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
@@ -1440,14 +1459,12 @@ class ModelRunner:
             else self.server_args.attention_backend
         )
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
-            assert (
-                self.server_args.speculative_algorithm is None
-            ), "Currently HybridAttentionBackend does not support speculative decoding."
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
             )
 
             attn_backend = HybridAttnBackend(
+                self,
                 decode_backend=self._get_attention_backend_from_str(
                     self.decode_attention_backend_str
                 ),
@@ -1654,7 +1671,7 @@ class ModelRunner:
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
-        from sglang.srt.model_parallel import tensor_parallel
+        from sglang.srt.layers.model_parallel import tensor_parallel
 
         device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
         tensor_parallel(self.model, device_mesh)
@@ -1810,7 +1827,10 @@ class ModelRunner:
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
-        if forward_batch.global_num_tokens_cpu is not None:
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and self.pp_group.is_last_rank
+        ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
         return ret, can_run_cuda_graph
