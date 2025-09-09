@@ -2204,7 +2204,7 @@ class Scheduler(
             if_success = False
         return if_success
 
-    def get_load(self, recv_req: GetLoadReqInput) -> GetLoadReqOutput:
+    def get_load(self, recv_req: GetLoadReqInput = None) -> GetLoadReqOutput:
         # TODO(lsyin): use dynamically maintained num_waiting_tokens
 
         if self.is_hybrid:
