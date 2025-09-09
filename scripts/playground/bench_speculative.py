@@ -55,10 +55,6 @@ class FakeTokenizer:
 
 
 def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
-    padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
-        :num_prompts
-    ]
-
     # format: (prompt, input_len, output len). We set input_len as a dummy value 0.
     if is_multimodal:
         input_requests = sample_mmmu_requests(
@@ -70,6 +66,9 @@ def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
         backend = "sglang-oai-chat"
         api_url = f"{base_url}/v1/chat/completions"
     else:
+        padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
+            :num_prompts
+        ]
         input_requests: List[DatasetRow] = [
             DatasetRow(p, 0, 512) for p in padded_prompts
         ]
