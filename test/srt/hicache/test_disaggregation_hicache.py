@@ -1,12 +1,13 @@
-from ast import Dict
 import os
 import random
 import tempfile
 import time
 import unittest
+from ast import Dict
 from urllib.parse import urlparse
 
 import requests
+
 from sglang.bench_serving import get_tokenizer
 from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
