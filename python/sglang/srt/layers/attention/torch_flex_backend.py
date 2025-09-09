@@ -27,6 +27,29 @@ class TorchFlexAttnBackend(AttentionBackend):
         """Init the metadata for a forward pass."""
         torch.cuda.empty_cache()
 
+        self.block_masks = []
+        for seq_idx in range(len(forward_batch.seq_lens)):
+            if forward_batch.forward_mode.is_extend():
+                seq_len = forward_batch.seq_lens[seq_idx]
+                prefix_len = forward_batch.extend_prefix_lens[seq_idx]
+            elif forward_batch.forward_mode.is_decode():
+                seq_len = forward_batch.seq_lens[seq_idx]
+                prefix_len = seq_len - 1
+
+            q_len = seq_len - prefix_len
+            self.q_offset = prefix_len
+            self.block_masks.append(create_block_mask(
+                self._causal_mask,
+                None,
+                None,
+                q_len,
+                seq_len,
+                device=self.device,
+                BLOCK_SIZE=128,
+                _compile=False,
+            ))
+
+
     def _causal_mask(self, b, h, q_idx, kv_idx):
         return self.q_offset + q_idx >= kv_idx
 
@@ -91,27 +114,12 @@ class TorchFlexAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            if causal:
-                self.q_offset = extend_prefix_lens[seq_idx]
-                block_mask = create_block_mask(
-                    self._causal_mask,
-                    None,
-                    None,
-                    extend_seq_len_q,
-                    seq_len_kv,
-                    device=query.device,
-                    BLOCK_SIZE=128,
-                    _compile=False,
-                )
-            else:
-                raise ValueError("We only support causal attention for now.")
-
             output[start_q:end_q, :, :] = (
                 self.flex_attention(
                     per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
-                    block_mask=block_mask,
+                    block_mask=self.block_masks[seq_idx],
                     scale=scaling,
                     enable_gqa=enable_gqa,
                 )
@@ -174,23 +182,12 @@ class TorchFlexAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            self.q_offset = seq_len_kv - seq_len_q
-            mask_mod = create_block_mask(
-                self._causal_mask,
-                None,
-                None,
-                seq_len_q,
-                seq_len_kv,
-                device=query.device,
-                BLOCK_SIZE=128,
-                _compile=False,
-            )
             per_req_out = (
                 self.flex_attention(
                     per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
-                    block_mask=mask_mod,
+                    block_mask=self.block_masks[seq_idx],
                     scale=scaling,
                     enable_gqa=enable_gqa,
                 )
