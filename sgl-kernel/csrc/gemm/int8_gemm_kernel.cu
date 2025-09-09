@@ -672,7 +672,7 @@ torch::Tensor int8_scaled_mm(
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
   TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
   TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
-  TORCH_CHECK(mat_b.stride(0) == 1, "mat_a must be a column major tensor");
+  TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
   TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
   TORCH_CHECK(mat_a.size(1) % 16 == 0, "mat_a.size(1) must be multiple of 16 for memory alignment");
   TORCH_CHECK(mat_b.size(0) % 16 == 0, "mat_b.size(0) must be multiple of 16 for memory alignment");
@@ -703,8 +703,8 @@ torch::Tensor int8_scaled_mm(
     sm75_dispatch_shape<cutlass::half_t, cutlass::arch::Sm75, cutlass::gemm::GemmShape<8, 8, 16>>(
         out, mat_a, mat_b, scales_a, scales_b, bias);
   } else if (sm_version >= 80 && sm_version < 90) {
-    // sm89 has a much smaller shared memory size (100K) than sm80 (160K)
-    if (sm_version == 89) {
+    // sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
+    if (sm_version == 86 || sm_version == 89) {
       if (out_dtype == torch::kBFloat16) {
         sm89_dispatch_shape<cutlass::bfloat16_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
             out, mat_a, mat_b, scales_a, scales_b, bias);

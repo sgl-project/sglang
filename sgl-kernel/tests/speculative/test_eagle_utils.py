@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn.functional as F
 from sgl_kernel import verify_tree_greedy
@@ -9,7 +10,7 @@ def test_verify_tree_greedy():
             [0, 1, 2, 3, 4, 5],
             [7, 8, 9, 10, 11, 12],
         ],
-        dtype=torch.int32,
+        dtype=torch.int64,
         device="cuda",
     )
     retrive_index = torch.tensor(
@@ -17,7 +18,7 @@ def test_verify_tree_greedy():
             [0, 1, 2, 3, 4, 5],
             [6, 7, 8, 9, 10, 11],
         ],
-        dtype=torch.int32,
+        dtype=torch.int64,
         device="cuda",
     )
     retrive_next_token = torch.tensor(
@@ -25,7 +26,7 @@ def test_verify_tree_greedy():
             [1, 2, -1, 4, 5, -1],
             [4, 2, 3, -1, 5, -1],
         ],
-        dtype=torch.int32,
+        dtype=torch.int64,
         device="cuda",
     )
     retrive_next_sibling = torch.tensor(
@@ -33,7 +34,7 @@ def test_verify_tree_greedy():
             [-1, 3, -1, -1, -1, -1],
             [-1, -1, -1, -1, 1, -1],
         ],
-        dtype=torch.int32,
+        dtype=torch.int64,
         device="cuda",
     )
 
@@ -48,13 +49,11 @@ def test_verify_tree_greedy():
             if torch.max(target_logits[i][j]) < 10:
                 target_logits[i][j][18] = 10
 
-    print(f"{target_logits=}")
-    target_predict = torch.argmax(target_logits, dim=-1).to(torch.int32)
+    target_predict = torch.argmax(target_logits, dim=-1)
     predict_shape = (12,)
 
     bs = candidates.shape[0]
     num_spec_step = 4
-    num_draft_tokens = candidates.shape[1]
 
     predicts = torch.full(
         predict_shape, -1, dtype=torch.int32, device="cuda"
@@ -63,12 +62,6 @@ def test_verify_tree_greedy():
         (bs, num_spec_step), -1, dtype=torch.int32, device="cuda"
     )  # mutable
     accept_token_num = torch.full((bs,), 0, dtype=torch.int32, device="cuda")  # mutable
-
-    print(f"{candidates=}")
-    print(f"{retrive_index=}")
-    print(f"{retrive_next_token=}")
-    print(f"{retrive_next_sibling=}")
-    print(f"{target_predict=}")
 
     verify_tree_greedy(
         predicts=predicts,
@@ -81,18 +74,14 @@ def test_verify_tree_greedy():
         target_predict=target_predict,
     )
 
-    print(f"{predicts=}")
-    print(f"{accept_index=}")
-    print(f"{accept_token_num=}")
-
-    return predicts, accept_index, accept_token_num
-
-
-if __name__ == "__main__":
-    predicts, accept_index, accept_token_num = test_verify_tree_greedy()
+    # Check the expected output.
     assert predicts.tolist() == [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18]
     assert accept_index.tolist() == [
         [0, 3, 4, 5],
         [6, 10, 11, -1],
     ]
     assert accept_token_num.tolist() == [3, 2]
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

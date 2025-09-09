@@ -12,7 +12,7 @@ import requests
 import torch
 
 from sglang.test.test_utils import is_in_ci
-from sglang.utils import print_highlight, terminate_process, wait_for_server
+from sglang.utils import terminate_process, wait_for_server
 
 if is_in_ci():
     from docs.backend.patch import launch_server_cmd
@@ -23,7 +23,7 @@ else:
 def main():
     # Launch the server
     server_process, port = launch_server_cmd(
-        "python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-1.5B-instruct --host 0.0.0.0"
+        "python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-1.5B-instruct --enable-return-hidden-states --host 0.0.0.0"
     )
     wait_for_server(f"http://localhost:{port}")
 

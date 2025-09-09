@@ -1,7 +1,8 @@
-// Adapt from https://github.com/vllm-project/vllm/blob/v0.7.1/csrc/cutlass_extensions/gemm/dispatch_policy.hpp
+// Adapted from https://github.com/vllm-project/vllm/blob/main/csrc/cutlass_extensions/gemm/dispatch_policy.hpp
+
 #pragma once
 
-#include <cutlass/gemm/dispatch_policy.hpp>
+#include "cutlass/gemm/dispatch_policy.hpp"
 
 namespace cutlass::gemm {
 

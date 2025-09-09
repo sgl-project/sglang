@@ -85,7 +85,7 @@ def main(args):
     call_generate = partial(get_call_generate(args), temperature=0)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
 
     if args.backend != "lmql":
 
@@ -120,7 +120,7 @@ def main(args):
                 asyncio.gather(*[get_one_answer_async(i) for i in bt])
             )
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     print(f"Latency: {latency:.3f}")

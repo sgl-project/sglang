@@ -1,12 +1,14 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
+import concurrent.futures
 import fnmatch
 import glob
 import hashlib
 import json
 import logging
 import os
+import queue
 import tempfile
 from collections import defaultdict
 from typing import (
@@ -22,7 +24,6 @@ from typing import (
 )
 
 import filelock
-import gguf
 import huggingface_hub.constants
 import numpy as np
 import safetensors.torch
@@ -35,6 +36,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.utils import print_warning_once
 
 logger = logging.getLogger(__name__)
@@ -93,7 +95,7 @@ def convert_bin_to_safetensor_file(
     pt_filename: str,
     sf_filename: str,
 ) -> None:
-    loaded = torch.load(pt_filename, map_location="cpu")
+    loaded = torch.load(pt_filename, map_location="cpu", weights_only=True)
     if "state_dict" in loaded:
         loaded = loaded["state_dict"]
     shared = _shared_pointers(loaded)
@@ -130,7 +132,9 @@ def convert_bin_to_safetensor_file(
 
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
-    model_config: ModelConfig, load_config: LoadConfig
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+    packed_modules_mapping: Dict[str, List[str]],
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
 
@@ -148,6 +152,7 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
+        hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
@@ -204,12 +209,28 @@ def get_quant_config(
             config["adapter_name_or_path"] = model_name_or_path
         elif model_config.quantization == "modelopt":
             if config["producer"]["name"] == "modelopt":
-                return quant_cls.from_config(config)
+                # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+                if config["quantization"]["quant_algo"] is None:
+                    if (
+                        model_config.hf_config.architectures[0]
+                        != "LlamaForCausalLMEagle3"
+                    ):
+                        raise ValueError(
+                            f"Invalid quant_config, quantization method: {model_config.quantization},"
+                            f"hf architectures: {model_config.hf_config.architectures[0]}. "
+                        )
+                    return None
+                if "FP4" in config["quantization"]["quant_algo"]:
+                    return ModelOptFp4Config.from_config(config)
+                else:
+                    return quant_cls.from_config(config)
             else:
                 raise ValueError(
                     f"Unsupported quantization config"
                     f" found for {model_config.quantization} in {f}."
                 )
+        elif model_config.quantization == "w8a8_int8":
+            config["packed_modules_mapping"] = packed_modules_mapping
 
     return quant_cls.from_config(config)
 
@@ -381,7 +402,7 @@ def np_cache_weights_iterator(
                 disable=not enable_tqdm,
                 bar_format=_BAR_FORMAT,
             ):
-                state = torch.load(bin_file, map_location="cpu")
+                state = torch.load(bin_file, map_location="cpu", weights_only=True)
                 for name, param in state.items():
                     param_path = os.path.join(np_folder, name)
                     with open(param_path, "wb") as f:
@@ -416,6 +437,7 @@ def safetensors_weights_iterator(
     hf_weights_files: List[str],
     is_all_weights_sharded: bool = False,
     decryption_key: Optional[str] = None,
+    disable_mmap: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -437,9 +459,70 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        result = safetensors.torch.load_file(st_file, device="cpu")
-        for name, param in result.items():
-            yield name, param
+        if disable_mmap:
+            with open(st_file, "rb") as f:
+                result = safetensors.torch.load(f.read())
+                for name, param in result.items():
+                    yield name, param
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    yield name, f.get_tensor(name)
+
+
+def multi_thread_safetensors_weights_iterator(
+    hf_weights_files: List[str],
+    is_all_weights_sharded: bool = False,
+    decryption_key: Optional[str] = None,
+    max_workers: int = 4,
+    disable_mmap: bool = False,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Multi-Thread iterate over the weights in the model safetensor files.
+
+    If is_all_weights_sharded is True, it uses more optimize read by reading an
+    entire file instead of reading each tensor one by one.
+    """
+    if decryption_key:
+        logger.warning(
+            "Multi-Thread loading is not working for encrypted safetensor weights."
+        )
+        yield from safetensors_encrypted_weights_iterator(
+            hf_weights_files, is_all_weights_sharded, decryption_key
+        )
+        return
+
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    def _load_file(st_file: str):
+        if disable_mmap:
+            with open(st_file, "rb") as f:
+                result = safetensors.torch.load(f.read())
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
+
+        return result
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
+
+        if enable_tqdm:
+            futures_iter = tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(hf_weights_files),
+                desc="Multi-thread loading shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            )
+        else:
+            futures_iter = concurrent.futures.as_completed(futures)
+
+        for future in futures_iter:
+            state_dict = future.result()
+            for name, param in state_dict.items():
+                yield name, param
 
 
 def pt_weights_iterator(
@@ -458,12 +541,46 @@ def pt_weights_iterator(
         state = torch.load(bin_file, map_location="cpu", weights_only=True)
         yield from state.items()
         del state
-        torch.cuda.empty_cache()
+
+
+def multi_thread_pt_weights_iterator(
+    hf_weights_files: List[str],
+    max_workers: int = 4,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Multi-Thread iterate over the weights in the model bin/pt files."""
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    def _load_file(bin_file: str):
+        return torch.load(bin_file, map_location="cpu", weights_only=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_load_file, bin_file) for bin_file in hf_weights_files
+        ]
+
+        if enable_tqdm:
+            futures_iter = tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(hf_weights_files),
+                desc="Multi-thread loading pt checkpoint shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            )
+        else:
+            futures_iter = concurrent.futures.as_completed(futures)
+
+        for future in futures_iter:
+            state = future.result()
+            yield from state.items()
 
 
 def get_gguf_extra_tensor_names(
     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> List[str]:
+    import gguf
+
     reader = gguf.GGUFReader(gguf_file)
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
     exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
@@ -478,6 +595,8 @@ def gguf_quant_weights_iterator(
     Iterate over the quant weights in the model gguf files and convert
     them to torch tensors
     """
+
+    import gguf
 
     reader = gguf.GGUFReader(gguf_file)
 
@@ -724,6 +843,16 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
                 return None
             return remapped_name
 
+    quark_scale_names = {
+        ".q_proj.output_scale": ".attn.q_scale",
+        ".k_proj.output_scale": ".attn.k_scale",
+        ".v_proj.output_scale": ".attn.v_scale",
+        "self_attn.prob_output_scale": ".attn.prob_scale",
+    }
+    for quark_scale_name, sglang_scale_name in quark_scale_names.items():
+        if name.endswith(quark_scale_name):
+            return name.replace(quark_scale_name, sglang_scale_name)
+
     # If there were no matches, return the untouched param name
     return name
 
@@ -844,3 +973,57 @@ def kv_cache_scales_loader(
         tp_rank,
     )
     return []
+
+
+def get_actual_shard_size(shard_size, weight_start, weight_end):
+    if weight_end < weight_start:
+        return 0
+
+    return min(shard_size, weight_end - weight_start)
+
+
+def reset_param_data_if_needed(param_data, dim, start, length):
+    if length == 0:
+        return
+
+    assert length > 0, f"Length should be positive, but got {length}"
+
+    param_data.narrow(dim, start, length).zero_()
+    return
+
+
+def narrow_padded_param_and_loaded_weight(
+    param_data,
+    loaded_weight,
+    param_data_start,
+    weight_start,
+    dim,
+    shard_size,
+    narrow_weight=True,
+):
+    actual_shard_size = get_actual_shard_size(
+        shard_size, weight_start, loaded_weight.size(dim)
+    )
+
+    if narrow_weight:
+        if actual_shard_size > 0:
+            loaded_weight = loaded_weight.narrow(dim, weight_start, actual_shard_size)
+        else:
+            # No real data to load; create a dummy tensor filled with zeros
+            loaded_weight = torch.zeros_like(
+                param_data.narrow(dim, param_data_start, actual_shard_size)
+            )
+
+    # [Note] Reset padded weights to zero.
+    # If the actual shard size is less than the shard size, we need to reset
+    # the padded param_data to zero and then copy the loaded_weight into it.
+    reset_param_data_if_needed(
+        param_data,
+        dim,
+        param_data_start + actual_shard_size,
+        shard_size - actual_shard_size,
+    )
+
+    param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
+
+    return param_data, loaded_weight

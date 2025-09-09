@@ -11,13 +11,14 @@ def tree_speculative_sampling_target_only(
     retrive_next_token: torch.Tensor,
     retrive_next_sibling: torch.Tensor,
     uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
     target_probs: torch.Tensor,
     draft_probs: torch.Tensor,
     threshold_single: float = 1.0,
     threshold_acc: float = 1.0,
     deterministic: bool = True,
 ) -> None:
-    torch.ops.sgl_kernel.tree_speculative_sampling_target_only(
+    torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default(
         predicts,
         accept_index,
         accept_token_num,
@@ -26,6 +27,7 @@ def tree_speculative_sampling_target_only(
         retrive_next_token,
         retrive_next_sibling,
         uniform_samples,
+        uniform_samples_for_final_sampling,
         target_probs,
         draft_probs,
         threshold_single,
@@ -45,7 +47,7 @@ def verify_tree_greedy(
     retrive_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.verify_tree_greedy(
+    torch.ops.sgl_kernel.verify_tree_greedy.default(
         predicts,
         accept_index,
         accept_token_num,
@@ -70,8 +72,9 @@ def build_tree_kernel_efficient(
     topk: int,
     depth: int,
     draft_token_num: int,
+    tree_mask_mode: int,
 ) -> None:
-    torch.ops.sgl_kernel.build_tree_kernel_efficient(
+    torch.ops.sgl_kernel.build_tree_kernel_efficient.default(
         parent_list,
         selected_index,
         verified_seq_len,
@@ -83,6 +86,7 @@ def build_tree_kernel_efficient(
         topk,
         depth,
         draft_token_num,
+        tree_mask_mode,
     )
 
 
@@ -91,11 +95,13 @@ def segment_packbits(
     input_indptr: torch.Tensor,
     output_indptr: torch.Tensor,
     y: torch.Tensor,
+    batch_size: int,
 ) -> None:
-    torch.ops.sgl_kernel.segment_packbits(
+    torch.ops.sgl_kernel.segment_packbits.default(
         x,
         input_indptr,
         output_indptr,
         y,
+        batch_size,
         torch.cuda.current_stream().cuda_stream,
     )

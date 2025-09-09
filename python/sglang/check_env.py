@@ -1,6 +1,6 @@
 """Check environment configurations and dependency versions."""
 
-import importlib
+import importlib.metadata
 import os
 import resource
 import subprocess
@@ -20,7 +20,7 @@ def is_cuda_v2():
 PACKAGE_LIST = [
     "sglang",
     "sgl_kernel",
-    "flashinfer",
+    "flashinfer_python",
     "triton",
     "transformers",
     "torchao",
@@ -36,8 +36,8 @@ PACKAGE_LIST = [
     "packaging",
     "psutil",
     "pydantic",
-    "multipart",
-    "zmq",
+    "python-multipart",
+    "pyzmq",
     "torchao",
     "uvicorn",
     "uvloop",
@@ -59,9 +59,8 @@ def get_package_versions(packages):
     for package in packages:
         package_name = package.split("==")[0].split(">=")[0].split("<=")[0]
         try:
-            module = importlib.import_module(package_name)
-            if hasattr(module, "__version__"):
-                versions[package_name] = module.__version__
+            version = importlib.metadata.version(package_name)
+            versions[package_name] = version
         except ModuleNotFoundError:
             versions[package_name] = "Module Not Found"
     return versions

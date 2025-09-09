@@ -49,7 +49,15 @@ class _ModelRegistry:
         if not architectures:
             logger.warning("No model architectures are specified")
 
-        return architectures
+        # filter out support architectures
+        normalized_arch = list(
+            filter(lambda model: model in self.models, architectures)
+        )
+
+        # make sure Transformers backend is put at the last as a fallback
+        if len(normalized_arch) != len(architectures):
+            normalized_arch.append("TransformersForCausalLM")
+        return normalized_arch
 
     def resolve_model_cls(
         self,
@@ -75,7 +83,7 @@ def import_model_classes():
             try:
                 module = importlib.import_module(name)
             except Exception as e:
-                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass

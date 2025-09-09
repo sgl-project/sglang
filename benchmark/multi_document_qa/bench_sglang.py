@@ -13,7 +13,7 @@ from sglang.utils import dump_state_text, read_jsonl
 @sgl.function
 def multi_document_qa(s, docs, question):
     s += sgl.user_begin()
-    s += "Pleaes answer a question according to given documents.\n"
+    s += "Please answer a question according to given documents.\n"
     s += "Question:" + question + "Documents begin.\n"
 
     forks = s.fork(len(docs))
@@ -49,11 +49,11 @@ def main(args):
     sgl.set_default_backend(backend)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = multi_document_qa.run_batch(
         arguments, temperature=0, num_threads=args.parallel, progress_bar=True
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     print([s["answer"] for s in states])

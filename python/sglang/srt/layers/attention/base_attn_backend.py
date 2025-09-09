@@ -19,7 +19,7 @@ class AttentionBackend(ABC):
         """Init the metadata for a forward pass."""
         raise NotImplementedError()
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
 
@@ -39,7 +39,6 @@ class AttentionBackend(ABC):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_kv_heads: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
@@ -48,7 +47,7 @@ class AttentionBackend(ABC):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        """Init the metadata for a forward pass for replying a cuda graph."""
+        """Init the metadata for a forward pass for replaying a cuda graph."""
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -63,9 +62,12 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run forward on an attention layer."""
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_idle():
+            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+        elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
                 q,
                 k,
@@ -73,6 +75,7 @@ class AttentionBackend(ABC):
                 layer,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
+                **kwargs,
             )
         else:
             return self.forward_extend(
@@ -82,6 +85,7 @@ class AttentionBackend(ABC):
                 layer,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
+                **kwargs,
             )
 
     def forward_decode(
@@ -107,3 +111,7 @@ class AttentionBackend(ABC):
     ):
         """Run a forward for extend."""
         raise NotImplementedError()
+
+    def support_triton(self):
+        """Check if the current backend supports triton."""
+        return True

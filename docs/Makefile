@@ -23,7 +23,8 @@ compile:
 		parallel -0 -j3 --halt soon,fail=1 ' \
 		NB_NAME=$$(basename {}); \
 		START_TIME=$$(date +%s); \
-		jupyter nbconvert --to notebook --execute --inplace "{}" \
+		retry --delay=0 --times=2 -- \
+			jupyter nbconvert --to notebook --execute --inplace "{}" \
 			--ExecutePreprocessor.timeout=600 \
 			--ExecutePreprocessor.kernel_name=python3; \
 		RET_CODE=$$?; \
@@ -39,8 +40,9 @@ compile:
 
 # Serve documentation with auto-build and live reload
 serve:
-	@echo "Starting auto-build server at http://localhost:$(PORT)"
+	@echo "Starting auto-build server at http://0.0.0.0:$(PORT)"
 	@$(SPHINXAUTOBUILD) "$(SOURCEDIR)" "$(BUILDDIR)/html" \
+		--host 0.0.0.0 \
 		--port $(PORT) \
 		--watch $(SOURCEDIR) \
 		--re-ignore ".*\.(ipynb_checkpoints|pyc|pyo|pyd|git)"

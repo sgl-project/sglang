@@ -12,10 +12,28 @@
 # limitations under the License.
 # ==============================================================================
 """Radix attention."""
+from __future__ import annotations
+
+from enum import Enum
+from typing import TYPE_CHECKING, Optional
 
 from torch import nn
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class AttentionType(Enum):
+    """
+    Attention type.
+    Use string to be compatible with `torch.compile`.
+    """
+
+    # Decoder attention between previous layer Q/K/V
+    DECODER = "decoder"
+    # Encoder attention between previous layer Q/K/V
+    ENCODER_ONLY = "encoder_only"
 
 
 class RadixAttention(nn.Module):
@@ -34,6 +52,11 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        pos_encoding_mode: str = "NONE",
+        logit_capping_method: str = "tanh",
+        quant_config: Optional[QuantizationConfig] = None,
+        attn_type: AttentionType = AttentionType.DECODER,
+        use_irope: bool = False,
         prefix: str = "",
     ):
         super().__init__()
@@ -48,8 +71,21 @@ class RadixAttention(nn.Module):
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
+        self.use_irope = use_irope
         self.k_scale = None
         self.v_scale = None
+        self.k_scale_float = None
+        self.v_scale_float = None
+        self.quant_method = None
+        if quant_config is not None:
+            self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+        if self.quant_method is not None:
+            self.quant_method.create_weights(self)
+        self.attn_type = attn_type
+
+        self.pos_encoding_mode = pos_encoding_mode
+        self.logit_capping_method = logit_capping_method
+        self.xai_temperature_len = -1
 
     def forward(
         self,
@@ -58,13 +94,23 @@ class RadixAttention(nn.Module):
         v,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None
-            k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
-            v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+            if "k_rope" not in kwargs:
+                k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
+                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+            else:
+                k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
         return forward_batch.attn_backend.forward(
-            q, k, v, self, forward_batch, save_kv_cache
+            q,
+            k,
+            v,
+            self,
+            forward_batch,
+            save_kv_cache,
+            **kwargs,
         )

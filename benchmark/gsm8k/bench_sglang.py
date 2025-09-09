@@ -7,9 +7,10 @@ import time
 
 import numpy as np
 
-from sglang.api import set_default_backend
+from sglang.lang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
+    dump_bench_raw_result,
     select_sglang_backend,
 )
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
@@ -84,21 +85,18 @@ def main(args):
     #####################################
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = few_shot_gsm8k.run_batch(
         arguments,
         temperature=0,
         num_threads=args.parallel,
         progress_bar=True,
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     preds = []
     for i in range(len(states)):
         preds.append(get_answer_value(states[i]["answer"]))
-
-    # print(f"{preds=}")
-    # print(f"{labels=}")
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
@@ -118,6 +116,12 @@ def main(args):
 
     # Dump results
     dump_state_text(f"tmp_output_{args.backend}.txt", states)
+    dump_bench_raw_result(
+        path=args.raw_result_file,
+        states=states,
+        preds=preds,
+        labels=labels,
+    )
 
     with open(args.result_file, "a") as fout:
         value = {

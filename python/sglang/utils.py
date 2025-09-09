@@ -1,12 +1,10 @@
 """Common utilities"""
 
-import base64
 import importlib
 import json
 import logging
 import os
 import random
-import signal
 import socket
 import subprocess
 import sys
@@ -15,18 +13,67 @@ import traceback
 import urllib.request
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
+import pybase64
 import requests
 from IPython.display import HTML, display
+from pydantic import BaseModel
 from tqdm import tqdm
 
-from sglang.srt.utils import kill_process_tree
-
 logger = logging.getLogger(__name__)
+
+
+def execute_once(func):
+    has_run = None
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        nonlocal has_run
+        if not has_run:
+            func(*args, **kwargs)
+            has_run = True
+
+    return wrapper
+
+
+@execute_once
+def info_once(message: str):
+    logger.info(message)
+
+
+def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
+    """Convert a JSON schema to a string.
+    Parameters
+    ----------
+    json_schema
+        The JSON schema.
+    Returns
+    -------
+    str
+        The JSON schema converted to a string.
+    Raises
+    ------
+    ValueError
+        If the schema is not a dictionary, a string or a Pydantic class.
+    """
+    if isinstance(json_schema, dict):
+        schema_str = json.dumps(json_schema)
+    elif isinstance(json_schema, str):
+        schema_str = json_schema
+    elif issubclass(json_schema, BaseModel):
+        schema_str = json.dumps(json_schema.model_json_schema())
+    else:
+        raise ValueError(
+            f"Cannot parse schema {json_schema}. The schema must be either "
+            + "a Pydantic class, a dictionary or a string that contains the JSON "
+            + "schema specification"
+        )
+    return schema_str
 
 
 def get_exception_traceback():
@@ -119,15 +166,15 @@ def encode_image_base64(image_path: Union[str, bytes]):
     if isinstance(image_path, str):
         with open(image_path, "rb") as image_file:
             data = image_file.read()
-            return base64.b64encode(data).decode("utf-8")
+            return pybase64.b64encode(data).decode("utf-8")
     elif isinstance(image_path, bytes):
-        return base64.b64encode(image_path).decode("utf-8")
+        return pybase64.b64encode(image_path).decode("utf-8")
     else:
         # image_path is PIL.WebPImagePlugin.WebPImageFile
         image = image_path
         buffered = BytesIO()
         image.save(buffered, format="PNG")
-        return base64.b64encode(buffered.getvalue()).decode("utf-8")
+        return pybase64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
 def encode_frame(frame):
@@ -194,7 +241,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     video_bytes = b"".join(encoded_frames)
 
     # Encode the concatenated bytes to base64
-    video_base64 = "video:" + base64.b64encode(video_bytes).decode("utf-8")
+    video_base64 = "video:" + pybase64.b64encode(video_bytes).decode("utf-8")
 
     return video_base64
 
@@ -241,17 +288,6 @@ def find_printable_text(text: str):
     # which may change with the subsequent token -- there are probably smarter ways to do this!)
     else:
         return text[: text.rfind(" ") + 1]
-
-
-def graceful_registry(sub_module_name: str):
-    def graceful_shutdown(signum, frame):
-        logger.info(
-            f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
-        )
-        if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} recive sigterm")
-
-    signal.signal(signal.SIGTERM, graceful_shutdown)
 
 
 class LazyImport:
@@ -391,6 +427,8 @@ def terminate_process(process):
     """
     Terminate the process and automatically release the reserved port.
     """
+    from sglang.srt.utils import kill_process_tree
+
     kill_process_tree(process.pid)
 
     lock_socket = process_socket_map.pop(process, None)
@@ -405,7 +443,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
         base_url: The base URL of the server
         timeout: Maximum time to wait in seconds. None means wait forever.
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     while True:
         try:
             response = requests.get(
@@ -419,12 +457,13 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
+                    To reduce the log length, we set the log level to warning for the server, the default log level is info.
+                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break
 
-            if timeout and time.time() - start_time > timeout:
+            if timeout and time.perf_counter() - start_time > timeout:
                 raise TimeoutError("Server did not become ready within timeout period")
         except requests.exceptions.RequestException:
             time.sleep(1)
@@ -433,6 +472,10 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
+
+    def __iadd__(self, other: "TypeBasedDispatcher"):
+        self._mapping.extend(other._mapping)
+        return self
 
     def __call__(self, obj: Any):
         for ty, fn in self._mapping:
@@ -481,3 +524,12 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
         cleaned_chunk = trim_overlap(final_text, chunk_text)
         final_text += cleaned_chunk
         yield cleaned_chunk  # yield the non-overlapping portion
+
+
+def resolve_obj_by_qualname(qualname: str) -> Any:
+    """
+    Resolve an object by its fully qualified name.
+    """
+    module_name, obj_name = qualname.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, obj_name)

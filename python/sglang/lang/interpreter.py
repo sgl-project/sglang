@@ -26,6 +26,7 @@ from sglang.lang.ir import (
     SglRoleBegin,
     SglRoleEnd,
     SglSelect,
+    SglSeparateReasoning,
     SglVariable,
     SglVarScopeBegin,
     SglVarScopeEnd,
@@ -472,6 +473,8 @@ class StreamExecutor:
                 self._execute_concatenate_and_append_kv_cache(other)
             else:
                 self._execute_concatenate_and_append_text(other)
+        elif isinstance(other, SglSeparateReasoning):
+            self._execute_separate_reasoning(other)
         else:
             raise ValueError(f"Unknown type: {type(other)}")
 
@@ -566,13 +569,13 @@ class StreamExecutor:
     def _execute_gen(self, expr: SglGen):
         sampling_params = self._resolve_sampling_params(expr.sampling_params)
         name = expr.name
-
         if not self.stream:
             if self.num_api_spec_tokens is None:
                 comp, meta_info = self.backend.generate(
                     self,
                     sampling_params=sampling_params,
                 )
+
             else:
                 if self.backend.is_chat_model:
                     # Speculative execution on models with only chat interface.
@@ -587,8 +590,11 @@ class StreamExecutor:
 
                 else:  # Speculative execution on models with completion interface
                     comp, meta_info = self._spec_gen(sampling_params)
-
-            self.text_ += comp
+            if isinstance(comp, list):
+                self.text_ += comp[0]
+            else:
+                assert isinstance(comp, str)
+                self.text_ += comp
 
             self.variables[name] = comp
             self.meta_info[name] = meta_info
@@ -721,8 +727,44 @@ class StreamExecutor:
         src_rids = [state.stream_executor.sid for state in expr.states]
         self.backend.concatenate_and_append(src_rids, self.sid)
 
+    def _execute_separate_reasoning(self, expr: SglSeparateReasoning):
+        if self.stream:
+            # separate reasoning for stream is not supported
+            return
+
+        if (
+            self.cur_role == "assistant"
+            and self.num_api_spec_tokens is not None
+            and self.backend.is_chat_model
+        ):
+            # Execute the stored lazy generation calls
+            self.backend.role_end_generate(self)
+
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        reasoning_parser = ReasoningParser(expr.model_type)
+        other = expr.expr
+        if not other:
+            return
+        elif isinstance(other, SglGen) or isinstance(other, SglSelect):
+            cur_text = self.get_var(other.name)
+            reasoning, normal_text = reasoning_parser.parse_non_stream(cur_text)
+            reasoning_name = expr.process_name_for_reasoning(other.name)
+            self.set_var(other.name, normal_text)
+            self.set_var(reasoning_name, reasoning)
+            # the variable is ready to be used
+            self.variable_event[reasoning_name].set()
+            self.text_ = self.text_[: self.cur_role_begin_pos] + normal_text
+        elif isinstance(other, SglExprList):
+            for x in other.expr_list:
+                self._execute_separate_reasoning(
+                    SglSeparateReasoning(expr.model_type, x)
+                )
+
     def _init_var_event(self, expr):
-        if isinstance(expr, (SglGen, SglSelect, SglVarScopeBegin)):
+        if isinstance(
+            expr, (SglGen, SglSelect, SglVarScopeBegin, SglSeparateReasoning)
+        ):
             self.variable_event[expr.name] = threading.Event()
             if self.stream:
                 self.stream_var_event[expr.name] = threading.Event()
@@ -747,6 +789,7 @@ class StreamExecutor:
         for item in [
             "max_new_tokens",
             "min_new_tokens",
+            "n",
             "stop",
             "stop_token_ids",
             "temperature",

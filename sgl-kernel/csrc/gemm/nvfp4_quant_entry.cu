@@ -1,0 +1,74 @@
+/* Copyright 2025 SGLang Team. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <torch/all.h>
+
+#if defined ENABLE_NVFP4 && ENABLE_NVFP4
+void scaled_fp4_quant_sm100a(
+    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_sf, torch::Tensor const& input_sf);
+
+void scaled_fp4_experts_quant_sm100a(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts);
+
+void silu_and_mul_scaled_fp4_experts_quant_sm100a(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& mask,
+    bool use_silu_and_mul);
+
+#endif
+
+void scaled_fp4_quant(
+    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_sf, torch::Tensor const& input_sf) {
+#if defined ENABLE_NVFP4 && ENABLE_NVFP4
+  return scaled_fp4_quant_sm100a(output, input, output_sf, input_sf);
+#endif
+  TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 quantization");
+}
+
+void scaled_fp4_experts_quant(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts) {
+#if defined ENABLE_NVFP4 && ENABLE_NVFP4
+  return scaled_fp4_experts_quant_sm100a(
+      output, output_scale, input, input_global_scale, input_offset_by_experts, output_scale_offset_by_experts);
+#endif
+  TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 experts quantization kernel");
+}
+
+void silu_and_mul_scaled_fp4_experts_quant(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& mask,
+    bool use_silu_and_mul) {
+#if defined ENABLE_NVFP4 && ENABLE_NVFP4
+  return silu_and_mul_scaled_fp4_experts_quant_sm100a(
+      output, output_scale, input, input_global_scale, mask, use_silu_and_mul);
+#endif
+  TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 experts quantization kernel");
+}

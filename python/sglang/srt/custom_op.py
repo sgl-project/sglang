@@ -1,12 +1,20 @@
-from typing import Optional
-
-import torch
 from torch import nn
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
 
 
 class CustomOp(nn.Module):
@@ -14,6 +22,47 @@ class CustomOp(nn.Module):
         super().__init__()
         self._forward_method = self.dispatch_forward()
 
+        # States for torch.compile
+        self._original_forward_method = None
+        self.is_torch_compile = False
+
+    def enter_torch_compile(self, num_tokens: int):
+        # Skip if Op is already entered compile mode.
+        # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
+        # among layers and `enter_torch_compile` will be called many times.
+        # We should prevent `self._original_forward_method` from being overridden when
+        # it is not the first time `enter_torch_compile` called.
+        if self.is_torch_compile:
+            return
+
+        self._original_forward_method = self._forward_method
+        # NOTE: Temporarily workaround MoE
+        # The performance of torch.compile on this layer is not always good when bs > 1,
+        # so we decide to only use torch.compile when bs=1
+        if "FusedMoE" in self.__class__.__name__:
+            if num_tokens == 1:
+                from sglang.srt.layers.moe.fused_moe_native import (
+                    fused_moe_forward_native,
+                )
+
+                self._forward_method = fused_moe_forward_native
+        elif "TopK" in self.__class__.__name__:
+            if num_tokens == 1:
+                self._forward_method = self.forward_native
+        else:
+            self._forward_method = self.forward_native
+        self.is_torch_compile = True
+
+    def leave_torch_compile(self):
+        # Skip if Op is already exited compile mode.
+        if not self.is_torch_compile:
+            return
+
+        self._forward_method = self._original_forward_method
+        self._original_forward_method = None
+        self.is_torch_compile = False
+
+    # Please do not override this method, because `self._forward_method` can change when in torch compile mode
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
 
@@ -21,6 +70,9 @@ class CustomOp(nn.Module):
         raise NotImplementedError
 
     def forward_cuda(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def forward_npu(self, *args, **kwargs):
         raise NotImplementedError
 
     def forward_hip(self, *args, **kwargs):
@@ -40,62 +92,11 @@ class CustomOp(nn.Module):
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip
+        elif _is_cpu and _is_cpu_amx_available:
+            return self.forward_cpu
+        elif _is_npu:
+            return self.forward_npu
+        elif _is_xpu:
+            return self.forward_xpu
         else:
             return self.forward_native
-
-
-if _is_cuda:
-    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
-
-    def scaled_fp8_quant(
-        input: torch.Tensor,
-        scale: Optional[torch.Tensor] = None,
-        use_per_token_if_dynamic: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Quantize input tensor to FP8 (8-bit floating point) format.
-
-        Args:
-            input (torch.Tensor): Input tensor to be quantized
-            scale (Optional[torch.Tensor]): Pre-computed scaling factor for static quantization.
-                If None, scales will be computed dynamically.
-            use_per_token_if_dynamic (bool): When using dynamic scaling (scale=None),
-                determines the quantization granularity:
-                - True: compute scale per token
-                - False: compute single scale per tensor
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-                - quantized_tensor: The FP8 quantized version of input
-                - scale_tensor: The scaling factors used for quantization
-
-        Raises:
-            AssertionError: If input is not 2D or if static scale's numel != 1
-        """
-        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
-        shape = input.shape
-        out_dtype = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
-        output = torch.empty(shape, device=input.device, dtype=out_dtype)
-
-        if scale is None:
-            # Dynamic scaling
-            if use_per_token_if_dynamic:
-                scale = torch.empty(
-                    (shape[0], 1), device=input.device, dtype=torch.float32
-                )
-                sgl_per_token_quant_fp8(input, output, scale)
-            else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                sgl_per_tensor_quant_fp8(
-                    input, output, scale, is_static=False
-                )  # False for dynamic
-        else:
-            # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
-            sgl_per_tensor_quant_fp8(
-                input, output, scale, is_static=True
-            )  # True for static
-
-        return output, scale

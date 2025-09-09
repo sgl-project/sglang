@@ -6,10 +6,10 @@ python3 test_overlap_schedule.py
 
 import unittest
 
-from sglang.test.test_utils import run_mmlu_test
+from sglang.test.test_utils import CustomTestCase, run_mmlu_test
 
 
-class TestOverlapSchedule(unittest.TestCase):
+class TestOverlapSchedule(CustomTestCase):
     def test_no_radix_attention_chunked_prefill(self):
         run_mmlu_test(
             disable_radix_cache=True, chunked_prefill_size=32, disable_overlap=True

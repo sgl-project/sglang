@@ -370,7 +370,7 @@ def test_dtype_gen():
     @sgl.function
     def dtype_gen(s):
         s += "Q: What is the full name of DNS?\n"
-        s += "A: The full nams is " + sgl.gen("str_res", dtype=str, stop="\n") + "\n"
+        s += "A: The full names is " + sgl.gen("str_res", dtype=str, stop="\n") + "\n"
         s += "Q: Which year was DNS invented?\n"
         s += "A: " + sgl.gen("int_res", dtype=int) + "\n"
         s += "Q: What is the value of pi?\n"
@@ -503,7 +503,7 @@ def test_hellaswag_select():
     #####################################
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     rets = few_shot_hellaswag.run_batch(
         arguments,
         temperature=0,
@@ -514,13 +514,13 @@ def test_hellaswag_select():
     preds = []
     for i, ret in enumerate(rets):
         preds.append(choices[i].index(ret["answer"]))
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     accuracy = np.mean(np.array(preds) == np.array(labels))
 
     # Test generator style of run_batch
-    tic = time.time()
+    tic = time.perf_counter()
     rets = few_shot_hellaswag.run_batch(
         arguments,
         temperature=0,
@@ -531,7 +531,7 @@ def test_hellaswag_select():
     preds_gen = []
     for i, ret in enumerate(rets):
         preds_gen.append(choices[i].index(ret["answer"]))
-    latency_gen = time.time() - tic
+    latency_gen = time.perf_counter() - tic
 
     # Compute accuracy
     accuracy_gen = np.mean(np.array(preds_gen) == np.array(labels))

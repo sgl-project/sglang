@@ -3,11 +3,12 @@ import unittest
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestHealthCheck(unittest.TestCase):
+class TestHealthCheck(CustomTestCase):
     def test_health_check(self):
         """Test that metrics endpoint returns data when enabled"""
         with self.assertRaises(TimeoutError):

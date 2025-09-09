@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 
-from sglang.api import set_default_backend
+from sglang.lang.api import set_default_backend
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
 
@@ -90,7 +90,7 @@ def run_eval(args):
     #####################################
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     states = few_shot_gsm8k.run_batch(
         arguments,
         temperature=args.temperature if hasattr(args, "temperature") else 0,
@@ -99,7 +99,7 @@ def run_eval(args):
         return_logprob=getattr(args, "return_logprob", None),
         logprob_start_len=getattr(args, "logprob_start_len", None),
     )
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     preds = []
     for i in range(len(states)):
@@ -129,6 +129,7 @@ def run_eval(args):
 
     return {
         "accuracy": acc,
+        "invalid": invalid,
         "latency": latency,
         "output_throughput": output_throughput,
     }

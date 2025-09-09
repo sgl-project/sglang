@@ -2,6 +2,7 @@
 import argparse
 import json
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, TypedDict
 
@@ -11,6 +12,7 @@ import triton
 from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
 
+from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe,
     get_config_dtype_str,
@@ -18,9 +20,11 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_default_config,
     get_moe_configs,
 )
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.utils import is_hip
 
-_is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 class BenchmarkConfig(TypedDict):
@@ -112,26 +116,35 @@ def benchmark_config(
             )
 
     if use_fp8_w8a8:
-        w1 = w1.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
-        w2 = w2.to(torch.float8_e4m3fnuz if _is_hip_ else torch.float8_e4m3fn)
+        w1 = w1.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
+        w2 = w2.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
 
-    input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
+    input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
+    topk_config = TopKConfig(
+        top_k=topk,
+        renormalize=True,
+    )
+    topk_output = select_experts(x, input_gating, topk_config)
 
     def prepare(i: int):
-        input_gating.copy_(gating_output[i])
+        input_gating = gating_output[i]
+        new_topk_output = select_experts(x, input_gating, topk_config)
+        topk_output.topk_weights.copy_(new_topk_output.topk_weights)
+        topk_output.topk_ids.copy_(new_topk_output.topk_ids)
+        topk_output.router_logits.copy_(new_topk_output.router_logits)
 
     def run():
-        from sglang.srt.layers.moe.fused_moe_triton import override_config
+        moe_runner_config = MoeRunnerConfig(
+            inplace=True,
+        )
 
         with override_config(config):
             fused_moe(
                 x,
                 w1,
                 w2,
-                input_gating,
-                topk,
-                renormalize=True,
-                inplace=True,
+                topk_output,
+                moe_runner_config=moe_runner_config,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_int8_w8a8=use_int8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
@@ -204,7 +217,7 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
     # TODO(woosuk): Increase the search space and use a performance model to
     # prune the search space.
     configs: List[BenchmarkConfig] = []
-    if _is_hip_:
+    if _is_hip:
         configs = get_rocm_configs_compute_bound()
     else:
         for num_stages in [2, 3, 4, 5]:
@@ -233,6 +246,9 @@ class BenchmarkWorker:
         torch.set_default_device("cuda")
         torch.cuda.manual_seed_all(0)
         self.seed = seed
+        # Get the device ID to allocate tensors and kernels
+        # on the respective GPU.
+        self.device_id = int(ray.get_gpu_ids()[0])
 
     def benchmark(
         self,
@@ -267,22 +283,24 @@ class BenchmarkWorker:
                 topk,
                 dtype_str,
                 False,
+                block_shape,
             )
         else:
             config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
-        kernel_time = benchmark_config(
-            config,
-            num_tokens,
-            num_experts,
-            shard_intermediate_size,
-            hidden_size,
-            topk,
-            dtype,
-            use_fp8_w8a8,
-            use_int8_w8a8,
-            use_int8_w8a16,
-            block_shape,
-        )
+        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            kernel_time = benchmark_config(
+                config,
+                num_tokens,
+                num_experts,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a8,
+                use_int8_w8a16,
+                block_shape,
+            )
         return config, kernel_time
 
     def tune(
@@ -301,29 +319,30 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
-        for config in tqdm(search_space):
-            try:
-                kernel_time = benchmark_config(
-                    config,
-                    num_tokens,
-                    num_experts,
-                    shard_intermediate_size,
-                    hidden_size,
-                    topk,
-                    dtype,
-                    use_fp8_w8a8,
-                    use_int8_w8a8,
-                    use_int8_w8a16,
-                    block_shape,
-                    num_iters=10,
-                )
-            except triton.runtime.autotuner.OutOfResources:
-                # Some configurations may be invalid and fail to compile.
-                continue
+        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            for config in tqdm(search_space):
+                try:
+                    kernel_time = benchmark_config(
+                        config,
+                        num_tokens,
+                        num_experts,
+                        shard_intermediate_size,
+                        hidden_size,
+                        topk,
+                        dtype,
+                        use_fp8_w8a8,
+                        use_int8_w8a8,
+                        use_int8_w8a16,
+                        block_shape,
+                        num_iters=10,
+                    )
+                except (triton.runtime.autotuner.OutOfResources, RuntimeError):
+                    # Some configurations may be invalid and fail to compile.
+                    continue
 
-            if kernel_time < best_time:
-                best_time = kernel_time
-                best_config = config
+                if kernel_time < best_time:
+                    best_time = kernel_time
+                    best_config = config
         now = datetime.now()
         print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
         assert best_config is not None
@@ -392,15 +411,26 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] == "Qwen2MoeForCausalLM":
+    elif config.architectures[0] in ["Qwen2MoeForCausalLM", "Qwen3MoeForCausalLM"]:
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-        E = config.n_routed_experts
+        E = (
+            config.n_routed_experts + (0 if args.disable_shared_experts_fusion else 1)
+            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
+            else config.n_routed_experts
+        )
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] == "Llama4ForConditionalGeneration":
+        E = config.text_config.num_local_experts + (
+            0 if args.disable_shared_experts_fusion else 1
+        )
+        topk = config.text_config.num_experts_per_tok
+        intermediate_size = config.text_config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
@@ -411,6 +441,11 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] in ["Glm4MoeForCausalLM"]:
+        E = config.n_routed_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
     else:
         # Default: Mixtral
         E = config.num_local_experts
@@ -418,7 +453,7 @@ def main(args: argparse.Namespace):
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
 
-    hidden_size = config.hidden_size
+    hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
     dtype = config.torch_dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
@@ -481,7 +516,7 @@ def main(args: argparse.Namespace):
             ]
         print(f"Start tuning over {len(search_space)} configurations...")
 
-        start = time.time()
+        start = time.perf_counter()
         configs = _distribute(
             "tune",
             [
@@ -516,7 +551,7 @@ def main(args: argparse.Namespace):
             use_int8_w8a16,
             block_shape,
         )
-        end = time.time()
+        end = time.perf_counter()
         print(f"Tuning took {end - start:.2f} seconds")
     else:
         outputs = _distribute(
@@ -548,7 +583,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
-    parser.add_argument("--tp-size", "-tp", type=int, default=2)
+    parser.add_argument("--tp-size", "--tp", type=int, default=2)
     parser.add_argument(
         "--dtype",
         type=str,
@@ -558,6 +593,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     args = parser.parse_args()
 
     main(args)

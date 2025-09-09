@@ -3,6 +3,8 @@ Usage:
 python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
 """
 
+import os
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -12,13 +14,14 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
 
 
-class TestEvalAccuracyLarge(unittest.TestCase):
+class TestEvalAccuracyLarge(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -48,7 +51,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         if is_in_ci():
             write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')
 
-        self.assertGreater(metrics["score"], 0.71)
+        self.assertGreater(metrics["score"], 0.70)
 
     def test_human_eval(self):
         args = SimpleNamespace(

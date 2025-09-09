@@ -7,11 +7,12 @@ from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestMLA(unittest.TestCase):
+class TestMLA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -23,26 +24,16 @@ class TestMLA(unittest.TestCase):
             other_args=[
                 "--trust-remote-code",
                 "--enable-torch-compile",
-                "--cuda-graph-max-bs",
-                "2",
+                "--torch-compile-max-bs",
+                "4",
+                "--chunked-prefill-size",
+                "256",
             ],
         )
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.5)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(

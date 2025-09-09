@@ -15,42 +15,28 @@
 import argparse
 import asyncio
 import json
-import os
 import random
 import resource
 import sys
 import time
 import traceback
-import warnings
 from argparse import ArgumentParser
-from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
-import requests
 from launch_server import LORA_PATH, NUM_LORAS
 from tqdm.asyncio import tqdm
-from transformers import (
-    AutoTokenizer,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerBase,
-    PreTrainedTokenizerFast,
-)
+from transformers import PreTrainedTokenizerBase
 
 from sglang.bench_serving import (
     AIOHTTP_TIMEOUT,
-    SHAREGPT_URL,
-    BenchmarkMetrics,
     RequestFuncInput,
     RequestFuncOutput,
     calculate_metrics,
-    check_chat_template,
-    get_model,
     get_request,
     get_tokenizer,
-    parse_request_rate_range,
     remove_prefix,
     sample_random_requests,
 )
@@ -176,14 +162,15 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len = input_requests[0]
+    test_request = input_requests[0]
     test_input = RequestFuncInput(
         model=model_id,
-        prompt=test_prompt,
+        prompt=test_request.prompt,
         api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
+        prompt_len=test_request.prompt_len,
+        output_len=test_request.output_len,
         lora_name="dummy",  # the lora_name argument will not be used
+        image_data=None,
         extra_request_body=extra_request_body,
     )
     test_output = await request_func(request_func_input=test_input)
@@ -200,14 +187,14 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
-        prompt, prompt_len, output_len = request
         request_func_input = RequestFuncInput(
             model=model_id,
-            prompt=prompt,
+            prompt=request.prompt,
             api_url=api_url,
-            prompt_len=prompt_len,
-            output_len=output_len,
+            prompt_len=request.prompt_len,
+            output_len=request.output_len,
             lora_name="dummy",
+            image_data=None,
             extra_request_body=extra_request_body,
         )
         tasks.append(

@@ -7,6 +7,7 @@ import os
 import pprint
 import random
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional
 
 import numpy as np
@@ -26,23 +27,31 @@ from tqdm import tqdm
 class EvalArgs:
     seed: int = 42
     split: str = "validation"
-    # Default setting to make the benchmark available on A100 for most 7B models
-    image_pixels_limit: int = 4300000
+    image_pixels_limit: int = -1
     result_filename: str = ""
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
     extra_request_body: Optional[str] = None
+    profile: bool = False
+    profile_number: int = 5
+    concurrency: int = 1
+    response_answer_regex: str = "(.*)"
+    lora_path: Optional[str] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument(
-            "--result-filename", type=str, default=EvalArgs.result_filename
+            "--result-filename",
+            type=str,
+            default=EvalArgs.result_filename,
+            help="The filename to save the evaluation results.",
         )
-
         parser.add_argument(
-            "--image-pixels-limit", type=int, default=EvalArgs.image_pixels_limit
+            "--image-pixels-limit",
+            type=int,
+            default=EvalArgs.image_pixels_limit,
+            help="The maximum number of pixels allowed for an image. If an image exceeds this limit, it will be skipped during evaluation.",
         )
-
         parser.add_argument(
             "--dataset-path",
             type=str,
@@ -55,7 +64,12 @@ class EvalArgs:
             type=str,
             help="The path to the prompt format of mmmu. If not, a default format llava_config.yaml will be used",
         )
-        parser.add_argument("--split", type=str, default=EvalArgs.split)
+        parser.add_argument(
+            "--split",
+            type=str,
+            default=EvalArgs.split,
+            help='Split of the dataset to use for evaluation. Default is "validation".',
+        )
         parser.add_argument(
             "--extra-request-body",
             metavar='{"key1": "value1", "key2": "value2"}',
@@ -63,6 +77,33 @@ class EvalArgs:
             default=EvalArgs.extra_request_body,
             help="Append given JSON object to the request payload. You can use this to specify"
             "additional generate params like sampling params.",
+        )
+        parser.add_argument(
+            "--profile", action="store_true", help="enable mmmu profile"
+        )
+        parser.add_argument(
+            "--profile-number",
+            type=int,
+            default=EvalArgs.profile_number,
+            help="Number of samples to profile. If not set, will profile all samples.",
+        )
+        parser.add_argument(
+            "--concurrency",
+            type=int,
+            default=EvalArgs.concurrency,
+            help="Number of concurrent requests to make during evaluation. Default is 1, which means no concurrency.",
+        )
+        parser.add_argument(
+            "--response-answer-regex",
+            type=str,
+            default=EvalArgs.response_answer_regex,
+            help="Specific regex to capture the answer from the response, string",
+        )
+        parser.add_argument(
+            "--lora-path",
+            type=str,
+            default=EvalArgs.lora_path,
+            help="Specify the LoRA path to use for evaluation. If specified, the value will be specified in the body of every request as `lora-path`.",
         )
 
     @classmethod
@@ -88,7 +129,7 @@ def set_seed(seed_value):
 
 
 def prepare_samples(eval_args: EvalArgs):
-    print("preparing samples...")
+    print("Preparing samples...")
     # Build prompts
     set_seed(eval_args.seed)
 
@@ -104,47 +145,90 @@ def prepare_samples(eval_args: EvalArgs):
             assert len(value) == 1, "key {} has more than one value".format(key)
             eval_args.config[key] = value[0]
 
-    # run for each subject
+    # run for each subject in parallel
     sub_dataset_list = []
+    subjects = list(CAT_SHORT2LONG.values())  # Get a fixed list of subjects
 
-    for subject in tqdm(CAT_SHORT2LONG.values()):
-        sub_dataset = load_dataset(
-            eval_args.dataset_path, subject, split=eval_args.split
-        )
-        sub_dataset_list.append(sub_dataset)
-        # break
+    print(f"Loading datasets for {len(subjects)} subjects...")
+    with ThreadPoolExecutor() as executor:
+        # Submit all load_dataset tasks
+        future_to_subject = {
+            executor.submit(
+                load_dataset, eval_args.dataset_path, subject, split=eval_args.split
+            ): subject
+            for subject in subjects
+        }
+
+        # Collect results as they complete
+        results = {}
+        for future in tqdm(
+            as_completed(future_to_subject),
+            total=len(subjects),
+            desc="Loading datasets",
+        ):
+            subject = future_to_subject[future]
+            try:
+                results[subject] = future.result()
+            except Exception as exc:
+                print(f"{subject} generated an exception: {exc}")
+
+    # Ensure datasets are added in the original order for consistency
+    for subject in subjects:
+        if subject in results:
+            sub_dataset_list.append(results[subject])
+        else:
+            # Handle cases where a dataset failed to load (optional, depends on desired behavior)
+            print(f"Warning: Dataset for subject '{subject}' could not be loaded.")
 
     # merge all dataset
     dataset = concatenate_datasets(sub_dataset_list)
 
-    ## prepare images
-    samples = []
-    skip_count = 0
-
-    # use image file as input to ensure the consistency between sglang and hf
+    # Prepare images in parallel
     images_path = os.path.expanduser("~/.cache/mmmu/images")
     os.makedirs(images_path, exist_ok=True)
     print(f"Saving images to: {images_path}")
 
-    for i, sample in enumerate(tqdm(dataset)):
+    samples = []
+    skip_count = 0
+
+    def process_sample(i, sample):
         sample = process_single_sample(sample)
         sample = construct_prompt(sample, eval_args.config)
         image = sample["image"]
-
         width, height = image.size
-        if width * height >= eval_args.image_pixels_limit:
-            skip_count += 1
-            continue
-        image_path = f"{images_path}/image_{i}.png"
+        if 0 < eval_args.image_pixels_limit <= width * height:
+            return None, True
+        # Use a unique identifier for the image path to avoid potential collisions if indices reset
+        image_path = f"{images_path}/image_{sample['id']}.png"
         if not os.path.exists(image_path):
             image.save(image_path)
         sample["image_path"] = image_path
-        samples.append(sample)
+        return sample, False
+
+    print("Processing samples...")
+    with ThreadPoolExecutor() as executor:
+        # Pass the sample itself to process_sample, index is less reliable now
+        futures = [
+            executor.submit(
+                process_sample, i, sample
+            )  # Keep index i for tqdm maybe? Or remove it. Let's keep it for now.
+            for i, sample in enumerate(dataset)
+        ]
+        for future in tqdm(
+            as_completed(futures), total=len(dataset), desc="Processing samples"
+        ):
+            sample, skipped = future.result()
+            if skipped:
+                skip_count += 1
+            elif sample:
+                samples.append(sample)
+
+    samples.sort(key=lambda x: x["final_input_prompt"])
 
     print(
-        f"skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
+        f"Skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
     )
-    print("samples have been prepared")
+    print("Samples have been prepared")
     return samples
 
 
@@ -442,6 +526,8 @@ def calculate_ins_level_acc(results: Dict):
 
 
 def process_result(response, sample, answer_dict, out_samples):
+    if response is None:
+        return
     if sample["question_type"] == "multiple-choice":
         pred_ans = parse_multi_choice_response(
             response, sample["all_choices"], sample["index2ans"]
@@ -458,7 +544,9 @@ def process_result(response, sample, answer_dict, out_samples):
     }
 
 
-def eval_result(model_answer_path, answer_dict):
+def eval_result(model_answer_path, answer_dict, eval_output_path=None):
+    if eval_output_path is None:
+        eval_output_path = model_answer_path
     print("Evaluating...")
     output_dict = json.load(open(model_answer_path))
     # answer_dict = json.load(open(answer_path))
@@ -553,7 +641,7 @@ def eval_result(model_answer_path, answer_dict):
         "acc": overall_acc,
     }
     pprint.pprint(printable_results)
-    out = model_answer_path
+    out = eval_output_path
     with open(out, "w", encoding="utf-8") as outfile:
         json.dump(printable_results, outfile)
         print(f"eval out saved to {out}")

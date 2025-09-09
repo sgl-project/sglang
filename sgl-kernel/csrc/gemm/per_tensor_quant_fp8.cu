@@ -44,52 +44,50 @@ per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output
   }
 }
 
-template <typename T>
+template <typename T, typename DST_DTYPE>
 __global__ void per_tensor_quant_fp8_kernel(
     const T* __restrict__ input,
-    FP8_TYPE* __restrict__ output,
+    DST_DTYPE* __restrict__ output,
     const float* __restrict__ scale,
     const int64_t num_elements) {
   const int gid = blockIdx.x * blockDim.x + threadIdx.x;
   const int grid_size = blockDim.x * gridDim.x;
   const float scale_val = 1.0f / (*scale);
 
-  constexpr uint32_t vec_size = 16 / sizeof(T);
-  using vec_t = flashinfer::vec_t<T, vec_size>;
+  // We want to store 128 bits of data at a time. 16 = 128 / 8 bits
+  // Load is already vectorized, so 16 elements work for T.
+  const uint32_t VEC_SIZE = 16;
+  using vec_t = flashinfer::vec_t<T, VEC_SIZE>;
 
-  const int32_t num_vec_elems = num_elements / vec_size;
+  const int32_t num_vec_elems = num_elements / VEC_SIZE;
 
   for (int32_t i = gid; i < num_vec_elems; i += grid_size) {
     vec_t input_vec;
-    input_vec.cast_load(input + i * vec_size);
+    input_vec.cast_load(input + i * VEC_SIZE);
 
-    FP8_TYPE output_arr[vec_size];
+    DST_DTYPE output_arr[VEC_SIZE];
 #pragma unroll
-    for (uint32_t j = 0; j < vec_size; ++j) {
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       float val = fmax(fmin(static_cast<float>(input_vec[j]) * scale_val, FP8_E4M3_MAX), -FP8_E4M3_MAX);
-#ifndef USE_ROCM
-      output_arr[j] = static_cast<FP8_TYPE>(val);
+#if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
+      output_arr[j] = static_cast<DST_DTYPE>(val);
 #else
       output_arr[j] = c10::Float8_e4m3fnuz(
-          __hip_cvt_float_to_fp8(value, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
+          __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
           c10::Float8_e4m3fnuz::from_bits());
 #endif
     }
-
-#pragma unroll
-    for (uint32_t j = 0; j < vec_size; ++j) {
-      output[i * vec_size + j] = output_arr[j];
-    }
+    *(uint4*)(output + i * VEC_SIZE) = *(uint4*)output_arr;
   }
 
-  const int32_t remaining_start = num_vec_elems * vec_size;
+  const int32_t remaining_start = num_vec_elems * VEC_SIZE;
   for (int32_t idx = remaining_start + gid; idx < num_elements; idx += grid_size) {
     float val = fmax(-FP8_E4M3_MAX, fmin(static_cast<float>(input[idx]) * scale_val, FP8_E4M3_MAX));
-#ifndef USE_ROCM
-    output[idx] = static_cast<FP8_TYPE>(val);
+#if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
+    output[idx] = static_cast<DST_DTYPE>(val);
 #else
     output[idx] = c10::Float8_e4m3fnuz(
-        __hip_cvt_float_to_fp8(value, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
+        __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
         c10::Float8_e4m3fnuz::from_bits());
 #endif
   }
@@ -115,9 +113,9 @@ void sgl_per_tensor_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch
           static_cast<scalar_t*>(input.data_ptr()), static_cast<float*>(output_s.data_ptr()), num_elements);
     }
 
-    per_tensor_quant_fp8_kernel<scalar_t><<<grid, block, 0, stream>>>(
+    per_tensor_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(
         static_cast<scalar_t*>(input.data_ptr()),
-        static_cast<FP8_TYPE*>(output_q.data_ptr()),
+        static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
         static_cast<float*>(output_s.data_ptr()),
         num_elements);
     return true;

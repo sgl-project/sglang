@@ -24,8 +24,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
-          pip install --upgrade "evalplus[vllm] @ git+https://github.com/evalplus/evalplus"
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 120

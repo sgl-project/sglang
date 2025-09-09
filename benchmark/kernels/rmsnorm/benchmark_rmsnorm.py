@@ -3,7 +3,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 import triton
-import triton.language as tl
 from flashinfer.norm import fused_add_rmsnorm, rmsnorm
 from torch import nn
 from vllm import _custom_ops as vllm_ops

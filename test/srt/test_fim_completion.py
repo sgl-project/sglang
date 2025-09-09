@@ -7,11 +7,12 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestFimCompletion(unittest.TestCase):
+class TestFimCompletion(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/deepseek-coder-1.3b-base"

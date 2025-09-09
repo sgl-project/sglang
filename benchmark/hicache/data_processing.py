@@ -20,7 +20,7 @@ from sglang.bench_serving import (
     get_gen_prefix_cache_path,
 )
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
-from sglang.srt.openai_api.protocol import ChatCompletionMessageContentPart
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
 from sglang.utils import encode_video_base64
 
 # type of content fields, can be only prompts or with images/videos
@@ -83,8 +83,9 @@ def common_filter_chat(
                 input_tokens += prompt_len
                 output_tokens += output_len
                 processed.append((prompt, prompt_len, output_len))
-            filtered_dataset.append(processed)
-            l += 1
+            if len(processed) != 0:
+                filtered_dataset.append(processed)
+                l += 1
 
     print(f"#Input tokens: {input_tokens}")
     print(f"#Output tokens: {output_tokens}")
@@ -438,8 +439,8 @@ def get_gen_prefix_cache_path(args, tokenizer):
 
     # Create a unique cache filename based on the generation parameters
     cache_key = (
-        f"gen_prefix_{args.gen_num_groups}_{args.gen_prompts_per_group}_"
-        f"{args.gen_system_prompt_len}_{args.gen_question_len}_{args.gen_output_len}_"
+        f"gsp_prefix_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
+        f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )
     return cache_dir / cache_key
@@ -576,11 +577,11 @@ def get_dataset(args, tokenizer):
         )
     elif args.dataset_name == "generated-shared-prefix":
         input_requests = sample_generated_shared_prefix_requests(
-            num_groups=args.gen_num_groups,
-            prompts_per_group=args.gen_prompts_per_group,
-            system_prompt_len=args.gen_system_prompt_len,
-            question_len=args.gen_question_len,
-            output_len=args.gen_output_len,
+            num_groups=args.gsp_num_groups,
+            prompts_per_group=args.gsp_prompts_per_group,
+            system_prompt_len=args.gsp_system_prompt_len,
+            question_len=args.gsp_question_len,
+            output_len=args.gsp_output_len,
             args=args,
             tokenizer=tokenizer,
         )

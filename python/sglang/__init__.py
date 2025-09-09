@@ -1,7 +1,8 @@
 # SGLang public APIs
 
 # Frontend Language APIs
-from sglang.api import (
+from sglang.global_config import global_config
+from sglang.lang.api import (
     Engine,
     Runtime,
     assistant,
@@ -15,6 +16,7 @@ from sglang.api import (
     get_server_info,
     image,
     select,
+    separate_reasoning,
     set_default_backend,
     system,
     system_begin,
@@ -30,17 +32,19 @@ from sglang.lang.choices import (
     token_length_normalized,
     unconditional_likelihood_normalized,
 )
-from sglang.utils import LazyImport
 
-ServerArgs = LazyImport("sglang.srt.server_args", "ServerArgs")
+# Lazy import some libraries
+from sglang.utils import LazyImport
+from sglang.version import __version__
+
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
 OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
 VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
 
-# Other configs
-from sglang.global_config import global_config
-from sglang.version import __version__
+# Runtime Engine APIs
+ServerArgs = LazyImport("sglang.srt.server_args", "ServerArgs")
+Engine = LazyImport("sglang.srt.entrypoints.engine", "Engine")
 
 __all__ = [
     "Engine",
@@ -56,6 +60,7 @@ __all__ = [
     "get_server_info",
     "image",
     "select",
+    "separate_reasoning",
     "set_default_backend",
     "system",
     "system_begin",

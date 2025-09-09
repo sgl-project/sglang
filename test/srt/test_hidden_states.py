@@ -4,10 +4,10 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
-class TestHiddenState(unittest.TestCase):
+class TestHiddenState(CustomTestCase):
     def test_return_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -23,6 +23,7 @@ class TestHiddenState(unittest.TestCase):
             model_path=model_path,
             random_seed=42,
             skip_tokenizer_init=True,
+            enable_return_hidden_states=True,
         )
         outputs = engine.generate(
             input_ids=input_ids,
@@ -96,6 +97,7 @@ class TestHiddenState(unittest.TestCase):
             model_path=model_path,
             random_seed=42,
             skip_tokenizer_init=True,
+            enable_return_hidden_states=True,
         )
         outputs_completion_first_round = engine.generate(
             input_ids=input_ids,

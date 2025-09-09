@@ -3,8 +3,13 @@
 import pytest
 import torch
 
-from sglang.srt.custom_op import scaled_fp8_quant
-from sglang.srt.utils import is_cuda
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
+from sglang.srt.utils import is_cuda, is_hip
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_fp8_fnuz = is_fp8_fnuz()
+fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -13,10 +18,10 @@ def test_scaled_fp8_quant_per_tensor(dtype) -> None:
     def quantize_ref_per_tensor(tensor, inv_scale):
         # The reference implementation that fully aligns to
         # the kernel being tested.
-        finfo = torch.finfo(torch.float8_e4m3fn)
+        finfo = torch.finfo(fp8_dtype)
         scale = inv_scale.reciprocal()
         qweight = (tensor.to(torch.float32) * scale).clamp(min=finfo.min, max=finfo.max)
-        qweight = qweight.to(torch.float8_e4m3fn)
+        qweight = qweight.to(fp8_dtype)
         return qweight
 
     def dequantize_per_tensor(tensor, inv_scale, dtype):
@@ -48,19 +53,19 @@ def test_scaled_fp8_quant_per_tensor(dtype) -> None:
     )
 
 
-if is_cuda:
+if _is_cuda or _is_hip:
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_scaled_fp8_quant_per_token_dynamic(dtype) -> None:
         def quantize_ref_per_token(tensor, inv_scale):
             # The reference implementation that fully aligns to
             # the kernel being tested.
-            finfo = torch.finfo(torch.float8_e4m3fn)
+            finfo = torch.finfo(fp8_dtype)
             scale = inv_scale.reciprocal()
             qweight = (tensor.to(torch.float32) * scale).clamp(
                 min=finfo.min, max=finfo.max
             )
-            qweight = qweight.to(torch.float8_e4m3fn)
+            qweight = qweight.to(fp8_dtype)
             return qweight
 
         def dequantize_per_token(tensor, inv_scale, dtype):
@@ -80,6 +85,61 @@ if is_cuda:
         torch.testing.assert_close(
             dequantize_per_token(y, scale, dtype),
             dequantize_per_token(ref_y, scale, dtype),
+        )
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_scaled_fp8_quant_with_padding(dtype) -> None:
+        original_rows = 5
+        x = (torch.randn(size=(original_rows, 16), device="cuda") * 13).to(dtype)
+
+        padding_size = 10
+
+        # Test with dynamic quantization
+        y_dynamic, scale_dynamic = scaled_fp8_quant(
+            x, None, num_token_padding=padding_size
+        )
+
+        # Verify output shape has the padded size
+        assert y_dynamic.shape[0] == padding_size
+        assert y_dynamic.shape[1] == x.shape[1]
+
+        # Verify that the actual data in the non-padded region is correctly quantized
+        y_without_padding, scale_without_padding = scaled_fp8_quant(x, None)
+        torch.testing.assert_close(y_dynamic[:original_rows], y_without_padding)
+
+        # Test with static quantization
+        # First get a scale
+        _, scale = scaled_fp8_quant(x, None)
+
+        # Then use it for static quantization with padding
+        y_static, _ = scaled_fp8_quant(x, scale, num_token_padding=padding_size)
+
+        # Verify output shape has the padded size
+        assert y_static.shape[0] == padding_size
+        assert y_static.shape[1] == x.shape[1]
+
+        # Verify that the actual data in the non-padded region is correctly quantized
+        y_static_without_padding, _ = scaled_fp8_quant(x, scale)
+        torch.testing.assert_close(y_static[:original_rows], y_static_without_padding)
+
+        # Test with per-token dynamic quantization
+        y_per_token, scale_per_token = scaled_fp8_quant(
+            x, None, num_token_padding=padding_size, use_per_token_if_dynamic=True
+        )
+
+        # Verify output shape has the padded size
+        assert y_per_token.shape[0] == padding_size
+        assert y_per_token.shape[1] == x.shape[1]
+
+        # Verify that the actual data in the non-padded region is correctly quantized
+        y_per_token_without_padding, scale_per_token_without_padding = scaled_fp8_quant(
+            x, None, use_per_token_if_dynamic=True
+        )
+        torch.testing.assert_close(
+            y_per_token[:original_rows], y_per_token_without_padding
+        )
+        torch.testing.assert_close(
+            scale_per_token[:original_rows], scale_per_token_without_padding
         )
 
 

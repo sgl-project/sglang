@@ -1,5 +1,5 @@
 """
-Convert Yi-VL config into a format useable with SGLang
+Convert Yi-VL config into a format usable with SGLang
 
 Usage: python3 scripts/convert_yi_vl.py --model-path <path-to-model>
 """

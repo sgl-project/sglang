@@ -85,6 +85,22 @@ class RuntimeEndpoint(BaseBackend):
         )
         self._assert_success(res)
 
+    def start_profile(self):
+        res = http_request(
+            self.base_url + "/start_profile",
+            api_key=self.api_key,
+            verify=self.verify,
+        )
+        self._assert_success(res)
+
+    def stop_profile(self):
+        res = http_request(
+            self.base_url + "/stop_profile",
+            api_key=self.api_key,
+            verify=self.verify,
+        )
+        self._assert_success(res)
+
     def commit_lazy_operations(self, s: StreamExecutor):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
         self._add_images(s, data)
@@ -324,7 +340,11 @@ class RuntimeEndpoint(BaseBackend):
 
     def _assert_success(self, res):
         if res.status_code != 200:
-            raise RuntimeError(res.json())
+            try:
+                content = res.json()
+            except json.JSONDecodeError:
+                content = res.text
+            raise RuntimeError(content)
 
 
 def compute_normalized_prompt_logprobs(input_logprobs):
@@ -370,7 +390,8 @@ class Runtime:
         self.pid = None
         pipe_reader, pipe_writer = multiprocessing.Pipe(duplex=False)
 
-        proc = multiprocessing.Process(
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(
             target=launch_server,
             args=(self.server_args, pipe_writer),
         )
@@ -401,6 +422,12 @@ class Runtime:
         if self.pid is not None:
             kill_process_tree(self.pid)
             self.pid = None
+
+    def start_profile(self):
+        self.endpoint.start_profile()
+
+    def stop_profile(self):
+        self.endpoint.stop_profile()
 
     def cache_prefix(self, prefix: str):
         self.endpoint.cache_prefix(prefix)

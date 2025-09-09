@@ -4,9 +4,10 @@ import unittest
 import torch
 
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestRMSNorm(unittest.TestCase):
+class TestRMSNorm(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
     NUM_TOKENS = [7, 83, 4096]
     HIDDEN_SIZES = [768, 769, 770, 771, 5120, 5124, 5125, 5126, 8192, 8199]
@@ -56,7 +57,7 @@ class TestRMSNorm(unittest.TestCase):
                 self._run_rms_norm_test(*params)
 
 
-class TestGemmaRMSNorm(unittest.TestCase):
+class TestGemmaRMSNorm(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
     NUM_TOKENS = [7, 83, 4096]
     HIDDEN_SIZES = [768, 769, 770, 771, 5120, 5124, 5125, 5126, 8192, 8199]
