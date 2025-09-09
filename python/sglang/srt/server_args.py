@@ -1363,8 +1363,8 @@ class ServerArgs:
     def _handle_moe_kernel_config(self):
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert (
-                self.quantization == "modelopt_fp4"
-            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+                self.quantization == "modelopt_fp4" or self.quantization is None
+            ), "modelopt_fp4 quantization or bf16 is required for Flashinfer MOE"
             assert self.ep_size in [
                 1,
                 self.tp_size,
