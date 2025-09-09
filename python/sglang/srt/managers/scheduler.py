@@ -1123,8 +1123,8 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
 
-            # If it is a MultiTokenizerWarpper, unwrap it and handle the inner request.
-            if isinstance(recv_req, MultiTokenizerWarpper):
+            # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
+            if isinstance(recv_req, MultiTokenizerWrapper):
                 worker_id = recv_req.worker_id
                 recv_req = recv_req.obj
                 output = self._request_dispatcher(recv_req)
