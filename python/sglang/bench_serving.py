@@ -995,21 +995,29 @@ def sample_mmmu_requests(
                 prompt = f"Question: {question}\n\nAnswer: "
                 if apply_chat_template:
                     try:
-                        if "llama" in tokenizer.name_or_path.lower():
-                            image_field = {"type": "image", "image": image_data}
+                        is_phi4_multimodal = (
+                            "phi-4-multimodal" in tokenizer.name_or_path.lower()
+                        )
+                        if is_phi4_multimodal:
+                            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
+                            content = prompt.replace("image 1", "<|endoftext10|>")
                         else:
-                            image_field = {
-                                "type": "image_url",
-                                "image_url": {"url": image_data},
-                            }
+                            if "llama" in tokenizer.name_or_path.lower():
+                                image_field = {"type": "image", "image": image_data}
+                            else:
+                                image_field = {
+                                    "type": "image_url",
+                                    "image_url": {"url": image_data},
+                                }
+                            content = [
+                                image_field,
+                                {"type": "text", "text": prompt},
+                            ]
                         prompt = tokenizer.apply_chat_template(
                             [
                                 {
                                     "role": "user",
-                                    "content": [
-                                        image_field,
-                                        {"type": "text", "text": prompt},
-                                    ],
+                                    "content": content,
                                 }
                             ],
                             add_generation_prompt=True,
