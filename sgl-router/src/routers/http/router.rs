@@ -1127,15 +1127,15 @@ impl Router {
         }
     }
 
-    async fn build_rerank_response(req: &RerankRequest, response: Response) -> anyhow::Result<Response> {
-        let (parts, response_body) = response.into_parts();
+    async fn build_rerank_response(
+        req: &RerankRequest,
+        response: Response,
+    ) -> anyhow::Result<Response> {
+        let (_, response_body) = response.into_parts();
         let body_bytes = to_bytes(response_body, usize::MAX).await?;
         let rerank_results = serde_json::from_slice::<Vec<RerankResult>>(&body_bytes)?;
-        let mut rerank_response = RerankResponse::new(
-            rerank_results,
-            req.model.clone(),
-            req.rid.clone(),
-        );
+        let mut rerank_response =
+            RerankResponse::new(rerank_results, req.model.clone(), req.rid.clone());
         rerank_response.sort_by_score();
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
@@ -1143,7 +1143,7 @@ impl Router {
         if !req.return_documents {
             rerank_response.drop_documents();
         }
-        Ok(Response::from_parts(parts, Body::from(serde_json::to_vec(&rerank_response)?)))
+        Ok(Json(rerank_response).into_response())
     }
 }
 
