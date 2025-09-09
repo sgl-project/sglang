@@ -13,6 +13,7 @@
 # ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
 
+import faulthandler
 import logging
 import multiprocessing as mp
 import signal
@@ -39,7 +40,12 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.utils import DPBalanceMeta
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
+from sglang.srt.utils import (
+    bind_port,
+    configure_logger,
+    get_zmq_socket,
+    kill_itself_when_parent_died,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -100,7 +106,7 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
-        self.workers = [None] * server_args.dp_size
+        self.workers: List[zmq.Socket] = [None] * server_args.dp_size
 
         if server_args.enable_dp_attention:
             dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
@@ -266,27 +272,34 @@ class DataParallelController:
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
+    def maybe_external_dp_rank_routing(self, req: Req):
+        if req.data_parallel_rank is not None:
+            logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+            self.workers[req.data_parallel_rank].send_pyobj(req)
+            return True
+        return False
+
     def round_robin_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
         if self.server_args.disaggregation_mode == "null":
-            if req.data_parallel_rank is not None:
-                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-                self.workers[req.data_parallel_rank].send_pyobj(req)
-            else:
-                self.workers[self.round_robin_counter].send_pyobj(req)
-                self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                    self.workers
-                )
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
         else:
-            if req.data_parallel_rank is not None:
-                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-                self.workers[req.data_parallel_rank].send_pyobj(req)
-            else:
-                self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
+        if self.maybe_external_dp_rank_routing(req):
+            return
         raise NotImplementedError()
 
     def minimum_tokens_scheduler(self, req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
         # This variable corresponds to the balance_id in TokenizedGenerateReqInput.
         # We use it to to control the number of onfly tokens (requests dispatched to workers but not yet received).
         def get_next_global_balance_id() -> int:
@@ -343,7 +356,9 @@ def run_data_parallel_controller_process(
     port_args: PortArgs,
     pipe_writer,
 ):
+    kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::data_parallel_controller")
+    faulthandler.enable()
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
     balance_meta = DPBalanceMeta(server_args.dp_size)
