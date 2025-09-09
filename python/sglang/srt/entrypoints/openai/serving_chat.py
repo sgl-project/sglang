@@ -175,7 +175,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.function.model_dump() for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
-                tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+                tool_call_constraint = parser.get_structure_constraint(
+                    request.tool_choice
+                )
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -537,7 +539,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
-                if request.tool_choice != "none" and request.tools and self.tool_call_parser:
+                if (
+                    request.tool_choice != "none"
+                    and request.tools
+                    and self.tool_call_parser
+                ):
                     async for chunk in self._process_tool_call_stream(
                         index,
                         delta,
@@ -727,8 +733,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle tool calls
             tool_calls = None
-            if request.tool_choice != "none" and request.tools and self.tool_call_parser:
-                tool_calls, text, finish_reason = self._process_tool_calls(text, request.tools, finish_reason)
+            if (
+                request.tool_choice != "none"
+                and request.tools
+                and self.tool_call_parser
+            ):
+                tool_calls, text, finish_reason = self._process_tool_calls(
+                    text, request.tools, finish_reason
+                )
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
@@ -834,7 +846,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_calls = []
                 for call_info in call_info_list:
                     # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
-                    if self.tool_call_parser == "kimi_k2" and call_info.name is not None:
+                    if (
+                        self.tool_call_parser == "kimi_k2"
+                        and call_info.name is not None
+                    ):
                         tool_id = f"functions.{call_info.name}:{call_info.tool_index}"
                     else:
                         tool_id = f"call_{uuid.uuid4().hex[:24]}"
