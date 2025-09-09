@@ -174,8 +174,13 @@ def run_one_case(
 
     profile_link = None
     if profile:
+        import torch
+
+        activities = ["CPU", "GPU"]
+        if torch.xpu.is_available():
+            activities.append("XPU")
         profile_link: str = run_profile(
-            url, profile_steps, ["CPU", "GPU"], None, None, profile_by_stage
+            url, profile_steps, activities, None, None, profile_by_stage
         )
 
     tic = time.perf_counter()
