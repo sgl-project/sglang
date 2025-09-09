@@ -1212,7 +1212,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        data_parallel_rank: Optional[int] = None,
+        prefill_dp_rank: Optional[int] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
@@ -1221,7 +1221,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         self.conclude_state = None
         self.init_time = None
-        self.data_parallel_rank = data_parallel_rank
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             (
@@ -1320,11 +1319,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
                 ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
 
-        if self.data_parallel_rank is not None:
-            logger.debug(f"Targeting DP rank: {self.data_parallel_rank}")
-            self.target_dp_group = self.data_parallel_rank
+        if prefill_dp_rank is not None:
+            logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
+            self.prefill_dp_rank = prefill_dp_rank
         else:
-            self.target_dp_group = bootstrap_room % self.prefill_dp_size
+            self.prefill_dp_rank = bootstrap_room % self.prefill_dp_size
+
+        # FIXME: alias here: target_dp_group -> prefill_dp_rank
+        self.target_dp_group = self.prefill_dp_rank
 
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num

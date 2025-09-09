@@ -3,7 +3,6 @@ Usage:
 python3 -m unittest test_intel_amx_attention_backend.TestIntelAMXAttnBackend.test_mmlu
 """
 
-import os
 import unittest
 from functools import wraps
 from types import SimpleNamespace
@@ -35,8 +34,6 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
                 "intel_amx",
                 "--disable-radix",
                 "--trust-remote-code",
-                "--batch-size",
-                "4",
             ]
             full_args = common_args + (extra_args or [])
 
@@ -60,28 +57,33 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
 
 class TestIntelAMXAttnBackend(CustomTestCase):
 
-    @intel_amx_benchmark(min_throughput=10)
+    @intel_amx_benchmark(extra_args=["--batch-size", "4"], min_throughput=10)
     def test_latency_mla_model(self):
         return DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
-    @intel_amx_benchmark(min_throughput=40)
+    @intel_amx_benchmark(extra_args=["--batch-size", "4"], min_throughput=40)
     def test_latency_default_model(self):
         return DEFAULT_MODEL_NAME_FOR_TEST
 
-    @intel_amx_benchmark(min_throughput=150)
+    @intel_amx_benchmark(extra_args=["--batch-size", "4"], min_throughput=150)
     def test_latency_fp8_qwen(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8
 
-    @intel_amx_benchmark(min_throughput=50)
+    @intel_amx_benchmark(extra_args=["--batch-size", "4"], min_throughput=50)
     def test_latency_fp8_moe_model(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE
 
-    @intel_amx_benchmark(extra_args=["--quantization", "w8a8_int8"], min_throughput=100)
+    @intel_amx_benchmark(
+        extra_args=["--batch-size", "4", "--quantization", "w8a8_int8"],
+        min_throughput=100,
+    )
     def test_latency_w8a8_default_model(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_W8A8
 
     @intel_amx_benchmark(
         extra_args=[
+            "--batch-size",
+            "4",
             "--quantization",
             "w8a8_int8",
             "--mem-fraction-static",

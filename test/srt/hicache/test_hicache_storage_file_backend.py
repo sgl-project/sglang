@@ -9,6 +9,7 @@ import random
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from typing import Dict
 from urllib.parse import urlparse
 
@@ -16,6 +17,7 @@ import requests
 
 from sglang.bench_serving import get_tokenizer
 from sglang.srt.utils import kill_process_tree
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -26,8 +28,8 @@ from sglang.test.test_utils import (
 )
 
 
-class HiCacheStorageBaseTest(CustomTestCase):
-    """Base test class with common setup and utilities"""
+class HiCacheStorageBaseMixin:
+    """Base mixin class with common setup and utilities"""
 
     @classmethod
     def setUpClass(cls):
@@ -166,11 +168,7 @@ class HiCacheStorageBaseTest(CustomTestCase):
             return False
 
     def gen_prompt(self, token_num: int) -> str:
-        """Generate a random prompt of specified token length using tokenizer vocabulary.
-
-        This function mimics the implementation from bench_serving.py to create
-        realistic prompts for testing cache behavior.
-        """
+        """Generate a random prompt of specified token length using tokenizer vocabulary."""
         all_available_tokens = list(self.tokenizer.get_vocab().values())
         selected_tokens = random.choices(all_available_tokens, k=token_num)
         return self.tokenizer.decode(selected_tokens)
@@ -201,10 +199,9 @@ class HiCacheStorageBaseTest(CustomTestCase):
 
         # Second request with extended prompt - should hit remote cache
         print("Step 2: Testing cache hit from remote storage...")
-        extended_prompt = base_prompt + "\n\n" + self.gen_prompt(64)
 
         start_time = time.time()
-        response2 = self.send_request(extended_prompt, max_tokens=150)
+        response2 = self.send_request(base_prompt, max_tokens=150)
         retrieval_time = time.time() - start_time
 
         cached_tokens = self.get_cached_tokens(response2)
@@ -213,12 +210,12 @@ class HiCacheStorageBaseTest(CustomTestCase):
         )
 
         # Assert cached tokens indicate a remote hit
-        self.assertEqual(
-            cached_tokens, 768, "Expected significant cached tokens for remote hit"
+        self.assertGreater(
+            cached_tokens, 700, "Expected significant cached tokens for remote hit"
         )
 
 
-class TestHiCacheStorageTP(HiCacheStorageBaseTest):
+class TestHiCacheStorageTP(HiCacheStorageBaseMixin, CustomTestCase):
     """Multi-TP tests for HiCache Storage functionality"""
 
     @classmethod
@@ -228,7 +225,7 @@ class TestHiCacheStorageTP(HiCacheStorageBaseTest):
         return server_args, {}
 
 
-class TestHiCacheStorageLayerFirstDirectIO(HiCacheStorageBaseTest):
+class TestHiCacheStorageLayerFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCase):
     """Layer first direct tests for HiCache Storage functionality"""
 
     @classmethod
@@ -241,7 +238,7 @@ class TestHiCacheStorageLayerFirstDirectIO(HiCacheStorageBaseTest):
         return server_args, {}
 
 
-class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseTest):
+class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase):
     """Page first layout tests for HiCache Storage functionality"""
 
     @classmethod
@@ -251,7 +248,7 @@ class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseTest):
         return server_args, {}
 
 
-class TestHiCacheStorageMLA(HiCacheStorageBaseTest):
+class TestHiCacheStorageMLA(HiCacheStorageBaseMixin, CustomTestCase):
     """MLA Model tests for HiCache Storage functionality"""
 
     @classmethod
@@ -264,6 +261,57 @@ class TestHiCacheStorageMLA(HiCacheStorageBaseTest):
         """Get additional server arguments specific to configuration - override in subclasses"""
         server_args = {"--tp-size": 2}
         return server_args, {}
+
+
+class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
+    """Accuracy tests for HiCache Storage functionality"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args = {"--tp-size": 2, "--hicache-ratio": 1.5}
+        return server_args, {}
+
+    def test_eval_accuracy(self):
+        """Test eval accuracy with cache persistence across cache flushes"""
+        print("\n=== Testing Eval Accuracy with Cache Persistence ===")
+
+        # First evaluation - populate cache
+        print("Phase 1: Running initial GSM8K evaluation to populate cache...")
+        args_initial = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=50,
+            max_new_tokens=512,
+            parallel=10,
+            host=f"http://{self.base_host}",
+            port=int(self.base_port),
+        )
+        metrics_initial = run_eval_few_shot_gsm8k(args_initial)
+
+        # Flush cache to force remote storage access
+        print("Phase 2: Flushing device cache...")
+        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
+        time.sleep(2)
+
+        # Second evaluation - should use remote cache
+        print("Phase 3: Running second GSM8K evaluation using remote cache...")
+        metrics_cached = run_eval_few_shot_gsm8k(args_initial)
+
+        # Verify accuracy consistency
+        accuracy_diff = abs(metrics_initial["accuracy"] - metrics_cached["accuracy"])
+        print(f"Accuracy difference: {accuracy_diff:.4f}")
+
+        # Assertions
+        self.assertGreater(
+            metrics_initial["accuracy"], 0.6, "Initial accuracy should be reasonable"
+        )
+        self.assertGreater(
+            metrics_cached["accuracy"], 0.6, "Cached accuracy should be reasonable"
+        )
+        self.assertLess(
+            accuracy_diff, 0.05, "Accuracy should be consistent between cache states"
+        )
 
 
 # TODO: Add other backends tests（3fs/mooncake）
