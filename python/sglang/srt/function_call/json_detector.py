@@ -52,7 +52,7 @@ class JsonDetector(BaseFormatDetector):
         This is not used for JSON schema constraints as they are handled
         by the constraint backends directly.
         """
-        return ""
+        raise NotImplementedError("EBNF generation is not supported for JSON schema constraints.")
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -73,6 +73,4 @@ class JsonDetector(BaseFormatDetector):
         This is not used for JSON schema constraints as they are handled
         by the constraint backends directly.
         """
-        def _get_info(tool_name: str):
-            return None
-        return _get_info
+        raise NotImplementedError("structure_info not used for JSON schema constraints")

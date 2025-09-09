@@ -856,7 +856,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_data = json.loads(text)
                 tool_calls = []
                 for i, call_info in enumerate(tool_call_data):
-                    tool_id = f"call_{uuid.uuid4().hex[:24]}"
+                    # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
+                    if tool_call_parser == "kimi_k2" and tool_choice.function.name is not None:
+                        tool_id = f"functions.{tool_choice.function.name}:0"
+                    else:
+                        tool_id = f"call_{uuid.uuid4().hex[:24]}"
+
                     tool_calls.append(
                         ToolCall(
                             id=tool_id,

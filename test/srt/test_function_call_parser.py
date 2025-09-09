@@ -2236,9 +2236,10 @@ class TestJsonDetector(unittest.TestCase):
         self.detector = JsonDetector()
 
     def test_json_detector_ebnf(self):
-        """Test that the JsonDetector returns empty EBNF."""
-        ebnf = self.detector.build_ebnf(self.tools)
-        self.assertEqual(ebnf, "")
+        """Test that the JsonDetector returns NotImplementedError for EBNF."""
+        with self.assertRaises(NotImplementedError) as context:
+            self.detector.build_ebnf(self.tools)
+        self.assertIn("EBNF generation is not supported for JSON schema constraints", str(context.exception))
 
     def test_has_tool_call(self):
         """Test detection of JSON tool calls"""
