@@ -59,7 +59,12 @@ class SchedulerMetricsMixin:
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
-            self.metrics_collector = SchedulerMetricsCollector(labels=labels)
+            self.metrics_collector = SchedulerMetricsCollector(
+                labels=labels,
+                bucket_eviction_duration=self.server_args.bucket_eviction_duration,
+                bucket_load_back_duration=self.server_args.bucket_load_back_duration,
+                bucket_chunked_prefill_loop_count=self.server_args.bucket_chunked_prefill_loop_count,
+            )
 
     def init_dp_balance(self: Scheduler, dp_balance_meta: Optional[DPBalanceMeta]):
         self.balance_meta = dp_balance_meta
@@ -109,6 +114,7 @@ class SchedulerMetricsMixin:
             num_used, token_usage, _, _ = self._get_token_info()
             token_msg = f"token usage: {token_usage:.2f}, "
 
+        self.stats.new_token_ratio = adder.new_token_ratio
         num_new_seq = len(can_run_list)
         f = (
             f"Prefill batch. "

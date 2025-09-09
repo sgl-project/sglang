@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -122,6 +123,7 @@ class RadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
         enable_kv_cache_events: bool = False,
+        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -129,6 +131,7 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        self.scheduler_metrics_collector = scheduler_metrics_collector
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -295,6 +298,7 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
+        start_time = time.perf_counter()
         leaves = self._collect_leaves()
         heapq.heapify(leaves)
 
@@ -315,6 +319,9 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(leaves, x.parent)
 
             self._record_remove_event(x)
+
+        if self.scheduler_metrics_collector is not None:
+            self.scheduler_metrics_collector.observe_eviction_duration(time.perf_counter() - start_time)
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:

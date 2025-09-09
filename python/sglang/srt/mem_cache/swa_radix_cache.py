@@ -30,6 +30,7 @@ import torch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -342,12 +343,14 @@ class SWARadixCache(BasePrefixCache):
         sliding_window_size: int,
         page_size: int,
         disable: bool = False,
+        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
         self.disable = disable
+        self.scheduler_metrics_collector = scheduler_metrics_collector
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -527,7 +530,7 @@ class SWARadixCache(BasePrefixCache):
     def evict(self, full_num_tokens: int, swa_num_tokens: int = 0) -> None:
         if self.disable:
             return
-
+        start_time = time.perf_counter()
         full_num_evicted = 0
         swa_num_evicted = 0
         if full_num_tokens > 0:
@@ -606,6 +609,9 @@ class SWARadixCache(BasePrefixCache):
                     self._iteratively_delete_tombstone_leaf(x)
 
                 x = x_next
+
+        if self.scheduler_metrics_collector is not None:
+            self.scheduler_metrics_collector.observe_eviction_duration(time.perf_counter() - start_time)
 
     def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
         """
