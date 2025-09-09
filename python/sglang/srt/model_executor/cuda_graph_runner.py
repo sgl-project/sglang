@@ -21,7 +21,7 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 import tqdm
@@ -311,7 +311,16 @@ class CudaGraphRunner:
 
         # Graph inputs
         with torch.device(self.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            if (
+                self.model_runner.model_config.channels
+                and self.model_runner.server_args.multi_channel
+            ):
+                self.input_ids = torch.zeros(
+                    (self.max_num_token, self.model_runner.model_config.channels),
+                    dtype=torch.int64,
+                )
+            else:
+                self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
@@ -377,11 +386,24 @@ class CudaGraphRunner:
                 dtype=torch.bool,
                 device=self.device,
             )
-            self.next_token_logits_buffer = torch.zeros(
-                (self.max_num_token, self.model_runner.model_config.vocab_size),
-                dtype=torch.float,
-                device=self.device,
-            )
+            if (
+                self.model_runner.model_config.channels
+                and self.model_runner.server_args.multi_channel
+            ):
+                self.next_token_logits_buffer = torch.zeros(
+                    (
+                        self.max_num_token,
+                        sum(self.model_runner.model_config.vocab_size_list),
+                    ),
+                    dtype=torch.float,
+                    device=self.device,
+                )
+            else:
+                self.next_token_logits_buffer = torch.zeros(
+                    (self.max_num_token, self.model_runner.model_config.vocab_size),
+                    dtype=torch.float,
+                    device=self.device,
+                )
 
         # Capture
         try:
@@ -824,6 +846,18 @@ class CudaGraphRunner:
                     else None
                 ),
             )
+        elif isinstance(output, List) and self.model_runner.server_args.multi_channel:
+            return [
+                LogitsProcessorOutput(
+                    next_token_logits=out.next_token_logits[: self.raw_num_token],
+                    hidden_states=(
+                        out.hidden_states[: self.raw_num_token]
+                        if out.hidden_states is not None
+                        else None
+                    ),
+                )
+                for out in output
+            ]
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})

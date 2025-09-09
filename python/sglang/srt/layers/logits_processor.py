@@ -202,10 +202,25 @@ class LogitsMetadata:
 
 class LogitsProcessor(nn.Module):
     def __init__(
-        self, config, skip_all_gather: bool = False, logit_scale: Optional[float] = None
+        self,
+        config,
+        vocab_size: Optional[Union[List[int], int]] = None,
+        skip_all_gather: bool = False,
+        logit_scale: Optional[float] = None,
+        channel: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
+        self.channel = channel
+        if vocab_size is not None:
+            if isinstance(vocab_size, list) and channel is not None:
+                self.vocab_size = vocab_size[channel]
+                self.vocab_size_list = vocab_size
+            else:
+                self.vocab_size = vocab_size
+        else:
+            self.vocab_size = config.vocab_size
+
         self.logit_scale = logit_scale
         self.use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
         if self.use_attn_tp_group:
@@ -470,23 +485,23 @@ class LogitsProcessor(nn.Module):
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
-                if self.config.vocab_size % self.attn_tp_size == 0:
+                if self.vocab_size % self.attn_tp_size == 0:
                     global_logits = torch.empty(
                         (
                             self.attn_tp_size,
                             logits.shape[0],
-                            self.config.vocab_size // self.attn_tp_size,
+                            self.vocab_size // self.attn_tp_size,
                         ),
                         device=logits.device,
                         dtype=logits.dtype,
                     )
                     attn_tp_all_gather_into_tensor(global_logits, logits)
                     global_logits = global_logits.permute(1, 0, 2).reshape(
-                        logits.shape[0], self.config.vocab_size
+                        logits.shape[0], self.vocab_size
                     )
                 else:
                     global_logits = torch.empty(
-                        (self.config.vocab_size, logits.shape[0]),
+                        (self.vocab_size, logits.shape[0]),
                         device=logits.device,
                         dtype=logits.dtype,
                     )
@@ -511,12 +526,23 @@ class LogitsProcessor(nn.Module):
             dp_scatter(logits, global_logits, logits_metadata)
 
         if logits_metadata.next_token_logits_buffer is not None:
-            logits_buffer = logits_metadata.next_token_logits_buffer
-            assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.config.vocab_size])
-            logits = logits_buffer
+            if self.channel is not None:
+                logits_buffer = logits_metadata.next_token_logits_buffer[
+                    :,
+                    sum(self.vocab_size_list[: self.channel]) : sum(
+                        self.vocab_size_list[: self.channel + 1]
+                    ),
+                ]
+                assert logits_buffer.dtype == torch.float
+                logits_buffer.copy_(logits[:, : self.vocab_size])
+                logits = logits_buffer
+            else:
+                logits_buffer = logits_metadata.next_token_logits_buffer
+                assert logits_buffer.dtype == torch.float
+                logits_buffer.copy_(logits[:, : self.vocab_size])
+                logits = logits_buffer
         else:
-            logits = logits[:, : self.config.vocab_size].float()
+            logits = logits[:, : self.vocab_size].float()
 
         if self.final_logit_softcapping:
             if not _is_npu:

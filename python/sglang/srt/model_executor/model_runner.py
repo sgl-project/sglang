@@ -66,12 +66,13 @@ from sglang.srt.layers.quantization import (
     deep_gemm_wrapper,
     monkey_patch_isinstance_for_vllm_base_layer,
 )
-from sglang.srt.layers.sampler import Sampler
+from sglang.srt.layers.sampler import MultiChannelSampler, Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
+    ModelWorkerBatch,
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.allocator import (
@@ -290,7 +291,10 @@ class ModelRunner:
         self.expert_location_updater = ExpertLocationUpdater()
 
         # Load the model
-        self.sampler = Sampler()
+        if self.server_args.multi_channel:
+            self.sampler = MultiChannelSampler()
+        else:
+            self.sampler = Sampler()
         self.load_model()
 
         # Check if the model is using hybrid SWA
@@ -1868,8 +1872,24 @@ class ModelRunner:
         return ret, can_run_graph
 
     def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
+        self,
+        logits_output: Union[LogitsProcessorOutput, List[LogitsProcessorOutput]],
+        sampling_info: SamplingBatchInfo,
+        current_generation_step: Optional[int] = None,
     ):
+        # Multi-channel models are not compatible with the current logit bias.
+        if self.server_args.multi_channel:
+            if self.server_args.delay_pattern:
+                for i, logits in enumerate(logits_output):
+                    if i != 0 and current_generation_step + 1 > i:
+                        logits.next_token_logits[:, self.model_config.pad_token[i]] = (
+                            -torch.inf
+                        )
+                    if i == 0 and current_generation_step <= 7:
+                        logits.next_token_logits[:, self.model_config.pad_token[i]] = (
+                            -torch.inf
+                        )
+            return
         # Apply logit bias
         if sampling_info.sampling_info_done:
             # Overlap mode: the function update_regex_vocab_mask was executed
@@ -1881,10 +1901,85 @@ class ModelRunner:
             sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
+    def is_speech_token(self, token_id: torch.Tensor) -> torch.Tensor:
+        return (token_id <= self.model_config.hf_text_config.speech_token_range[1]) & (
+            token_id >= self.model_config.hf_text_config.speech_token_range[0]
+        )
+
+    def _postprocess_tokens(
+        self,
+        next_token_ids: torch.Tensor,
+        current_generation_step: int,
+        truncated_input_ids: torch.Tensor,
+        needs_additional_steps: torch.Tensor,
+        unfinished_sequences: torch.Tensor,
+    ):
+        channels = self.model_config.channels
+        indices = (~self.is_speech_token(next_token_ids[:, 0])) & (
+            needs_additional_steps < 0
+        )
+        needs_additional_steps[indices] = channels - 1
+
+        if current_generation_step < channels - 1:
+            i = current_generation_step + 1
+            # Handle different shapes of truncated_input_ids
+            if (
+                truncated_input_ids.dim() == 2
+                and truncated_input_ids.shape[0] > current_generation_step
+            ):
+                # 2D case: [generation_step, channel]
+                next_token_ids[:, i:] = truncated_input_ids[current_generation_step, i:]
+            elif truncated_input_ids.dim() == 1 and len(truncated_input_ids) > 0:
+                # 1D case: flattened or single sequence - use pad tokens
+                next_token_ids[:, i:] = torch.tensor(
+                    self.model_config.pad_token[i:],
+                    dtype=next_token_ids.dtype,
+                    device=next_token_ids.device,
+                )
+            else:
+                # Fallback: use pad tokens
+                next_token_ids[:, i:] = torch.tensor(
+                    self.model_config.pad_token[i:],
+                    dtype=next_token_ids.dtype,
+                    device=next_token_ids.device,
+                )
+
+        # Handle tensor boolean operations properly
+        mask = (needs_additional_steps > 0) & (needs_additional_steps < channels - 1)
+        if torch.any(mask):
+            next_token_ids[mask, 0] = next(iter(self.model_config.hf_eos_token_id))
+            for i in range(1, channels):
+                channel_mask = mask & (needs_additional_steps < channels - i)
+                if torch.any(channel_mask):
+                    next_token_ids[channel_mask, i] = self.model_config.pad_token[i]
+
+        for i in range(channels):
+            pddp = (
+                next(iter(self.model_config.hf_eos_token_id))
+                if i == 0
+                else self.model_config.pad_token[i]
+            )
+            next_token_ids[:, i] = next_token_ids[
+                :, i
+            ] * unfinished_sequences + pddp * (1 - unfinished_sequences)
+
+        needs_additional_steps = torch.where(
+            needs_additional_steps > 0,
+            needs_additional_steps - 1,
+            needs_additional_steps,
+        )
+
+        stopping = (next_token_ids[:, 0] == self.model_config.pad_token[0]) | (
+            needs_additional_steps == 0
+        )
+        unfinished_sequences = unfinished_sequences & ~stopping
+        unfinished_sequences = unfinished_sequences | (needs_additional_steps > 0)
+        return needs_additional_steps, unfinished_sequences
+
     def sample(
         self,
         logits_output: LogitsProcessorOutput,
-        forward_batch: ForwardBatch,
+        batch: ModelWorkerBatch,
     ) -> torch.Tensor:
         """Sample and compute logprobs and update logits_output.
 
@@ -1898,20 +1993,57 @@ class ModelRunner:
         # For duplex models with multiple output streams.
         if isinstance(logits_output, tuple):
             return torch.stack(
-                [self.sample(values, forward_batch) for values in logits_output],
+                [self.sample(values, batch) for values in logits_output],
                 axis=-1,
             )
 
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        self._preprocess_logits(
+            logits_output, batch.sampling_info, batch.current_generation_step
+        )
 
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
-            forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
+            batch.sampling_info,
+            batch.return_logprob,
+            batch.top_logprobs_nums,
+            batch.token_ids_logprobs,
         )
+
+        # Current delay pattern postprocessing is designed specifically for MOSS-TTSD
+
+        # Delay pattern (TTS and multi-codebook audio)
+        # - Meaning:
+        #   - TTS: context-dependent timing between phonemes/characters (non-fixed, model-predicted).
+        #   - Audio tokens (RVQ): offsets (delays) between parallel codebooks to model cross-codebook deps.
+        #
+        # - Why it matters (TTS):
+        #   - Pauses: natural punctuation- and structure-aware breaks improve intelligibility.
+        #   - Prosody: tempo/pauses vary with emotion and emphasis for expressive speech.
+        #   - Speaker style: captures individual rhythm and pace.
+        #
+        # - Typical implementations (TTS):
+        #   - Duration prediction: per-phoneme/character duration as conditioning.
+        #   - Alignment learning: end-to-end mapping from text steps to acoustic frames.
+        #
+        # - Codebook interleaving (audio tokens):
+        #   - Introduces staggered offsets across codebooks to expose dependencies to AR decoding.
+        #   - Balances modeling power and efficiency by reducing AR steps vs. full flattening.
+        #   - Key for efficient, high-quality music/audio generation.
+        if (
+            global_server_args_dict["delay_pattern"]
+            and self.model_config.hf_config.model_type == "moss_ttsd"
+        ):
+            batch.needs_additional_steps, batch.unfinished_sequences = (
+                self._postprocess_tokens(
+                    next_token_ids,
+                    batch.current_generation_step,
+                    batch.truncated_input_ids,
+                    batch.needs_additional_steps,
+                    batch.unfinished_sequences,
+                )
+            )
+
         return next_token_ids
 
     @property

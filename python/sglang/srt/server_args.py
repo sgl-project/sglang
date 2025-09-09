@@ -390,6 +390,12 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # For multi-channel model support
+    multi_channel: Optional[bool] = None
+
+    # For delay-pattern model support
+    delay_pattern: Optional[bool] = None
+
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
@@ -828,6 +834,28 @@ class ServerArgs:
 
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
+
+        # For delay-pattern model support
+        # If we use delay-pattern model, it must be a multi-channel model.
+        # And for delay-pattern sampling, overlap mode must be disabled.
+        if self.delay_pattern:
+            if not self.multi_channel:
+                logger.warning("Delay-pattern model requires multi-channel support.")
+            self.multi_channel = True
+            if self.disable_overlap_schedule:
+                logger.warning(
+                    "Overlap scheduling is disabled for delay-pattern model."
+                )
+            self.disable_overlap_schedule = True
+
+        # For multi-channel model support
+        # If we use multi-channel input, we need to set skip_tokenizer_init to True,
+        # so that we can directly get output_ids,
+        # because SGLang doesn't have a built-in way to handle multi-channel i/o tokens.
+        if self.multi_channel:
+            if not self.skip_tokenizer_init:
+                logger.warning("Multi-channel model skips tokenizer init.")
+            self.skip_tokenizer_init = True
 
         # Propagate env vars
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
@@ -2161,6 +2189,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.sm_group_num,
             help="Number of sm partition groups.",
+        )
+
+        # For multi-channel model support
+        parser.add_argument(
+            "--multi-channel",
+            action="store_true",
+            help="Enable multi-channel model support.",
+        )
+
+        # For delay-pattern model support
+        parser.add_argument(
+            "--delay-pattern",
+            action="store_true",
+            help="Enable delay-pattern model support.",
         )
 
         # Deprecated arguments

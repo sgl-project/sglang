@@ -2157,6 +2157,19 @@ def add_prefix(name: str, prefix: str) -> str:
     return name if not prefix else f"{prefix}.{name}"
 
 
+def remove_prefix(text: str, prefix: str) -> str:
+    """Remove a weight path prefix from a module name.
+
+    Args:
+        text: The module name to modify.
+        prefix: The weight path prefix to remove.
+
+    Returns:
+        The modified module name with the prefix removed.
+    """
+    return text[len(prefix) :] if text.startswith(prefix) else text
+
+
 def is_remote_url(url: Union[str, Path]) -> bool:
     """
     Check if the URL is a remote URL of the format:

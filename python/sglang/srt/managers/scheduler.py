@@ -1165,6 +1165,19 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            if self.server_args.delay_pattern:
+                if len(recv_req.input_ids) >= self.model_config.channels:
+                    truncated_input_ids = recv_req.input_ids[
+                        1 - self.model_config.channels :
+                    ]
+                    recv_req.input_ids = recv_req.input_ids[
+                        : 1 - self.model_config.channels
+                    ]
+                else:
+                    truncated_input_ids = []
+            else:
+                truncated_input_ids = None
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1184,6 +1197,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
+                truncated_input_ids=truncated_input_ids,
             )
             req.tokenizer = self.tokenizer
 
@@ -1816,6 +1830,12 @@ class Scheduler(
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 bid = model_worker_batch.bid
+                # For delay-pattern sampling
+                if self.server_args.delay_pattern:
+                    batch.needs_additional_steps = (
+                        model_worker_batch.needs_additional_steps
+                    )
+                    batch.unfinished_sequences = model_worker_batch.unfinished_sequences
             else:
                 (
                     logits_output,
@@ -1831,6 +1851,9 @@ class Scheduler(
 
             if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids
+                # For delay-pattern sampling
+                if self.server_args.delay_pattern:
+                    batch.current_generation_step += 1
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
