@@ -103,6 +103,8 @@ Note: To get started quickly, if `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-
 **Start the `SGLang server` with Mooncake enabled:**
 Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` layout (which optimizes memory access patterns for KV cache operations).
 
+There are two ways to configure Mooncake: 1. Using environment variables; 2. Using extra-config of sglang arguments.
+
 **Using env variables to configure Mooncake**
 
 ```bash
