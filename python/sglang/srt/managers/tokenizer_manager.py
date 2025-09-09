@@ -1664,7 +1664,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             return
 
         while True:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(self.server_args.load_watch_interval)
             loads = await self.get_load_communicator(GetLoadReqInput())
             load_udpate_req = WatchLoadUpdateReq(loads=loads)
             self.send_to_scheduler.send_pyobj(load_udpate_req)
