@@ -27,12 +27,18 @@ def pack_interleave(num_experts, ref_weight, ref_scale):
     w_q = weight.view((num_experts, n, k // 2)).view(torch.int8)
     w_q = w_q.contiguous()
 
+    alignment = 4 if k % 512 == 0 else 1
     scale_interleaved = ref_scale.reshape(
-        ref_scale.shape[0], ref_scale.shape[1], (ref_scale.shape[2] // 4), 4
+        ref_scale.shape[0],
+        ref_scale.shape[1],
+        (ref_scale.shape[2] // alignment),
+        alignment,
     )  # [E, N, K/4, 4]
     scale_interleaved = scale_interleaved.permute(0, 2, 1, 3)  # [E, K/4, N, 4]
     scale_interleaved = scale_interleaved.reshape(
-        ref_scale.shape[0], ref_scale.shape[2] // 4, ref_scale.shape[1] * 4
+        ref_scale.shape[0],
+        ref_scale.shape[2] // alignment,
+        ref_scale.shape[1] * alignment,
     )  # [E, K/4, N*4]
     w_scale = scale_interleaved.contiguous()
 
@@ -90,7 +96,7 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
     a_q = torch.clamp((a / a_scale), -448.0, 448.0).to(torch.float8_e4m3fn).to(device)
 
     # Create output tensor
-    c = torch.empty((m, n), dtype=torch.float16, device=device)
+    c = torch.empty((m, n), dtype=torch.bfloat16, device=device)
     cutlass_w4a8_moe_mm(
         c,
         a_q,
@@ -137,8 +143,8 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
     reason="cutlass_w4a8_moe_mm is only supported on sm90",
 )
 @pytest.mark.parametrize("batch_size", [2, 4, 8, 16])
-@pytest.mark.parametrize("k", [512, 1024])
-@pytest.mark.parametrize("n", [1024, 2048])
+@pytest.mark.parametrize("k", [256, 512, 1024])
+@pytest.mark.parametrize("n", [1024, 2048, 7168])
 @pytest.mark.parametrize("num_experts", [2, 4, 6, 8])
 def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts):
     torch.manual_seed(0)
@@ -205,7 +211,7 @@ def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts):
     b_strides = a_strides
     s_strides = c_strides
 
-    c_perm = torch.empty((batch_size, n), dtype=torch.float16, device=device)
+    c_perm = torch.empty((batch_size, n), dtype=torch.bfloat16, device=device)
     cutlass_w4a8_moe_mm(
         c_perm,
         a_q_perm,
@@ -256,10 +262,9 @@ def ref_grouped_gemm(c, a, a_scale, w, w_scale, num_experts, experts_selection_r
             continue
         a = a_q[token_idx]
 
-        ref_w_scale_repeat = w_scale[i].repeat_interleave(128, dim=1).to(float)
-        ref_w = (w[i].to(float) * ref_w_scale_repeat).to(dtype)
-        c = torch.matmul(a.to(dtype), ref_w.t().to(dtype)) * a_scale
-        c = c.to(dtype)
+        ref_w_scale_repeat = w_scale[i].repeat_interleave(128, dim=1).to(torch.float32)
+        ref_w = w[i].to(torch.float32) * ref_w_scale_repeat
+        c = torch.matmul(a.to(torch.float32), ref_w.t()) * a_scale
         c_ref[token_idx] = c.to(dtype)
 
     return c_ref
