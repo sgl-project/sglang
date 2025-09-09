@@ -1430,9 +1430,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
-        while (
-            _get_available_size() < get_required_tokens(len(sorted_indices))
-            or first_iter
+        while first_iter or (
+            not self.check_decode_mem(selected_indices=sorted_indices)
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
@@ -1485,10 +1484,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
                 else:
                     self.tree_cache.dec_lock_ref(req.last_node)
-
-                # NOTE(lsyin): we should use the newly evictable memory instantly.
-                num_tokens = len(sorted_indices) * global_config.retract_decode_steps
-                self._evict_tree_cache_if_needed(num_tokens)
 
             req.reset_for_retract()
 
