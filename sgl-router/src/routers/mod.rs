@@ -9,7 +9,9 @@ use axum::{
 };
 use std::fmt::Debug;
 
-use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
+use crate::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest,
+};
 
 pub mod factory;
 pub mod grpc;
@@ -78,7 +80,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
 
     async fn route_embeddings(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
 
-    async fn route_rerank(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
+    async fn route_rerank(&self, headers: Option<&HeaderMap>, body: &RerankRequest) -> Response;
 
     /// Flush cache on all workers
     async fn flush_cache(&self) -> Response;
