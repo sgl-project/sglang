@@ -126,6 +126,7 @@ class Sampler(nn.Module):
                     logprobs = torch.log(probs_without_temp_scaling).clamp(
                         min=torch.finfo(probs_without_temp_scaling.dtype).min
                     )
+                    del probs_without_temp_scaling
                 else:
                     logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
