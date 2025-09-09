@@ -5,7 +5,6 @@ Uses GrpcRequestManager for orchestration without tokenization.
 
 import argparse
 import asyncio
-import json
 import logging
 import multiprocessing as mp
 import os
@@ -18,11 +17,13 @@ from typing import AsyncIterator, Dict, Optional, Tuple
 import grpc
 from grpc_reflection.v1alpha import reflection
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 from sglang.srt.entrypoints.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
+from sglang.srt.managers.data_parallel_controller import (
+    run_data_parallel_controller_process,
+)
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -36,7 +37,6 @@ from sglang.srt.utils import (
     PortArgs,
     prepare_model_and_tokenizer,
 )
-from sglang.utils import get_ip_address
 
 logger = logging.getLogger(__name__)
 
@@ -52,68 +52,99 @@ def _launch_scheduler_process_only(
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
-    
+
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
-    
+
     # Prepare model and tokenizer paths
     server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
         server_args.model_path, server_args.tokenizer_path
     )
-    
+
     scheduler_procs = []
-    scheduler_pipe_readers = []
-    
-    # Handle tensor parallel case
-    for tp_rank in range(server_args.tp_size):
-        reader, writer = mp.Pipe(duplex=False)
-        
-        # Calculate GPU ID
-        gpu_id = getattr(server_args, 'base_gpu_id', 0) + tp_rank
-        pp_rank = 0  # No pipeline parallelism for gRPC server
-        moe_ep_rank = tp_rank // (server_args.tp_size // getattr(server_args, 'ep_size', 1))
-        
-        proc = mp.Process(
-            target=run_scheduler_process,
-            args=(
-                server_args,
-                port_args,
-                gpu_id,
-                tp_rank,
-                moe_ep_rank,
-                pp_rank,
-                None,  # detokenizer_ipc_name (not needed for gRPC)
-                writer,
-                None,  # model_override_args
-            ),
+    if server_args.dp_size == 1:
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
         )
-        
+        scheduler_pipe_readers = []
+
+        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+        tp_rank_range = range(
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+        )
+
+        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        pp_rank_range = range(
+            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
+            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
+        )
+
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                reader, writer = mp.Pipe(duplex=False)
+                gpu_id = (
+                    server_args.base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                )
+                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+                proc = mp.Process(
+                    target=run_scheduler_process,
+                    args=(
+                        server_args,
+                        port_args,
+                        gpu_id,
+                        tp_rank,
+                        moe_ep_rank,
+                        pp_rank,
+                        None,
+                        writer,
+                        None,
+                    ),
+                )
+
+                with memory_saver_adapter.configure_subprocess():
+                    proc.start()
+                scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
+    else:
+        # Launch the data parallel controller
+        reader, writer = mp.Pipe(duplex=False)
+        scheduler_pipe_readers = [reader]
+        proc = mp.Process(
+            target=run_data_parallel_controller_process,
+            args=(server_args, port_args, writer),
+        )
         proc.start()
         scheduler_procs.append(proc)
-        scheduler_pipe_readers.append(reader)
-    
+
+    # TODO(CatherineSue): handle cases for multi-node
+
     # Wait for all scheduler processes to be ready
     scheduler_infos = []
     for i, reader in enumerate(scheduler_pipe_readers):
-        logger.info(f"Waiting for scheduler rank {i} to initialize...")
         try:
             data = reader.recv()
         except EOFError:
-            logger.error(f"Scheduler process rank {i} died during initialization")
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
             scheduler_procs[i].join()
-            logger.error(f"Scheduler rank {i} exit code: {scheduler_procs[i].exitcode}")
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
             raise RuntimeError(f"Failed to initialize scheduler rank {i}")
-        
+
         if data.get("status") != "ready":
             raise RuntimeError(
                 f"Scheduler rank {i} initialization failed: {data.get('error', 'Unknown error')}"
             )
         scheduler_infos.append(data)
-    
+
     logger.info(f"All {len(scheduler_procs)} scheduler process(es) initialized successfully")
-    
+
     # Return the first scheduler's info (they should all be the same)
     return scheduler_infos[0], port_args, scheduler_procs
 
@@ -123,7 +154,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     Standalone gRPC service implementation using GrpcRequestManager.
     Fully separated from HTTP server with its own process and no shared globals.
     """
-    
+
     def __init__(
         self,
         request_manager: GrpcRequestManager,
@@ -135,12 +166,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.server_args = server_args
         self.model_info = model_info
         self.start_time = time.time()
-        
+
         # Start the request manager's event loop
         self.handle_loop_task = asyncio.create_task(self.request_manager.handle_loop())
-        
+
         logger.info("Standalone gRPC scheduler service initialized")
-    
+
     async def Initialize(
         self,
         request: sglang_scheduler_pb2.InitializeRequest,
@@ -148,7 +179,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> sglang_scheduler_pb2.InitializeResponse:
         """Handle client initialization."""
         logger.info(f"Client initialization: {request.client_id}")
-        
+
         try:
             return sglang_scheduler_pb2.InitializeResponse(
                 success=True,
@@ -163,7 +194,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 scheduler_version=self._get_version(),
                 error_message=str(e),
             )
-    
+
     async def Generate(
         self,
         request: sglang_scheduler_pb2.GenerateRequest,
@@ -171,24 +202,24 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> AsyncIterator[sglang_scheduler_pb2.GenerateResponse]:
         """Handle generation requests with streaming responses."""
         logger.info(f"Generation request: {request.request_id}")
-        
+
         try:
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
-            
+
             # Submit to request manager
             output_queue = await self.request_manager.generate_request(
                 obj=tokenized_req,
                 request_id=request.request_id,
                 grpc_context=context,
             )
-            
+
             # Stream outputs
             while True:
                 try:
                     # Get output with timeout
                     output = await asyncio.wait_for(output_queue.get(), timeout=1.0)
-                    
+
                     # Check for errors
                     if "error" in output:
                         yield sglang_scheduler_pb2.GenerateResponse(
@@ -199,7 +230,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                             ),
                         )
                         break
-                    
+
                     # Check if finished
                     if output.get("finished", False):
                         # Send completion
@@ -208,7 +239,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     else:
                         # Send chunk
                         yield self._create_chunk_response(request.request_id, output)
-                        
+
                 except asyncio.TimeoutError:
                     # Check if context is still active
                     if context.cancelled():
@@ -216,7 +247,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         await self.request_manager.abort_request(request.request_id)
                         break
                     continue
-                    
+
         except Exception as e:
             logger.error(f"Generate failed: {e}\n{get_exception_traceback()}")
             yield sglang_scheduler_pb2.GenerateResponse(
@@ -227,7 +258,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     details=get_exception_traceback(),
                 ),
             )
-    
+
     async def Embed(
         self,
         request: sglang_scheduler_pb2.EmbedRequest,
@@ -235,20 +266,20 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> sglang_scheduler_pb2.EmbedResponse:
         """Handle embedding requests."""
         logger.info(f"Embedding request: {request.request_id}")
-        
+
         try:
             # Convert request
             tokenized_req = self._convert_embed_request(request)
-            
+
             # Submit to request manager
             future = await self.request_manager.embedding_request(
                 obj=tokenized_req,
                 request_id=request.request_id,
             )
-            
+
             # Wait for result
             result = await future
-            
+
             # Create response
             return sglang_scheduler_pb2.EmbedResponse(
                 request_id=request.request_id,
@@ -260,7 +291,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     generation_time=time.time() - self.start_time,
                 ),
             )
-            
+
         except Exception as e:
             logger.error(f"Embed failed: {e}\n{get_exception_traceback()}")
             return sglang_scheduler_pb2.EmbedResponse(
@@ -271,7 +302,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     details=get_exception_traceback(),
                 ),
             )
-    
+
     async def HealthCheck(
         self,
         request: sglang_scheduler_pb2.HealthCheckRequest,
@@ -280,7 +311,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Health check endpoint."""
         try:
             server_info = self.request_manager.get_server_info()
-            
+
             return sglang_scheduler_pb2.HealthCheckResponse(
                 healthy=True,
                 num_requests_running=server_info["active_requests"],
@@ -302,7 +333,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         except Exception as e:
             logger.error(f"Health check failed: {e}")
             return sglang_scheduler_pb2.HealthCheckResponse(healthy=False)
-    
+
     async def Abort(
         self,
         request: sglang_scheduler_pb2.AbortRequest,
@@ -310,10 +341,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> sglang_scheduler_pb2.AbortResponse:
         """Abort an ongoing request."""
         logger.info(f"Aborting request: {request.request_id}")
-        
+
         try:
             success = await self.request_manager.abort_request(request.request_id)
-            
+
             return sglang_scheduler_pb2.AbortResponse(
                 success=success,
                 message=f"Request {request.request_id} {'aborted' if success else 'not found'}",
@@ -324,7 +355,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 success=False,
                 message=str(e),
             )
-    
+
     async def FlushCache(
         self,
         request: sglang_scheduler_pb2.FlushCacheRequest,
@@ -332,10 +363,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> sglang_scheduler_pb2.FlushCacheResponse:
         """Flush cache entries."""
         logger.info(f"Flushing cache - flush_all: {request.flush_all}")
-        
+
         try:
             result = await self.request_manager.flush_cache()
-            
+
             return sglang_scheduler_pb2.FlushCacheResponse(
                 success=True,
                 num_entries_flushed=0,
@@ -348,14 +379,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 success=False,
                 message=str(e),
             )
-    
+
     # Helper methods for request/response conversion
-    
+
     def _convert_generate_request(
         self, grpc_req: sglang_scheduler_pb2.GenerateRequest
     ) -> TokenizedGenerateReqInput:
         """Convert gRPC GenerateRequest to internal format."""
-        
+
         # Extract input
         if grpc_req.HasField("text"):
             input_text = grpc_req.text
@@ -365,10 +396,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             input_ids = list(grpc_req.tokenized.input_ids)
         else:
             raise ValueError("Either text or tokenized input must be provided")
-        
+
         # Convert sampling params
         sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
-        
+
         # Create request
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
@@ -381,12 +412,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             stream=True,  # Always stream for gRPC
             lora_path=grpc_req.lora_id if grpc_req.lora_id else None,
         )
-    
+
     def _convert_embed_request(
         self, grpc_req: sglang_scheduler_pb2.EmbedRequest
     ) -> TokenizedEmbeddingReqInput:
         """Convert gRPC EmbedRequest to internal format."""
-        
+
         # Extract input
         if grpc_req.HasField("text"):
             input_text = grpc_req.text
@@ -396,30 +427,30 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             input_ids = list(grpc_req.tokenized.input_ids)
         else:
             raise ValueError("Either text or tokenized input must be provided")
-        
+
         return TokenizedEmbeddingReqInput(
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
         )
-    
+
     def _convert_sampling_params(
         self, grpc_params: sglang_scheduler_pb2.SamplingParams
     ) -> SGLSamplingParams:
         """Convert gRPC SamplingParams to internal format."""
-        
+
         # Handle constraint types
         regex = None
         json_schema = None
         ebnf_grammar = None
-        
+
         if grpc_params.HasField("regex"):
             regex = grpc_params.regex
         elif grpc_params.HasField("json_schema"):
             json_schema = grpc_params.json_schema
         elif grpc_params.HasField("ebnf_grammar"):
             ebnf_grammar = grpc_params.ebnf_grammar
-        
+
         return SGLSamplingParams(
             temperature=grpc_params.temperature or 1.0,
             top_p=grpc_params.top_p or 1.0,
@@ -440,7 +471,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             n=grpc_params.n or 1,
             ignore_eos=grpc_params.ignore_eos,
         )
-    
+
     def _create_chunk_response(
         self, request_id: str, output: Dict
     ) -> sglang_scheduler_pb2.GenerateResponse:
@@ -457,12 +488,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 queue_time=0.0,
             ),
         )
-    
+
     def _create_completion_response(
         self, request_id: str, output: Dict
     ) -> sglang_scheduler_pb2.GenerateResponse:
         """Create a completion response."""
-        
+
         # Determine finish reason
         finish_reason = sglang_scheduler_pb2.GenerateComplete.STOP
         meta_info = output.get("meta_info", {})
@@ -470,7 +501,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             finish_reason = sglang_scheduler_pb2.GenerateComplete.LENGTH
         elif meta_info.get("finish_reason") == "eos_token":
             finish_reason = sglang_scheduler_pb2.GenerateComplete.EOS_TOKEN
-        
+
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
             complete=sglang_scheduler_pb2.GenerateComplete(
@@ -486,7 +517,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 spec_verify_count=0,
             ),
         )
-    
+
     def _create_model_info(self) -> sglang_scheduler_pb2.ModelInfo:
         """Create model info from server configuration."""
         return sglang_scheduler_pb2.ModelInfo(
@@ -506,7 +537,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             pad_token_id=self.model_info.get("pad_token_id", 0),
             bos_token_id=self.model_info.get("bos_token_id", 1),
         )
-    
+
     def _create_capabilities(self) -> sglang_scheduler_pb2.ServerCapabilities:
         """Create server capabilities."""
         return sglang_scheduler_pb2.ServerCapabilities(
@@ -530,7 +561,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             pipeline_parallel_size=1,
             data_parallel_size=self.server_args.dp_size or 1,
         )
-    
+
     def _get_version(self) -> str:
         """Get SGLang version."""
         try:
@@ -538,11 +569,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             return getattr(sglang, "__version__", "0.3.0")
         except:
             return "0.3.0"
-    
+
     async def shutdown(self):
         """Shutdown the service."""
         logger.info("Shutting down gRPC service")
-        
+
         # Cancel handle loop
         if self.handle_loop_task:
             self.handle_loop_task.cancel()
@@ -550,7 +581,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 await self.handle_loop_task
             except asyncio.CancelledError:
                 pass
-        
+
         # Shutdown request manager
         await self.request_manager.shutdown()
 
@@ -561,19 +592,19 @@ async def serve_grpc(
     model_info: Optional[Dict] = None,
 ):
     """Start the standalone gRPC server with integrated scheduler."""
-    
+
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    
+
     # Launch only the scheduler process(es) (no tokenizer/detokenizer needed for gRPC)
     logger.info("Launching scheduler process(es)...")
     scheduler_info, port_args, scheduler_procs = _launch_scheduler_process_only(
         server_args=server_args,
     )
-    
+
     # Update model info from scheduler info
     if model_info is None:
         model_info = {
@@ -587,13 +618,13 @@ async def serve_grpc(
             "pad_token_id": scheduler_info.get("pad_token_id", 0),
             "bos_token_id": scheduler_info.get("bos_token_id", 1),
         }
-    
+
     # Create request manager with the correct port args
     request_manager = GrpcRequestManager(
         server_args=server_args,
         port_args=port_args.__dict__ if hasattr(port_args, '__dict__') else port_args,
     )
-    
+
     # Create gRPC server
     server = grpc.aio.server(
         futures.ThreadPoolExecutor(max_workers=10),
@@ -602,7 +633,7 @@ async def serve_grpc(
             ("grpc.max_receive_message_length", 1024 * 1024 * 256),
         ],
     )
-    
+
     # Add service
     servicer = SGLangSchedulerServicer(
         request_manager=request_manager,
@@ -610,42 +641,42 @@ async def serve_grpc(
         model_info=model_info,
     )
     sglang_scheduler_pb2_grpc.add_SglangSchedulerServicer_to_server(servicer, server)
-    
+
     # Enable reflection
     SERVICE_NAMES = (
         sglang_scheduler_pb2.DESCRIPTOR.services_by_name["SglangScheduler"].full_name,
         reflection.SERVICE_NAME,
     )
     reflection.enable_server_reflection(SERVICE_NAMES, server)
-    
+
     # Start server
     listen_addr = f"[::]:{port}"
     server.add_insecure_port(listen_addr)
-    
+
     logger.info(f"Starting standalone gRPC server on {listen_addr}")
     logger.info(f"Model: {server_args.model_path}")
     logger.info(f"Max context length: {model_info.get('max_context_length', 'unknown')}")
-    
+
     await server.start()
-    
+
     # Handle shutdown signals
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
-    
+
     def signal_handler():
         logger.info("Received shutdown signal")
         stop_event.set()
-    
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, signal_handler)
-    
+
     try:
         await stop_event.wait()
     finally:
         logger.info("Shutting down gRPC server")
         await servicer.shutdown()
         await server.stop(5.0)
-        
+
         # Terminate scheduler processes
         for i, proc in enumerate(scheduler_procs):
             if proc and proc.is_alive():
@@ -661,18 +692,18 @@ async def serve_grpc(
 def main():
     """Main entry point for standalone gRPC server."""
     parser = argparse.ArgumentParser(description="SGLang Standalone gRPC Server")
-    
+
     # Server arguments
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=30000, help="gRPC server port")
-    
+
     # Model arguments
     parser.add_argument("--model-path", type=str, required=True, help="Model path")
     parser.add_argument("--tokenizer-path", type=str, help="Tokenizer path")
     parser.add_argument("--context-length", type=int, help="Context length")
     parser.add_argument("--tp-size", type=int, default=1, help="Tensor parallel size")
     parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
-    
+
     # Runtime arguments
     parser.add_argument(
         "--max-running-requests", type=int, default=2048, help="Max concurrent requests"
@@ -687,14 +718,14 @@ def main():
         "--attention-backend", type=str, default="flashinfer", help="Attention backend"
     )
     parser.add_argument("--lora-paths", type=str, help="LoRA adapter paths")
-    
+
     # Logging
     parser.add_argument(
         "--log-level", type=str, default="INFO", help="Logging level"
     )
-    
+
     args = parser.parse_args()
-    
+
     # Convert to ServerArgs
     server_args = ServerArgs(
         model_path=args.model_path,
@@ -709,7 +740,7 @@ def main():
         lora_paths=args.lora_paths.split(",") if args.lora_paths else None,
         log_level=args.log_level,
     )
-    
+
     # Run server
     asyncio.run(
         serve_grpc(
