@@ -566,7 +566,7 @@ class WorkloadGenerator:
                         request_count = round_data["request_count"]
                         print(
                             f"  Round {round_num}: Average TTFT = {avg_ttft:.2f}s, "
-                            f"Cache Hit Rate = {cache_hit_rate:.4f}, "
+                            f"Cache Hit Rate = {cache_hit_rate:.6f}, "
                             f"({request_count} requests)"
                         )
                     else:
