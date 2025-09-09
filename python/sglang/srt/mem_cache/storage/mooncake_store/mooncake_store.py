@@ -72,6 +72,26 @@ class MooncakeStoreConfig:
             master_server_address=os.getenv("MOONCAKE_MASTER"),
         )
 
+    @staticmethod
+    def load_from_extra_config(extra_config: dict) -> "MooncakeStoreConfig":
+        """Load config from extra_config dictionary."""
+        if "master_server_address" not in extra_config:
+            raise ValueError("master_server_address is required in extra_config")
+
+        return MooncakeStoreConfig(
+            local_hostname=extra_config.get("local_hostname", "localhost"),
+            metadata_server=extra_config.get("metadata_server", "P2PHANDSHAKE"),
+            global_segment_size=extra_config.get(
+                "global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE
+            ),
+            local_buffer_size=extra_config.get(
+                "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
+            ),
+            protocol=extra_config.get("protocol", "tcp"),
+            device_name=extra_config.get("device_name", "auto"),
+            master_server_address=extra_config["master_server_address"],
+        )
+
     def __post_init__(self):
         if self.device_name == "auto":
             os.environ["MC_MS_AUTO_DISC"] = "1"
@@ -93,8 +113,26 @@ class MooncakeStore(HiCacheStorage):
 
         try:
             self.store = MooncakeDistributedStore()
-            self.config = MooncakeStoreConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded from env successfully.")
+
+            extra_config = (
+                getattr(storage_config, "extra_config", None)
+                if storage_config
+                else None
+            )
+            # Load configuration with master_server_address prioritized from extra_config if available
+            if (
+                extra_config is not None
+                and extra_config.get("master_server_address") is not None
+            ):
+                # Load from extra_config
+                self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+                logger.info(
+                    "Mooncake Configuration loaded from extra_config successfully."
+                )
+            else:
+                # Load from environment variables
+                self.config = MooncakeStoreConfig.load_from_env()
+                logger.info("Mooncake Configuration loaded from env successfully.")
 
             ret_code = self.store.setup(
                 self.config.local_hostname,
