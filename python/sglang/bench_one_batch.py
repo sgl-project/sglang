@@ -364,11 +364,14 @@ def latency_test_run_once(
 
     profiler = None
     if profile:
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+        if hasattr(torch.profiler.ProfilerActivity, "XPU"):
+            activities.append(torch.profiler.ProfilerActivity.XPU)
         profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=activities,
             with_stack=True,
         )
         profiler.start()
