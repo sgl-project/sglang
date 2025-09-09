@@ -1,3 +1,15 @@
+"""
+Benchmark the throughput of embedding model in the offline mode.
+It accepts server arguments (the same as launch_server.py) and benchmark arguments.
+
+# Usage
+## Sharegpt dataset with default args
+python -m sglang.bench_embedding_offline --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
+
+## Random dataset with default args
+python -m sglang.bench_embedding_offline --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024
+"""
+
 import os
 import time
 import json
@@ -21,7 +33,6 @@ from sglang.bench_serving import (
     set_ulimit,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.lang.backend.runtime_endpoint import Runtime
 from sglang.srt.entrypoints.engine import Engine
 
 
