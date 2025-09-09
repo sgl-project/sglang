@@ -25,10 +25,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCall,
     ToolChoice,
     TopLogprob,
+    ToolCallProcessingResult,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
-from sglang.srt.function_call.core_types import ToolCallProcessingResult
 from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
@@ -837,6 +837,12 @@ class OpenAIServingChat(OpenAIServingBase):
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
         return ChoiceLogprobs(content=token_logprobs)
 
+    def _get_tool_id(self, tool_call_parser: str, name: str, index: int) -> str:
+        if tool_call_parser == "kimi_k2" and name is not None:
+            return f"functions.{name}:{index}"
+        else:
+            return f"call_{uuid.uuid4().hex[:24]}"
+
     def _process_tool_calls(
         self,
         text: str,
@@ -847,26 +853,19 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
-        def get_tool_id(name: str, index: int) -> str:
-            if tool_call_parser == "kimi_k2" and name is not None:
-                return f"functions.{name}:{index}"
-            else:
-                return f"call_{uuid.uuid4().hex[:24]}"
-
-        def set_finish_reason_tool_calls():
+        # Handle required or named tool choice
+        if tool_choice == "required" or (isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"):
+            # Set finish reason to tool_calls since we're processing tool calls
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
-
-        # Handle required or named tool choice
-        if tool_choice == "required" or (isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"):
-            set_finish_reason_tool_calls()
+            
             try:
                 # For required tool choice, we expect a JSON array of tool calls
                 tool_call_data = json.loads(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
-                    tool_id = get_tool_id(tool.get("name"), i)
+                    tool_id = self._get_tool_id(tool_call_parser, tool.get("name"), i)
                     tool_calls.append(
                         ToolCall(
                             id=tool_id,
@@ -885,12 +884,16 @@ class OpenAIServingChat(OpenAIServingBase):
         # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, tool_call_parser, tool_choice)
         if parser.has_tool_call(text):
-            set_finish_reason_tool_calls()
+            # Set finish reason to tool_calls since we detected tool calls
+            if finish_reason["type"] == "stop":
+                finish_reason["type"] = "tool_calls"
+                finish_reason["matched"] = None
+            
             try:
                 text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = []
                 for call_info in call_info_list:
-                    tool_id = get_tool_id(call_info.name, call_info.tool_index)
+                    tool_id = self._get_tool_id(tool_call_parser, call_info.name, call_info.tool_index)
                     tool_calls.append(
                         ToolCall(
                             id=tool_id,
