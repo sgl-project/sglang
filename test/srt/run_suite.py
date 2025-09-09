@@ -73,19 +73,24 @@ suites = {
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_gpt_oss_1gpu.py", 600),
+        TestFile("test_harmony_parser.py", 20),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_hybrid_attn_backend.py", 100),
+        TestFile("test_standalone_speculative_decoding.py", 250),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
+        TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
         TestFile("test_mla_deepseek_v3.py", 700),
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
+        TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 234),
+        TestFile("test_original_logprobs.py", 200),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
@@ -120,6 +125,8 @@ suites = {
         TestFile("test_dp_attention.py", 277),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 127),
+        TestFile("hicache/test_hicache_storage_file_backend.py", 400),
+        TestFile("hicache/test_hicache_storage_3fs_backend.py", 400),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 600),
@@ -130,12 +137,15 @@ suites = {
     "per-commit-8-gpu": [
         # Disabled because it hangs on the CI.
         # TestFile("ep/test_moe_ep.py", 181),
+        TestFile("lora/test_lora_llama4.py", 600),
         TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_different_tp.py", 155),
+        TestFile("test_disaggregation_pp.py", 60),
         TestFile("test_full_deepseek_v3.py", 333),
     ],
     "per-commit-8-gpu-b200": [
         # add more here
+        TestFile("test_gpt_oss_4gpu.py", 600),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -161,6 +171,9 @@ suites = {
 # Add AMD tests
 suite_amd = {
     "per-commit-amd": [
+        TestFile("hicache/test_hicache.py", 116),
+        TestFile("hicache/test_hicache_mla.py", 127),
+        TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
@@ -205,6 +218,7 @@ suite_amd = {
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
+        TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 242),
         TestFile("test_mla_deepseek_v3.py", 221),
         TestFile("test_no_chunked_prefill.py", 108),
@@ -262,6 +276,7 @@ suite_xeon = {
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
         TestFile("test_intel_amx_attention_backend.py"),
+        TestFile("test_cpu_graph.py"),
     ],
 }
 
@@ -274,9 +289,12 @@ suite_ascend = {
     "per-commit-2-ascend-npu": [
         TestFile("ascend/test_ascend_tp2_bf16.py", 400),
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
+        TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
+        TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
     ],
     "per-commit-4-ascend-npu": [
         TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
+        TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
 }
 

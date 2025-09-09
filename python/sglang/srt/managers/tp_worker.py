@@ -78,6 +78,11 @@ class TpModelWorker:
                 if not is_draft_worker
                 else server_args.speculative_draft_model_path
             ),
+            model_revision=(
+                server_args.revision
+                if not is_draft_worker
+                else server_args.speculative_draft_model_revision
+            ),
             is_draft_model=is_draft_worker,
         )
 
@@ -92,6 +97,7 @@ class TpModelWorker:
             pp_rank=pp_rank,
             pp_size=server_args.pp_size,
             nccl_port=nccl_port,
+            dp_rank=dp_rank,
             server_args=server_args,
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
