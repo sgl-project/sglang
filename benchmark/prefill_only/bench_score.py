@@ -80,7 +80,10 @@ def create_score_request_builder():
     def generate_text_with_token_count_local(num_toks):
         """Generate text with precise token count using replicated token."""
         return generate_text_with_token_count(
-            SCORE_MODEL_PATH, num_toks, config.special_replicated_token
+            SCORE_MODEL_PATH,
+            num_toks,
+            config.special_replicated_token,
+            tokenizer=tokenizer,
         )
 
     def build_score_request(index: int, item_count: int) -> tuple:
@@ -116,12 +119,21 @@ def validate_score_response(response_data: dict) -> bool:
 
 def build_warmup_score_request() -> dict:
     """Build a warmup request for the score API."""
+    # Load tokenizer once for warmup generation
+    tokenizer = AutoTokenizer.from_pretrained(SCORE_MODEL_PATH)
+
     warmup_query = generate_text_with_token_count(
-        SCORE_MODEL_PATH, SCORE_QUERY_TOKENS, config.special_replicated_token
+        SCORE_MODEL_PATH,
+        SCORE_QUERY_TOKENS,
+        config.special_replicated_token,
+        tokenizer=tokenizer,
     )
     warmup_items = [
         generate_text_with_token_count(
-            SCORE_MODEL_PATH, SCORE_ITEM_TOKENS, config.special_replicated_token
+            SCORE_MODEL_PATH,
+            SCORE_ITEM_TOKENS,
+            config.special_replicated_token,
+            tokenizer=tokenizer,
         )
         for _ in range(3)
     ]

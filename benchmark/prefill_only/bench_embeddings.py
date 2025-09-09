@@ -19,6 +19,7 @@ Usage:
 import asyncio
 import logging
 
+from transformers import AutoTokenizer
 from util import (
     BenchmarkConfig,
     generate_text_with_token_count,
@@ -51,15 +52,22 @@ config.freeze_gc = True  # Enable GC freeze functionality
 HTTP_URL = "http://localhost:30000/v1/embeddings"
 
 # Embeddings API Config
-EMBEDDINGS_MODEL_PATH = "/shared/public/sharing/suramach/Qwen3-0.6B"
+EMBEDDINGS_MODEL_PATH = "/Qwen/Qwen3-Embedding-0.6B"
 BATCH_SIZE = [1]  # Number of items per request (batch size)
 
 # Configurable input token length
 EMBEDDINGS_INPUT_TOKENS = 500  # Default token length
 
-# Generate input text with the specified token length
+# Load tokenizer once for embeddings text generation
+print("Loading tokenizer for embeddings input generation...")
+embeddings_tokenizer = AutoTokenizer.from_pretrained(EMBEDDINGS_MODEL_PATH)
+
+# Generate input text with the specified token length using pre-loaded tokenizer
 EMBEDDINGS_INPUT_TEXT = generate_text_with_token_count(
-    EMBEDDINGS_MODEL_PATH, EMBEDDINGS_INPUT_TOKENS, config.special_replicated_token
+    EMBEDDINGS_MODEL_PATH,
+    EMBEDDINGS_INPUT_TOKENS,
+    config.special_replicated_token,
+    tokenizer=embeddings_tokenizer,
 )
 
 

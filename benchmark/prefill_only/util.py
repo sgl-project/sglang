@@ -44,7 +44,10 @@ class BenchmarkConfig:
 
 
 def generate_text_with_token_count(
-    model_path: str, num_tokens: int, special_token: str = "<|im_start|>"
+    model_path: str,
+    num_tokens: int,
+    special_token: str = "<|im_start|>",
+    tokenizer: Optional[Any] = None,
 ) -> str:
     """
     Generate text with precise token count using a replicated token.
@@ -53,11 +56,13 @@ def generate_text_with_token_count(
         model_path: Path to the model for tokenizer
         num_tokens: Target number of tokens
         special_token: Token to replicate
+        tokenizer: Optional pre-loaded tokenizer to avoid repeated loading
 
     Returns:
         Generated text with approximately the target token count
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     # Verify token count
     special_token_count = len(tokenizer.encode(special_token, add_special_tokens=False))
