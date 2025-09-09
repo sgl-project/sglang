@@ -16,10 +16,14 @@ from types import SimpleNamespace
 
 import numpy as np
 import requests
-
 from transformers import AutoTokenizer
 
-from sglang.bench_serving import DatasetRow, benchmark, set_global_args, sample_mmmu_requests
+from sglang.bench_serving import (
+    DatasetRow,
+    benchmark,
+    sample_mmmu_requests,
+    set_global_args,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -66,7 +70,9 @@ def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
         backend = "sglang-oai-chat"
         api_url = f"{base_url}/v1/chat/completions"
     else:
-        input_requests: List[DatasetRow] = [DatasetRow(p, 0, 512) for p in padded_prompts]
+        input_requests: List[DatasetRow] = [
+            DatasetRow(p, 0, 512) for p in padded_prompts
+        ]
         backend = "sglang"
         api_url = f"{base_url}/generate"
 
@@ -226,11 +232,17 @@ def main(args, server_args):
 
         try:
             # Warmup
-            send_one_batch(base_url, batch_size, batch_size, tokenizer, args.is_multimodal)
+            send_one_batch(
+                base_url, batch_size, batch_size, tokenizer, args.is_multimodal
+            )
 
             # Benchmark
             acc_length, step_time, speed, completion_tokens = send_one_batch(
-                base_url, max(args.num_prompts, batch_size), batch_size, tokenizer, args.is_multimodal
+                base_url,
+                max(args.num_prompts, batch_size),
+                batch_size,
+                tokenizer,
+                args.is_multimodal,
             )
         finally:
             kill_process_tree(process.pid)
