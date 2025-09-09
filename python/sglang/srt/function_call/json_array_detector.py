@@ -23,27 +23,15 @@ class JsonArrayDetector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         """
         Check if the given text contains a JSON tool call (array or single object).
-        
-        Args:
-            text: The text to check for tool calls
-            
-        Returns:
-            True if the text starts with a JSON array or object, False otherwise
-        """
+        """        
         stripped = text.strip()
         return stripped.startswith("[") 
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
         Parse JSON tool calls using the base class implementation.
-        
-        Args:
-            text: The text to parse
-            tools: List of available tools
-            
-        Returns:
-            StreamingParseResult with parsed tool calls
         """
+
         return super().detect_and_parse(text, tools)
 
     def build_ebnf(self, tools: List[Tool]) -> str:
@@ -57,14 +45,8 @@ class JsonArrayDetector(BaseFormatDetector):
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         """
         Parse streaming JSON tool calls using the base class implementation.
-        
-        Args:
-            new_text: The new chunk of text to parse
-            tools: List of available tools
-            
-        Returns:
-            StreamingParseResult with parsed tool calls
         """
+
         return super().parse_streaming_increment(new_text, tools)
 
     def structure_info(self) -> callable:

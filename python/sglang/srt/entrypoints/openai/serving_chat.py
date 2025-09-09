@@ -865,10 +865,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_data = json.loads(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
-                    tool_id = self._get_tool_id(tool_call_parser, tool.get("name"), i)
                     tool_calls.append(
                         ToolCall(
-                            id=tool_id,
+                            id=self._get_tool_id(tool_call_parser, tool.get("name"), i),
                             index=i,
                             function=FunctionResponse(
                                 name=tool['name'], 
@@ -893,10 +892,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = []
                 for call_info in call_info_list:
-                    tool_id = self._get_tool_id(tool_call_parser, call_info.name, call_info.tool_index)
                     tool_calls.append(
                         ToolCall(
-                            id=tool_id,
+                            id=self._get_tool_id(tool_call_parser, call_info.name, call_info.tool_index),
                             index=getattr(call_info, "tool_index", None),
                             function=FunctionResponse(
                                 name=call_info.name, arguments=call_info.parameters
