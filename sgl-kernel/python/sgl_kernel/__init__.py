@@ -21,23 +21,24 @@ def _find_cuda_home():
             cuda_home = '/usr/local/cuda'
     return cuda_home
 
-cuda_home = Path(_find_cuda_home())
+if torch.version.hip is None:
+    cuda_home = Path(_find_cuda_home())
 
-if (cuda_home / 'lib').is_dir():
-    cuda_path = cuda_home / 'lib'
-elif (cuda_home / 'lib64').is_dir():
-    cuda_path = cuda_home / 'lib64'
-else:
-    # Search for 'libcudart.so.12' in subdirectories
-    for path in cuda_home.rglob('libcudart.so.12'):
-        cuda_path = path.parent
-        break
+    if (cuda_home / 'lib').is_dir():
+        cuda_path = cuda_home / 'lib'
+    elif (cuda_home / 'lib64').is_dir():
+        cuda_path = cuda_home / 'lib64'
     else:
-        raise RuntimeError("Could not find CUDA lib directory.")
+        # Search for 'libcudart.so.12' in subdirectories
+        for path in cuda_home.rglob('libcudart.so.12'):
+            cuda_path = path.parent
+            break
+        else:
+            raise RuntimeError("Could not find CUDA lib directory.")
 
-cuda_include = (cuda_path / 'libcudart.so.12').resolve()
-if cuda_include.exists():
-    ctypes.CDLL(str(cuda_include), mode=ctypes.RTLD_GLOBAL)
+    cuda_include = (cuda_path / 'libcudart.so.12').resolve()
+    if cuda_include.exists():
+        ctypes.CDLL(str(cuda_include), mode=ctypes.RTLD_GLOBAL)
 
 from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
