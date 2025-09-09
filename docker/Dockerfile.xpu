@@ -45,7 +45,7 @@ RUN --mount=type=secret,id=github_token \
     cd /root && \
     . /miniforge3/bin/activate && \
     conda activate py${PYTHON_VERSION} && \
-    git clone https://github.com/vllm-project/vllm.git && \
+    git clone https://github.com/vllm-project/vllm.git -b v0.10.1 && \
     cd vllm && \
     pip install --upgrade pip && \
     pip install -v -r requirements/xpu.txt && \
