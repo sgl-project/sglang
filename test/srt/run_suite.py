@@ -146,6 +146,7 @@ suites = {
     "per-commit-8-gpu-b200": [
         # add more here
         TestFile("test_gpt_oss_4gpu.py", 600),
+        TestFile("test_cutedsl_flashinfer_8gpu.py", 800),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
