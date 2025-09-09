@@ -552,6 +552,9 @@ class ServerArgs:
                 "Cuda graph is disabled because of using torch Flex Attention backend"
             )
             self.disable_cuda_graph = True
+            assert self.speculative_algorithm is None, (
+                "Speculative decoding is currently not supported with Flex Attention backend"
+            )
 
         if self.attention_backend == "ascend":
             logger.warning(
