@@ -540,7 +540,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
             tokenized_obj = TokenizedGenerateReqInput(
-                obj.rid,
                 input_text,
                 input_ids,
                 mm_inputs,
@@ -550,6 +549,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.top_logprobs_num,
                 obj.token_ids_logprob,
                 obj.stream,
+                rid=obj.rid,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
@@ -562,12 +562,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
-                obj.rid,
                 input_text,
                 input_ids,
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
+                rid=obj.rid,
             )
 
         return tokenized_obj
@@ -845,7 +845,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
             return
-        req = AbortReq(rid, abort_all)
+        req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
 
         if self.enable_metrics:
@@ -1502,7 +1502,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         asyncio.create_task(asyncio.to_thread(background_task))
 
-    def _handle_abort_req(self, recv_obj):
+    def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
         state = self.rid_to_state[recv_obj.rid]

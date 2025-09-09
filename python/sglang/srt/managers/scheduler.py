@@ -1115,7 +1115,7 @@ class Scheduler(
             if is_work_request(recv_req):
                 if len(self.waiting_queue) + 1 > self.max_queued_requests:
                     abort_req = AbortReq(
-                        recv_req.rid,
+                        rid=recv_req.rid,
                         finished_reason={
                             "type": "abort",
                             "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
@@ -2336,7 +2336,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            self.send_to_tokenizer.send_pyobj(AbortReq(rid=req.rid))
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.tree_cache.cache_finished_req(req)
@@ -2519,7 +2519,8 @@ class IdleSleeper:
 
 
 def is_health_check_generate_req(recv_req):
-    return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
+    rid = getattr(recv_req, "rid", None)
+    return rid is not None and rid.startswith("HEALTH_CHECK")
 
 
 def is_work_request(recv_req):

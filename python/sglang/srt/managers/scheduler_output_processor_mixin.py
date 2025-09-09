@@ -136,7 +136,7 @@ class SchedulerOutputProcessorMixin:
                             logger.error(
                                 f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                             )
-                            self.abort_request(AbortReq(req.rid))
+                            self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
@@ -283,7 +283,7 @@ class SchedulerOutputProcessorMixin:
                     logger.error(
                         f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                     )
-                    self.abort_request(AbortReq(req.rid))
+                    self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
         self.set_next_batch_sampling_info_done(batch)
@@ -674,7 +674,6 @@ class SchedulerOutputProcessorMixin:
 
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
-                    rids,
                     finished_reasons,
                     decoded_texts,
                     decode_ids_list,
@@ -700,6 +699,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx,
                     output_hidden_states,
+                    rids=rids,
                 )
             )
 
@@ -719,6 +719,10 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens.append(req.cached_tokens)
         self.send_to_detokenizer.send_pyobj(
             BatchEmbeddingOut(
-                rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
+                finished_reasons,
+                embeddings,
+                prompt_tokens,
+                cached_tokens,
+                rids=rids,
             )
         )

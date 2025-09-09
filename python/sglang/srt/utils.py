@@ -1157,7 +1157,7 @@ def pytorch_profile(name, func, *args, data_size=-1):
 
 def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-):
+) -> zmq.Socket:
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
