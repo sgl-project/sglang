@@ -30,6 +30,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetLoadReqInput,
+    GetLoadReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -182,6 +184,9 @@ class TokenizerCommunicatorMixin:
         self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.get_load_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size, mode="watching"
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -243,6 +248,10 @@ class TokenizerCommunicatorMixin:
                 (
                     LoRAUpdateResult,
                     self.update_lora_adapter_communicator.handle_recv,
+                ),
+                (
+                    GetLoadReqOutput,
+                    self.get_load_communicator.handle_recv,
                 ),
             ]
         )
@@ -509,10 +518,6 @@ class TokenizerCommunicatorMixin:
         )
         return [res.updated for res in responses]
 
-    async def get_load(self: TokenizerManager) -> dict:
-        # TODO(lsyin): fake load report server
-        if not self.current_load_lock.locked():
-            async with self.current_load_lock:
-                internal_state = await self.get_internal_state()
-                self.current_load = internal_state[0]["load"]
-        return {"load": self.current_load}
+    async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
+        req = GetLoadReqInput()
+        return await self.get_load_communicator(req)

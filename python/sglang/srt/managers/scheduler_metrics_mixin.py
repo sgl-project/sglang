@@ -278,7 +278,7 @@ class SchedulerMetricsMixin:
             self.server_args.load_balance_method == "minimum_tokens"
             and self.forward_ct % 40 == 0
         ):
-            holding_tokens = self.get_load()
+            holding_tokens = self.get_load().num_tokens
 
             new_recv_dp_balance_id_list, holding_token_list = (
                 self.gather_dp_balance_info(holding_tokens)
