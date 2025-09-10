@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.layers.attention.mamba.causal_conv1d import (
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -295,16 +295,39 @@ class MambaAttnBackend(AttentionBackend):
             )
             has_initial_states = forward_batch.extend_prefix_lens > 0
             conv_states_to_use = conv_states
-        mixed_qkv = causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            conv_weights,
-            bias,
-            activation=activation,
-            conv_states=conv_states_to_use,
-            has_initial_state=has_initial_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-        ).transpose(0, 1)[:seq_len]
+
+        if is_target_verify:
+            batch_size = seq_len // forward_batch.spec_info.draft_token_num
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            mixed_qkv_reshaped = (
+                mixed_qkv.view(batch_size, draft_token_num, -1)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            mixed_qkv_processed = causal_conv1d_update(
+                mixed_qkv_reshaped,
+                conv_states_to_use,
+                conv_weights,
+                bias,
+                activation,
+                conv_state_indices=cache_indices[:batch_size],
+            )
+            mixed_qkv = (
+                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
+            )
+        else:
+            mixed_qkv = causal_conv1d_fn(
+                mixed_qkv.transpose(0, 1),
+                conv_weights,
+                bias,
+                activation=activation,
+                conv_states=conv_states_to_use.transpose(-1, -2)
+                .contiguous()
+                .transpose(-1, -2),
+                has_initial_state=has_initial_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            ).transpose(0, 1)[:seq_len]
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -569,13 +592,39 @@ class HybridLinearAttnBackend(AttentionBackend):
                 conv_state = conv_states[layer_id]
                 mixed_qkv = mixed_qkvs[layer_id]
 
-                _ = causal_conv1d_fn(
-                    mixed_qkv.transpose(0, 1),
-                    conv_weights,
-                    layer.linear_attn.conv1d.bias,
-                    activation=layer.linear_attn.activation,
-                    conv_states=conv_state,
-                    has_initial_state=has_initial_states,
-                    cache_indices=state_indices_tensor,
-                    query_start_loc=query_start_loc,
-                )
+                # Check if all requests have the same accepted length for optimization
+                if (
+                    torch.all(accepted_length == accepted_length[0])
+                    and accepted_length[0] > 0
+                ):
+                    # Use causal_conv1d_update for uniform accepted lengths
+                    # Reshape mixed_qkv from (request_number, accepted_length) to (request_number, dim, accepted_length)
+                    accepted_len = accepted_length[0].item()
+                    mixed_qkv_reshaped = (
+                        mixed_qkv.view(request_number, accepted_len, -1)
+                        .transpose(1, 2)
+                        .contiguous()
+                    )
+
+                    _ = causal_conv1d_update(
+                        mixed_qkv_reshaped,
+                        conv_state,
+                        conv_weights,
+                        layer.linear_attn.conv1d.bias,
+                        activation=layer.linear_attn.activation,
+                        conv_state_indices=state_indices_tensor,
+                    )
+                else:
+                    # Fall back to causal_conv1d_fn for variable lengths
+                    _ = causal_conv1d_fn(
+                        mixed_qkv.transpose(0, 1),
+                        conv_weights,
+                        layer.linear_attn.conv1d.bias,
+                        activation=layer.linear_attn.activation,
+                        conv_states=conv_state.transpose(-1, -2)
+                        .contiguous()
+                        .transpose(-1, -2),
+                        has_initial_state=has_initial_states,
+                        cache_indices=state_indices_tensor,
+                        query_start_loc=query_start_loc,
+                    )
