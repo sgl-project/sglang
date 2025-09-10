@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +224,8 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
+    prefill_round_robin_balance: bool = False
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -262,6 +265,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    speculative_attention_mode: str = "prefill"
 
     # Expert parallelism
     ep_size: int = 1
@@ -473,9 +477,14 @@ class ServerArgs:
                     # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
                     reserved_mem = 32 * 1024
 
+                # draft model and larger cuda graph buffers
                 if self.speculative_algorithm is not None:
-                    # draft model and larger cuda graph buffers
-                    reserved_mem += 2 * 1024
+                    if self.speculative_algorithm == "STANDALONE":
+                        # Standalone speculative decoding needs more memory than other speculative
+                        # decoding algorithms since the draft model is typically larger.
+                        reserved_mem += 6 * 1024
+                    else:
+                        reserved_mem += 2 * 1024
                 if self.enable_dp_attention:
                     reserved_mem += 4 * 1024
 
@@ -617,12 +626,12 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        if self.dp_size == 1:
+            self.enable_dp_attention = False
+
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
-            assert (
-                self.dp_size > 1
-            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
             assert self.tp_size % self.dp_size == 0
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
@@ -645,11 +654,13 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
-            if not self.disable_shared_experts_fusion:
-                self.disable_shared_experts_fusion = True
-                logger.warning(
-                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
-                )
+            assert (
+                self.quantization == "modelopt_fp4" or self.quantization == "fp8"
+            ), "modelopt_fp4 quantization is required for Flashinfer TRTLLM MoE"
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -704,7 +715,12 @@ class ServerArgs:
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3"):
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+            if self.speculative_algorithm == "STANDALONE":
+                # TODO: support dp attention for standalone speculative decoding
+                assert (
+                    self.enable_dp_attention is False
+                ), "Currently standalone speculative decoding does not support dp attention."
             if self.max_running_requests is None:
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
@@ -796,6 +812,13 @@ class ServerArgs:
 
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+
+            if self.dp_size > 1 and not is_in_ci():
+                assert self.prefill_round_robin_balance, (
+                    "Prefill round robin balance is required when dp size > 1. "
+                    "Please make sure that the prefill instance is launched with `--load-balance-method round_robin`"
+                    " and `--prefill-round-robin-balance` is set for decode server."
+                )
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
@@ -1373,6 +1396,12 @@ class ServerArgs:
                 "minimum_tokens",
             ],
         )
+        parser.add_argument(
+            "--prefill-round-robin-balance",
+            default=ServerArgs.prefill_round_robin_balance,
+            action="store_true",
+            help="Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank.",
+        )
 
         # Multi-node distributed serving
         parser.add_argument(
@@ -1499,11 +1528,12 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
             "--speculative-draft-model-path",
+            "--speculative-draft-model",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
         )
@@ -1551,6 +1581,13 @@ class ServerArgs:
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
         )
+        parser.add_argument(
+            "--speculative-attention-mode",
+            type=str,
+            choices=["prefill", "decode"],
+            help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
+            default=ServerArgs.speculative_attention_mode,
+        )
 
         # Expert parallelism
         parser.add_argument(
@@ -1585,7 +1622,7 @@ class ServerArgs:
         parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
-            choices=["mxfp4", "bf16"],
+            choices=["default", "bf16"],
             default=ServerArgs.flashinfer_mxfp4_moe_precision,
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
@@ -2635,7 +2672,9 @@ def auto_choose_speculative_params(self: ServerArgs):
     """
     hf_config = self.get_hf_config()
     arch = hf_config.architectures[0]
-
+    if self.speculative_algorithm == "STANDALONE":
+        # The default value for standalone speculative decoding
+        return (3, 1, 4)
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
