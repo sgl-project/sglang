@@ -24,7 +24,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, PortArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
 from sglang.srt.managers.tokenizer_manager import SignalHandler
@@ -83,7 +83,7 @@ class GrpcRequestManager:
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: Dict[str, int],
+        port_args: PortArgs,
     ):
         """Initialize the gRPC request manager."""
         self.server_args = server_args
@@ -96,16 +96,16 @@ class GrpcRequestManager:
         self.recv_from_scheduler = get_zmq_socket(
             context,
             zmq.PULL,
-            f"tcp://127.0.0.1:{port_args['scheduler_output_port']}",
-            bind=False
+            port_args.tokenizer_ipc_name,
+            bind=True
         )
 
         # Socket for sending requests to scheduler
         self.send_to_scheduler = get_zmq_socket(
             context,
             zmq.PUSH,
-            f"tcp://127.0.0.1:{port_args['scheduler_input_port']}",
-            bind=False
+            port_args.scheduler_input_ipc_name,
+            bind=True
         )
 
         # State Management (from TokenizerManager)
@@ -130,9 +130,9 @@ class GrpcRequestManager:
         self.crash_dump_performed = False
 
         logger.info(
-            f"GrpcRequestManager initialized with ZMQ ports: "
-            f"recv={port_args['scheduler_output_port']}, "
-            f"send={port_args['scheduler_input_port']}"
+            f"GrpcRequestManager initialized with ZMQ IPC: "
+            f"recv={port_args.tokenizer_ipc_name}, "
+            f"send={port_args.scheduler_input_ipc_name}"
         )
 
     async def generate_request(

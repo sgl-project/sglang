@@ -560,7 +560,7 @@ async def serve_grpc(
     # Create request manager with the correct port args
     request_manager = GrpcRequestManager(
         server_args=server_args,
-        port_args=port_args.__dict__ if hasattr(port_args, '__dict__') else port_args,
+        port_args=port_args,
     )
 
     # Create gRPC server
