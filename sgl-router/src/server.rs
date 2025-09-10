@@ -427,8 +427,8 @@ pub fn build_app(
     let worker_routes = Router::new()
         .route("/workers", post(create_worker))
         .route("/workers", get(list_workers_rest))
-        .route("/workers/:url", get(get_worker))
-        .route("/workers/:url", axum::routing::delete(delete_worker));
+        .route("/workers/{url}", get(get_worker))
+        .route("/workers/{url}", axum::routing::delete(delete_worker));
 
     // Build app with all routes and middleware
     Router::new()

@@ -382,7 +382,7 @@ impl WorkerRegistry {
 
                 // Perform health checks
                 for worker in &workers {
-                    let _ = worker.check_health(); // check_health is synchronous
+                    let _ = worker.check_health_async().await; // Use async version directly
                 }
 
                 // Reset loads periodically
