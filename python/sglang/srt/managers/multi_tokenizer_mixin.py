@@ -346,6 +346,10 @@ class MultiHttpWorkerDetokenizerMixin:
             worker_ids = []
         return worker_ids
 
+    def maybe_clear_socket_mapping(self):
+        if hasattr(self, "socket_mapping"):
+            self.socket_mapping.clear_all_sockets()
+
     def multi_http_worker_event_loop(self):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
