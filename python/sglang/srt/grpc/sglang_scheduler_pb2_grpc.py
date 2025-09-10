@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from . import sglang_scheduler_pb2 as sglang__scheduler__pb2
+import sglang_scheduler_pb2 as sglang__scheduler__pb2
 
 GRPC_GENERATED_VERSION = '1.74.0'
 GRPC_VERSION = grpc.__version__
@@ -78,7 +78,7 @@ class SglangSchedulerServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def HealthCheck(self, request, context):
-        """Health check and metrics (generate-based like HTTP /health_generate)
+        """Health check and metrics
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

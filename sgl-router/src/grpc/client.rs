@@ -54,7 +54,10 @@ impl SglangSchedulerClient {
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error>> {
         debug!("Sending health check request");
         let request = Request::new(proto::HealthCheckRequest {
-            input: Some(proto::health_check_request::Input::Text("Hello".to_string())),
+            tokenized: Some(proto::TokenizedInput {
+                original_text: "Hello".to_string(),
+                input_ids: vec![9906], // Mock token ID for "Hello"
+            }),
         });
 
         let response = self.client.health_check(request).await?;
@@ -84,9 +87,12 @@ mod tests {
     fn test_proto_types_compilation() {
         // Test that protobuf types can be constructed
         let health_req = proto::HealthCheckRequest {
-            include_detailed_metrics: true,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: "test".to_string(),
+                input_ids: vec![1296],
+            }),
         };
-        assert_eq!(health_req.include_detailed_metrics, true);
+        assert!(health_req.tokenized.is_some());
     }
 
     #[test]
@@ -102,9 +108,10 @@ mod tests {
 
         let gen_req = proto::GenerateRequest {
             request_id: "test-req-123".to_string(),
-            input: Some(proto::generate_request::Input::Text(
-                "Hello world".to_string(),
-            )),
+            tokenized: Some(proto::TokenizedInput {
+                original_text: "Hello world".to_string(),
+                input_ids: vec![9906, 1917], // Mock token IDs for "Hello world"
+            }),
             sampling_params: Some(sampling_params),
             return_logprob: true,
             logprob_start_len: 0,
@@ -113,8 +120,8 @@ mod tests {
         };
 
         assert_eq!(gen_req.request_id, "test-req-123");
-        if let Some(proto::generate_request::Input::Text(text)) = &gen_req.input {
-            assert_eq!(text, "Hello world");
+        if let Some(ref tokenized) = &gen_req.tokenized {
+            assert_eq!(tokenized.original_text, "Hello world");
         }
         assert!(gen_req.return_logprob);
         assert_eq!(gen_req.top_logprobs_num, 5);
@@ -128,9 +135,12 @@ mod tests {
     #[test]
     fn test_health_check_request() {
         let health_req = proto::HealthCheckRequest {
-            input: Some(proto::health_check_request::Input::Text("test".to_string())),
+            tokenized: Some(proto::TokenizedInput {
+                original_text: "test".to_string(),
+                input_ids: vec![1296], // Mock token ID for "test"
+            }),
         };
-        assert!(health_req.input.is_some());
+        assert!(health_req.tokenized.is_some());
     }
 
     #[test]
@@ -172,38 +182,26 @@ mod tests {
         assert_eq!(mm_inputs.modalities[0], "image");
     }
 
-    #[test]
-    fn test_session_params() {
-        let session_params = proto::SessionParams {
-            session_id: "sess-789".to_string(),
-            request_id: "req-101".to_string(),
-            offset: 100,
-            replace: true,
-            drop_previous_output: false,
-        };
-
-        assert_eq!(session_params.session_id, "sess-789");
-        assert_eq!(session_params.request_id, "req-101");
-        assert_eq!(session_params.offset, 100);
-        assert!(session_params.replace);
-        assert!(!session_params.drop_previous_output);
-    }
+    // TODO: SessionParams not in current proto - skip test
+    // #[test]
+    // fn test_session_params() { ... }
 
     #[test]
     fn test_embed_request() {
         let embed_req = proto::EmbedRequest {
             request_id: "embed-req-202".to_string(),
-            input: Some(proto::embed_request::Input::Text(
-                "This is a test sentence for embedding".to_string(),
-            )),
+            tokenized: Some(proto::TokenizedInput {
+                original_text: "This is a test sentence for embedding".to_string(),
+                input_ids: vec![2028, 374, 264, 1296, 11914, 369, 28537], // Mock token IDs
+            }),
             log_metrics: true,
             data_parallel_rank: 0,
             ..Default::default()
         };
 
         assert_eq!(embed_req.request_id, "embed-req-202");
-        if let Some(proto::embed_request::Input::Text(text)) = &embed_req.input {
-            assert_eq!(text, "This is a test sentence for embedding");
+        if let Some(ref tokenized) = &embed_req.tokenized {
+            assert_eq!(tokenized.original_text, "This is a test sentence for embedding");
         }
         assert!(embed_req.log_metrics);
         assert_eq!(embed_req.data_parallel_rank, 0);
@@ -250,36 +248,7 @@ mod tests {
         assert_eq!(chunk.queue_time, 10);
     }
 
-    #[test]
-    fn test_model_info() {
-        let model_info = proto::ModelInfo {
-            model_name: "Meta-Llama-3-8B-Instruct".to_string(),
-            max_context_length: 8192,
-            vocab_size: 128256,
-            supports_tool_calling: true,
-            supports_vision: false,
-            special_tokens: vec![
-                "<|begin_of_text|>".to_string(),
-                "<|end_of_text|>".to_string(),
-            ],
-            model_type: "llama".to_string(),
-            num_layers: 32,
-            hidden_size: 4096,
-            num_attention_heads: 32,
-            num_key_value_heads: 8,
-            tokenizer_type: "llama".to_string(),
-            eos_token_ids: vec![128001, 128009],
-            pad_token_id: 128001,
-            bos_token_id: 128000,
-        };
-
-        assert_eq!(model_info.model_name, "Meta-Llama-3-8B-Instruct");
-        assert_eq!(model_info.max_context_length, 8192);
-        assert_eq!(model_info.vocab_size, 128256);
-        assert!(model_info.supports_tool_calling);
-        assert!(!model_info.supports_vision);
-        assert_eq!(model_info.special_tokens.len(), 2);
-        assert_eq!(model_info.num_layers, 32);
-        assert_eq!(model_info.eos_token_ids, vec![128001, 128009]);
-    }
+    // TODO: ModelInfo not in current proto - skip test  
+    // #[test]
+    // fn test_model_info() { ... }
 }

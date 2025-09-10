@@ -14,7 +14,7 @@ service SglangScheduler {
   // Submit an embedding request
   rpc Embed(EmbedRequest) returns (EmbedResponse);
 
-  // Health check and metrics (generate-based like HTTP /health_generate)
+  // Health check and metrics
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 
   // Abort a running request
@@ -85,47 +85,43 @@ message DisaggregatedParams {
 message GenerateRequest {
   string request_id = 1;
 
-  // Input can be either text or tokenized
-  oneof input {
-    string text = 2;
-    TokenizedInput tokenized = 3;
-  }
+  // Input must be tokenized (no raw text)
+  TokenizedInput tokenized = 2;
 
   // Multimodal inputs
-  MultimodalInputs mm_inputs = 4;
+  MultimodalInputs mm_inputs = 3;
 
   // Generation parameters
-  SamplingParams sampling_params = 5;
+  SamplingParams sampling_params = 4;
 
   // Return options
-  bool return_logprob = 6;
-  int32 logprob_start_len = 7;
-  int32 top_logprobs_num = 8;
-  repeated int32 token_ids_logprob = 9;
-  bool return_hidden_states = 10;
-
+  bool return_logprob = 5;
+  int32 logprob_start_len = 6;
+  int32 top_logprobs_num = 7;
+  repeated int32 token_ids_logprob = 8;
+  bool return_hidden_states = 9;
 
   // For disaggregated serving
-  DisaggregatedParams disaggregated_params = 12;
+  DisaggregatedParams disaggregated_params = 10;
 
   // Custom logit processor (serialized)
-  string custom_logit_processor = 13;
+  string custom_logit_processor = 11;
 
   // Request metadata
-  google.protobuf.Timestamp timestamp = 14;
-  bool log_metrics = 15;
+  google.protobuf.Timestamp timestamp = 12;
+  bool log_metrics = 13;
 
   // Input embeddings (alternative to text/tokens)
-  repeated float input_embeds = 16;
+  repeated float input_embeds = 14;
 
   // LoRA adapter ID (if pre-loaded)
-  string lora_id = 17;
+  string lora_id = 15;
 
   // Data parallel routing
-  int32 data_parallel_rank = 18;
+  int32 data_parallel_rank = 16;
 
   // For load balancing
-  int32 dp_balance_id = 19;
+  int32 dp_balance_id = 17;
 }
 
 message TokenizedInput {
@@ -263,10 +259,8 @@ message HiddenStates {
 message EmbedRequest {
   string request_id = 1;
 
-  oneof input {
-    string text = 2;
-    TokenizedInput tokenized = 3;
-  }
+  // Input must be tokenized (no raw text)
+  TokenizedInput tokenized = 2;
 
   // Multimodal inputs
   MultimodalInputs mm_inputs = 4;
@@ -326,11 +320,8 @@ message EmbedError {
 // =====================
 
 message HealthCheckRequest {
-  // Input for health test generation
-  oneof input {
-    string text = 1;
-    TokenizedInput tokenized = 2;
-  }
+  // Input for health test generation (must be tokenized)
+  TokenizedInput tokenized = 1;
 }
 
 message HealthCheckResponse {
@@ -347,7 +338,6 @@ message AbortResponse {
   bool success = 1;
   string message = 2;
 }
-
 
 
 // =====================

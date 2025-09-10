@@ -294,21 +294,20 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     message="Server shutting down"
                 )
 
-            # Extract input from request
-            if request.HasField("text"):
-                input_text = request.text
-                input_ids = []
-            elif request.HasField("tokenized"):
-                input_text = request.tokenized.original_text
-                input_ids = list(request.tokenized.input_ids)
-            else:
+            # Extract tokenized input from request
+            if not request.HasField("tokenized"):
                 return sglang_scheduler_pb2.HealthCheckResponse(
                     healthy=False,
-                    message="No input provided for health check"
+                    message="Tokenized input required for health check"
                 )
+            
+            input_text = request.tokenized.original_text
+            input_ids = list(request.tokenized.input_ids)
 
             # Create health check request
             rid = f"HEALTH_CHECK_GRPC_{time.time()}"
+            logger.info(f"Creating health check request with rid: {rid}")
+            logger.info(f"Input text: '{input_text[:50]}...', input_ids: {input_ids}")
 
             health_request = TokenizedGenerateReqInput(
                 rid=rid,
@@ -325,6 +324,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 top_logprobs_num=0,
                 token_ids_logprob=None,
             )
+            
+            logger.info(f"Sending health check request to request manager...")
 
             # Submit and wait for response
             output_queue = await self.request_manager.generate_request(
@@ -392,15 +393,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> TokenizedGenerateReqInput:
         """Convert gRPC GenerateRequest to internal format."""
 
-        # Extract input
-        if grpc_req.HasField("text"):
-            input_text = grpc_req.text
-            input_ids = []
-        elif grpc_req.HasField("tokenized"):
-            input_text = grpc_req.tokenized.original_text
-            input_ids = list(grpc_req.tokenized.input_ids)
-        else:
-            raise ValueError("Either text or tokenized input must be provided")
+        # Extract tokenized input
+        if not grpc_req.HasField("tokenized"):
+            raise ValueError("Tokenized input must be provided")
+        
+        input_text = grpc_req.tokenized.original_text
+        input_ids = list(grpc_req.tokenized.input_ids)
 
         # Convert sampling params
         sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
@@ -425,15 +423,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> TokenizedEmbeddingReqInput:
         """Convert gRPC EmbedRequest to internal format."""
 
-        # Extract input
-        if grpc_req.HasField("text"):
-            input_text = grpc_req.text
-            input_ids = []
-        elif grpc_req.HasField("tokenized"):
-            input_text = grpc_req.tokenized.original_text
-            input_ids = list(grpc_req.tokenized.input_ids)
-        else:
-            raise ValueError("Either text or tokenized input must be provided")
+        # Extract tokenized input
+        if not grpc_req.HasField("tokenized"):
+            raise ValueError("Tokenized input must be provided")
+        
+        input_text = grpc_req.tokenized.original_text
+        input_ids = list(grpc_req.tokenized.input_ids)
 
         return TokenizedEmbeddingReqInput(
             rid=grpc_req.request_id,
