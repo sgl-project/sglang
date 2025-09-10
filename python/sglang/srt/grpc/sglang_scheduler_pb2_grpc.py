@@ -36,11 +36,6 @@ class SglangSchedulerStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.Initialize = channel.unary_unary(
-                '/sglang.grpc.scheduler.SglangScheduler/Initialize',
-                request_serializer=sglang__scheduler__pb2.InitializeRequest.SerializeToString,
-                response_deserializer=sglang__scheduler__pb2.InitializeResponse.FromString,
-                _registered_method=True)
         self.Generate = channel.unary_stream(
                 '/sglang.grpc.scheduler.SglangScheduler/Generate',
                 request_serializer=sglang__scheduler__pb2.GenerateRequest.SerializeToString,
@@ -61,24 +56,12 @@ class SglangSchedulerStub(object):
                 request_serializer=sglang__scheduler__pb2.AbortRequest.SerializeToString,
                 response_deserializer=sglang__scheduler__pb2.AbortResponse.FromString,
                 _registered_method=True)
-        self.FlushCache = channel.unary_unary(
-                '/sglang.grpc.scheduler.SglangScheduler/FlushCache',
-                request_serializer=sglang__scheduler__pb2.FlushCacheRequest.SerializeToString,
-                response_deserializer=sglang__scheduler__pb2.FlushCacheResponse.FromString,
-                _registered_method=True)
 
 
 class SglangSchedulerServicer(object):
     """Service definition for SGLang scheduler communication
     This protocol bridges the Rust router and Python scheduler
     """
-
-    def Initialize(self, request, context):
-        """Initialize connection and get model info
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
 
     def Generate(self, request, context):
         """Submit a generation request (supports streaming)
@@ -108,21 +91,9 @@ class SglangSchedulerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def FlushCache(self, request, context):
-        """Flush KV cache
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
 
 def add_SglangSchedulerServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'Initialize': grpc.unary_unary_rpc_method_handler(
-                    servicer.Initialize,
-                    request_deserializer=sglang__scheduler__pb2.InitializeRequest.FromString,
-                    response_serializer=sglang__scheduler__pb2.InitializeResponse.SerializeToString,
-            ),
             'Generate': grpc.unary_stream_rpc_method_handler(
                     servicer.Generate,
                     request_deserializer=sglang__scheduler__pb2.GenerateRequest.FromString,
@@ -143,11 +114,6 @@ def add_SglangSchedulerServicer_to_server(servicer, server):
                     request_deserializer=sglang__scheduler__pb2.AbortRequest.FromString,
                     response_serializer=sglang__scheduler__pb2.AbortResponse.SerializeToString,
             ),
-            'FlushCache': grpc.unary_unary_rpc_method_handler(
-                    servicer.FlushCache,
-                    request_deserializer=sglang__scheduler__pb2.FlushCacheRequest.FromString,
-                    response_serializer=sglang__scheduler__pb2.FlushCacheResponse.SerializeToString,
-            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'sglang.grpc.scheduler.SglangScheduler', rpc_method_handlers)
@@ -160,33 +126,6 @@ class SglangScheduler(object):
     """Service definition for SGLang scheduler communication
     This protocol bridges the Rust router and Python scheduler
     """
-
-    @staticmethod
-    def Initialize(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/sglang.grpc.scheduler.SglangScheduler/Initialize',
-            sglang__scheduler__pb2.InitializeRequest.SerializeToString,
-            sglang__scheduler__pb2.InitializeResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
 
     @staticmethod
     def Generate(request,
@@ -286,33 +225,6 @@ class SglangScheduler(object):
             '/sglang.grpc.scheduler.SglangScheduler/Abort',
             sglang__scheduler__pb2.AbortRequest.SerializeToString,
             sglang__scheduler__pb2.AbortResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def FlushCache(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/sglang.grpc.scheduler.SglangScheduler/FlushCache',
-            sglang__scheduler__pb2.FlushCacheRequest.SerializeToString,
-            sglang__scheduler__pb2.FlushCacheResponse.FromString,
             options,
             channel_credentials,
             insecure,

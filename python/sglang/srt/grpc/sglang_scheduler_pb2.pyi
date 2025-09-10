@@ -72,20 +72,6 @@ class SamplingParams(_message.Message):
     custom_params: _struct_pb2.Struct
     def __init__(self, temperature: _Optional[float] = ..., top_p: _Optional[float] = ..., top_k: _Optional[int] = ..., min_p: _Optional[float] = ..., frequency_penalty: _Optional[float] = ..., presence_penalty: _Optional[float] = ..., repetition_penalty: _Optional[float] = ..., max_new_tokens: _Optional[int] = ..., stop: _Optional[_Iterable[str]] = ..., stop_token_ids: _Optional[_Iterable[int]] = ..., skip_special_tokens: bool = ..., spaces_between_special_tokens: bool = ..., regex: _Optional[str] = ..., json_schema: _Optional[str] = ..., ebnf_grammar: _Optional[str] = ..., lora_path: _Optional[str] = ..., n: _Optional[int] = ..., token_healing: bool = ..., min_new_tokens: _Optional[int] = ..., ignore_eos: bool = ..., no_stop_trim: bool = ..., stream_interval: _Optional[int] = ..., logit_bias: _Optional[_Mapping[str, float]] = ..., structural_tag: _Optional[str] = ..., custom_params: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
 
-class SessionParams(_message.Message):
-    __slots__ = ("session_id", "request_id", "offset", "replace", "drop_previous_output")
-    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
-    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
-    OFFSET_FIELD_NUMBER: _ClassVar[int]
-    REPLACE_FIELD_NUMBER: _ClassVar[int]
-    DROP_PREVIOUS_OUTPUT_FIELD_NUMBER: _ClassVar[int]
-    session_id: str
-    request_id: str
-    offset: int
-    replace: bool
-    drop_previous_output: bool
-    def __init__(self, session_id: _Optional[str] = ..., request_id: _Optional[str] = ..., offset: _Optional[int] = ..., replace: bool = ..., drop_previous_output: bool = ...) -> None: ...
-
 class DisaggregatedParams(_message.Message):
     __slots__ = ("bootstrap_host", "bootstrap_port", "bootstrap_room")
     BOOTSTRAP_HOST_FIELD_NUMBER: _ClassVar[int]
@@ -96,116 +82,8 @@ class DisaggregatedParams(_message.Message):
     bootstrap_room: int
     def __init__(self, bootstrap_host: _Optional[str] = ..., bootstrap_port: _Optional[int] = ..., bootstrap_room: _Optional[int] = ...) -> None: ...
 
-class InitializeRequest(_message.Message):
-    __slots__ = ("client_id", "client_version", "mode")
-    class Mode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
-        __slots__ = ()
-        REGULAR: _ClassVar[InitializeRequest.Mode]
-        PREFILL: _ClassVar[InitializeRequest.Mode]
-        DECODE: _ClassVar[InitializeRequest.Mode]
-    REGULAR: InitializeRequest.Mode
-    PREFILL: InitializeRequest.Mode
-    DECODE: InitializeRequest.Mode
-    CLIENT_ID_FIELD_NUMBER: _ClassVar[int]
-    CLIENT_VERSION_FIELD_NUMBER: _ClassVar[int]
-    MODE_FIELD_NUMBER: _ClassVar[int]
-    client_id: str
-    client_version: str
-    mode: InitializeRequest.Mode
-    def __init__(self, client_id: _Optional[str] = ..., client_version: _Optional[str] = ..., mode: _Optional[_Union[InitializeRequest.Mode, str]] = ...) -> None: ...
-
-class InitializeResponse(_message.Message):
-    __slots__ = ("success", "scheduler_version", "model_info", "capabilities", "error_message")
-    SUCCESS_FIELD_NUMBER: _ClassVar[int]
-    SCHEDULER_VERSION_FIELD_NUMBER: _ClassVar[int]
-    MODEL_INFO_FIELD_NUMBER: _ClassVar[int]
-    CAPABILITIES_FIELD_NUMBER: _ClassVar[int]
-    ERROR_MESSAGE_FIELD_NUMBER: _ClassVar[int]
-    success: bool
-    scheduler_version: str
-    model_info: ModelInfo
-    capabilities: ServerCapabilities
-    error_message: str
-    def __init__(self, success: bool = ..., scheduler_version: _Optional[str] = ..., model_info: _Optional[_Union[ModelInfo, _Mapping]] = ..., capabilities: _Optional[_Union[ServerCapabilities, _Mapping]] = ..., error_message: _Optional[str] = ...) -> None: ...
-
-class ModelInfo(_message.Message):
-    __slots__ = ("model_name", "max_context_length", "vocab_size", "supports_tool_calling", "supports_vision", "special_tokens", "model_type", "num_layers", "hidden_size", "num_attention_heads", "num_key_value_heads", "tokenizer_type", "eos_token_ids", "pad_token_id", "bos_token_id")
-    MODEL_NAME_FIELD_NUMBER: _ClassVar[int]
-    MAX_CONTEXT_LENGTH_FIELD_NUMBER: _ClassVar[int]
-    VOCAB_SIZE_FIELD_NUMBER: _ClassVar[int]
-    SUPPORTS_TOOL_CALLING_FIELD_NUMBER: _ClassVar[int]
-    SUPPORTS_VISION_FIELD_NUMBER: _ClassVar[int]
-    SPECIAL_TOKENS_FIELD_NUMBER: _ClassVar[int]
-    MODEL_TYPE_FIELD_NUMBER: _ClassVar[int]
-    NUM_LAYERS_FIELD_NUMBER: _ClassVar[int]
-    HIDDEN_SIZE_FIELD_NUMBER: _ClassVar[int]
-    NUM_ATTENTION_HEADS_FIELD_NUMBER: _ClassVar[int]
-    NUM_KEY_VALUE_HEADS_FIELD_NUMBER: _ClassVar[int]
-    TOKENIZER_TYPE_FIELD_NUMBER: _ClassVar[int]
-    EOS_TOKEN_IDS_FIELD_NUMBER: _ClassVar[int]
-    PAD_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
-    BOS_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
-    model_name: str
-    max_context_length: int
-    vocab_size: int
-    supports_tool_calling: bool
-    supports_vision: bool
-    special_tokens: _containers.RepeatedScalarFieldContainer[str]
-    model_type: str
-    num_layers: int
-    hidden_size: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    tokenizer_type: str
-    eos_token_ids: _containers.RepeatedScalarFieldContainer[int]
-    pad_token_id: int
-    bos_token_id: int
-    def __init__(self, model_name: _Optional[str] = ..., max_context_length: _Optional[int] = ..., vocab_size: _Optional[int] = ..., supports_tool_calling: bool = ..., supports_vision: bool = ..., special_tokens: _Optional[_Iterable[str]] = ..., model_type: _Optional[str] = ..., num_layers: _Optional[int] = ..., hidden_size: _Optional[int] = ..., num_attention_heads: _Optional[int] = ..., num_key_value_heads: _Optional[int] = ..., tokenizer_type: _Optional[str] = ..., eos_token_ids: _Optional[_Iterable[int]] = ..., pad_token_id: _Optional[int] = ..., bos_token_id: _Optional[int] = ...) -> None: ...
-
-class ServerCapabilities(_message.Message):
-    __slots__ = ("continuous_batching", "disaggregated_serving", "speculative_decoding", "max_batch_size", "max_num_batched_tokens", "max_prefill_tokens", "attention_backend", "supports_lora", "supports_grammar", "supports_multimodal", "supported_modalities", "supports_custom_logit_processor", "supports_session", "num_gpus", "gpu_type", "total_gpu_memory", "tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size")
-    CONTINUOUS_BATCHING_FIELD_NUMBER: _ClassVar[int]
-    DISAGGREGATED_SERVING_FIELD_NUMBER: _ClassVar[int]
-    SPECULATIVE_DECODING_FIELD_NUMBER: _ClassVar[int]
-    MAX_BATCH_SIZE_FIELD_NUMBER: _ClassVar[int]
-    MAX_NUM_BATCHED_TOKENS_FIELD_NUMBER: _ClassVar[int]
-    MAX_PREFILL_TOKENS_FIELD_NUMBER: _ClassVar[int]
-    ATTENTION_BACKEND_FIELD_NUMBER: _ClassVar[int]
-    SUPPORTS_LORA_FIELD_NUMBER: _ClassVar[int]
-    SUPPORTS_GRAMMAR_FIELD_NUMBER: _ClassVar[int]
-    SUPPORTS_MULTIMODAL_FIELD_NUMBER: _ClassVar[int]
-    SUPPORTED_MODALITIES_FIELD_NUMBER: _ClassVar[int]
-    SUPPORTS_CUSTOM_LOGIT_PROCESSOR_FIELD_NUMBER: _ClassVar[int]
-    SUPPORTS_SESSION_FIELD_NUMBER: _ClassVar[int]
-    NUM_GPUS_FIELD_NUMBER: _ClassVar[int]
-    GPU_TYPE_FIELD_NUMBER: _ClassVar[int]
-    TOTAL_GPU_MEMORY_FIELD_NUMBER: _ClassVar[int]
-    TENSOR_PARALLEL_SIZE_FIELD_NUMBER: _ClassVar[int]
-    PIPELINE_PARALLEL_SIZE_FIELD_NUMBER: _ClassVar[int]
-    DATA_PARALLEL_SIZE_FIELD_NUMBER: _ClassVar[int]
-    continuous_batching: bool
-    disaggregated_serving: bool
-    speculative_decoding: bool
-    max_batch_size: int
-    max_num_batched_tokens: int
-    max_prefill_tokens: int
-    attention_backend: str
-    supports_lora: bool
-    supports_grammar: bool
-    supports_multimodal: bool
-    supported_modalities: _containers.RepeatedScalarFieldContainer[str]
-    supports_custom_logit_processor: bool
-    supports_session: bool
-    num_gpus: int
-    gpu_type: str
-    total_gpu_memory: int
-    tensor_parallel_size: int
-    pipeline_parallel_size: int
-    data_parallel_size: int
-    def __init__(self, continuous_batching: bool = ..., disaggregated_serving: bool = ..., speculative_decoding: bool = ..., max_batch_size: _Optional[int] = ..., max_num_batched_tokens: _Optional[int] = ..., max_prefill_tokens: _Optional[int] = ..., attention_backend: _Optional[str] = ..., supports_lora: bool = ..., supports_grammar: bool = ..., supports_multimodal: bool = ..., supported_modalities: _Optional[_Iterable[str]] = ..., supports_custom_logit_processor: bool = ..., supports_session: bool = ..., num_gpus: _Optional[int] = ..., gpu_type: _Optional[str] = ..., total_gpu_memory: _Optional[int] = ..., tensor_parallel_size: _Optional[int] = ..., pipeline_parallel_size: _Optional[int] = ..., data_parallel_size: _Optional[int] = ...) -> None: ...
-
 class GenerateRequest(_message.Message):
-    __slots__ = ("request_id", "text", "tokenized", "mm_inputs", "sampling_params", "return_logprob", "logprob_start_len", "top_logprobs_num", "token_ids_logprob", "return_hidden_states", "session_params", "disaggregated_params", "custom_logit_processor", "timestamp", "log_metrics", "input_embeds", "lora_id", "data_parallel_rank", "dp_balance_id")
+    __slots__ = ("request_id", "text", "tokenized", "mm_inputs", "sampling_params", "return_logprob", "logprob_start_len", "top_logprobs_num", "token_ids_logprob", "return_hidden_states", "disaggregated_params", "custom_logit_processor", "timestamp", "log_metrics", "input_embeds", "lora_id", "data_parallel_rank", "dp_balance_id")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     TEXT_FIELD_NUMBER: _ClassVar[int]
     TOKENIZED_FIELD_NUMBER: _ClassVar[int]
@@ -216,7 +94,6 @@ class GenerateRequest(_message.Message):
     TOP_LOGPROBS_NUM_FIELD_NUMBER: _ClassVar[int]
     TOKEN_IDS_LOGPROB_FIELD_NUMBER: _ClassVar[int]
     RETURN_HIDDEN_STATES_FIELD_NUMBER: _ClassVar[int]
-    SESSION_PARAMS_FIELD_NUMBER: _ClassVar[int]
     DISAGGREGATED_PARAMS_FIELD_NUMBER: _ClassVar[int]
     CUSTOM_LOGIT_PROCESSOR_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
@@ -235,7 +112,6 @@ class GenerateRequest(_message.Message):
     top_logprobs_num: int
     token_ids_logprob: _containers.RepeatedScalarFieldContainer[int]
     return_hidden_states: bool
-    session_params: SessionParams
     disaggregated_params: DisaggregatedParams
     custom_logit_processor: str
     timestamp: _timestamp_pb2.Timestamp
@@ -244,7 +120,7 @@ class GenerateRequest(_message.Message):
     lora_id: str
     data_parallel_rank: int
     dp_balance_id: int
-    def __init__(self, request_id: _Optional[str] = ..., text: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., return_logprob: bool = ..., logprob_start_len: _Optional[int] = ..., top_logprobs_num: _Optional[int] = ..., token_ids_logprob: _Optional[_Iterable[int]] = ..., return_hidden_states: bool = ..., session_params: _Optional[_Union[SessionParams, _Mapping]] = ..., disaggregated_params: _Optional[_Union[DisaggregatedParams, _Mapping]] = ..., custom_logit_processor: _Optional[str] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., log_metrics: bool = ..., input_embeds: _Optional[_Iterable[float]] = ..., lora_id: _Optional[str] = ..., data_parallel_rank: _Optional[int] = ..., dp_balance_id: _Optional[int] = ...) -> None: ...
+    def __init__(self, request_id: _Optional[str] = ..., text: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., return_logprob: bool = ..., logprob_start_len: _Optional[int] = ..., top_logprobs_num: _Optional[int] = ..., token_ids_logprob: _Optional[_Iterable[int]] = ..., return_hidden_states: bool = ..., disaggregated_params: _Optional[_Union[DisaggregatedParams, _Mapping]] = ..., custom_logit_processor: _Optional[str] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., log_metrics: bool = ..., input_embeds: _Optional[_Iterable[float]] = ..., lora_id: _Optional[str] = ..., data_parallel_rank: _Optional[int] = ..., dp_balance_id: _Optional[int] = ...) -> None: ...
 
 class TokenizedInput(_message.Message):
     __slots__ = ("original_text", "input_ids")
@@ -517,26 +393,6 @@ class AbortResponse(_message.Message):
     success: bool
     message: str
     def __init__(self, success: bool = ..., message: _Optional[str] = ...) -> None: ...
-
-class FlushCacheRequest(_message.Message):
-    __slots__ = ("flush_all", "session_ids")
-    FLUSH_ALL_FIELD_NUMBER: _ClassVar[int]
-    SESSION_IDS_FIELD_NUMBER: _ClassVar[int]
-    flush_all: bool
-    session_ids: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, flush_all: bool = ..., session_ids: _Optional[_Iterable[str]] = ...) -> None: ...
-
-class FlushCacheResponse(_message.Message):
-    __slots__ = ("success", "num_entries_flushed", "memory_freed", "message")
-    SUCCESS_FIELD_NUMBER: _ClassVar[int]
-    NUM_ENTRIES_FLUSHED_FIELD_NUMBER: _ClassVar[int]
-    MEMORY_FREED_FIELD_NUMBER: _ClassVar[int]
-    MESSAGE_FIELD_NUMBER: _ClassVar[int]
-    success: bool
-    num_entries_flushed: int
-    memory_freed: int
-    message: str
-    def __init__(self, success: bool = ..., num_entries_flushed: _Optional[int] = ..., memory_freed: _Optional[int] = ..., message: _Optional[str] = ...) -> None: ...
 
 class LoadLoRARequest(_message.Message):
     __slots__ = ("adapter_id", "adapter_path", "rank")

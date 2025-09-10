@@ -167,8 +167,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.model_info = model_info
         self.start_time = time.time()
 
-        # Start the request manager's event loop
-        self.handle_loop_task = asyncio.create_task(self.request_manager.handle_loop())
+        # Start the request manager's event loop using auto_create_handle_loop
+        self.request_manager.auto_create_handle_loop()
 
         logger.info("Standalone gRPC scheduler service initialized")
 
@@ -196,7 +196,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             while True:
                 try:
                     # Get output with timeout
-                    output = await asyncio.wait_for(output_queue.get(), timeout=1.0)
+                    output = await asyncio.wait_for(output_queue.get(), timeout=4)
 
                     # Check for errors
                     if "error" in output:
@@ -501,15 +501,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Shutdown the service."""
         logger.info("Shutting down gRPC service")
 
-        # Cancel handle loop
-        if self.handle_loop_task:
-            self.handle_loop_task.cancel()
-            try:
-                await self.handle_loop_task
-            except asyncio.CancelledError:
-                pass
-
-        # Shutdown request manager
+        # Shutdown request manager (handles its own tasks)
         await self.request_manager.shutdown()
 
 

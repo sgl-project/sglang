@@ -20,8 +20,6 @@ service SglangScheduler {
   // Abort a running request
   rpc Abort(AbortRequest) returns (AbortResponse);
 
-  // Flush KV cache
-  rpc FlushCache(FlushCacheRequest) returns (FlushCacheResponse);
 }
 
 // =====================
@@ -72,14 +70,6 @@ message SamplingParams {
   google.protobuf.Struct custom_params = 25;
 }
 
-// Session parameters for continual prompting
-message SessionParams {
-  string session_id = 1;
-  string request_id = 2;
-  int32 offset = 3;
-  bool replace = 4;
-  bool drop_previous_output = 5;
-}
 
 // Disaggregated serving parameters
 message DisaggregatedParams {
@@ -114,8 +104,6 @@ message GenerateRequest {
   repeated int32 token_ids_logprob = 9;
   bool return_hidden_states = 10;
 
-  // Session management
-  SessionParams session_params = 11;
 
   // For disaggregated serving
   DisaggregatedParams disaggregated_params = 12;
@@ -383,17 +371,6 @@ message AbortResponse {
   string message = 2;
 }
 
-message FlushCacheRequest {
-  bool flush_all = 1;
-  repeated string session_ids = 2;  // Flush specific sessions
-}
-
-message FlushCacheResponse {
-  bool success = 1;
-  int32 num_entries_flushed = 2;
-  int64 memory_freed = 3;  // bytes
-  string message = 4;
-}
 
 // =====================
 // Additional Operations (Future)

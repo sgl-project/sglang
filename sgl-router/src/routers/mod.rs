@@ -80,8 +80,6 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
 
     async fn route_rerank(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
 
-    /// Flush cache on all workers
-    async fn flush_cache(&self) -> Response;
 
     /// Get worker loads (for monitoring)
     async fn get_worker_loads(&self) -> Response;
