@@ -2,7 +2,6 @@ ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
 
 ARG BUILD_TYPE=all
-ARG BRANCH_TYPE=remote
 ARG DEEPEP_COMMIT=b92d0d4860ce6866cd6d31bfbae937f9a7a3772b
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -121,19 +120,23 @@ COPY . /src
 FROM base AS build-image
 
 # Install Python development tools (consolidated)
-RUN python3 -m pip install --no-cache-dir \
+RUN python3 -m pip install --no-cache-dir --upgrade \
     black \
     datamodel_code_generator \
+    html5lib \
     icdiff \
     matplotlib \
     mooncake-transfer-engine==0.3.5 \
     nixl \
     pandas \
+    pip \
     pre-commit \
     py-spy \
     pytest \
     scikit-build-core \
+    setuptools \
     setuptools-rust \
+    six \
     tabulate \
     uv \
     wheel
@@ -352,7 +355,7 @@ RUN git clone https://github.com/deepseek-ai/DeepEP.git \
     && NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
 
 # Install SGLang
-ARG BRANCH_TYPE
+ARG BRANCH_TYPE=remote
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
@@ -360,8 +363,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
  && rm -rf /tmp/local_src
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
- && cd sglang \
+RUN cd sglang \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
       12.8.1) CUINDEX=128 ;; \
@@ -376,7 +378,10 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
     fi
 
 # Build and install sgl-router
-RUN cd /sgl-workspace/sglang/sgl-router \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/sgl-workspace/sglang/sgl-router/target \
+    cd /sgl-workspace/sglang/sgl-router \
     && cargo build --release \
     && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache
