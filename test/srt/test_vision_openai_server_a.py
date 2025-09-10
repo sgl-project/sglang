@@ -332,7 +332,7 @@ class TestPhi4MMServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
         pass
 
 
-class TestQwen2_5_AI_AGENT(ImageOpenAITestMixin):
+class TestQwen2_5_AI_AGENT(TestOpenAIOmniServerBase):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
