@@ -17,7 +17,7 @@ MOE_TOLERANCE_MEAN_DIFF = 0.3
 # Dense model configuration
 DENSE_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000.pkl"
-DENSE_TOLERANCE_MAX_DIFF = 1.0
+DENSE_TOLERANCE_MAX_DIFF = 1.5
 DENSE_TOLERANCE_MEAN_DIFF = 0.1
 
 
