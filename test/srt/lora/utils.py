@@ -16,6 +16,7 @@ import dataclasses
 from typing import List
 
 import torch
+import random
 
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l
@@ -386,3 +387,10 @@ def run_lora_test_by_batch(
             srt_no_lora_outputs.output_strs[i].strip(" "),
             hf_no_lora_outputs.output_strs[i].strip(" "),
         )
+
+def ensure_reproducibility():
+    seed = 42
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
