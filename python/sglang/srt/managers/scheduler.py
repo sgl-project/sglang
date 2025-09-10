@@ -2092,10 +2092,11 @@ class Scheduler(
 
     def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
         if batch.next_batch_sampling_info:
-            if batch.next_batch_sampling_info.grammars is not None:
-                batch.next_batch_sampling_info.update_regex_vocab_mask()
-                self.current_stream.synchronize()
-            batch.next_batch_sampling_info.sampling_info_done.set()
+            if self.disaggregation_mode != DisaggregationMode.PREFILL:
+                if batch.next_batch_sampling_info.grammars is not None:
+                    batch.next_batch_sampling_info.update_regex_vocab_mask()
+                    self.current_stream.synchronize()
+                batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
