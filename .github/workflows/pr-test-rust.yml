@@ -73,6 +73,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python venv
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+
       - name: Install rust dependencies
         run: |
           bash scripts/ci/ci_install_rust.sh
@@ -84,6 +90,7 @@ jobs:
       - name: Build python binding
         run: |
           source "$HOME/.cargo/env"
+          source .venv/bin/activate
           cd sgl-router
           pip install setuptools-rust wheel build
           python3 -m build
@@ -94,6 +101,7 @@ jobs:
         run: |
           cd sgl-router
           source "$HOME/.cargo/env"
+          source ../.venv/bin/activate || source .venv/bin/activate
           pip install pytest pytest-cov pytest-xdist
           pytest -q py_test/unit --cov=sglang_router --cov-report=term-missing --cov-fail-under=80
 
@@ -101,6 +109,7 @@ jobs:
         run: |
           cd sgl-router
           source "$HOME/.cargo/env"
+          source ../.venv/bin/activate || source .venv/bin/activate
           # Integration tests use FastAPI/uvicorn for mock workers
           pip install fastapi uvicorn orjson
           pytest -q -m integration
@@ -109,6 +118,7 @@ jobs:
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
+          source ../.venv/bin/activate || source .venv/bin/activate
           pip install genai-bench
           pytest -m e2e -s  -vv -o log_cli=true --log-cli-level=INFO
 
