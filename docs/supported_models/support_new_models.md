@@ -160,7 +160,7 @@ from sglang.srt.models.llama import LlamaForCausalLM
 ```
 
 Next, we declare a new `class` for our model and have it inherit from `LlamaForCausalLM`, which allows our model to access `LlamaForCausalLM`'s predefined modules and layers, such as `LlamaAttention` and `LlamaMLP`.
-Note that almost all model implementations take in `config` and `quant_config` as arguments for their `__init__` method; `config` and `quant_config` are passed in via [`model_loader/loader.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_loader/loader.py#L205).
+Note that almost all model implementations take in `config` and `quant_config` as arguments for their `__init__` method; `config` and `quant_config` are passed in via [`model_loader/loader.py`](https://github.com/sgl-project/sglang/blob/bf72b80122fd888bf619d17b96fa3e323ab809fc/python/sglang/srt/model_loader/loader.py#L219).
 Because we have inherited from `LlamaForCausalLM`, we can pass our parameters directly to its constructor, which will set the member variables for us.
 
 ```python
@@ -176,39 +176,39 @@ class LlamaWrapper(LlamaForCausalLM):
 
 Now, we want to define the `forward` method, which is what will be called at inference time.
 Note that the signature for `forward` is essentially the same for any model; you can take a look at the other models defined in the [`models` directory](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/) for references.
-To see where exactly `forward` is called in the SGLang runtime's internals, take a look at [`forward_decode`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/model_runner.py#L1663) and [`forward_extend`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/model_runner.py#L1682) in the [`ModelRunner` class](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/model_runner.py).
+To see where exactly `forward` is called in the SGLang runtime's internals, take a look at [`forward_decode`](https://github.com/sgl-project/sglang/blob/bf72b80122fd888bf619d17b96fa3e323ab809fc/python/sglang/srt/model_executor/model_runner.py#L1705) and [`forward_extend`](https://github.com/sgl-project/sglang/blob/bf72b80122fd888bf619d17b96fa3e323ab809fc/python/sglang/srt/model_executor/model_runner.py#L1724) in the [`ModelRunner` class](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/model_runner.py).
 
 ```python
-   @torch.no_grad()
-   def forward(
-      self,
-      input_ids: torch.Tensor,
-      positions: torch.Tensor,
-      forward_batch: ForwardBatch,
-      pp_proxy_tensors: Optional[PPProxyTensors] = None,
-      input_embeds: Optional[torch.Tensor] = None,
-      get_embedding: bool = False,
-   ) -> LogitsProcessorOutput:
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_embeds: Optional[torch.Tensor] = None,
+        get_embedding: bool = False,
+    ) -> LogitsProcessorOutput:
 ```
 
 We now call the `__call__` method for `self.model` (which is a member variable that `LlamaForCausalLM` defines in its `__init__` method), which eventually calls `LlamaForCausalLM`'s `forward` method.
 After that, we feed the `hidden_states` into our model's `LogitsProcessor` (again defined in `LlamaForCausalLM`).
 
 ```python
-      hidden_states = self.model(
-         input_ids,
-         positions,
-         forward_batch,
-         input_embeds,
-         pp_proxy_tensors=pp_proxy_tensors,
-      )
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
 
-      res: LogitsProcessorOutput = self.logits_processor(
-          input_ids,
-          hidden_states,
-          self.lm_head,
-          forward_batch,
-      )
+        res: LogitsProcessorOutput = self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+        )
 ```
 
 After receiving the logits for the next token, we can finally perform our biasing step.
