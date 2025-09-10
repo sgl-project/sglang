@@ -1380,7 +1380,7 @@ class Scheduler(
             if abort_existing_req:
                 self.waiting_queue.pop(idx)
                 req_to_abort = min_priority_req
-                message = "The request is aborted based on priority."
+                message = "The request is aborted by a higher priority request."
 
         self.send_to_tokenizer.send_pyobj(
             AbortReq(
