@@ -83,9 +83,8 @@ class DisaggregatedParams(_message.Message):
     def __init__(self, bootstrap_host: _Optional[str] = ..., bootstrap_port: _Optional[int] = ..., bootstrap_room: _Optional[int] = ...) -> None: ...
 
 class GenerateRequest(_message.Message):
-    __slots__ = ("request_id", "text", "tokenized", "mm_inputs", "sampling_params", "return_logprob", "logprob_start_len", "top_logprobs_num", "token_ids_logprob", "return_hidden_states", "disaggregated_params", "custom_logit_processor", "timestamp", "log_metrics", "input_embeds", "lora_id", "data_parallel_rank", "dp_balance_id")
+    __slots__ = ("request_id", "tokenized", "mm_inputs", "sampling_params", "return_logprob", "logprob_start_len", "top_logprobs_num", "token_ids_logprob", "return_hidden_states", "disaggregated_params", "custom_logit_processor", "timestamp", "log_metrics", "input_embeds", "lora_id", "data_parallel_rank", "dp_balance_id")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
-    TEXT_FIELD_NUMBER: _ClassVar[int]
     TOKENIZED_FIELD_NUMBER: _ClassVar[int]
     MM_INPUTS_FIELD_NUMBER: _ClassVar[int]
     SAMPLING_PARAMS_FIELD_NUMBER: _ClassVar[int]
@@ -103,7 +102,6 @@ class GenerateRequest(_message.Message):
     DATA_PARALLEL_RANK_FIELD_NUMBER: _ClassVar[int]
     DP_BALANCE_ID_FIELD_NUMBER: _ClassVar[int]
     request_id: str
-    text: str
     tokenized: TokenizedInput
     mm_inputs: MultimodalInputs
     sampling_params: SamplingParams
@@ -120,7 +118,7 @@ class GenerateRequest(_message.Message):
     lora_id: str
     data_parallel_rank: int
     dp_balance_id: int
-    def __init__(self, request_id: _Optional[str] = ..., text: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., return_logprob: bool = ..., logprob_start_len: _Optional[int] = ..., top_logprobs_num: _Optional[int] = ..., token_ids_logprob: _Optional[_Iterable[int]] = ..., return_hidden_states: bool = ..., disaggregated_params: _Optional[_Union[DisaggregatedParams, _Mapping]] = ..., custom_logit_processor: _Optional[str] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., log_metrics: bool = ..., input_embeds: _Optional[_Iterable[float]] = ..., lora_id: _Optional[str] = ..., data_parallel_rank: _Optional[int] = ..., dp_balance_id: _Optional[int] = ...) -> None: ...
+    def __init__(self, request_id: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., return_logprob: bool = ..., logprob_start_len: _Optional[int] = ..., top_logprobs_num: _Optional[int] = ..., token_ids_logprob: _Optional[_Iterable[int]] = ..., return_hidden_states: bool = ..., disaggregated_params: _Optional[_Union[DisaggregatedParams, _Mapping]] = ..., custom_logit_processor: _Optional[str] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., log_metrics: bool = ..., input_embeds: _Optional[_Iterable[float]] = ..., lora_id: _Optional[str] = ..., data_parallel_rank: _Optional[int] = ..., dp_balance_id: _Optional[int] = ...) -> None: ...
 
 class TokenizedInput(_message.Message):
     __slots__ = ("original_text", "input_ids")
@@ -267,9 +265,8 @@ class HiddenStates(_message.Message):
     def __init__(self, values: _Optional[_Iterable[float]] = ..., layer: _Optional[int] = ..., position: _Optional[int] = ...) -> None: ...
 
 class EmbedRequest(_message.Message):
-    __slots__ = ("request_id", "text", "tokenized", "mm_inputs", "sampling_params", "log_metrics", "token_type_ids", "data_parallel_rank", "is_cross_encoder", "texts")
+    __slots__ = ("request_id", "tokenized", "mm_inputs", "sampling_params", "log_metrics", "token_type_ids", "data_parallel_rank", "is_cross_encoder", "texts")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
-    TEXT_FIELD_NUMBER: _ClassVar[int]
     TOKENIZED_FIELD_NUMBER: _ClassVar[int]
     MM_INPUTS_FIELD_NUMBER: _ClassVar[int]
     SAMPLING_PARAMS_FIELD_NUMBER: _ClassVar[int]
@@ -279,7 +276,6 @@ class EmbedRequest(_message.Message):
     IS_CROSS_ENCODER_FIELD_NUMBER: _ClassVar[int]
     TEXTS_FIELD_NUMBER: _ClassVar[int]
     request_id: str
-    text: str
     tokenized: TokenizedInput
     mm_inputs: MultimodalInputs
     sampling_params: SamplingParams
@@ -288,7 +284,7 @@ class EmbedRequest(_message.Message):
     data_parallel_rank: int
     is_cross_encoder: bool
     texts: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, request_id: _Optional[str] = ..., text: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., log_metrics: bool = ..., token_type_ids: _Optional[_Iterable[int]] = ..., data_parallel_rank: _Optional[int] = ..., is_cross_encoder: bool = ..., texts: _Optional[_Iterable[str]] = ...) -> None: ...
+    def __init__(self, request_id: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., log_metrics: bool = ..., token_type_ids: _Optional[_Iterable[int]] = ..., data_parallel_rank: _Optional[int] = ..., is_cross_encoder: bool = ..., texts: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class EmbedResponse(_message.Message):
     __slots__ = ("request_id", "complete", "error")
@@ -335,12 +331,10 @@ class EmbedError(_message.Message):
     def __init__(self, message: _Optional[str] = ..., code: _Optional[str] = ..., details: _Optional[str] = ...) -> None: ...
 
 class HealthCheckRequest(_message.Message):
-    __slots__ = ("text", "tokenized")
-    TEXT_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("tokenized",)
     TOKENIZED_FIELD_NUMBER: _ClassVar[int]
-    text: str
     tokenized: TokenizedInput
-    def __init__(self, text: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ...) -> None: ...
+    def __init__(self, tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ...) -> None: ...
 
 class HealthCheckResponse(_message.Message):
     __slots__ = ("healthy", "message")
