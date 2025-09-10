@@ -102,17 +102,20 @@ def set_bootstrap_server(
     if obj.check_idle or obj.failed_bootstrap_addr:
         return
     if manager.server_args.disaggregation_mode == "decode":
-        # find a free port
-        bootstrap_port = 8998
-        while True:
-            if is_port_available(bootstrap_port):
-                break
+        if obj.bootstrap_port is None or not is_port_available(obj.bootstrap_port):
+            # find a free port
+            bootstrap_port = 8998
+            while bootstrap_port <= 65535:
+                if is_port_available(bootstrap_port):
+                    break
+                else:
+                    bootstrap_port += 1
             else:
-                bootstrap_port += 1
-        manager.server_args.disaggregation_bootstrap_port = bootstrap_port
+                raise RuntimeError("No available port found for bootstrap server.")
+            obj.bootstrap_port = bootstrap_port
+        manager.server_args.disaggregation_bootstrap_port = obj.bootstrap_port
         manager.server_args.disaggregation_mode = "prefill"
         manager.bootstrap_server = start_disagg_service(manager.server_args)
-        obj.bootstrap_port = bootstrap_port
         set_env_vars(obj.disaggregation_prefill_envs)
     else:
         # stop the bootstrap server
