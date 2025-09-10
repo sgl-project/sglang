@@ -1116,10 +1116,10 @@ impl PDRouter {
 
     // Check if either prefill or decode policy needs request text
     fn policies_need_request_text(&self) -> bool {
-        // For now, check the default policy
-        // TODO: In the future, we might want to check per-model policies
-        let default_policy = self.policy_registry.get_default_policy();
-        default_policy.needs_request_text()
+        // Check both prefill and decode policies
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+        prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
     // Select a pair of prefill and decode servers considering circuit breaker state
@@ -1152,20 +1152,20 @@ impl PDRouter {
         };
 
         // Select workers using helper function
-        // For PD router, we use the default policy for both prefill and decode
-        // TODO: In the future, we might want separate policies per worker type and model
-        let default_policy = self.policy_registry.get_default_policy();
+        // Use separate policies for prefill and decode to avoid counter conflicts
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
 
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
-            &*default_policy,
+            &*prefill_policy,
             request_text,
             "prefill",
         )?;
 
         let decode = Self::pick_worker_by_policy_arc(
             &decode_workers,
-            &*default_policy,
+            &*decode_policy,
             request_text,
             "decode",
         )?;
