@@ -146,7 +146,7 @@ class TpModelWorker:
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
         assert (
-            self.max_running_requests > 0
+            self.max_queued_requests > 0
         ), "max_queued_requests is zero. We need to be at least 1 to schedule a request."
         self.max_req_len = min(
             self.model_config.context_len - 1,
