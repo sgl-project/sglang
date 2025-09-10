@@ -15,6 +15,8 @@ if TYPE_CHECKING:
         DeepEPNormalOutput,
         StandardCombineInput,
         StandardDispatchOutput,
+        MoRINormalOutput,
+        MoRILLOutput,
     )
     from sglang.srt.layers.moe.topk import TopKOutput
 
@@ -53,6 +55,23 @@ class DispatchOutputChecker:
     ) -> TypeGuard[AscendDeepEPLLOutput]:
         return dispatch_output.format.is_ascent_ll()
 
+    @staticmethod
+    def format_is_mori_normal(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MoRINormalOutput]:
+        return dispatch_output.format.is_mori_normal()
+
+    @staticmethod
+    def format_is_mori_ll(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MoRILLOutput]:
+        return dispatch_output.format.is_mori_ll()
+
+    @staticmethod
+    def format_is_mori(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[Union[MoRINormalOutput, MoRILLOutput]]:
+        return dispatch_output.format.is_mori()
 
 class DispatchOutputFormat(Enum):
 
@@ -60,6 +79,8 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     ASCENT_LL = "ascent_ll"
+    MORI_NORMAL = "mori_normal"
+    MORI_LL = "mori_ll"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -79,6 +100,17 @@ class DispatchOutputFormat(Enum):
     def is_ascent_ll(self) -> bool:
         return self == DispatchOutputFormat.ASCENT_LL
 
+    def is_mori_normal(self) -> bool:
+        return self == DispatchOutputFormat.MORI_NORMAL
+
+    def is_mori_ll(self) -> bool:
+        return self == DispatchOutputFormat.MORI_LL
+
+    def is_mori(self) -> bool:
+        return self in [
+            DispatchOutputFormat.MORI_NORMAL,
+            DispatchOutputFormat.MORI_LL,
+        ]
 
 @runtime_checkable
 class DispatchOutput(Protocol):

@@ -20,7 +20,7 @@ from sglang.srt.layers.moe import (
     get_tbo_token_distribution_threshold,
     is_tbo_enabled,
 )
-from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher, MoRIEPDispatcher
+from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher, MoRIDispatcher
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
@@ -967,7 +967,7 @@ class MaybeTboDeepEPDispatcher:
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         self._inners = [
             (
-                MoRIEPDispatcher(**kwargs)
+                MoRIDispatcher(**kwargs)
                 if get_moe_a2a_backend().is_mori()
                 else DeepEPDispatcher(**kwargs)
             )
