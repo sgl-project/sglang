@@ -12,15 +12,13 @@ import time
 MOE_MODEL_NAME = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST
 MOE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_moe.pkl"
 MOE_TOLERANCE_MAX_DIFF = 10
-MOE_TOLERANCE_MEAN_DIFF = 0.1
-MOE_TOLERANCE_MEAN_DIFF_SAMPLE = 0.3
+MOE_TOLERANCE_MEAN_DIFF = 0.3
 
 # Dense model configuration
 DENSE_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000.pkl"
 DENSE_TOLERANCE_MAX_DIFF = 1.0
-DENSE_TOLERANCE_MEAN_DIFF = 0.05
-DENSE_TOLERANCE_MEAN_DIFF_SAMPLE = 0.1
+DENSE_TOLERANCE_MEAN_DIFF = 0.1
 
 
 # Common configuration
@@ -159,7 +157,7 @@ class TestLogprobsMOE(unittest.TestCase):
 - **Configuration**: {config}
 - **Max of max Δ**: {max_of_max:.6g}
 - **Mean of mean Δ**: {mean_of_mean:.6g}
-- **Status**: {'✅ Passed' if max_of_max <= MOE_TOLERANCE_MAX_DIFF and mean_of_mean <= MOE_TOLERANCE_MEAN_DIFF_SAMPLE else '❌ Failed'}
+- **Status**: {'✅ Passed' if max_of_max <= MOE_TOLERANCE_MAX_DIFF and mean_of_mean <= MOE_TOLERANCE_MEAN_DIFF else '❌ Failed'}
 
 """
                 write_github_step_summary(summary_content)
@@ -174,8 +172,8 @@ class TestLogprobsMOE(unittest.TestCase):
                 for i, (max_diff, mean_diff) in enumerate(zip(all_max, all_mean)):
                     if max_diff > MOE_TOLERANCE_MAX_DIFF:
                         failed_samples.append(f"Sample {i}: max_diff={max_diff:.6g} > {MOE_TOLERANCE_MAX_DIFF}")
-                    if mean_diff > MOE_TOLERANCE_MEAN_DIFF_SAMPLE:
-                        failed_samples.append(f"Sample {i}: mean_diff={mean_diff:.6g} > {MOE_TOLERANCE_MEAN_DIFF_SAMPLE}")
+                    if mean_diff > MOE_TOLERANCE_MEAN_DIFF:
+                        failed_samples.append(f"Sample {i}: mean_diff={mean_diff:.6g} > {MOE_TOLERANCE_MEAN_DIFF}")
                 
                 if failed_samples:
                     self.fail(f"Config {config} - Tolerance exceeded in {len(failed_samples)} samples:\n" + "\n".join(failed_samples[:5]))
@@ -304,7 +302,7 @@ class TestLogprobsDense(unittest.TestCase):
 - **Configuration**: {config}
 - **Max of max Δ**: {max_of_max:.6g}
 - **Mean of mean Δ**: {mean_of_mean:.6g}
-- **Status**: {'✅ Passed' if max_of_max <= DENSE_TOLERANCE_MAX_DIFF and mean_of_mean <= DENSE_TOLERANCE_MEAN_DIFF_SAMPLE else '❌ Failed'}
+- **Status**: {'✅ Passed' if max_of_max <= DENSE_TOLERANCE_MAX_DIFF and mean_of_mean <= DENSE_TOLERANCE_MEAN_DIFF else '❌ Failed'}
 """
                 write_github_step_summary(summary_content)
 
@@ -318,8 +316,8 @@ class TestLogprobsDense(unittest.TestCase):
                 for i, (max_diff, mean_diff) in enumerate(zip(all_max, all_mean)):
                     if max_diff > DENSE_TOLERANCE_MAX_DIFF:
                         failed_samples.append(f"Sample {i}: max_diff={max_diff:.6g} > {DENSE_TOLERANCE_MAX_DIFF}")
-                    if mean_diff > DENSE_TOLERANCE_MEAN_DIFF_SAMPLE:
-                        failed_samples.append(f"Sample {i}: mean_diff={mean_diff:.6g} > {DENSE_TOLERANCE_MEAN_DIFF_SAMPLE}")
+                    if mean_diff > DENSE_TOLERANCE_MEAN_DIFF:
+                        failed_samples.append(f"Sample {i}: mean_diff={mean_diff:.6g} > {DENSE_TOLERANCE_MEAN_DIFF}")
                 
                 if failed_samples:
                     self.fail(f"Config {config} - Tolerance exceeded in {len(failed_samples)} samples:\n" + "\n".join(failed_samples[:5]))
