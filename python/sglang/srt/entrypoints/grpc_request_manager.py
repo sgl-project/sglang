@@ -25,7 +25,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.server_args import ServerArgs, PortArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
 
@@ -119,18 +119,12 @@ class GrpcRequestManager:
 
         # Socket for receiving outputs from scheduler
         self.recv_from_scheduler = get_zmq_socket(
-            context,
-            zmq.PULL,
-            port_args.detokenizer_ipc_name,
-            bind=True
+            context, zmq.PULL, port_args.detokenizer_ipc_name, bind=True
         )
 
         # Socket for sending requests to scheduler
         self.send_to_scheduler = get_zmq_socket(
-            context,
-            zmq.PUSH,
-            port_args.scheduler_input_ipc_name,
-            bind=True
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name, bind=True
         )
 
         # State Management (from TokenizerManager)
@@ -139,7 +133,6 @@ class GrpcRequestManager:
         self.gracefully_exit = False
         self.no_create_loop = False
         self.event_loop = None
-
 
         # Pause/Resume Control
         self.is_pause = False
@@ -192,7 +185,7 @@ class GrpcRequestManager:
         )
 
         # Track session if needed
-        if hasattr(obj, 'session_params') and obj.session_params:
+        if hasattr(obj, "session_params") and obj.session_params:
             state.session_id = obj.session_params.session_id
             state.is_session_request = True
 
@@ -291,13 +284,9 @@ class GrpcRequestManager:
             state.event.set()
 
             # Send abort notification to output queue
-            await state.out_queue.put({
-                "error": "Request aborted",
-                "abort": True
-            })
+            await state.out_queue.put({"error": "Request aborted", "abort": True})
 
         return True
-
 
     async def pause_generation(self):
         """Pause generation processing."""
@@ -311,7 +300,6 @@ class GrpcRequestManager:
             self.is_pause = False
             self.is_pause_cond.notify_all()
             logger.info("Generation resumed")
-
 
     async def handle_loop(self):
         """
@@ -371,23 +359,39 @@ class GrpcRequestManager:
                 "token_ids": batch_out.output_ids[i] if batch_out.output_ids else [],
                 "finished": batch_out.finished_reasons[i] is not None,
                 "meta_info": {
-                    "prompt_tokens": batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0,
-                    "completion_tokens": batch_out.completion_tokens[i] if batch_out.completion_tokens else 0,
-                    "finish_reason": str(batch_out.finished_reasons[i]) if batch_out.finished_reasons[i] else None
-                }
+                    "prompt_tokens": (
+                        batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
+                    ),
+                    "completion_tokens": (
+                        batch_out.completion_tokens[i]
+                        if batch_out.completion_tokens
+                        else 0
+                    ),
+                    "finish_reason": (
+                        str(batch_out.finished_reasons[i])
+                        if batch_out.finished_reasons[i]
+                        else None
+                    ),
+                },
             }
 
             # Add logprobs if available
-            if batch_out.output_token_logprobs_val and i < len(batch_out.output_token_logprobs_val):
+            if batch_out.output_token_logprobs_val and i < len(
+                batch_out.output_token_logprobs_val
+            ):
                 output_data["logprobs"] = {
                     "tokens": batch_out.output_token_logprobs_val[i],
-                    "top_logprobs": batch_out.output_top_logprobs_val[i]
-                    if batch_out.output_top_logprobs_val and i < len(batch_out.output_top_logprobs_val) else None
+                    "top_logprobs": (
+                        batch_out.output_top_logprobs_val[i]
+                        if batch_out.output_top_logprobs_val
+                        and i < len(batch_out.output_top_logprobs_val)
+                        else None
+                    ),
                 }
 
             # Update state
             if output_data["text"]:
-                state.text += output_data["text"][state.last_output_offset:]
+                state.text += output_data["text"][state.last_output_offset :]
                 state.last_output_offset = len(output_data["text"])
 
             if output_data["token_ids"]:
@@ -423,8 +427,12 @@ class GrpcRequestManager:
             result = {
                 "request_id": rid,
                 "embedding": batch_out.embeddings[i],
-                "prompt_tokens": batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0,
-                "finish_reason": batch_out.finish_reason[i] if batch_out.finish_reason else None,
+                "prompt_tokens": (
+                    batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
+                ),
+                "finish_reason": (
+                    batch_out.finish_reason[i] if batch_out.finish_reason else None
+                ),
             }
 
             # Send result
@@ -438,7 +446,7 @@ class GrpcRequestManager:
     async def _handle_health_check_output(self, health_out: HealthCheckOutput):
         """Handle health check output from scheduler."""
         rid = health_out.rid
-        
+
         if rid not in self.rid_to_state:
             logger.warning(f"Health check output for unknown request: {rid}")
             return
@@ -449,8 +457,14 @@ class GrpcRequestManager:
         result = {
             "request_id": rid,
             "healthy": True,  # If we got a response, scheduler is healthy
-            "output_text": health_out.output_str if hasattr(health_out, 'output_str') else "",
-            "finish_reason": health_out.finish_reason if hasattr(health_out, 'finish_reason') else "stop",
+            "output_text": (
+                health_out.output_str if hasattr(health_out, "output_str") else ""
+            ),
+            "finish_reason": (
+                health_out.finish_reason
+                if hasattr(health_out, "finish_reason")
+                else "stop"
+            ),
         }
 
         # Send result
@@ -472,11 +486,13 @@ class GrpcRequestManager:
     def record_request_for_crash_dump(self, obj):
         """Record request for potential crash dump."""
         if len(self.crash_dump_request_list) < 100:
-            self.crash_dump_request_list.append({
-                "time": time.time(),
-                "request_id": getattr(obj, 'rid', 'unknown'),
-                "type": type(obj).__name__,
-            })
+            self.crash_dump_request_list.append(
+                {
+                    "time": time.time(),
+                    "request_id": getattr(obj, "rid", "unknown"),
+                    "type": type(obj).__name__,
+                }
+            )
 
     async def shutdown(self):
         """Gracefully shutdown the request manager."""
@@ -486,10 +502,9 @@ class GrpcRequestManager:
         # Cancel all pending requests
         for rid, state in self.rid_to_state.items():
             if not state.finished:
-                await state.out_queue.put({
-                    "error": "Server shutting down",
-                    "shutdown": True
-                })
+                await state.out_queue.put(
+                    {"error": "Server shutting down", "shutdown": True}
+                )
                 state.finished = True
                 state.event.set()
 
