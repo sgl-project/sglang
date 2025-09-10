@@ -61,45 +61,43 @@ def fused_qkvzba_split_reshape_cat_kernel(
     z,
     b,
     a,
-    mixed_qkvzba,
+    mixed_qkvz,
+    mixed_ba,
     NUM_HEADS_QK: tl.constexpr,
     NUM_HEADS_V: tl.constexpr,
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
 ):
     i_bs, i_qk = tl.program_id(0), tl.program_id(1)
-    QKVZBA_DIM_T: tl.constexpr = (
-        HEAD_QK * 2
-        + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V * 2
-        + NUM_HEADS_V // NUM_HEADS_QK * 2
-    )
+    QKVZ_DIM_T: tl.constexpr = HEAD_QK * 2 + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V * 2
+    BA_DIM_T: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK * 2
     QKV_DIM_T: tl.constexpr = HEAD_QK * 2 + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
     q_end: tl.constexpr = HEAD_QK
     blk_q_ptr = (
-        mixed_qkvzba
-        + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T
-        + i_qk * QKVZBA_DIM_T
+        mixed_qkvz
+        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
+        + i_qk * QKVZ_DIM_T
         + tl.arange(0, q_end)
     )
     k_end: tl.constexpr = q_end + HEAD_QK
     blk_k_ptr = (
-        mixed_qkvzba
-        + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T
-        + i_qk * QKVZBA_DIM_T
+        mixed_qkvz
+        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
+        + i_qk * QKVZ_DIM_T
         + tl.arange(q_end, k_end)
     )
     v_end: tl.constexpr = k_end + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
     blk_v_ptr = (
-        mixed_qkvzba
-        + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T
-        + i_qk * QKVZBA_DIM_T
+        mixed_qkvz
+        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
+        + i_qk * QKVZ_DIM_T
         + tl.arange(k_end, v_end)
     )
     z_end: tl.constexpr = v_end + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
     blk_z_ptr = (
-        mixed_qkvzba
-        + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T
-        + i_qk * QKVZBA_DIM_T
+        mixed_qkvz
+        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
+        + i_qk * QKVZ_DIM_T
         + tl.arange(v_end, z_end)
     )
     blk_q_st_ptr = (
@@ -132,20 +130,14 @@ def fused_qkvzba_split_reshape_cat_kernel(
     tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
     tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
     tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
-    b_end: tl.constexpr = z_end + NUM_HEADS_V // NUM_HEADS_QK
+    b_end: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
     a_end: tl.constexpr = b_end + NUM_HEADS_V // NUM_HEADS_QK
-    for i in tl.static_range(z_end, b_end):
-        blk_b_ptr = (
-            mixed_qkvzba + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T + i_qk * QKVZBA_DIM_T + i
-        )
-        blk_b_st_ptr = (
-            b + i_bs * NUM_HEADS_V + i_qk * NUM_HEADS_V // NUM_HEADS_QK + (i - z_end)
-        )
+    for i in tl.static_range(b_end):
+        blk_b_ptr = mixed_ba + i_bs * NUM_HEADS_QK * BA_DIM_T + i_qk * BA_DIM_T + i
+        blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * NUM_HEADS_V // NUM_HEADS_QK + i
         tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
     for i in tl.static_range(b_end, a_end):
-        blk_a_ptr = (
-            mixed_qkvzba + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T + i_qk * QKVZBA_DIM_T + i
-        )
+        blk_a_ptr = mixed_ba + i_bs * NUM_HEADS_QK * BA_DIM_T + i_qk * BA_DIM_T + i
         blk_a_st_ptr = (
             a + i_bs * NUM_HEADS_V + i_qk * NUM_HEADS_V // NUM_HEADS_QK + (i - b_end)
         )
@@ -153,28 +145,29 @@ def fused_qkvzba_split_reshape_cat_kernel(
 
 
 def fused_qkvzba_split_reshape_cat(
-    mixed_qkvzba,
+    mixed_qkvz,
+    mixed_ba,
     num_heads_qk,
     num_heads_v,
     head_qk,
     head_v,
 ):
-    batch, seq_len = mixed_qkvzba.shape[0], 1
+    batch, seq_len = mixed_qkvz.shape[0], 1
     qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
     mixed_qkv = torch.empty(
         [batch * seq_len, qkv_dim_t],
-        dtype=mixed_qkvzba.dtype,
-        device=mixed_qkvzba.device,
+        dtype=mixed_qkvz.dtype,
+        device=mixed_qkvz.device,
     )
     z = torch.empty(
         [batch * seq_len, num_heads_v, head_v],
-        dtype=mixed_qkvzba.dtype,
-        device=mixed_qkvzba.device,
+        dtype=mixed_qkvz.dtype,
+        device=mixed_qkvz.device,
     )
     b = torch.empty(
         [batch * seq_len, num_heads_v],
-        dtype=mixed_qkvzba.dtype,
-        device=mixed_qkvzba.device,
+        dtype=mixed_ba.dtype,
+        device=mixed_ba.device,
     )
     a = torch.empty_like(b)
     grid = (batch * seq_len, num_heads_qk)
@@ -183,7 +176,8 @@ def fused_qkvzba_split_reshape_cat(
         z,
         b,
         a,
-        mixed_qkvzba,
+        mixed_qkvz,
+        mixed_ba,
         num_heads_qk,
         num_heads_v,
         head_qk,
@@ -393,22 +387,20 @@ class Qwen3GatedDeltaNet(nn.Module):
         forward_batch: ForwardBatch,
     ):
         seq_len, _ = hidden_states.shape
-        has_prefill = forward_batch.forward_mode.is_prefill()
+        is_cuda_graph = forward_batch.forward_mode.is_cuda_graph()
 
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
         projected_states_ba, _ = self.in_proj_ba(hidden_states)
 
-        # if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not has_prefill:
-        #     mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
-        #         projected_states,
-        #         triton.cdiv(self.num_k_heads, self.attn_tp_size),
-        #         triton.cdiv(self.num_v_heads, self.attn_tp_size),
-        #         self.head_k_dim,
-        #         self.head_v_dim,
-        #     )
-        # TODO(caoyizhong): update fused_qkvzba_split_reshape_cat for split qkvz and ba
-        if False:
-            raise NotImplementedError("Not implemented")
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and is_cuda_graph:
+            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
+                projected_states_qkvz,
+                projected_states_ba,
+                triton.cdiv(self.num_k_heads, self.attn_tp_size),
+                triton.cdiv(self.num_v_heads, self.attn_tp_size),
+                self.head_k_dim,
+                self.head_v_dim,
+            )
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 projected_states_qkvz, projected_states_ba
