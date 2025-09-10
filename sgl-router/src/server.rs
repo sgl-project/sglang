@@ -592,6 +592,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         RouterFactory::create_router(&app_context).await?
     };
 
+    // Start health checker for all workers in the registry
+    let _health_checker = app_context
+        .worker_registry
+        .start_health_checker(config.router_config.health_check.check_interval_secs);
+    info!(
+        "Started health checker for workers with {}s interval",
+        config.router_config.health_check.check_interval_secs
+    );
+
     // Set up concurrency limiter with queue if configured
     let (limiter, processor) = crate::middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),

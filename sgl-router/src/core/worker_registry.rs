@@ -346,6 +346,58 @@ impl WorkerRegistry {
             decode_workers: decode_count,
         }
     }
+
+    /// Start a health checker for all workers in the registry
+    /// This should be called once after the registry is populated with workers
+    pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let workers_ref = self.workers.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
+
+            // Counter for periodic load reset (every 10 health check cycles)
+            let mut check_count = 0u64;
+            const LOAD_RESET_INTERVAL: u64 = 10;
+
+            loop {
+                interval.tick().await;
+
+                // Check for shutdown signal
+                if shutdown_clone.load(Ordering::Acquire) {
+                    tracing::debug!("Registry health checker shutting down");
+                    break;
+                }
+
+                // Get all workers from registry
+                let workers: Vec<Arc<dyn crate::core::Worker>> = workers_ref
+                    .iter()
+                    .map(|entry| entry.value().clone())
+                    .collect();
+
+                // Perform health checks
+                for worker in &workers {
+                    let _ = worker.check_health(); // check_health is synchronous
+                }
+
+                // Reset loads periodically
+                check_count += 1;
+                if check_count % LOAD_RESET_INTERVAL == 0 {
+                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
+                    for worker in &workers {
+                        worker.reset_load();
+                    }
+                }
+            }
+        });
+
+        crate::core::HealthChecker::new(handle, shutdown)
+    }
 }
 
 impl Default for WorkerRegistry {

@@ -1032,6 +1032,11 @@ impl fmt::Debug for HealthChecker {
 }
 
 impl HealthChecker {
+    /// Create a new HealthChecker
+    pub fn new(handle: tokio::task::JoinHandle<()>, shutdown: Arc<AtomicBool>) -> Self {
+        Self { handle, shutdown }
+    }
+
     /// Shutdown the health checker gracefully
     pub async fn shutdown(self) {
         self.shutdown.store(true, Ordering::Release);
