@@ -186,8 +186,13 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 tools = [item.function.model_dump() for item in request.tools]
 
-            tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-            parser = FunctionCallParser(request.tools, tool_call_parser, request.tool_choice)
+            # Use JSON parser for required or named tool choice
+            if request.tool_choice == "required" or isinstance(request.tool_choice, ToolChoice) or (isinstance(request.tool_choice, dict) and "function" in request.tool_choice):
+                tool_call_parser = "json"
+            else:
+                tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+            
+            parser = FunctionCallParser(request.tools, tool_call_parser)
             tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
 
         # Use chat template
@@ -880,8 +885,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 logger.error(f"Tool call parsing error: {e}")
                 return ToolCallProcessingResult(None, text, finish_reason)
         
+        # Use JSON parser for required or named tool choice
+        if tool_choice == "required" or isinstance(tool_choice, ToolChoice) or (isinstance(tool_choice, dict) and "function" in tool_choice):
+            tool_call_parser = "json"
+        
         # Use parser since output is not constrained by JSON schema
-        parser = FunctionCallParser(tools, tool_call_parser, tool_choice)
+        parser = FunctionCallParser(tools, tool_call_parser)
         if parser.has_tool_call(text):
             # Set finish reason to tool_calls since we detected tool calls
             if finish_reason["type"] == "stop":
@@ -980,10 +989,15 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
+            # Use JSON parser for required or named tool choice
+            if request.tool_choice == "required" or isinstance(request.tool_choice, ToolChoice) or (isinstance(request.tool_choice, dict) and "function" in request.tool_choice):
+                tool_call_parser = "json"
+            else:
+                tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+            
             parser_dict[index] = FunctionCallParser(
                 tools=request.tools,
-                tool_call_parser=self.tokenizer_manager.server_args.tool_call_parser,
-                tool_choice=request.tool_choice,
+                tool_call_parser=tool_call_parser,
             )
         parser = parser_dict[index]
 

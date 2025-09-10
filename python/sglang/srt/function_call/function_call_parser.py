@@ -46,18 +46,16 @@ class FunctionCallParser:
         "glm45": Glm4MoeDetector,
         "step3": Step3Detector,
         "gpt-oss": GptOssDetector,
+        "json": JsonArrayDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str, tool_choice: Optional[Union[str, ToolChoice]] = None):
-        # Use JSON parsing for tool_choice="required" or named tool
-        if tool_choice == "required" or isinstance(tool_choice, ToolChoice) or (isinstance(tool_choice, dict) and "function" in tool_choice):
-            detector = JsonArrayDetector()
+    def __init__(self, tools: List[Tool], tool_call_parser: str):
+        detector: Type[BaseFormatDetector] = None
+        detector_class = self.ToolCallParserEnum.get(tool_call_parser)
+        if detector_class:
+            detector = detector_class()
         else:
-            detector_class = self.ToolCallParserEnum.get(tool_call_parser)
-            if detector_class:
-                detector = detector_class()
-            else:
-                raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+            raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 
         self.detector = detector
         self.tools = tools
