@@ -4,8 +4,10 @@ import importlib.util
 import logging
 from enum import Enum
 from functools import lru_cache
+from math import prod
 from typing import TYPE_CHECKING, Optional
 
+import torch
 from packaging import version as pkg_version
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
@@ -199,3 +201,12 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and is_dp_attention_enabled()
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
     )
+
+
+def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
+    """
+    Shrink the given tensor and apply the given view to it.  This is
+    used to resize the intermediate fused_moe caches.
+    """
+    assert prod(v) <= x.numel(), f"{v} ({prod(v)}) <= {x.shape} ({x.numel()})"
+    return x.flatten()[: prod(v)].view(*v)

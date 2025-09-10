@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -124,7 +125,7 @@ def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
     return shard_offsets
 
 
-class LinearBase(torch.nn.Module):
+class LinearBase(CustomOp):
     """Base linear layer.
 
     Args:

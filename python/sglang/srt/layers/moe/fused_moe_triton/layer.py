@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -100,7 +101,7 @@ class FusedMoeWeightScaleSupported(Enum):
     BLOCK = "block"
 
 
-class FusedMoE(torch.nn.Module):
+class FusedMoE(CustomOp):
     """FusedMoE layer for MoE models.
 
     This layer contains both MergedColumnParallel weights (gate_up_proj /
