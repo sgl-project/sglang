@@ -30,9 +30,7 @@ use tracing::{debug, error, info, warn};
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
-    policy: Arc<dyn LoadBalancingPolicy>,
     worker_registry: Arc<WorkerRegistry>,
-    #[allow(dead_code)]
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
     worker_startup_timeout_secs: u64,
@@ -50,7 +48,6 @@ impl Router {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         worker_urls: Vec<String>,
-        policy: Arc<dyn LoadBalancingPolicy>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
         // Update active workers gauge
@@ -84,7 +81,10 @@ impl Router {
         };
 
         // Register workers in the registry
+        // In IGW mode, we need to fetch model info from workers
         for url in &worker_urls {
+            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
+            // For now, create worker without model_id
             let worker = BasicWorker::new(url.clone(), WorkerType::Regular)
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {
@@ -94,31 +94,37 @@ impl Router {
                     failure_threshold: ctx.router_config.health_check.failure_threshold,
                     success_threshold: ctx.router_config.health_check.success_threshold,
                 });
-            ctx.worker_registry.register(Arc::new(worker));
-        }
 
-        // Initialize policy with workers if needed (e.g., for cache-aware)
-        if let Some(cache_aware) = policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            let all_workers = ctx.worker_registry.get_all();
-            let worker_refs: Vec<Box<dyn Worker>> =
-                all_workers.iter().map(|w| w.clone_worker()).collect();
-            cache_aware.init_workers(&worker_refs);
-        }
+            let worker_arc = Arc::new(worker);
+            ctx.worker_registry.register(worker_arc.clone());
 
-        // TODO Start health checker for workers in registry
-        // Health checking is centralized in the WorkerRegistry
+            // Notify PolicyRegistry about the new worker
+            let model_id = worker_arc.model_id();
+            let policy = ctx.policy_registry.on_worker_added(model_id, None);
+
+            // If this is a cache-aware policy and it's the first worker for this model,
+            // initialize it with the worker
+            if policy.name() == "cache_aware" {
+                if let Some(cache_aware) = policy
+                    .as_any()
+                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                {
+                    let worker_box = worker_arc.clone_worker();
+                    cache_aware.init_workers(&[worker_box]);
+                }
+            }
+        }
 
         // Setup load monitoring for PowerOfTwo policy
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
         let worker_loads = Arc::new(rx);
 
-        let load_monitor_handle = if policy.name() == "power_of_two" {
+        // Check if default policy is power_of_two for load monitoring
+        let default_policy = ctx.policy_registry.get_default_policy();
+        let load_monitor_handle = if default_policy.name() == "power_of_two" {
             let monitor_urls = worker_urls.clone();
             let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
-            let policy_clone = Arc::clone(&policy);
+            let policy_clone = default_policy.clone();
             let client_clone = ctx.client.clone();
 
             Some(Arc::new(tokio::spawn(async move {
@@ -136,7 +142,6 @@ impl Router {
         };
 
         Ok(Router {
-            policy,
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
@@ -465,23 +470,6 @@ impl Router {
         }
     }
 
-    // New method to route typed requests directly
-    /// Select worker considering circuit breaker state
-    #[allow(dead_code)]
-    fn select_worker_with_circuit_breaker(&self, text: Option<&str>) -> Option<Box<dyn Worker>> {
-        let workers = self.worker_registry.get_all();
-        let available: Vec<Box<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .map(|w| w.clone_worker())
-            .collect();
-        if available.is_empty() {
-            return None;
-        }
-        let idx = self.policy.select_worker(&available, text)?;
-        Some(available[idx].clone_worker())
-    }
-
     /// Select worker for a specific model considering circuit breaker state
     fn select_worker_for_model(
         &self,
@@ -502,7 +490,14 @@ impl Router {
         if available.is_empty() {
             return None;
         }
-        let idx = self.policy.select_worker(&available, text)?;
+
+        // Get the appropriate policy for this model
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        let idx = policy.select_worker(&available, text)?;
         Some(available[idx].clone_worker())
     }
 
@@ -534,7 +529,13 @@ impl Router {
                 };
 
                 // Optional load tracking for cache-aware policy
-                let load_incremented = if self.policy.name() == "cache_aware" {
+                // Get the policy for this model to check if it's cache-aware
+                let policy = match model_id {
+                    Some(model) => self.policy_registry.get_policy_or_default(model),
+                    None => self.policy_registry.get_default_policy(),
+                };
+
+                let load_incremented = if policy.name() == "cache_aware" {
                     worker.increment_load();
                     RouterMetrics::set_running_requests(worker.url(), worker.load());
                     true
@@ -879,12 +880,36 @@ impl Router {
                                     continue;
                                 }
                                 info!("Added worker: {}", dp_url);
+                                // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
                                 let new_worker =
                                     BasicWorker::new(dp_url.to_string(), WorkerType::Regular)
                                         .with_circuit_breaker_config(
                                             self.circuit_breaker_config.clone(),
                                         );
-                                self.worker_registry.register(Arc::new(new_worker));
+
+                                let worker_arc = Arc::new(new_worker);
+                                self.worker_registry.register(worker_arc.clone());
+
+                                // Notify PolicyRegistry about the new worker
+                                let model_id = worker_arc.model_id();
+                                let policy = self.policy_registry.on_worker_added(model_id, None);
+
+                                // If this is a cache-aware policy, update it with all workers for this model
+                                if policy.name() == "cache_aware" {
+                                    if let Some(cache_aware) = policy
+                                        .as_any()
+                                        .downcast_ref::<crate::policies::CacheAwarePolicy>(
+                                    ) {
+                                        let model_workers =
+                                            self.worker_registry.get_by_model_fast(model_id);
+                                        let worker_refs: Vec<Box<dyn Worker>> = model_workers
+                                            .iter()
+                                            .map(|w| w.clone_worker())
+                                            .collect();
+                                        cache_aware.init_workers(&worker_refs);
+                                    }
+                                }
+
                                 worker_added = true;
                             }
                             if !worker_added {
@@ -895,28 +920,38 @@ impl Router {
                                 return Err(format!("Worker {} already exists", worker_url));
                             }
                             info!("Added worker: {}", worker_url);
+
+                            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
                             let new_worker =
                                 BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
                                     .with_circuit_breaker_config(
                                         self.circuit_breaker_config.clone(),
                                     );
-                            self.worker_registry.register(Arc::new(new_worker));
+
+                            let worker_arc = Arc::new(new_worker);
+                            self.worker_registry.register(worker_arc.clone());
+
+                            // Notify PolicyRegistry about the new worker
+                            let model_id = worker_arc.model_id();
+                            let policy = self.policy_registry.on_worker_added(model_id, None);
+
+                            // If this is a cache-aware policy, add this worker to it
+                            if policy.name() == "cache_aware" {
+                                if let Some(cache_aware) = policy
+                                    .as_any()
+                                    .downcast_ref::<crate::policies::CacheAwarePolicy>(
+                                ) {
+                                    // Get all workers for this model
+                                    let model_workers =
+                                        self.worker_registry.get_by_model_fast(model_id);
+                                    let worker_refs: Vec<Box<dyn Worker>> =
+                                        model_workers.iter().map(|w| w.clone_worker()).collect();
+                                    cache_aware.init_workers(&worker_refs);
+                                }
+                            }
                         }
 
                         RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-
-                        // If cache aware policy, initialize the worker in the tree
-                        if let Some(cache_aware) =
-                            self.policy
-                                .as_any()
-                                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                        {
-                            // Get all workers from registry
-                            let all_workers = self.worker_registry.get_all();
-                            let worker_refs: Vec<Box<dyn Worker>> =
-                                all_workers.iter().map(|w| w.clone_worker()).collect();
-                            cache_aware.init_workers(&worker_refs);
-                        }
 
                         return Ok(format!("Successfully added worker: {}", worker_url));
                     } else {
@@ -967,9 +1002,15 @@ impl Router {
             let all_workers = self.worker_registry.get_all();
             for w in all_workers.iter() {
                 if w.url().starts_with(&worker_url_prefix) {
+                    // Get model_id before removing
+                    let model_id = w.model_id().to_string();
+
                     if self.worker_registry.remove_by_url(w.url()).is_some() {
                         info!("Removed worker: {}", w.url());
                         removed_workers.push(w.url().to_string());
+
+                        // Notify PolicyRegistry about the removed worker
+                        self.policy_registry.on_worker_removed(&model_id);
                     } else {
                         warn!("Worker {} not found, skipping removal", w.url());
                     }
@@ -978,34 +1019,49 @@ impl Router {
 
             RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
 
-            // If cache aware policy, remove the workers from the tree
-            if let Some(cache_aware) = self
-                .policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                for dp_url in removed_workers.iter() {
-                    cache_aware.remove_worker_by_url(dp_url);
-                    info!("Removed worker from tree: {}", dp_url);
+            // If any models are using cache aware policy, remove the workers from the tree
+            // Check each removed worker's model and get its policy
+            for dp_url in removed_workers.iter() {
+                if let Some(worker) = self.worker_registry.get_by_url(dp_url) {
+                    let model_id = worker.model_id();
+                    if let Some(policy) = self.policy_registry.get_policy(model_id) {
+                        if let Some(cache_aware) = policy
+                            .as_any()
+                            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                        {
+                            cache_aware.remove_worker_by_url(dp_url);
+                            info!("Removed worker from cache-aware tree: {}", dp_url);
+                        }
+                    }
                 }
             }
         } else {
-            if self.worker_registry.remove_by_url(worker_url).is_some() {
-                info!("Removed worker: {}", worker_url);
-                RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
+            // Get the worker first to extract model_id
+            let model_id = if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                worker.model_id().to_string()
             } else {
                 warn!("Worker {} not found, skipping removal", worker_url);
                 return;
+            };
+
+            if self.worker_registry.remove_by_url(worker_url).is_some() {
+                info!("Removed worker: {}", worker_url);
+
+                // Notify PolicyRegistry about the removed worker
+                self.policy_registry.on_worker_removed(&model_id);
+
+                RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
             }
 
-            // If cache aware policy, remove the workers from the tree
-            if let Some(cache_aware) = self
-                .policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                cache_aware.remove_worker_by_url(worker_url);
-                info!("Removed worker from tree: {}", worker_url);
+            // If the model is using cache aware policy, remove the worker from the tree
+            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
+                if let Some(cache_aware) = policy
+                    .as_any()
+                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                {
+                    cache_aware.remove_worker_by_url(worker_url);
+                    info!("Removed worker from cache-aware tree: {}", worker_url);
+                }
             }
         }
     }
@@ -1388,7 +1444,6 @@ impl RouterTrait for Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policies::RandomPolicy;
     use std::collections::HashMap;
 
     fn create_test_regular_router() -> Router {
@@ -1406,7 +1461,6 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
-            policy: Arc::new(RandomPolicy::new()),
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,

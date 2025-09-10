@@ -375,7 +375,7 @@ async fn delete_worker(
     axum::extract::Path(url): axum::extract::Path<String>,
 ) -> Response {
     if let Some(router_manager) = &state.context.router_manager {
-        match router_manager.remove_worker(&url) {
+        match router_manager.remove_worker_from_registry(&url) {
             Ok(response) => (StatusCode::OK, Json(response)).into_response(),
             Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
         }

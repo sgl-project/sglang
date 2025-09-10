@@ -78,14 +78,14 @@ impl RouterFactory {
     /// Create a regular router with injected policy
     pub async fn create_regular_router(
         worker_urls: &[String],
-        policy_config: &PolicyConfig,
+        _policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // Create policy
-        let policy = PolicyFactory::create_from_config(policy_config);
+        // PolicyRegistry is now used for policy management
+        // The policy_config is used to initialize the default policy in PolicyRegistry
 
-        // Create regular router with injected policy and context
-        let router = Router::new(worker_urls.to_vec(), policy, ctx).await?;
+        // Create regular router with context
+        let router = Router::new(worker_urls.to_vec(), ctx).await?;
 
         Ok(Box::new(router))
     }
@@ -99,21 +99,18 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // Create policies - use specific policies if provided, otherwise fall back to main policy
+        // Initialize policies in PolicyRegistry - use specific policies if provided, otherwise fall back to main policy
         let prefill_policy =
             PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
         let decode_policy =
             PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
 
-        // Create PD router with separate policies and context
-        let router = PDRouter::new(
-            prefill_urls.to_vec(),
-            decode_urls.to_vec(),
-            prefill_policy,
-            decode_policy,
-            ctx,
-        )
-        .await?;
+        // Set the prefill and decode policies in the registry
+        ctx.policy_registry.set_prefill_policy(prefill_policy);
+        ctx.policy_registry.set_decode_policy(decode_policy);
+
+        // Create PD router with context (policies are in PolicyRegistry)
+        let router = PDRouter::new(prefill_urls.to_vec(), decode_urls.to_vec(), ctx).await?;
 
         Ok(Box::new(router))
     }

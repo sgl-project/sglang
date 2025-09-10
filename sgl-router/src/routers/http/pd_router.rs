@@ -36,10 +36,7 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
-    #[allow(dead_code)]
     pub policy_registry: Arc<PolicyRegistry>,
-    pub prefill_policy: Arc<dyn LoadBalancingPolicy>,
-    pub decode_policy: Arc<dyn LoadBalancingPolicy>,
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
@@ -65,8 +62,6 @@ struct PDRequestContext<'a> {
 }
 
 impl PDRouter {
-    // Dynamic worker management methods for service discovery
-
     // Private helper method to perform health check on a new server
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
         crate::routers::http::router::Router::wait_for_healthy_workers(
@@ -224,23 +219,34 @@ impl PDRouter {
         }
 
         // Create Worker for the new prefill server with circuit breaker configuration
+        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
         let worker = WorkerFactory::create_prefill_with_config(
             url.clone(),
             bootstrap_port,
             self.circuit_breaker_config.clone(),
         );
 
-        // Update cache-aware policy if applicable (before registering)
-        if let Some(cache_policy) = self
-            .prefill_policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_policy.add_worker(worker.as_ref());
-        }
+        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
 
         // Register the worker in the registry
-        self.worker_registry.register(Arc::from(worker));
+        self.worker_registry.register(worker_arc.clone());
+
+        // Notify PolicyRegistry about the new worker
+        let model_id = worker_arc.model_id();
+        let policy = self.policy_registry.on_worker_added(model_id, None);
+
+        // If this is a cache-aware policy, update it with all workers for this model
+        if policy.name() == "cache_aware" {
+            if let Some(cache_aware) = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+            {
+                let model_workers = self.worker_registry.get_by_model_fast(model_id);
+                let worker_refs: Vec<Box<dyn Worker>> =
+                    model_workers.iter().map(|w| w.clone_worker()).collect();
+                cache_aware.init_workers(&worker_refs);
+            }
+        }
 
         info!("Added prefill server: {}", url);
         Ok(format!("Successfully added prefill server: {}", url))
@@ -256,47 +262,68 @@ impl PDRouter {
         }
 
         // Create Worker for the new decode server with circuit breaker configuration
+        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
         let worker = WorkerFactory::create_decode_with_config(
             url.clone(),
             self.circuit_breaker_config.clone(),
         );
 
-        // Update cache-aware policy if applicable (before registering)
-        if let Some(cache_policy) = self
-            .decode_policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_policy.add_worker(worker.as_ref());
-        }
+        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
 
         // Register the worker in the registry
-        self.worker_registry.register(Arc::from(worker));
+        self.worker_registry.register(worker_arc.clone());
+
+        // Notify PolicyRegistry about the new worker
+        let model_id = worker_arc.model_id();
+        let policy = self.policy_registry.on_worker_added(model_id, None);
+
+        // If this is a cache-aware policy, update it with all workers for this model
+        if policy.name() == "cache_aware" {
+            if let Some(cache_aware) = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+            {
+                let model_workers = self.worker_registry.get_by_model_fast(model_id);
+                let worker_refs: Vec<Box<dyn Worker>> =
+                    model_workers.iter().map(|w| w.clone_worker()).collect();
+                cache_aware.init_workers(&worker_refs);
+            }
+        }
 
         info!("Added decode server: {}", url);
         Ok(format!("Successfully added decode server: {}", url))
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
-        // Check if worker exists
-        let worker = self.worker_registry.get_by_url(url);
-        if worker.is_none() {
-            return Err(PDRouterError::WorkerNotFound {
-                url: url.to_string(),
-            });
-        }
-
-        // Remove from cache-aware policy if applicable
-        if let Some(cache_policy) = self
-            .prefill_policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_policy.remove_worker_by_url(url);
-        }
+        // Check if worker exists and get model_id
+        let model_id = match self.worker_registry.get_by_url(url) {
+            Some(worker) => worker.model_id().to_string(),
+            None => {
+                return Err(PDRouterError::WorkerNotFound {
+                    url: url.to_string(),
+                });
+            }
+        };
 
         // Remove from registry
         let removed = self.worker_registry.remove_by_url(url);
+
+        if removed.is_some() {
+            // Notify PolicyRegistry about the removed worker
+            self.policy_registry.on_worker_removed(&model_id);
+
+            // Get the policy for this model to update cache-aware if needed
+            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
+                if policy.name() == "cache_aware" {
+                    if let Some(cache_aware) = policy
+                        .as_any()
+                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                    {
+                        cache_aware.remove_worker_by_url(url);
+                    }
+                }
+            }
+        }
 
         if removed.is_some() {
             info!("Removed prefill server: {}", url);
@@ -309,25 +336,35 @@ impl PDRouter {
     }
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
-        // Check if worker exists
-        let worker = self.worker_registry.get_by_url(url);
-        if worker.is_none() {
-            return Err(PDRouterError::WorkerNotFound {
-                url: url.to_string(),
-            });
-        }
-
-        // Remove from cache-aware policy if applicable
-        if let Some(cache_policy) = self
-            .decode_policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_policy.remove_worker_by_url(url);
-        }
+        // Check if worker exists and get model_id
+        let model_id = match self.worker_registry.get_by_url(url) {
+            Some(worker) => worker.model_id().to_string(),
+            None => {
+                return Err(PDRouterError::WorkerNotFound {
+                    url: url.to_string(),
+                });
+            }
+        };
 
         // Remove from registry
         let removed = self.worker_registry.remove_by_url(url);
+
+        if removed.is_some() {
+            // Notify PolicyRegistry about the removed worker
+            self.policy_registry.on_worker_removed(&model_id);
+
+            // Get the policy for this model to update cache-aware if needed
+            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
+                if policy.name() == "cache_aware" {
+                    if let Some(cache_aware) = policy
+                        .as_any()
+                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                    {
+                        cache_aware.remove_worker_by_url(url);
+                    }
+                }
+            }
+        }
 
         if removed.is_some() {
             info!("Removed decode server: {}", url);
@@ -343,8 +380,6 @@ impl PDRouter {
     pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
-        prefill_policy: Arc<dyn LoadBalancingPolicy>,
-        decode_policy: Arc<dyn LoadBalancingPolicy>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
@@ -412,6 +447,10 @@ impl PDRouter {
         // Set up background load monitoring for power-of-two selection
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
         let worker_loads = Arc::new(rx);
+
+        // Get policies from registry to check if we need load monitoring
+        let prefill_policy = ctx.policy_registry.get_prefill_policy();
+        let decode_policy = ctx.policy_registry.get_decode_policy();
 
         let load_monitor_handle =
             if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
@@ -520,8 +559,6 @@ impl PDRouter {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
-            prefill_policy,
-            decode_policy,
             worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: ctx
                 .router_config
@@ -1079,7 +1116,10 @@ impl PDRouter {
 
     // Check if either prefill or decode policy needs request text
     fn policies_need_request_text(&self) -> bool {
-        self.prefill_policy.needs_request_text() || self.decode_policy.needs_request_text()
+        // For now, check the default policy
+        // TODO: In the future, we might want to check per-model policies
+        let default_policy = self.policy_registry.get_default_policy();
+        default_policy.needs_request_text()
     }
 
     // Select a pair of prefill and decode servers considering circuit breaker state
@@ -1112,16 +1152,20 @@ impl PDRouter {
         };
 
         // Select workers using helper function
+        // For PD router, we use the default policy for both prefill and decode
+        // TODO: In the future, we might want separate policies per worker type and model
+        let default_policy = self.policy_registry.get_default_policy();
+
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
-            &*self.prefill_policy,
+            &*default_policy,
             request_text,
             "prefill",
         )?;
 
         let decode = Self::pick_worker_by_policy_arc(
             &decode_workers,
-            &*self.decode_policy,
+            &*default_policy,
             request_text,
             "decode",
         )?;
@@ -2050,11 +2094,8 @@ impl RouterTrait for PDRouter {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
-    use crate::policies::RandomPolicy;
 
     fn create_test_pd_router() -> PDRouter {
-        let prefill_policy = Arc::new(RandomPolicy::new());
-        let decode_policy = Arc::new(RandomPolicy::new());
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
@@ -2062,8 +2103,6 @@ mod tests {
         PDRouter {
             worker_registry,
             policy_registry,
-            prefill_policy,
-            decode_policy,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
@@ -2297,8 +2336,13 @@ mod tests {
     async fn test_load_monitor_updates() {
         let power_of_two_policy = Arc::new(crate::policies::PowerOfTwoPolicy::new());
         let mut router = create_test_pd_router();
-        router.prefill_policy = power_of_two_policy.clone();
-        router.decode_policy = power_of_two_policy;
+        // Set power_of_two policies in the registry
+        router
+            .policy_registry
+            .set_prefill_policy(power_of_two_policy.clone());
+        router
+            .policy_registry
+            .set_decode_policy(power_of_two_policy);
 
         // Create load channel
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());

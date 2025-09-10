@@ -259,7 +259,10 @@ impl RouterManager {
     }
 
     /// Remove a worker from the registry
-    pub fn remove_worker(&self, url: &str) -> Result<WorkerApiResponse, WorkerErrorResponse> {
+    pub fn remove_worker_from_registry(
+        &self,
+        url: &str,
+    ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
         // Get worker to extract model_id before removing
         let model_id = self
             .worker_registry
@@ -495,7 +498,7 @@ impl WorkerManagement for RouterManager {
 
     /// Remove a worker from the registry
     fn remove_worker(&self, worker_url: &str) {
-        let _ = self.remove_worker(worker_url);
+        let _ = self.remove_worker_from_registry(worker_url);
     }
 
     /// Get all worker URLs from the registry

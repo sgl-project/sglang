@@ -27,6 +27,12 @@ pub struct PolicyRegistry {
 
     /// Default policy factory
     default_policy_factory: PolicyFactory,
+
+    /// Prefill policy for PD mode
+    prefill_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
+
+    /// Decode policy for PD mode
+    decode_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
 }
 
 impl PolicyRegistry {
@@ -40,6 +46,8 @@ impl PolicyRegistry {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
             default_policy_factory: factory,
+            prefill_policy: Arc::new(RwLock::new(None)),
+            decode_policy: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -221,6 +229,36 @@ impl PolicyRegistry {
         policies.clear();
         let mut counts = self.model_worker_counts.write().unwrap();
         counts.clear();
+    }
+
+    /// Set the prefill policy for PD mode
+    pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        let mut prefill_policy = self.prefill_policy.write().unwrap();
+        *prefill_policy = Some(policy);
+    }
+
+    /// Set the decode policy for PD mode
+    pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        let mut decode_policy = self.decode_policy.write().unwrap();
+        *decode_policy = Some(policy);
+    }
+
+    /// Get the prefill policy for PD mode, or default if not set
+    pub fn get_prefill_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
+        let prefill_policy = self.prefill_policy.read().unwrap();
+        prefill_policy
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| self.get_default_policy())
+    }
+
+    /// Get the decode policy for PD mode, or default if not set
+    pub fn get_decode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
+        let decode_policy = self.decode_policy.read().unwrap();
+        decode_policy
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| self.get_default_policy())
     }
 }
 
