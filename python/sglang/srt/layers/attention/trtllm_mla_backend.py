@@ -583,7 +583,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or self.forward_decode_metadata
             )
 
-            # Ensure query has shape [bs, acc_q_len, num_q_heads, head_dim] when seq_len 1
+            # Ensure query has shape [bs, num_draft_tokens, num_q_heads, head_dim]
             bs = forward_batch.batch_size
             q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
 
