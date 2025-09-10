@@ -121,7 +121,10 @@ class SchedulerProfilerMixin:
 
             self.rpd_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                "rpd-" + str(time.time()) + f"-TP-{self.tp_rank}" + ".trace.json.gz",
+                "rpd-" + str(time.time()) 
+                + f"-TP-{self.tp_rank}" 
+                + f"-PP-{self.pp_rank}" 
+                + ".trace.json.gz",
             )
 
             if self.tp_rank == 0:
@@ -191,6 +194,7 @@ class SchedulerProfilerMixin:
                         self.torch_profiler_output_dir,
                         self.profile_id
                         + f"-TP-{self.tp_rank}"
+                        + f"-PP-{self.pp_rank}" 
                         + stage_suffix
                         + ".trace.json.gz",
                     )
@@ -214,7 +218,9 @@ class SchedulerProfilerMixin:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
                 str(time.time())
-                + f"-TP-{self.tp_rank}-memory"
+                + f"-TP-{self.tp_rank}"
+                + f"-PP-{self.pp_rank}" 
+                + "-memory"
                 + stage_suffix
                 + ".pickle",
             )
