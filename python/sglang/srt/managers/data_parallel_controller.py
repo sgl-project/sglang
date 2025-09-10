@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import struct
 import sys
@@ -29,6 +30,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
@@ -107,6 +109,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
+        self.total_req_num = 0
 
         if server_args.enable_dp_attention:
             dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
@@ -289,7 +292,21 @@ class DataParallelController:
                 self.workers
             )
         else:
-            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+            if req.data_parallel_rank is not None:
+                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+                self.workers[req.data_parallel_rank].send_pyobj(req)
+            else:
+                DP_ROUND_ROBIN = os.getenv("DP_ROUND_ROBIN", "0") == "1"
+                if DP_ROUND_ROBIN and self.server_args.disaggregation_mode == "decode":
+                    self.total_req_num = (
+                        1
+                        if self.total_req_num == len(self.workers)
+                        else self.total_req_num + 1
+                    )
+                    select_result = (self.total_req_num - 1) % len(self.workers)
+                else:
+                    select_result = req.bootstrap_room % len(self.workers)
+                self.workers[select_result].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
         if self.maybe_external_dp_rank_routing(req):

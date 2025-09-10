@@ -12,6 +12,7 @@ from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
@@ -21,6 +22,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_mlapo = get_bool_env_var("SGLANG_USE_MLAPO")
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -96,6 +98,11 @@ class RotaryEmbedding(CustomOp):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
+        self.cos_cached_total = None
+        self.sin_cached_total = None
+        self.cos_cached = None
+        self.sin_cached = None
+
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
         if not _is_cuda:
@@ -118,7 +125,7 @@ class RotaryEmbedding(CustomOp):
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
         inv_freq = 1.0 / (
-            base
+            baseW
             ** (
                 torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
             )
@@ -134,7 +141,41 @@ class RotaryEmbedding(CustomOp):
         cos = freqs.cos()
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.cos_cached_total = torch.cos(emb)
+        self.sin_cached_total = torch.sin(emb)
         return cache
+
+    def get_cos_cached_total(self):
+        return self.cos_cached_total
+
+    def get_sin_cached_total(self):
+        return self.sin_cached_total
+
+    def update_and_get_cos_sin_cache(
+        self, positions, layer_id, dtype, offsets: Optional[torch.Tensor] = None
+    ):
+        if layer_id == 0:
+            self.cos_cached = (
+                self.cos_cached_total[
+                    torch.add(positions, offsets) if offsets is not None else positions
+                ]
+                .unsqueeze(-2)
+                .unsqueeze(-2)
+                .to(dtype)
+            )
+            self.sin_cached = (
+                self.sin_cached_total[
+                    torch.add(positions, offsets) if offsets is not None else positions
+                ]
+                .unsqueeze(-2)
+                .unsqueeze(-2)
+                .to(dtype)
+            )
+        cos = self.cos_cached.to(positions.device)
+        sin = self.sin_cached.to(positions.device)
+        return cos, sin
 
     def forward_native(
         self,
@@ -174,8 +215,6 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-        import os
-
         if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
             return self.forward_native(positions, query, key, offsets)
         else:
@@ -732,6 +771,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         cos = freqs.cos() * self.mscale
         sin = freqs.sin() * self.mscale
         cache = torch.cat((cos, sin), dim=-1)
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.cos_cached_total = torch.cos(emb) * self.mscale
+        self.sin_cached_total = torch.sin(emb) * self.mscale
         return cache
 
     def forward_native(
@@ -1029,7 +1072,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward(
         self,
         positions: torch.Tensor,
