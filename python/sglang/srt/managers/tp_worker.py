@@ -12,10 +12,11 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
+from __future__ import annotations
 
 import logging
 import threading
-from typing import Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 
@@ -44,6 +45,9 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
 
@@ -167,10 +171,10 @@ class TpModelWorker:
 
         self.hicache_layer_transfer_counter = None
 
-    def register_hicache_layer_transfer_counter(self, counter):
+    def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
 
-    def set_hicache_consumer(self, consumer_index):
+    def set_hicache_consumer(self, consumer_index: int):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
@@ -230,6 +234,9 @@ class TpModelWorker:
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
     ]:
+        # update the consumer index of hicache to the running batch
+        self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         pp_proxy_tensors = None

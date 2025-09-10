@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,8 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
+    prefill_round_robin_balance: bool = False
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -625,12 +628,12 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        if self.dp_size == 1:
+            self.enable_dp_attention = False
+
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
-            assert (
-                self.dp_size > 1
-            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
             assert self.tp_size % self.dp_size == 0
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
@@ -653,11 +656,13 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
-            if not self.disable_shared_experts_fusion:
-                self.disable_shared_experts_fusion = True
-                logger.warning(
-                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
-                )
+            assert (
+                self.quantization == "modelopt_fp4" or self.quantization == "fp8"
+            ), "modelopt_fp4 quantization is required for Flashinfer TRTLLM MoE"
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -809,6 +814,13 @@ class ServerArgs:
 
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+
+            if self.dp_size > 1 and not is_in_ci():
+                assert self.prefill_round_robin_balance, (
+                    "Prefill round robin balance is required when dp size > 1. "
+                    "Please make sure that the prefill instance is launched with `--load-balance-method round_robin`"
+                    " and `--prefill-round-robin-balance` is set for decode server."
+                )
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
@@ -1404,6 +1416,12 @@ class ServerArgs:
                 "minimum_tokens",
             ],
         )
+        parser.add_argument(
+            "--prefill-round-robin-balance",
+            default=ServerArgs.prefill_round_robin_balance,
+            action="store_true",
+            help="Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank.",
+        )
 
         # Multi-node distributed serving
         parser.add_argument(
@@ -1535,6 +1553,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--speculative-draft-model-path",
+            "--speculative-draft-model",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
         )
@@ -1623,7 +1642,7 @@ class ServerArgs:
         parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
-            choices=["mxfp4", "bf16"],
+            choices=["default", "bf16"],
             default=ServerArgs.flashinfer_mxfp4_moe_precision,
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )

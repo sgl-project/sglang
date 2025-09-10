@@ -34,6 +34,7 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
+from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
 
 if torch.version.hip is not None:
     from sgl_kernel.elementwise import gelu_quick
