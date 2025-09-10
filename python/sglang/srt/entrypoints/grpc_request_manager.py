@@ -121,7 +121,7 @@ class GrpcRequestManager:
         self.recv_from_scheduler = get_zmq_socket(
             context,
             zmq.PULL,
-            port_args.tokenizer_ipc_name,
+            port_args.detokenizer_ipc_name,
             bind=True
         )
 
@@ -156,7 +156,7 @@ class GrpcRequestManager:
 
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
-            f"recv={port_args.tokenizer_ipc_name}, "
+            f"recv={port_args.detokenizer_ipc_name}, "
             f"send={port_args.scheduler_input_ipc_name}"
         )
 
@@ -367,18 +367,22 @@ class GrpcRequestManager:
             # Extract output for this request
             output_data = {
                 "request_id": rid,
-                "text": batch_out.output_strs[i] if batch_out.output_strs else "",
+                "text": batch_out.decoded_texts[i] if batch_out.decoded_texts else "",
                 "token_ids": batch_out.output_ids[i] if batch_out.output_ids else [],
-                "finished": batch_out.finished_reason[i] is not None,
-                "meta_info": batch_out.meta_info[i] if batch_out.meta_info else {},
+                "finished": batch_out.finished_reasons[i] is not None,
+                "meta_info": {
+                    "prompt_tokens": batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0,
+                    "completion_tokens": batch_out.completion_tokens[i] if batch_out.completion_tokens else 0,
+                    "finish_reason": str(batch_out.finished_reasons[i]) if batch_out.finished_reasons[i] else None
+                }
             }
 
             # Add logprobs if available
-            if batch_out.output_token_logprobs:
+            if batch_out.output_token_logprobs_val and i < len(batch_out.output_token_logprobs_val):
                 output_data["logprobs"] = {
-                    "tokens": batch_out.output_token_logprobs[i],
-                    "top_logprobs": batch_out.output_top_logprobs[i]
-                    if batch_out.output_top_logprobs else None
+                    "tokens": batch_out.output_token_logprobs_val[i],
+                    "top_logprobs": batch_out.output_top_logprobs_val[i]
+                    if batch_out.output_top_logprobs_val and i < len(batch_out.output_top_logprobs_val) else None
                 }
 
             # Update state
