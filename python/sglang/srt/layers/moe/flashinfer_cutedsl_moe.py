@@ -76,7 +76,7 @@ def flashinfer_cutedsl_moe_masked(
     n = w2.shape[-1] * 2  # intermediate dimension
     a_q = hidden_states[0].view(torch.uint8)
     a_q_sf = hidden_states[1].view(torch.float8_e4m3fn)
-    num_experts, m, k_by_2 = a_q.shape
+    m, k_by_2, num_experts = a_q.shape
     k = k_by_2 * 2
 
     assert w1.shape[-2] == 2 * n, f"w1 last-2 dim must be 2*n, got {w1.shape}"
@@ -112,7 +112,6 @@ def flashinfer_cutedsl_moe_masked(
     c_dtype = "bfloat16"
 
     # Gemm1
-    a_q = a_q.permute(1, 2, 0)
     grouped_gemm_nt_masked(
         (a_q, a_q_sf),
         (w1.permute(1, 2, 0), w1_blockscale),

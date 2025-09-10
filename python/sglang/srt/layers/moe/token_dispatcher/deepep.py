@@ -563,7 +563,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_experts,
                 use_fp8=use_fp8,
                 use_nvfp4=True,
-                x_global_scales=input_global_scale,
+                x_sf_scale=input_global_scale,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
