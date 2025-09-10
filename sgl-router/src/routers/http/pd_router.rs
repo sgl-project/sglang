@@ -118,83 +118,95 @@ impl PDRouter {
         (results, errors)
     }
 
-    // Helper to get worker URLs from a worker collection
-    fn get_worker_urls_by_type(&self, worker_type_enum: WorkerType) -> Vec<String> {
+    // Helper to get prefill worker URLs
+    fn get_prefill_worker_urls(&self) -> Vec<String> {
         self.worker_registry
-            .get_by_type(&worker_type_enum)
+            .get_prefill_workers()
             .iter()
             .map(|w| w.url().to_string())
             .collect()
     }
 
-    // Generic helper for proxying requests to the first worker
-    async fn proxy_to_first_worker(
+    // Helper to get decode worker URLs
+    fn get_decode_worker_urls(&self) -> Vec<String> {
+        self.worker_registry
+            .get_decode_workers()
+            .iter()
+            .map(|w| w.url().to_string())
+            .collect()
+    }
+
+    // Helper for proxying requests to the first prefill worker
+    async fn proxy_to_first_prefill_worker(
         &self,
-        worker_type_enum: WorkerType,
         endpoint: &str,
-        worker_type: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        // Get first worker URL from registry
-        let workers = self.worker_registry.get_by_type(&worker_type_enum);
+        let workers = self.worker_registry.get_prefill_workers();
         let first_worker_url = workers.first().map(|w| w.url().to_string());
 
         if let Some(worker_url) = first_worker_url {
-            let url = format!("{}/{}", worker_url, endpoint);
-            let mut request_builder = self.client.get(&url);
-
-            // Add headers if provided
-            if let Some(headers) = headers {
-                for (name, value) in headers {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
-
-            match request_builder.send().await {
-                Ok(res) if res.status().is_success() => {
-                    let response_headers = header_utils::preserve_response_headers(res.headers());
-
-                    match res.bytes().await {
-                        Ok(body) => {
-                            let mut response = Response::new(axum::body::Body::from(body));
-                            *response.status_mut() = StatusCode::OK;
-                            *response.headers_mut() = response_headers;
-                            response
-                        }
-                        Err(e) => {
-                            error!("Failed to read response body: {}", e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to read response body: {}", e),
-                            )
-                                .into_response()
-                        }
-                    }
-                }
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        status,
-                        format!("{} server returned status: {}", worker_type, res.status()),
-                    )
-                        .into_response()
-                }
-                Err(e) => {
-                    error!("Failed to proxy request to {} server: {}", worker_type, e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to proxy request: {}", e),
-                    )
-                        .into_response()
-                }
-            }
+            self.proxy_to_worker(worker_url, endpoint, headers).await
         } else {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("No {} servers available", worker_type),
+                "No prefill servers available".to_string(),
             )
                 .into_response()
+        }
+    }
+
+    // Generic helper for proxying to a specific worker
+    async fn proxy_to_worker(
+        &self,
+        worker_url: String,
+        endpoint: &str,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Response {
+        let url = format!("{}/{}", worker_url, endpoint);
+        let mut request_builder = self.client.get(&url);
+
+        // Add headers if provided
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                request_builder = request_builder.header(name, value);
+            }
+        }
+
+        match request_builder.send().await {
+            Ok(res) if res.status().is_success() => {
+                let response_headers = header_utils::preserve_response_headers(res.headers());
+
+                match res.bytes().await {
+                    Ok(body) => {
+                        let mut response = Response::new(axum::body::Body::from(body));
+                        *response.status_mut() = StatusCode::OK;
+                        *response.headers_mut() = response_headers;
+                        response
+                    }
+                    Err(e) => {
+                        error!("Failed to read response body: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to read response body: {}", e),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+            Ok(res) => {
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                (status, format!("{} server returned status: ", res.status())).into_response()
+            }
+            Err(e) => {
+                error!("Failed to proxy request server: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to proxy request: {}", e),
+                )
+                    .into_response()
+            }
         }
     }
 
@@ -1719,7 +1731,7 @@ impl RouterTrait for PDRouter {
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         // Get info from the first decode server to match sglang's server info format
         // Note: We use decode workers for server info to match expected format
-        self.proxy_to_first_worker(WorkerType::Decode, "get_server_info", "decode", None)
+        self.proxy_to_first_prefill_worker("get_server_info", None)
             .await
     }
 
@@ -1728,15 +1740,8 @@ impl RouterTrait for PDRouter {
         let headers = header_utils::copy_request_headers(&req);
 
         // Proxy to first prefill worker
-        self.proxy_to_first_worker(
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            "v1/models",
-            "prefill",
-            Some(headers),
-        )
-        .await
+        self.proxy_to_first_prefill_worker("v1/models", Some(headers))
+            .await
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
@@ -1744,15 +1749,8 @@ impl RouterTrait for PDRouter {
         let headers = header_utils::copy_request_headers(&req);
 
         // Proxy to first prefill worker
-        self.proxy_to_first_worker(
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            "get_model_info",
-            "prefill",
-            Some(headers),
-        )
-        .await
+        self.proxy_to_first_prefill_worker("get_model_info", Some(headers))
+            .await
     }
 
     async fn route_generate(
@@ -1957,9 +1955,7 @@ impl RouterTrait for PDRouter {
         let mut errors = Vec::new();
 
         // Process prefill workers
-        let prefill_urls = self.get_worker_urls_by_type(WorkerType::Prefill {
-            bootstrap_port: None,
-        });
+        let prefill_urls = self.get_prefill_worker_urls();
         for worker_url in prefill_urls {
             match get_worker_load(&self.client, &worker_url).await {
                 Some(load) => {
@@ -1972,7 +1968,7 @@ impl RouterTrait for PDRouter {
         }
 
         // Process decode workers
-        let decode_urls = self.get_worker_urls_by_type(WorkerType::Decode);
+        let decode_urls = self.get_decode_worker_urls();
         for worker_url in decode_urls {
             match get_worker_load(&self.client, &worker_url).await {
                 Some(load) => {
