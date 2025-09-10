@@ -11,7 +11,9 @@ class BaseLoRABackend:
        Each backend has its own implementation of Lora kernels.
 
     Args:
-        batch_info: information of current batch for use
+        max_loras_per_batch: maximum number of different lora weights
+                             that can be applied in a single forward batch.
+        device: the device where the backend runs.
     """
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
