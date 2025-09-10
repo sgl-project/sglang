@@ -1093,7 +1093,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and is_sm100_supported()
                 and self.current_attention_backend in ("cutlass_mla", "flashinfer")
                 and _is_fp4_quantization_enabled()
-			):
+            ):
                 skip_chunked_mha = True
 
             if (
