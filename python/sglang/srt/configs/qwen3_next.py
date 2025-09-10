@@ -15,6 +15,7 @@
 """Qwen3Hybrid model configuration"""
 
 import enum
+import os
 
 import numpy as np
 import torch
@@ -24,7 +25,6 @@ from transformers.utils import logging
 
 from sglang.srt.distributed.utils import divide
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-import os
 
 logger = logging.get_logger(__name__)
 
