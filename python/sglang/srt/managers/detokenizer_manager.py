@@ -246,6 +246,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_hidden_states=recv_obj.output_hidden_states,
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
@@ -257,6 +259,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
