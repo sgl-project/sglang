@@ -54,7 +54,7 @@ impl SglangSchedulerClient {
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error>> {
         debug!("Sending health check request");
         let request = Request::new(proto::HealthCheckRequest {
-            include_detailed_metrics: false,
+            input: Some(proto::health_check_request::Input::Text("Hello".to_string())),
         });
 
         let response = self.client.health_check(request).await?;
@@ -74,20 +74,6 @@ impl SglangSchedulerClient {
         Ok(())
     }
 
-    /// Flush cache
-    pub async fn flush_cache(
-        &mut self,
-        flush_all: bool,
-        session_ids: &[String],
-    ) -> Result<proto::FlushCacheResponse, Box<dyn std::error::Error>> {
-        let request = Request::new(proto::FlushCacheRequest {
-            flush_all,
-            session_ids: session_ids.to_vec(),
-        });
-
-        let response = self.client.flush_cache(request).await?;
-        Ok(response.into_inner())
-    }
 }
 
 #[cfg(test)]
@@ -142,9 +128,9 @@ mod tests {
     #[test]
     fn test_health_check_request() {
         let health_req = proto::HealthCheckRequest {
-            include_detailed_metrics: true,
+            input: Some(proto::health_check_request::Input::Text("test".to_string())),
         };
-        assert!(health_req.include_detailed_metrics);
+        assert!(health_req.input.is_some());
     }
 
     #[test]
@@ -157,16 +143,6 @@ mod tests {
         assert_eq!(abort_req.reason, "User canceled");
     }
 
-    #[test]
-    fn test_flush_cache_request() {
-        let flush_req = proto::FlushCacheRequest {
-            flush_all: true,
-            session_ids: vec!["session1".to_string(), "session2".to_string()],
-        };
-        assert!(flush_req.flush_all);
-        assert_eq!(flush_req.session_ids.len(), 2);
-        assert_eq!(flush_req.session_ids[0], "session1");
-    }
 
     #[test]
     fn test_sampling_params_defaults() {

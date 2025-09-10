@@ -1218,54 +1218,6 @@ impl RouterTrait for Router {
         todo!()
     }
 
-    async fn flush_cache(&self) -> Response {
-        // Get all worker URLs
-        let worker_urls = self.get_worker_urls();
-
-        // Send requests to all workers concurrently without headers
-        let mut tasks = Vec::new();
-        for worker_url in &worker_urls {
-            let worker_url = if self.dp_aware {
-                // Need to extract the URL from "http://host:port@dp_rank"
-                let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
-                    Ok(tup) => tup,
-                    Err(e) => {
-                        error!("Failed to extract dp_rank: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to extract dp_rank: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-                worker_url_prefix
-            } else {
-                worker_url
-            };
-            let request_builder = self.client.post(format!("{}/flush_cache", worker_url));
-            tasks.push(request_builder.send());
-        }
-
-        // Wait for all responses
-        let results = futures_util::future::join_all(tasks).await;
-
-        // Check if all succeeded
-        let all_success = results.iter().all(|r| {
-            r.as_ref()
-                .map(|res| res.status().is_success())
-                .unwrap_or(false)
-        });
-
-        if all_success {
-            (StatusCode::OK, "Cache flushed on all servers").into_response()
-        } else {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Cache flush failed on one or more servers",
-            )
-                .into_response()
-        }
-    }
 
     async fn get_worker_loads(&self) -> Response {
         let urls = self.get_worker_urls();

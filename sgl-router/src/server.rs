@@ -194,9 +194,6 @@ async fn remove_worker(
         .into_response()
 }
 
-async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    state.router.flush_cache().await
-}
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
     state.router.get_worker_loads().await
@@ -245,7 +242,6 @@ pub fn build_app(
         .route("/add_worker", post(add_worker))
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
-        .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads));
 
     // Build app with all routes and middleware

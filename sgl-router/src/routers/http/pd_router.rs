@@ -1938,38 +1938,6 @@ impl RouterTrait for PDRouter {
         todo!()
     }
 
-    async fn flush_cache(&self) -> Response {
-        // Process both prefill and decode workers
-        let (prefill_results, prefill_errors) = self
-            .process_workers(&self.prefill_workers, "Prefill", "flush_cache")
-            .await;
-        let (decode_results, decode_errors) = self
-            .process_workers(&self.decode_workers, "Decode", "flush_cache")
-            .await;
-
-        // Combine results and errors
-        let mut results = prefill_results;
-        results.extend(decode_results);
-        let mut errors = prefill_errors;
-        errors.extend(decode_errors);
-
-        if errors.is_empty() {
-            (
-                StatusCode::OK,
-                format!("Cache flushed successfully: {:?}", results),
-            )
-                .into_response()
-        } else {
-            (
-                StatusCode::PARTIAL_CONTENT,
-                format!(
-                    "Partial success. Results: {:?}, Errors: {:?}",
-                    results, errors
-                ),
-            )
-                .into_response()
-        }
-    }
 
     async fn get_worker_loads(&self) -> Response {
         let mut loads = HashMap::new();
