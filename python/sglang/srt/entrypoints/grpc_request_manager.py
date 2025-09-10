@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
     BatchTokenIDOut,
+    HealthCheckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -333,6 +334,8 @@ class GrpcRequestManager:
                     await self._handle_batch_output(recv_obj)
                 elif isinstance(recv_obj, BatchEmbeddingOut):
                     await self._handle_embedding_output(recv_obj)
+                elif isinstance(recv_obj, HealthCheckOutput):
+                    await self._handle_health_check_output(recv_obj)
                 else:
                     logger.warning(f"Unknown output type: {type(recv_obj)}")
 
@@ -427,6 +430,32 @@ class GrpcRequestManager:
             state.finished = True
             state.finished_time = time.time()
             state.event.set()
+
+    async def _handle_health_check_output(self, health_out: HealthCheckOutput):
+        """Handle health check output from scheduler."""
+        rid = health_out.rid
+        
+        if rid not in self.rid_to_state:
+            logger.warning(f"Health check output for unknown request: {rid}")
+            return
+
+        state = self.rid_to_state[rid]
+
+        # Create health check result
+        result = {
+            "request_id": rid,
+            "healthy": True,  # If we got a response, scheduler is healthy
+            "output_text": health_out.output_str if hasattr(health_out, 'output_str') else "",
+            "finish_reason": health_out.finish_reason if hasattr(health_out, 'finish_reason') else "stop",
+        }
+
+        # Send result
+        await state.out_queue.put(result)
+
+        # Mark as finished
+        state.finished = True
+        state.finished_time = time.time()
+        state.event.set()
 
     async def _send_to_scheduler(self, obj):
         """Send an object to the scheduler via ZMQ."""
