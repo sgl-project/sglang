@@ -5,10 +5,15 @@ from typing import Optional
 
 import torch
 import triton
-from sgl_kernel import machete_mm, machete_supported_schedules
-from sgl_kernel.scalar_type import ScalarType, scalar_types
+from sgl_kernel import (
+    ScalarType,
+    machete_mm,
+    machete_prepack_B,
+    machete_supported_schedules,
+    scalar_types,
+)
 
-from sglang.srt.layers.quantization.utils import machete_quantize_and_pack
+from sglang.srt.layers.quantization.utils import pack_rows, quantize_weights
 
 
 @dataclass
@@ -39,6 +44,29 @@ class TypeConfig:
     group_zero_type: Optional[torch.dtype]
     channel_scale_type: Optional[torch.dtype]
     token_scale_type: Optional[torch.dtype]
+
+
+def machete_quantize_and_pack(
+    atype: torch.dtype,
+    w: torch.Tensor,
+    wtype: ScalarType,
+    stype: Optional[torch.dtype],
+    group_size: Optional[int],
+    zero_points: bool = False,
+):
+    w_ref, w_q, w_s, w_zp = quantize_weights(
+        w,
+        wtype,
+        group_size=group_size,
+        zero_points=zero_points,
+        ref_zero_points_after_scales=True,
+    )
+
+    w_q = pack_rows(w_q, wtype.size_bits, *w_q.shape)
+    w_q = w_q.t().contiguous().t()  # convert to col major
+
+    w_q_machete = machete_prepack_B(w_q, atype, wtype, stype)
+    return w_ref, w_q_machete, w_s, w_zp
 
 
 def group_size_valid(shape: tuple[int, int, int], group_size: Optional[int]) -> bool:
