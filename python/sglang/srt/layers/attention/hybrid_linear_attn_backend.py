@@ -279,13 +279,9 @@ class MambaAttnBackend(AttentionBackend):
             (
                 conv_states,
                 ssm_states,
-                mixed_qkv_cache,
                 intermediate_state_cache,
                 intermediate_conv_window_cache,
             ) = self.req_to_token_pool.get_mamba_params(layer_id)
-            mixed_qkv_cache[cache_indices] = mixed_qkv.view(
-                (-1,) + mixed_qkv_cache.shape[1:]
-            ).clone()
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
                 dtype=torch.bool,
@@ -546,7 +542,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         (
             conv_states,
             ssm_states,
-            _,
             intermediate_state_cache,
             intermediate_conv_window_cache,
         ) = mamba_caches
