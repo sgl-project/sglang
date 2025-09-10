@@ -17,13 +17,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-cu124:
+  build-cu129:
     if: github.repository == 'sgl-project/sglang'
     runs-on: sgl-kernel-release-node
     strategy:
       matrix:
         python-version: ["3.10"]
-        cuda-version: ["12.4"]
+        cuda-version: ["12.9"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,14 +46,14 @@ jobs:
           pip install twine
           python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
 
-  build-cu129:
+  build-cu124:
     if: github.repository == 'sgl-project/sglang'
-    needs: build-cu124
+    needs: build-cu129
     runs-on: sgl-kernel-release-node
     strategy:
       matrix:
         python-version: ["3.10"]
-        cuda-version: ["12.9"]
+        cuda-version: ["12.4"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,8 +76,8 @@ jobs:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
           path: sgl-kernel/dist/*
 
-  release-cu129:
-    needs: build-cu129
+  release-cu124:
+    needs: build-cu124
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -114,7 +114,7 @@ jobs:
           WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
 
       - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --cuda 129
+        run: python3 scripts/update_kernel_whl_index.py --cuda 124
 
       - name: Push wheel index
         run: |

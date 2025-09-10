@@ -1807,10 +1807,6 @@ class Scheduler(
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
 
-                # update the consumer index of hicache to the running batch
-                self.tp_worker.set_hicache_consumer(
-                    model_worker_batch.hicache_consumer_index
-                )
                 if self.pp_group.is_last_rank:
                     logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)

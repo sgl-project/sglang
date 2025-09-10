@@ -3,6 +3,7 @@ import logging
 import threading
 from enum import IntEnum
 from functools import wraps
+from typing import Optional
 
 import psutil
 import torch
@@ -169,7 +170,7 @@ class HostKVCache(abc.ABC):
         return len(self.free_slots)
 
     @synchronized()
-    def alloc(self, need_size: int) -> torch.Tensor:
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert (
             need_size % self.page_size == 0
         ), "The requested size should be a multiple of the page size."
