@@ -1108,9 +1108,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                     or sum_extend_prefix_lens == 0
                 )
+                and not skip_chunked_mha
             ):
-                if skip_chunked_mha:
-                    return AttnForwardMethod.MHA
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return _dispatch_mla_subtype()
