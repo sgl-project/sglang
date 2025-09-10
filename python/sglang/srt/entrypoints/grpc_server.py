@@ -525,16 +525,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
 async def serve_grpc(
     server_args: ServerArgs,
-    port: int = 30000,
     model_info: Optional[Dict] = None,
 ):
     """Start the standalone gRPC server with integrated scheduler."""
-
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
 
     # Launch only the scheduler process(es) (no tokenizer/detokenizer needed for gRPC)
     logger.info("Launching scheduler process(es)...")
@@ -589,14 +582,10 @@ async def serve_grpc(
     reflection.enable_server_reflection(SERVICE_NAMES, server)
 
     # Start server
-    listen_addr = f"[::]:{port}"
+    listen_addr = f"{server_args.host}:{server_args.port}"
     server.add_insecure_port(listen_addr)
 
     logger.info(f"Starting standalone gRPC server on {listen_addr}")
-    logger.info(f"Model: {server_args.model_path}")
-    logger.info(
-        f"Max context length: {model_info.get('max_context_length', 'unknown')}"
-    )
 
     await server.start()
 
@@ -668,7 +657,7 @@ def main():
 
     args = parser.parse_args()
 
-    # Convert to ServerArgs
+    # Convert to ServerArgs with gRPC host and port
     server_args = ServerArgs(
         model_path=args.model_path,
         tokenizer_path=args.tokenizer_path or args.model_path,
@@ -681,13 +670,15 @@ def main():
         attention_backend=args.attention_backend,
         lora_paths=args.lora_paths.split(",") if args.lora_paths else None,
         log_level=args.log_level,
+        # Override with gRPC server host and port
+        host=args.host,
+        port=args.port,
     )
 
     # Run server
     asyncio.run(
         serve_grpc(
             server_args=server_args,
-            port=args.port,
         )
     )
 
