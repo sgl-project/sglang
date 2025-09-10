@@ -13,9 +13,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 
-/// Factory function type for creating default policies
-type PolicyFactory = Arc<dyn Fn() -> Arc<dyn LoadBalancingPolicy> + Send + Sync>;
-
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
 pub struct PolicyRegistry {
@@ -25,8 +22,8 @@ pub struct PolicyRegistry {
     /// Model ID -> Worker count for cleanup tracking
     model_worker_counts: Arc<RwLock<HashMap<String, usize>>>,
 
-    /// Default policy factory
-    default_policy_factory: PolicyFactory,
+    /// Default policy instance (cached)
+    default_policy: Arc<dyn LoadBalancingPolicy>,
 
     /// Prefill policy for PD mode
     prefill_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
@@ -37,15 +34,13 @@ pub struct PolicyRegistry {
 
 impl PolicyRegistry {
     /// Create a new PolicyRegistry with a default policy
-    pub fn new(default_policy: PolicyConfig) -> Self {
-        let factory = Arc::new(move || -> Arc<dyn LoadBalancingPolicy> {
-            Self::create_policy_from_config(&default_policy)
-        });
+    pub fn new(default_policy_config: PolicyConfig) -> Self {
+        let default_policy = Self::create_policy_from_config(&default_policy_config);
 
         Self {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
-            default_policy_factory: factory,
+            default_policy,
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
         }
@@ -144,7 +139,7 @@ impl PolicyRegistry {
 
     /// Get the default policy
     pub fn get_default_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
-        (self.default_policy_factory)()
+        Arc::clone(&self.default_policy)
     }
 
     /// Get policy for a model, or default if not found
@@ -167,7 +162,7 @@ impl PolicyRegistry {
 
         // 2. Use default policy
         debug!("Using default policy for model {}", model_id);
-        (self.default_policy_factory)()
+        Arc::clone(&self.default_policy)
     }
 
     /// Create a policy from a type string
@@ -179,7 +174,7 @@ impl PolicyRegistry {
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
-                (self.default_policy_factory)()
+                Arc::clone(&self.default_policy)
             }
         }
     }
@@ -267,7 +262,7 @@ impl std::fmt::Debug for PolicyRegistry {
         f.debug_struct("PolicyRegistry")
             .field("model_policies", &self.model_policies)
             .field("model_worker_counts", &self.model_worker_counts)
-            .field("default_policy_factory", &"<function>")
+            .field("default_policy", &self.default_policy.name())
             .finish()
     }
 }
