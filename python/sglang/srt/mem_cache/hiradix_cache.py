@@ -124,7 +124,11 @@ class HiRadixCache(RadixCache):
         )
         self.load_back_threshold = 10
         super().__init__(
-            req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            page_size,
+            disable=False,
+            scheduler_metrics_collector=scheduler_metrics_collector,
         )
 
     def reset(self):
