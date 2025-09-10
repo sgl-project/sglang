@@ -1,7 +1,7 @@
 import os, pickle, numpy as np
 import torch
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST, write_github_step_summary
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE, write_github_step_summary
 import random
 import unittest
 import requests
@@ -10,7 +10,7 @@ import time
 
 
 # MOE model configuration
-MOE_MODEL_NAME = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST
+MOE_MODEL_NAME = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE
 if torch.version.hip is not None:
     print("Running on AMD ROCm GPU")
     MOE_INPUT_PKL_URL = "https://huggingface.co/datasets/yushengsu/logprobs/resolve/main/sglang_baseline_moe_v0.5.1.pkl"
