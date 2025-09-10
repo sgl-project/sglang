@@ -1083,6 +1083,19 @@ class DeepseekV2AttentionMLA(nn.Module):
             disable_ragged = (
                 attention_backend == "flashinfer" or attention_backend == "flashmla"
             ) and self.flashinfer_mla_disable_ragged
+
+            original_mode = getattr(forward_batch, "_original_forward_mode", None)
+            skip_chunked_mha = False
+            # TODO(shuw@nvidia.com) Only flashinfer cutlass and cutlass_mla backend has accuracy issue on blackwell.
+            if (
+                original_mode is not None
+                and original_mode.is_decode()
+                and is_sm100_supported()
+                and self.current_attention_backend in ("cutlass_mla", "flashinfer")
+                and _is_fp4_quantization_enabled()
+			):
+                skip_chunked_mha = True
+
             if (
                 not disable_ragged
                 and forward_batch.forward_mode.is_extend()
@@ -1095,6 +1108,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                     or sum_extend_prefix_lens == 0
                 )
+                and not skip_chunked_mha
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:

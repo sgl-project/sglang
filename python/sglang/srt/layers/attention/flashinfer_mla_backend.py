@@ -232,12 +232,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         self.fmha_backend = "auto"
         if is_sm100_supported():
-            # TODO(shuw): Flashinfer CUTLASS MHA kernel has accuracy issue
-            # with ragged tensor input for prefill. Remove this once resolved.
-            if not global_server_args_dict["disable_chunked_prefix_cache"]:
-                self.fmha_backend = "fa2"
-            else:
-                self.fmha_backend = "cutlass"
+            self.fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
