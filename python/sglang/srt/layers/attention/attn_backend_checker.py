@@ -23,16 +23,19 @@ class AttentionFeatureList:
     spec: bool = False
     # Speculative decoding support for topk > 1
     spec_topk_gt_1: bool = False
-    # MLA(Multi-head Latent Attention) support
-    mla: bool = False
     # Sliding window support(SWA)
     sliding_window: bool = False
+    # MLA(Multi-head Latent Attention) support
+    mla: bool = False
     # Dp attention support, only targeted MLA models
     # Ref: https://docs.sglang.ai/basic_usage/deepseek.html#data-parallelism-attention
     dp_attention: bool = False
     # Chunked prefix cache support, only targeted MLA models
     # Ref: https://github.com/sgl-project/sglang/pull/5113
     chunked_prefix_cache: bool = False
+    # Support of kv cache dtype less than 16 bits
+    kv_cache_dtype: Optional[List[str]] = None
+
 
 
 # TODO: add more backends
@@ -57,6 +60,7 @@ SUPPORT_MATRIX = {
         sliding_window=True,
         dp_attention=True,
         chunked_prefix_cache=True,
+        kv_cache_dtype=["fp8_e4m3"],
     ),
     "flashinfer": AttentionFeatureList(hardware=["cuda"]),
     "flashmla": AttentionFeatureList(hardware=["cuda"]),
@@ -72,7 +76,7 @@ SUPPORT_MATRIX = {
 }
 
 
-def check_attention_backend_support(server_args: ServerArgs):
+def check_attention_backend_support(server_args: ServerArgs, use_mla: bool = False):
     """
     This function is mainly for banning unsupported or unvalidated combination of attention backend and features.
     When calling this function, we assume that the attention backend is already set by model_specific_adjustment in model_runner.py.
@@ -126,3 +130,13 @@ def check_attention_backend_support(server_args: ServerArgs):
             assert (
                 feature_list.page_size_gt_1
             ), f"Page size > 1 is not supported for {attention_backend}."
+
+    # Check cuda graph
+    if is_cuda() and not server_args.disable_cuda_graph:
+        assert feature_list.cuda_graph, f"{attention_backend} doesn't support cuda graph on CUDA."
+
+    # Check speculative decoding
+    if server_args.speculative_algorithm is not None:
+        assert feature_list.spec, f"{attention_backend} doesn't support speculative decoding."
+        if server_args.speculative_eagle_topk > 1:
+            assert feature_list.spec_topk_gt_1, f"{attention_backend} doesn't support speculative decoding with topk > 1."
