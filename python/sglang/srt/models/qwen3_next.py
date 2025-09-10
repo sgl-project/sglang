@@ -826,7 +826,6 @@ class Qwen3NextModel(nn.Module):
                 alt_stream=alt_stream,
             )
 
-        # self.start_layer, self.end_layer, self.layers = make_layers(
         self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
@@ -963,12 +962,19 @@ class Qwen3NextForCausalLM(nn.Module):
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
 
-            if is_mtp and name not in [
-                "fc.weight",
-                "pre_fc_norm_embedding.weight",
-                "pre_fc_norm_hidden.weight",
-            ]:
-                name = f"model.{name}"
+            if is_mtp:
+
+                if "mtp" not in name:
+                    continue
+
+                if name in [
+                    "mtp.fc.weight",
+                    "mtp.pre_fc_norm_embedding.weight",
+                    "mtp.pre_fc_norm_hidden.weight",
+                ]:
+                    name = name.replace("mtp.", "")
+                else:
+                    name = name.replace("mtp", "model")
 
             if not is_mtp and "mtp" in name:
                 continue
@@ -1015,6 +1021,7 @@ class Qwen3NextForCausalLM(nn.Module):
                     ) and name not in params_dict:
                         continue
                     param = params_dict[name]
+
                     weight_loader = getattr(param, "weight_loader")
                     weight_loader(
                         param,
