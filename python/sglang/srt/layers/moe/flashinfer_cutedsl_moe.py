@@ -166,8 +166,14 @@ def flashinfer_cutedsl_moe_masked(
         sf_vec_size=sf_vec_size,
         alpha=w2_alpha.view(1, 1, num_experts),
         alpha_dtype=get_cute_dtype(w2_alpha),
-        sm_count=down_sm_count,
-        dst_signals=down_signals,
+        **(
+            dict(
+                sm_count=down_sm_count,
+                dst_signals=down_signals,
+            )
+            if down_sm_count is not None or down_signals is not None
+            else {}
+        )
     )  # in logical [m, k, l]
 
     if get_bool_env_var("SGLANG_HACK_CUTEDSL_GEMM_FAKE_INPUT"):
