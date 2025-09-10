@@ -109,6 +109,7 @@ jobs:
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
+          pip install genai-bench
           pytest -m e2e -s  -vv -o log_cli=true --log-cli-level=INFO
 
   finish:
