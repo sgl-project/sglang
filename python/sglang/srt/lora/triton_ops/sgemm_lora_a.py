@@ -33,19 +33,36 @@ def _sgemm_lora_a_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
+    """
+    Computes a segmented batched matrix multiplication for the LoRA A matrix.
 
-    # x: (s, K), s is the sum of sequence lengths
-    # weights: (num_lora, N, K)
-    # output: (s, N)
+    The kernel ensures that output[seg_start:seg_start + seg_len, :rank * stack_num]
+    stores the product of the input `x` and the LoRA weights for the corresponding
+    sequence. This implies that when rank is 0, the kernel is essentially a no-op,
+    as output[seg_start:seg_start + seg_len, :0] is trivially correct (empty).
+
+    Args:
+        x (torch.Tensor): The input activations tensor of shape `(s, K)`, where `s`
+            is the sum of all sequence lengths in the batch.
+        weights (torch.Tensor): The LoRA 'A' weights for all available adapters,
+            with shape `(num_lora, N, K)`.
+        output (torch.Tensor): The output tensor of shape `(s, N)`.
+    """
 
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len
     batch_id = tl.program_id(axis=1)
-    pid = tl.program_id(axis=0)
-    seg_len = tl.load(seg_lens + batch_id)
     w_index = tl.load(weight_indices + batch_id)
-    seg_start = tl.load(seg_indptr + batch_id)
     rank = tl.load(lora_ranks + w_index)
+
+    # If rank is 0, this kernel becomes a no-op as the output is always trivially correct.
+    if rank == 0:
+        return
+
+    pid = tl.program_id(axis=0)
+    seg_start = tl.load(seg_indptr + batch_id)
+    seg_len = tl.load(seg_lens + batch_id)
+
     # Adjust N (stack_num * max_rank) according to the specific LoRA adapter
     N = tl.minimum(N, rank * stack_num)
 
@@ -72,13 +89,12 @@ def _sgemm_lora_a_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len)
-            and (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) and (n_offset[None, :] < N),
+            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < N),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -91,7 +107,7 @@ def _sgemm_lora_a_kernel(
     output_ptr = (output + seg_start * output_stride_0) + (
         s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = (s_offset[:, None] < seg_len) and (n_offset[None, :] < N)
+    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < N)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 

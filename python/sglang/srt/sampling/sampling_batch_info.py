@@ -10,7 +10,6 @@ import torch
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils import merge_bias_tensor
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -68,26 +67,31 @@ class SamplingBatchInfo:
     logit_bias: Optional[torch.Tensor] = None
 
     @classmethod
+    def _get_global_server_args_dict(cls):
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+        return global_server_args_dict
+
+    @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
+        global_server_args_dict = cls._get_global_server_args_dict()
+
         reqs = batch.reqs
         device = batch.device
-        temperatures = (
-            torch.tensor(
-                [r.sampling_params.temperature for r in reqs],
-                dtype=torch.float,
-            )
-            .view(-1, 1)
-            .to(device, non_blocking=True)
-        )
+        temperatures = torch.tensor(
+            [r.sampling_params.temperature for r in reqs],
+            dtype=torch.float,
+            device=device,
+        ).view(-1, 1)
         top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float
-        ).to(device, non_blocking=True)
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
+        )
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32
-        ).to(device, non_blocking=True)
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
+        )
         min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float
-        ).to(device, non_blocking=True)
+            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
+        )
 
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
@@ -98,10 +102,11 @@ class SamplingBatchInfo:
                         logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            batch.enable_custom_logit_processor  # check the flag first.
-            and any(r.custom_logit_processor for r in reqs)  # then check the requests.
-        )
+        has_custom_logit_processor = global_server_args_dict[
+            "enable_custom_logit_processor"
+        ] and any(  # check the flag first.
+            r.custom_logit_processor for r in reqs
+        )  # then check the requests.
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -323,6 +328,12 @@ class SamplingBatchInfo:
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
 
+        # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
+        # See note below on len(self) and len(other).
+        self.logit_bias = merge_bias_tensor(
+            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
+        )
+
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
@@ -341,7 +352,41 @@ class SamplingBatchInfo:
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
 
-        # Merge logit bias
-        self.logit_bias = merge_bias_tensor(
-            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
-        )
+
+def merge_bias_tensor(
+    lhs: Optional[torch.Tensor],
+    rhs: Optional[torch.Tensor],
+    bs1: int,
+    bs2: int,
+    device: str,
+    default: float,
+):
+    """Merge two bias tensors for batch merging.
+
+    Args:
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor
+        bs1: Batch size of left-hand side tensor
+        bs2: Batch size of right-hand side tensor
+        device: Device to place the merged tensor on
+        default: Default value for missing tensor elements
+
+    Returns:
+        Merged tensor or None if both inputs are None
+    """
+    if lhs is None and rhs is None:
+        return None
+
+    if lhs is not None and rhs is not None:
+        return torch.cat([lhs, rhs])
+    else:
+        if lhs is not None:
+            shape, dtype = lhs.shape[1:], lhs.dtype
+        else:
+            shape, dtype = rhs.shape[1:], rhs.dtype
+
+        if lhs is None:
+            lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
+        if rhs is None:
+            rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
+        return torch.cat([lhs, rhs])

@@ -11,8 +11,6 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.global_config import global_config
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -22,7 +20,6 @@ from sglang.srt.utils import is_cuda
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo
 
 _is_cuda = is_cuda()
@@ -105,7 +102,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     block_kv_indices,
                     self.req_to_token.stride(0),
                     max_seqlen_pad,
-                    PAGE_SIZE,
+                    PAGED_SIZE=PAGE_SIZE,
                 )
                 workspace_size = cutlass_mla_get_workspace_size(
                     max_seqlen_pad * PAGE_SIZE, bs, num_kv_splits=1
@@ -125,6 +122,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
+        max_num_tokens: int,
         block_kv_indices: Optional[torch.Tensor] = None,
     ):
         if block_kv_indices is None:
@@ -167,7 +165,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     self.cuda_graph_kv_indices,
                     self.req_to_token.stride(0),
                     self.cuda_graph_kv_indices.stride(0),
-                    PAGE_SIZE,
+                    PAGED_SIZE=PAGE_SIZE,
                 )
                 self.forward_metadata = CutlassMLADecodeMetadata(
                     self.cuda_graph_mla_workspace,
@@ -208,7 +206,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_kv_indices,
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
-                PAGE_SIZE,
+                PAGED_SIZE=PAGE_SIZE,
             )
         else:
             super().init_forward_metadata_replay_cuda_graph(

@@ -21,16 +21,15 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
-import os
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
-import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -45,21 +44,22 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import (
-    KVCache,
-    ReqToTokenPool,
-    TokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils import get_int_env_var, require_mlp_sync
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
+
+CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
 
 
 class DecodeReqToTokenPool:
@@ -90,7 +90,7 @@ class DecodeReqToTokenPool:
         self.max_context_len = max_context_len
         self.device = device
         self.pre_alloc_size = pre_alloc_size
-        with memory_saver_adapter.region():
+        with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (size + pre_alloc_size, max_context_len),
                 dtype=torch.int32,
@@ -139,7 +139,7 @@ class DecodePreallocQueue:
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
@@ -187,9 +187,13 @@ class DecodePreallocQueue:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
-        attn_tp_size = self.tp_size // self.dp_size
+        attn_tp_size = get_attention_tp_size()
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
+
         kv_args.decode_tp_size = attn_tp_size
+        # Note(shangming): pp is not supported on the decode side yet, so its rank is fixed to 0
+        kv_args.pp_rank = 0
+        kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_pp_size = self.prefill_pp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
@@ -214,8 +218,10 @@ class DecodePreallocQueue:
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
-        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(
+        kv_manager_class: Type[BaseKVManager] = get_kv_class(
+            self.transfer_backend, KVClassType.MANAGER
+        )
+        kv_manager: BaseKVManager = kv_manager_class(
             kv_args,
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
@@ -244,7 +250,7 @@ class DecodePreallocQueue:
                 mgr=self.kv_manager,
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
-                data_parallel_rank=req.data_parallel_rank,
+                prefill_dp_rank=req.data_parallel_rank,
             )
 
             self.queue.append(
@@ -255,7 +261,7 @@ class DecodePreallocQueue:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
-            prepare_abort(req, message)
+            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
             return True
         return False
@@ -330,6 +336,8 @@ class DecodePreallocQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -382,7 +390,10 @@ class DecodePreallocQueue:
                 max(
                     required_tokens_for_request,
                     origin_input_len
-                    + decode_req.req.sampling_params.max_new_tokens
+                    + min(
+                        decode_req.req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKEN,
+                    )
                     - retractable_tokens,
                 )
                 > allocatable_tokens
@@ -419,13 +430,19 @@ class DecodePreallocQueue:
 
         return preallocated_reqs
 
+    @property
+    def num_tokens_pre_allocated(self):
+        return sum(
+            len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
+        )
+
     def _allocatable_tokens(
         self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
     ) -> int:
         need_space_for_single_req = (
             max(
                 [
-                    x.sampling_params.max_new_tokens
+                    min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
                     + len(x.origin_input_ids)
                     - retractable_tokens
                     for x in self.scheduler.running_batch.reqs
@@ -436,7 +453,13 @@ class DecodePreallocQueue:
             else 0
         )
 
-        available_size = self.token_to_kv_pool_allocator.available_size()
+        if self.scheduler.model_config.is_hybrid:
+            available_size = min(
+                self.token_to_kv_pool_allocator.full_available_size(),
+                self.token_to_kv_pool_allocator.swa_available_size(),
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
 
         allocatable_tokens = available_size - max(
             # preserve some space for future decode
@@ -540,6 +563,7 @@ class DecodeTransferQueue:
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
+        self.spec_algorithm = scheduler.spec_algorithm
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -575,6 +599,8 @@ class DecodeTransferQueue:
                 # unlock the kv cache or it will have memory leak
                 self.tree_cache.cache_finished_req(decode_req.req)
                 indices_to_remove.add(i)
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
 
@@ -585,10 +611,12 @@ class DecodeTransferQueue:
                     output_token_logprobs_idx,
                     output_top_logprobs_val,
                     output_top_logprobs_idx,
+                    output_hidden_states,
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())
-
+                if not self.spec_algorithm.is_none():
+                    decode_req.req.hidden_states_tensor = output_hidden_states
                 if decode_req.req.return_logprob:
                     decode_req.req.output_token_logprobs_val.append(
                         output_token_logprobs_val[0].item()
@@ -606,9 +634,21 @@ class DecodeTransferQueue:
                             : decode_req.req.top_logprobs_num
                         ].tolist()
                     )
+
                 if hasattr(decode_req.kv_receiver, "clear"):
                     decode_req.kv_receiver.clear()
-                transferred_reqs.append(decode_req.req)
+
+                # special handling for sampling_params.max_new_tokens == 1
+                if decode_req.req.sampling_params.max_new_tokens == 1:
+                    # finish immediately
+                    decode_req.req.check_finished()
+                    self.scheduler.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    self.tree_cache.cache_finished_req(decode_req.req)
+                else:
+                    transferred_reqs.append(decode_req.req)
+
                 indices_to_remove.add(i)
             elif poll in [
                 KVPoll.Bootstrapping,
@@ -645,10 +685,7 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
-            prepare_dp_attn_flag = (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            )
+            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
 
             if batch:
                 # Generate fake extend output.
@@ -657,14 +694,14 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
-                    if prepare_dp_attn_flag:
+                    if prepare_mlp_sync_flag:
                         self._prepare_idle_batch_and_run(None)
                 else:
-                    if prepare_dp_attn_flag:
-                        self.prepare_dp_attn_batch(batch)
+                    if prepare_mlp_sync_flag:
+                        self.prepare_mlp_sync_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
-            elif prepare_dp_attn_flag:
+            elif prepare_mlp_sync_flag:
                 batch, _ = self._prepare_idle_batch_and_run(None)
 
             if batch is None and (
@@ -673,10 +710,7 @@ class SchedulerDisaggregationDecodeMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
                 == 0
             ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
 
@@ -695,10 +729,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.cur_batch = batch
             last_batch_in_queue = False
 
-            prepare_dp_attn_flag = (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            )
+            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
 
             if batch:
                 # Generate fake extend output.
@@ -707,7 +738,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
-                    if prepare_dp_attn_flag:
+                    if prepare_mlp_sync_flag:
                         batch_, result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
                         )
@@ -715,8 +746,8 @@ class SchedulerDisaggregationDecodeMixin:
                             result_queue.append((batch_.copy(), result))
                             last_batch_in_queue = True
                 else:
-                    if prepare_dp_attn_flag:
-                        self.prepare_dp_attn_batch(batch)
+                    if prepare_mlp_sync_flag:
+                        self.prepare_mlp_sync_batch(batch)
                     result = self.run_batch(batch)
                     result_queue.append((batch.copy(), result))
 
@@ -731,7 +762,7 @@ class SchedulerDisaggregationDecodeMixin:
                         self.set_next_batch_sampling_info_done(tmp_batch)
                     last_batch_in_queue = True
 
-            elif prepare_dp_attn_flag:
+            elif prepare_mlp_sync_flag:
                 batch, result = self._prepare_idle_batch_and_run(
                     None, delay_process=True
                 )
@@ -753,16 +784,13 @@ class SchedulerDisaggregationDecodeMixin:
                 + len(self.disagg_decode_prealloc_queue.queue)
                 == 0
             ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                self.maybe_sleep_on_idle()
+                self.self_check_during_idle()
 
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
 
-    def _prepare_idle_batch_and_run(self, batch, delay_process=False):
-        batch, _ = self.prepare_dp_attn_batch(batch)
+    def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
+        batch = self.prepare_mlp_sync_batch(batch)
         result = None
         if batch:
             result = self.run_batch(batch)
@@ -842,7 +870,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            self.server_args.enable_custom_logit_processor,
         )
 
         # construct fake completed prefill

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
 import platform
 import sys
 from pathlib import Path
@@ -35,27 +36,46 @@ def _get_version():
 operator_namespace = "sgl_kernel"
 include_dirs = [
     root / "include",
+    root / "include" / "impl",
     root / "csrc",
 ]
 
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
+    "csrc/allreduce/quick_all_reduce.cu",
+    "csrc/common_extension_rocm.cc",
+    "csrc/elementwise/activation.cu",
+    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
-    "csrc/torch_extension_rocm.cc",
     "csrc/speculative/eagle_utils.cu",
+    "csrc/kvcacheio/transfer.cu",
 ]
 
 cxx_flags = ["-O3"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
-amdgpu_target = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
+default_target = "gfx942"
+amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
+
+if torch.cuda.is_available():
+    try:
+        amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    except Exception as e:
+        print(f"Warning: Failed to detect GPU properties: {e}")
+else:
+    print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
+
 if amdgpu_target not in ["gfx942", "gfx950"]:
     print(
         f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
     )
     sys.exit(1)
+
+fp8_macro = (
+    "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
+)
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -64,10 +84,10 @@ hipcc_flags = [
     "-Xcompiler",
     "-fPIC",
     "-std=c++17",
-    "-D__HIP_PLATFORM_AMD__=1",
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
+    fp8_macro,
 ]
 
 ext_modules = [

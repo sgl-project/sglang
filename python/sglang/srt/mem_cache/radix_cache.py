@@ -23,7 +23,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -31,11 +31,10 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    KVCacheEvent,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -47,17 +46,20 @@ class TreeNode:
 
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
-        self.parent = None
-        self.key = None
-        self.value = None
+        self.parent: TreeNode = None
+        self.key: List[int] = None
+        self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
 
         self.hit_count = 0
-        # indicating the node is loading KV cache from host
-        self.loading = False
+        # indicating the node is locked to protect from eviction
+        # incremented when the node is referenced by a storage operation
+        self.host_ref_counter = 0
         # store the host indices of KV cache
-        self.host_value = None
+        self.host_value: Optional[torch.Tensor] = None
+        # store hash values of each pages
+        self.hash_value: Optional[List[str]] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -69,6 +71,23 @@ class TreeNode:
     @property
     def backuped(self):
         return self.host_value is not None
+
+    def protect_host(self):
+        """Protect the host value from eviction."""
+        self.host_ref_counter += 1
+
+    def release_host(self):
+        """Release the host value, allowing it to be evicted."""
+        if self.host_ref_counter > 0:
+            self.host_ref_counter -= 1
+        else:
+            raise RuntimeError("Host reference counter is already zero.")
+
+    def get_last_hash_value(self) -> Optional[str]:
+        """Returns the hash value of the last page in this node."""
+        if self.hash_value is None or len(self.hash_value) == 0:
+            return None
+        return self.hash_value[-1]
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
@@ -99,7 +118,7 @@ class RadixCache(BasePrefixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         disable: bool = False,
         enable_kv_cache_events: bool = False,
@@ -130,12 +149,13 @@ class RadixCache(BasePrefixCache):
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
+        self.root_node.host_value = []
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
 
-    def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, int]:
+    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
             key: A list of token IDs to find a matching prefix.
@@ -147,13 +167,14 @@ class RadixCache(BasePrefixCache):
             than the last node's value.
         """
         if self.disable or len(key) == 0:
-            return (
-                torch.empty(
+            return MatchResult(
+                device_indices=torch.empty(
                     (0,),
                     dtype=torch.int64,
                     device=self.device,
                 ),
-                self.root_node,
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
             )
 
         if self.page_size != 1:
@@ -165,9 +186,13 @@ class RadixCache(BasePrefixCache):
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        return value, last_node
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node,
+        )
 
-    def insert(self, key: List, value=None):
+    def insert(self, key: List, value=None, chunked=False):
         if self.disable:
             return 0
 
@@ -192,11 +217,13 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
             page_aligned_len = len(kv_indices)
-            page_aligned_kv_indices = kv_indices.clone()
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
@@ -210,7 +237,7 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req):
+    def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
@@ -222,20 +249,24 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
         else:
             page_aligned_len = len(kv_indices)
-            page_aligned_kv_indices = kv_indices.clone()
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
+        new_prefix_len = self.insert(
+            page_aligned_token_ids, page_aligned_kv_indices, chunked=chunked
+        )
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node = self.match_prefix(page_aligned_token_ids)
+        new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
             new_indices[len(req.prefix_indices) :],
@@ -464,7 +495,7 @@ class RadixCache(BasePrefixCache):
         # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
             # First chunk links to the last page of the parent node (if any).
-            if node.parent is None:
+            if node.parent is None or node != self.root_node:
                 parent_block_hash = None
             else:
                 last_page_start = (
