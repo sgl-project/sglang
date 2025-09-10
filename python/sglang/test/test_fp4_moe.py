@@ -3,15 +3,15 @@ from typing import Callable
 
 import pytest
 import torch
-from torch.nn import functional as F
 from flashinfer import fp4_quantize
 from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-from sgl_kernel import scaled_fp4_quant, scaled_fp4_grouped_quant
+from sgl_kernel import scaled_fp4_grouped_quant, scaled_fp4_quant
+from torch.nn import functional as F
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
 from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
 if torch.cuda.get_device_capability() < (10, 0):
@@ -461,13 +461,27 @@ def test_flashinfer_cutedsl_moe_masked(
     device = "cuda"
     dtype = torch.bfloat16
     num_experts = 8
-    hidden_states = torch.randn(bs, hidden_dim, dtype=torch.bfloat16, device=device) / 5.0
-    w1 = torch.randn(num_experts, 2 * inter_dim, hidden_dim, dtype=torch.bfloat16, device=device) / 10.0
-    w2 = torch.randn(num_experts, hidden_dim, inter_dim, dtype=torch.bfloat16, device=device) / 10.0
+    hidden_states = (
+        torch.randn(bs, hidden_dim, dtype=torch.bfloat16, device=device) / 5.0
+    )
+    w1 = (
+        torch.randn(
+            num_experts, 2 * inter_dim, hidden_dim, dtype=torch.bfloat16, device=device
+        )
+        / 10.0
+    )
+    w2 = (
+        torch.randn(
+            num_experts, hidden_dim, inter_dim, dtype=torch.bfloat16, device=device
+        )
+        / 10.0
+    )
     router_logits = torch.randn(bs, num_experts, dtype=torch.float32)
 
     hidden_states_expanded = (
-        hidden_states.view(bs, -1, hidden_dim).repeat(1, topk, 1).reshape(-1, hidden_dim)
+        hidden_states.view(bs, -1, hidden_dim)
+        .repeat(1, topk, 1)
+        .reshape(-1, hidden_dim)
     )
     hidden_states_3d, masked_m, topk_idx, routing_weights = prepare_inputs(
         hidden_states_expanded, router_logits, num_experts, topk
@@ -522,8 +536,12 @@ def test_flashinfer_cutedsl_moe_masked(
         device=hidden_states.device,
         block_size=16,
     )
-    w1_d = torch.empty((num_experts, 2 * inter_dim, hidden_dim), device=w1.device, dtype=w1.dtype)
-    w2_d = torch.empty((num_experts, hidden_dim, inter_dim), device=w2.device, dtype=w2.dtype)
+    w1_d = torch.empty(
+        (num_experts, 2 * inter_dim, hidden_dim), device=w1.device, dtype=w1.dtype
+    )
+    w2_d = torch.empty(
+        (num_experts, hidden_dim, inter_dim), device=w2.device, dtype=w2.dtype
+    )
 
     for idx in range(0, num_experts):
         w1_fp4_sliced, w1_blockscale_sliced = fp4_quantize(
@@ -575,7 +593,9 @@ def test_flashinfer_cutedsl_moe_masked(
     )
 
 
-@pytest.mark.parametrize("bs, hidden_dim, inter_dim, topk", [(2, 128, 256, 2), (16, 128, 512, 5)])
+@pytest.mark.parametrize(
+    "bs, hidden_dim, inter_dim, topk", [(2, 128, 256, 2), (16, 128, 512, 5)]
+)
 @torch.inference_mode()
 def test_grouped_gemm_nt_masked(
     bs: int, hidden_dim: int, inter_dim: int, topk: int
@@ -674,5 +694,5 @@ def test_grouped_gemm_nt_masked(
 if __name__ == "__main__":
     test_cutlass_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
     test_flashinfer_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
-    test_flashinfer_cutedsl_moe_masked(16, 128, 512, 4) 
+    test_flashinfer_cutedsl_moe_masked(16, 128, 512, 4)
     test_grouped_gemm_nt_masked(16, 128, 512, 4)
