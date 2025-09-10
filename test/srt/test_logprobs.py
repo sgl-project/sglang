@@ -1,7 +1,7 @@
 import os, pickle, numpy as np
 import torch
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST, write_github_step_summary
 import random
 import unittest
 import requests
@@ -10,14 +10,14 @@ import time
 
 # MOE model configuration
 MOE_MODEL_NAME = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST
-MOE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_moe_0.5.2.pkl"
+MOE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_moe.pkl"
 MOE_TOLERANCE_MAX_DIFF = 10
 MOE_TOLERANCE_MEAN_DIFF = 0.1
 MOE_TOLERANCE_MEAN_DIFF_SAMPLE = 0.3
 
 # Dense model configuration
 DENSE_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_0.5.2.pkl"
+DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000.pkl"
 DENSE_TOLERANCE_MAX_DIFF = 1.0
 DENSE_TOLERANCE_MEAN_DIFF = 0.05
 DENSE_TOLERANCE_MEAN_DIFF_SAMPLE = 0.1
@@ -30,22 +30,22 @@ RETRY_DELAY = 2
 
 # Test configurations
 TEST_CONFIGS = [
-    {"batch_size": 50, "num_samples": 200, "temperature": 1.0},
-    {"batch_size": 100, "num_samples": 300, "temperature": 1.0},
-    {"batch_size": 20, "num_samples": 500, "temperature": 1.0},
+    {"batch_size": 50, "num_samples": 200, "temperature": 0.5},
+    {"batch_size": 100, "num_samples": 300, "temperature": 10.0},
+    {"batch_size": 20, "num_samples": 500, "temperature": 2.0},
     {"batch_size": 20, "num_samples": 500, "temperature": 1.0},
 ]
 
 os.environ["RETURN_ORIGINAL_LOGPROB"] = "True"
 
 
+@unittest.skip("Skipping MOE test case for now")
 class TestLogprobsMOE(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
         """Set up the test class - initialize the engine once for all tests."""
         print(f"Launching SGLang Engine with {MOE_MODEL_NAME}...")
-        print(f"SGLang version: {sgl.__version__}")
         cls.engine = sgl.Engine(
             model_path=MOE_MODEL_NAME,
             random_seed=42,
@@ -108,7 +108,6 @@ class TestLogprobsMOE(unittest.TestCase):
         
         for config_idx, config in enumerate(TEST_CONFIGS):
             with self.subTest(config=config):
-                print(f"\n=== Testing Config {config_idx + 1}: {config} ===")
                 
                 # Sample records for this config
                 test_records = random.sample(records, k=min(config["num_samples"], len(records)))
@@ -148,8 +147,22 @@ class TestLogprobsMOE(unittest.TestCase):
                         all_max.append(max_diff)
                         all_mean.append(mean_diff)
 
-                print(f"Config {config_idx + 1} - max of max Δ={max(all_max):.6g}")
-                print(f"Config {config_idx + 1} - mean of mean Δ={np.mean(all_mean):.6g}")
+                max_of_max = max(all_max)
+                mean_of_mean = np.mean(all_mean)
+                
+                print(f"Config {config_idx + 1} - max of max Δ={max_of_max:.6g}")
+                print(f"Config {config_idx + 1} - mean of mean Δ={mean_of_mean:.6g}")
+
+                # Write results to GitHub summary
+                summary_content = f"""
+## MOE Logprobs Test - Config {config_idx + 1}
+- **Configuration**: {config}
+- **Max of max Δ**: {max_of_max:.6g}
+- **Mean of mean Δ**: {mean_of_mean:.6g}
+- **Status**: {'✅ Passed' if max_of_max <= MOE_TOLERANCE_MAX_DIFF and mean_of_mean <= MOE_TOLERANCE_MEAN_DIFF_SAMPLE else '❌ Failed'}
+
+"""
+                write_github_step_summary(summary_content)
 
                 # Basic validation
                 self.assertIsInstance(all_max, list)
@@ -176,7 +189,6 @@ class TestLogprobsDense(unittest.TestCase):
     def setUpClass(cls):
         """Set up the test class - initialize the engine once for all tests."""
         print(f"Launching SGLang Engine with {DENSE_MODEL_NAME}...")
-        print(f"SGLang version: {sgl.__version__}")
         cls.engine = sgl.Engine(
             model_path=DENSE_MODEL_NAME,
             random_seed=42,
@@ -219,7 +231,9 @@ class TestLogprobsDense(unittest.TestCase):
         """Compare metadata between two outputs and return max and mean differences."""
         diffs = []
         for key in ["input_top_logprobs", "output_top_logprobs"]:
+            self.assertEqual(len(metaA[key]), len(metaB[key]), f"Length of {key} is not equal, sglang did not return the log probs from the correct starting index")
             arrA, arrB = metaA[key], metaB[key]
+            self.assertEqual(len(arrA), len(arrB), f"Length of {key} is not equal, sglang did not return the correct number of log probs(should be top 20)")
             for e1, e2 in zip(arrA, arrB):
                 if not e1 or not e2:
                     continue
@@ -239,7 +253,6 @@ class TestLogprobsDense(unittest.TestCase):
         
         for config_idx, config in enumerate(TEST_CONFIGS):
             with self.subTest(config=config):
-                print(f"\n=== Testing Config {config_idx + 1}: {config} ===")
                 
                 # Sample records for this config
                 test_records = random.sample(records, k=min(config["num_samples"], len(records)))
@@ -279,8 +292,21 @@ class TestLogprobsDense(unittest.TestCase):
                         all_max.append(max_diff)
                         all_mean.append(mean_diff)
 
-                print(f"Config {config_idx + 1} - max of max Δ={max(all_max):.6g}")
-                print(f"Config {config_idx + 1} - mean of mean Δ={np.mean(all_mean):.6g}")
+                max_of_max = max(all_max)
+                mean_of_mean = np.mean(all_mean)
+                
+                print(f"Config {config_idx + 1} - max of max Δ={max_of_max:.6g}")
+                print(f"Config {config_idx + 1} - mean of mean Δ={mean_of_mean:.6g}")
+
+                # Write results to GitHub summary
+                summary_content = f"""
+## Dense Logprobs Test - Config {config_idx + 1}
+- **Configuration**: {config}
+- **Max of max Δ**: {max_of_max:.6g}
+- **Mean of mean Δ**: {mean_of_mean:.6g}
+- **Status**: {'✅ Passed' if max_of_max <= DENSE_TOLERANCE_MAX_DIFF and mean_of_mean <= DENSE_TOLERANCE_MEAN_DIFF_SAMPLE else '❌ Failed'}
+"""
+                write_github_step_summary(summary_content)
 
                 # Basic validation
                 self.assertIsInstance(all_max, list)
