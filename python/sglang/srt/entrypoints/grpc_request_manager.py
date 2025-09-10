@@ -573,7 +573,7 @@ async def print_exception_wrapper(func):
         await func()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        logger.error(f"GrpcRequestManager hit an exception: {traceback}")
         if hasattr(func, "__self__") and isinstance(func.__self__, GrpcRequestManager):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
