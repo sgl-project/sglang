@@ -35,28 +35,28 @@ jobs:
         run: |
           docker run -dt \
             --device /dev/dri/ \
-            --name ci_sglang_xpu \
+            --name main_sglang_xpu \
             -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
-            xpu_sglang:pvc
+            xpu_sglang_main:pvc
 
       - name: Install Dependency
         timeout-minutes: 20
         run: |
-          docker exec ci_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec ci_sglang_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
-          docker exec ci_sglang_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
+          docker exec main_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
+          docker exec main_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
+          docker exec main_sglang_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
+          docker exec main_sglang_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20
         run: |
-          docker exec -w /root/sglang/ ci_sglang_xpu \
+          docker exec -w /root/sglang/ main_sglang_xpu \
             bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-xpu"
 
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f ci_sglang_xpu || true
+          docker rm -f main_sglang_xpu || true
 
   finish:
     if: always()
