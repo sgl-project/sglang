@@ -96,9 +96,7 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI {
-                model,
-                worker_urls,
-                ..
+                model, worker_urls, ..
             } => {
                 // Validate model is provided and not empty
                 let model_str = model

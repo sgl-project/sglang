@@ -180,7 +180,6 @@ struct CliArgs {
     #[arg(long)]
     model: Option<String>,
 
-
     /// Directory to store log files
     #[arg(long)]
     log_dir: Option<String>,

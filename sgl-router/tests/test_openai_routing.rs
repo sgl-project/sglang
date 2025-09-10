@@ -10,7 +10,9 @@ use axum::{
 use serde_json::json;
 use sglang_router_rs::{
     config::{RouterConfig, RoutingMode},
-    protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest, ChatMessage, UserMessageContent},
+    protocols::spec::{
+        ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, UserMessageContent,
+    },
     routers::{openai_router::OpenAIRouter, RouterTrait},
 };
 use std::sync::Arc;
@@ -252,13 +254,11 @@ async fn test_openai_router_chat_completion_with_mock() {
 
     // Create a minimal chat completion request
     let mut chat_request = create_minimal_chat_request();
-    chat_request.messages = vec![
-        ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Text("Hello, how are you?".to_string()),
-            name: None,
-        },
-    ];
+    chat_request.messages = vec![ChatMessage::User {
+        role: "user".to_string(),
+        content: UserMessageContent::Text("Hello, how are you?".to_string()),
+        name: None,
+    }];
     chat_request.temperature = Some(0.7);
 
     // Route the request

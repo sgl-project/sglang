@@ -1,8 +1,8 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code)]
 
-pub mod mock_server;
 pub mod mock_mcp_server;
+pub mod mock_server;
 pub mod mock_worker;
 pub mod test_app;
 

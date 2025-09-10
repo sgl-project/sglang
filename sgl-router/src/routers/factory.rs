@@ -1,6 +1,5 @@
 //! Factory for creating router instances
 
-
 use super::{
     http::{openai_router::OpenAIRouter, pd_router::PDRouter, router::Router},
     RouterTrait,
@@ -46,7 +45,7 @@ impl RouterFactory {
                         .await
                     }
                     RoutingMode::OpenAI { .. } => {
-                        return Err("OpenAI mode requires HTTP connection_mode".to_string());
+                        Err("OpenAI mode requires HTTP connection_mode".to_string())
                     }
                 }
             }
@@ -77,13 +76,15 @@ impl RouterFactory {
                         api_key,
                         model,
                         worker_urls,
-                    } => Self::create_openai_router(
-                        api_key.clone(),
-                        model.clone(),
-                        worker_urls.clone(),
-                        ctx,
-                    )
-                    .await,
+                    } => {
+                        Self::create_openai_router(
+                            api_key.clone(),
+                            model.clone(),
+                            worker_urls.clone(),
+                            ctx,
+                        )
+                        .await
+                    }
                 }
             }
         }
@@ -188,7 +189,7 @@ impl RouterFactory {
     ) -> Result<Box<dyn RouterTrait>, String> {
         // Use the first worker URL as the OpenAI-compatible base
         let base_url = worker_urls
-            .get(0)
+            .first()
             .cloned()
             .ok_or_else(|| "OpenAI mode requires at least one worker URL".to_string())?;
 
