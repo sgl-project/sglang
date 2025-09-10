@@ -151,7 +151,6 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor pos_ids,
     bool interleave,
     bool enable_pdl,
-    int64_t cuda_stream,
     const std::optional<at::Tensor>& v,
     const std::optional<at::Tensor>& k_buffer,
     const std::optional<at::Tensor>& v_buffer,
@@ -226,8 +225,7 @@ void bmm_fp8(
     at::Tensor A_scale,
     at::Tensor B_scale,
     at::Tensor workspace_buffer,
-    int64_t cublas_handle,
-    int64_t cuda_stream);
+    int64_t cublas_handle);
 void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
