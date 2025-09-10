@@ -11,11 +11,12 @@ from typing import Dict, List, Optional, Set
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, KVPoll
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
+    CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -527,7 +528,7 @@ class NixlKVManager(CommonKVManager):
         threading.Thread(target=bootstrap_thread).start()
 
 
-class NixlKVSender(BaseKVSender):
+class NixlKVSender(CommonKVSender):
 
     def __init__(
         self,
@@ -537,6 +538,7 @@ class NixlKVSender(BaseKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
     ):
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.xfer_handles = []
         self.has_sent = False
         self.chunk_id = 0
