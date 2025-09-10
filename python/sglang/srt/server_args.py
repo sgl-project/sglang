@@ -1627,7 +1627,7 @@ class ServerArgs:
         parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
-            choices=["mxfp4", "bf16"],
+            choices=["default", "bf16"],
             default=ServerArgs.flashinfer_mxfp4_moe_precision,
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
