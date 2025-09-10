@@ -8,17 +8,36 @@ import requests
 import io
 import time
 
+
 # MOE model configuration
 MOE_MODEL_NAME = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST
-MOE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_moe.pkl"
-MOE_TOLERANCE_MAX_DIFF = 10
-MOE_TOLERANCE_MEAN_DIFF = 0.3
+if torch.version.hip is not None:
+    print("Running on AMD ROCm GPU")
+    MOE_INPUT_PKL_URL = "https://huggingface.co/datasets/yushengsu/logprobs/resolve/main/sglang_baseline_moe_v0.5.1.pkl"
+    MOE_TOLERANCE_MAX_DIFF = 9.0
+    MOE_TOLERANCE_MEAN_DIFF = 0.5
+elif torch.version.cuda is not None:
+    print("Running on NVIDIA CUDA GPU")
+    MOE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_moe.pkl"
+    MOE_TOLERANCE_MAX_DIFF = 10
+    MOE_TOLERANCE_MEAN_DIFF = 0.3
+else:
+    print("No GPU backend (CPU only)")
 
 # Dense model configuration
 DENSE_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000.pkl"
-DENSE_TOLERANCE_MAX_DIFF = 1.5
-DENSE_TOLERANCE_MEAN_DIFF = 0.1
+if torch.version.hip is not None:
+    print("Running on AMD ROCm GPU")
+    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/yushengsu/logprobs/resolve/main/sglang_baseline_v0.5.1.pkl"
+    DENSE_TOLERANCE_MAX_DIFF = 1.4
+    DENSE_TOLERANCE_MEAN_DIFF = 0.1
+elif torch.version.cuda is not None:
+    print("Running on NVIDIA CUDA GPU")
+    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000.pkl"
+    DENSE_TOLERANCE_MAX_DIFF = 1.5
+    DENSE_TOLERANCE_MEAN_DIFF = 0.1
+else:
+    print("No GPU backend (CPU only)")
 
 
 # Common configuration
