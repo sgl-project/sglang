@@ -266,28 +266,18 @@ impl WorkerRegistry {
         connection_mode: Option<ConnectionMode>,
         healthy_only: bool,
     ) -> Vec<Arc<dyn Worker>> {
-        // Start with all workers or filtered by most selective criteria
+        // Start with the most efficient collection based on filters
+        // Use model index when possible as it's O(1) lookup
         let workers = if let Some(model) = model_id {
-            self.get_by_model(model)
-        } else if let Some(ref wtype) = worker_type {
-            self.get_by_type(wtype)
-        } else if let Some(ref conn) = connection_mode {
-            self.get_by_connection(conn)
+            self.get_by_model_fast(model)
         } else {
             self.get_all()
         };
 
-        // Apply additional filters
+        // Apply remaining filters
         workers
             .into_iter()
             .filter(|w| {
-                // Check model_id if specified
-                if let Some(model) = model_id {
-                    if w.model_id() != model {
-                        return false;
-                    }
-                }
-
                 // Check worker_type if specified
                 if let Some(ref wtype) = worker_type {
                     if w.worker_type() != *wtype {
