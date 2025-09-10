@@ -25,7 +25,10 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build --no-cache --progress=plain -f docker/Dockerfile.xpu -t xpu_sglang:pvc .
+          docker build \
+            --build-arg SG_LANG_BRANCH=${{ github.head_ref }} \
+            --build-arg SG_LANG_REPO=${{ github.event.pull_request.head.repo.clone_url }} \
+            --no-cache --progress=plain -f docker/Dockerfile.xpu -t xpu_sglang_main:pvc .
 
 
       - name: Run container
