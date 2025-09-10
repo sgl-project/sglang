@@ -503,8 +503,14 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
+        # ModelOptNvFp4FusedMoEMethod uses max of global expert scaling factors for input scaling factor
+        load_global_experts = (
+            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            and "input_scale" in weight_name
+        )
+
         global_expert_location_metadata = get_global_expert_location_metadata()
-        if global_expert_location_metadata is None:
+        if global_expert_location_metadata is None or load_global_experts:
             self._weight_loader_impl(
                 param=param,
                 loaded_weight=loaded_weight,
