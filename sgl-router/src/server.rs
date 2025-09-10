@@ -301,17 +301,34 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
         let response = router_manager.list_workers();
         Json(response).into_response()
     } else {
-        // In single router mode, return simplified list
-        let urls = state.router.get_worker_urls();
+        // In single router mode, get detailed worker info from registry
+        let workers = state.context.worker_registry.get_all();
         let response = serde_json::json!({
-            "workers": urls.iter().map(|url| {
-                serde_json::json!({
-                    "url": url,
-                    "model_id": "unknown",
-                    "is_healthy": true
-                })
+            "workers": workers.iter().map(|worker| {
+                let mut worker_info = serde_json::json!({
+                    "url": worker.url(),
+                    "model_id": worker.model_id(),
+                    "worker_type": format!("{:?}", worker.worker_type()),
+                    "is_healthy": worker.is_healthy(),
+                    "load": worker.load(),
+                    "connection_mode": format!("{:?}", worker.connection_mode()),
+                    "priority": worker.priority(),
+                    "cost": worker.cost(),
+                });
+
+                // Add bootstrap_port for Prefill workers
+                if let crate::core::WorkerType::Prefill { bootstrap_port } = worker.worker_type() {
+                    worker_info["bootstrap_port"] = serde_json::json!(bootstrap_port);
+                }
+
+                worker_info
             }).collect::<Vec<_>>(),
-            "total": urls.len()
+            "total": workers.len(),
+            "stats": {
+                "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
+                "decode_count": state.context.worker_registry.get_decode_workers().len(),
+                "regular_count": state.context.worker_registry.get_by_type(&crate::core::WorkerType::Regular).len(),
+            }
         });
         Json(response).into_response()
     }
