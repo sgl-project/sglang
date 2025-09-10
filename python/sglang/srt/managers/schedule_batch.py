@@ -98,7 +98,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "sampling_backend",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
-    "speculative_attention_backend",
+    "speculative_attention_mode",
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
@@ -911,7 +911,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_prefill_only: bool = False
 
     # hicache pointer for synchronizing data loading from CPU to GPU
-    hicache_consumer_index: int = 0
+    hicache_consumer_index: int = -1
 
     @classmethod
     def init_new(
@@ -1897,7 +1897,7 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-    hicache_consumer_index: int = 0
+    hicache_consumer_index: int = -1
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
