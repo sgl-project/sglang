@@ -3,15 +3,17 @@ import logging
 import threading
 from enum import IntEnum
 from functools import wraps
+from typing import Optional
 
 import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_xpu
 
 _is_npu = is_npu()
-if not _is_npu:
+_is_xpu = is_xpu()
+if not (_is_npu or _is_xpu):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_lf_pf,
@@ -168,7 +170,7 @@ class HostKVCache(abc.ABC):
         return len(self.free_slots)
 
     @synchronized()
-    def alloc(self, need_size: int) -> torch.Tensor:
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert (
             need_size % self.page_size == 0
         ), "The requested size should be a multiple of the page size."

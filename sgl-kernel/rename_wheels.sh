@@ -16,8 +16,8 @@ for wheel in "${wheel_files[@]}"; do
     fi
 
     # Detect CUDA version and add appropriate suffix
-    if ls /usr/local/ | grep -q "12.9"; then
-        new_wheel="${intermediate_wheel/-cp${cp_version}/+cu129-cp${cp_version}}"
+    if ls /usr/local/ | grep -q "12.4"; then
+        new_wheel="${intermediate_wheel/-cp${cp_version}/+cu124-cp${cp_version}}"
     elif ls /usr/local/ | grep -q "12.8"; then
         new_wheel="${intermediate_wheel/-cp${cp_version}/+cu128-cp${cp_version}}"
     else

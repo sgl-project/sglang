@@ -305,6 +305,21 @@ python3 -m sglang.bench_serving \
   --disable-ignore-eos
 ```
 
+9) Evaluating large-scale KVCache sharing with mooncake trace (sglang only):
+
+```bash
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 --port 30000 \
+  --model mode-name \
+  --dataset-name mooncake \
+  --mooncake-slowdown-factor 1.0 \
+  --mooncake-num-rounds 1000 \
+  --mooncake-workload conversation|mooncake|agent|synthetic
+  --use-trace-timestamps true \
+  --random-output-len 256
+```
+
 ### Troubleshooting
 
 - All requests failed: verify `--backend`, server URL/port, `--model`, and authentication. Check warmup errors printed by the script.

@@ -9,6 +9,8 @@ from typing import List
 import torch
 from torch.utils.cpp_extension import load
 
+from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
+
 root = Path(__file__).parent.resolve()
 hf3fs_utils = load(name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"])
 
@@ -51,7 +53,9 @@ def wsynchronized():
     return _decorator
 
 
-class Hf3fsClient:
+class Hf3fsUsrBioClient(Hf3fsClient):
+    """HF3FS client implementation using usrbio."""
+
     def __init__(self, path: str, size: int, bytes_per_page: int, entries: int):
         if not HF3FS_AVAILABLE:
             raise ImportError(

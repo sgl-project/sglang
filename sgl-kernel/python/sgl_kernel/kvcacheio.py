@@ -128,6 +128,31 @@ def transfer_kv_direct(
     )
 
 
+def transfer_kv_per_layer_direct_pf_lf(
+    src_ptrs: List[torch.Tensor],
+    dst_ptrs: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    page_size: int,
+):
+    torch.ops.sgl_kernel.transfer_kv_per_layer_direct_pf_lf(
+        src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size
+    )
+
+
+def transfer_kv_all_layer_direct_lf_pf(
+    src_ptrs: List[torch.Tensor],
+    dst_ptrs: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    page_size: int,
+):
+    torch.ops.sgl_kernel.transfer_kv_all_layer_direct_lf_pf(
+        src_ptrs, dst_ptrs, src_indices, dst_indices, page_size
+    )
+
+
 def transfer_kv_per_layer_mla(
     src: torch.Tensor,
     dst: torch.Tensor,

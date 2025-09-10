@@ -23,6 +23,7 @@ from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_
 from sgl_kernel.elementwise import (
     FusedSetKVBufferArg,
     apply_rope_with_cos_sin_cache_inplace,
+    concat_mla_k,
     copy_to_gpu_no_ce,
     downcast_fp8,
     fused_add_rmsnorm,
@@ -33,6 +34,7 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
+from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
 
 if torch.version.hip is not None:
     from sgl_kernel.elementwise import gelu_quick

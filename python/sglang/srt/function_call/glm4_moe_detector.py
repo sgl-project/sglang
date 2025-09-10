@@ -160,5 +160,5 @@ class Glm4MoeDetector(BaseFormatDetector):
             function_format="xml",
             call_rule_fmt='"{name}" "\\n" ( {arguments_rule} "\\n" )?',
             key_value_rule_fmt='"<arg_key>{key}</arg_key>" "\\n" "<arg_value>" {valrule} "</arg_value>"',
-            key_value_separator="\\n",
+            key_value_separator='"\\n"',
         )
