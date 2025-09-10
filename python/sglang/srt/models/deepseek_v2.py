@@ -1092,7 +1092,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and original_mode.is_decode()
                 and is_sm100_supported()
                 and self.current_attention_backend in ("cutlass_mla", "flashinfer")
-                and _is_fp4_quantization_enabled()
             ):
                 skip_chunked_mha = True
 
@@ -1114,10 +1113,28 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return _dispatch_mla_subtype()
         elif attention_backend == "trtllm_mla":
+            # TODO(shuw@nvidia.com) Same reason as mentioned in flashinfer branch.
+            original_mode = getattr(forward_batch, "_original_forward_mode", None)
+            skip_chunked_mha = False
+            if (
+                original_mode is not None
+                and original_mode.is_decode()
+                and is_sm100_supported()
+            ):
+                return _dispatch_mla_subtype()
+
+            sum_extend_prefix_lens = (
+                sum(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.extend_prefix_lens_cpu is not None
+                else 0
+            )
             if (
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
+                and (
+                    not self.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
+                )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
