@@ -50,10 +50,10 @@ runtime_common = [
     "timm==1.0.16",
     "tiktoken",
     "torchao==0.9.0",
-    "transformers==4.56.0",
+    "transformers==4.56.1",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.23",
+    "xgrammar==0.1.24",
 ]
 
 srt = [
@@ -74,6 +74,7 @@ blackwell = [
     "torchvision",
     "cuda-python",
     "flashinfer_python==0.3.1",
+    "nvidia-cutlass-dsl==4.1.0",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
