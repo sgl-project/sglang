@@ -833,11 +833,13 @@ class TokenizerMetricsCollector:
                 float(generation_tokens)
             )
 
-    def observe_time_to_first_token(self, labels: Dict[str, str], value: float, label: str = ""):
-        if label == "batch":
-            self.histogram_time_to_first_token_offline_batch.labels(
-                **labels
-            ).observe(value)
+    def observe_time_to_first_token(
+        self, labels: Dict[str, str], value: float, type: str = ""
+    ):
+        if type == "batch":
+            self.histogram_time_to_first_token_offline_batch.labels(**labels).observe(
+                value
+            )
         else:
             self.histogram_time_to_first_token.labels(**labels).observe(value)
 
