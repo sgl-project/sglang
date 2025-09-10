@@ -1313,6 +1313,10 @@ class ServerArgs:
                     "Please make sure that the prefill instance is launched with `--load-balance-method round_robin`"
                     " and `--prefill-round-robin-balance` is set for decode server."
                 )
+        elif self.disaggregation_mode == "encode":
+            self.disable_radix_cache = True
+            self.disable_cuda_graph = True
+            logger.warning("Cuda graph/radix cache is disabled for encode server")
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
@@ -2903,7 +2907,7 @@ class ServerArgs:
             "--disaggregation-mode",
             type=str,
             default=ServerArgs.disaggregation_mode,
-            choices=["null", "prefill", "decode"],
+            choices=["null", "prefill", "decode", "encode", "language"],
             help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
         )
         parser.add_argument(

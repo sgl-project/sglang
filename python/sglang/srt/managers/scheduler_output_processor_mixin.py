@@ -84,6 +84,11 @@ class SchedulerOutputProcessorMixin:
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
+                    if (
+                        self.disaggregation_mode == DisaggregationMode.LANGUAGE
+                        and req.metadata_buffer_index != -1
+                    ):
+                        self.req_to_metadata_buffer_idx_allocator.free_with_req(req)
                     continue
 
                 if req.is_chunked <= 0:
@@ -97,6 +102,10 @@ class SchedulerOutputProcessorMixin:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
+
+                    if self.disaggregation_mode == DisaggregationMode.LANGUAGE:
+                        if req.metadata_buffer_index != -1:
+                            self.req_to_metadata_buffer_idx_allocator.free_with_req(req)
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None

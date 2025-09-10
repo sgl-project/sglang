@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -37,8 +37,9 @@ class FakeKVSender(BaseKVSender):
 
     def init(
         self,
-        kv_indices: list[int],
+        kv_indices: Optional[list[int]] = None,
         aux_index: Optional[int] = None,
+        embedding_index: Optional[int] = None,
     ):
         logger.debug(
             f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}"
@@ -47,10 +48,19 @@ class FakeKVSender(BaseKVSender):
 
     def send(
         self,
-        kv_indices: npt.NDArray[np.int32],
+        kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        embedding_index: Optional[int] = None,
     ):
         self.has_sent = True
         logger.debug(f"FakeKVSender send with kv_indices: {kv_indices}")
+
+    def send_embedding(
+        self, embedding_index: int, last_chunk: bool, chunk_info: List[Tuple[int, int]]
+    ):
+        self.has_sent = True
+        logger.debug(
+            f"FakeKVSender send_embedding with embedding_index: {embedding_index}, last_chunk: {last_chunk}, chunk_info: {chunk_info}"
+        )
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
@@ -75,7 +85,12 @@ class FakeKVReceiver(BaseKVReceiver):
             logger.debug("FakeKVReceiver poll success")
             return KVPoll.Success
 
-    def init(self, kv_indices: list[int], aux_index: Optional[int] = None):
+    def init(
+        self,
+        kv_indices: Optional[list[int]] = None,
+        aux_index: Optional[int] = None,
+        embedding_index: Optional[int] = None,
+    ):
         self.has_init = True
         logger.debug(
             f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}"

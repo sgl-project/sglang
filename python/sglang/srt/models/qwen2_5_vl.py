@@ -48,9 +48,12 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -498,14 +501,34 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("visual", prefix),
         )
 
-        self.model = Qwen2Model(
-            config,
-            quant_config,
-            prefix=add_prefix("model", prefix),
-        )
+        if (
+            hasattr(config, "is_multimodal_embedding")
+            and config.is_multimodal_embedding
+        ):
+            # build a dummy model for text embedding
+            self.model = nn.Module()
+            model_prefix = add_prefix("model", prefix)
+            self.model.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", model_prefix),
+            )
+            setattr(self.model, "get_input_embeddings", lambda: self.model.embed_tokens)
+            self.is_multimodal_embedding = True
+        else:
+            self.model = Qwen2Model(
+                config,
+                quant_config,
+                prefix=add_prefix("model", prefix),
+            )
+            self.is_multimodal_embedding = False
 
         if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+            if self.is_multimodal_embedding:
+                self.lm_head = self.embed_tokens
+            else:
+                self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -557,6 +580,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        get_multimodal_embedding: bool = False,
     ):
         """Run forward pass for Qwen2_5-VL.
 
@@ -589,11 +613,15 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             language_model=self.model,
             multimodal_model=self,
             positions=positions,
+            get_multimodal_embedding=get_multimodal_embedding,
         )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+
+        if get_multimodal_embedding:
+            return EmbeddingPoolerOutput(embeddings=hidden_states)
 
         if not get_embedding:
             return self.logits_processor(
@@ -630,14 +658,25 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
+                if self.is_multimodal_embedding:
+                    if not (
+                        "visual" in name and ("up_proj" in name or "gate_proj" in name)
+                    ):
+                        continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 if "visual" in name:
-                    # adapt to VisionAttention
+                    # adapt to VisionAttentiona
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+
+                if self.is_multimodal_embedding:
+                    if "model" in name and "embed_tokens" not in name:
+                        continue
 
                 try:
                     # Skip loading extra bias for GPTQ models.

@@ -26,6 +26,8 @@ class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
     DECODE = "decode"
+    ENCODE = "encode"
+    LANGUAGE = "language"
 
 
 #########################
@@ -70,14 +72,32 @@ class ReqToMetadataIdxAllocator:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self) -> Optional[int]:
+    def alloc(self, fake: bool = False) -> Optional[int]:
+        if fake:
+            return random.randint(0, self.size - 1)
+
         if len(self.free_slots) == 0:
             return None
 
         return self.free_slots.popleft()
 
-    def free(self, free_index: int):
+    def free(self, free_index: int, fake: bool = False):
+        if fake:
+            return
+
         self.free_slots.append(free_index)
+
+    def free_with_req(self, req: Req):
+        """
+        This function is used to free slot and reset the metadata buffer index of the request.
+        NOTE: Only used in the disaggregation language mode: \
+              since transfer buffer need to be freed after the prefill is done. \
+        TODO: Need to refactor the code to keep interface consistent.
+        """
+        free_index = req.metadata_buffer_index
+        fake = req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+        self.free(free_index, fake=fake)
+        req.metadata_buffer_index = -1
 
 
 class MetadataBuffers:
@@ -245,7 +265,9 @@ class KVClassType(Enum):
 
 
 def get_kv_class(
-    transfer_backend: TransferBackend, class_type: KVClassType
+    transfer_backend: TransferBackend,
+    class_type: KVClassType,
+    is_multimodal: bool = False,
 ) -> Optional[Type]:
     from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
 
@@ -257,13 +279,29 @@ def get_kv_class(
             MooncakeKVReceiver,
             MooncakeKVSender,
         )
+        from sglang.srt.disaggregation.mooncake.conn_multimodal import (
+            MooncakeEmbeddingBootstrapServer,
+            MooncakeEmbeddingManager,
+            MooncakeEmbeddingReceiver,
+            MooncakeEmbeddingSender,
+        )
 
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
-            KVClassType.MANAGER: MooncakeKVManager,
-            KVClassType.SENDER: MooncakeKVSender,
-            KVClassType.RECEIVER: (MooncakeKVReceiver),
-            KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
+            KVClassType.MANAGER: (
+                MooncakeKVManager if not is_multimodal else MooncakeEmbeddingManager
+            ),
+            KVClassType.SENDER: (
+                MooncakeKVSender if not is_multimodal else MooncakeEmbeddingSender
+            ),
+            KVClassType.RECEIVER: (
+                (MooncakeKVReceiver) if not is_multimodal else MooncakeEmbeddingReceiver
+            ),
+            KVClassType.BOOTSTRAP_SERVER: (
+                MooncakeKVBootstrapServer
+                if not is_multimodal
+                else MooncakeEmbeddingBootstrapServer
+            ),
         }
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.ASCEND:
@@ -358,3 +396,92 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.input_top_logprobs_idx = []
         req.input_token_ids_logprobs_val = []
         req.input_token_ids_logprobs_idx = []
+
+
+class MultimodalDataBuffers:
+    def __init__(
+        self, size: int, max_prefill_tokens: int, embedding_dim: int = 8192
+    ) -> None:
+        self.input_embeddings = torch.zeros(
+            (size, max_prefill_tokens * embedding_dim),
+            dtype=torch.bfloat16,
+            device="cpu",
+        )
+        self.fill_ids = torch.zeros(
+            (size, max_prefill_tokens), dtype=torch.int32, device="cpu"
+        )
+        # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
+        self.mrope_positions = torch.zeros(
+            (size, 3 * max_prefill_tokens), dtype=torch.int32, device="cpu"
+        )
+        # aux_datas: embedding_length, mrope_position_delta, to speedup transfer
+        self.aux_datas = torch.zeros((size, 16), dtype=torch.int32, device="cpu")
+        self.max_prefill_tokens = max_prefill_tokens
+        self.embedding_dim = embedding_dim
+
+    def get_buf_chunk_info(self, req: Req):
+        # (offset, size)
+        return [
+            (
+                0,
+                len(req.fill_ids) * self.embedding_dim * self.input_embeddings.itemsize,
+            ),
+            (0, len(req.fill_ids) * self.fill_ids.itemsize),
+            (0, len(req.fill_ids) * 3 * self.mrope_positions.itemsize),
+            (0, self.aux_datas.shape[1] * self.aux_datas.itemsize),
+        ]
+
+    def get_buf_infos(self):
+        ptrs = [
+            self.input_embeddings.data_ptr(),
+            self.fill_ids.data_ptr(),
+            self.mrope_positions.data_ptr(),
+            self.aux_datas.data_ptr(),
+        ]
+        data_lens = [
+            self.input_embeddings.nbytes,
+            self.fill_ids.nbytes,
+            self.mrope_positions.nbytes,
+            self.aux_datas.nbytes,
+        ]
+        item_lens = [
+            self.input_embeddings[0].nbytes,
+            self.fill_ids[0].nbytes,
+            self.mrope_positions[0].nbytes,
+            self.aux_datas[0].nbytes,
+        ]
+        return ptrs, data_lens, item_lens
+
+    def get_buf(self, idx: int):
+        input_embeddings = self.input_embeddings[idx].reshape(
+            self.max_prefill_tokens, self.embedding_dim
+        )
+        fill_ids = self.fill_ids[idx]
+        mrope_positions = self.mrope_positions[idx]
+        aux_datas = self.aux_datas[idx]
+        return input_embeddings, fill_ids, mrope_positions, aux_datas
+
+    def set_buf(self, req: Req):
+        embed_length = req.embedding.shape[0]
+        self.fill_ids[req.metadata_buffer_index, : len(req.fill_ids)] = torch.tensor(
+            req.fill_ids
+        )
+        if (
+            req.multimodal_inputs is not None
+            and req.multimodal_inputs.mrope_positions is not None
+        ):
+            self.mrope_positions[req.metadata_buffer_index, : 3 * embed_length] = (
+                req.multimodal_inputs.mrope_positions.flatten().detach().cpu()
+            )
+        self.input_embeddings[
+            req.metadata_buffer_index, : embed_length * self.embedding_dim
+        ] = req.embedding.flatten()
+        self.aux_datas[req.metadata_buffer_index][0] = embed_length
+        if (
+            req.multimodal_inputs is not None
+            and req.multimodal_inputs.mrope_position_delta is not None
+        ):
+            assert req.multimodal_inputs.mrope_position_delta.numel() == 1
+            self.aux_datas[req.metadata_buffer_index][1] = (
+                req.multimodal_inputs.mrope_position_delta[0][0]
+            )

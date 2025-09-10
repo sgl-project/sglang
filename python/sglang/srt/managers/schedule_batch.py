@@ -279,6 +279,17 @@ class MultimodalDataItem:
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
 
+    def clear_cuda_tensors(self):
+        if self.feature is not None and self.feature.device.type != "cpu":
+            del self.feature
+            self.feature = None
+        if (
+            self.precomputed_embeddings is not None
+            and self.precomputed_embeddings.device.type != "cpu"
+        ):
+            del self.precomputed_embeddings
+            self.precomputed_embeddings = None
+
 
 @dataclasses.dataclass
 class MultimodalInputs:
@@ -623,6 +634,7 @@ class Req:
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+        self.disagg_embedding_sender: Optional[BaseKVSender] = None
 
         # For data parallel rank routing
         self.data_parallel_rank: Optional[int] = data_parallel_rank
@@ -1222,8 +1234,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
-                # If req.input_embeds is already a list, append its content directly
-                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+                # for multimoldal embedding, tolist op is heavy, keep tensor format
+                if isinstance(req.input_embeds, list):
+                    input_embeds.extend(
+                        req.input_embeds[len(req.prefix_indices) : len(req.fill_ids)]
+                    )  # Use extend to avoid nesting
+                else:
+                    chunk_embeds = req.input_embeds[
+                        len(req.prefix_indices) : len(req.fill_ids)
+                    ]
+                    if isinstance(input_embeds, list):
+                        input_embeds = chunk_embeds
+                    else:
+                        input_embeds = torch.cat([input_embeds, chunk_embeds], dim=0)
 
             multimodal_inputs.append(req.multimodal_inputs)
 
@@ -1313,11 +1336,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = req_pool_indices_tensor
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
-        self.input_embeds = (
-            torch.tensor(input_embeds).to(self.device, non_blocking=True)
-            if input_embeds
-            else None
-        )
+        if isinstance(input_embeds, list):
+            self.input_embeds = (
+                torch.tensor(input_embeds).to(self.device, non_blocking=True)
+                if input_embeds
+                else None
+            )
+        else:
+            self.input_embeds = input_embeds.to(self.device, non_blocking=True)
         for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue

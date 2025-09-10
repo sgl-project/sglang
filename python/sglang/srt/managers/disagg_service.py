@@ -20,10 +20,11 @@ def start_disagg_service(
     disagg_mode = DisaggregationMode(server_args.disaggregation_mode)
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 
-    if disagg_mode == DisaggregationMode.PREFILL:
+    if disagg_mode in [DisaggregationMode.PREFILL, DisaggregationMode.ENCODE]:
         # only start bootstrap server on prefill tm
+        is_multimodal = disagg_mode == DisaggregationMode.ENCODE
         kv_bootstrap_server_class: Type[BaseKVBootstrapServer] = get_kv_class(
-            transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            transfer_backend, KVClassType.BOOTSTRAP_SERVER, is_multimodal=is_multimodal
         )
         bootstrap_server: BaseKVBootstrapServer = kv_bootstrap_server_class(
             host=server_args.host,

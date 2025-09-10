@@ -748,6 +748,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
+                bootstrap_host=obj.bootstrap_host,
+                bootstrap_port=obj.bootstrap_port,
+                bootstrap_room=obj.bootstrap_room,
                 rid=obj.rid,
                 priority=obj.priority,
             )

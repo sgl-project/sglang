@@ -125,9 +125,14 @@ class SchedulerMetricsMixin:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"token usage: {token_usage:.2f}, "
 
-        f = (
-            f"Prefill batch. "
-            f"#new-seq: {len(can_run_list)}, "
+        num_new_seq = len(can_run_list)
+
+        if self.disaggregation_mode == DisaggregationMode.ENCODE:
+            f = f"Encode batch. "
+        else:
+            f = f"Prefill batch. "
+        f += (
+            f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
             f"{token_usage_msg}"
@@ -138,6 +143,24 @@ class SchedulerMetricsMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
+        elif self.disaggregation_mode == DisaggregationMode.LANGUAGE:
+            f += f"#unbootstrapped-req: {len(self.disagg_language_prealloc_queue.queue)}, "
+            f += f"#queue-req: {len(self.waiting_queue)}, "
+            f += (
+                f"#transferring-req: {len(self.disagg_language_transfer_queue.queue)}, "
+            )
+            f += f"#avaliable-slots: {self.req_to_metadata_buffer_idx_allocator.available_size()}, "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+        elif self.disaggregation_mode == DisaggregationMode.ENCODE:
+            f += f"#running-req: {running_bs}, "
+            f += f"#queue-req: {len(self.waiting_queue)}, "
+            f += f"#unbootstrapped-req: {len(self.disagg_embedding_bootstrap_queue.queue)}, "
+            f += f"#transferring-req: {len(self.disagg_embedding_inflight_queue)}, "
+            f += f"#avaliable-slots: {self.req_to_metadata_buffer_idx_allocator.available_size()}, "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+        else:
+            f += f"#running-req: {running_bs}, "
+            f += f"#queue-req: {len(self.waiting_queue)}, "
 
         logger.info(f)
 

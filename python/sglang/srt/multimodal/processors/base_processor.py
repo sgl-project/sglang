@@ -559,6 +559,10 @@ class BaseMultimodalProcessor(ABC):
                 if attr_name in self.FEATURE_NAMES:
                     attr_name = "feature"
 
+                # NOTE: move to cpu to avoid cuda memory leak
+                if isinstance(value, torch.Tensor) and value.is_cuda:
+                    value = value.cpu()
+
                 items[modality].set(attr_name, value)
 
         return list(items.values())

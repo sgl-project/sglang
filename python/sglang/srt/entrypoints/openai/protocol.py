@@ -754,6 +754,11 @@ class EmbeddingRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
+    # For disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
+
 
 class EmbeddingObject(BaseModel):
     embedding: List[float]

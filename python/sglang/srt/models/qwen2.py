@@ -451,6 +451,7 @@ class Qwen2ForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
@@ -470,6 +471,18 @@ class Qwen2ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        # TODO: remove here from modeling
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and forward_batch.contains_mm_inputs()
+        ):
+            # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+            # just being defensive here
+            forward_batch.mm_inputs = None
+
         hidden_states = self.model(
             input_ids,
             positions,
@@ -584,6 +597,9 @@ class Qwen2ForCausalLM(nn.Module):
                 else:
                     continue
             if name.startswith("model.vision_tower") and name not in params_dict:
+                continue
+
+            if name.startswith("visual") and name not in params_dict:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

@@ -1458,8 +1458,8 @@ def _execute_server_warmup(
             )
             assert res.status_code == 200, f"{res}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
-
         else:
+            # NOTE: no need for encode mode now, since cuda-graph/torch-compile is not supported
             logger.info(f"Start of pd disaggregation warmup ...")
             json_data = {
                 "sampling_params": {

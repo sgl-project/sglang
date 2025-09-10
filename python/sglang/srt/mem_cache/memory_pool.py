@@ -441,6 +441,7 @@ class MHATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        disable_allocate_kvcache: bool = False,
         enable_kv_cache_copy: bool = False,
     ):
         super().__init__(
@@ -469,7 +470,11 @@ class MHATokenToKVPool(KVCache):
         else:
             self.custom_mem_pool = None
 
-        self._create_buffers()
+        if not disable_allocate_kvcache:
+            self._create_buffers()
+        else:
+            self.k_buffer = None
+            self.v_buffer = None
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
@@ -576,6 +581,8 @@ class MHATokenToKVPool(KVCache):
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
+        if self.k_buffer is None or self.v_buffer is None:
+            return 0, 0
         k_size_bytes = 0
         for k_cache in self.k_buffer:
             k_size_bytes += get_tensor_size_bytes(k_cache)
@@ -615,6 +622,8 @@ class MHATokenToKVPool(KVCache):
         return self.custom_mem_pool
 
     def get_cpu_copy(self, indices):
+        if self.k_buffer is None or self.v_buffer is None:
+            return []
         torch.cuda.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -633,6 +642,8 @@ class MHATokenToKVPool(KVCache):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
+        if self.k_buffer is None or self.v_buffer is None:
+            return
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
