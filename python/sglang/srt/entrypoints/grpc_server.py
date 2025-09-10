@@ -29,13 +29,12 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, PortArgs
 from sglang.srt.utils import (
     configure_logger,
-    get_exception_traceback,
-    PortArgs,
     prepare_model_and_tokenizer,
 )
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -377,30 +376,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 message=str(e),
             )
 
-    async def FlushCache(
-        self,
-        request: sglang_scheduler_pb2.FlushCacheRequest,
-        context: grpc.aio.ServicerContext,
-    ) -> sglang_scheduler_pb2.FlushCacheResponse:
-        """Flush cache entries."""
-        logger.info(f"Flushing cache - flush_all: {request.flush_all}")
-
-        try:
-            result = await self.request_manager.flush_cache()
-
-            return sglang_scheduler_pb2.FlushCacheResponse(
-                success=True,
-                num_entries_flushed=0,
-                memory_freed=0,
-                message="Cache flush requested",
-            )
-        except Exception as e:
-            logger.error(f"Flush cache failed: {e}")
-            return sglang_scheduler_pb2.FlushCacheResponse(
-                success=False,
-                message=str(e),
-            )
-
     # Helper methods for request/response conversion
 
     def _convert_generate_request(
@@ -654,6 +629,9 @@ async def serve_grpc(
 
 def main():
     """Main entry point for standalone gRPC server."""
+    # Fix CUDA multiprocessing issues - must be called before any CUDA operations
+    mp.set_start_method("spawn", force=True)
+    
     parser = argparse.ArgumentParser(description="SGLang Standalone gRPC Server")
 
     # Server arguments

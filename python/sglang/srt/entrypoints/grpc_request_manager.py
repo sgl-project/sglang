@@ -6,7 +6,9 @@ Mimics TokenizerManager's state management and ZMQ communication patterns.
 import asyncio
 import dataclasses
 import logging
+import os
 import signal
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Union
@@ -21,10 +23,10 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateWeightReqOutput,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_exception_traceback, get_zmq_socket, print_exception_wrapper
+from sglang.srt.utils import get_zmq_socket, kill_process_tree
+from sglang.utils import get_exception_traceback
 from sglang.srt.managers.tokenizer_manager import SignalHandler
 
 logger = logging.getLogger(__name__)
@@ -307,8 +309,6 @@ class GrpcRequestManager:
                     await self._handle_batch_output(recv_obj)
                 elif isinstance(recv_obj, BatchEmbeddingOut):
                     await self._handle_embedding_output(recv_obj)
-                elif isinstance(recv_obj, UpdateWeightReqOutput):
-                    await self._handle_update_weights_output(recv_obj)
                 else:
                     logger.warning(f"Unknown output type: {type(recv_obj)}")
 
@@ -404,12 +404,6 @@ class GrpcRequestManager:
             state.finished_time = time.time()
             state.event.set()
 
-
-    async def _handle_update_weights_output(self, output: UpdateWeightReqOutput):
-        """Handle model weights update output."""
-        async with self.model_update_lock:
-            self.model_update_result = output
-
     async def _send_to_scheduler(self, obj):
         """Send an object to the scheduler via ZMQ."""
         try:
@@ -496,3 +490,19 @@ class GrpcRequestManager:
         """Watchdog to handle SIGTERM gracefully, matching TokenizerManager pattern."""
         while not self.gracefully_exit:
             await asyncio.sleep(1.0)
+
+
+async def print_exception_wrapper(func):
+    """
+    Sometimes an asyncio function does not print exception.
+    We do another wrapper to handle the exception.
+    """
+    try:
+        await func()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        if hasattr(func, "__self__") and isinstance(func.__self__, GrpcRequestManager):
+            func.__self__.dump_requests_before_crash()
+        kill_process_tree(os.getpid(), include_parent=True)
+        sys.exit(1)
