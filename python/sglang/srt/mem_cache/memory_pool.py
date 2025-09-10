@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from __future__ import annotations
+
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
@@ -27,7 +29,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import logging
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -37,6 +39,9 @@ import triton.language as tl
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +135,29 @@ class KVCache(abc.ABC):
         # used for chunked cpu-offloading
         self.cpu_offloading_chunk_size = 8192
 
+        # default state for optional layer-wise transfer control
+        self.layer_transfer_counter = None
+
+    def _finalize_allocation_log(self, num_tokens: int):
+        """Common logging and mem_usage computation for KV cache allocation.
+        Supports both tuple (K, V) size returns and single KV size returns.
+        """
+        kv_size_bytes = self.get_kv_size_bytes()
+        if isinstance(kv_size_bytes, tuple):
+            k_size, v_size = kv_size_bytes
+            k_size_GB = k_size / GB
+            v_size_GB = v_size / GB
+            logger.info(
+                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+            )
+            self.mem_usage = k_size_GB + v_size_GB
+        else:
+            kv_size_GB = kv_size_bytes / GB
+            logger.info(
+                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+            )
+            self.mem_usage = kv_size_GB
+
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -152,7 +180,7 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
-    def register_layer_transfer_counter(self, layer_transfer_counter):
+    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
     def get_cpu_copy(self, indices):
@@ -205,15 +233,9 @@ class MHATokenToKVPool(KVCache):
 
         self._create_buffers()
 
-        self.layer_transfer_counter = None
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
-
-        k_size, v_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
-        )
-        self.mem_usage = (k_size + v_size) / GB
+        self._finalize_allocation_log(size)
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -352,7 +374,6 @@ class MHATokenToKVPool(KVCache):
         # same applies to get_value_buffer and get_kv_buffer
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
@@ -427,43 +448,30 @@ class SWAKVPool(KVCache):
         self,
         size: int,
         size_swa: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
         swa_attention_layer_ids: List[int],
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
-        device: str,
+        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        **kwargs,
     ):
         self.size = size
         self.size_swa = size_swa
-        self.dtype = dtype
-        self.device = device
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
-        self.page_size = 1
+        kwargs["page_size"] = 1
+        kwargs["enable_memory_saver"] = False
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
-        TokenToKVPoolClass = MHATokenToKVPool
-        self.swa_kv_pool = TokenToKVPoolClass(
+
+        self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
-            page_size=self.page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
             layer_num=self.swa_layer_nums,
-            device=device,
-            enable_memory_saver=False,
+            **kwargs,
         )
-        self.full_kv_pool = TokenToKVPoolClass(
+        self.full_kv_pool = token_to_kv_pool_class(
             size=size,
-            page_size=self.page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
             layer_num=self.full_layer_nums,
-            device=device,
-            enable_memory_saver=False,
+            **kwargs,
         )
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
@@ -768,13 +776,7 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        self.layer_transfer_counter = None
-
-        kv_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
-        )
-        self.mem_usage = kv_size / GB
+        self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -936,13 +938,7 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
                 device=self.device,
             )
 
-        self.layer_transfer_counter = None
-
-        kv_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
-        )
-        self.mem_usage = kv_size / GB
+        self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")

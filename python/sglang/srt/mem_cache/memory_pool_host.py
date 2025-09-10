@@ -3,15 +3,17 @@ import logging
 import threading
 from enum import IntEnum
 from functools import wraps
+from typing import Optional
 
 import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_xpu
 
 _is_npu = is_npu()
-if not _is_npu:
+_is_xpu = is_xpu()
+if not (_is_npu or _is_xpu):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_lf_pf,
@@ -171,7 +173,7 @@ class HostKVCache(abc.ABC):
         return len(self.free_slots)
 
     @synchronized()
-    def alloc(self, need_size: int) -> torch.Tensor:
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert (
             need_size % self.page_size == 0
         ), "The requested size should be a multiple of the page size."
@@ -525,20 +527,23 @@ class MHATokenToKVPoolHost(HostKVCache):
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
 
-    def get_buffer_with_hash(self, keys, indices):
+    def get_buffer_with_hash(self, keys, indices=None):
         assert self.layout == "page_first"
-        assert len(keys) == (len(indices) // self.page_size)
+        assert indices is None or (len(keys) == (len(indices) // self.page_size))
 
         key_list = []
         buf_list = []
 
-        for key, i in zip(keys, range(0, len(indices), self.page_size)):
+        for i in range(len(keys)):
+            key = keys[i]
             key_list.append(f"{key}-k")
-            buf_list.append(self.k_buffer[i : i + self.page_size])
             key_list.append(f"{key}-v")
-            buf_list.append(self.v_buffer[i : i + self.page_size])
+            if indices is not None:
+                index = indices[i * self.page_size]
+                buf_list.append(self.k_buffer[index : index + self.page_size])
+                buf_list.append(self.v_buffer[index : index + self.page_size])
 
-        return key_list, buf_list
+        return key_list, buf_list, 2
 
 
 class MLATokenToKVPoolHost(HostKVCache):
@@ -778,13 +783,15 @@ class MLATokenToKVPoolHost(HostKVCache):
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
 
-    def get_buffer_with_hash(self, keys, indices):
+    def get_buffer_with_hash(self, keys, indices=None):
         assert self.layout == "page_first"
-        assert len(keys) == (len(indices) // self.page_size)
+        assert indices is None or (len(keys) == (len(indices) // self.page_size))
 
         buf_list = []
 
-        for i in range(0, len(indices), self.page_size):
-            buf_list.append(self.kv_buffer[i : i + self.page_size])
+        if indices is not None:
+            for i in range(len(keys)):
+                index = indices[i * self.page_size]
+                buf_list.append(self.kv_buffer[index : index + self.page_size])
 
-        return keys, buf_list
+        return keys, buf_list, 1
