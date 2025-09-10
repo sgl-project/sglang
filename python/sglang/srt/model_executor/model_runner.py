@@ -207,6 +207,7 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = model_config.is_hybrid
+        self.is_hybrid_gdn = False
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
@@ -424,6 +425,13 @@ class ModelRunner:
                     "Dual chunk attention is enabled, but attention backend is set to "
                     f"{server_args.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
                 )
+
+        # For Qwen3Next
+        if self.model_config.hf_config.architectures[0] in [
+            "Qwen3NextForCausalLM",
+            "Qwen3NextForCausalLMMTP",
+        ]:
+            self.is_hybrid_gdn = True
 
         if server_args.attention_backend is None:
             """
