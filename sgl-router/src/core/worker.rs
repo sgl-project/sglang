@@ -690,6 +690,7 @@ impl OpenAIWorker {
                 let metadata = WorkerMetadata {
                     url: url.clone(),
                     worker_type: worker_type.clone(),
+                    connection_mode: ConnectionMode::Http,
                     labels: std::collections::HashMap::new(),
                     health_config: HealthConfig::default(),
                 };
@@ -732,6 +733,10 @@ impl Worker for OpenAIWorker {
 
     fn worker_type(&self) -> WorkerType {
         self.metadata.worker_type.clone()
+    }
+
+    fn connection_mode(&self) -> ConnectionMode {
+        ConnectionMode::Http
     }
 
     fn is_healthy(&self) -> bool {

@@ -45,6 +45,9 @@ impl RouterFactory {
                         )
                         .await
                     }
+                    RoutingMode::OpenAI { .. } => {
+                        return Err("OpenAI mode requires HTTP connection_mode".to_string());
+                    }
                 }
             }
             ConnectionMode::Http => {
@@ -70,15 +73,20 @@ impl RouterFactory {
                         )
                         .await
                     }
+                    RoutingMode::OpenAI {
+                        api_key,
+                        model,
+                        base_url,
+                    } => {
+                        Self::create_openai_router(
+                            api_key.clone(),
+                            model.clone(),
+                            base_url.clone(),
+                            ctx,
+                        )
+                        .await
+                    }
                 }
-            }
-            RoutingMode::OpenAI {
-                api_key,
-                model,
-                base_url,
-            } => {
-                Self::create_openai_router(api_key.clone(), model.clone(), base_url.clone(), ctx)
-                    .await
             }
         }
     }

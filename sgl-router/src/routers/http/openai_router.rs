@@ -2,9 +2,8 @@
 
 use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
-use crate::protocols::{
-    generate::GenerateRequest,
-    openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
+use crate::protocols::spec::{
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, UserMessageContent,
 };
 use async_openai::{config::OpenAIConfig, Client};
 use async_trait::async_trait;
@@ -180,13 +179,11 @@ impl super::super::RouterTrait for OpenAIRouter {
         // For now, just extract text from the first message
         // TODO: Properly convert all messages to OpenAI format
         let user_content = match body.messages.first() {
-            Some(crate::protocols::openai::chat::types::ChatMessage::User {
-                content: crate::protocols::openai::chat::types::UserMessageContent::Text(text),
+            Some(ChatMessage::User {
+                content: UserMessageContent::Text(text),
                 ..
             }) => text.clone(),
-            Some(crate::protocols::openai::chat::types::ChatMessage::System {
-                content, ..
-            }) => content.clone(),
+            Some(ChatMessage::System { content, .. }) => content.clone(),
             _ => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -274,5 +271,21 @@ impl super::super::RouterTrait for OpenAIRouter {
         } else {
             (StatusCode::SERVICE_UNAVAILABLE, "Not ready").into_response()
         }
+    }
+
+    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Embeddings endpoint not implemented for OpenAI backend",
+        )
+            .into_response()
+    }
+
+    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Rerank endpoint not implemented for OpenAI backend",
+        )
+            .into_response()
     }
 }

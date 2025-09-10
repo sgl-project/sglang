@@ -10,10 +10,7 @@ use axum::{
 use serde_json::json;
 use sglang_router_rs::{
     config::{RouterConfig, RoutingMode},
-    protocols::{
-        generate::GenerateRequest,
-        openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
-    },
+    protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest, ChatMessage, UserMessageContent},
     routers::{openai_router::OpenAIRouter, RouterTrait},
 };
 use std::sync::Arc;
@@ -24,62 +21,21 @@ use common::mock_server::MockOpenAIServer;
 
 /// Helper function to create a minimal chat completion request for testing
 fn create_minimal_chat_request() -> ChatCompletionRequest {
-    ChatCompletionRequest {
-        model: "gpt-3.5-turbo".to_string(),
-        messages: vec![
-            sglang_router_rs::protocols::openai::chat::types::ChatMessage::User {
-                role: "user".to_string(),
-                content: sglang_router_rs::protocols::openai::chat::types::UserMessageContent::Text(
-                    "Hello".to_string(),
-                ),
-                name: None,
-            },
+    let val = json!({
+        "model": "gpt-3.5-turbo",
+        "messages": [
+            {"role": "user", "content": "Hello"}
         ],
-        temperature: None,
-        top_p: None,
-        n: None,
-        stream: false,
-        stream_options: None,
-        stop: None,
-        max_tokens: Some(100),
-        max_completion_tokens: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        logit_bias: None,
-        user: None,
-        seed: None,
-        logprobs: false,
-        top_logprobs: None,
-        response_format: None,
-        tools: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        functions: None,
-        function_call: None,
-        top_k: None,
-        min_p: None,
-        min_tokens: None,
-        repetition_penalty: None,
-        regex: None,
-        ebnf: None,
-        stop_token_ids: None,
-        no_stop_trim: false,
-        ignore_eos: false,
-        continue_final_message: false,
-        skip_special_tokens: true,
-        lora_path: None,
-        session_params: None,
-        separate_reasoning: true,
-        stream_reasoning: true,
-        return_hidden_states: false,
-    }
+        "max_tokens": 100
+    });
+    serde_json::from_value(val).unwrap()
 }
 
 /// Helper function to create a minimal completion request for testing
 fn create_minimal_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
-        prompt: sglang_router_rs::protocols::common::StringOrArray::String("Hello".to_string()),
+        prompt: sglang_router_rs::protocols::spec::StringOrArray::String("Hello".to_string()),
         suffix: None,
         max_tokens: Some(100),
         temperature: None,
@@ -297,11 +253,9 @@ async fn test_openai_router_chat_completion_with_mock() {
     // Create a minimal chat completion request
     let mut chat_request = create_minimal_chat_request();
     chat_request.messages = vec![
-        sglang_router_rs::protocols::openai::chat::types::ChatMessage::User {
+        ChatMessage::User {
             role: "user".to_string(),
-            content: sglang_router_rs::protocols::openai::chat::types::UserMessageContent::Text(
-                "Hello, how are you?".to_string(),
-            ),
+            content: UserMessageContent::Text("Hello, how are you?".to_string()),
             name: None,
         },
     ];

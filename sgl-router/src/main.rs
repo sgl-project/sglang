@@ -429,8 +429,14 @@ impl CliArgs {
                 }
                 all_urls.extend(decode_urls.clone());
             }
+            RoutingMode::OpenAI { .. } => {
+                // OpenAI mode does not use worker URLs; force HTTP connection mode below
+            }
         }
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+        let connection_mode = match &mode {
+            RoutingMode::OpenAI { .. } => ConnectionMode::Http,
+            _ => Self::determine_connection_mode(&all_urls),
+        };
 
         // Build RouterConfig
         Ok(RouterConfig {
