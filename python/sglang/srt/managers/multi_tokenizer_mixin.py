@@ -95,7 +95,7 @@ class SocketMapping:
     def send_output(self, worker_id: str, output: Any):
         if worker_id not in self._mapping:
             logger.error(
-                f"worker ID {worker_id} not registered. Check if the server Process is alive"
+                f"Worker {worker_id} not registered. Check if the server Process is alive"
             )
             return
         self._mapping[worker_id].send_pyobj(output)
