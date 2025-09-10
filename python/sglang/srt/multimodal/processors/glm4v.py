@@ -26,9 +26,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
-CACHED_IMAGE_MAX_NUM = 128
+CACHED_IMAGE_MAX_NUM = 1024
 
 
 # code from transformers
@@ -307,12 +307,17 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
         if cache_mm_image_items and is_glm4_5_v_processor:
             images = base_output.images
-            if len(images) > CACHED_IMAGE_MAX_NUM:
+
+            max_image_num = CACHED_IMAGE_MAX_NUM
+            if get_int_env_var("SGL_IMAGE_CACHE_NUM"):
+                max_image_num = get_int_env_var("SGL_IMAGE_CACHE_NUM")
+
+            if len(images) > max_image_num:
                 raise RuntimeError(
-                    "input image num exceed max size, try to use no cache mode(unset SGL_CACHE_MM_IMAGE)"
+                    "input image num exceed max size, try to use no cache mode(unset SGL_CACHE_MM_IMAGE) or increase image cache num by set SGL_IMAGE_CACHE_NUM"
                 )
 
-            self.image_cache_table.pop_until(CACHED_IMAGE_MAX_NUM - len(images))
+            self.image_cache_table.pop_until(max_image_num - len(images))
 
             img_hash_keys = []
             img_heights = []

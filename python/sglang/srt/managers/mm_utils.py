@@ -48,7 +48,7 @@ class FIFOTensorCache:
         self.order.append(key)
         if len(self.hash_map) > self.max_size:
             oldest_key = self.order.pop(0)
-            return oldest_key
+            self.hash_map.pop(oldest_key)
         return None
 
     def get(self, key: int):
