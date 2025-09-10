@@ -1,4 +1,5 @@
 // Mock worker for testing - these functions are used by integration tests
+
 #![allow(dead_code)]
 
 use axum::{

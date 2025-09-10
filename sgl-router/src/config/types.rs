@@ -101,6 +101,15 @@ pub enum RoutingMode {
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
     },
+    #[serde(rename = "openai")]
+    OpenAI {
+        /// API key for OpenAI
+        api_key: Option<String>,
+        /// Model name to use
+        model: Option<String>,
+        /// Base URL for the API endpoint
+        base_url: Option<String>,
+    },
 }
 
 impl RoutingMode {
@@ -116,6 +125,7 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
+            RoutingMode::OpenAI { .. } => 1,
         }
     }
 
@@ -380,6 +390,7 @@ impl RouterConfig {
         match self.mode {
             RoutingMode::Regular { .. } => "regular",
             RoutingMode::PrefillDecode { .. } => "prefill_decode",
+            RoutingMode::OpenAI { .. } => "openai",
         }
     }
 
@@ -415,6 +426,22 @@ impl RouterConfig {
     pub fn is_igw_mode(&self) -> bool {
         self.enable_igw
     }
+}
+
+// ============= OpenAI Proxy Configuration =============
+
+/// OpenAI proxy configuration
+/// This is the configuration needed to proxy requests to OpenAI-compatible APIs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIProxyConfig {
+    /// API key for authentication
+    pub api_key: String,
+    /// Model name (e.g., "gpt-4", "gpt-3.5-turbo", "llama-2-7b")
+    pub model: String,
+    /// Base URL for the API (e.g., "https://api.openai.com", "http://localhost:8000")
+    pub base_url: String,
+    /// Optional organization ID (for OpenAI)
+    pub organization_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -1229,5 +1256,60 @@ mod tests {
             PolicyConfig::RoundRobin => {} // Success
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+
+    // ============= OpenAI Configuration Tests =============
+
+    #[test]
+    fn test_openai_backend_config_required_fields() {
+        // Test that all required fields must be explicitly set
+        let config = OpenAIProxyConfig {
+            api_key: "sk-test123".to_string(),
+            model: "gpt-4".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            organization_id: None,
+        };
+
+        assert_eq!(config.api_key, "sk-test123");
+        assert_eq!(config.model, "gpt-4");
+        assert_eq!(config.base_url, "https://api.openai.com");
+        assert_eq!(config.organization_id, None);
+    }
+
+    #[test]
+    fn test_openai_backend_config_creation() {
+        let config = OpenAIProxyConfig {
+            api_key: "sk-test123".to_string(),
+            model: "gpt-4".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            organization_id: Some("org-123".to_string()),
+        };
+
+        assert_eq!(config.api_key, "sk-test123");
+        assert_eq!(config.model, "gpt-4");
+        assert_eq!(config.base_url, "https://api.openai.com");
+        assert_eq!(config.organization_id, Some("org-123".to_string()));
+    }
+
+    #[test]
+    fn test_openai_backend_config_serialization() {
+        let config = OpenAIProxyConfig {
+            api_key: "sk-test123".to_string(),
+            model: "gpt-4".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            organization_id: Some("org-123".to_string()),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"api_key\":\"sk-test123\""));
+        assert!(json.contains("\"model\":\"gpt-4\""));
+        assert!(json.contains("\"base_url\":\"https://api.openai.com\""));
+        assert!(json.contains("\"organization_id\":\"org-123\""));
+
+        // Test deserialization
+        let deserialized: OpenAIProxyConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.api_key, config.api_key);
+        assert_eq!(deserialized.model, config.model);
+        assert_eq!(deserialized.organization_id, config.organization_id);
     }
 }

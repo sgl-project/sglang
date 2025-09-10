@@ -145,6 +145,18 @@ struct CliArgs {
     #[arg(long)]
     api_key: Option<String>,
 
+    /// Use OpenAI as the backend instead of SGLang workers
+    #[arg(long, default_value_t = false)]
+    openai_backend: bool,
+
+    /// Model name to use (required when openai_backend is set)
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Base URL for the API endpoint (required when openai_backend is set)
+    #[arg(long)]
+    base_url: Option<String>,
+
     /// Directory to store log files
     #[arg(long)]
     log_dir: Option<String>,
@@ -334,10 +346,18 @@ impl CliArgs {
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         // Determine routing mode
+
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
             RoutingMode::Regular {
                 worker_urls: vec![],
+            }
+        } else if self.openai_backend {
+            // OpenAI backend mode
+            RoutingMode::OpenAI {
+                api_key: self.api_key.clone(),
+                model: self.model.clone(),
+                base_url: self.base_url.clone(),
             }
         } else if self.pd_disaggregation {
             let decode_urls = self.decode.clone();

@@ -1,6 +1,7 @@
 use super::{CircuitBreaker, CircuitBreakerConfig, WorkerError, WorkerResult};
 use crate::grpc::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
+use async_openai::{config::OpenAIConfig, Client as OpenAIClient};
 use async_trait::async_trait;
 use futures;
 use serde_json;
@@ -193,6 +194,17 @@ pub enum WorkerType {
     },
     /// Decode worker for PD disaggregated mode
     Decode,
+    /// OpenAI-compatible API backend worker
+    OpenAI {
+        /// API key for authentication (optional for local services)
+        api_key: Option<String>,
+        /// Base URL for the API (e.g., https://api.openai.com, http://localhost:8000)
+        base_url: String,
+        /// Model name to use (e.g., gpt-4, gpt-3.5-turbo, llama-2-7b)
+        model: String,
+        /// Optional organization ID (for OpenAI)
+        organization_id: Option<String>,
+    },
 }
 
 impl fmt::Display for WorkerType {
@@ -204,6 +216,15 @@ impl fmt::Display for WorkerType {
                 None => write!(f, "Prefill"),
             },
             WorkerType::Decode => write!(f, "Decode"),
+            WorkerType::OpenAI {
+                model,
+                base_url,
+                organization_id,
+                ..
+            } => match organization_id {
+                Some(org) => write!(f, "OpenAI(model:{}, org:{}, url:{})", model, org, base_url),
+                None => write!(f, "OpenAI(model:{}, url:{})", model, base_url),
+            },
         }
     }
 }
@@ -621,6 +642,180 @@ impl Worker for DPAwareWorker {
     }
 }
 
+/// OpenAI worker that implements the Worker trait using the OpenAI client
+#[derive(Debug)]
+pub struct OpenAIWorker {
+    /// Base worker metadata and state
+    metadata: WorkerMetadata,
+    /// OpenAI client for making API calls
+    client: OpenAIClient<OpenAIConfig>,
+    /// Current load (number of active requests)
+    load: Arc<AtomicUsize>,
+    /// Number of processed requests
+    processed_requests: Arc<AtomicUsize>,
+    /// Health status
+    healthy: Arc<AtomicBool>,
+    /// Circuit breaker for reliability
+    circuit_breaker: CircuitBreaker,
+}
+
+impl OpenAIWorker {
+    /// Create a new OpenAI worker
+    pub fn new(url: String, worker_type: WorkerType) -> WorkerResult<Self> {
+        match &worker_type {
+            WorkerType::OpenAI {
+                api_key,
+                base_url,
+                organization_id,
+                ..
+            } => {
+                // Create OpenAI client configuration
+                let mut config = OpenAIConfig::new();
+
+                if let Some(key) = api_key {
+                    config = config.with_api_key(key);
+                }
+
+                if let Some(org) = organization_id {
+                    config = config.with_org_id(org);
+                }
+
+                // Set custom base URL if different from default
+                if base_url != "https://api.openai.com" {
+                    config = config.with_api_base(base_url);
+                }
+
+                let client = OpenAIClient::with_config(config);
+
+                let metadata = WorkerMetadata {
+                    url: url.clone(),
+                    worker_type: worker_type.clone(),
+                    labels: std::collections::HashMap::new(),
+                    health_config: HealthConfig::default(),
+                };
+
+                Ok(Self {
+                    metadata,
+                    client,
+                    load: Arc::new(AtomicUsize::new(0)),
+                    processed_requests: Arc::new(AtomicUsize::new(0)),
+                    healthy: Arc::new(AtomicBool::new(true)),
+                    circuit_breaker: CircuitBreaker::new(),
+                })
+            }
+            _ => Err(WorkerError::InvalidConfiguration {
+                message: "OpenAIWorker can only be created with OpenAI WorkerType".to_string(),
+            }),
+        }
+    }
+
+    /// Get a reference to the OpenAI client for making API calls
+    pub fn client(&self) -> &OpenAIClient<OpenAIConfig> {
+        &self.client
+    }
+
+    /// Get the model name for this worker
+    pub fn model(&self) -> Option<&str> {
+        if let WorkerType::OpenAI { model, .. } = &self.metadata.worker_type {
+            Some(model)
+        } else {
+            None
+        }
+    }
+}
+
+#[async_trait]
+impl Worker for OpenAIWorker {
+    fn url(&self) -> &str {
+        &self.metadata.url
+    }
+
+    fn worker_type(&self) -> WorkerType {
+        self.metadata.worker_type.clone()
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    fn set_healthy(&self, healthy: bool) {
+        self.healthy.store(healthy, Ordering::Release);
+    }
+
+    async fn check_health_async(&self) -> WorkerResult<()> {
+        // For OpenAI workers, we can check health by making a simple API call
+        // or just assume healthy if we have valid configuration
+        if let WorkerType::OpenAI { api_key, .. } = &self.metadata.worker_type {
+            if api_key.is_some() {
+                // We have an API key, assume healthy
+                // In a real implementation, we might make a test API call
+                Ok(())
+            } else {
+                // No API key for a service that might require it
+                Err(WorkerError::HealthCheckFailed {
+                    url: self.url().to_string(),
+                    reason: "No API key configured".to_string(),
+                })
+            }
+        } else {
+            Err(WorkerError::HealthCheckFailed {
+                url: self.url().to_string(),
+                reason: "Invalid worker type".to_string(),
+            })
+        }
+    }
+
+    fn load(&self) -> usize {
+        self.load.load(Ordering::Acquire)
+    }
+
+    fn increment_load(&self) {
+        self.load.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn decrement_load(&self) {
+        self.load.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn processed_requests(&self) -> usize {
+        self.processed_requests.load(Ordering::Acquire)
+    }
+
+    fn increment_processed(&self) {
+        self.processed_requests.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn circuit_breaker(&self) -> &CircuitBreaker {
+        &self.circuit_breaker
+    }
+
+    fn metadata(&self) -> &WorkerMetadata {
+        &self.metadata
+    }
+
+    fn clone_worker(&self) -> Box<dyn Worker> {
+        Box::new(Self {
+            metadata: self.metadata.clone(),
+            client: self.client.clone(),
+            load: Arc::clone(&self.load),
+            processed_requests: Arc::clone(&self.processed_requests),
+            healthy: Arc::clone(&self.healthy),
+            circuit_breaker: self.circuit_breaker.clone(),
+        })
+    }
+
+    // OpenAI workers use the client directly, so we override endpoint_url
+    fn endpoint_url(&self, _route: &str) -> String {
+        // The OpenAI client handles the full URL construction
+        // We just return the base URL for compatibility
+        if let WorkerType::OpenAI { base_url, .. } = &self.metadata.worker_type {
+            base_url.clone()
+        } else {
+            self.url().to_string()
+        }
+    }
+}
+
 /// Worker factory for creating workers of different types
 pub struct WorkerFactory;
 
@@ -850,6 +1045,38 @@ impl WorkerFactory {
                 .collect())
         }
     }
+
+    /// Create an OpenAI worker
+    pub fn create_openai(
+        url: String,
+        api_key: Option<String>,
+        base_url: String,
+        model: String,
+        organization_id: Option<String>,
+    ) -> WorkerResult<Box<dyn Worker>> {
+        let worker_type = WorkerType::OpenAI {
+            api_key,
+            base_url,
+            model,
+            organization_id,
+        };
+
+        OpenAIWorker::new(url, worker_type).map(|worker| Box::new(worker) as Box<dyn Worker>)
+    }
+
+    /// Create an OpenAI worker with custom circuit breaker configuration
+    pub fn create_openai_with_config(
+        url: String,
+        api_key: Option<String>,
+        base_url: String,
+        model: String,
+        organization_id: Option<String>,
+        _circuit_breaker_config: CircuitBreakerConfig,
+    ) -> WorkerResult<Box<dyn Worker>> {
+        // Note: OpenAI workers use their own circuit breaker implementation
+        // Custom config is accepted for API compatibility but not currently used
+        Self::create_openai(url, api_key, base_url, model, organization_id)
+    }
 }
 
 /// Helper trait for collections of workers
@@ -1059,6 +1286,29 @@ mod tests {
             "Prefill"
         );
         assert_eq!(WorkerType::Decode.to_string(), "Decode");
+
+        // Test OpenAI WorkerType
+        let openai_with_org = WorkerType::OpenAI {
+            api_key: Some("sk-test123".to_string()),
+            base_url: "https://api.openai.com".to_string(),
+            model: "gpt-4".to_string(),
+            organization_id: Some("org-123".to_string()),
+        };
+        assert_eq!(
+            openai_with_org.to_string(),
+            "OpenAI(model:gpt-4, org:org-123, url:https://api.openai.com)"
+        );
+
+        let openai_without_org = WorkerType::OpenAI {
+            api_key: Some("sk-test123".to_string()),
+            base_url: "https://api.openai.com".to_string(),
+            model: "gpt-3.5-turbo".to_string(),
+            organization_id: None,
+        };
+        assert_eq!(
+            openai_without_org.to_string(),
+            "OpenAI(model:gpt-3.5-turbo, url:https://api.openai.com)"
+        );
     }
 
     #[test]
@@ -1081,6 +1331,30 @@ mod tests {
                 bootstrap_port: Some(8081)
             }
         );
+
+        // Test OpenAI WorkerType equality
+        let openai1 = WorkerType::OpenAI {
+            api_key: Some("sk-test123".to_string()),
+            base_url: "https://api.openai.com".to_string(),
+            model: "gpt-4".to_string(),
+            organization_id: Some("org-123".to_string()),
+        };
+        let openai2 = WorkerType::OpenAI {
+            api_key: Some("sk-test123".to_string()),
+            base_url: "https://api.openai.com".to_string(),
+            model: "gpt-4".to_string(),
+            organization_id: Some("org-123".to_string()),
+        };
+        let openai3 = WorkerType::OpenAI {
+            api_key: Some("sk-different".to_string()),
+            base_url: "https://api.openai.com".to_string(),
+            model: "gpt-4".to_string(),
+            organization_id: Some("org-123".to_string()),
+        };
+
+        assert_eq!(openai1, openai2);
+        assert_ne!(openai1, openai3);
+        assert_ne!(openai1, WorkerType::Regular);
     }
 
     #[test]
@@ -1090,6 +1364,16 @@ mod tests {
         };
         let cloned = original.clone();
         assert_eq!(original, cloned);
+
+        // Test OpenAI WorkerType clone
+        let openai_original = WorkerType::OpenAI {
+            api_key: Some("sk-test123".to_string()),
+            base_url: "https://api.openai.com".to_string(),
+            model: "gpt-4".to_string(),
+            organization_id: Some("org-123".to_string()),
+        };
+        let openai_cloned = openai_original.clone();
+        assert_eq!(openai_original, openai_cloned);
     }
 
     // Test HealthConfig
@@ -1391,6 +1675,78 @@ mod tests {
         let worker = WorkerFactory::create_decode("http://decode:8080".to_string());
         assert_eq!(worker.url(), "http://decode:8080");
         assert_eq!(worker.worker_type(), WorkerType::Decode);
+    }
+
+    #[test]
+    fn test_create_openai_worker() {
+        let worker = WorkerFactory::create_openai(
+            "https://api.openai.com".to_string(),
+            Some("sk-test123".to_string()),
+            "https://api.openai.com".to_string(),
+            "gpt-4".to_string(),
+            None,
+        );
+        assert!(worker.is_ok());
+
+        let worker = worker.unwrap();
+        assert_eq!(worker.url(), "https://api.openai.com");
+        assert_eq!(
+            worker.worker_type(),
+            WorkerType::OpenAI {
+                api_key: Some("sk-test123".to_string()),
+                base_url: "https://api.openai.com".to_string(),
+                model: "gpt-4".to_string(),
+                organization_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_create_openai_worker_with_org() {
+        let worker = WorkerFactory::create_openai(
+            "https://api.openai.com".to_string(),
+            Some("sk-test123".to_string()),
+            "https://api.openai.com".to_string(),
+            "gpt-3.5-turbo".to_string(),
+            Some("org-12345".to_string()),
+        );
+        assert!(worker.is_ok());
+
+        let worker = worker.unwrap();
+        assert_eq!(
+            worker.worker_type(),
+            WorkerType::OpenAI {
+                api_key: Some("sk-test123".to_string()),
+                base_url: "https://api.openai.com".to_string(),
+                model: "gpt-3.5-turbo".to_string(),
+                organization_id: Some("org-12345".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_create_openai_worker_local_endpoint() {
+        // Test with local OpenAI-compatible endpoint (like vLLM or Ollama)
+        let worker = WorkerFactory::create_openai(
+            "http://localhost:8000".to_string(),
+            None, // No API key needed for local endpoints
+            "http://localhost:8000".to_string(),
+            "llama-2-7b".to_string(),
+            None,
+        );
+        assert!(worker.is_ok());
+
+        let worker = worker.unwrap();
+        assert_eq!(worker.url(), "http://localhost:8000");
+        assert_eq!(
+            worker.worker_type(),
+            WorkerType::OpenAI {
+                api_key: None,
+                base_url: "http://localhost:8000".to_string(),
+                model: "llama-2-7b".to_string(),
+                organization_id: None,
+            }
+        );
     }
 
     #[test]
@@ -1976,5 +2332,62 @@ mod tests {
             }
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+    }
+
+    // ===== Tests for OpenAI Worker =====
+
+    #[test]
+    fn test_openai_worker_creation() {
+        let worker_type = WorkerType::OpenAI {
+            api_key: Some("sk-test123".to_string()),
+            base_url: "https://api.openai.com".to_string(),
+            model: "gpt-4".to_string(),
+            organization_id: None,
+        };
+
+        let worker = OpenAIWorker::new("https://api.openai.com".to_string(), worker_type);
+        assert!(worker.is_ok());
+
+        let worker = worker.unwrap();
+        assert_eq!(worker.url(), "https://api.openai.com");
+        assert!(worker.is_healthy());
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.processed_requests(), 0);
+        assert_eq!(worker.model(), Some("gpt-4"));
+    }
+
+    #[test]
+    fn test_openai_worker_invalid_type() {
+        let worker_type = WorkerType::Regular;
+        let result = OpenAIWorker::new("http://test".to_string(), worker_type);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_openai_worker_health_check() {
+        let worker_type = WorkerType::OpenAI {
+            api_key: Some("sk-test123".to_string()),
+            base_url: "https://api.openai.com".to_string(),
+            model: "gpt-4".to_string(),
+            organization_id: None,
+        };
+
+        let worker = OpenAIWorker::new("https://api.openai.com".to_string(), worker_type).unwrap();
+        let result = worker.check_health_async().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_openai_worker_no_api_key() {
+        let worker_type = WorkerType::OpenAI {
+            api_key: None,
+            base_url: "http://localhost:8000".to_string(),
+            model: "llama-2-7b".to_string(),
+            organization_id: None,
+        };
+
+        let worker = OpenAIWorker::new("http://localhost:8000".to_string(), worker_type).unwrap();
+        let result = worker.check_health_async().await;
+        assert!(result.is_err());
     }
 }
