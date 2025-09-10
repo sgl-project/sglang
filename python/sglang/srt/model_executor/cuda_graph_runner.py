@@ -518,11 +518,24 @@ class CudaGraphRunner:
         if self.model_runner.server_args.enable_memory_saver:
             from torch_memory_saver import torch_memory_saver
 
-            ctx = torch_memory_saver.cuda_graph(
-                graph, pool=pool, stream=stream, tag="graph"
-            )
-            with ctx:
-                out = run_once_fn()
+            # For tensor parallel operations, we need to temporarily disable
+            # custom all-reduce during graph capture to avoid IPC compatibility issues
+            backup_ca_comm = None
+            if self.tp_size > 1:
+                # Temporarily disable custom all-reduce for tensor parallel
+                backup_ca_comm = self.model_runner.tp_group.ca_comm
+                self.model_runner.tp_group.ca_comm = None
+
+            try:
+                ctx = torch_memory_saver.cuda_graph(
+                    graph, pool=pool, stream=stream, tag="graph"
+                )
+                with ctx:
+                    out = run_once_fn()
+            finally:
+                # Restore custom all-reduce after graph capture
+                if backup_ca_comm is not None:
+                    self.model_runner.tp_group.ca_comm = backup_ca_comm
         else:
             with self.device_module.graph(graph, pool=pool, stream=stream):
                 out = run_once_fn()
