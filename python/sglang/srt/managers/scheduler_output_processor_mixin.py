@@ -107,14 +107,15 @@ class SchedulerOutputProcessorMixin:
                         if batch.is_prefill_only:
                             self._initialize_empty_logprob_containers(req)
 
-                        self.add_logprob_return_values(
-                            i,
-                            req,
-                            logprob_pt,
-                            next_token_ids,
-                            num_input_logprobs,
-                            logits_output,
-                        )
+                        if req.return_logprob:
+                            self.add_logprob_return_values(
+                                i,
+                                req,
+                                logprob_pt,
+                                next_token_ids,
+                                num_input_logprobs,
+                                logits_output,
+                            )
                         logprob_pt += num_input_logprobs
 
                     if (
