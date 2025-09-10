@@ -173,16 +173,13 @@ struct CliArgs {
     api_key: Option<String>,
 
     /// Backend to route requests to (sglang, vllm, trtllm, openai, anthropic)
-    #[arg(long, value_enum, default_value_t = Backend::Sglang)]
+    #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime")]
     backend: Backend,
 
-    /// Model name to use (required when runtime=openai)
+    /// Model name to use (required when backend=openai)
     #[arg(long)]
     model: Option<String>,
 
-    /// Base URL for the API endpoint (required when runtime=openai)
-    #[arg(long)]
-    base_url: Option<String>,
 
     /// Directory to store log files
     #[arg(long)]
@@ -380,11 +377,11 @@ impl CliArgs {
                 worker_urls: vec![],
             }
         } else if matches!(self.backend, Backend::Openai) {
-            // OpenAI backend mode
+            // OpenAI backend mode - use worker_urls as base(s)
             RoutingMode::OpenAI {
                 api_key: self.api_key.clone(),
                 model: self.model.clone(),
-                base_url: self.base_url.clone(),
+                worker_urls: self.worker_urls.clone(),
             }
         } else if self.pd_disaggregation {
             let decode_urls = self.decode.clone();

@@ -107,8 +107,8 @@ pub enum RoutingMode {
         api_key: Option<String>,
         /// Model name to use
         model: Option<String>,
-        /// Base URL for the API endpoint
-        base_url: Option<String>,
+        /// OpenAI-compatible API base(s), provided via worker URLs
+        worker_urls: Vec<String>,
     },
 }
 
@@ -125,7 +125,7 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
-            RoutingMode::OpenAI { .. } => 1,
+            RoutingMode::OpenAI { worker_urls, .. } => worker_urls.len().max(1),
         }
     }
 

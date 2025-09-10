@@ -96,7 +96,9 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI {
-                model, base_url, ..
+                model,
+                worker_urls,
+                ..
             } => {
                 // Validate model is provided and not empty
                 let model_str = model
@@ -110,17 +112,18 @@ impl ConfigValidator {
                     });
                 }
 
-                // Validate base URL is provided and valid
-                let base_url_str =
-                    base_url
-                        .as_ref()
-                        .ok_or_else(|| ConfigError::ValidationFailed {
-                            reason: "OpenAI base URL is required".to_string(),
-                        })?;
-                if let Err(e) = url::Url::parse(base_url_str) {
+                // Validate at least one worker URL provided and each is a valid URL
+                if worker_urls.is_empty() {
                     return Err(ConfigError::ValidationFailed {
-                        reason: format!("Invalid OpenAI base URL '{}': {}", base_url_str, e),
+                        reason: "OpenAI mode requires at least one --worker-urls entry".to_string(),
                     });
+                }
+                for u in worker_urls {
+                    if let Err(e) = url::Url::parse(u) {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!("Invalid OpenAI worker URL '{}': {}", u, e),
+                        });
+                    }
                 }
             }
         }

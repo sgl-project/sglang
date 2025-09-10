@@ -76,16 +76,14 @@ impl RouterFactory {
                     RoutingMode::OpenAI {
                         api_key,
                         model,
-                        base_url,
-                    } => {
-                        Self::create_openai_router(
-                            api_key.clone(),
-                            model.clone(),
-                            base_url.clone(),
-                            ctx,
-                        )
-                        .await
-                    }
+                        worker_urls,
+                    } => Self::create_openai_router(
+                        api_key.clone(),
+                        model.clone(),
+                        worker_urls.clone(),
+                        ctx,
+                    )
+                    .await,
                 }
             }
         }
@@ -185,14 +183,19 @@ impl RouterFactory {
     async fn create_openai_router(
         api_key: Option<String>,
         model: Option<String>,
-        base_url: Option<String>,
+        worker_urls: Vec<String>,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // Create OpenAI router - validation ensures model and base_url are present
+        // Use the first worker URL as the OpenAI-compatible base
+        let base_url = worker_urls
+            .get(0)
+            .cloned()
+            .ok_or_else(|| "OpenAI mode requires at least one worker URL".to_string())?;
+
         let router = OpenAIRouter::new(
             api_key,
             model.unwrap(),
-            base_url.unwrap(),
+            base_url,
             Some(ctx.router_config.circuit_breaker.clone()),
         )
         .await?;

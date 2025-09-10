@@ -177,7 +177,7 @@ async fn test_router_factory_openai_mode() {
     let routing_mode = RoutingMode::OpenAI {
         api_key: Some("test-key".to_string()),
         model: Some("gpt-4".to_string()),
-        base_url: Some("https://api.openai.com".to_string()),
+        worker_urls: vec!["https://api.openai.com".to_string()],
     };
 
     let router_config =
