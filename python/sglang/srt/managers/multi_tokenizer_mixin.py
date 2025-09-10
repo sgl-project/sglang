@@ -215,6 +215,8 @@ def _handle_output_by_index(output, i):
                 if output.output_hidden_states
                 else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchEmbeddingOut):
         new_output = BatchEmbeddingOut(
@@ -231,6 +233,8 @@ def _handle_output_by_index(output, i):
             cached_tokens=(
                 [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchStrOut):
         new_output = BatchStrOut(
@@ -327,6 +331,8 @@ def _handle_output_by_index(output, i):
                 if output.output_hidden_states
                 else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchMultimodalOut):
         new_output = BatchMultimodalOut(
@@ -348,6 +354,8 @@ def _handle_output_by_index(output, i):
             cached_tokens=(
                 [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     else:
         new_output = output
