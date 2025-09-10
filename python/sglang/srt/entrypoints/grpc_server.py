@@ -306,8 +306,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
             # Create health check request
             rid = f"HEALTH_CHECK_GRPC_{time.time()}"
-            logger.info(f"Creating health check request with rid: {rid}")
-            logger.info(f"Input text: '{input_text[:50]}...', input_ids: {input_ids}")
 
             health_request = TokenizedGenerateReqInput(
                 rid=rid,
