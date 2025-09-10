@@ -1369,19 +1369,14 @@ class Scheduler(
         if self.enable_priority_scheduling:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # Request with min priority is the last index item in the waiting queue after sorting.
-            abort_existing_req = False
-            if self.schedule_low_priority_values_first:
-                idx, min_priority_req = max(
-                    enumerate(self.waiting_queue),
-                    key=lambda item: (item[1].priority, item[1].queue_time_start),
-                )
-                abort_existing_req = recv_req.priority < min_priority_req.priority
-            else:
-                idx, min_priority_req = max(
-                    enumerate(self.waiting_queue),
-                    key=lambda item: (-item[1].priority, item[1].queue_time_start),
-                )
-                abort_existing_req = recv_req.priority > min_priority_req.priority
+            # With priority scheduling, consider aboritng an existing request based on the priority.
+            # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
+            # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
+            # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
+            direction = 1 if self.schedule_low_priority_values_first else -1
+            key_fn = lambda item: (direction * item[1].priority, item[1].queue_time_start)
+            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
+            abort_existing_req = direction * recv_req.priority < direction * candidate_req.priority
             if abort_existing_req:
                 self.waiting_queue.pop(idx)
                 req_to_abort = min_priority_req
