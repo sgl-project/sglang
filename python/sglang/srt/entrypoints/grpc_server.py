@@ -309,11 +309,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
             # Create health check request
             rid = f"HEALTH_CHECK_GRPC_{time.time()}"
+
             health_request = TokenizedGenerateReqInput(
                 rid=rid,
                 input_text=input_text,
                 input_ids=input_ids,
-                sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+                sampling_params=SGLSamplingParams(
+                    max_new_tokens=1,
+                    temperature=0.0
+                ),
                 stream=False,
                 mm_inputs=None,
                 return_logprob=False,
@@ -637,7 +641,7 @@ def main():
     """Main entry point for standalone gRPC server."""
     # Fix CUDA multiprocessing issues - must be called before any CUDA operations
     mp.set_start_method("spawn", force=True)
-    
+
     parser = argparse.ArgumentParser(description="SGLang Standalone gRPC Server")
 
     # Server arguments

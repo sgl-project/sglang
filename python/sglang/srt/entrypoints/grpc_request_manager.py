@@ -27,9 +27,33 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.server_args import ServerArgs, PortArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
-from sglang.srt.managers.tokenizer_manager import SignalHandler
 
 logger = logging.getLogger(__name__)
+
+
+class GrpcSignalHandler:
+    """Minimal signal handler for gRPC server - delegates real crash handling to scheduler."""
+
+    def __init__(self, grpc_manager):
+        self.grpc_manager = grpc_manager
+
+    def sigterm_handler(self, signum=None, frame=None):
+        """Handle SIGTERM by gracefully shutting down gRPC server."""
+        logger.warning(
+            f"SIGTERM received. {signum=} {frame=}. Shutting down gRPC server..."
+        )
+        self.grpc_manager.gracefully_exit = True
+
+    def running_phase_sigquit_handler(self, signum=None, frame=None):
+        """Handle SIGQUIT from failed scheduler process."""
+        logger.error(
+            "Received SIGQUIT from scheduler process. Scheduler failed, shutting down gRPC server."
+        )
+        logger.info(
+            "Note: Crash dumps are handled by the scheduler process, not the gRPC server."
+        )
+        # Just exit cleanly - the scheduler handles crash dumps
+        kill_process_tree(os.getpid(), include_parent=True)
 
 
 @dataclasses.dataclass
@@ -470,7 +494,7 @@ class GrpcRequestManager:
         # We cannot add signal handler when the grpc manager is not in
         # the main thread due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
-            signal_handler = SignalHandler(self)
+            signal_handler = GrpcSignalHandler(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
