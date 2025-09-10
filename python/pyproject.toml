@@ -87,7 +87,7 @@ srt_hip = [
 ]
 
 # https://docs.sglang.ai/platforms/cpu_server.html
-srt_cpu = ["sglang[runtime_common]"]
+srt_cpu = ["sglang[runtime_common]", "intel-openmp"]
 
 # https://docs.sglang.ai/platforms/ascend_npu.html
 srt_npu = ["sglang[runtime_common]"]

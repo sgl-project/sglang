@@ -1692,7 +1692,12 @@ class ModelRunner:
                 )
             self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
         else:
-            self.local_omp_cpuid = omp_cpuids.split("|")[self.tp_rank]
+            threads_bind_list = omp_cpuids.split("|")
+            assert self.tp_size == len(threads_bind_list), (
+                f"SGLANG_CPU_OMP_THREADS_BIND setting must be aligned with TP size parameter ({self.tp_size}). "
+                f"Please double check your settings."
+            )
+            self.local_omp_cpuid = threads_bind_list[self.tp_rank]
             if self.tp_size > n_numa_node:
                 logger.warning(
                     f"TP size ({self.tp_size})is larger than numa node number ({n_numa_node}), "

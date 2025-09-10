@@ -84,13 +84,13 @@ git checkout <YOUR-DESIRED-VERSION>
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
-pip install intel-openmp
 pip install -e "python[all_cpu]"
+pip install torch==2.7.1 torchvision==0.22.1 triton==3.3.1 --force-reinstall
 
 # Build the CPU backend kernels
 cd sgl-kernel
 cp pyproject_cpu.toml pyproject.toml
-pip install -v .
+pip install .
 
 # Other required environment variables
 # Recommend to set these in ~/.bashrc in order not to set every time in a new terminal
