@@ -15,6 +15,7 @@
 """Qwen3Hybrid model configuration"""
 
 import enum
+import os
 
 import numpy as np
 import torch
@@ -298,7 +299,11 @@ class Qwen3NextConfig(PretrainedConfig):
             self.linear_value_head_dim,
         )
         conv_dtype = torch.bfloat16
-        ssm_dtype = torch.float32
+        dtype_map = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+        }
+        ssm_dtype = dtype_map[os.environ["SGLANG_MAMBA_SSM_DTYPE"]]
         mamba_layers = self.linear_layer_ids
         return (
             conv_state_shape,
