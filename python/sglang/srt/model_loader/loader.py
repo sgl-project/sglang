@@ -1935,15 +1935,10 @@ class ModelOptModelLoader(DefaultModelLoader):
                 model_config=model_config, device_config=device_config
             )
 
-        # Determine workflow based on quantize_and_serve flag
-        quantize_and_serve = getattr(model_config, "quantize_and_serve", False)
-
-        if quantize_and_serve:
-            logger.info("Quantize-and-serve mode: Will quantize and serve immediately")
-            return self._quantize_and_serve_workflow(model_config, device_config)
-        else:
-            logger.info("Standard quantization mode: Will quantize and export/save")
-            return self._standard_quantization_workflow(model_config, device_config)
+        # TODO: Quantize-and-serve mode has been disabled at the ModelConfig level
+        # All quantization now uses the standard workflow (quantize + export/save)
+        logger.info("Standard quantization mode: Will quantize and export/save")
+        return self._standard_quantization_workflow(model_config, device_config)
 
     def _standard_quantization_workflow(
         self, model_config: ModelConfig, device_config: DeviceConfig
@@ -2009,75 +2004,6 @@ class ModelOptModelLoader(DefaultModelLoader):
         except Exception as e:
             logger.warning(f"ModelOpt quantization failed: {e}")
             logger.warning("Proceeding without quantization...")
-
-        return model.eval()
-
-    def _quantize_and_serve_workflow(
-        self, model_config: ModelConfig, device_config: DeviceConfig
-    ) -> nn.Module:
-        """Quantize-and-serve workflow: quantize in memory and serve immediately (no export)."""
-        logger.info("Starting quantize-and-serve workflow...")
-
-        # Validate that conflicting options are not set
-        if model_config.modelopt_export_path:
-            logger.warning(
-                "modelopt_export_path is ignored in quantize-and-serve mode. "
-                "Use standard quantization mode if you need to export the model."
-            )
-
-        # Use shared method from parent class to load base model for quantization
-        model = self._load_modelopt_base_model(model_config)
-
-        # Import ModelOpt modules
-        try:
-            import modelopt.torch.quantization as mtq
-        except ImportError:
-            logger.error(
-                "NVIDIA Model Optimizer (modelopt) library not found. "
-                "Please install it to use ModelOpt quantization."
-            )
-            raise
-
-        # Handle both old modelopt_quant and new unified quantization flags
-        if model_config.modelopt_quant:
-            quant_choice_str = model_config.modelopt_quant
-        else:
-            quant_choice_str = model_config._get_modelopt_quant_type()
-
-        quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
-        if not quant_cfg_name:
-            raise ValueError(
-                f"Invalid quantization choice: '{quant_choice_str}'. "
-                f"Available choices: {list(QUANT_CFG_CHOICES.keys())}"
-            )
-
-        try:
-            quant_cfg = getattr(mtq, quant_cfg_name)
-        except AttributeError:
-            raise AttributeError(
-                f"ModelOpt quantization config '{quant_cfg_name}' not found."
-            )
-
-        logger.info(f"Quantizing model for serving with config: mtq.{quant_cfg_name}")
-
-        # Set up quantization without export (in-memory only)
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_config.model_path, use_fast=True
-        )
-
-        try:
-            self._setup_modelopt_quantization(
-                model,
-                tokenizer,
-                quant_cfg,
-                quantized_ckpt_restore_path=model_config.modelopt_checkpoint_restore_path,
-                quantized_ckpt_save_path=model_config.modelopt_checkpoint_save_path,
-                export_path=None,  # No export in quantize-and-serve mode
-            )
-            logger.info("✅ Model quantized successfully and ready to serve!")
-        except Exception as e:
-            logger.error(f"Quantize-and-serve failed: {e}")
-            raise
 
         return model.eval()
 
