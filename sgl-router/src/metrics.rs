@@ -153,6 +153,7 @@ pub fn init_metrics() {
         "sgl_router_embeddings_errors_total",
         "Embedding request errors"
     );
+    describe_gauge!("sgl_router_embeddings_queue_size", "Embedding queue size");
 
     // Running requests gauge for cache-aware policy
     describe_gauge!(
@@ -466,6 +467,10 @@ impl RouterMetrics {
             "error_type" => error_type.to_string()
         )
         .increment(1);
+    }
+
+    pub fn set_embeddings_queue_size(size: usize) {
+        gauge!("sgl_router_embeddings_queue_size").set(size as f64);
     }
 
     // Running requests for cache-aware policy

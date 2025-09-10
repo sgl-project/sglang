@@ -24,7 +24,7 @@ use axum::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -1416,31 +1416,8 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-<<<<<<< HEAD
         self.route_typed_request(headers, body, "/v1/responses", model_id)
-=======
-<<<<<<< HEAD
-        self.route_typed_request(headers, body, "/v1/responses")
->>>>>>> b5c21104e (apply review comments)
             .await
-=======
-        // Record embeddings-specific metrics in addition to general request metrics
-        let start = Instant::now();
-        let res = self
-            .route_typed_request(headers, body, "/v1/embeddings")
-            .await;
-
-        // Embedding specific metrics
-        if res.status().is_success() {
-            RouterMetrics::record_embeddings_request();
-            RouterMetrics::record_embeddings_duration(start.elapsed());
-        } else {
-            let error_type = format!("http_{}", res.status().as_u16());
-            RouterMetrics::record_embeddings_error(&error_type);
-        }
-
-        res
->>>>>>> 93e97e95e (apply review comments)
     }
 
     async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
@@ -1453,9 +1430,28 @@ impl RouterTrait for Router {
         self.route_post_empty_request(headers, &endpoint).await
     }
 
-    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
-        // Not implemented for regular router in this branch
-        (StatusCode::NOT_IMPLEMENTED, "Embeddings not implemented").into_response()
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        // Record embeddings-specific metrics in addition to general request metrics
+        let start = Instant::now();
+        let res = self
+            .route_typed_request(headers, body, "/v1/embeddings", model_id)
+            .await;
+
+        // Embedding specific metrics
+        if res.status().is_success() {
+            RouterMetrics::record_embeddings_request();
+            RouterMetrics::record_embeddings_duration(start.elapsed());
+        } else {
+            let error_type = format!("http_{}", res.status().as_u16());
+            RouterMetrics::record_embeddings_error(&error_type);
+        }
+
+        res
     }
 
     async fn route_rerank(

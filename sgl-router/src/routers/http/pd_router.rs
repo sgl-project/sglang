@@ -1909,7 +1909,6 @@ impl RouterTrait for PDRouter {
         self.execute_dual_dispatch(headers, body, context).await
     }
 
-<<<<<<< HEAD
     async fn route_responses(
         &self,
         _headers: Option<&HeaderMap>,
@@ -1939,15 +1938,17 @@ impl RouterTrait for PDRouter {
             .into_response()
     }
 
-    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
-=======
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::EmbeddingRequest,
+        _model_id: Option<&str>,
     ) -> Response {
->>>>>>> 9b46a891c (router: Add Embedding routing logic)
-        todo!()
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Embeddings endpoint not implemented for PD router",
+        )
+            .into_response()
     }
 
     async fn route_rerank(

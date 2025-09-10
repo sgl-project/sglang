@@ -3,18 +3,12 @@ use crate::core::WorkerRegistry;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::middleware::TokenBucket;
-<<<<<<< HEAD
 use crate::policies::PolicyRegistry;
-=======
->>>>>>> b5c21104e (apply review comments)
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesRequest, V1RerankReqInput,
 };
-<<<<<<< HEAD
 use crate::protocols::worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse};
-=======
->>>>>>> b5c21104e (apply review comments)
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::router_manager::{RouterId, RouterManager};
 use crate::routers::{RouterFactory, RouterTrait};
@@ -481,7 +475,7 @@ pub fn build_app(
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
-.route("/v1/responses", post(v1_responses))
+        .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
