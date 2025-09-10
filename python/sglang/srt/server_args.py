@@ -654,11 +654,13 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
-            if not self.disable_shared_experts_fusion:
-                self.disable_shared_experts_fusion = True
-                logger.warning(
-                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
-                )
+            assert (
+                self.quantization == "modelopt_fp4" or self.quantization == "fp8"
+            ), "modelopt_fp4 quantization is required for Flashinfer TRTLLM MoE"
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -1620,7 +1622,7 @@ class ServerArgs:
         parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
-            choices=["mxfp4", "bf16"],
+            choices=["default", "bf16"],
             default=ServerArgs.flashinfer_mxfp4_moe_precision,
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
