@@ -1,10 +1,10 @@
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig,
-    RetryExecutor, Worker, WorkerFactory, WorkerType,
+    RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
-use crate::policies::LoadBalancingPolicy;
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest, RerankRequest,
     RerankResponse, RerankResult, ResponsesRequest,
@@ -22,7 +22,7 @@ use axum::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -30,8 +30,10 @@ use tracing::{debug, error, info, warn};
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
-    workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
     policy: Arc<dyn LoadBalancingPolicy>,
+    worker_registry: Arc<WorkerRegistry>,
+    #[allow(dead_code)]
+    policy_registry: Arc<PolicyRegistry>,
     client: Client,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval_secs: u64,
@@ -82,36 +84,34 @@ impl Router {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        // Create Worker trait objects from URLs with health check config
-        let workers: Vec<Box<dyn Worker>> = worker_urls
-            .iter()
-            .map(|url| {
-                let worker = BasicWorker::new(url.clone(), WorkerType::Regular)
-                    .with_circuit_breaker_config(core_cb_config.clone())
-                    .with_health_config(HealthConfig {
-                        timeout_secs: ctx.router_config.health_check.timeout_secs,
-                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                        endpoint: ctx.router_config.health_check.endpoint.clone(),
-                        failure_threshold: ctx.router_config.health_check.failure_threshold,
-                        success_threshold: ctx.router_config.health_check.success_threshold,
-                    });
-                Box::new(worker) as Box<dyn Worker>
-            })
-            .collect();
+        // Register workers in the registry
+        for url in &worker_urls {
+            let worker = BasicWorker::new(url.clone(), WorkerType::Regular)
+                .with_circuit_breaker_config(core_cb_config.clone())
+                .with_health_config(HealthConfig {
+                    timeout_secs: ctx.router_config.health_check.timeout_secs,
+                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                    endpoint: ctx.router_config.health_check.endpoint.clone(),
+                    failure_threshold: ctx.router_config.health_check.failure_threshold,
+                    success_threshold: ctx.router_config.health_check.success_threshold,
+                });
+            ctx.worker_registry.register(Arc::new(worker));
+        }
 
         // Initialize policy with workers if needed (e.g., for cache-aware)
         if let Some(cache_aware) = policy
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
-            cache_aware.init_workers(&workers);
+            let all_workers = ctx.worker_registry.get_all();
+            let worker_refs: Vec<Box<dyn Worker>> =
+                all_workers.iter().map(|w| w.clone_worker()).collect();
+            cache_aware.init_workers(&worker_refs);
         }
 
-        let workers = Arc::new(RwLock::new(workers));
-        let health_checker = crate::core::start_health_checker(
-            Arc::clone(&workers),
-            ctx.router_config.worker_startup_check_interval_secs,
-        );
+        // TODO Start health checker for workers in registry
+        // Note: This might need to be moved to a central location if multiple routers share the registry
+        let health_checker = None; // Health checking should be centralized in the registry
 
         // Setup load monitoring for PowerOfTwo policy
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
@@ -138,8 +138,9 @@ impl Router {
         };
 
         Ok(Router {
-            workers,
             policy,
+            worker_registry: ctx.worker_registry.clone(),
+            policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
             worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: ctx
@@ -151,18 +152,22 @@ impl Router {
             circuit_breaker_config: core_cb_config,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
-            _health_checker: Some(health_checker),
+            _health_checker: health_checker,
         })
     }
 
     /// Get the current list of worker URLs
     pub fn get_worker_urls(&self) -> Vec<String> {
-        self.workers
-            .read()
-            .unwrap()
-            .iter()
-            .map(|w| w.url().to_string())
-            .collect()
+        self.worker_registry.get_all_urls()
+    }
+
+    /// Get worker URLs for a specific model
+    pub fn get_worker_urls_for_model(&self, model_id: Option<&str>) -> Vec<String> {
+        let workers = match model_id {
+            Some(model) => self.worker_registry.get_by_model_fast(model),
+            None => self.worker_registry.get_all(),
+        };
+        workers.iter().map(|w| w.url().to_string()).collect()
     }
 
     pub async fn wait_for_healthy_workers(
@@ -332,11 +337,27 @@ impl Router {
     }
 
     fn select_first_worker(&self) -> Result<String, String> {
-        let workers_guard = self.workers.read().unwrap();
-        if workers_guard.is_empty() {
+        let workers = self.worker_registry.get_all();
+        if workers.is_empty() {
             Err("No workers are available".to_string())
         } else {
-            Ok(workers_guard[0].url().to_string())
+            Ok(workers[0].url().to_string())
+        }
+    }
+
+    #[allow(dead_code)]
+    fn select_first_worker_for_model(&self, model_id: Option<&str>) -> Result<String, String> {
+        let workers = match model_id {
+            Some(model) => self.worker_registry.get_by_model_fast(model),
+            None => self.worker_registry.get_all(),
+        };
+        if workers.is_empty() {
+            Err(format!(
+                "No workers are available for model: {:?}",
+                model_id
+            ))
+        } else {
+            Ok(workers[0].url().to_string())
         }
     }
 
@@ -449,8 +470,33 @@ impl Router {
 
     // New method to route typed requests directly
     /// Select worker considering circuit breaker state
+    #[allow(dead_code)]
     fn select_worker_with_circuit_breaker(&self, text: Option<&str>) -> Option<Box<dyn Worker>> {
-        let workers = self.workers.read().ok()?;
+        let workers = self.worker_registry.get_all();
+        let available: Vec<Box<dyn Worker>> = workers
+            .iter()
+            .filter(|w| w.is_available())
+            .map(|w| w.clone_worker())
+            .collect();
+        if available.is_empty() {
+            return None;
+        }
+        let idx = self.policy.select_worker(&available, text)?;
+        Some(available[idx].clone_worker())
+    }
+
+    /// Select worker for a specific model considering circuit breaker state
+    fn select_worker_for_model(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+    ) -> Option<Box<dyn Worker>> {
+        // Get workers for the specified model (O(1) lookup if model_id is provided)
+        let workers = match model_id {
+            Some(model) => self.worker_registry.get_by_model_fast(model),
+            None => self.worker_registry.get_all(),
+        };
+
         let available: Vec<Box<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
@@ -468,6 +514,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &str,
+        model_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -477,7 +524,7 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_with_circuit_breaker(Some(&text)) {
+                let worker = match self.select_worker_for_model(model_id, Some(&text)) {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -654,11 +701,9 @@ impl Router {
 
                 // Decrement load on error if it was incremented
                 if load_incremented {
-                    if let Ok(workers_guard) = self.workers.read() {
-                        if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
+                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                        worker.decrement_load();
+                        RouterMetrics::set_running_requests(worker_url, worker.load());
                     }
                 }
 
@@ -687,13 +732,9 @@ impl Router {
                 Err(e) => {
                     // IMPORTANT: Decrement load on error before returning
                     if load_incremented {
-                        if let Ok(workers_guard) = self.workers.read() {
-                            if let Some(worker) =
-                                workers_guard.iter().find(|w| w.url() == worker_url)
-                            {
-                                worker.decrement_load();
-                                RouterMetrics::set_running_requests(worker_url, worker.load());
-                            }
+                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                            worker.decrement_load();
+                            RouterMetrics::set_running_requests(worker_url, worker.load());
                         }
                     }
 
@@ -704,18 +745,16 @@ impl Router {
 
             // Decrement load counter for non-streaming requests if it was incremented
             if load_incremented {
-                if let Ok(workers_guard) = self.workers.read() {
-                    if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
+                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                    worker.decrement_load();
+                    RouterMetrics::set_running_requests(worker_url, worker.load());
                 }
             }
 
             response
         } else if load_incremented {
             // For streaming with load tracking, we need to manually decrement when done
-            let workers = Arc::clone(&self.workers);
+            let registry = Arc::clone(&self.worker_registry);
             let worker_url = worker_url.to_string();
 
             // Preserve headers for streaming response
@@ -739,17 +778,10 @@ impl Router {
                                 .windows(12)
                                 .any(|window| window == b"data: [DONE]")
                             {
-                                if let Ok(workers_guard) = workers.read() {
-                                    if let Some(worker) =
-                                        workers_guard.iter().find(|w| w.url() == worker_url)
-                                    {
-                                        worker.decrement_load();
-                                        RouterMetrics::set_running_requests(
-                                            &worker_url,
-                                            worker.load(),
-                                        );
-                                        decremented = true;
-                                    }
+                                if let Some(worker) = registry.get_by_url(&worker_url) {
+                                    worker.decrement_load();
+                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
+                                    decremented = true;
                                 }
                             }
                             if tx.send(Ok(bytes)).is_err() {
@@ -763,11 +795,9 @@ impl Router {
                     }
                 }
                 if !decremented {
-                    if let Ok(workers_guard) = workers.read() {
-                        if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(&worker_url, worker.load());
-                        }
+                    if let Some(worker) = registry.get_by_url(&worker_url) {
+                        worker.decrement_load();
+                        RouterMetrics::set_running_requests(&worker_url, worker.load());
                     }
                 }
             });
@@ -839,7 +869,6 @@ impl Router {
             match client.get(format!("{}/health", worker_url)).send().await {
                 Ok(res) => {
                     if res.status().is_success() {
-                        let mut workers_guard = self.workers.write().unwrap();
                         if self.dp_aware {
                             // Need to contact the worker to extract the dp_size,
                             // and add them as multiple workers
@@ -848,34 +877,36 @@ impl Router {
                                 .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
                             let mut worker_added: bool = false;
                             for dp_url in &dp_url_vec {
-                                if workers_guard.iter().any(|w| w.url() == dp_url) {
+                                if self.worker_registry.get_by_url(dp_url).is_some() {
                                     warn!("Worker {} already exists", dp_url);
                                     continue;
                                 }
                                 info!("Added worker: {}", dp_url);
-                                let new_worker = WorkerFactory::create_regular_with_config(
-                                    dp_url.to_string(),
-                                    self.circuit_breaker_config.clone(),
-                                );
-                                workers_guard.push(new_worker);
+                                let new_worker =
+                                    BasicWorker::new(dp_url.to_string(), WorkerType::Regular)
+                                        .with_circuit_breaker_config(
+                                            self.circuit_breaker_config.clone(),
+                                        );
+                                self.worker_registry.register(Arc::new(new_worker));
                                 worker_added = true;
                             }
                             if !worker_added {
                                 return Err(format!("No worker added for {}", worker_url));
                             }
                         } else {
-                            if workers_guard.iter().any(|w| w.url() == worker_url) {
+                            if self.worker_registry.get_by_url(worker_url).is_some() {
                                 return Err(format!("Worker {} already exists", worker_url));
                             }
                             info!("Added worker: {}", worker_url);
-                            let new_worker = WorkerFactory::create_regular_with_config(
-                                worker_url.to_string(),
-                                self.circuit_breaker_config.clone(),
-                            );
-                            workers_guard.push(new_worker);
+                            let new_worker =
+                                BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
+                                    .with_circuit_breaker_config(
+                                        self.circuit_breaker_config.clone(),
+                                    );
+                            self.worker_registry.register(Arc::new(new_worker));
                         }
 
-                        RouterMetrics::set_active_workers(workers_guard.len());
+                        RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
 
                         // If cache aware policy, initialize the worker in the tree
                         if let Some(cache_aware) =
@@ -883,10 +914,11 @@ impl Router {
                                 .as_any()
                                 .downcast_ref::<crate::policies::CacheAwarePolicy>()
                         {
-                            // Get updated workers after adding
-                            drop(workers_guard);
-                            let workers_guard = self.workers.read().unwrap();
-                            cache_aware.init_workers(&workers_guard);
+                            // Get all workers from registry
+                            let all_workers = self.worker_registry.get_all();
+                            let worker_refs: Vec<Box<dyn Worker>> =
+                                all_workers.iter().map(|w| w.clone_worker()).collect();
+                            cache_aware.init_workers(&worker_refs);
                         }
 
                         return Ok(format!("Successfully added worker: {}", worker_url));
@@ -931,35 +963,23 @@ impl Router {
         if self.dp_aware {
             // remove dp-aware workers in a prefix-matching fashion
             // without contacting the remote worker
-            let mut candidate_workers: Vec<String> = Vec::new();
             let mut removed_workers: Vec<String> = Vec::new();
             let worker_url_prefix = format!("{}@", worker_url);
 
-            {
-                // find the candidate workers to be removed
-                let workers_guard = self.workers.read().unwrap();
-                for w in workers_guard.iter() {
-                    if w.url().starts_with(&worker_url_prefix) {
-                        candidate_workers.push(w.url().to_string());
+            // Find and remove all workers with matching prefix
+            let all_workers = self.worker_registry.get_all();
+            for w in all_workers.iter() {
+                if w.url().starts_with(&worker_url_prefix) {
+                    if self.worker_registry.remove_by_url(w.url()).is_some() {
+                        info!("Removed worker: {}", w.url());
+                        removed_workers.push(w.url().to_string());
+                    } else {
+                        warn!("Worker {} not found, skipping removal", w.url());
                     }
                 }
             }
 
-            {
-                // do the removing on the worker_urls
-                let mut workers_guard = self.workers.write().unwrap();
-                for dp_url in candidate_workers.iter() {
-                    if let Some(index) = workers_guard.iter().position(|w| w.url() == dp_url) {
-                        workers_guard.remove(index);
-                        info!("Removed worker: {}", dp_url);
-                        removed_workers.push(dp_url.to_string());
-                    } else {
-                        warn!("Worker {} not found, skipping removal", dp_url);
-                        continue;
-                    }
-                }
-                RouterMetrics::set_active_workers(workers_guard.len());
-            }
+            RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
 
             // If cache aware policy, remove the workers from the tree
             if let Some(cache_aware) = self
@@ -973,11 +993,9 @@ impl Router {
                 }
             }
         } else {
-            let mut workers_guard = self.workers.write().unwrap();
-            if let Some(index) = workers_guard.iter().position(|w| w.url() == worker_url) {
-                workers_guard.remove(index);
+            if self.worker_registry.remove_by_url(worker_url).is_some() {
                 info!("Removed worker: {}", worker_url);
-                RouterMetrics::set_active_workers(workers_guard.len());
+                RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
             } else {
                 warn!("Worker {} not found, skipping removal", worker_url);
                 return;
@@ -1171,7 +1189,7 @@ impl RouterTrait for Router {
     }
 
     async fn health(&self, _req: Request<Body>) -> Response {
-        let workers = self.workers.read().unwrap();
+        let workers = self.worker_registry.get_all();
         let unhealthy_servers: Vec<_> = workers
             .iter()
             .filter(|w| !w.is_healthy())
@@ -1209,16 +1227,19 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate").await
+        self.route_typed_request(headers, body, "/generate", model_id)
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions")
+        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
             .await
     }
 
@@ -1226,8 +1247,9 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions")
+        self.route_typed_request(headers, body, "/v1/completions", model_id)
             .await
     }
 
@@ -1235,8 +1257,9 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses")
+        self.route_typed_request(headers, body, "/v1/responses", model_id)
             .await
     }
 
@@ -1340,19 +1363,15 @@ impl RouterTrait for Router {
 
     fn readiness(&self) -> Response {
         // Regular router is ready if it has at least one healthy worker
-        let healthy_count = self
-            .workers
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|w| w.is_healthy())
-            .count();
+        let workers = self.worker_registry.get_all();
+        let healthy_count = workers.iter().filter(|w| w.is_healthy()).count();
+        let total_workers = workers.len();
 
         if healthy_count > 0 {
             Json(serde_json::json!({
                 "status": "ready",
                 "healthy_workers": healthy_count,
-                "total_workers": self.workers.read().unwrap().len()
+                "total_workers": total_workers
             }))
             .into_response()
         } else {
@@ -1361,7 +1380,7 @@ impl RouterTrait for Router {
                 Json(serde_json::json!({
                     "status": "not_ready",
                     "reason": "no healthy workers available",
-                    "total_workers": self.workers.read().unwrap().len()
+                    "total_workers": total_workers
                 })),
             )
                 .into_response()
@@ -1376,14 +1395,23 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_test_regular_router() -> Router {
-        let workers = vec![
-            WorkerFactory::create_regular("http://worker1:8080".to_string()),
-            WorkerFactory::create_regular("http://worker2:8080".to_string()),
-        ];
+        // Create registries
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::RoundRobin,
+        ));
+
+        // Register test workers
+        let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
+        let worker2 = BasicWorker::new("http://worker2:8080".to_string(), WorkerType::Regular);
+        worker_registry.register(Arc::new(worker1));
+        worker_registry.register(Arc::new(worker2));
+
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
-            workers: Arc::new(RwLock::new(workers)),
             policy: Arc::new(RandomPolicy::new()),
+            worker_registry,
+            policy_registry,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             dp_aware: false,
@@ -1413,7 +1441,9 @@ mod tests {
         let result = router.select_first_worker();
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "http://worker1:8080");
+        let url = result.unwrap();
+        // DashMap doesn't guarantee order, so just check we get one of the workers
+        assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 
 use crate::core::{ConnectionMode, Worker, WorkerType};
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 /// Unique identifier for a worker
@@ -34,13 +34,20 @@ impl Default for WorkerId {
     }
 }
 
+/// Type alias for the model index to reduce complexity
+type ModelIndex = Arc<DashMap<String, Arc<RwLock<Vec<Arc<dyn Worker>>>>>>;
+
 /// Worker registry with model-based indexing
+#[derive(Debug)]
 pub struct WorkerRegistry {
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
-    /// Workers indexed by model ID
+    /// Workers indexed by model ID (stores WorkerId for reference)
     model_workers: Arc<DashMap<String, Vec<WorkerId>>>,
+
+    /// Optimized model index for O(1) lookups (stores Arc<dyn Worker> directly)
+    model_index: ModelIndex,
 
     /// Workers indexed by worker type
     type_workers: Arc<DashMap<WorkerType, Vec<WorkerId>>>,
@@ -58,6 +65,7 @@ impl WorkerRegistry {
         Self {
             workers: Arc::new(DashMap::new()),
             model_workers: Arc::new(DashMap::new()),
+            model_index: Arc::new(DashMap::new()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
@@ -80,12 +88,20 @@ impl WorkerRegistry {
         self.url_to_id
             .insert(worker.url().to_string(), worker_id.clone());
 
-        // Update model index
+        // Update model index (both ID-based and optimized)
         let model_id = worker.model_id().to_string();
         self.model_workers
-            .entry(model_id)
+            .entry(model_id.clone())
             .or_default()
             .push(worker_id.clone());
+
+        // Update optimized model index for O(1) lookups
+        self.model_index
+            .entry(model_id)
+            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
+            .write()
+            .unwrap()
+            .push(worker.clone());
 
         // Update type index
         self.type_workers
@@ -108,9 +124,18 @@ impl WorkerRegistry {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
-            // Remove from model index
+            // Remove from model index (both ID-based and optimized)
             if let Some(mut model_workers) = self.model_workers.get_mut(worker.model_id()) {
                 model_workers.retain(|id| id != worker_id);
+            }
+
+            // Remove from optimized model index
+            if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
+                let worker_url = worker.url();
+                model_index_entry
+                    .write()
+                    .unwrap()
+                    .retain(|w| w.url() != worker_url);
             }
 
             // Remove from type index
@@ -158,12 +183,40 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
+    /// Get all workers for a model (O(1) optimized version)
+    /// This method uses the pre-indexed model_index for fast lookups
+    pub fn get_by_model_fast(&self, model_id: &str) -> Vec<Arc<dyn Worker>> {
+        self.model_index
+            .get(model_id)
+            .map(|workers| workers.read().unwrap().clone())
+            .unwrap_or_default()
+    }
+
     /// Get all workers by worker type
     pub fn get_by_type(&self, worker_type: &WorkerType) -> Vec<Arc<dyn Worker>> {
         self.type_workers
             .get(worker_type)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
             .unwrap_or_default()
+    }
+
+    /// Get all prefill workers (regardless of bootstrap_port)
+    pub fn get_prefill_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.workers
+            .iter()
+            .filter_map(|entry| {
+                let worker = entry.value();
+                match worker.worker_type() {
+                    WorkerType::Prefill { .. } => Some(worker.clone()),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Get all decode workers
+    pub fn get_decode_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.get_by_type(&WorkerType::Decode)
     }
 
     /// Get all workers by connection mode
@@ -196,6 +249,66 @@ impl WorkerRegistry {
             .iter()
             .filter(|entry| !entry.value().is_empty())
             .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// Get workers filtered by multiple criteria
+    ///
+    /// This method allows flexible filtering of workers based on:
+    /// - model_id: Filter by specific model
+    /// - worker_type: Filter by worker type (Regular, Prefill, Decode)
+    /// - connection_mode: Filter by connection mode (Http, Grpc)
+    /// - healthy_only: Only return healthy workers
+    pub fn get_workers_filtered(
+        &self,
+        model_id: Option<&str>,
+        worker_type: Option<WorkerType>,
+        connection_mode: Option<ConnectionMode>,
+        healthy_only: bool,
+    ) -> Vec<Arc<dyn Worker>> {
+        // Start with all workers or filtered by most selective criteria
+        let workers = if let Some(model) = model_id {
+            self.get_by_model(model)
+        } else if let Some(ref wtype) = worker_type {
+            self.get_by_type(wtype)
+        } else if let Some(ref conn) = connection_mode {
+            self.get_by_connection(conn)
+        } else {
+            self.get_all()
+        };
+
+        // Apply additional filters
+        workers
+            .into_iter()
+            .filter(|w| {
+                // Check model_id if specified
+                if let Some(model) = model_id {
+                    if w.model_id() != model {
+                        return false;
+                    }
+                }
+
+                // Check worker_type if specified
+                if let Some(ref wtype) = worker_type {
+                    if w.worker_type() != *wtype {
+                        return false;
+                    }
+                }
+
+                // Check connection_mode if specified
+                if let Some(ref conn) = connection_mode {
+                    if w.connection_mode() != *conn {
+                        return false;
+                    }
+                }
+
+                // Check health if required
+                if healthy_only && !w.is_healthy() {
+                    return false;
+                }
+
+                true
+            })
             .collect()
     }
 
@@ -293,5 +406,66 @@ mod tests {
         // Remove worker
         registry.remove(&worker_id);
         assert!(registry.get(&worker_id).is_none());
+    }
+
+    #[test]
+    fn test_model_index_fast_lookup() {
+        let registry = WorkerRegistry::new();
+
+        // Create workers for different models
+        let mut labels1 = HashMap::new();
+        labels1.insert("model_id".to_string(), "llama-3".to_string());
+        let worker1 = WorkerFactory::create_regular_with_labels(
+            "http://worker1:8080".to_string(),
+            labels1,
+            CircuitBreakerConfig::default(),
+        );
+
+        let mut labels2 = HashMap::new();
+        labels2.insert("model_id".to_string(), "llama-3".to_string());
+        let worker2 = WorkerFactory::create_regular_with_labels(
+            "http://worker2:8080".to_string(),
+            labels2,
+            CircuitBreakerConfig::default(),
+        );
+
+        let mut labels3 = HashMap::new();
+        labels3.insert("model_id".to_string(), "gpt-4".to_string());
+        let worker3 = WorkerFactory::create_regular_with_labels(
+            "http://worker3:8080".to_string(),
+            labels3,
+            CircuitBreakerConfig::default(),
+        );
+
+        // Register workers
+        registry.register(Arc::from(worker1));
+        registry.register(Arc::from(worker2));
+        registry.register(Arc::from(worker3));
+
+        // Test get_by_model_fast for llama-3
+        let llama_workers = registry.get_by_model_fast("llama-3");
+        assert_eq!(llama_workers.len(), 2);
+        let urls: Vec<String> = llama_workers.iter().map(|w| w.url().to_string()).collect();
+        assert!(urls.contains(&"http://worker1:8080".to_string()));
+        assert!(urls.contains(&"http://worker2:8080".to_string()));
+
+        // Test get_by_model_fast for gpt-4
+        let gpt_workers = registry.get_by_model_fast("gpt-4");
+        assert_eq!(gpt_workers.len(), 1);
+        assert_eq!(gpt_workers[0].url(), "http://worker3:8080");
+
+        // Test get_by_model_fast for non-existent model
+        let unknown_workers = registry.get_by_model_fast("unknown-model");
+        assert_eq!(unknown_workers.len(), 0);
+
+        // Test that both get_by_model and get_by_model_fast return same results
+        let llama_workers_slow = registry.get_by_model("llama-3");
+        assert_eq!(llama_workers.len(), llama_workers_slow.len());
+
+        // Test removal updates the model index
+        registry.remove_by_url("http://worker1:8080");
+        let llama_workers_after = registry.get_by_model_fast("llama-3");
+        assert_eq!(llama_workers_after.len(), 1);
+        assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
     }
 }

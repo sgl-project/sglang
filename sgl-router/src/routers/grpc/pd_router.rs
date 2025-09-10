@@ -269,6 +269,7 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::GenerateRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -277,6 +278,7 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ChatCompletionRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -285,6 +287,7 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::CompletionRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -293,6 +296,7 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ResponsesRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }

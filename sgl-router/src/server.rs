@@ -1,12 +1,14 @@
 use crate::config::RouterConfig;
+use crate::core::WorkerRegistry;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::middleware::TokenBucket;
-use crate::protocols::worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse};
+use crate::policies::PolicyRegistry;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest,
     V1RerankReqInput,
 };
+use crate::protocols::worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse};
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::router_manager::{RouterId, RouterManager};
 use crate::routers::{RouterFactory, RouterTrait};
@@ -38,6 +40,8 @@ pub struct AppContext {
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub reasoning_parser_factory: Option<ParserFactory>,
     pub tool_parser_registry: Option<&'static ParserRegistry>,
+    pub worker_registry: Arc<WorkerRegistry>, // Shared worker registry
+    pub policy_registry: Arc<PolicyRegistry>, // Shared policy registry
     pub router_manager: Option<Arc<RouterManager>>, // Only present when enable_igw=true
 }
 
@@ -78,6 +82,12 @@ impl AppContext {
                 (None, None, None)
             };
 
+        // Initialize shared registries
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            router_config.policy.clone(), // Use default policy from config
+        ));
+
         // Initialize RouterManager only when enable_igw is true
         let router_manager = None; // Will be initialized in startup() based on config
 
@@ -88,6 +98,8 @@ impl AppContext {
             tokenizer,
             reasoning_parser_factory,
             tool_parser_registry,
+            worker_registry,
+            policy_registry,
             router_manager,
         })
     }
@@ -141,7 +153,10 @@ async fn generate(
     headers: http::HeaderMap,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
-    state.router.route_generate(Some(&headers), &body).await
+    state
+        .router
+        .route_generate(Some(&headers), &body, None)
+        .await
 }
 
 async fn v1_chat_completions(
@@ -149,7 +164,7 @@ async fn v1_chat_completions(
     headers: http::HeaderMap,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Response {
-    state.router.route_chat(Some(&headers), &body).await
+    state.router.route_chat(Some(&headers), &body, None).await
 }
 
 async fn v1_completions(
@@ -157,7 +172,10 @@ async fn v1_completions(
     headers: http::HeaderMap,
     Json(body): Json<CompletionRequest>,
 ) -> Response {
-    state.router.route_completion(Some(&headers), &body).await
+    state
+        .router
+        .route_completion(Some(&headers), &body, None)
+        .await
 }
 
 async fn rerank(
@@ -184,7 +202,10 @@ async fn v1_responses(
     headers: http::HeaderMap,
     Json(body): Json<ResponsesRequest>,
 ) -> Response {
-    state.router.route_responses(Some(&headers), &body).await
+    state
+        .router
+        .route_responses(Some(&headers), &body, None)
+        .await
 }
 
 // Worker management endpoints
@@ -497,8 +518,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let router: Box<dyn RouterTrait> = if config.router_config.enable_igw {
         info!("Multi-router mode enabled (enable_igw=true)");
 
-        // Create RouterManager
-        let mut router_manager = RouterManager::new(config.router_config.clone(), client.clone());
+        // Create RouterManager with shared registries from AppContext
+        let mut router_manager = RouterManager::new(
+            config.router_config.clone(),
+            client.clone(),
+            app_context.worker_registry.clone(),
+            app_context.policy_registry.clone(),
+        );
 
         // Create HTTP routers at startup (with empty worker lists)
         // Workers will be added to these routers dynamically via RouterManager's worker registry
