@@ -534,17 +534,6 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def update_mamba_state_after_mtp_verify(self, accepted_length, model):
         request_number = accepted_length.shape[0]
-        query_start_loc = accepted_length.cumsum(-1, dtype=accepted_length.dtype)
-        query_start_loc = torch.cat(
-            [
-                torch.zeros(
-                    1,
-                    dtype=query_start_loc.dtype,
-                    device=query_start_loc.device,
-                ),
-                query_start_loc,
-            ]
-        )
 
         state_indices_tensor = self.attn_backend_list[
             1
