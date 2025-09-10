@@ -393,6 +393,7 @@ class ServerArgs:
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
+    mamba_ssm_dtype: str = "float32"
 
     # Deprecated arguments
     enable_ep_moe: bool = False
@@ -839,6 +840,8 @@ class ServerArgs:
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
+        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = self.mamba_ssm_dtype
+
         # Set env var before grammar backends init
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
@@ -1724,6 +1727,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_mamba_cache_size,
             help="It is used for mamba cache memory static allocation.",
+        )
+        parser.add_argument(
+            "--mamba-ssm-dtype",
+            type=str,
+            default=ServerArgs.mamba_ssm_dtype,
+            choices=["float32", "bfloat16"],
+            help="It is used to tune mamba ssm dtype",
         )
         # Hierarchical cache
         parser.add_argument(
