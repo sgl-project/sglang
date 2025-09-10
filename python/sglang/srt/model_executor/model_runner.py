@@ -1451,7 +1451,12 @@ class ModelRunner:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    full_attention_layer_ids=self.model_config.hf_config.full_attention_layer_ids,
+                    # if draft worker, we only need 1 attention layer's kv pool
+                    full_attention_layer_ids=(
+                        [0]
+                        if self.is_draft_worker
+                        else self.model_config.hf_config.full_attention_layer_ids
+                    ),
                     enable_kvcache_transpose=False,
                     device=self.device,
                 )
