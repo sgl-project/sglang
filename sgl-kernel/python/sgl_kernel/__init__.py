@@ -6,11 +6,12 @@ from pathlib import Path
 
 import torch
 
+
 # copy & modify from torch/utils/cpp_extension.py
 def _find_cuda_home():
     """Find the CUDA install path."""
     # Guess #1
-    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if cuda_home is None:
         # Guess #2
         nvcc_path = shutil.which("nvcc")
@@ -18,25 +19,26 @@ def _find_cuda_home():
             cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
         else:
             # Guess #3
-            cuda_home = '/usr/local/cuda'
+            cuda_home = "/usr/local/cuda"
     return cuda_home
+
 
 if torch.version.hip is None:
     cuda_home = Path(_find_cuda_home())
 
-    if (cuda_home / 'lib').is_dir():
-        cuda_path = cuda_home / 'lib'
-    elif (cuda_home / 'lib64').is_dir():
-        cuda_path = cuda_home / 'lib64'
+    if (cuda_home / "lib").is_dir():
+        cuda_path = cuda_home / "lib"
+    elif (cuda_home / "lib64").is_dir():
+        cuda_path = cuda_home / "lib64"
     else:
         # Search for 'libcudart.so.12' in subdirectories
-        for path in cuda_home.rglob('libcudart.so.12'):
+        for path in cuda_home.rglob("libcudart.so.12"):
             cuda_path = path.parent
             break
         else:
             raise RuntimeError("Could not find CUDA lib directory.")
 
-    cuda_include = (cuda_path / 'libcudart.so.12').resolve()
+    cuda_include = (cuda_path / "libcudart.so.12").resolve()
     if cuda_include.exists():
         ctypes.CDLL(str(cuda_include), mode=ctypes.RTLD_GLOBAL)
 
