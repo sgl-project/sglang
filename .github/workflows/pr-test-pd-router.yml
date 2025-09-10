@@ -182,6 +182,32 @@ jobs:
 
         echo "✓ Servers started (PID: $SERVER_PID)"
 
+    - name: Wait for disaggregation servers to be healthy
+      timeout-minutes: 6
+      run: |
+        echo "Waiting for disaggregation servers to be healthy (8/8)..."
+        TIMEOUT=300
+        START=$(date +%s)
+        while true; do
+          HEALTHY=0
+          for i in {1..8}; do
+            if curl -s -f "http://127.0.0.${i}:$((30000 + i))/health" >/dev/null 2>&1; then
+              HEALTHY=$((HEALTHY + 1))
+            fi
+          done
+          ELAPSED=$(( $(date +%s) - START ))
+          echo "Healthy servers: ${HEALTHY}/8 (elapsed: ${ELAPSED}s)"
+          if [ $HEALTHY -eq 8 ]; then
+            echo "✓ All 8 servers are healthy"
+            break
+          fi
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "❌ Timeout waiting for servers to be healthy"
+            exit 1
+          fi
+          sleep 5
+        done
+
     - name: Test all policies sequentially
       timeout-minutes: 30
       run: |
