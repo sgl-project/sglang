@@ -203,19 +203,6 @@ message GenerateComplete {
   }
   FinishReason finish_reason = 3;
 
-  // Final counts
-  int32 prompt_tokens = 4;
-  int32 completion_tokens = 5;
-  int32 cached_tokens = 6;
-
-  // Performance metrics
-  float total_generation_time = 7;
-  float time_to_first_token = 8;
-  float tokens_per_second = 9;
-
-  // Spec decode metrics
-  int32 spec_verify_count = 10;
-
   // All logprobs if requested
   repeated LogProbs all_logprobs = 11;
 

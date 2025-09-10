@@ -505,13 +505,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 output_ids=output.get("token_ids", []),
                 output_text=output.get("text", ""),
                 finish_reason=finish_reason,
-                prompt_tokens=meta_info.get("prompt_tokens", 0),
-                completion_tokens=len(output.get("token_ids", [])),
-                cached_tokens=0,
-                total_generation_time=time.time() - self.start_time,
-                time_to_first_token=0.0,
-                tokens_per_second=0.0,
-                spec_verify_count=0,
             ),
         )
 

@@ -183,7 +183,7 @@ class GenerateStreamChunk(_message.Message):
     def __init__(self, token_id: _Optional[int] = ..., text: _Optional[str] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., logprobs: _Optional[_Union[LogProbs, _Mapping]] = ..., hidden_states: _Optional[_Iterable[float]] = ..., generation_time: _Optional[float] = ..., queue_time: _Optional[int] = ...) -> None: ...
 
 class GenerateComplete(_message.Message):
-    __slots__ = ("output_ids", "output_text", "finish_reason", "prompt_tokens", "completion_tokens", "cached_tokens", "total_generation_time", "time_to_first_token", "tokens_per_second", "spec_verify_count", "all_logprobs", "all_hidden_states")
+    __slots__ = ("output_ids", "output_text", "finish_reason", "all_logprobs", "all_hidden_states")
     class FinishReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         STOP: _ClassVar[GenerateComplete.FinishReason]
@@ -199,28 +199,14 @@ class GenerateComplete(_message.Message):
     OUTPUT_IDS_FIELD_NUMBER: _ClassVar[int]
     OUTPUT_TEXT_FIELD_NUMBER: _ClassVar[int]
     FINISH_REASON_FIELD_NUMBER: _ClassVar[int]
-    PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
-    COMPLETION_TOKENS_FIELD_NUMBER: _ClassVar[int]
-    CACHED_TOKENS_FIELD_NUMBER: _ClassVar[int]
-    TOTAL_GENERATION_TIME_FIELD_NUMBER: _ClassVar[int]
-    TIME_TO_FIRST_TOKEN_FIELD_NUMBER: _ClassVar[int]
-    TOKENS_PER_SECOND_FIELD_NUMBER: _ClassVar[int]
-    SPEC_VERIFY_COUNT_FIELD_NUMBER: _ClassVar[int]
     ALL_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     ALL_HIDDEN_STATES_FIELD_NUMBER: _ClassVar[int]
     output_ids: _containers.RepeatedScalarFieldContainer[int]
     output_text: str
     finish_reason: GenerateComplete.FinishReason
-    prompt_tokens: int
-    completion_tokens: int
-    cached_tokens: int
-    total_generation_time: float
-    time_to_first_token: float
-    tokens_per_second: float
-    spec_verify_count: int
     all_logprobs: _containers.RepeatedCompositeFieldContainer[LogProbs]
     all_hidden_states: _containers.RepeatedCompositeFieldContainer[HiddenStates]
-    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., output_text: _Optional[str] = ..., finish_reason: _Optional[_Union[GenerateComplete.FinishReason, str]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., total_generation_time: _Optional[float] = ..., time_to_first_token: _Optional[float] = ..., tokens_per_second: _Optional[float] = ..., spec_verify_count: _Optional[int] = ..., all_logprobs: _Optional[_Iterable[_Union[LogProbs, _Mapping]]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ...) -> None: ...
+    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., output_text: _Optional[str] = ..., finish_reason: _Optional[_Union[GenerateComplete.FinishReason, str]] = ..., all_logprobs: _Optional[_Iterable[_Union[LogProbs, _Mapping]]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ...) -> None: ...
 
 class GenerateError(_message.Message):
     __slots__ = ("message", "http_status_code", "details")
