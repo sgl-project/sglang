@@ -534,12 +534,6 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def update_mamba_state_after_mtp_verify(self, accepted_length, model):
         request_number = accepted_length.shape[0]
-        # QQ: step = spec num_draft token num
-        num_draft_tokens = (
-            self.attn_backend_list[1]
-            .req_to_token_pool.mamba_pool.mamba_cache[2]
-            .shape[2]
-        )
         query_start_loc = accepted_length.cumsum(-1, dtype=accepted_length.dtype)
         query_start_loc = torch.cat(
             [
@@ -551,9 +545,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 query_start_loc,
             ]
         )
-        mask = torch.arange(num_draft_tokens, device=accepted_length.device).unsqueeze(
-            0
-        ) < accepted_length.unsqueeze(1)
 
         state_indices_tensor = self.attn_backend_list[
             1
@@ -566,18 +557,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         (
             conv_states,
             ssm_states,
-            mix_qkv_cache,
+            _,
             intermediate_state_cache,
             intermediate_conv_window_cache,
         ) = mamba_caches
-
-        mixed_qkvs = mix_qkv_cache[:, state_indices_tensor][:, mask]
-
-        mamba_map = self.attn_backend_list[1].req_to_token_pool.mamba_map
-
-        has_initial_states = torch.ones(
-            request_number, dtype=torch.bool, device=accepted_length.device
-        )
 
         # Batch SSM state updates (outside the loop for efficiency)
         valid_mask = accepted_length > 0
@@ -598,47 +581,3 @@ class HybridLinearAttnBackend(AttentionBackend):
             conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
                 :, valid_state_indices, last_steps
             ].to(conv_states.dtype)
-
-        # For loop conv state updates (can be optimized)
-        for i in range(len(model.model.layers)):
-            layer = model.model.layers[i]
-            if isinstance(layer, Qwen3HybridLinearDecoderLayer):
-                conv_weights = layer.linear_attn.conv1d.weight.view(
-                    layer.linear_attn.conv1d.weight.size(0),
-                    layer.linear_attn.conv1d.weight.size(2),
-                )
-
-                layer_id = mamba_map[i]
-                conv_state = conv_states[layer_id]
-                mixed_qkv = mixed_qkvs[layer_id]
-
-                # Check if all requests have the same accepted length for optimization
-                if (
-                    torch.all(accepted_length == accepted_length[0])
-                    and accepted_length[0] > 0
-                ):
-                    # Use causal_conv1d_update for uniform accepted lengths
-                    # Reshape mixed_qkv from (request_number, accepted_length) to (request_number, dim, accepted_length)
-                    accepted_len = accepted_length[0].item()
-                    mixed_qkv_reshaped = (
-                        mixed_qkv.view(request_number, accepted_len, -1)
-                        .transpose(1, 2)
-                        .contiguous()
-                    )
-
-                    # Skip second causal_conv1d_update as conv state has been updated from cache
-                    pass
-                else:
-                    # Fall back to causal_conv1d_fn for variable lengths
-                    _ = causal_conv1d_fn(
-                        mixed_qkv.transpose(0, 1),
-                        conv_weights,
-                        layer.linear_attn.conv1d.bias,
-                        activation=layer.linear_attn.activation,
-                        conv_states=conv_state.transpose(-1, -2)
-                        .contiguous()
-                        .transpose(-1, -2),
-                        has_initial_state=has_initial_states,
-                        cache_indices=state_indices_tensor,
-                        query_start_loc=query_start_loc,
-                    )
