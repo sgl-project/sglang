@@ -315,6 +315,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 input_ids=input_ids,
                 sampling_params={"max_new_tokens": 1, "temperature": 0.0},
                 stream=False,
+                mm_inputs=None,
+                return_logprob=False,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
             )
 
             # Submit and wait for response
@@ -408,6 +413,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
             stream=True,  # Always stream for gRPC
             lora_path=grpc_req.lora_id if grpc_req.lora_id else None,
+            token_ids_logprob=list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None,
         )
 
     def _convert_embed_request(
