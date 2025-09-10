@@ -135,6 +135,9 @@ class GenerateReqInput:
     # Label for the request
     label: Optional[str] = None
 
+    # Priority for the request
+    priority: Optional[int] = None
+
     # Image gen grpc migration
     return_bytes: bool = False
 
@@ -537,6 +540,7 @@ class GenerateReqInput:
             ),
             conversation_id=self.conversation_id,
             label=self.label,
+            priority=self.priority,
             return_bytes=self.return_bytes,
         )
 
@@ -594,6 +598,9 @@ class TokenizedGenerateReqInput:
 
     # Label for the request
     label: Optional[str] = None
+
+    # Priority for the request
+    priority: Optional[int] = None
 
     # Image gen grpc migration
     return_bytes: bool = False
