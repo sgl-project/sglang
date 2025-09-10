@@ -164,7 +164,13 @@ class MambaStateUpdateCudaGraphRunner:
         ]
         mamba_caches = self.req_to_token_pool.get_mamba_params_all_layers()
 
-        _, ssm_states, mix_qkv_cache, intermediate_state_cache = mamba_caches
+        (
+            _,
+            ssm_states,
+            mix_qkv_cache,
+            intermediate_state_cache,
+            intermediate_conv_window_cache,
+        ) = mamba_caches
         mixed_qkvs = mamba_caches[2][:, state_indices_tensor][:, mask]
         self.mixed_qkv_cache[:, : mixed_qkvs.shape[1]].copy_(mixed_qkvs)
         self.query_start_loc[: request_number + 1] = query_start_loc
@@ -181,6 +187,15 @@ class MambaStateUpdateCudaGraphRunner:
             ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
                 :, valid_state_indices, last_steps
             ].to(ssm_states.dtype)
+
+        # Also update conv windows using cached windows so we can skip second conv update
+        conv_states = mamba_caches[0]
+        if intermediate_conv_window_cache is not None:
+            last_steps = (accepted_length - 1).to(torch.int64)
+            valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
+            conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
+                :, valid_state_indices, last_steps
+            ].to(conv_states.dtype)
 
     def replay(self, accepted_length):
         # batch_size and num_seqs can be different in case there are finished examples

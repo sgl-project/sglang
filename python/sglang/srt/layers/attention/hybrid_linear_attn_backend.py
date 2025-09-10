@@ -195,7 +195,9 @@ class MambaAttnBackend(AttentionBackend):
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
 
-        conv_states, ssm_states = self.req_to_token_pool.get_mamba_params(layer_id)
+        conv_states, ssm_states, *rest = self.req_to_token_pool.get_mamba_params(
+            layer_id
+        )
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -279,6 +281,7 @@ class MambaAttnBackend(AttentionBackend):
                 ssm_states,
                 mixed_qkv_cache,
                 intermediate_state_cache,
+                intermediate_conv_window_cache,
             ) = self.req_to_token_pool.get_mamba_params(layer_id)
             mixed_qkv_cache[cache_indices] = mixed_qkv.view(
                 (-1,) + mixed_qkv_cache.shape[1:]
@@ -311,6 +314,7 @@ class MambaAttnBackend(AttentionBackend):
                 bias,
                 activation,
                 conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv_window_cache,
             )
             mixed_qkv = (
                 mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
@@ -559,7 +563,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             1
         ].req_to_token_pool.get_mamba_params_all_layers()
 
-        conv_states, ssm_states, mix_qkv_cache, intermediate_state_cache = mamba_caches
+        (
+            conv_states,
+            ssm_states,
+            mix_qkv_cache,
+            intermediate_state_cache,
+            intermediate_conv_window_cache,
+        ) = mamba_caches
 
         mixed_qkvs = mix_qkv_cache[:, state_indices_tensor][:, mask]
 
@@ -578,6 +588,16 @@ class HybridLinearAttnBackend(AttentionBackend):
             ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
                 :, valid_state_indices, last_steps
             ].to(ssm_states.dtype)
+
+        # Batch conv window updates from cached intermediate windows
+        if intermediate_conv_window_cache is not None:
+            last_steps = (accepted_length - 1).to(torch.int64)
+            valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
+            # conv_states shape: [num_layers, num_cache_lines, dim, K-1]
+            # intermediate_conv_window_cache shape: [num_layers, num_cache_lines, steps, dim, K-1]
+            conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
+                :, valid_state_indices, last_steps
+            ].to(conv_states.dtype)
 
         # For loop conv state updates (can be optimized)
         for i in range(len(model.model.layers)):
@@ -606,14 +626,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                         .contiguous()
                     )
 
-                    _ = causal_conv1d_update(
-                        mixed_qkv_reshaped,
-                        conv_state,
-                        conv_weights,
-                        layer.linear_attn.conv1d.bias,
-                        activation=layer.linear_attn.activation,
-                        conv_state_indices=state_indices_tensor,
-                    )
+                    # Skip second causal_conv1d_update as conv state has been updated from cache
+                    pass
                 else:
                     # Fall back to causal_conv1d_fn for variable lengths
                     _ = causal_conv1d_fn(
