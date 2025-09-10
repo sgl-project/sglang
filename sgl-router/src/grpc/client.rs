@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(chunk.queue_time, 10);
     }
 
-    // TODO: ModelInfo not in current proto - skip test  
+    // TODO: ModelInfo not in current proto - skip test
     // #[test]
     // fn test_model_info() { ... }
 }
