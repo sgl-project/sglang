@@ -67,7 +67,10 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FusedMoE,
+    _is_fp4_quantization_enabled,
+)
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -246,7 +249,11 @@ class DeepseekV2MLP(nn.Module):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        if gemm_output_zero_allocator != None and x.shape[0] <= 256:
+        if (
+            gemm_output_zero_allocator is not None
+            and x.shape[0] <= 256
+            and self.gate_up_proj.weight.dtype == torch.uint8
+        ):
             y = gemm_output_zero_allocator.allocate(
                 x.shape[0] * self.gate_up_proj.output_size_per_partition
             ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
@@ -299,7 +306,9 @@ class MoEGate(nn.Module):
             and _device_sm >= 90
         ):
             # router gemm output float32
-            logits = dsv3_router_gemm(hidden_states, self.weight)
+            logits = dsv3_router_gemm(
+                hidden_states, self.weight, out_dtype=torch.float32
+            )
         elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
             logits = aiter_dsv3_router_gemm(
                 hidden_states, self.weight, gemm_output_zero_allocator
@@ -364,6 +373,9 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        correction_bias = self.gate.e_score_correction_bias
+        if _is_fp4_quantization_enabled():
+            correction_bias = correction_bias.to(torch.bfloat16)
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             renormalize=config.norm_topk_prob,
@@ -371,7 +383,7 @@ class DeepseekV2MoE(nn.Module):
             num_expert_group=config.n_group,
             num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
+            correction_bias=correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk(),
             force_topk=quant_config is None,
@@ -1033,6 +1045,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         # Determine attention backend used by current forward batch
         if forward_batch.forward_mode.is_decode_or_idle():
             attention_backend = global_server_args_dict["decode_attention_backend"]
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
+            # Use the specified backend for speculative operations (both verify and draft extend)
+            if global_server_args_dict["speculative_attention_mode"] == "decode":
+                attention_backend = global_server_args_dict["decode_attention_backend"]
+            else:  # default to prefill
+                attention_backend = global_server_args_dict["prefill_attention_backend"]
         else:
             attention_backend = global_server_args_dict["prefill_attention_backend"]
         self.current_attention_backend = attention_backend
@@ -1050,7 +1071,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             attention_backend == "flashinfer"
             or attention_backend == "fa3"
             or attention_backend == "flashmla"
-            or attention_backend == "trtllm_mla"
             or attention_backend == "cutlass_mla"
         ):
             # Use MHA with chunked KV cache when prefilling on long sequences.
@@ -1075,6 +1095,15 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                     or sum_extend_prefix_lens == 0
                 )
+            ):
+                return AttnForwardMethod.MHA_CHUNKED_KV
+            else:
+                return _dispatch_mla_subtype()
+        elif attention_backend == "trtllm_mla":
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
@@ -1998,7 +2027,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         quant_format = (
             "mxfp4"
             if _is_gfx95_supported
-            and self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8
+            and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None) is not None
+            and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
+            is not None
+            and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
             else ""
         )
 
@@ -2553,7 +2585,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
-            if _use_aiter_gfx95 and self.quant_config.get_name() == "quark":
+            if (
+                _use_aiter_gfx95
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "quark"
+            ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )
