@@ -174,6 +174,8 @@ def is_blackwell():
 
 @lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
     )
@@ -181,6 +183,8 @@ def is_sm100_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
     )
@@ -570,6 +574,18 @@ def is_port_available(port):
             return False
         except OverflowError:
             return False
+
+
+cmo_stream = None
+
+
+def get_cmo_stream(device="cuda"):
+    if is_npu():
+        device = "npu"
+    global cmo_stream
+    if cmo_stream is None:
+        cmo_stream = torch.get_device_module(device).Stream()
+    return cmo_stream
 
 
 def get_free_port():
@@ -2895,6 +2911,10 @@ def parse_module_path(module_path, function_name, create_dummy):
         return final_module, getattr(final_module, function_name)
 
     return final_module, None
+
+
+def alloc_len_per_eagle_decode(worker: "EagleWorker") -> int:
+    return max(worker.num_steps * worker.topk, worker.num_draft_tokens)
 
 
 def mxfp_supported():

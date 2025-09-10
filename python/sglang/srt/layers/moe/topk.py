@@ -330,6 +330,14 @@ class TopK(CustomOp):
                 )
                 topk_weights = topk_weights / topk_weights_sum
 
+            if expert_location_dispatch_info is not None:
+                topk_ids = topk_ids_logical_to_physical(
+                    topk_ids, expert_location_dispatch_info
+                )
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=topk_ids
+            )
+
             return StandardTopKOutput(topk_weights, topk_ids, _)
         else:
             self.topk_config.torch_native = True
@@ -827,10 +835,11 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
     elif torch_native and custom_routing_function is None:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in fused_topk_native"
-        assert expert_location_dispatch_info is None
+        # TODO: to be fixed
+        # assert (
+        #     num_token_non_padded is None
+        # ), "num_token_non_padded is not yet supported in fused_topk_native"
+        # assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,

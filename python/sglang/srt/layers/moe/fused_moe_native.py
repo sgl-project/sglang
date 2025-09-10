@@ -99,3 +99,43 @@ def moe_forward_native(
         .type(new_x.dtype)
     )
     return final_out
+
+
+def moe_init_routing_native(
+    hidden_states: torch.Tensor,
+    row_idx: torch.Tensor,
+    expert_idx: torch.Tensor,
+    active_num: torch.Tensor = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare inputs for MoE layer by sorting tokens based on expert IDs.
+    Args:
+        hidden_states (torch.Tensor): The input tensor.
+        row_idx (torch.Tensor): The row indices for the experts, should be of type torch.int64.
+        expert_idx (torch.Tensor): The expert indices selected by each token.
+        active_num (torch.Tensor): The number of active rows, which must equal the number of rows in `expert_idx`.
+    Returns:
+        A tuple containing:
+        - torch.Tensor: The gathered hidden states (`expanded_x`).
+        - torch.Tensor: The expanded row indices.
+        - torch.Tensor: The sorted expert indices.
+    """
+
+    num_rows = expert_idx.shape[0]
+    assert (
+        active_num == num_rows
+    ), "active_num must equal to row num on native implement"
+    flat_expert = expert_idx.view(-1)
+    flat_row = row_idx.view(-1)
+    device = hidden_states.device
+
+    sorted_expert, sort_indices = flat_expert.sort(stable=True)
+    sorted_row = flat_row[sort_indices]
+
+    expanded_row_idx = torch.zeros_like(sorted_row, dtype=torch.int32, device=device)
+    expanded_row_idx[sorted_row] = torch.arange(
+        sorted_row.numel(), dtype=torch.int32, device=device
+    )
+
+    expanded_x = hidden_states[sorted_row % num_rows].clone()
+
+    return expanded_x, expanded_row_idx, sorted_expert

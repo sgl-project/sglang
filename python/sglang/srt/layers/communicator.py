@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -55,6 +56,7 @@ from sglang.srt.utils import (
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = is_cuda() and is_sm90_supported()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
+_use_ag_after_qlora = get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 
@@ -387,6 +389,8 @@ class CommunicateSimpleFn:
         if (input_mode == ScatterMode.SCATTERED) and (
             output_mode == ScatterMode.TP_ATTN_FULL
         ):
+            if _use_ag_after_qlora:
+                return CommunicateSimpleFn._trivial
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")

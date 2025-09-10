@@ -24,7 +24,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,9 @@ if is_cuda():
     )
 elif is_hip():
     from sgl_kernel import fast_topk, verify_tree_greedy
+elif is_npu():
+    tensor_zero = None
+    tensor_one = None
 
 
 logger = logging.getLogger(__name__)
@@ -81,6 +84,11 @@ class EagleDraftInput:
     # shape: (b,)
     seq_lens_for_draft_extend: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
+
+    if is_npu():
+        device = "npu"
+    else:
+        device = "cuda"
 
     def prepare_for_extend(self, batch: ScheduleBatch):
 
@@ -156,16 +164,16 @@ class EagleDraftInput:
         req_to_token: torch.Tensor,
     ):
         bs = self.accept_length.numel()
-        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
+        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
-        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
+        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         if paged_kernel_lens_sum is None:
             paged_kernel_lens_sum = cum_kv_seq_len[-1]
 
         kv_indices = torch.empty(
-            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+            paged_kernel_lens_sum, dtype=torch.int32, device=self.device
         )
 
         create_flashinfer_kv_indices_triton[(bs,)](
@@ -245,21 +253,29 @@ class EagleVerifyInput:
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
+    if is_npu():
+        device = "npu"
+    else:
+        device = "cuda"
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+        if is_npu():
+            device = "npu"
+        else:
+            device = "cuda"
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
             retrive_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrive_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrive_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrive_cum_len=None,
             topk=topk,
@@ -294,15 +310,26 @@ class EagleVerifyInput:
             self.last_loc = last_loc
 
         bs = batch.batch_size()
-        assign_req_to_token_pool[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
-            batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
+        if is_npu():
+            import sgl_kernel_npu
+
+            torch.ops.npu.cache_loc_assign(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                end_offset,
+                batch.out_cache_loc,
+            )
+        else:
+            assign_req_to_token_pool[(bs,)](
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                end_offset,
+                batch.out_cache_loc,
+                batch.req_to_token_pool.req_to_token.shape[1],
+                next_power_of_2(bs),
+            )
 
     def generate_attn_arg_prefill(
         self,
@@ -317,10 +344,10 @@ class EagleVerifyInput:
             (1 + batch_size) * self.draft_token_num,
             step=self.draft_token_num,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
         cum_kv_seq_len = torch.zeros(
-            (batch_size + 1,), dtype=torch.int32, device="cuda"
+            (batch_size + 1,), dtype=torch.int32, device=self.device
         )
 
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
@@ -329,7 +356,7 @@ class EagleVerifyInput:
         kv_indices = torch.empty(
             paged_kernel_lens_sum + self.draft_token_num * batch_size,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
         create_flashinfer_kv_indices_triton[(batch_size,)](
             req_to_token,
@@ -386,11 +413,11 @@ class EagleVerifyInput:
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
-        predict = torch.empty(predict_shape, dtype=torch.int32, device="cuda")
+        predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
         accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=self.device
         )
-        accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
+        accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
@@ -411,7 +438,7 @@ class EagleVerifyInput:
             linear_penalty = torch.zeros(
                 (bs, logits_output.next_token_logits.shape[1]),
                 dtype=torch.float32,
-                device="cuda",
+                device=self.device,
             )
             sampling_info.apply_logits_bias(linear_penalty)
             logits_output.next_token_logits.add_(
@@ -436,17 +463,30 @@ class EagleVerifyInput:
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
-
-            verify_tree_greedy(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
-                candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
-                target_predict=target_predict,
-            )
+            if is_npu():
+                predict, accept_index, accept_length = verify_tree_greedy_native(
+                    candidates,
+                    self.retrive_index,
+                    self.retrive_next_token,
+                    self.retrive_next_sibling,
+                    target_predict,
+                    accept_index,
+                    accept_length,
+                    predict,
+                    self.spec_steps + 1,
+                    self.topk,
+                )
+            else:
+                verify_tree_greedy(
+                    predicts=predict,  # mutable
+                    accept_index=accept_index,  # mutable
+                    accept_token_num=accept_length,  # mutable
+                    candidates=candidates,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
+                    target_predict=target_predict,
+                )
         else:
             # apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
@@ -472,14 +512,14 @@ class EagleVerifyInput:
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
             draft_probs = torch.zeros(
-                target_probs.shape, dtype=torch.float32, device="cuda"
+                target_probs.shape, dtype=torch.float32, device=self.device
             )
 
             # coins for rejection sampling
-            coins = torch.rand_like(candidates, dtype=torch.float32, device="cuda")
+            coins = torch.rand_like(candidates, dtype=torch.float32, device=self.device)
             # coins for final sampling
             coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device="cuda"
+                (bs,), dtype=torch.float32, device=self.device
             )
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
@@ -623,15 +663,24 @@ class EagleVerifyInput:
         if not has_finished:
             if page_size == 1 or self.topk == 1:
                 batch.out_cache_loc = batch.out_cache_loc[accept_index]
-                assign_req_to_token_pool[(bs,)](
-                    batch.req_pool_indices,
-                    batch.req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.seq_lens + accept_length + 1,
-                    batch.out_cache_loc,
-                    batch.req_to_token_pool.req_to_token.shape[1],
-                    next_power_of_2(bs),
-                )
+                if is_npu():
+                    torch.ops.npu.cache_loc_assign(
+                        batch.req_pool_indices,
+                        batch.req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.seq_lens + accept_length + 1,
+                        batch.out_cache_loc,
+                    )
+                else:
+                    assign_req_to_token_pool[(bs,)](
+                        batch.req_pool_indices,
+                        batch.req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.seq_lens + accept_length + 1,
+                        batch.out_cache_loc,
+                        batch.req_to_token_pool.req_to_token.shape[1],
+                        next_power_of_2(bs),
+                    )
             else:
                 batch.out_cache_loc = tgt_cache_loc
             batch.seq_lens.add_(accept_length + 1)
@@ -654,15 +703,24 @@ class EagleVerifyInput:
             )
         else:
             if page_size == 1 or self.topk == 1:
-                assign_req_to_token_pool[(bs,)](
-                    batch.req_pool_indices,
-                    batch.req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.seq_lens + accept_length + 1,
-                    batch.out_cache_loc[accept_index],
-                    batch.req_to_token_pool.req_to_token.shape[1],
-                    next_power_of_2(bs),
-                )
+                if is_npu():
+                    torch.ops.npu.cache_loc_assign(
+                        batch.req_pool_indices,
+                        batch.req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.seq_lens + accept_length + 1,
+                        batch.out_cache_loc[accept_index],
+                    )
+                else:
+                    assign_req_to_token_pool[(bs,)](
+                        batch.req_pool_indices,
+                        batch.req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.seq_lens + accept_length + 1,
+                        batch.out_cache_loc[accept_index],
+                        batch.req_to_token_pool.req_to_token.shape[1],
+                        next_power_of_2(bs),
+                    )
                 batch.seq_lens.add_(accept_length + 1)
 
             accept_length_cpu = accept_length.tolist()
@@ -1079,7 +1137,7 @@ def create_accept_length_filter(
     return accept_length_filter
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=is_npu())
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -1088,6 +1146,10 @@ def select_top_k_tokens(
     scores: torch.Tensor,
     topk: int,
 ):
+    if is_npu():
+        device = "npu"
+    else:
+        device = "cuda"
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
@@ -1097,7 +1159,7 @@ def select_top_k_tokens(
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device="cuda")
+            torch.arange(-1, topk, dtype=torch.long, device=device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )
@@ -1116,7 +1178,7 @@ def select_top_k_tokens(
 
         if hidden_states.shape[0] > 0:
             selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device="cuda"
+                0, hidden_states.shape[0], step=topk, device=device
             ).repeat_interleave(topk)
             hidden_states = hidden_states[selected_input_index, :]
 
@@ -1137,6 +1199,10 @@ def _generate_simulated_accept_index(
     bs,
     spec_steps,
 ):
+    if is_npu():
+        device = "npu"
+    else:
+        device = "cuda"
     simulate_acc_len_float = float(simulate_acc_len)
     if SIMULATE_ACC_METHOD == "multinomial":
         simulated_values = torch.normal(
@@ -1170,7 +1236,7 @@ def _generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device=device
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
@@ -1295,3 +1361,78 @@ def generate_token_bitmask(
 
     verify_input.grammar = grammar
     return allocate_token_bitmask
+
+
+def verify_tree_greedy_native(
+    candidates,
+    retrive_index,
+    retrive_next_token,
+    retrive_next_sibling,
+    target_predict,
+    accept_index,
+    accept_token_num,
+    predicts,
+    num_speculative_tokens,
+    topk,
+):
+    batch_size, num_draft_tokens = candidates.shape
+
+    # Optimized common case for performance.
+    if num_draft_tokens == 2 and accept_index.shape[1] == 2 and topk == 1:
+        global tensor_one
+        if tensor_one is None:
+            tensor_one = torch.tensor([1], device=candidates.device)
+        comparison_result = candidates[:, 1] == target_predict[:, 0]
+
+        target_predict_view = target_predict[:, 1]
+        target_predict_view[~comparison_result] = 0
+
+        target_predict_flatten = target_predict.flatten()
+        predicts = torch.cat([target_predict_flatten, tensor_one])
+
+        accept_index = torch.arange(
+            0, num_draft_tokens * batch_size, device=candidates.device, dtype=torch.long
+        ).reshape(batch_size, num_draft_tokens)
+        accept_index[~comparison_result, 1] = -1
+
+        accept_token_num = comparison_result.int()
+        return predicts, accept_index, accept_token_num
+
+    # BFS
+    for bx in range(batch_size):
+        cur_candidates = candidates[bx]
+        cur_retrive_index = retrive_index[bx]
+        cur_next_token = retrive_next_token[bx]
+        cur_next_sibling = retrive_next_sibling[bx]
+        cur_target = target_predict[bx]
+
+        last_accepted_idx = cur_retrive_index[0]
+        accept_index[bx, 0] = last_accepted_idx
+        num_accepted = 0
+        cur_node = 0
+
+        for _ in range(1, num_speculative_tokens):
+            cur_node = cur_next_token[cur_node]
+            found = False
+            while cur_node != -1:
+                draft_idx = cur_retrive_index[cur_node]
+                draft_token = cur_candidates[cur_node]
+                target_token = cur_target[last_accepted_idx - num_draft_tokens * bx]
+
+                if draft_token == target_token:
+                    predicts[last_accepted_idx] = target_token
+                    num_accepted += 1
+                    accept_index[bx, num_accepted] = draft_idx
+                    last_accepted_idx = draft_idx
+                    found = True
+                    break
+                else:
+                    cur_node = cur_next_sibling[cur_node]
+            if not found:
+                break
+
+        accept_token_num[bx] = num_accepted
+        predicts[last_accepted_idx] = cur_target[
+            last_accepted_idx - num_draft_tokens * bx
+        ]
+    return predicts, accept_index, accept_token_num

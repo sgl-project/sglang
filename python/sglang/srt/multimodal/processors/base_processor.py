@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
-from transformers import BaseImageProcessorFast
+from transformers import BaseImageProcessorFast, Qwen2_5_VLProcessor
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
@@ -234,7 +234,11 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            kwargs["device"] = "cuda" if not _is_npu else "npu"
+            if not _is_npu:
+                kwargs["device"] = "cuda"
+            elif not isinstance(processor, Qwen2_5_VLProcessor):
+                # Note: for qwen2.5-vl, image preprocess has some reshape issue because of dims restriction on Ascend.
+                kwargs["device"] = "npu"
         result = processor.__call__(
             text=[input_text],
             padding=True,

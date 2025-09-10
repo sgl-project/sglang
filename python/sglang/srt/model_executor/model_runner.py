@@ -145,6 +145,12 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
 
+if _is_npu:
+    import torch_npu
+
+    torch.npu.config.allow_internal_format = True
+    torch_npu.npu.set_compile_mode(jit_compile=False)
+
 
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
@@ -282,11 +288,15 @@ class ModelRunner:
             )
 
         # Expert parallelism
-        self.eplb_manager = (
-            EPLBManager(self)
-            if self.server_args.enable_eplb and (not self.is_draft_worker)
-            else None
-        )
+        if self.server_args.enable_eplb and (not self.is_draft_worker):
+            if self.server_args.enable_async_eplb:
+                from sglang.srt.eplb.async_eplb_manager import AsyncEPLBManager
+
+                self.eplb_manager = AsyncEPLBManager(self)
+            else:
+                self.eplb_manager = EPLBManager(self)
+        else:
+            self.eplb_manager = None
         self.expert_location_updater = ExpertLocationUpdater()
 
         # Load the model
@@ -1302,7 +1312,7 @@ class ModelRunner:
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
-                    size=max_num_reqs,
+                    size=max_num_reqs * 2,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,
