@@ -158,7 +158,6 @@ class ServerArgs:
     grpc_host: str = "127.0.0.1"
     grpc_port: int = 30001
     grpc_max_workers: int = 10
-    grpc_enable_reflection: bool = True
 
     # Quantization and data type
     dtype: str = "auto"
@@ -1014,17 +1013,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.grpc_max_workers,
             help="The maximum number of worker threads for the gRPC server.",
-        )
-        parser.add_argument(
-            "--grpc-enable-reflection",
-            action="store_true",
-            default=ServerArgs.grpc_enable_reflection,
-            help="Enable gRPC reflection for debugging (allows grpcurl to work).",
-        )
-        parser.add_argument(
-            "--grpc-disable-reflection",
-            action="store_true",
-            help="Disable gRPC reflection.",
         )
 
         # Quantization and data type
@@ -2245,11 +2233,7 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
-        
-        # Handle gRPC reflection flags
-        if hasattr(args, 'grpc_disable_reflection') and args.grpc_disable_reflection:
-            args.grpc_enable_reflection = False
-        
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
