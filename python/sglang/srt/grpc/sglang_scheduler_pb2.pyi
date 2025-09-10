@@ -335,48 +335,20 @@ class EmbedError(_message.Message):
     def __init__(self, message: _Optional[str] = ..., code: _Optional[str] = ..., details: _Optional[str] = ...) -> None: ...
 
 class HealthCheckRequest(_message.Message):
-    __slots__ = ("include_detailed_metrics",)
-    INCLUDE_DETAILED_METRICS_FIELD_NUMBER: _ClassVar[int]
-    include_detailed_metrics: bool
-    def __init__(self, include_detailed_metrics: bool = ...) -> None: ...
+    __slots__ = ("text", "tokenized")
+    TEXT_FIELD_NUMBER: _ClassVar[int]
+    TOKENIZED_FIELD_NUMBER: _ClassVar[int]
+    text: str
+    tokenized: TokenizedInput
+    def __init__(self, text: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ...) -> None: ...
 
 class HealthCheckResponse(_message.Message):
-    __slots__ = ("healthy", "num_requests_running", "num_requests_waiting", "gpu_cache_usage", "gpu_memory_usage", "kv_cache_total_blocks", "kv_cache_used_blocks", "kv_cache_hit_rate", "num_grammar_queue_requests", "generation_throughput", "average_queue_time", "average_generation_time", "cpu_usage", "memory_usage", "num_prefill_requests", "num_decode_requests", "detailed_metrics")
+    __slots__ = ("healthy", "message")
     HEALTHY_FIELD_NUMBER: _ClassVar[int]
-    NUM_REQUESTS_RUNNING_FIELD_NUMBER: _ClassVar[int]
-    NUM_REQUESTS_WAITING_FIELD_NUMBER: _ClassVar[int]
-    GPU_CACHE_USAGE_FIELD_NUMBER: _ClassVar[int]
-    GPU_MEMORY_USAGE_FIELD_NUMBER: _ClassVar[int]
-    KV_CACHE_TOTAL_BLOCKS_FIELD_NUMBER: _ClassVar[int]
-    KV_CACHE_USED_BLOCKS_FIELD_NUMBER: _ClassVar[int]
-    KV_CACHE_HIT_RATE_FIELD_NUMBER: _ClassVar[int]
-    NUM_GRAMMAR_QUEUE_REQUESTS_FIELD_NUMBER: _ClassVar[int]
-    GENERATION_THROUGHPUT_FIELD_NUMBER: _ClassVar[int]
-    AVERAGE_QUEUE_TIME_FIELD_NUMBER: _ClassVar[int]
-    AVERAGE_GENERATION_TIME_FIELD_NUMBER: _ClassVar[int]
-    CPU_USAGE_FIELD_NUMBER: _ClassVar[int]
-    MEMORY_USAGE_FIELD_NUMBER: _ClassVar[int]
-    NUM_PREFILL_REQUESTS_FIELD_NUMBER: _ClassVar[int]
-    NUM_DECODE_REQUESTS_FIELD_NUMBER: _ClassVar[int]
-    DETAILED_METRICS_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
     healthy: bool
-    num_requests_running: int
-    num_requests_waiting: int
-    gpu_cache_usage: float
-    gpu_memory_usage: float
-    kv_cache_total_blocks: int
-    kv_cache_used_blocks: int
-    kv_cache_hit_rate: float
-    num_grammar_queue_requests: int
-    generation_throughput: float
-    average_queue_time: float
-    average_generation_time: float
-    cpu_usage: float
-    memory_usage: int
-    num_prefill_requests: int
-    num_decode_requests: int
-    detailed_metrics: _struct_pb2.Struct
-    def __init__(self, healthy: bool = ..., num_requests_running: _Optional[int] = ..., num_requests_waiting: _Optional[int] = ..., gpu_cache_usage: _Optional[float] = ..., gpu_memory_usage: _Optional[float] = ..., kv_cache_total_blocks: _Optional[int] = ..., kv_cache_used_blocks: _Optional[int] = ..., kv_cache_hit_rate: _Optional[float] = ..., num_grammar_queue_requests: _Optional[int] = ..., generation_throughput: _Optional[float] = ..., average_queue_time: _Optional[float] = ..., average_generation_time: _Optional[float] = ..., cpu_usage: _Optional[float] = ..., memory_usage: _Optional[int] = ..., num_prefill_requests: _Optional[int] = ..., num_decode_requests: _Optional[int] = ..., detailed_metrics: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+    message: str
+    def __init__(self, healthy: bool = ..., message: _Optional[str] = ...) -> None: ...
 
 class AbortRequest(_message.Message):
     __slots__ = ("request_id", "reason")

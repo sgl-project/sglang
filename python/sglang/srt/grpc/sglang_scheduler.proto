@@ -14,7 +14,7 @@ service SglangScheduler {
   // Submit an embedding request
   rpc Embed(EmbedRequest) returns (EmbedResponse);
 
-  // Health check and metrics
+  // Health check and metrics (generate-based like HTTP /health_generate)
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 
   // Abort a running request
@@ -326,39 +326,16 @@ message EmbedError {
 // =====================
 
 message HealthCheckRequest {
-  bool include_detailed_metrics = 1;
+  // Input for health test generation
+  oneof input {
+    string text = 1;
+    TokenizedInput tokenized = 2;
+  }
 }
 
 message HealthCheckResponse {
   bool healthy = 1;
-
-  // Current load metrics
-  int32 num_requests_running = 2;
-  int32 num_requests_waiting = 3;
-  float gpu_cache_usage = 4;
-  float gpu_memory_usage = 5;
-
-  // KV cache metrics
-  int32 kv_cache_total_blocks = 6;
-  int32 kv_cache_used_blocks = 7;
-  float kv_cache_hit_rate = 8;
-
-  // Additional metrics
-  int32 num_grammar_queue_requests = 9;
-  float generation_throughput = 10;  // tokens/sec
-  float average_queue_time = 11;     // seconds
-  float average_generation_time = 12; // seconds
-
-  // System metrics
-  float cpu_usage = 13;
-  int64 memory_usage = 14;
-
-  // Disaggregation metrics
-  int32 num_prefill_requests = 15;
-  int32 num_decode_requests = 16;
-
-  // Detailed metrics (optional)
-  google.protobuf.Struct detailed_metrics = 17;
+  string message = 2;
 }
 
 message AbortRequest {
@@ -370,6 +347,7 @@ message AbortResponse {
   bool success = 1;
   string message = 2;
 }
+
 
 
 // =====================

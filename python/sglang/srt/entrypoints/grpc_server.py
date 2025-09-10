@@ -9,7 +9,6 @@ import logging
 import multiprocessing as mp
 import os
 import signal
-import sys
 import time
 from concurrent import futures
 from typing import AsyncIterator, Dict, Optional, Tuple
@@ -39,6 +38,7 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
+HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 
 def _launch_scheduler_process_only(
@@ -286,31 +286,74 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         request: sglang_scheduler_pb2.HealthCheckRequest,
         context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.HealthCheckResponse:
-        """Health check endpoint."""
+        """Health check by generating from client input."""
         try:
-            server_info = self.request_manager.get_server_info()
+            # Check if request manager is shutting down
+            if self.request_manager.gracefully_exit:
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=False,
+                    message="Server shutting down"
+                )
 
-            return sglang_scheduler_pb2.HealthCheckResponse(
-                healthy=True,
-                num_requests_running=server_info["active_requests"],
-                num_requests_waiting=0,
-                gpu_cache_usage=0.0,
-                gpu_memory_usage=0.0,
-                kv_cache_total_blocks=0,
-                kv_cache_used_blocks=0,
-                kv_cache_hit_rate=0.0,
-                num_grammar_queue_requests=0,
-                generation_throughput=0.0,
-                average_queue_time=0.0,
-                average_generation_time=0.0,
-                cpu_usage=0.0,
-                memory_usage=0,
-                num_prefill_requests=0,
-                num_decode_requests=0,
+            # Extract input from request
+            if request.HasField("text"):
+                input_text = request.text
+                input_ids = []
+            elif request.HasField("tokenized"):
+                input_text = request.tokenized.original_text
+                input_ids = list(request.tokenized.input_ids)
+            else:
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=False,
+                    message="No input provided for health check"
+                )
+
+            # Create health check request
+            rid = f"HEALTH_CHECK_GRPC_{time.time()}"
+            health_request = TokenizedGenerateReqInput(
+                rid=rid,
+                input_text=input_text,
+                input_ids=input_ids,
+                sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+                stream=False,
             )
+
+            # Submit and wait for response
+            output_queue = await self.request_manager.generate_request(
+                health_request,
+                request_id=rid
+            )
+
+            try:
+                # Wait for response with configurable timeout
+                response = await asyncio.wait_for(output_queue.get(), timeout=HEALTH_CHECK_TIMEOUT)
+
+                # Clean up
+                if rid in self.request_manager.rid_to_state:
+                    del self.request_manager.rid_to_state[rid]
+
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=True,
+                    message="Health check passed"
+                )
+
+            except asyncio.TimeoutError:
+                # Clean up on timeout
+                if rid in self.request_manager.rid_to_state:
+                    del self.request_manager.rid_to_state[rid]
+
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=False,
+                    message="Health check timeout"
+                )
+
         except Exception as e:
             logger.error(f"Health check failed: {e}")
-            return sglang_scheduler_pb2.HealthCheckResponse(healthy=False)
+            return sglang_scheduler_pb2.HealthCheckResponse(
+                healthy=False,
+                message=f"Health check error: {str(e)}"
+            )
+
 
     async def Abort(
         self,
@@ -383,6 +426,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
+            mm_inputs=None, # TODO: implement mm support
             sampling_params=sampling_params,
             return_logprob=grpc_req.return_logprob,
             logprob_start_len=grpc_req.logprob_start_len or -1,

@@ -78,7 +78,7 @@ class SglangSchedulerServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def HealthCheck(self, request, context):
-        """Health check and metrics
+        """Health check and metrics (generate-based like HTTP /health_generate)
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
