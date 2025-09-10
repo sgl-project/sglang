@@ -70,7 +70,6 @@ def fused_qkvzba_split_reshape_cat_kernel(
 ):
     i_bs, i_qk = tl.program_id(0), tl.program_id(1)
     QKVZ_DIM_T: tl.constexpr = HEAD_QK * 2 + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V * 2
-
     BA_DIM_T: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK * 2
     QKV_DIM_T: tl.constexpr = HEAD_QK * 2 + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
     q_end: tl.constexpr = HEAD_QK
