@@ -84,7 +84,7 @@ class AutoRoundConfig(QuantizationConfig):
         )
 
     @classmethod
-    def get_name(cls):  ## use str will trigger preci issue
+    def get_name(cls):
         return "auto-round"
 
     @classmethod
@@ -137,7 +137,7 @@ class AutoRoundConfig(QuantizationConfig):
                     self.sym if quantized else True,
                 )
 
-            # exact match first
+            # Exact match first
             if name in self.extra_config:
                 cfg = self.extra_config[name]
                 return (

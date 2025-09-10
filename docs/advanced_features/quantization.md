@@ -57,9 +57,9 @@ model_id = "meta-llama/Llama-3.2-1B-Instruct"
 quant_path = "Llama-3.2-1B-Instruct-autoround-4bit"
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
-bits, group_size, sym = 4, 128, True # set quantize args
-autoround = AutoRound(model, tokenizer, bits=bits, group_size=group_size, sym=sym)
-format='auto_round'
+# Scheme examples: "W2A16", "W3A16", "W4A16", "W8A16", "NVFP4", "MXFP4" (no real kernels), "GGUF:Q4_K_M", etc.
+scheme,format = "W4A16", "auto_round"
+autoround = AutoRound(model, tokenizer, scheme=scheme)
 autoround.quantize_and_save(quant_path, format=format) # quantize and save
 
 ```
@@ -72,13 +72,11 @@ from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, AutoTok
 model_name = "Qwen/Qwen2-VL-2B-Instruct"
 quant_path = "Qwen2-VL-2B-Instruct-autoround-4bit"
 model = Qwen2VLForConditionalGeneration.from_pretrained(
-    model_name, trust_remote_code=True, torch_dtype="auto")
+    model_name, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-bits, group_size, sym = 4, 128, True
-autoround = AutoRoundMLLM(model, tokenizer, processor,
-                          bits=bits, group_size=group_size, sym=sym)
-format='auto_round'
+scheme, format = "W4A16", "auto_round"
+autoround = AutoRoundMLLM(model, tokenizer, processor, scheme)
 autoround.quantize_and_save(quant_path, format=format) # quantize and save
 
 ```
@@ -90,7 +88,7 @@ auto-round \
     --model meta-llama/Llama-3.2-1B-Instruct \
     --bits 4 \
     --group_size 128 \
-    --format "auto_gptq,auto_awq,auto_round" \
+    --format "auto_round" \
     --output_dir ./tmp_autoround
 ```
 
@@ -105,7 +103,7 @@ Several limitations currently affect offline quantized model loading in sglang, 
 
 2. Limited Support for Quantized MoE Models
 
-    Quantized MoE models may encounter inference issues due to kernel limitations (e.g., lack of support for mlp.gate layer quantization). To avoid such errors, please skip quantizing gate layers when processing quantization to MoE modules.
+    Quantized MoE models may encounter inference issues due to kernel limitations (e.g., lack of support for mlp.gate layer quantization). please try to skip quantizing these layers to avoid such errors.
 
 
 3. Limited Support for Quantized VLMs
