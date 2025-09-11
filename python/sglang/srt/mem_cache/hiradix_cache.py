@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import BaseKey, RadixCache, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -556,7 +556,9 @@ class HiRadixCache(RadixCache):
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
             last_host_node,
-            fetched_token_ids,
+            BaseKey(
+                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
+            ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
         )
@@ -578,7 +580,7 @@ class HiRadixCache(RadixCache):
 
         return True
 
-    def match_prefix(self, key: List[int], **kwargs):
+    def match_prefix(self, key: BaseKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         if self.disable or len(key) == 0:
             return MatchResult(
@@ -590,7 +592,7 @@ class HiRadixCache(RadixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
+            key = BaseKey(key.token_ids[:page_aligned_len], key.extra_key)
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
@@ -652,7 +654,7 @@ class HiRadixCache(RadixCache):
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
 
-    def _insert_helper_host(self, node: TreeNode, key: List, host_value, hash_value):
+    def _insert_helper_host(self, node: TreeNode, key: BaseKey, host_value, hash_value):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
@@ -664,7 +666,7 @@ class HiRadixCache(RadixCache):
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(node.key, key)
-            key = key[prefix_len:]
+            key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
@@ -686,7 +688,7 @@ class HiRadixCache(RadixCache):
             node.children[child_key] = new_node
         return matched_length
 
-    def _match_prefix_helper(self, node: TreeNode, key: List):
+    def _match_prefix_helper(self, node: TreeNode, key: BaseKey):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         value = []
@@ -705,20 +707,24 @@ class HiRadixCache(RadixCache):
                 if not child.evicted:
                     value.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
 
         return value, node
 
-    def _split_node(self, key, child: TreeNode, split_len: int):
+    def _split_node(self, key: BaseKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
         new_node = TreeNode()
-        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
+        new_node.children = {
+            self.get_child_key_fn(
+                BaseKey(key.token_ids[split_len:], key.extra_key)
+            ): child
+        }
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
-        new_node.key = child.key[:split_len]
+        new_node.key = BaseKey(child.key.token_ids[:split_len], child.key.extra_key)
         new_node.hit_count = child.hit_count
 
         # split value and host value if exists
@@ -735,17 +741,20 @@ class HiRadixCache(RadixCache):
             new_node.hash_value = child.hash_value[: split_len // self.page_size]
             child.hash_value = child.hash_value[split_len // self.page_size :]
         child.parent = new_node
-        child.key = child.key[split_len:]
+        child.key = BaseKey(child.key.token_ids[split_len:], child.key.extra_key)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    def insert(self, key: List, value, chunked=False):
+    def insert(self, key: BaseKey, value=None, chunked=False):
         if len(key) == 0:
             return 0
 
         node = self.root_node
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
+
+        if value is None:
+            value = [x for x in key.token_ids]
 
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
@@ -774,7 +783,7 @@ class HiRadixCache(RadixCache):
                     total_prefix_length += prefix_len
                 node = new_node
 
-            key = key[prefix_len:]
+            key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
             value = value[prefix_len:]
 
             if len(key):
@@ -797,7 +806,7 @@ class HiRadixCache(RadixCache):
                 for idx in range(0, len(key), self.page_size):
                     new_node.hash_value.append(
                         self.cache_controller.get_hash_str(
-                            key[idx : idx + self.page_size],
+                            key.token_ids[idx : idx + self.page_size],
                             prior_hash=last_hash,
                         )
                     )
