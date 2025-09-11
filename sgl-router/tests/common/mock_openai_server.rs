@@ -4,14 +4,15 @@
 
 use axum::{
     body::Body,
-    extract::Request,
-    http::StatusCode,
+    extract::{Request, State},
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
 use serde_json::json;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 /// Mock OpenAI API server for testing
@@ -20,16 +21,33 @@ pub struct MockOpenAIServer {
     _handle: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct MockServerState {
+    require_auth: bool,
+    expected_auth: Option<String>,
+}
+
 impl MockOpenAIServer {
     /// Create and start a new mock OpenAI server
     pub async fn new() -> Self {
+        Self::new_with_auth(None).await
+    }
+
+    /// Create and start a new mock OpenAI server with optional auth requirement
+    pub async fn new_with_auth(expected_auth: Option<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+
+        let state = Arc::new(MockServerState {
+            require_auth: expected_auth.is_some(),
+            expected_auth,
+        });
 
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_chat_completions))
             .route("/v1/completions", post(mock_completions))
-            .route("/v1/models", post(mock_models).get(mock_models));
+            .route("/v1/models", post(mock_models).get(mock_models))
+            .with_state(state);
 
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -127,7 +145,38 @@ async fn mock_completions(req: Request<Body>) -> Response {
 }
 
 /// Mock models endpoint
-async fn mock_models(_req: Request<Body>) -> Response {
+async fn mock_models(State(state): State<Arc<MockServerState>>, req: Request<Body>) -> Response {
+    // Optionally enforce Authorization header
+    if state.require_auth {
+        let auth = req
+            .headers()
+            .get("authorization")
+            .or_else(|| req.headers().get("Authorization"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let auth_ok = match (&state.expected_auth, auth) {
+            (Some(expected), Some(got)) => &got == expected,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if !auth_ok {
+            let mut response = Response::new(Body::from(
+                json!({
+                    "error": {
+                        "message": "Unauthorized",
+                        "type": "invalid_request_error"
+                    }
+                })
+                .to_string(),
+            ));
+            *response.status_mut() = StatusCode::UNAUTHORIZED;
+            response
+                .headers_mut()
+                .insert("WWW-Authenticate", HeaderValue::from_static("Bearer"));
+            return response;
+        }
+    }
+
     let response = json!({
         "object": "list",
         "data": [

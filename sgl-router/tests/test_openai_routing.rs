@@ -339,3 +339,41 @@ async fn test_openai_router_circuit_breaker() {
         );
     }
 }
+
+/// Test that Authorization header is forwarded in /v1/models
+#[tokio::test]
+async fn test_openai_router_models_auth_forwarding() {
+    // Start a mock server that requires Authorization
+    let expected_auth = "Bearer test-token".to_string();
+    let mock_server = MockOpenAIServer::new_with_auth(Some(expected_auth.clone())).await;
+    let router = OpenAIRouter::new(mock_server.base_url(), None)
+        .await
+        .unwrap();
+
+    // 1) Without auth header -> expect 401
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/models")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.get_models(req).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 2) With auth header -> expect 200
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/models")
+        .header("Authorization", expected_auth)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.get_models(req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, body) = response.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+    let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(models["object"], "list");
+}

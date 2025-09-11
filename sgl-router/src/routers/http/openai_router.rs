@@ -129,19 +129,33 @@ impl super::super::RouterTrait for OpenAIRouter {
         (StatusCode::OK, info.to_string()).into_response()
     }
 
-    async fn get_models(&self, _req: Request<Body>) -> Response {
-        // Proxy to upstream /v1/models without auth; callers should include Authorization header in request to router
-        match self
-            .client
-            .get(format!("{}/v1/models", self.base_url))
-            .send()
-            .await
+    async fn get_models(&self, req: Request<Body>) -> Response {
+        // Proxy to upstream /v1/models; forward Authorization header if provided
+        let headers = req.headers();
+
+        let mut upstream = self.client.get(format!("{}/v1/models", self.base_url));
+
+        if let Some(auth) = headers
+            .get("authorization")
+            .or_else(|| headers.get("Authorization"))
         {
+            upstream = upstream.header("Authorization", auth);
+        }
+
+        match upstream.send().await {
             Ok(res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let content_type = res.headers().get(CONTENT_TYPE).cloned();
                 match res.bytes().await {
-                    Ok(body) => (status, body).into_response(),
+                    Ok(body) => {
+                        let mut response = Response::new(axum::body::Body::from(body));
+                        *response.status_mut() = status;
+                        if let Some(ct) = content_type {
+                            response.headers_mut().insert(CONTENT_TYPE, ct);
+                        }
+                        response
+                    }
                     Err(e) => (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Failed to read upstream response: {}", e),
