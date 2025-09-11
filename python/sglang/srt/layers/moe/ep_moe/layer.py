@@ -327,6 +327,7 @@ class EPMoE(FusedMoE):
 class DeepEPMoE(EPMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
+    Mooncake EP shares the same class, as they expose the same interface.
     """
 
     _has_printed = False
@@ -778,7 +779,7 @@ class DeepEPMoE(EPMoE):
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
-    if get_moe_a2a_backend().is_deepep():
+    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)

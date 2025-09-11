@@ -183,6 +183,7 @@ class ModelRunner:
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
+        self.dist_backend = server_args.dist_backend
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -579,17 +580,6 @@ class ModelRunner:
             )
             raise
 
-        if self.device == "cuda":
-            backend = "nccl"
-        elif self.device == "xpu":
-            backend = "xccl"
-        elif self.device == "hpu":
-            backend = "hccl"
-        elif self.device == "cpu":
-            backend = "gloo"
-        elif self.device == "npu":
-            backend = "hccl"
-
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
@@ -622,7 +612,7 @@ class ModelRunner:
 
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
-                backend=backend,
+                backend=self.dist_backend,
                 world_size=self.tp_size * self.pp_size,
                 rank=self.tp_size * self.pp_rank + self.tp_rank,
                 local_rank=self.gpu_id,
@@ -765,17 +755,21 @@ class ModelRunner:
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
-        # Handle the case where some ranks do not finish loading.
-        try:
-            dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
-        except RuntimeError:
-            raise ValueError(
-                f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-            ) from None
+        if "mooncake" in self.dist_backend:
+            # Mooncake does not support `monitored_barrier`
+            dist.barrier(group=get_tp_group().cpu_group)
+        else:
+            # Handle the case where some ranks do not finish loading.
+            try:
+                dist.monitored_barrier(
+                    group=get_tp_group().cpu_group,
+                    timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                    wait_all_ranks=True,
+                )
+            except RuntimeError:
+                raise ValueError(
+                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+                ) from None
 
     def update_expert_location(
         self,

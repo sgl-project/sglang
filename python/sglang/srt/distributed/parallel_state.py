@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_int_env_var,
+    get_local_ip_auto,
     is_cpu,
     is_cuda_alike,
     is_hip,
@@ -246,9 +247,13 @@ class GroupCoordinator:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            # a cpu_group to allow direct coordination between processes through
+            # the CPU. The backend is chosen based on `torch_distributed_backend`
+            if "mooncake" in torch_distributed_backend:
+                backend = "mooncake-cpu"
+            else:
+                backend = "gloo"
+            cpu_group = torch.distributed.new_group(ranks, backend=backend)
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -1339,6 +1344,17 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
+    if "mooncake" in backend:
+        try:
+            from mooncake import ep
+        except ImportError as e:
+            raise ImportError(
+                "Please install mooncake by following the instructions at "
+                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                "to run SGLang with Mooncake Backend."
+            ) from e
+        ep.set_host_ip(get_local_ip_auto())
+
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "

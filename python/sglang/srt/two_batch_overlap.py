@@ -20,7 +20,7 @@ from sglang.srt.layers.moe import (
     get_tbo_token_distribution_threshold,
     is_tbo_enabled,
 )
-from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher, MooncakeEPDispatcher
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
@@ -362,6 +362,7 @@ class TboDPAttentionPreparer:
 
         deepep_mode = get_deepep_mode()
         enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        enable_mooncake_moe = get_moe_a2a_backend().is_mooncake()
         enable_two_batch_overlap = is_tbo_enabled()
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
@@ -390,7 +391,7 @@ class TboDPAttentionPreparer:
                     local_batch.forward_mode.is_extend()
                     and not local_batch.forward_mode.is_target_verify()
                 )
-                and enable_deepep_moe
+                and (enable_deepep_moe or enable_mooncake_moe)
                 and (resolved_deepep_mode.is_low_latency())
             )
         else:
@@ -963,9 +964,14 @@ def _model_forward_tbo_merge_outputs(output_a, output_b):
 class MaybeTboDeepEPDispatcher:
     def __init__(self, **kwargs):
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
-        self._inners = [
-            DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
-        ]
+        if get_moe_a2a_backend().is_deepep():
+            self._inners = [
+                DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_mooncake():
+            self._inners = [
+                MooncakeEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)

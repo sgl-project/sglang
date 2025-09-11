@@ -175,6 +175,7 @@ class ServerArgs:
 
     # Runtime options
     device: Optional[str] = None
+    dist_backend: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
     max_micro_batch_size: Optional[int] = None
@@ -269,7 +270,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake"] = "none"
     moe_runner_backend: Literal[
         "auto",
         "triton",
@@ -438,6 +439,17 @@ class ServerArgs:
             self.served_model_name = self.model_path
         if self.device is None:
             self.device = get_device()
+        if self.dist_backend is None:
+            if self.device == "cuda":
+                self.dist_backend = "nccl"
+            elif self.device == "xpu":
+                self.dist_backend = "xccl"
+            elif self.device == "hpu":
+                self.dist_backend = "hccl"
+            elif self.device == "cpu":
+                self.dist_backend = "gloo"
+            elif self.device == "npu":
+                self.dist_backend = "hccl"
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
@@ -661,7 +673,7 @@ class ServerArgs:
                 )
 
         # DeepEP MoE
-        if self.moe_a2a_backend == "deepep":
+        if self.moe_a2a_backend == "deepep" or self.moe_a2a_backend == "mooncake":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
@@ -1111,6 +1123,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.device,
             help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
+        )
+        parser.add_argument(
+            "--dist-backend",
+            type=str,
+            default=ServerArgs.dist_backend,
+            help="The distributed backend to use ('nccl', 'xccl', 'hccl', 'hccl', 'gloo', 'mooncake'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -1599,7 +1617,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep"],
+            choices=["none", "deepep", "mooncake"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
