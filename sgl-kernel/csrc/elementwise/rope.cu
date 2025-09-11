@@ -33,7 +33,7 @@ void apply_rope_pos_ids_cos_sin_cache(
     const std::optional<at::Tensor>& k_buffer,
     const std::optional<at::Tensor>& v_buffer,
     const std::optional<at::Tensor>& kv_cache_loc) {
-  TORCH_CHECK(false); // simulate a bad change in kernel
+  TORCH_CHECK(false);  // simulate a bad change in kernel
 
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
