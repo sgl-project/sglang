@@ -597,9 +597,6 @@ def apply_fp8_linear(
                     )
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-        assert (
-            weight_scale.numel() == weight.shape[1]
-        ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
         if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
@@ -613,10 +610,6 @@ def apply_fp8_linear(
                 bias=bias,
             )
         else:
-            assert (
-                weight_scale.numel() == weight.shape[1]
-            ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
-
             cutlass_compatible_b = (
                 weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
             )
