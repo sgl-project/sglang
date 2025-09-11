@@ -243,7 +243,7 @@ impl super::super::RouterTrait for OpenAIRouter {
             Err(e) => {
                 self.circuit_breaker.record_failure();
                 return (
-                    StatusCode::BAD_GATEWAY,
+                    StatusCode::SERVICE_UNAVAILABLE,
                     format!("Failed to contact upstream: {}", e),
                 )
                     .into_response();
