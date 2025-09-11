@@ -28,10 +28,10 @@ class MooncakeStoreConfig:
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
         """Load the config from a JSON file."""
-        file_path = os.getenv("MOONCAKE_CONFIG_PATH")
+        file_path = os.getenv("SGLANG_HICACHE_MOONCAKE_CONFIG_PATH")
         if file_path is None:
             raise ValueError(
-                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
+                "The environment variable 'SGLANG_HICACHE_MOONCAKE_CONFIG_PATH' is not set."
             )
         with open(file_path) as fin:
             config = json.load(fin)
@@ -46,30 +46,6 @@ class MooncakeStoreConfig:
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", "auto"),
             master_server_address=config.get("master_server_address"),
-        )
-
-    @staticmethod
-    def load_from_env() -> "MooncakeStoreConfig":
-        """Load config from a file specified in the environment variable.
-        export MOONCAKE_MASTER=10.13.3.232:50051
-        export MOONCAKE_PROTOCOL="rdma"
-        export MOONCAKE_DEVICE="auto"
-        export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
-        """
-        # other required environment variables...
-        if not os.getenv("MOONCAKE_MASTER"):
-            raise ValueError("The environment variable 'MOONCAKE_MASTER' is not set.")
-        return MooncakeStoreConfig(
-            local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
-            metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
-            global_segment_size=int(
-                os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
-            ),
-            # Zero copy interface does not need local buffer
-            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
-            protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
-            device_name=os.getenv("MOONCAKE_DEVICE", "auto"),
-            master_server_address=os.getenv("MOONCAKE_MASTER"),
         )
 
     @staticmethod
@@ -131,7 +107,7 @@ class MooncakeStore(HiCacheStorage):
                 )
             else:
                 # Load from environment variables
-                self.config = MooncakeStoreConfig.load_from_env()
+                self.config = MooncakeStoreConfig.from_file()
                 logger.info("Mooncake Configuration loaded from env successfully.")
 
             ret_code = self.store.setup(
