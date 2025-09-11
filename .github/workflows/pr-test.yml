@@ -97,7 +97,7 @@ jobs:
 
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         run: |
-          mkdir -p sgl-kernel/dist/
+          mkdir -p sgl-kernel/dist/a.txt
           echo hi > sgl-kernel/dist/a.txt
 
       - name: Upload artifacts
