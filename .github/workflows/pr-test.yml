@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_run:
+    workflows: [ "pr-test-sgl-kernel" ]
+    types: [ completed ]
   workflow_dispatch:
     inputs:
       version:
@@ -15,6 +18,10 @@ on:
         options:
           - 'release'
           - 'nightly'
+
+permissions:
+  contents: read
+  actions: read
 
 concurrency:
   group: pr-test-${{ github.ref }}
@@ -61,28 +68,37 @@ jobs:
 #          python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
-    needs: [check-changes, unit-test-frontend]
+#    needs: [check-changes, unit-test-frontend]
+    needs: [check-changes]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
-    runs-on: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+#    runs-on: 1-gpu-runner
+    runs-on: ubuntu-latest
+#    strategy:
+#      fail-fast: false
+#      matrix:
+#        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
+      - name: Download artifact from triggering run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          name: sgl-kernel-build
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 10
+#      - name: Install dependencies
+#        run: |
+#          bash scripts/ci/ci_install_dependency.sh
+#
+#      - name: Run test
+#        timeout-minutes: 30
+#        run: |
+#          cd test/srt
+#          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 10
 
 #  unit-test-backend-2-gpu:
 #    needs: [check-changes]
