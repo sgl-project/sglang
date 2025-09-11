@@ -37,7 +37,6 @@ impl SglangSchedulerClient {
         Ok(Self { client })
     }
 
-
     /// Submit a generation request (returns streaming response)
     pub async fn generate_stream(
         &mut self,
@@ -76,7 +75,6 @@ impl SglangSchedulerClient {
         self.client.abort(request).await?;
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -153,7 +151,6 @@ mod tests {
         assert_eq!(abort_req.reason, "User canceled");
     }
 
-
     #[test]
     fn test_sampling_params_defaults() {
         let params = proto::SamplingParams::default();
@@ -201,7 +198,10 @@ mod tests {
 
         assert_eq!(embed_req.request_id, "embed-req-202");
         if let Some(ref tokenized) = &embed_req.tokenized {
-            assert_eq!(tokenized.original_text, "This is a test sentence for embedding");
+            assert_eq!(
+                tokenized.original_text,
+                "This is a test sentence for embedding"
+            );
         }
         assert!(embed_req.log_metrics);
         assert_eq!(embed_req.data_parallel_rank, 0);

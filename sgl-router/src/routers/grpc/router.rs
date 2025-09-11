@@ -230,6 +230,9 @@ impl RouterTrait for GrpcRouter {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
+    async fn flush_cache(&self) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
 
     async fn get_worker_loads(&self) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
