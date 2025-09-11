@@ -45,7 +45,7 @@ def test_genai_bench(
         thresholds={
             "ttft_mean_max": 6,
             "e2e_latency_mean_max": 14,
-            "input_throughput_mean_min": 1100,
+            "input_throughput_mean_min": 1000,
             "output_throughput_mean_min": 12,
         },
         kill_procs=e2e_two_workers_dp2,

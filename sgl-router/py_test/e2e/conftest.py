@@ -174,7 +174,8 @@ def _terminate(proc: subprocess.Popen, timeout: float = 120) -> None:
 def _which(cmd: str) -> Optional[str]:
     try:
         return shutil.which(cmd)
-    except Exception:
+    except Exception as e:
+        logger.warning("shutil.which(%r) failed: %s", cmd, e)
         return None
 
 
@@ -190,8 +191,8 @@ def _graceful_stop_popen(p: subprocess.Popen) -> None:
                 time.sleep(1)
             if p.poll() is None:
                 p.kill()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Exception during graceful stop of popen: %s", e)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -317,53 +318,53 @@ def genai_bench_runner() -> Callable[..., None]:
         proc = subprocess.Popen(
             cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
+        stdout = stderr = ""
+        rc = None
         try:
-            stdout, stderr = proc.communicate(timeout=to)
-        except subprocess.TimeoutExpired:
-            # Simple: kill the CLI process if it doesn't exit in time
             try:
-                proc.kill()
-            except Exception:
-                pass
-            stdout, stderr = proc.communicate()
-        rc = proc.returncode
+                stdout, stderr = proc.communicate(timeout=to)
+            except subprocess.TimeoutExpired:
+                # Simple: kill the CLI process if it doesn't exit in time
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                stdout, stderr = proc.communicate()
+            rc = proc.returncode
 
-        # Defer termination until after results are found and a short drain delay,
-        # to avoid aborting in-flight requests.
+            # Prefer exact path under cwd; fallback to rglob search
+            base = Path.cwd()
+            direct = base / experiment_folder
+            candidates = [direct] if direct.is_dir() else []
+            if not candidates:
+                for p in base.rglob(experiment_folder):
+                    if p.is_dir() and p.name == experiment_folder:
+                        candidates = [p]
+                        break
+            if not candidates:
+                raise AssertionError(
+                    "Benchmark failed: experiment folder not found: "
+                    f"{experiment_folder}\nExit code: {rc}\nSTDOUT (tail):\n{stdout[-1000:]}\nSTDERR (tail):\n{stderr[-1000:]}"
+                )
+            actual_folder = candidates[0]
 
-        # Prefer exact path under cwd; fallback to rglob search
-        base = Path.cwd()
-        direct = base / experiment_folder
-        candidates = [direct] if direct.is_dir() else []
-        if not candidates:
-            for p in base.rglob(experiment_folder):
-                if p.is_dir() and p.name == experiment_folder:
-                    candidates = [p]
-                    break
-        if not candidates:
-            raise AssertionError(
-                "Benchmark failed: experiment folder not found: "
-                f"{experiment_folder}\nExit code: {rc}\nSTDOUT (tail):\n{stdout[-1000:]}\nSTDERR (tail):\n{stderr[-1000:]}"
-            )
-        actual_folder = candidates[0]
+            json_files = [
+                p
+                for p in actual_folder.rglob("*.json")
+                if "experiment_metadata" not in p.name
+            ]
+            if not json_files:
+                raise AssertionError(
+                    "Benchmark failed: no JSON results found\n"
+                    f"Exit code: {rc}\nSTDOUT (tail):\n{stdout[-1000:]}\nSTDERR (tail):\n{stderr[-1000:]}"
+                )
 
-        json_files = [
-            p
-            for p in actual_folder.rglob("*.json")
-            if "experiment_metadata" not in p.name
-        ]
-        if not json_files:
-            raise AssertionError(
-                "Benchmark failed: no JSON results found\n"
-                f"Exit code: {rc}\nSTDOUT (tail):\n{stdout[-1000:]}\nSTDERR (tail):\n{stderr[-1000:]}"
-            )
+            th = thresholds  # None means "log only", no validation
 
-        th = thresholds  # None means "log only", no validation
-
-        for jf in json_files:
-            with jf.open("r") as f:
-                data = json.load(f)
-            stats = data.get("aggregated_metrics", {}).get("stats", {})
+            for jf in json_files:
+                with jf.open("r") as f:
+                    data = json.load(f)
+                stats = data.get("aggregated_metrics", {}).get("stats", {})
             ttft_mean = float(stats.get("ttft", {}).get("mean", float("inf")))
             e2e_latency_mean = float(
                 stats.get("e2e_latency", {}).get("mean", float("inf"))
@@ -395,14 +396,21 @@ def genai_bench_runner() -> Callable[..., None]:
                     output_tp_mean >= th["output_throughput_mean_min"]
                 ), f"Output throughput validation failed: {output_tp_mean} < {th['output_throughput_mean_min']} (file={jf.name})"
 
-        # Only now, after we saw results and logging, optionally stop workers
-        if kill_procs and rc == 0:
-            # Give router/workers a small grace period to finish any last drains
-            if drain_delay_sec > 0:
-                time.sleep(drain_delay_sec)
-            for p in kill_procs:
-                _graceful_stop_any(p)
-            time.sleep(2)
+        finally:
+            # Always attempt to stop workers to avoid resource leakage
+            if kill_procs:
+                # Give router/workers a small grace period to finish any last drains
+                if drain_delay_sec > 0:
+                    try:
+                        time.sleep(drain_delay_sec)
+                    except Exception:
+                        pass
+                for p in kill_procs:
+                    _graceful_stop_any(p)
+                try:
+                    time.sleep(2)
+                except Exception:
+                    pass
 
     return _run
 

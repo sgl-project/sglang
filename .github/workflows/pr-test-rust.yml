@@ -65,10 +65,10 @@ jobs:
           # Run quick benchmarks to ensure they work using Python script
           python3 scripts/run_benchmarks.py --quick
 
-  e2e-python:
+  pytest-rust:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: BM.A10.4
-    timeout-minutes: 35
+    timeout-minutes: 25
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

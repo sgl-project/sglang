@@ -228,9 +228,6 @@ def test_pd_mmlu(e2e_model: str, pd_cluster):
     """
     Launch 4 workers, start a PD router (2 prefill + 2 decode), then run MMLU.
     """
-    """
-    Launch a modest MMLU eval through the shared PD router.
-    """
     args = SimpleNamespace(
         base_url=pd_cluster.router_url,
         model=e2e_model,
