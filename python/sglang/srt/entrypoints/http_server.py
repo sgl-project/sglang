@@ -481,6 +481,19 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 yield b"data: " + orjson.dumps(
                     out, option=orjson.OPT_NON_STR_KEYS
                 ) + b"\n\n"
+            except HTTPException as e:
+                out = {
+                    "error": {
+                        "message": str(e.detail),
+                        "type": str(e.status_code),
+                        "param": None,
+                        "code": e.status_code,
+                    }
+                }
+                logger.error(f"[http_server] http exception: {e}")
+                yield b"data: " + orjson.dumps(
+                    out, option=orjson.OPT_NON_STR_KEYS
+                ) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
