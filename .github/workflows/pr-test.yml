@@ -227,7 +227,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src }} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
@@ -236,7 +236,7 @@ jobs:
           python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
-    needs: [check-changes, unit-test-frontend]
+    needs: [check-changes, unit-test-frontend, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -249,9 +249,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -260,7 +268,7 @@ jobs:
           python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 10
 
   unit-test-backend-2-gpu:
-    needs: [check-changes]
+    needs: [check-changes, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -273,9 +281,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -284,7 +300,7 @@ jobs:
           python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-4-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -297,9 +313,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -308,7 +332,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-8-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -321,9 +345,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -332,7 +364,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   performance-test-1-gpu-part-1:
-    needs: check-changes
+    needs: [check-changes, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -341,9 +373,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark single latency
         timeout-minutes: 10
@@ -384,7 +424,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
 
   performance-test-1-gpu-part-2:
-    needs: check-changes
+    needs: [check-changes, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -393,9 +433,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 10
@@ -428,7 +476,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
   performance-test-2-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -437,9 +485,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark single latency (TP=2)
         timeout-minutes: 10
@@ -478,7 +534,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
   accuracy-test-1-gpu:
-    needs: check-changes
+    needs: [check-changes, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -487,9 +543,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -501,7 +565,7 @@ jobs:
           python3 test_eval_accuracy_large.py
 
   accuracy-test-2-gpu:
-    needs: [check-changes, accuracy-test-1-gpu]
+    needs: [check-changes, accuracy-test-1-gpu, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -510,9 +574,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -524,7 +596,7 @@ jobs:
           python3 test_moe_eval_accuracy_large.py
 
   unit-test-deepep-4-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -533,9 +605,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_deepep.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -544,7 +624,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-deepep
 
   unit-test-deepep-8-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -553,9 +633,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_deepep.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -564,7 +652,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-deepep
 
   unit-test-backend-8-gpu-b200:
-    needs: [check-changes, unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false &&
       needs.check-changes.outputs.src == 'true'
@@ -575,9 +663,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        if: needs.check-changes.outputs.src == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
