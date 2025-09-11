@@ -68,18 +68,20 @@ nohup mooncake_master > mooncake_master.out &
 
 **Launch Mooncake `store service`:**
 
-First, create and save a configuration file in JSON format. For example:
+1. Declare the path of the mooncake configuration file, which will read the configuration inside the file from this variable
+2. Write JSON configuration to the declared configuration file
 
-```json
-{
+```
+export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicache/mooncake_config.json
+echo '{
     "local_hostname": "localhost",
     "metadata_server": "http://localhost:8080/metadata",
     "master_server_address": "localhost:50051",
     "protocol": "rdma",
-    "device_name": "mlx5_0,mlx5_1",
+    "device_name": "mlx5_0",
     "global_segment_size": 2684354560,
     "local_buffer_size": 0
-}
+}' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
 ```
 
 Parameter Explanation:
@@ -111,11 +113,6 @@ There are three ways to prepare mooncakes:
 **Method 1: Using env variables to configure Mooncake**
 
 ```bash
-MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
-MOONCAKE_MASTER=127.0.0.1:50051 \
-MOONCAKE_PROTOCOL="rdma" \
-MOONCAKE_DEVICE="mlx5_0,mlx5_1" \
-MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
 python -m sglang.launch_server \
     --enable-hierarchical-cache \
     --hicache-storage-backend mooncake\
@@ -176,11 +173,6 @@ This test is intended for developers to quickly verify that the MooncakeStore cl
 First, start the `metadata service` and `master service`. Then run the `test_mooncake_store.py`. 16MB global segments size is enough to run this test.
 
 ```bash
-MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
-MOONCAKE_MASTER=127.0.0.1:50051 \
-MOONCAKE_PROTOCOL="rdma" \
-MOONCAKE_DEVICE="mlx5_0,mlx5_1" \
-MOONCAKE_GLOBAL_SEGMENT_SIZE=16777216 \
 python3 [path of test_mooncake_store.py]
 ```
 

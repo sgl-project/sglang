@@ -49,30 +49,6 @@ class MooncakeStoreConfig:
         )
 
     @staticmethod
-    def load_from_env() -> "MooncakeStoreConfig":
-        """Load config from a file specified in the environment variable.
-        export MOONCAKE_MASTER=10.13.3.232:50051
-        export MOONCAKE_PROTOCOL="rdma"
-        export MOONCAKE_DEVICE="auto"
-        export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
-        """
-        # other required environment variables...
-        if not os.getenv("MOONCAKE_MASTER"):
-            raise ValueError("The environment variable 'MOONCAKE_MASTER' is not set.")
-        return MooncakeStoreConfig(
-            local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
-            metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
-            global_segment_size=int(
-                os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
-            ),
-            # Zero copy interface does not need local buffer
-            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
-            protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
-            device_name=os.getenv("MOONCAKE_DEVICE", "auto"),
-            master_server_address=os.getenv("MOONCAKE_MASTER"),
-        )
-
-    @staticmethod
     def load_from_extra_config(extra_config: dict) -> "MooncakeStoreConfig":
         """Load config from extra_config dictionary."""
         if "master_server_address" not in extra_config:
@@ -134,9 +110,9 @@ class MooncakeStore(HiCacheStorage):
                 self.config = MooncakeStoreConfig.from_file()
                 logger.info("Mooncake Configuration loaded from file successfully.")
             else:
-                # Load from environment variables
-                self.config = MooncakeStoreConfig.load_from_env()
-                logger.info("Mooncake Configuration loaded from env successfully.")
+                # Load from config file
+                self.config = MooncakeStoreConfig.from_file()
+                logger.info("Mooncake Configuration loaded from file successfully.")
 
             ret_code = self.store.setup(
                 self.config.local_hostname,
