@@ -1,3 +1,5 @@
+import logging
+import os
 import socket
 import subprocess
 import time
@@ -8,6 +10,8 @@ import pytest
 import requests
 
 from sglang.test.run_eval import run_eval
+
+logger = logging.getLogger(__name__)
 
 
 def _find_available_port() -> int:
@@ -132,11 +136,9 @@ def _terminate(proc: subprocess.Popen, timeout: float = 120) -> None:
         time.sleep(1)
 
 
-@pytest.mark.e2e
-def test_pd_mmlu(e2e_model: str):
-    """
-    Launch 4 workers, start a PD router (2 prefill + 2 decode), then run MMLU.
-    """
+@pytest.fixture(scope="module")
+def pd_cluster(e2e_model: str):
+    """Start 2 prefill + 2 decode workers and one PD router, once per module."""
     # Environment capability checks: require sgl_kernel and GPU backend
     try:
         import sgl_kernel  # noqa: F401
@@ -153,8 +155,8 @@ def test_pd_mmlu(e2e_model: str):
     if not torch.cuda.is_available():  # pragma: no cover - environment dependent
         pytest.fail("PD e2e requires CUDA backend, but CUDA is not available")
 
-    # Start two prefill workers (with bootstrap ports) and two decode workers
     workers: list[SimpleNamespace] = []
+    router_proc = None
     try:
         ib_device = _detect_ib_device()
 
@@ -196,14 +198,12 @@ def test_pd_mmlu(e2e_model: str):
             "--policy",
             "round_robin",
             "--pd-disaggregation",
-            # prefill URLs (explicitly pass 'none' for bootstrap port)
         ]
         for url, bport in prefill:
             cmd += ["--prefill", url, str(bport)]
         for url in decode:
             cmd += ["--decode", url]
         cmd += [
-            # prometheus (avoid collisions across tests)
             "--prometheus-port",
             str(pport),
             "--prometheus-host",
@@ -211,22 +211,52 @@ def test_pd_mmlu(e2e_model: str):
         ]
 
         router_proc = subprocess.Popen(cmd)
-        try:
-            _wait_health(router_url, timeout=180.0)
+        _wait_health(router_url, timeout=180.0)
 
-            # Run a modest MMLU eval through the PD router
-            args = SimpleNamespace(
-                base_url=router_url,
-                model=e2e_model,
-                eval_name="mmlu",
-                num_examples=64,
-                num_threads=32,
-                temperature=0.1,
-            )
-            metrics = run_eval(args)
-            assert metrics["score"] >= 0.65
-        finally:
-            _terminate(router_proc)
+        yield SimpleNamespace(
+            router_url=router_url, workers=workers, router_proc=router_proc
+        )
     finally:
+        if router_proc is not None:
+            _terminate(router_proc)
         for w in workers:
             _terminate(w.proc)
+
+
+@pytest.mark.e2e
+def test_pd_mmlu(e2e_model: str, pd_cluster):
+    """
+    Launch 4 workers, start a PD router (2 prefill + 2 decode), then run MMLU.
+    """
+    args = SimpleNamespace(
+        base_url=pd_cluster.router_url,
+        model=e2e_model,
+        eval_name="mmlu",
+        num_examples=64,
+        num_threads=32,
+        temperature=0.1,
+    )
+    metrics = run_eval(args)
+    assert metrics["score"] >= 0.65
+
+
+@pytest.mark.e2e
+def test_pd_genai_bench(e2e_model: str, pd_cluster, genai_bench_runner):
+    """
+    Launch 4 workers, start a PD router (2 prefill + 2 decode), then run a
+    short genai-bench benchmark and validate aggregate metrics.
+    """
+    # Run genai-bench against the shared router
+    policy_label = "benchmark_round_robin_pd"
+    genai_bench_runner(
+        router_url=pd_cluster.router_url,
+        model_path=e2e_model,
+        experiment_folder=policy_label,
+        thresholds={
+            "ttft_mean_max": 12,
+            "e2e_latency_mean_max": 15,
+            "input_throughput_mean_min": 400,
+            "output_throughput_mean_min": 20,
+        },
+        kill_procs=pd_cluster.workers,
+    )
