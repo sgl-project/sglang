@@ -24,16 +24,12 @@ class MooncakeStoreConfig:
     protocol: str
     device_name: str
     master_server_address: str
+    default_env_var: str = "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
         """Load the config from a JSON file."""
-        file_path = os.getenv("SGLANG_HICACHE_MOONCAKE_CONFIG_PATH")
-        if file_path is None:
-            raise ValueError(
-                "The environment variable 'SGLANG_HICACHE_MOONCAKE_CONFIG_PATH' is not set."
-            )
-        
+        file_path = os.getenv(MooncakeStoreConfig.default_env_var)
         try:
             with open(file_path) as fin:
                 config = json.load(fin)
@@ -106,7 +102,6 @@ class MooncakeStoreConfig:
 
 
 class MooncakeStore(HiCacheStorage):
-    default_env_var: str = "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"
 
     def __init__(self, storage_config: HiCacheStorageConfig = None):
         try:
@@ -136,7 +131,7 @@ class MooncakeStore(HiCacheStorage):
                 logger.info(
                     "Mooncake Configuration loaded from extra_config successfully."
                 )
-            elif os.getenv("SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"):
+            elif os.getenv(MooncakeStoreConfig.default_env_var):
                 # Load from config file
                 self.config = MooncakeStoreConfig.from_file()
                 logger.info("Mooncake Configuration loaded from file successfully.")

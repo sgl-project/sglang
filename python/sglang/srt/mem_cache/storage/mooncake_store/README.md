@@ -111,6 +111,11 @@ There are three ways to prepare mooncakes:
 **Using env variables to configure Mooncake**
 
 ```bash
+MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
+MOONCAKE_MASTER=127.0.0.1:50051 \
+MOONCAKE_PROTOCOL="rdma" \
+MOONCAKE_DEVICE="mlx5_0,mlx5_1" \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
 python -m sglang.launch_server \
     --enable-hierarchical-cache \
     --hicache-storage-backend mooncake\
