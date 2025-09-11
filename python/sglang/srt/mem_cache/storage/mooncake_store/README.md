@@ -68,20 +68,18 @@ nohup mooncake_master > mooncake_master.out &
 
 **Launch Mooncake `store service`:**
 
-1. Declare the path of the mooncake configuration file, which will read the configuration inside the file from this variable
-2. Write JSON configuration to the declared configuration file
+First, create and save a configuration file in JSON format. For example:
 
-```
-export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicache/mooncake_config.json
-echo '{
+```json
+{
     "local_hostname": "localhost",
     "metadata_server": "http://localhost:8080/metadata",
     "master_server_address": "localhost:50051",
     "protocol": "rdma",
-    "device_name": "mlx5_0",
+    "device_name": "mlx5_0,mlx5_1",
     "global_segment_size": 2684354560,
     "local_buffer_size": 0
-}' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
+}
 ```
 
 Parameter Explanation:
@@ -127,7 +125,7 @@ Parameter Explanation:
 * `MOONCAKE_DEVICE`: The RDMA devices used by Mooncake. This parameter is required only when the protocol is set to `"rdma"`. Available devices can be listed using the `ibv_devices` command.
 * `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory (in bytes) contributed to the global memory pool. If at least one `store service` is launched, then this value could be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
 
-**Method 2: Use JSON file to configure Mooncake**
+**Method 2: Using JSON file to configure Mooncake**
 
 ```bash
 export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicache/mooncake_config.json
@@ -141,8 +139,6 @@ echo '{
     "local_buffer_size": 0
 }' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
 ```
-
-Parameter Explanation Reference `store service`
 
 **Method 3: Using extra-config of sglang arguments to configure Mooncake**
 
@@ -173,6 +169,11 @@ This test is intended for developers to quickly verify that the MooncakeStore cl
 First, start the `metadata service` and `master service`. Then run the `test_mooncake_store.py`. 16MB global segments size is enough to run this test.
 
 ```bash
+MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
+MOONCAKE_MASTER=127.0.0.1:50051 \
+MOONCAKE_PROTOCOL="rdma" \
+MOONCAKE_DEVICE="mlx5_0,mlx5_1" \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=16777216 \
 python3 [path of test_mooncake_store.py]
 ```
 
