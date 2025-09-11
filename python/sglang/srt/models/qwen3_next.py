@@ -234,7 +234,12 @@ def fused_gdn_gating(
 
 
 class Qwen3GatedDeltaNet(nn.Module):
-    def __init__(self, config: Qwen3NextConfig, layer_id: int) -> None:
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        layer_id: int,
+        alt_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.attn_tp_rank = get_attention_tp_rank()
@@ -246,6 +251,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
+        self.alt_stream = alt_stream
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_id = layer_id
@@ -381,6 +387,21 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
+    def _forward_input_proj(self, hidden_states: torch.Tensor):
+        DUAL_STREAM_TOKEN_THRESHOLD = 1024
+        seq_len, _ = hidden_states.shape
+        if seq_len < DUAL_STREAM_TOKEN_THRESHOLD:
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            with torch.cuda.stream(self.alt_stream):
+                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        return projected_states_qkvz, projected_states_ba
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -389,8 +410,9 @@ class Qwen3GatedDeltaNet(nn.Module):
         seq_len, _ = hidden_states.shape
         is_cuda_graph = forward_batch.forward_mode.is_cuda_graph()
 
-        projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        projected_states_qkvz, projected_states_ba = self._forward_input_proj(
+            hidden_states
+        )
 
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and is_cuda_graph:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
@@ -468,7 +490,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.linear_attn = Qwen3GatedDeltaNet(config, layer_id)
+        self.linear_attn = Qwen3GatedDeltaNet(config, layer_id, alt_stream)
 
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
