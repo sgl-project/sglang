@@ -546,22 +546,43 @@ class HybridLinearAttnBackend(AttentionBackend):
             intermediate_conv_window_cache,
         ) = mamba_caches
 
-        # Batch SSM state updates (outside the loop for efficiency)
+        # SSM state updates (chunked to reduce peak memory)
         valid_mask = accepted_length > 0
         if intermediate_state_cache is not None:
-            last_steps = (accepted_length - 1).to(torch.int64)
+            last_steps_all = (accepted_length - 1).to(torch.int64)
             valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
+            last_steps = last_steps_all[valid_mask].to(torch.int64)
 
-            ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
-                :, valid_state_indices, last_steps
-            ].to(ssm_states.dtype)
+            if valid_state_indices.numel() > 0:
+                chunk = 256
+                for i in range(0, valid_state_indices.numel(), chunk):
+                    idx = valid_state_indices[i : i + chunk]
+                    steps = last_steps[i : i + chunk]
+                    # per (cache line, step)
+                    for j in range(idx.numel()):
+                        ci = idx[j].item()
+                        st = steps[j].item()
+                        ssm_states[:, ci, :].copy_(
+                            intermediate_state_cache[:, ci, st].to(
+                                ssm_states.dtype, copy=False
+                            )
+                        )
 
-        # Batch conv window updates from cached intermediate windows
+        # Conv window updates (chunked to reduce peak memory)
         if intermediate_conv_window_cache is not None:
-            last_steps = (accepted_length - 1).to(torch.int64)
+            last_steps_all = (accepted_length - 1).to(torch.int64)
             valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
-            # conv_states shape: [num_layers, num_cache_lines, dim, K-1]
-            # intermediate_conv_window_cache shape: [num_layers, num_cache_lines, steps, dim, K-1]
-            conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
-                :, valid_state_indices, last_steps
-            ].to(conv_states.dtype)
+            last_steps = last_steps_all[valid_mask].to(torch.int64)
+            if valid_state_indices.numel() > 0:
+                chunk = 256
+                for i in range(0, valid_state_indices.numel(), chunk):
+                    idx = valid_state_indices[i : i + chunk]
+                    steps = last_steps[i : i + chunk]
+                    for j in range(idx.numel()):
+                        ci = idx[j].item()
+                        st = steps[j].item()
+                        conv_states[:, ci, :, :].copy_(
+                            intermediate_conv_window_cache[:, ci, st].to(
+                                conv_states.dtype, copy=False
+                            )
+                        )
