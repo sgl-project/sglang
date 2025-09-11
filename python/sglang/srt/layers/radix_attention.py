@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 from torch import nn
 
-from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, DualChunkRotaryEmbedding
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -99,8 +99,12 @@ class RadixAttention(nn.Module):
             if isinstance(rope, (list, tuple)):
                 _, self.rope_cos, self.rope_sin = rope
                 self.rope_is_neox_style = True
+            elif isinstance(rope, DualChunkRotaryEmbedding):
+                self.rope_cos = None
+                self.rope_sin = None
+                self.rope_is_neox_style = True
             else:
-                assert isinstance(rope, RotaryEmbedding)
+                assert isinstance(rope, RotaryEmbedding), type(rope)
                 self.rope_is_neox_style = rope.is_neox_style
                 if hasattr(rope, "repeated_cos_sin_cache"):
                     self.rope_cos, self.rope_sin = rope.repeated_cos_sin_cache

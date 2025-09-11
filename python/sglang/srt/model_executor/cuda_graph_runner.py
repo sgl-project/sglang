@@ -866,6 +866,7 @@ class CudaGraphRunner:
         if self.enable_hip_attention:
             graph_handle = (self.bs, forward_batch.hip_metadata_cached_stages)
         run_bench = os.getenv("HIP_DEBUG_BENCH", "0") == "1" and get_local_rank() == 0
+        run_bench = os.getenv("HIP_DEBUG_BENCH_DECODE", "1") == "1" and run_bench
         if run_bench:
             start = torch.cuda.Event(True)
             end = torch.cuda.Event(True)
