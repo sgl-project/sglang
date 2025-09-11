@@ -33,6 +33,7 @@ class MooncakeStoreConfig:
             raise ValueError(
                 "The environment variable 'SGLANG_HICACHE_MOONCAKE_CONFIG_PATH' is not set."
             )
+        
         try:
             with open(file_path) as fin:
                 config = json.load(fin)
