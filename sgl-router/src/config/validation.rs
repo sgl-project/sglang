@@ -95,33 +95,18 @@ impl ConfigValidator {
                     Self::validate_policy(d_policy)?;
                 }
             }
-            RoutingMode::OpenAI {
-                model, worker_urls, ..
-            } => {
-                // Validate model is provided and not empty
-                let model_str = model
-                    .as_ref()
-                    .ok_or_else(|| ConfigError::ValidationFailed {
-                        reason: "OpenAI model is required".to_string(),
-                    })?;
-                if model_str.trim().is_empty() {
+            RoutingMode::OpenAI { worker_urls } => {
+                // Require exactly one worker URL for OpenAI router
+                if worker_urls.len() != 1 {
                     return Err(ConfigError::ValidationFailed {
-                        reason: "OpenAI model name cannot be empty".to_string(),
+                        reason: "OpenAI mode requires exactly one --worker-urls entry".to_string(),
                     });
                 }
-
-                // Validate at least one worker URL provided and each is a valid URL
-                if worker_urls.is_empty() {
+                // Validate URL format
+                if let Err(e) = url::Url::parse(&worker_urls[0]) {
                     return Err(ConfigError::ValidationFailed {
-                        reason: "OpenAI mode requires at least one --worker-urls entry".to_string(),
+                        reason: format!("Invalid OpenAI worker URL '{}': {}", &worker_urls[0], e),
                     });
-                }
-                for u in worker_urls {
-                    if let Err(e) = url::Url::parse(u) {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: format!("Invalid OpenAI worker URL '{}': {}", u, e),
-                        });
-                    }
                 }
             }
         }

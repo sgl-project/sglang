@@ -378,8 +378,6 @@ impl CliArgs {
         } else if matches!(self.backend, Backend::Openai) {
             // OpenAI backend mode - use worker_urls as base(s)
             RoutingMode::OpenAI {
-                api_key: self.api_key.clone(),
-                model: self.model.clone(),
                 worker_urls: self.worker_urls.clone(),
             }
         } else if self.pd_disaggregation {

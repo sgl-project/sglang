@@ -78,8 +78,6 @@ fn create_minimal_completion_request() -> CompletionRequest {
 #[tokio::test]
 async fn test_openai_router_creation() {
     let router = OpenAIRouter::new(
-        Some("test-key".to_string()),
-        "gpt-3.5-turbo".to_string(),
         "https://api.openai.com".to_string(),
         None,
     )
@@ -96,8 +94,6 @@ async fn test_openai_router_creation() {
 #[tokio::test]
 async fn test_openai_router_health() {
     let router = OpenAIRouter::new(
-        Some("test-key".to_string()),
-        "gpt-3.5-turbo".to_string(),
         "https://api.openai.com".to_string(),
         None,
     )
@@ -118,8 +114,6 @@ async fn test_openai_router_health() {
 #[tokio::test]
 async fn test_openai_router_server_info() {
     let router = OpenAIRouter::new(
-        Some("test-key".to_string()),
-        "gpt-4".to_string(),
         "https://api.openai.com".to_string(),
         None,
     )
@@ -140,16 +134,15 @@ async fn test_openai_router_server_info() {
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
 
     assert!(body_str.contains("openai"));
-    assert!(body_str.contains("gpt-4"));
 }
 
 /// Test models endpoint
 #[tokio::test]
 async fn test_openai_router_models() {
+    // Use mock server for deterministic models response
+    let mock_server = MockOpenAIServer::new().await;
     let router = OpenAIRouter::new(
-        Some("test-key".to_string()),
-        "gpt-3.5-turbo".to_string(),
-        "https://api.openai.com".to_string(),
+        mock_server.base_url(),
         None,
     )
     .await
@@ -170,15 +163,13 @@ async fn test_openai_router_models() {
     let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
 
     assert_eq!(models["object"], "list");
-    assert_eq!(models["data"][0]["id"], "gpt-3.5-turbo");
+    assert!(models["data"].is_array());
 }
 
 /// Test router factory with OpenAI routing mode
 #[tokio::test]
 async fn test_router_factory_openai_mode() {
     let routing_mode = RoutingMode::OpenAI {
-        api_key: Some("test-key".to_string()),
-        model: Some("gpt-4".to_string()),
         worker_urls: vec!["https://api.openai.com".to_string()],
     };
 
@@ -201,8 +192,6 @@ async fn test_router_factory_openai_mode() {
 #[tokio::test]
 async fn test_unsupported_endpoints() {
     let router = OpenAIRouter::new(
-        Some("test-key".to_string()),
-        "gpt-3.5-turbo".to_string(),
         "https://api.openai.com".to_string(),
         None,
     )
@@ -244,8 +233,6 @@ async fn test_openai_router_chat_completion_with_mock() {
 
     // Create router pointing to mock server
     let router = OpenAIRouter::new(
-        Some("test-key".to_string()),
-        "gpt-3.5-turbo".to_string(),
         base_url,
         None,
     )
@@ -287,8 +274,6 @@ async fn test_openai_e2e_with_server() {
 
     // Create router
     let router = OpenAIRouter::new(
-        Some("test-key".to_string()),
-        "gpt-3.5-turbo".to_string(),
         base_url,
         None,
     )
@@ -362,8 +347,6 @@ async fn test_openai_router_circuit_breaker() {
     };
 
     let router = OpenAIRouter::new(
-        Some("test-key".to_string()),
-        "gpt-3.5-turbo".to_string(),
         "http://invalid-url-that-will-fail".to_string(),
         Some(cb_config),
     )

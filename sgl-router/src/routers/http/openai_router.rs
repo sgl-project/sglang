@@ -1,18 +1,16 @@
-//! OpenAI router implementation
+//! OpenAI router implementation (reqwest-based)
 
 use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, UserMessageContent,
-};
-use async_openai::{config::OpenAIConfig, Client};
+use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use std::{
     any::Any,
     sync::atomic::{AtomicBool, Ordering},
@@ -21,11 +19,9 @@ use std::{
 /// Router for OpenAI backend
 #[derive(Debug)]
 pub struct OpenAIRouter {
-    /// OpenAI client for direct API calls
-    openai_client: Client<OpenAIConfig>,
-    /// Model name
-    model: String,
-    /// Base URL for identification
+    /// HTTP client for upstream OpenAI-compatible API
+    client: reqwest::Client,
+    /// Base URL for identification (no trailing slash)
     base_url: String,
     /// Circuit breaker
     circuit_breaker: CircuitBreaker,
@@ -36,27 +32,15 @@ pub struct OpenAIRouter {
 impl OpenAIRouter {
     /// Create a new OpenAI router
     pub async fn new(
-        api_key: Option<String>,
-        model: String,
         base_url: String,
         circuit_breaker_config: Option<CircuitBreakerConfig>,
     ) -> Result<Self, String> {
-        // Configure OpenAI client
-        let final_api_key =
-            api_key.unwrap_or_else(|| std::env::var("OPENAI_API_KEY").unwrap_or_default());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-        if final_api_key.is_empty() {
-            return Err("No OpenAI API key provided. Use --api-key or set OPENAI_API_KEY environment variable.".to_string());
-        }
-
-        // Append /v1 to base URL for async-openai
-        let api_base_url = format!("{}/v1", base_url.trim_end_matches('/'));
-
-        let config = OpenAIConfig::new()
-            .with_api_base(&api_base_url)
-            .with_api_key(final_api_key.clone());
-
-        let openai_client = Client::with_config(config);
+        let base_url = base_url.trim_end_matches('/').to_string();
 
         // Convert circuit breaker config
         let core_cb_config = circuit_breaker_config
@@ -71,8 +55,7 @@ impl OpenAIRouter {
         let circuit_breaker = CircuitBreaker::with_config(core_cb_config);
 
         Ok(Self {
-            openai_client,
-            model,
+            client,
             base_url,
             circuit_breaker,
             healthy: AtomicBool::new(true),
@@ -102,10 +85,33 @@ impl super::super::RouterTrait for OpenAIRouter {
     }
 
     async fn health(&self, _req: Request<Body>) -> Response {
-        if self.healthy.load(Ordering::Acquire) && self.circuit_breaker.can_execute() {
-            (StatusCode::OK, "OK").into_response()
-        } else {
-            (StatusCode::SERVICE_UNAVAILABLE, "Not healthy").into_response()
+        // Simple upstream probe: GET {base}/v1/models without auth
+        let url = format!("{}/v1/models", self.base_url);
+        match self
+            .client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let code = resp.status();
+                // Treat success and auth-required as healthy (endpoint reachable)
+                if code.is_success() || code.as_u16() == 401 || code.as_u16() == 403 {
+                    (StatusCode::OK, "OK").into_response()
+                } else {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Upstream status: {}", code),
+                    )
+                        .into_response()
+                }
+            }
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Upstream error: {}", e),
+            )
+                .into_response(),
         }
     }
 
@@ -117,7 +123,6 @@ impl super::super::RouterTrait for OpenAIRouter {
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         let info = serde_json::json!({
             "router_type": "openai",
-            "model": &self.model,
             "workers": 1,
             "base_url": &self.base_url
         });
@@ -125,26 +130,40 @@ impl super::super::RouterTrait for OpenAIRouter {
     }
 
     async fn get_models(&self, _req: Request<Body>) -> Response {
-        let models = serde_json::json!({
-            "object": "list",
-            "data": [{
-                "id": &self.model,
-                "object": "model",
-                "created": 0,
-                "owned_by": "openai"
-            }]
-        });
-        (StatusCode::OK, models.to_string()).into_response()
+        // Proxy to upstream /v1/models without auth; callers should include Authorization header in request to router
+        match self
+            .client
+            .get(format!("{}/v1/models", self.base_url))
+            .send()
+            .await
+        {
+            Ok(res) => {
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                match res.bytes().await {
+                    Ok(body) => (status, body).into_response(),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to read upstream response: {}", e),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to contact upstream: {}", e),
+            )
+                .into_response(),
+        }
     }
 
     async fn get_model_info(&self, _req: Request<Body>) -> Response {
-        let info = serde_json::json!({
-            "id": &self.model,
-            "object": "model",
-            "created": 0,
-            "owned_by": "openai"
-        });
-        (StatusCode::OK, info.to_string()).into_response()
+        // Not directly supported without model param; return 501
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "get_model_info not implemented for OpenAI router",
+        )
+            .into_response()
     }
 
     async fn route_generate(
@@ -162,76 +181,128 @@ impl super::super::RouterTrait for OpenAIRouter {
 
     async fn route_chat(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
     ) -> Response {
         if !self.circuit_breaker.can_execute() {
             return (StatusCode::SERVICE_UNAVAILABLE, "Circuit breaker open").into_response();
         }
 
-        // Use the model from the request or fall back to router's default model
-        let model_name = if body.model.is_empty() {
-            self.model.as_str()
-        } else {
-            body.model.as_str()
-        };
-
-        // For now, just extract text from the first message
-        // TODO: Properly convert all messages to OpenAI format
-        let user_content = match body.messages.first() {
-            Some(ChatMessage::User {
-                content: UserMessageContent::Text(text),
-                ..
-            }) => text.clone(),
-            Some(ChatMessage::System { content, .. }) => content.clone(),
-            _ => {
+        // Serialize request body, removing SGLang-only fields
+        let mut payload = match serde_json::to_value(body) {
+            Ok(v) => v,
+            Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    "First message must be a text user or system message",
+                    format!("Failed to serialize request: {}", e),
+                )
+                    .into_response();
+            }
+        };
+        if let Some(obj) = payload.as_object_mut() {
+            for key in [
+                "top_k",
+                "min_p",
+                "min_tokens",
+                "regex",
+                "ebnf",
+                "stop_token_ids",
+                "no_stop_trim",
+                "ignore_eos",
+                "continue_final_message",
+                "skip_special_tokens",
+                "lora_path",
+                "session_params",
+                "separate_reasoning",
+                "stream_reasoning",
+                "chat_template_kwargs",
+                "return_hidden_states",
+                "repetition_penalty",
+            ] {
+                obj.remove(key);
+            }
+        }
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let mut req = self.client.post(&url).json(&payload);
+
+        // Forward Authorization header if provided
+        if let Some(h) = headers {
+            if let Some(auth) = h.get("authorization").or_else(|| h.get("Authorization")) {
+                req = req.header("Authorization", auth);
+            }
+        }
+
+        // Accept SSE when stream=true
+        if body.stream {
+            req = req.header("Accept", "text/event-stream");
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                self.circuit_breaker.record_failure();
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to contact upstream: {}", e),
                 )
                     .into_response();
             }
         };
 
-        // Use the content for OpenAI request
-        let user_content_for_openai = user_content;
+        let status = StatusCode::from_u16(resp.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-        // Create a simple user message for OpenAI
-        let openai_messages = vec![async_openai::types::ChatCompletionRequestMessage::User(
-            async_openai::types::ChatCompletionRequestUserMessageArgs::default()
-                .content(user_content_for_openai)
-                .build()
-                .unwrap(),
-        )];
-
-        // Build OpenAI request - start simple and add essential parameters
-        let openai_request = async_openai::types::CreateChatCompletionRequestArgs::default()
-            .model(model_name)
-            .messages(openai_messages)
-            .max_tokens(body.max_tokens.unwrap_or(100)) // Default to 100 if not specified
-            .temperature(body.temperature.unwrap_or(1.0)) // Default to 1.0 if not specified
-            .build();
-
-        match openai_request {
-            Ok(req) => match self.openai_client.chat().create(req).await {
-                Ok(response) => {
+        if !body.stream {
+            // Capture Content-Type before consuming response body
+            let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+            match resp.bytes().await {
+                Ok(body) => {
                     self.circuit_breaker.record_success();
-                    (
-                        StatusCode::OK,
-                        serde_json::to_string(&response).unwrap_or_default(),
-                    )
-                        .into_response()
+                    let mut response = Response::new(axum::body::Body::from(body));
+                    *response.status_mut() = status;
+                    if let Some(ct) = content_type {
+                        response.headers_mut().insert(CONTENT_TYPE, ct);
+                    }
+                    response
                 }
                 Err(e) => {
                     self.circuit_breaker.record_failure();
-                    let error_msg = format!("OpenAI API error: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to read response: {}", e),
+                    )
+                        .into_response()
                 }
-            },
-            Err(e) => {
-                let error_msg = format!("Invalid OpenAI request: {}", e);
-                (StatusCode::BAD_REQUEST, error_msg).into_response()
             }
+        } else {
+            // Stream SSE bytes to client
+            let stream = resp.bytes_stream();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let mut s = stream;
+                while let Some(chunk) = s.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if tx.send(Ok(bytes)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            break;
+                        }
+                    }
+                }
+            });
+            let mut response = Response::new(Body::from_stream(
+                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            ));
+            *response.status_mut() = status;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            response
         }
     }
 

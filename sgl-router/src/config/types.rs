@@ -103,10 +103,6 @@ pub enum RoutingMode {
     },
     #[serde(rename = "openai")]
     OpenAI {
-        /// API key for OpenAI
-        api_key: Option<String>,
-        /// Model name to use
-        model: Option<String>,
         /// OpenAI-compatible API base(s), provided via worker URLs
         worker_urls: Vec<String>,
     },
@@ -125,7 +121,8 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
-            RoutingMode::OpenAI { worker_urls, .. } => worker_urls.len().max(1),
+            // OpenAI mode represents a single upstream
+            RoutingMode::OpenAI { .. } => 1,
         }
     }
 

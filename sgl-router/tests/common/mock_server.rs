@@ -29,7 +29,7 @@ impl MockOpenAIServer {
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_chat_completions))
             .route("/v1/completions", post(mock_completions))
-            .route("/v1/models", post(mock_models));
+            .route("/v1/models", post(mock_models).get(mock_models));
 
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
