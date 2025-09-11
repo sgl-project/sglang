@@ -596,17 +596,6 @@ class ServerArgs:
             self.served_model_name = self.model_path
         if self.device is None:
             self.device = get_device()
-        if self.dist_backend is None:
-            if self.device == "cuda":
-                self.dist_backend = "nccl"
-            elif self.device == "xpu":
-                self.dist_backend = "xccl"
-            elif self.device == "hpu":
-                self.dist_backend = "hccl"
-            elif self.device == "cpu":
-                self.dist_backend = "gloo"
-            elif self.device == "npu":
-                self.dist_backend = "hccl"
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
