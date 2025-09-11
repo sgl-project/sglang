@@ -398,6 +398,9 @@ class ServerArgs:
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
 
+    # Elastic memory
+    enable_elastic_memory: bool = False
+
     def __post_init__(self):
         # Check deprecated arguments
         if self.enable_ep_moe:
@@ -2197,6 +2200,11 @@ class ServerArgs:
             action="store_true",
             help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
         )
+        parser.add_argument(
+            "--enable-elastic-memory",
+            action="store_true",
+            help="Enable elastic memory (kvcached) backend.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -2476,10 +2484,10 @@ class ServerArgs:
             }, "fa3, aiter, or triton is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
-            "Gemma3ForCausalLM",
-            "Gemma3ForConditionalGeneration",
-            "Gemma3nForCausalLM",
-            "Gemma3nForConditionalGeneration",
+            # "Gemma3ForCausalLM",
+            # "Gemma3ForConditionalGeneration",
+            # "Gemma3nForCausalLM",
+            # "Gemma3nForConditionalGeneration",
         ]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
             # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736

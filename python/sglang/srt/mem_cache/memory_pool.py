@@ -441,6 +441,111 @@ class MHATokenToKVPool(KVCache):
         )
 
 
+class ElasticMHATokenToKVPool(MHATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_overlap_schedule: bool = True,
+    ):
+        # Import the interface locally to avoid circular imports
+        from .elastic_mem_interface import (
+            create_elastic_kv_tensors,
+            get_elasticmem_cache_manager,
+            init_elasticmem,
+            is_elasticmem_available,
+            shutdown_elasticmem,
+        )
+
+        if not is_elasticmem_available():
+            raise ImportError(
+                "ElasticMem is not available. Please install kvcached with "
+                "`pip install kvcached --no-build-isolation`"
+            )
+
+        # Call grandparent (KVCache) initializer because we redefine
+        # all member variables.
+        super(MHATokenToKVPool, self).__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.custom_mem_pool = None
+
+        # Initialize elasticmem backend
+        init_elasticmem(async_sched=enable_overlap_schedule)
+
+        # Per-token KV bytes
+        self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
+
+        # Get elastic memory cache manager (SGLang internal naming)
+        self.elasticmem_allocator = get_elasticmem_cache_manager(
+            self.size + self.page_size,
+            self.page_size,
+            self.cell_size,
+            num_layers=layer_num,
+        )
+
+        # Create KV buffers via elasticmem interface
+        self._create_buffers()
+
+        self.layer_transfer_counter = None
+        self.device_module = torch.get_device_module(self.device)
+        self.alt_stream = self.device_module.Stream() if _is_cuda else None
+
+        k_size, v_size = self.get_kv_size_bytes()
+        logger.info(
+            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
+        )
+        self.mem_usage = (k_size + v_size) / GB
+
+    def __del__(self):
+        """Best-effort cleanup when object is destroyed."""
+        try:
+            from .elastic_mem_interface import shutdown_elasticmem
+
+            shutdown_elasticmem()
+        except Exception:
+            pass
+
+    def _create_buffers(self):
+        """Create KV buffers using elasticmem interface."""
+        from .elastic_mem_interface import create_elastic_kv_tensors
+
+        if "cuda" not in self.device:
+            raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
+
+        self.k_buffer, self.v_buffer = create_elastic_kv_tensors(
+            kvcache_shape=(
+                self.size + self.page_size,
+                self.head_num,
+                self.head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device,
+            num_layers=self.layer_num,
+            page_size=self.page_size,
+            attention_type="MHA",
+            kv_layout="NHD",
+        )
+
+
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
 
@@ -463,15 +568,25 @@ class SWAKVPool(KVCache):
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
 
-        self.swa_kv_pool = token_to_kv_pool_class(
+        # Allow overriding pool classes separately for full and swa
+        full_pool_class = kwargs.pop("full_pool_class", token_to_kv_pool_class)
+        swa_pool_class = kwargs.pop("swa_pool_class", token_to_kv_pool_class)
+
+        # Prepare kwargs per pool: full(static) does not take enable_overlap_schedule
+        swa_kwargs = dict(kwargs)
+        full_kwargs = dict(kwargs)
+        # remove elastic-only arg for static full pool
+        full_kwargs.pop("enable_overlap_schedule", None)
+
+        self.swa_kv_pool = swa_pool_class(
             size=size_swa,
             layer_num=self.swa_layer_nums,
-            **kwargs,
+            **swa_kwargs,
         )
-        self.full_kv_pool = token_to_kv_pool_class(
+        self.full_kv_pool = full_pool_class(
             size=size,
             layer_num=self.full_layer_nums,
-            **kwargs,
+            **full_kwargs,
         )
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
