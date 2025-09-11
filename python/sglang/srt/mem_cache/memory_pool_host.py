@@ -16,16 +16,16 @@ _is_xpu = is_xpu()
 if not (_is_npu or _is_xpu):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
+        transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_direct,
         transfer_kv_per_layer,
+        transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_direct_pf_lf,
     )
 
 logger = logging.getLogger(__name__)
@@ -321,7 +321,14 @@ class MHATokenToKVPoolHost(HostKVCache):
         elif self.layout == "page_first":
             dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
         elif self.layout == "page_first_direct":
-            dims = (2, self.page_num, self.layer_num, self.page_size, self.head_num, self.head_dim)
+            dims = (
+                2,
+                self.page_num,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
