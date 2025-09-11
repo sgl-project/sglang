@@ -1,8 +1,8 @@
 import os
 import subprocess
+import time
 import unittest
 import warnings
-import time
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (

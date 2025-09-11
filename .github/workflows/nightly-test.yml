@@ -136,7 +136,7 @@ jobs:
       - name: Publish traces to storage repo
         run: |
           mkdir -p nightly-storage/traces/${{ github.run_id }}
-          cp -v test/srt/performance_profiles_vlms/* nightly-storage/traces/${{ github.run_id }}/ || true
+          cp -v -r test/srt/performance_profiles_vlms/* nightly-storage/traces/${{ github.run_id }}/ || true
           cd nightly-storage
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
