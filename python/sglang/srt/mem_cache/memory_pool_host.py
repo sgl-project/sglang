@@ -502,23 +502,24 @@ class MHATokenToKVPoolHost(HostKVCache):
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
 
-    def get_buffer_with_hash(self, keys, indices=None):
-        assert self.layout == "page_first"
-        assert indices is None or (len(keys) == (len(indices) // self.page_size))
-
-        key_list = []
-        buf_list = []
-
-        for i in range(len(keys)):
-            key = keys[i]
-            key_list.append(f"{key}-k")
-            key_list.append(f"{key}-v")
-            if indices is not None:
-                index = indices[i * self.page_size]
-                buf_list.append(self.k_buffer[index : index + self.page_size])
-                buf_list.append(self.v_buffer[index : index + self.page_size])
-
-        return key_list, buf_list, 2
+    def get_page_buffer_list(self, indices):
+        assert len(indices) % self.page_size == 0
+        page_buffer_list = []
+        if self.layout == "layer_first":
+            for i in range(0, len(indices), self.page_size):
+                index = indices[i]
+                page_buffer_list.append(
+                    self.kv_buffer[:, :, index : index + self.page_size, :, :]
+                )
+        elif self.layout == "page_first":
+            for i in range(0, len(indices), self.page_size):
+                index = indices[i]
+                page_buffer_list.append(
+                    self.kv_buffer[:, index : index + self.page_size, :, :, :]
+                )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        return page_buffer_list
 
 
 class MLATokenToKVPoolHost(HostKVCache):
@@ -733,15 +734,21 @@ class MLATokenToKVPoolHost(HostKVCache):
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
 
-    def get_buffer_with_hash(self, keys, indices=None):
-        assert self.layout == "page_first"
-        assert indices is None or (len(keys) == (len(indices) // self.page_size))
-
-        buf_list = []
-
-        if indices is not None:
-            for i in range(len(keys)):
-                index = indices[i * self.page_size]
-                buf_list.append(self.kv_buffer[index : index + self.page_size])
-
-        return keys, buf_list, 1
+    def get_page_buffer_list(self, indices):
+        assert len(indices) % self.page_size == 0
+        page_buffer_list = []
+        if self.layout == "layer_first":
+            for i in range(0, len(indices), self.page_size):
+                index = indices[i]
+                page_buffer_list.append(
+                    self.kv_buffer[:, index : index + self.page_size, :, :]
+                )
+        elif self.layout == "page_first":
+            for i in range(0, len(indices), self.page_size):
+                index = indices[i]
+                page_buffer_list.append(
+                    self.kv_buffer[index : index + self.page_size, :, :, :]
+                )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        return page_buffer_list
