@@ -407,15 +407,6 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
-        if self.target_worker.model_runner.is_hybrid_gdn:
-            from sglang.srt.speculative.eagle_target_verify_cuda_graph_runner import (
-                MambaStateUpdateCudaGraphRunner,
-            )
-
-            self.cuda_graph_runner_for_target_verify = MambaStateUpdateCudaGraphRunner(
-                self
-            )
-
     @property
     def draft_model_runner(self):
         return self.model_runner
@@ -848,12 +839,9 @@ class EAGLEWorker(TpModelWorker):
                 )
                 + 1
             )
-            if self.cuda_graph_runner_for_target_verify.can_run(accepted_length):
-                self.cuda_graph_runner_for_target_verify.replay(accepted_length)
-            else:
-                self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                    accepted_length, self.target_worker.model_runner.model
-                )
+            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+                accepted_length, self.target_worker.model_runner.model
+            )
 
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
