@@ -309,6 +309,46 @@ async fn test_openai_e2e_with_server() {
     assert!(!response_json["choices"].as_array().unwrap().is_empty());
 }
 
+/// Test streaming chat completions pass-through with mock server
+#[tokio::test]
+async fn test_openai_router_chat_streaming_with_mock() {
+    let mock_server = MockOpenAIServer::new().await;
+    let base_url = mock_server.base_url();
+    let router = OpenAIRouter::new(base_url, None).await.unwrap();
+
+    // Build a streaming chat request
+    let val = json!({
+        "model": "gpt-3.5-turbo",
+        "messages": [
+            {"role": "user", "content": "Hello"}
+        ],
+        "max_tokens": 10,
+        "stream": true
+    });
+    let chat_request: ChatCompletionRequest = serde_json::from_value(val).unwrap();
+
+    let response = router.route_chat(None, &chat_request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Should be SSE
+    let headers = response.headers();
+    let ct = headers
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(ct.contains("text/event-stream"));
+
+    // Read entire stream body and assert chunks + DONE
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("chat.completion.chunk"));
+    assert!(text.contains("[DONE]"));
+}
+
 /// Test circuit breaker functionality
 #[tokio::test]
 async fn test_openai_router_circuit_breaker() {

@@ -6,10 +6,12 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::sse::{Event, KeepAlive},
+    response::{IntoResponse, Response, Sse},
     routing::post,
     Json, Router,
 };
+use futures_util::stream::{self, StreamExt};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -81,31 +83,68 @@ async fn mock_chat_completions(req: Request<Body>) -> Response {
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    // Extract model from request or use default
-    let model = request["model"].as_str().unwrap_or("gpt-3.5-turbo");
+    // Extract model from request or use default (owned String to satisfy 'static in stream)
+    let model: String = request
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gpt-3.5-turbo")
+        .to_string();
 
-    // Create a mock response
-    let response = json!({
-        "id": "chatcmpl-123456789",
-        "object": "chat.completion",
-        "created": 1677652288,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": "Hello! I'm a mock OpenAI assistant. How can I help you today?"
-            },
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": 9,
-            "completion_tokens": 12,
-            "total_tokens": 21
-        }
-    });
+    // If stream requested, return SSE
+    let is_stream = request
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    Json(response).into_response()
+    if is_stream {
+        let created = 1677652288u64;
+        // Single chunk then [DONE]
+        let model_chunk = model.clone();
+        let event_stream = stream::once(async move {
+            let chunk = json!({
+                "id": "chatcmpl-123456789",
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_chunk,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "Hello!"
+                    },
+                    "finish_reason": null
+                }]
+            });
+            Ok::<_, std::convert::Infallible>(Event::default().data(chunk.to_string()))
+        })
+        .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+
+        Sse::new(event_stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        // Create a mock non-streaming response
+        let response = json!({
+            "id": "chatcmpl-123456789",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello! I'm a mock OpenAI assistant. How can I help you today?"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 9,
+                "completion_tokens": 12,
+                "total_tokens": 21
+            }
+        });
+
+        Json(response).into_response()
+    }
 }
 
 /// Mock completions endpoint (legacy)
