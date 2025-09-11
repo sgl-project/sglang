@@ -18,9 +18,7 @@ from sglang.srt.utils import get_int_env_var
 try:
     from mooncake.mooncake_ep_buffer import Buffer
 except ImportError:
-    raise ImportError(
-        "Mooncake EP is not installed. TODO: add message"
-    )
+    raise ImportError("Mooncake EP is not installed. TODO: add message")
 
 from enum import Enum, IntEnum, auto
 
@@ -70,14 +68,8 @@ def get_ep_broken_ranks() -> torch.Tensor:
     return _BROKEN_RANKS
 
 
-class DeepEPDispatchMode(IntEnum):
-    NORMAL = auto()
-    LOW_LATENCY = auto()
-
-
 class EPBuffer:
     _buffer = None
-    _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
@@ -152,7 +144,9 @@ class _MooncakeEPDispatcherImpl:
 
         global _BROKEN_RANKS
         if _BROKEN_RANKS is None:
-            _BROKEN_RANKS = torch.zeros((self.num_experts,), dtype=torch.int32, device="cuda")
+            _BROKEN_RANKS = torch.zeros(
+                (self.num_experts,), dtype=torch.int32, device="cuda"
+            )
         self.broken_ranks = _BROKEN_RANKS
 
         self.handle = None

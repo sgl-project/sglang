@@ -20,7 +20,10 @@ from sglang.srt.layers.moe import (
     get_tbo_token_distribution_threshold,
     is_tbo_enabled,
 )
-from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher, MooncakeEPDispatcher
+from sglang.srt.layers.moe.token_dispatcher import (
+    DeepEPDispatcher,
+    MooncakeEPDispatcher,
+)
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
@@ -361,8 +364,7 @@ class TboDPAttentionPreparer:
     ):
 
         deepep_mode = get_deepep_mode()
-        enable_deepep_moe = get_moe_a2a_backend().is_deepep()
-        enable_mooncake_moe = get_moe_a2a_backend().is_mooncake()
+        enable_a2a_moe = not get_moe_a2a_backend().is_none()
         enable_two_batch_overlap = is_tbo_enabled()
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
@@ -391,7 +393,7 @@ class TboDPAttentionPreparer:
                     local_batch.forward_mode.is_extend()
                     and not local_batch.forward_mode.is_target_verify()
                 )
-                and (enable_deepep_moe or enable_mooncake_moe)
+                and enable_a2a_moe
                 and (resolved_deepep_mode.is_low_latency())
             )
         else:

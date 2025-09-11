@@ -175,7 +175,7 @@ class ServerArgs:
 
     # Runtime options
     device: Optional[str] = None
-    dist_backend: Optional[str] = None
+    dist_backend: Literal[None, "mooncake"] = None
     tp_size: int = 1
     pp_size: int = 1
     max_micro_batch_size: Optional[int] = None
@@ -439,17 +439,6 @@ class ServerArgs:
             self.served_model_name = self.model_path
         if self.device is None:
             self.device = get_device()
-        if self.dist_backend is None:
-            if self.device == "cuda":
-                self.dist_backend = "nccl"
-            elif self.device == "xpu":
-                self.dist_backend = "xccl"
-            elif self.device == "hpu":
-                self.dist_backend = "hccl"
-            elif self.device == "cpu":
-                self.dist_backend = "gloo"
-            elif self.device == "npu":
-                self.dist_backend = "hccl"
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
@@ -673,13 +662,19 @@ class ServerArgs:
                 )
 
         # DeepEP MoE
-        if self.moe_a2a_backend == "deepep" or self.moe_a2a_backend == "mooncake":
+        if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.moe_a2a_backend == "mooncake":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -1128,7 +1123,8 @@ class ServerArgs:
             "--dist-backend",
             type=str,
             default=ServerArgs.dist_backend,
-            help="The distributed backend to use ('nccl', 'xccl', 'hccl', 'hccl', 'gloo', 'mooncake'). Defaults to auto-detection if not specified.",
+            choices=["mooncake"],
+            help="Use 'mooncake' to support fault-tolerant communication. Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--tensor-parallel-size",

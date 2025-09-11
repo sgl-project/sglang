@@ -580,6 +580,18 @@ class ModelRunner:
             )
             raise
 
+        if self.dist_backend is None:
+            if self.device == "cuda":
+                self.dist_backend = "nccl"
+            elif self.device == "xpu":
+                self.dist_backend = "xccl"
+            elif self.device == "hpu":
+                self.dist_backend = "hccl"
+            elif self.device == "cpu":
+                self.dist_backend = "gloo"
+            elif self.device == "npu":
+                self.dist_backend = "hccl"
+
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
@@ -763,7 +775,9 @@ class ModelRunner:
             try:
                 dist.monitored_barrier(
                     group=get_tp_group().cpu_group,
-                    timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                    timeout=datetime.timedelta(
+                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
+                    ),
                     wait_all_ranks=True,
                 )
             except RuntimeError:
