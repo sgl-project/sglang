@@ -169,10 +169,12 @@ class BailingMoESparseMoeBlock(nn.Module):
         layer_id: int,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.alt_stream = alt_stream
         self.tp_size = get_tensor_model_parallel_world_size()
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
@@ -308,6 +310,32 @@ class BailingMoESparseMoeBlock(nn.Module):
             if name not in ["correction_bias"]
         ]
 
+    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+        shared_output = None
+        if self.num_shared_experts > 0:
+            shared_output = self.shared_experts(hidden_states)
+        return shared_output
+
+    def _forward_router_experts(self, hidden_states: torch.Tensor):
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        return self.experts(hidden_states, topk_output)
+
+    def forward_normal_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        shared_output = self._forward_shared_experts(hidden_states)
+
+        with torch.cuda.stream(self.alt_stream):
+            router_output = self._forward_router_experts(hidden_states)
+        current_stream.wait_stream(self.alt_stream)
+
+        return router_output, shared_output
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -315,15 +343,19 @@ class BailingMoESparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if self.num_shared_experts > 0:
-            shared_output = self.shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
 
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
-
-        # final_hidden_states *= self.routed_scaling_factor
+        DUAL_STREAM_TOKEN_THRESHOLD = 1024
+        if (
+            self.alt_stream is not None
+            and num_tokens > 0
+            and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
+        ):
+            final_hidden_states, shared_output = self.forward_normal_dual_stream(
+                hidden_states
+            )
+        else:
+            shared_output = self._forward_shared_experts(hidden_states)
+            final_hidden_states = self._forward_router_experts(hidden_states)
 
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
@@ -573,6 +605,7 @@ class BailingMoEBlock(nn.Module):
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
+                alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix),
             )
         else:
@@ -652,10 +685,10 @@ class BailingMoEModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
     ):
         super().__init__()
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.pp_group = get_pp_group()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -746,9 +779,12 @@ class BailingMoEForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
+
         self.model = BailingMoEModel(
             config,
             quant_config,
+            alt_stream=alt_stream,
             prefix=add_prefix("model", ""),
         )
 
