@@ -14,7 +14,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.dp_attention import is_dp_max_padding
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
@@ -1068,7 +1068,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = topk_output
-            with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
                 symm_output = torch.empty_like(x)
             output = cutlass_fused_experts_fp8(
                 x,
@@ -1150,7 +1152,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else topk_config.correction_bias.to(x.dtype)
         )
 
-        with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
             return trtllm_fp8_block_scale_moe(
                 routing_logits=router_logits.to(torch.float32),
                 routing_bias=correction_bias,

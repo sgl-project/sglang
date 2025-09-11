@@ -1,4 +1,5 @@
 import tempfile
+from contextlib import nullcontext
 
 import torch
 from packaging import version
@@ -76,33 +77,18 @@ def get_nccl_mem_pool():
     return _mem_pool
 
 
-class use_symmetric_memory:
+class SymmetricMemoryContext:
     def __init__(
         self,
         group_coordinator: GroupCoordinator,
-        disabled: bool = False,
     ):
-        self.disabled = (
-            disabled
-            or not is_symmetric_memory_enabled()
-            or group_coordinator.world_size == 1
-        )
-        if self.disabled:
-            self.group_coordinator = None
-            self._mem_pool_ctx = None
-            self.is_graph_capture = None
-            self.device = None
-            self.pre_2_8_0 = None
-        else:
-            self.group_coordinator = group_coordinator
-            self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
-            self.is_graph_capture = torch.cuda.is_current_stream_capturing()
-            self.device = torch.cuda.current_device()
-            self.pre_2_8_0 = version.parse(torch.__version__) < version.parse("2.8.0")
+        self.group_coordinator = group_coordinator
+        self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
+        self.is_graph_capture = torch.cuda.is_current_stream_capturing()
+        self.device = torch.cuda.current_device()
+        self.pre_2_8_0 = version.parse(torch.__version__) < version.parse("2.8.0")
 
     def __enter__(self):
-        if self.disabled:
-            return self
         assert (
             self.group_coordinator.pynccl_comm is not None
         ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.group_name}'"
@@ -124,8 +110,6 @@ class use_symmetric_memory:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.disabled:
-            return
         global _cached_pool_snapshot
         global _registered_base_addrs
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
@@ -150,3 +134,12 @@ class use_symmetric_memory:
                 torch._C._cuda_beginAllocateCurrentThreadToPool(
                     self.device, _graph_pool_id
                 )
+
+
+def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
+    disabled = (
+        disabled
+        or not is_symmetric_memory_enabled()
+        or group_coordinator.world_size == 1
+    )
+    return SymmetricMemoryContext(group_coordinator) if not disabled else nullcontext()
