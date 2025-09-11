@@ -41,9 +41,8 @@ using MmaType = cutlass::float_e4m3_t;     // FP8 e4m3 type
 using QuantType = cutlass::int4b_t;        // 4-bit integer type
 using ElementAccumulator = float;          // Accumulator type
 using ElementScale = cutlass::bfloat16_t;  // Scale type
-using ElementScalePacked = cutlass::Array<ElementScale, 4>;
-using ElementC = cutlass::half_t;  // Default output type (FP16)
-using ElementD = ElementC;         // Default output type (FP16)
+using ElementC = cutlass::bfloat16_t;      // Output type
+using ElementD = ElementC;                 // Output type
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
 // Architecture-specific configurations
@@ -73,6 +72,10 @@ static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
 template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule>
 struct cutlass_3x_w4a8_group_gemm {
+  static constexpr int GroupSize = 128;
+  static constexpr int PackedScalesNum = get<2>(TileShape{}) / GroupSize;
+  using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
+
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
       OperatorClass,
@@ -184,8 +187,6 @@ void cutlass_w4a8_group_gemm_caller(
   TORCH_CHECK(b_tensors.size(0) == num_experts, "B tensor first dimension must match number of groups");
   TORCH_CHECK(b_scales.size(0) == num_experts, "Scale tensor first dimension must match number of groups");
   TORCH_CHECK(b_tensors.size(2) * 2 == a_tensors.size(1), "B tensor K/2 dimension must match A tensor K dimension");
-  TORCH_CHECK(b_scales.size(1) == a_tensors.size(1) / 512, "Scale tensor second dimension must be K//512");
-  TORCH_CHECK(b_scales.size(2) == 4 * b_tensors.size(1), "Scale tensor last dimension must be 4*N");
 
   // Check tensor types
   TORCH_CHECK(a_tensors.scalar_type() == torch::kFloat8_e4m3fn, "A tensor must be fp8 (float_e4m3_t) type");
@@ -208,7 +209,7 @@ void cutlass_w4a8_group_gemm_caller(
 
   Args arguments;
   decltype(arguments.epilogue.thread) fusion_args;
-  fusion_args.alpha = 1.0f;
+  fusion_args.alpha = 0;
   fusion_args.beta = 0;
   fusion_args.alpha_ptr = a_scales.data_ptr<float>();
   ;
@@ -241,7 +242,7 @@ void cutlass_w4a8_group_gemm_caller(
        static_cast<typename Gemm::StrideB*>(b_strides.data_ptr()),
        static_cast<const MmaType**>(a_ptrs.data_ptr()),
        static_cast<typename Gemm::StrideA*>(a_strides.data_ptr()),
-       static_cast<const ElementScalePacked**>(b_scales_ptrs.data_ptr()),
+       static_cast<const typename Gemm::ElementScalePacked**>(b_scales_ptrs.data_ptr()),
        static_cast<typename Gemm::StrideS*>(s_strides.data_ptr()),
        static_cast<int>(chunk_size)},
       {fusion_args,

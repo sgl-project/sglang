@@ -113,12 +113,13 @@ class Qwen2_5_VisionBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         num_dummy_heads: int = 0,
+        rms_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm1 = RMSNorm(dim, eps=1e-6)
-        self.norm2 = RMSNorm(dim, eps=1e-6)
+        self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
+        self.norm2 = RMSNorm(dim, eps=rms_norm_eps)
 
         if attn_implementation is None:
             softmax_in_single_precision = False
@@ -517,6 +518,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -587,9 +591,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             positions=positions,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -642,6 +650,22 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        self.model.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = [Qwen2_5_VLForConditionalGeneration]

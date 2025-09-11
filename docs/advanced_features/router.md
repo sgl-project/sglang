@@ -278,7 +278,7 @@ The most sophisticated policy that combines cache optimization with load balanci
 
 3. **Cache Management**:
    - Maintains approximate radix trees per worker
-   - Periodically evicts LRU entries based on `--eviction-interval` and `--max-tree-size`
+   - Periodically evicts LRU entries based on `--eviction-interval-secs` and `--max-tree-size`
 
 ### Data Parallelism Aware Routing
 
@@ -296,7 +296,7 @@ This mode coordinates with SGLang's DP controller for optimized request distribu
 ### Core Settings
 
 | Parameter                   | Type | Default     | Description                                                     |
-|-----------------------------|------|-------------|-----------------------------------------------------------------|
+| --------------------------- | ---- | ----------- | --------------------------------------------------------------- |
 | `--host`                    | str  | 127.0.0.1   | Router server host address                                      |
 | `--port`                    | int  | 30000       | Router server port                                              |
 | `--worker-urls`             | list | []          | Worker URLs for separate launch mode                            |
@@ -307,18 +307,18 @@ This mode coordinates with SGLang's DP controller for optimized request distribu
 
 ### Cache-Aware Routing Parameters
 
-| Parameter                 | Type  | Default  | Description                                            |
-|---------------------------|-------|----------|--------------------------------------------------------|
-| `--cache-threshold`       | float | 0.5      | Minimum prefix match ratio for cache routing (0.0-1.0) |
-| `--balance-abs-threshold` | int   | 32       | Absolute load difference threshold                     |
-| `--balance-rel-threshold` | float | 1.0001   | Relative load ratio threshold                          |
-| `--eviction-interval`     | int   | 60       | Seconds between cache eviction cycles                  |
-| `--max-tree-size`         | int   | 16777216 | Maximum nodes in routing tree                          |
+| Parameter                  | Type  | Default  | Description                                            |
+| -------------------------- | ----- | -------- | ------------------------------------------------------ |
+| `--cache-threshold`        | float | 0.5      | Minimum prefix match ratio for cache routing (0.0-1.0) |
+| `--balance-abs-threshold`  | int   | 32       | Absolute load difference threshold                     |
+| `--balance-rel-threshold`  | float | 1.0001   | Relative load ratio threshold                          |
+| `--eviction-interval-secs` | int   | 60       | Seconds between cache eviction cycles                  |
+| `--max-tree-size`          | int   | 16777216 | Maximum nodes in routing tree                          |
 
 ### Fault Tolerance Parameters
 
 | Parameter                    | Type  | Default | Description                           |
-|------------------------------|-------|---------|---------------------------------------|
+| ---------------------------- | ----- | ------- | ------------------------------------- |
 | `--retry-max-retries`        | int   | 3       | Maximum retry attempts per request    |
 | `--retry-initial-backoff-ms` | int   | 100     | Initial retry backoff in milliseconds |
 | `--retry-max-backoff-ms`     | int   | 10000   | Maximum retry backoff in milliseconds |
@@ -334,7 +334,7 @@ This mode coordinates with SGLang's DP controller for optimized request distribu
 ### Prefill-Decode Disaggregation Parameters
 
 | Parameter                         | Type | Default | Description                                           |
-|-----------------------------------|------|---------|-------------------------------------------------------|
+| --------------------------------- | ---- | ------- | ----------------------------------------------------- |
 | `--pd-disaggregation`             | flag | False   | Enable PD disaggregated mode                          |
 | `--prefill`                       | list | []      | Prefill server URLs with optional bootstrap ports     |
 | `--decode`                        | list | []      | Decode server URLs                                    |
@@ -346,7 +346,7 @@ This mode coordinates with SGLang's DP controller for optimized request distribu
 ### Kubernetes Integration
 
 | Parameter                       | Type | Default                  | Description                                          |
-|---------------------------------|------|--------------------------|------------------------------------------------------|
+| ------------------------------- | ---- | ------------------------ | ---------------------------------------------------- |
 | `--service-discovery`           | flag | False                    | Enable Kubernetes service discovery                  |
 | `--selector`                    | list | []                       | Label selector for workers (key1=value1 key2=value2) |
 | `--prefill-selector`            | list | []                       | Label selector for prefill servers in PD mode        |
@@ -358,7 +358,7 @@ This mode coordinates with SGLang's DP controller for optimized request distribu
 ### Observability
 
 | Parameter              | Type | Default   | Description                                           |
-|------------------------|------|-----------|-------------------------------------------------------|
+| ---------------------- | ---- | --------- | ----------------------------------------------------- |
 | `--prometheus-port`    | int  | 29000     | Prometheus metrics port                               |
 | `--prometheus-host`    | str  | 127.0.0.1 | Prometheus metrics host                               |
 | `--log-dir`            | str  | None      | Directory for log files                               |
@@ -368,7 +368,7 @@ This mode coordinates with SGLang's DP controller for optimized request distribu
 ### CORS Configuration
 
 | Parameter                | Type | Default | Description          |
-|--------------------------|------|---------|----------------------|
+| ------------------------ | ---- | ------- | -------------------- |
 | `--cors-allowed-origins` | list | []      | Allowed CORS origins |
 
 ## Advanced Features
@@ -429,7 +429,7 @@ python -m sglang_router.launch_router \
 
 2. **High latency**: Check if cache-aware routing is causing imbalance. Try adjusting `--balance-abs-threshold` and `--balance-rel-threshold`.
 
-3. **Memory growth**: Reduce `--max-tree-size` or decrease `--eviction-interval` for more aggressive cache cleanup.
+3. **Memory growth**: Reduce `--max-tree-size` or decrease `--eviction-interval-secs` for more aggressive cache cleanup.
 
 4. **Circuit breaker triggering frequently**: Increase `--cb-failure-threshold` or extend `--cb-window-duration-secs`.
 
