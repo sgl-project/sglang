@@ -193,17 +193,6 @@ pub enum WorkerType {
     },
     /// Decode worker for PD disaggregated mode
     Decode,
-    /// OpenAI-compatible API backend worker
-    OpenAI {
-        /// API key for authentication (optional for local services)
-        api_key: Option<String>,
-        /// Base URL for the API (e.g., https://api.openai.com, http://localhost:8000)
-        base_url: String,
-        /// Model name to use (e.g., gpt-4, gpt-3.5-turbo, llama-2-7b)
-        model: String,
-        /// Optional organization ID (for OpenAI)
-        organization_id: Option<String>,
-    },
 }
 
 impl fmt::Display for WorkerType {
@@ -215,15 +204,6 @@ impl fmt::Display for WorkerType {
                 None => write!(f, "Prefill"),
             },
             WorkerType::Decode => write!(f, "Decode"),
-            WorkerType::OpenAI {
-                model,
-                base_url,
-                organization_id,
-                ..
-            } => match organization_id {
-                Some(org) => write!(f, "OpenAI(model:{}, org:{}, url:{})", model, org, base_url),
-                None => write!(f, "OpenAI(model:{}, url:{})", model, base_url),
-            },
         }
     }
 }
@@ -1080,28 +1060,6 @@ mod tests {
         );
         assert_eq!(WorkerType::Decode.to_string(), "Decode");
 
-        // Test OpenAI WorkerType
-        let openai_with_org = WorkerType::OpenAI {
-            api_key: Some("sk-test123".to_string()),
-            base_url: "https://api.openai.com".to_string(),
-            model: "gpt-4".to_string(),
-            organization_id: Some("org-123".to_string()),
-        };
-        assert_eq!(
-            openai_with_org.to_string(),
-            "OpenAI(model:gpt-4, org:org-123, url:https://api.openai.com)"
-        );
-
-        let openai_without_org = WorkerType::OpenAI {
-            api_key: Some("sk-test123".to_string()),
-            base_url: "https://api.openai.com".to_string(),
-            model: "gpt-3.5-turbo".to_string(),
-            organization_id: None,
-        };
-        assert_eq!(
-            openai_without_org.to_string(),
-            "OpenAI(model:gpt-3.5-turbo, url:https://api.openai.com)"
-        );
     }
 
     #[test]
@@ -1125,29 +1083,6 @@ mod tests {
             }
         );
 
-        // Test OpenAI WorkerType equality
-        let openai1 = WorkerType::OpenAI {
-            api_key: Some("sk-test123".to_string()),
-            base_url: "https://api.openai.com".to_string(),
-            model: "gpt-4".to_string(),
-            organization_id: Some("org-123".to_string()),
-        };
-        let openai2 = WorkerType::OpenAI {
-            api_key: Some("sk-test123".to_string()),
-            base_url: "https://api.openai.com".to_string(),
-            model: "gpt-4".to_string(),
-            organization_id: Some("org-123".to_string()),
-        };
-        let openai3 = WorkerType::OpenAI {
-            api_key: Some("sk-different".to_string()),
-            base_url: "https://api.openai.com".to_string(),
-            model: "gpt-4".to_string(),
-            organization_id: Some("org-123".to_string()),
-        };
-
-        assert_eq!(openai1, openai2);
-        assert_ne!(openai1, openai3);
-        assert_ne!(openai1, WorkerType::Regular);
     }
 
     #[test]
@@ -1158,15 +1093,6 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(original, cloned);
 
-        // Test OpenAI WorkerType clone
-        let openai_original = WorkerType::OpenAI {
-            api_key: Some("sk-test123".to_string()),
-            base_url: "https://api.openai.com".to_string(),
-            model: "gpt-4".to_string(),
-            organization_id: Some("org-123".to_string()),
-        };
-        let openai_cloned = openai_original.clone();
-        assert_eq!(openai_original, openai_cloned);
     }
 
     // Test HealthConfig
