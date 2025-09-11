@@ -2,6 +2,7 @@ import os
 import subprocess
 import unittest
 import warnings
+import time
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -73,44 +74,53 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                 try:
                     # Run bench_one_batch_server against the launched server
                     os.makedirs(PROFILE_DIR, exist_ok=True)
-                    profile_filename = model.replace("/", "_")
-                    command = [
-                        "python3",
-                        "-m",
-                        "sglang.bench_one_batch_server",
-                        f"--model={model}",
-                        "--base-url",
-                        self.base_url,
-                        "--batch-size",
-                        *[str(x) for x in self.batch_sizes],
-                        "--input-len",
-                        *[str(x) for x in self.input_lens],
-                        "--output-len",
-                        *[str(x) for x in self.output_lens],
-                        "--dataset-name=mmmu",
-                        "--show-report",
-                        "--profile",
-                        "--profile-by-stage",
-                        "--profile-filename-prefix",
-                        f"{PROFILE_DIR}/{profile_filename}",
-                    ]
+                    for batch_size in self.batch_sizes:
+                        profile_filename = f"{model.replace('/', '_')}_bs{batch_size}_{int(time.time())}"
+                        profile_path_prefix = os.path.join(
+                            PROFILE_DIR, profile_filename
+                        )
 
-                    print(f"Running command: {' '.join(command)}")
-                    result = subprocess.run(command, capture_output=True, text=True)
+                        command = [
+                            "python3",
+                            "-m",
+                            "sglang.bench_one_batch_server",
+                            f"--model={model}",
+                            "--base-url",
+                            self.base_url,
+                            "--batch-size",
+                            str(batch_size),
+                            "--input-len",
+                            *[str(x) for x in self.input_lens],
+                            "--output-len",
+                            *[str(x) for x in self.output_lens],
+                            "--dataset-name=mmmu",
+                            "--show-report",
+                            "--profile",
+                            "--profile-by-stage",
+                            "--profile-filename-prefix",
+                            profile_path_prefix,
+                        ]
 
-                    if result.returncode != 0:
-                        print(f"Error running benchmark for {model}:")
-                        print(result.stderr)
-                        continue
+                        print(f"Running command: {' '.join(command)}")
+                        result = subprocess.run(command, capture_output=True, text=True)
 
-                    print(f"Output for {model}:")
-                    print(result.stdout)
-                    model_results.append(
-                        {
-                            "output": result.stdout,
-                            "profile_filename": f"{profile_filename}.json",
-                        }
-                    )
+                        if result.returncode != 0:
+                            print(
+                                f"Error running benchmark for {model} with batch size {batch_size}:"
+                            )
+                            print(result.stderr)
+                            # Continue to next batch size even if one fails
+                            continue
+
+                        print(f"Output for {model} with batch size {batch_size}:")
+                        print(result.stdout)
+
+                        model_results.append(
+                            {
+                                "output": result.stdout,
+                                "profile_filename": f"{profile_filename}.json",
+                            }
+                        )
 
                 finally:
                     kill_process_tree(process.pid)

@@ -45,59 +45,34 @@ jobs:
 
       - name: Run performance test for text models
         timeout-minutes: 180
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/mickqian/SGLang-test-nightly/main/traces/${{ github.run_id }}
         run: |
           rm -rf test/srt/performance_profiles_text_models/
           cd test/srt
           python3 test_nightly_text_models_perf.py
 
-      - name: Upload profile traces' artifacts
-        id: upload_profiles
-        uses: actions/upload-artifact@v4
+      - name: Checkout storage repo (SGLang-test-nightly)
+        uses: actions/checkout@v4
         with:
-          name: performance-profiles-${{ github.run_id }}
-          path: test/srt/performance_profiles_text_models/
+          repository: mickqian/SGLang-test-nightly
+          token: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
+          path: nightly-storage
 
-      - name: Resolve artifact URL for performance profiles
-        id: resolve_artifact_url
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          ARTIFACT_NAME: performance-profiles-${{ github.run_id }}
+      - name: Publish traces to storage repo
         run: |
-          python3 - <<'PY'
-          import json, os, urllib.request, datetime
-          token = os.environ['GITHUB_TOKEN']
-          repo = os.environ['REPO']
-          run_id = os.environ['RUN_ID']
-          target_name = os.environ['ARTIFACT_NAME']
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts",
-              headers={
-                  "Authorization": f"Bearer {token}",
-                  "Accept": "application/vnd.github+json",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              },
-          )
-          with urllib.request.urlopen(req) as resp:
-              data = json.loads(resp.read().decode())
-          # Filter by exact name and non-expired
-          cand = [a for a in data.get('artifacts', []) if a.get('name') == target_name and not a.get('expired')]
-          print(f"{cand=}")
-          # Pick the latest by updated_at
-          def parse_dt(s):
-              try:
-                  return datetime.datetime.fromisoformat(s.replace('Z','+00:00'))
-              except Exception:
-                  return datetime.datetime.min
-          cand.sort(key=lambda a: parse_dt(a.get('updated_at') or a.get('created_at') or ''), reverse=True)
-          url = cand[0]['archive_download_url'] if cand else ''
-          out = os.environ.get("GITHUB_OUTPUT")
-          if out:
-              with open(out, 'a') as f:
-                  f.write(f"url={url}\n")
-          print(f"Resolved artifact url: {url}")
-          PY
+          mkdir -p nightly-storage/traces/${{ github.run_id }}
+          cp -v test/srt/performance_profiles_text_models/*.json nightly-storage/traces/${{ github.run_id }}/ || true
+          cd nightly-storage
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .
+            git commit -m "Nightly traces for run ${{ github.run_id }} at ${{ github.run_number }}"
+            git push origin HEAD:main
+          else
+            echo "No changes to commit"
+          fi
 
   nightly-test-eval-vlm-models:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -116,10 +91,7 @@ jobs:
           cd test/srt
           python3 test_nightly_vlm_mmmu_eval.py
 
-      - name: Print full performance table with artifact link
-        if: steps.resolve_artifact_url.outputs.url != ''
-        env:
-          ARTIFACT_URL: ${{ steps.resolve_artifact_url.outputs.url }}
+      - name: Print performance table if exists
         run: |
           python3 - <<'PY'
           import os
@@ -128,9 +100,6 @@ jobs:
               print('Report not found, skip printing')
               raise SystemExit(0)
           s = open(p, 'r').read()
-          s = s.replace('<<ARTIFACT_URL>>', os.environ['ARTIFACT_URL'])
-          # overwrite file for record
-          open(p, 'w').write(s)
           # append to GitHub summary
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
               f.write('\n')
@@ -150,6 +119,46 @@ jobs:
 
       - name: Run perf test for VLM models (MMMU-100)
         timeout-minutes: 240
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/mickqian/SGLang-test-nightly/main/traces/${{ github.run_id }}
         run: |
+          rm -rf test/srt/performance_profiles_vlms/
           cd test/srt
           python3 test_nightly_vlm_models_perf.py
+
+      - name: Checkout storage repo (SGLang-test-nightly)
+        uses: actions/checkout@v4
+        with:
+          repository: mickqian/SGLang-test-nightly
+          token: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
+          path: nightly-storage
+
+      - name: Publish traces to storage repo
+        run: |
+          mkdir -p nightly-storage/traces/${{ github.run_id }}
+          cp -v test/srt/performance_profiles_vlms/*.json nightly-storage/traces/${{ github.run_id }}/ || true
+          cd nightly-storage
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .
+            git commit -m "Nightly VLM traces for run ${{ github.run_id }} at ${{ github.run_number }}"
+            git push origin HEAD:main
+          else
+            echo "No changes to commit"
+          fi
+
+      - name: Print VLM performance table if exists
+        run: |
+          python3 - <<'PY'
+          import os
+          p = 'test/srt/vlm_performance_report.md'
+          if not os.path.exists(p):
+              print('VLM Report not found, skip printing')
+              raise SystemExit(0)
+          s = open(p, 'r').read()
+          # append to GitHub summary
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('\n')
+              f.write(s)
+          PY

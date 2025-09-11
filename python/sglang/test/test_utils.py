@@ -1476,6 +1476,8 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
     summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profiled trace |\n"
     summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
 
+    base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
+
     for result in results:
         # Extract the metrics row that bench_one_batch_server prints (without the profile column)
         m = re.search(
@@ -1485,8 +1487,12 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
         if m:
             # Reconstruct the row and append a placeholder artifact link for profile
             parts = [part.strip() for part in m.group(0).split("|") if part.strip()]
-            PROFILE_URL_PLACEHOLDER = "PROFILE_URL_PLACEHOLDER"
-            row = f"| {' | '.join(parts)} | [trace]({PROFILE_URL_PLACEHOLDER}) |\n"
+            filename = result.get("profile_filename")
+            if base_url and filename:
+                link = f"{base_url}/{filename}"
+                row = f"| {' | '.join(parts)} | [trace]({link}) |\n"
+            else:
+                row = f"| {' | '.join(parts)} | [trace](#) |\n"
             summary += row
     return summary
 
