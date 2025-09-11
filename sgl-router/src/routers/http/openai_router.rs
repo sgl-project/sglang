@@ -334,16 +334,19 @@ impl super::super::RouterTrait for OpenAIRouter {
     }
 
     async fn flush_cache(&self) -> Response {
-        (StatusCode::OK, "Cache flushed").into_response()
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "flush_cache not supported for OpenAI router",
+        )
+            .into_response()
     }
 
     async fn get_worker_loads(&self) -> Response {
-        let loads = serde_json::json!({
-            "loads": {
-                "openai": 0
-            }
-        });
-        (StatusCode::OK, loads.to_string()).into_response()
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "get_worker_loads not supported for OpenAI router",
+        )
+            .into_response()
     }
 
     fn router_type(&self) -> &'static str {
