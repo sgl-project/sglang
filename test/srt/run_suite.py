@@ -147,6 +147,10 @@ suites = {
         # add more here
         TestFile("test_gpt_oss_4gpu.py", 600),
     ],
+    "per-commit-4-gpu-gb200": [
+        # add more here
+        TestFile("test_gpt_oss_4gpu.py", 600), # temporarily use this to test CI
+    ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
     ],
