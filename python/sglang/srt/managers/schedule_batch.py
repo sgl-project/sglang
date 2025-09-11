@@ -108,6 +108,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "quantization",
     "enable_custom_logit_processor",
     "disaggregation_mode",
+    "moe_shared_expert_rank_num",
 ]
 
 # Put some global args for easy access
