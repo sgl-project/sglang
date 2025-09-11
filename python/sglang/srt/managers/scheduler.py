@@ -135,6 +135,10 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
+from sglang.srt.mem_cache.base_prefix_cache import (
+    PrefixCacheBackend,
+    get_prefix_cache_backend,
+)
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.lora_radix_cache import LoRARadixCache
@@ -585,112 +589,112 @@ class Scheduler(
 
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
+        prefix_cache_backend: PrefixCacheBackend = get_prefix_cache_backend(
+            server_args.prefix_cache_backend
+        )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
 
-        if (
-            server_args.chunked_prefill_size is not None
-            and server_args.disable_radix_cache
-        ):
-            if self.is_hybrid:
-                ChunkCacheClass = SWAChunkCache
-            else:
-                ChunkCacheClass = ChunkCache
+        if prefix_cache_backend in [
+            PrefixCacheBackend.chunk,
+            PrefixCacheBackend.swa_chunk,
+        ]:
+            ChunkCacheClass = SWAChunkCache if self.is_hybrid else ChunkCache
             self.tree_cache = ChunkCacheClass(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
             )
+        elif prefix_cache_backend in [
+            PrefixCacheBackend.radix_cpp,
+            PrefixCacheBackend.hierarchical_cpp,
+        ]:
+            from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
+
+            self.tree_cache = RadixCacheCpp(
+                disable=False,
+                use_hicache=prefix_cache_backend == PrefixCacheBackend.hierarchical_cpp,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool_allocator,
+                tp_cache_group=self.tp_cpu_group,
+                page_size=self.page_size,
+                hicache_ratio=server_args.hicache_ratio,
+                hicache_size=server_args.hicache_size,
+                hicache_write_policy=server_args.hicache_write_policy,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+            )
+        elif prefix_cache_backend == PrefixCacheBackend.hierarchical:
+            self.tree_cache = HiRadixCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_cache_group=(
+                    self.attn_tp_cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_cpu_group
+                ),
+                page_size=self.page_size,
+                hicache_ratio=server_args.hicache_ratio,
+                hicache_size=server_args.hicache_size,
+                hicache_write_policy=server_args.hicache_write_policy,
+                hicache_io_backend=server_args.hicache_io_backend,
+                hicache_mem_layout=server_args.hicache_mem_layout,
+                enable_metrics=self.enable_metrics,
+                hicache_storage_backend=server_args.hicache_storage_backend,
+                hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
+            )
+            self.tp_worker.register_hicache_layer_transfer_counter(
+                self.tree_cache.cache_controller.layer_done_counter
+            )
+        elif self.is_hybrid:
+            assert (
+                self.server_args.disaggregation_mode == "null"
+            ), "Hybrid mode does not support disaggregation yet"
+            self.tree_cache = SWARadixCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                sliding_window_size=self.sliding_window_size,
+                page_size=self.page_size,
+                disable=prefix_cache_backend == PrefixCacheBackend.none,
+            )
+        elif self.enable_lora:
+            self.tree_cache = LoRARadixCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
+                disable=prefix_cache_backend == PrefixCacheBackend.none,
+            )
+        elif prefix_cache_backend == PrefixCacheBackend.lmcache:
+            from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
+                LMCRadixCache,
+            )
+
+            self.tree_cache = LMCRadixCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
+                disable=False,
+                model_config=self.model_config,
+                tp_size=self.tp_size,
+                rank=self.tp_rank,
+                tp_group=self.tp_group,
+            )
+        elif prefix_cache_backend in [
+            PrefixCacheBackend.radix,
+            PrefixCacheBackend.none,
+        ]:
+            self.tree_cache = RadixCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
+                disable=prefix_cache_backend == PrefixCacheBackend.none,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+            )
         else:
-            if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
-                # lazy import to avoid JIT overhead
-                from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
-
-                self.tree_cache = RadixCacheCpp(
-                    disable=False,
-                    use_hicache=self.enable_hierarchical_cache,
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool=self.token_to_kv_pool_allocator,
-                    tp_cache_group=self.tp_cpu_group,
-                    page_size=self.page_size,
-                    hicache_ratio=server_args.hicache_ratio,
-                    hicache_size=server_args.hicache_size,
-                    hicache_write_policy=server_args.hicache_write_policy,
-                    enable_kv_cache_events=self.enable_kv_cache_events,
-                )
-            elif self.enable_hierarchical_cache:
-                self.tree_cache = HiRadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=(
-                        self.attn_tp_cpu_group
-                        if self.server_args.enable_dp_attention
-                        else self.tp_cpu_group
-                    ),
-                    page_size=self.page_size,
-                    hicache_ratio=server_args.hicache_ratio,
-                    hicache_size=server_args.hicache_size,
-                    hicache_write_policy=server_args.hicache_write_policy,
-                    hicache_io_backend=server_args.hicache_io_backend,
-                    hicache_mem_layout=server_args.hicache_mem_layout,
-                    enable_metrics=self.enable_metrics,
-                    hicache_storage_backend=server_args.hicache_storage_backend,
-                    hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
-                    model_name=server_args.served_model_name,
-                    storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
-                )
-                self.tp_worker.register_hicache_layer_transfer_counter(
-                    self.tree_cache.cache_controller.layer_done_counter
-                )
-            elif self.is_hybrid:
-                assert (
-                    self.server_args.disaggregation_mode == "null"
-                ), "Hybrid mode does not support disaggregation yet"
-                self.tree_cache = SWARadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    sliding_window_size=self.sliding_window_size,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                )
-            elif self.enable_lora:
-                assert (
-                    not self.enable_hierarchical_cache
-                ), "LoRA radix cache doesn't support hierarchical cache"
-                assert (
-                    self.schedule_policy == "fcfs"
-                ), "LoRA radix cache only supports FCFS policy"
-                self.tree_cache = LoRARadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                )
-            elif server_args.enable_lmcache:
-                from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-                    LMCRadixCache,
-                )
-
-                self.tree_cache = LMCRadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                    model_config=self.model_config,
-                    tp_size=self.tp_size,
-                    rank=self.tp_rank,
-                    tp_group=self.tp_group,
-                )
-            else:
-                self.tree_cache = RadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                    enable_kv_cache_events=self.enable_kv_cache_events,
-                )
+            raise ValueError(f"Unknown prefix cache backend: {prefix_cache_backend}")
 
         self.decode_mem_cache_buf_multiplier = (
             1

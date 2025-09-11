@@ -327,6 +327,18 @@ class ServerArgs:
     offload_mode: str = "cpu"
 
     # Optimization/debug options
+    prefix_cache_backend: Literal[
+        "radix",
+        "radix_cpp",
+        "chunk",
+        "hierarchical",
+        "hierarchical_cpp",
+        "lora",
+        "lmcache",
+        "swa_radix",
+        "swa_chunk",
+        "none",
+    ] = "radix"
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
@@ -436,6 +448,34 @@ class ServerArgs:
                 "NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead."
             )
 
+        if (
+            self.disable_radix_cache
+            or self.enable_hierarchical_cache
+            or self.enable_lmcache
+        ):
+            if self.disable_radix_cache:
+                print_deprecated_warning(
+                    "NOTE: --disable-radix-cache is deprecated. Please use --prefix-cache-backend instead."
+                )
+                self.prefix_cache_backend = "none"
+            if self.enable_hierarchical_cache:
+                print_deprecated_warning(
+                    "NOTE: --enable-hierarchical-cache is deprecated. Please use --prefix-cache-backend instead."
+                )
+                assert self.disable_radix_cache is False, (
+                    "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
+                    "and cannot be used at the same time. Please use only one of them."
+                )
+                self.prefix_cache_backend = "hierarchical"
+            if self.enable_lmcache:
+                print_deprecated_warning(
+                    "NOTE: --enable-lmcache is deprecated. Please use --prefix-cache-backend instead."
+                )
+                assert self.disable_radix_cache is False, (
+                    "The arguments enable-lmcache and disable-radix-cache are mutually exclusive "
+                    "and cannot be used at the same time. Please use only one of them."
+                )
+                self.prefix_cache_backend = "lmcache"
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -516,6 +556,12 @@ class ServerArgs:
                     self.chunked_prefill_size = 16384
             else:
                 self.chunked_prefill_size = 4096
+        # NOTE: chunked_prefill_size always has a value
+        if (
+            self.chunked_prefill_size is not None
+            and self.prefix_cache_backend == "none"
+        ):
+            self.prefix_cache_backend = "chunk"
 
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
@@ -617,7 +663,7 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_cuda_graph = True
-            self.disable_radix_cache = True
+            self.prefix_cache_backend = "chunk"
 
         # Set page size
         if self.page_size is None:
@@ -815,7 +861,7 @@ class ServerArgs:
                 self.disaggregation_decode_dp is None
             ), "Cannot set --disaggregation-decode-dp for the decode engine."
 
-            self.disable_radix_cache = True
+            self.prefix_cache_backend = "chunk"
             logger.warning("KV cache is forced as chunk cache for decode server")
 
             if self.dp_size > 1 and not is_in_ci():
@@ -847,11 +893,8 @@ class ServerArgs:
             "1" if self.disable_outlines_disk_cache else "0"
         )
 
-        if self.enable_hierarchical_cache and self.disable_radix_cache:
-            raise ValueError(
-                "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
-                "and cannot be used at the same time. Please use only one of them."
-            )
+        if self.schedule_policy and self.prefix_cache_backend == "lora":
+            raise ValueError("LoRA radix cache only supports FCFS policy")
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1741,7 +1784,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-hierarchical-cache",
             action="store_true",
-            help="Enable hierarchical cache",
+            help="(Deprecated) Enable hierarchical cache",
         )
         parser.add_argument(
             "--hicache-ratio",
@@ -1800,7 +1843,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-lmcache",
             action="store_true",
-            help="Using LMCache as an alternative hierarchical cache solution",
+            help="(Deprecated) Using LMCache as an alternative hierarchical cache solution",
         )
 
         # Double Sparsity
@@ -1874,9 +1917,28 @@ class ServerArgs:
 
         # Optimization/debug options
         parser.add_argument(
+            "--prefix-cache-backend",
+            type=str,
+            default=ServerArgs.prefix_cache_backend,
+            choices=[
+                "radix",
+                "radix_cpp",
+                "chunk",
+                "hierarchical",
+                "hierarchical_cpp",
+                "lora",
+                "lmcache",
+                "swa_radix",
+                "swa_chunk",
+                "none",
+            ],
+            help="The backend of prefix cache.",
+        )
+
+        parser.add_argument(
             "--disable-radix-cache",
             action="store_true",
-            help="Disable RadixAttention for prefix caching.",
+            help="(Deprecated) Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
             "--cuda-graph-max-bs",
@@ -2353,7 +2415,6 @@ class ServerArgs:
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
                     "Expected a list or a dictionary."
                 )
-
             # Expand target modules
             if self.lora_target_modules:
                 self.lora_target_modules = set(self.lora_target_modules)
@@ -2378,6 +2439,7 @@ class ServerArgs:
                     "The number of LoRA paths should not exceed max_loaded_loras. "
                     f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
                 )
+            assert self.prefix_cache_backend in ["lora", "none"]
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
