@@ -222,6 +222,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
 
+        if forward_mode.is_target_verify():
+            seq_lens += spec_info.draft_token_num
+
         create_flashmla_kv_indices_triton[(bs,)](
             self.req_to_token,
             req_pool_indices,
@@ -273,6 +276,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
+
+        if forward_mode.is_target_verify():
+            seq_lens += spec_info.draft_token_num
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[(bs,)](
