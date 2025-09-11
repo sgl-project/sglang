@@ -441,6 +441,88 @@ class MHATokenToKVPool(KVCache):
         )
 
 
+class ElasticMHATokenToKVPool(MHATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_overlap_schedule: bool = True,
+    ):
+        super(MHATokenToKVPool, self).__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.custom_mem_pool = None
+
+        try:
+            import kvcached.integration.sglang.interfaces as kvcached_interfaces
+
+            self.kvcached_interfaces = kvcached_interfaces
+            self.kvcached_interfaces.init_kvcached(async_sched=enable_overlap_schedule)
+
+            # Initialize KV allocator based on per-token KV size (cell_size)
+            self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
+
+            self.kvcached_allocator = kvcached_interfaces.get_kv_cache_manager(
+                self.size + self.page_size,
+                self.page_size,
+                self.cell_size,
+                num_layers=layer_num,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "kvcached is not found. Please install kvcached with `pip install kvcached --no-build-isolation` to use elastic KV cache."
+            ) from e
+
+        self._create_buffers()
+
+        self.layer_transfer_counter = None
+        self.device_module = torch.get_device_module(self.device)
+        self.alt_stream = self.device_module.Stream() if _is_cuda else None
+
+        k_size, v_size = self.get_kv_size_bytes()
+        logger.info(
+            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
+        )
+        self.mem_usage = (k_size + v_size) / GB
+
+    def __del__(self):
+        self.kvcached_interfaces.shutdown_kvcached()
+        del self.kvcached_allocator
+        self.k_buffer = None
+        self.v_buffer = None
+
+    def _create_buffers(self):
+        if "cuda" not in self.device:
+            raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
+
+        self.k_buffer, self.v_buffer = self.kvcached_interfaces.alloc_kv_cache(
+            kvcache_shape=(self.size + self.page_size, self.head_num, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+            num_layers=self.layer_num,
+            page_size=self.page_size,
+            attention_type="MHA",
+            kv_layout="NHD",
+        )
+
+
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
 

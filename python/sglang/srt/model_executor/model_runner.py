@@ -76,6 +76,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
+    ElasticTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -85,6 +86,7 @@ from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
+    ElasticMHATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -207,6 +209,8 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = model_config.is_hybrid
+        # Use environment variable to enable elastic memory
+        self.is_elastic = get_bool_env_var("ENABLE_KVCACHED", "false")
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
@@ -1383,8 +1387,8 @@ class ModelRunner:
                     device=self.device,
                 )
             else:
-                self.token_to_kv_pool = MHATokenToKVPool(
-                    self.max_total_num_tokens,
+                mha_token_to_kv_pool_args = dict(
+                    size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
@@ -1397,6 +1401,19 @@ class ModelRunner:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+                if not self.is_elastic:
+                    self.token_to_kv_pool = MHATokenToKVPool(
+                        **mha_token_to_kv_pool_args
+                    )
+                else:
+                    # add enable overlap schedule args to elastic mha token to kv pool
+                    elastic_mha_token_to_kv_pool_args = mha_token_to_kv_pool_args
+                    elastic_mha_token_to_kv_pool_args["enable_overlap_schedule"] = (
+                        not self.server_args.disable_overlap_schedule
+                    )
+                    self.token_to_kv_pool = ElasticMHATokenToKVPool(
+                        **elastic_mha_token_to_kv_pool_args
+                    )
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
@@ -1422,7 +1439,12 @@ class ModelRunner:
                             need_sort=need_sort,
                         )
                     else:
-                        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                        allocator_cls = (
+                            ElasticTokenToKVPoolAllocator
+                            if self.is_elastic
+                            else TokenToKVPoolAllocator
+                        )
+                        self.token_to_kv_pool_allocator = allocator_cls(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
