@@ -1,25 +1,33 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
+from __future__ import annotations
+
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from torch.nn import Module
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.linear import (
-    LinearBase,
-    LinearMethodBase,
-    UnquantizedLinearMethod,
-)
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -78,7 +86,7 @@ class BlockInt8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "BlockInt8Config":
+    def from_config(cls, config: Dict[str, Any]) -> BlockInt8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_int8_serialized = "int8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
@@ -93,7 +101,8 @@ class BlockInt8Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
@@ -230,7 +239,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
         )
 
 
-class BlockInt8MoEMethod:
+class BlockInt8MoEMethod(FusedMoEMethodBase):
     """MoE method for INT8.
     Supports loading INT8 checkpoints with static weight scale and
     dynamic activation scale.
@@ -242,25 +251,7 @@ class BlockInt8MoEMethod:
         quant_config: The quantization config.
     """
 
-    def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
-
-    def __init__(self, quant_config):
+    def __init__(self, quant_config: BlockInt8Config):
         self.quant_config = quant_config
         assert self.quant_config.weight_block_size is not None
         assert self.quant_config.is_checkpoint_int8_serialized
@@ -270,7 +261,7 @@ class BlockInt8MoEMethod:
         layer: Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
@@ -286,25 +277,28 @@ class BlockInt8MoEMethod:
         )
         # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
         # Required by column parallel or enabling merged weights
-        if intermediate_size % block_n != 0:
+        if intermediate_size_per_partition % block_n != 0:
             raise ValueError(
                 f"The output_size of gate's and up's weight = "
-                f"{intermediate_size} is not divisible by "
+                f"{intermediate_size_per_partition} is not divisible by "
                 f"weight quantization block_n = {block_n}."
             )
         if tp_size > 1:
             # Required by row parallel
-            if intermediate_size % block_k != 0:
+            if intermediate_size_per_partition % block_k != 0:
                 raise ValueError(
                     f"The input_size of down's weight = "
-                    f"{intermediate_size} is not divisible by "
+                    f"{intermediate_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -313,7 +307,10 @@ class BlockInt8MoEMethod:
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, hidden_size, intermediate_size, dtype=params_dtype
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -324,7 +321,7 @@ class BlockInt8MoEMethod:
         w13_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
-                2 * ((intermediate_size + block_n - 1) // block_n),
+                2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                 (hidden_size + block_k - 1) // block_k,
                 dtype=torch.float32,
             ),
@@ -334,7 +331,7 @@ class BlockInt8MoEMethod:
             torch.ones(
                 num_experts,
                 (hidden_size + block_n - 1) // block_n,
-                (intermediate_size + block_k - 1) // block_k,
+                (intermediate_size_per_partition + block_k - 1) // block_k,
                 dtype=torch.float32,
             ),
             requires_grad=False,
@@ -357,59 +354,27 @@ class BlockInt8MoEMethod:
         # Block quant doesn't need to process weights after loading
         return
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-        from sglang.srt.layers.moe.topk import select_experts
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
 
-        # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
-
-        # Expert fusion with INT8 quantization
-        return fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=inplace,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
             use_int8_w8a8=True,
-            w1_scale=(layer.w13_weight_scale_inv),
-            w2_scale=(layer.w2_weight_scale_inv),
-            a1_scale=layer.w13_input_scale,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )
+
+        return self.runner.run(dispatch_output, quant_info)

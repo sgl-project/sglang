@@ -56,14 +56,14 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
                     "if the model is custom)."
                 )
             model_module = auto_modules["AutoModel"]
-        if model_config.impl == ModelImpl.TRANSFORMERS:
+        if model_config.model_impl == ModelImpl.TRANSFORMERS:
             if not model_module.is_backend_compatible():
                 raise ValueError(
                     f"The Transformers implementation of {arch} is not "
-                    "compatible with vLLM."
+                    "compatible with SGLang."
                 )
             architectures[i] = "TransformersForCausalLM"
-        if model_config.impl == ModelImpl.AUTO:
+        if model_config.model_impl == ModelImpl.AUTO:
             if not model_module.is_backend_compatible():
                 raise ValueError(
                     f"{arch} has no SGlang implementation and the Transformers "
@@ -97,7 +97,7 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     supported_archs = ModelRegistry.get_supported_archs()
     is_native_supported = any(arch in supported_archs for arch in architectures)
 
-    if not is_native_supported or model_config.impl == ModelImpl.TRANSFORMERS:
+    if not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
         architectures = resolve_transformers_arch(model_config, architectures)
 
     return ModelRegistry.resolve_model_cls(architectures)
@@ -105,3 +105,15 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
 
 def get_architecture_class_name(model_config: ModelConfig) -> str:
     return get_model_architecture(model_config)[1]
+
+
+def post_load_weights(model: nn.Module, model_config: ModelConfig):
+    # Model weight loading consists of two stages:
+    # 1. Initial weight loading.
+    # 2. Post-processing of weights, including assigning specific member variables.
+    # For `dummy_init`, only the second stage is required.
+    if hasattr(model, "post_load_weights"):
+        if model_config.hf_config.architectures[0] == "DeepseekV3ForCausalLMNextN":
+            model.post_load_weights(is_nextn=True)
+        else:
+            model.post_load_weights()

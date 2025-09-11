@@ -12,10 +12,11 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
+from __future__ import annotations
 
 import logging
 import threading
-from typing import Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 
@@ -41,8 +42,12 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,7 @@ class TpModelWorker:
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+        moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
@@ -65,6 +71,7 @@ class TpModelWorker:
         # Parse args
         self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
+        self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
 
         # Init model and tokenizer
@@ -75,6 +82,11 @@ class TpModelWorker:
                 if not is_draft_worker
                 else server_args.speculative_draft_model_path
             ),
+            model_revision=(
+                server_args.revision
+                if not is_draft_worker
+                else server_args.speculative_draft_model_revision
+            ),
             is_draft_model=is_draft_worker,
         )
 
@@ -84,9 +96,12 @@ class TpModelWorker:
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
             pp_rank=pp_rank,
             pp_size=server_args.pp_size,
             nccl_port=nccl_port,
+            dp_rank=dp_rank,
             server_args=server_args,
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
@@ -129,6 +144,10 @@ class TpModelWorker:
             self.model_runner.req_to_token_pool.size,
         )
         assert self.max_running_requests > 0, "max_running_request is zero"
+        self.max_queued_requests = server_args.max_queued_requests
+        assert (
+            self.max_queued_requests > 0
+        ), "max_queued_requests is zero. We need to be at least 1 to schedule a request."
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
@@ -152,10 +171,10 @@ class TpModelWorker:
 
         self.hicache_layer_transfer_counter = None
 
-    def register_hicache_layer_transfer_counter(self, counter):
+    def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
 
-    def set_hicache_consumer(self, consumer_index):
+    def set_hicache_consumer(self, consumer_index: int):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
@@ -164,6 +183,7 @@ class TpModelWorker:
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.max_queued_requests,
             self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
@@ -172,6 +192,20 @@ class TpModelWorker:
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
+        )
+
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.model_runner.sliding_window_size
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.model_runner.is_hybrid is not None
+
+    def get_tokens_per_layer_info(self):
+        return (
+            self.model_runner.full_max_total_num_tokens,
+            self.model_runner.swa_max_total_num_tokens,
         )
 
     def get_pad_input_ids_func(self):
@@ -200,6 +234,9 @@ class TpModelWorker:
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
     ]:
+        # update the consumer index of hicache to the running batch
+        self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         pp_proxy_tensors = None
@@ -264,6 +301,8 @@ class TpModelWorker:
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+
+        monkey_patch_torch_reductions()
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_rank]
@@ -279,11 +318,12 @@ class TpModelWorker:
         return parameter
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        result = self.model_runner.load_lora_adapter(
-            recv_req.lora_name, recv_req.lora_path
-        )
+        result = self.model_runner.load_lora_adapter(recv_req.to_ref())
         return result
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
-        result = self.model_runner.unload_lora_adapter(recv_req.lora_name)
+        result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
+
+    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
+        return self.model_runner.lora_manager.validate_lora_batch(lora_ids)

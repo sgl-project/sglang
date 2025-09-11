@@ -12,13 +12,14 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
+from __future__ import annotations
 
 import dataclasses
 import logging
 import signal
 import threading
 from queue import Queue
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import psutil
 import torch
@@ -37,6 +38,9 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import DynamicGradMode, get_compiler_backend
 from sglang.utils import get_exception_traceback
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +62,14 @@ class TpModelWorkerClient:
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+        moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
     ):
         # Load the model
         self.worker = TpModelWorker(
-            server_args, gpu_id, tp_rank, pp_rank, dp_rank, nccl_port
+            server_args, gpu_id, tp_rank, moe_ep_rank, pp_rank, dp_rank, nccl_port
         )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
@@ -78,7 +83,7 @@ class TpModelWorkerClient:
         )
 
         # Launch threads
-        self.input_queue = Queue()
+        self.input_queue = Queue[Tuple[ModelWorkerBatch, int, torch.Event]]()
         self.output_queue = Queue()
         self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
@@ -92,15 +97,22 @@ class TpModelWorkerClient:
 
         self.hicache_layer_transfer_counter = None
 
-    def register_hicache_layer_transfer_counter(self, counter):
+    def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
-
-    def set_hicache_consumer(self, consumer_index):
-        if self.hicache_layer_transfer_counter is not None:
-            self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
+
+    def get_tokens_per_layer_info(self):
+        return self.worker.get_tokens_per_layer_info()
+
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.worker.sliding_window_size
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.worker.is_hybrid
 
     def get_pad_input_ids_func(self):
         return self.worker.get_pad_input_ids_func()
@@ -135,7 +147,7 @@ class TpModelWorkerClient:
     @DynamicGradMode()
     def forward_thread_func_(self):
         batch_pt = 0
-        batch_lists = [None] * 2
+        batch_lists: List = [None] * 2
 
         while True:
             model_worker_batch, future_token_ids_ct, sync_event = self.input_queue.get()
@@ -157,8 +169,6 @@ class TpModelWorkerClient:
             input_ids = model_worker_batch.input_ids
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
 
-            # update the consumer index of hicache to the running batch
-            self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
             # Run forward
             logits_output, next_token_ids, can_run_cuda_graph = (
                 self.worker.forward_batch_generation(
@@ -275,6 +285,9 @@ class TpModelWorkerClient:
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
         return self.worker.unload_lora_adapter(recv_req)
+
+    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
+        return self.worker.can_run_lora_batch(lora_ids)
 
     def __delete__(self):
         self.input_queue.put((None, None))

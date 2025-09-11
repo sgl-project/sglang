@@ -67,7 +67,11 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -140,7 +144,7 @@ class KimiVLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = (
-            torch.cat([item.pixel_values for item in items], dim=0)
+            torch.cat([item.feature for item in items], dim=0)
             .type(self.vision_tower.dtype)
             .to(self.vision_tower.device)
         )
@@ -168,7 +172,9 @@ class KimiVLForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
+            data_embedding_funcs={
+                Modality.IMAGE: self.get_image_feature,
+            },
             positions=positions,
         )
 
