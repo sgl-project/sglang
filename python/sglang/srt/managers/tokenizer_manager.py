@@ -1177,8 +1177,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
+            _t_wait_begin = time.time()
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            _t_wait_end = time.time()
+            print(
+                f"SGLANG-TIME tokman.recv_from_detokenizer: {_t_wait_end - _t_wait_begin:.6f}s, type={type(recv_obj).__name__}"
+            )
+
+            _t_dispatch_begin = time.time()
             self._result_dispatcher(recv_obj)
+            _t_dispatch_end = time.time()
+            print(
+                f"SGLANG-TIME tokman.dispatch_result: {_t_dispatch_end - _t_dispatch_begin:.6f}s"
+            )
             self.last_receive_tstamp = time.time()
 
     def _handle_batch_output(
@@ -1187,6 +1198,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
         ],
     ):
+        _t_total_begin = time.time()
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1278,8 +1290,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 if self.server_args.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
+            _t_enqueue_begin = time.time()
             state.out_list.append(out_dict)
             state.event.set()
+            _t_enqueue_end = time.time()
+            print(
+                f"SGLANG-TIME tokman.enqueue_and_set_event: {_t_enqueue_end - _t_enqueue_begin:.6f}s, rid={rid}, finished={state.finished}"
+            )
 
             # Log metrics and dump
             if self.enable_metrics and state.obj.log_metrics:
@@ -1288,6 +1305,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
+        _t_total_end = time.time()
+        try:
+            _bs = len(recv_obj.rids)
+        except Exception:
+            _bs = -1
+        print(
+            f"SGLANG-TIME tokman._handle_batch_output_total: {_t_total_end - _t_total_begin:.6f}s, bs={_bs}"
+        )
 
     def convert_logprob_style(
         self,

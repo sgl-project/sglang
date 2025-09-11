@@ -23,6 +23,7 @@ from typing import Dict, List, Union
 import psutil
 import setproctitle
 import zmq
+import time
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
@@ -114,10 +115,21 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
+            _t_wait_begin = time.time()
             recv_obj = self.recv_from_scheduler.recv_pyobj()
+            _t_wait_end = time.time()
+            print(f"SGLANG-TIME detok.recv_from_scheduler: {_t_wait_end - _t_wait_begin:.6f}s")
+
+            _t_dispatch_begin = time.time()
             output = self._request_dispatcher(recv_obj)
+            _t_dispatch_end = time.time()
+            print(f"SGLANG-TIME detok.dispatch_handle: {_t_dispatch_end - _t_dispatch_begin:.6f}s, type={type(recv_obj).__name__}")
+
             if output is not None:
+                _t_send_begin = time.time()
                 self.send_to_tokenizer.send_pyobj(output)
+                _t_send_end = time.time()
+                print(f"SGLANG-TIME detok.send_to_tokenizer: {_t_send_end - _t_send_begin:.6f}s")
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -150,6 +162,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return recv_obj
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
+        _t_begin = time.time()
         bs = len(recv_obj.rids)
 
         # Initialize decode status
@@ -178,6 +191,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
         # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
+        _t_decode_begin = time.time()
         surr_texts = self.tokenizer.batch_decode(
             surr_ids,
             skip_special_tokens=recv_obj.skip_special_tokens[0],
@@ -187,6 +201,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             read_ids,
             skip_special_tokens=recv_obj.skip_special_tokens[0],
             spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+        )
+        _t_decode_end = time.time()
+        print(
+            f"SGLANG-TIME detok.batch_decode: {_t_decode_end - _t_decode_begin:.6f}s, bs={bs}"
         )
 
         # Incremental decoding
@@ -224,7 +242,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
-        return BatchStrOut(
+        _t_pack_begin = time.time()
+        ret = BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
@@ -249,6 +268,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
+        _t_pack_end = time.time()
+        print(
+            f"SGLANG-TIME detok.pack_batchstrout: {_t_pack_end - _t_pack_begin:.6f}s, bs={bs}"
+        )
+        _t_end = time.time()
+        print(
+            f"SGLANG-TIME detok.handle_batch_token_id_out_total: {_t_end - _t_begin:.6f}s, bs={bs}"
+        )
+        return ret
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
         outputs = self.tokenizer.detokenize(recv_obj)

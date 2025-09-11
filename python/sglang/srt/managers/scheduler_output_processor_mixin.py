@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -199,6 +200,9 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t_decode_begin_total = time.time()
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
@@ -217,11 +221,17 @@ class SchedulerOutputProcessorMixin:
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
+        _t_free_group_begin = time.time()   
         self.token_to_kv_pool_allocator.free_group_begin()
+        _t_free_group_begin_end = time.time()
+        print(
+            f"SGLANG-TIME decode.free_group_begin: {_t_free_group_begin_end - _t_free_group_begin:.6f}s, batch_reqs={len(batch.reqs)}"
+        )
 
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
+        _t_finish_loop = time.time()
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
@@ -285,10 +295,40 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(req.rid))
                 req.grammar.finished = req.finished()
+        _t_finish_loop_end = time.time()
+        print(
+            f"SGLANG-TIME decode.finish_loop: {_t_finish_loop_end - _t_finish_loop:.6f}s, batch_reqs={len(batch.reqs)}"
+        )
 
+        _t_set_next_batch_sampling_info_done = time.time()
         self.set_next_batch_sampling_info_done(batch)
+        _t_set_next_batch_sampling_info_done_end = time.time()
+        print(
+            f"SGLANG-TIME decode.set_next_batch_sampling_info_done: {_t_set_next_batch_sampling_info_done_end - _t_set_next_batch_sampling_info_done:.6f}s"
+        )
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t_stream_output = time.time()
         self.stream_output(batch.reqs, batch.return_logprob)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t_stream_output_end = time.time()
+        print(
+            f"SGLANG-TIME decode.stream_output: {_t_stream_output_end - _t_stream_output:.6f}s, sent_reqs={len(batch.reqs)}"
+        )
+
+        _t0 = time.time()
         self.token_to_kv_pool_allocator.free_group_end()
+        _t1 = time.time()
+        print(f"SGLANG-TIME decode.free_group_end: {_t1 - _t0:.6f}s")
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t_decode_end_total = time.time()
+        print(
+            f"SGLANG-TIME decode.process_batch_result_decode_total: {_t_decode_end_total - _t_decode_begin_total:.6f}s, batch_reqs={len(batch.reqs)}"
+        )
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         if (
@@ -480,6 +520,7 @@ class SchedulerOutputProcessorMixin:
         return_logprob: bool,
         skip_req: Optional[Req] = None,
     ):
+        _t_stream_begin_total = time.time()
         rids = []
         finished_reasons: List[BaseFinishReason] = []
 
@@ -521,6 +562,7 @@ class SchedulerOutputProcessorMixin:
                 output_token_ids_logprobs_idx
             ) = None
 
+        _t_collect_loop = time.time()
         for req in reqs:
             if req is skip_req:
                 continue
@@ -667,11 +709,18 @@ class SchedulerOutputProcessorMixin:
             ):
                 req.log_time_stats()
 
+        _t_collect_loop_end = time.time()
+        print(
+            f"SGLANG-TIME stream_output_generation.collect_loop: {_t_collect_loop_end - _t_collect_loop:.6f}s, to_send_reqs={len(rids)}"
+        )
+
         # Send to detokenizer
         if rids:
             if self.model_config.is_multimodal_gen:
                 return
-
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _t_send_to_detokenizer = time.time()
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
                     rids,
@@ -704,6 +753,16 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_val=None,
                 )
             )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _t_send_to_detokenizer_end = time.time()
+            print(
+                f"SGLANG-TIME stream_output_generation.send_to_detokenizer: {_t_send_to_detokenizer_end - _t_send_to_detokenizer:.6f}s, sent_reqs={len(rids)}"
+            )
+        _t_stream_end_total = time.time()
+        print(
+            f"SGLANG-TIME stream_output_generation.total: {_t_stream_end_total - _t_stream_begin_total:.6f}s, reqs={len(reqs)}"
+        )
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []
