@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 mod common;
-use common::mock_server::MockOpenAIServer;
+use common::mock_openai_server::MockOpenAIServer;
 
 /// Helper function to create a minimal chat completion request for testing
 fn create_minimal_chat_request() -> ChatCompletionRequest {

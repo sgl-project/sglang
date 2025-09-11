@@ -1238,6 +1238,4 @@ mod tests {
             _ => panic!("Expected RoundRobin for regular mode"),
         }
     }
-
-    // (Removed) OpenAI Proxy config tests as the struct is deleted
 }

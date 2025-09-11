@@ -176,10 +176,6 @@ struct CliArgs {
     #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime")]
     backend: Backend,
 
-    /// Model name to use (required when backend=openai)
-    #[arg(long)]
-    model: Option<String>,
-
     /// Directory to store log files
     #[arg(long)]
     log_dir: Option<String>,
@@ -369,7 +365,6 @@ impl CliArgs {
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         // Determine routing mode
-
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
             RoutingMode::Regular {
@@ -451,7 +446,7 @@ impl CliArgs {
                 all_urls.extend(decode_urls.clone());
             }
             RoutingMode::OpenAI { .. } => {
-                // OpenAI mode does not use worker URLs; force HTTP connection mode below
+                // For connection-mode detection, skip URLs; OpenAI forces HTTP below.
             }
         }
         let connection_mode = match &mode {
