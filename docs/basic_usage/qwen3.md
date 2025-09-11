@@ -7,7 +7,7 @@ SGLang has supported Qwen3-Next-80B-A3B-Instruct and Qwen3-Next-80B-A3B-Thinking
 To serve Qwen3-Next models on 4xH100/H200 GPUs:
 
 ```bash
-python3 -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Instruct  --tp 4
+python3 -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 4
 ```
 
 ### Configuration Tips
