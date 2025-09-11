@@ -21,26 +21,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      src: ${{ steps.filter.outputs.src }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Detect file changes
-        id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            src:
-              - "python/**"
-              - "scripts/ci/**"
-              - "test/**"
-              - ".github/workflows/pr-test.yml"
-              - "sgl-kernel/**"
-
   # =============================================== sgl-kernel ====================================================
 
   sgl-kernel-check-changes:
@@ -190,6 +170,7 @@ jobs:
 
   sgl-kernel-finish:
     needs: [sgl-kernel-unit-test, sgl-kernel-mla-test, sgl-kernel-lint, sgl-kernel-build-wheels]
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
@@ -206,8 +187,28 @@ jobs:
 
   # =============================================== primary ====================================================
 
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            src:
+              - "python/**"
+              - "scripts/ci/**"
+              - "test/**"
+              - ".github/workflows/pr-test.yml"
+              - "sgl-kernel/**"
+
   unit-test-frontend:
-    needs: check-changes
+    needs: [check-changes, sgl-kernel-finish]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -216,9 +217,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src }} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
