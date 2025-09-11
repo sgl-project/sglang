@@ -1487,7 +1487,7 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
         if m:
             # Reconstruct the row and append a placeholder artifact link for profile
             parts = [part.strip() for part in m.group(0).split("|") if part.strip()]
-            filename = result.get("profile_filename")
+            filename = result.get("trace_link")
             if base_url and filename:
                 link = f"{base_url}/{filename}"
                 row = f"| {' | '.join(parts)} | [trace]({link}) |\n"
@@ -1495,6 +1495,14 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
                 row = f"| {' | '.join(parts)} | [trace](#) |\n"
             summary += row
     return summary
+
+
+def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:
+    match = re.search(r"\[Profile\]\((.*?)\)", output)
+    if match:
+        trace_link = match.group(1)
+        return trace_link
+    return None
 
 
 def parse_models(model_string: str):

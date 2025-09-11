@@ -67,10 +67,8 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                     model_results = []
 
                     for batch_size in batch_sizes or self.batch_sizes:
-                        profile_filename = f"{model.replace('/', '_')}_bs{batch_size}_{int(time.time())}"
-                        profile_path_prefix = os.path.join(
-                            PROFILE_DIR, profile_filename
-                        )
+                        trace_filename = f"{model.replace('/', '_')}_bs{batch_size}_{int(time.time())}"
+                        profile_path_prefix = os.path.join(PROFILE_DIR, trace_filename)
 
                         command = [
                             "python3",
@@ -110,7 +108,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                         model_results.append(
                             {
                                 "output": result.stdout,
-                                "profile_filename": f"{profile_filename}.json",
+                                "trace_filename": f"{trace_filename}.json",
                             }
                         )
 

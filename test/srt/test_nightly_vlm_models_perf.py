@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import time
 import unittest
@@ -9,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     _parse_int_list_env,
+    extract_trace_link_from_bench_one_batch_server_output,
     generate_markdown_report_nightly,
     is_in_ci,
     parse_models,
@@ -69,9 +71,9 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
             "## TestNightlyVLMModelsPerformance (with bench_one_batch_server)\n"
         )
         for model in self.models:
+            model_results = []
             with self.subTest(model=model):
                 process = popen_launch_server_wrapper(self.base_url, model)
-                model_results = []
                 try:
                     # Run bench_one_batch_server against the launched server
                     os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -116,10 +118,16 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                         print(f"Output for {model} with batch size {batch_size}:")
                         print(result.stdout)
 
+                        trace_link = (
+                            extract_trace_link_from_bench_one_batch_server_output(
+                                result.stdout
+                            )
+                        )
+                        print(f"{trace_link=}")
                         model_results.append(
                             {
                                 "output": result.stdout,
-                                "profile_filename": f"{profile_filename}.json",
+                                "trace_link": f"{trace_link}",
                             }
                         )
 
