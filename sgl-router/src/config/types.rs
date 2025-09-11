@@ -425,7 +425,6 @@ impl RouterConfig {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

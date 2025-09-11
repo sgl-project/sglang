@@ -1059,7 +1059,6 @@ mod tests {
             "Prefill"
         );
         assert_eq!(WorkerType::Decode.to_string(), "Decode");
-
     }
 
     #[test]
@@ -1082,7 +1081,6 @@ mod tests {
                 bootstrap_port: Some(8081)
             }
         );
-
     }
 
     #[test]
@@ -1092,7 +1090,6 @@ mod tests {
         };
         let cloned = original.clone();
         assert_eq!(original, cloned);
-
     }
 
     // Test HealthConfig
@@ -1395,8 +1392,6 @@ mod tests {
         assert_eq!(worker.url(), "http://decode:8080");
         assert_eq!(worker.worker_type(), WorkerType::Decode);
     }
-
-    // OpenAI worker factory functions removed; corresponding tests omitted
 
     #[test]
     fn test_create_from_urls() {
@@ -1982,6 +1977,4 @@ mod tests {
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
     }
-
-    // No OpenAIWorker tests since async-openai is removed
 }
