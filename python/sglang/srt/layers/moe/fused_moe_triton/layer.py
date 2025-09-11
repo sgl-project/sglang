@@ -193,33 +193,6 @@ class FusedMoE(torch.nn.Module):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
 
         self.quant_config = quant_config
-        self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
-        # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
-        if (
-            self.quant_config is not None
-            and self.quant_config.get_name() == "mxfp4"
-            and self.use_flashinfer_mxfp4_moe
-        ):
-            hidden_size = round_up(hidden_size, 256)
-        self.hidden_size = hidden_size
-
-        self.moe_runner_config = MoeRunnerConfig(
-            num_experts=num_experts,
-            num_local_experts=self.num_local_experts,
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=self.intermediate_size_per_partition,
-            layer_id=layer_id,
-            top_k=top_k,
-            num_fused_shared_experts=num_fused_shared_experts,
-            params_dtype=params_dtype,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            inplace=inplace,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
-            gemm1_alpha=gemm1_alpha,
-            gemm1_clamp_limit=gemm1_clamp_limit,
-        )
 
         if quant_config is None:
             self.quant_method: FusedMoEMethodBase = UnquantizedFusedMoEMethod(
@@ -243,6 +216,28 @@ class FusedMoE(torch.nn.Module):
                 else self.weight_loader_fused
             ),
             with_bias=with_bias,
+        )
+        self.hidden_size = (
+            self.quant_method.hidden_size
+            if hasattr(self.quant_method, "hidden_size")
+            else hidden_size
+        )
+        self.moe_runner_config = MoeRunnerConfig(
+            num_experts=num_experts,
+            num_local_experts=self.num_local_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size_per_partition=self.intermediate_size_per_partition,
+            layer_id=layer_id,
+            top_k=top_k,
+            num_fused_shared_experts=num_fused_shared_experts,
+            params_dtype=params_dtype,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            inplace=inplace,
+            no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit,
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
@@ -477,6 +472,20 @@ class FusedMoE(torch.nn.Module):
             return expert_id
         return self.expert_map_cpu[expert_id].item()
 
+    def _weight_loader_mxfp4(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+    ) -> None:
+        dim1 = loaded_weight.shape[1]
+        if "bias" in weight_name:
+            param.data[:, :dim1].copy_(loaded_weight)
+        else:
+            packing_factor = param.data.element_size() // loaded_weight.element_size()
+            dim2 = loaded_weight.shape[2] // packing_factor
+            param.data[:, :dim1, :dim2].copy_(loaded_weight.view(param.data.dtype))
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -494,13 +503,7 @@ class FusedMoE(torch.nn.Module):
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
         ):
-            if "bias" in weight_name:
-                dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
-            else:
-                dim1 = loaded_weight.shape[1]
-                dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+            self._weight_loader_mxfp4(param, loaded_weight, weight_name)
             return
 
         global_expert_location_metadata = get_global_expert_location_metadata()
@@ -751,15 +754,7 @@ class FusedMoE(torch.nn.Module):
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
         ):
-            if "bias" in weight_name:
-                dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
-            elif "scale" in weight_name:
-                param.data.copy_(loaded_weight)
-            else:
-                dim1 = loaded_weight.shape[1]
-                dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+            self._weight_loader_mxfp4(param, loaded_weight, weight_name)
             return
 
         # compressed-tensors checkpoints with packed weights are stored flipped
