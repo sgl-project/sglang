@@ -1,5 +1,4 @@
 import os
-import re
 import subprocess
 import time
 import unittest
@@ -11,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     _parse_int_list_env,
     extract_trace_link_from_bench_one_batch_server_output,
+    find_traces_under_path,
     generate_markdown_report_nightly,
     is_in_ci,
     parse_models,
@@ -83,6 +83,8 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                             PROFILE_DIR, profile_filename
                         )
 
+                        print(f"{profile_filename=}")
+
                         command = [
                             "python3",
                             "-m",
@@ -118,16 +120,32 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                         print(f"Output for {model} with batch size {batch_size}:")
                         print(result.stdout)
 
-                        trace_link = (
+                        trace_dir = (
                             extract_trace_link_from_bench_one_batch_server_output(
                                 result.stdout
                             )
                         )
-                        print(f"{trace_link=}")
+
+                        print(f"{trace_dir=}")
+
+                        trace_files = find_traces_under_path(trace_dir)
+                        print(f"{trace_files=}")
+                        extend_trace_filename = [
+                            trace_file
+                            for trace_file in trace_files
+                            if trace_file.endswith(".EXTEND.trace.json.gz")
+                        ][0]
+
+                        # because the profile_id dir under PROFILE_DIR
+                        extend_trace_file_relative_path_from_profile_dir = trace_dir[
+                            trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1 :
+                        ]
+
+                        print(f"{extend_trace_file_relative_path_from_profile_dir}")
                         model_results.append(
                             {
                                 "output": result.stdout,
-                                "trace_link": f"{trace_link}",
+                                "trace_link": f"{extend_trace_file_relative_path_from_profile_dir}/{extend_trace_filename}",
                             }
                         )
 

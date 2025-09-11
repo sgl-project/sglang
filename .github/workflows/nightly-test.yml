@@ -42,6 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_dependency.sh
+          apt-get install rsync -y
 
       - name: Run performance test for text models
         timeout-minutes: 180
@@ -62,7 +63,9 @@ jobs:
       - name: Publish traces to storage repo
         run: |
           mkdir -p nightly-storage/traces/${{ github.run_id }}
-          cp -v test/srt/performance_profiles_text_models/*.json nightly-storage/traces/${{ github.run_id }}/ || true
+          if [ -d test/srt/performance_profiles_text_models ]; then
+            rsync -av --include='/' --include='.json.gz' --exclude='' test/srt/performance_profiles_text_models/ nightly-storage/traces/${{ github.run_id }}/
+          fi
           cd nightly-storage
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -73,6 +76,7 @@ jobs:
           else
             echo "No changes to commit"
           fi
+
 
   nightly-test-eval-vlm-models:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -118,7 +122,6 @@ jobs:
           bash scripts/ci/ci_install_dependency.sh
           apt-get install rsync -y
 
-
       - name: Run perf test for VLM models (MMMU-100)
         timeout-minutes: 240
         env:
@@ -139,7 +142,7 @@ jobs:
         run: |
           mkdir -p nightly-storage/traces/${{ github.run_id }}
           if [ -d test/srt/performance_profiles_vlms ]; then
-            rsync -av --include='/' --include='.json' --include='.json.gz' --exclude='' test/srt/performance_profiles_vlms/ nightly-storage/traces/${{ github.run_id }}/
+            rsync -av --include='/' --include='.json.gz' --exclude='' test/srt/performance_profiles_vlms/ nightly-storage/traces/${{ github.run_id }}/
           fi
           cd nightly-storage
           git config user.name "github-actions[bot]"

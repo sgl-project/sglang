@@ -1545,3 +1545,15 @@ def check_model_scores(results, model_score_thresholds, test_name):
 def _parse_int_list_env(name: str, default_val: str):
     val = os.environ.get(name, default_val)
     return [int(x) for x in val.split(",") if x]
+
+
+# Return filenames
+def find_traces_under_path(path: str) -> List[str]:
+    results = []
+    for _, dirs, files in os.walk(path):
+        print(f"{dirs=}")
+        print(f"{files=}")
+        for file in files:
+            if file.endswith(".trace.json.gz"):
+                results.append(f"{file}")
+    return results
