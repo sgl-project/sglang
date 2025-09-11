@@ -25,6 +25,13 @@ from sglang.srt.utils import (
     is_hip,
 )
 
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _support_tensor_descriptor = True
+except:
+    _support_tensor_descriptor = False
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -39,6 +46,10 @@ elif _is_hip:
     pass
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+
+
+def support_tensor_descriptor():
+    return _support_tensor_descriptor
 
 
 @triton.jit
@@ -344,6 +355,7 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
+    c_sorted: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -444,7 +456,10 @@ def fused_moe_kernel(
         # block-wise
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-            offs_bsn = offs_bn // group_n
+            if BLOCK_SIZE_N > group_n:
+                offs_bsn = offs_bn // group_n
+            else:
+                offs_bsn = pid_n * BLOCK_SIZE_N // group_n
             b_scale_ptrs = (
                 b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
             )
@@ -498,8 +513,10 @@ def fused_moe_kernel(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
-
-                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                if BLOCK_SIZE_N > group_n:
+                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                else:
+                    accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
             else:
                 if use_fp8_w8a8:
                     accumulator = tl.dot(a, b, acc=accumulator)
@@ -528,7 +545,12 @@ def fused_moe_kernel(
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    if c_sorted:
+        c_ptrs = (
+            c_ptr + stride_cm * offs_token_id[:, None] + stride_cn * offs_cn[None, :]
+        )
+    else:
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
@@ -557,6 +579,7 @@ def invoke_fused_moe_kernel(
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    c_sorted: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -689,8 +712,8 @@ def invoke_fused_moe_kernel(
             B.stride(1),
             bias.stride(0) if bias is not None else 0,
             bias.stride(1) if bias is not None else 0,
-            C.stride(1),
-            C.stride(2),
+            C.stride(-2),
+            C.stride(-1),
             A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
             A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
             B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
@@ -706,8 +729,259 @@ def invoke_fused_moe_kernel(
             use_int8_w8a16=use_int8_w8a16,
             per_channel_quant=per_channel_quant,
             even_Ks=even_Ks,
+            c_sorted=c_sorted,
             **config,
         )
+
+
+@triton.jit
+def fused_moe_down_tma_kernel(
+    # Pointers to matrices
+    a_desc,
+    b_desc,
+    bias_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    # The stride variables represent how much to increase the ptr by when
+    # moving by 1 element in a particular dimension. E.g. `stride_am` is
+    # how much to increase `a_ptr` by to get the element one row down
+    # (A has M rows).
+    stride_bias_e,
+    stride_bias_n,
+    stride_cm,
+    stride_cn,
+    stride_asm,
+    stride_ask,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    # Block size for block-wise quantization
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """
+    Implements the fused computation for a Mixture of Experts (MOE) using
+    token and expert matrices.
+
+    Key Parameters:
+    - A: The input tensor representing tokens with shape (*, K), where '*' can
+        be any shape representing batches and K is the feature dimension of
+        each token.
+    - B: The stacked MOE weight tensor with shape (E, N, K), where E is
+        the number of experts, K is the input feature dimension, and N is
+        the output feature dimension.
+    - C: The output cache tensor with shape (M, topk, N), where M is the
+        total number of tokens post padding, topk is the number of times
+        each token is repeated, and N is the output feature dimension.
+    - sorted_token_ids: A tensor containing the sorted indices of tokens,
+        repeated topk times and arranged by the expert index they are
+        assigned to.
+    - expert_ids: A tensor containing the indices of the expert for each
+        block. It determines which expert matrix from B should be used for
+        each block in A.
+
+    This kernel performs the multiplication of a token by its corresponding
+    expert matrix as determined by `expert_ids`. The sorting of
+    `sorted_token_ids` by expert index and padding ensures divisibility by
+    BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
+    multiplication across different blocks processed by the same expert.
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    start_offs_m = pid_m * BLOCK_SIZE_M
+    start_offs_n = pid_n * BLOCK_SIZE_N
+
+    offs_token_id = start_offs_m + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs_token = offs_token.to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m)
+
+    offs_bn = (start_offs_n + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
+    if BLOCK_SIZE_N > group_n:
+        offs_bsn = offs_bn // group_n
+    else:
+        offs_bsn = start_offs_n // group_n
+    b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+
+    # -----------------------------------------------------------
+    # Iterate to compute a block of the C matrix.
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # of fp32 values for higher accuracy.
+    # `accumulator` will be converted back to fp16 after the loop.
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for offset_k in range(0, K, BLOCK_SIZE_K):
+        # Load the next block of A and B, generate a mask by checking the
+        # K dimension.
+        a = a_desc.load([start_offs_m, offset_k])
+        b = (
+            b_desc.load([off_experts, start_offs_n, offset_k])
+            .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
+            .T
+        )
+
+        offs_ks = offset_k // group_k
+        a_scale = tl.load(
+            a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+        )
+        b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+        if BLOCK_SIZE_N > group_n:
+            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+        else:
+            accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
+
+    if bias_ptr is not None:
+        bias = tl.load(
+            bias_ptr + off_experts * stride_bias_e + offs_bn[None, :] * stride_bias_n
+        )
+        accumulator += bias
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator *= moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    # -----------------------------------------------------------
+    # Write back the block of the output
+    offs_cn = start_offs_n + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+def invoke_fused_moe_down_tma_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    C: torch.Tensor,
+    A_scale: Optional[torch.Tensor],
+    B_scale: Optional[torch.Tensor],
+    B_zp: Optional[torch.Tensor],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: Dict[str, Any],
+    compute_type: tl.dtype,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_channel_quant: bool,
+    block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
+) -> None:
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+    assert top_k == 1
+    assert use_fp8_w8a8
+    assert B_scale is not None
+    # activation block-wise fp8 quantization
+    assert len(block_shape) == 2
+    block_n, block_k = block_shape[0], block_shape[1]
+    if _is_cuda:
+        A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+    else:
+        A, A_scale = per_token_group_quant_fp8(A, block_k)
+    assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
+    assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
+    assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+
+    assert config["BLOCK_SIZE_K"] <= block_shape[0]
+
+    grid = lambda META: (
+        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+    )
+
+    # TMA descriptors require a global memory allocation
+    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+        return torch.empty(size, device="cuda", dtype=torch.int8)
+
+    triton.set_allocator(alloc_fn)
+
+    a_desc = TensorDescriptor(
+        A, A.shape, A.stride(), [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
+    )
+    b_desc = TensorDescriptor(
+        B, B.shape, B.stride(), [1, config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"]]
+    )
+
+    fused_moe_down_tma_kernel[grid](
+        a_desc,
+        b_desc,
+        bias,
+        C,
+        A_scale,
+        B_scale,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        B.shape[1],
+        B.shape[2],
+        sorted_token_ids.shape[0],
+        topk_ids.numel(),
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(1) if bias is not None else 0,
+        C.stride(-2),
+        C.stride(-1),
+        A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+        A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+        B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+        B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        0 if block_shape is None else block_shape[0],
+        0 if block_shape is None else block_shape[1],
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        **config,
+    )
 
 
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
