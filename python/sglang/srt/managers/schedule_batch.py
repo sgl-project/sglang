@@ -1449,7 +1449,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
-            self.unbudget_req(req, idx, len(sorted_indices), server_args)
+            self.unbudget_req(idx, len(sorted_indices), server_args)
 
             if len(retracted_reqs) == 0:
                 # Corner case: only one request left
