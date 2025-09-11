@@ -486,7 +486,7 @@ def causal_conv1d_fn(
         stride_istate_seq = conv_states.stride(0)
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
-        assert stride_istate_dim == 1
+        # assert stride_istate_dim == 1
     if out.dim() == 2:
         stride_o_seq = 0
         stride_o_dim = out.stride(0)

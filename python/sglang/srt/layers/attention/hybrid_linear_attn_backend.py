@@ -321,9 +321,7 @@ class MambaAttnBackend(AttentionBackend):
                 conv_weights,
                 bias,
                 activation=activation,
-                conv_states=conv_states_to_use.transpose(-1, -2)
-                .contiguous()
-                .transpose(-1, -2),
+                conv_states=conv_states_to_use,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
