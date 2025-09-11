@@ -25,7 +25,7 @@ struct TrieNode {
   TrieNode* parent;
   std::list<TrieNode*> lru;
   int32_t freq = 0;
-  std::set<TrieNode*> topk_nodes;
+
   struct CompareByFreq {
     bool operator()(TrieNode* a, TrieNode* b) const {
       return std::tie(b->freq, a->token, a) < std::tie(a->freq, b->token, b);
