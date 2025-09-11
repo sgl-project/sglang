@@ -130,13 +130,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: mickqian/SGLang-test-nightly
-#          token: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
+          token: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
           path: nightly-storage
 
       - name: Publish traces to storage repo
         run: |
           mkdir -p nightly-storage/traces/${{ github.run_id }}
-          cp -v -r test/srt/performance_profiles_vlms/* nightly-storage/traces/${{ github.run_id }}/ || true
+          cp -v -r test/srt/performance_profiles_vlms/*EXTEND.trace.json.gz nightly-storage/traces/${{ github.run_id }}/ || true
           cd nightly-storage
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
