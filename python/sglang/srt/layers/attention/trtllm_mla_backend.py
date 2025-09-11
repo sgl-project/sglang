@@ -187,7 +187,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
-        self.decode_cuda_graph_workspace = torch.empty(
+        self.decode_cuda_graph_workspace = torch.zeros(
             self.workspace_size, dtype=torch.int8, device=self.device
         )
 
