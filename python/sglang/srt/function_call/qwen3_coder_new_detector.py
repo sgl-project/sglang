@@ -1443,12 +1443,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 self.parser.tool_call_start_token
             ) - self._buf.count(self.parser.tool_call_end_token)
             if open_calls == 0 and self.parser.tool_call_index > 0:
-                # If current_call_id is None, use last_completed_call_id
-                call_id = (
-                    self.parser.current_call_id or self.parser.last_completed_call_id
-                )
                 return StreamingParseResult(
-                    calls=[ToolCallItem(tool_index=call_id, name="", parameters="")]
+                    calls=[
+                        ToolCallItem(
+                            tool_index=self.parser.tool_call_index - 1,
+                            name="",
+                            parameters="",
+                        )
+                    ]
                 )
 
         self._buf += new_text

@@ -651,6 +651,269 @@ circle
         params2 = json.loads(tool_calls[1]["parameters"])
         self.assertEqual(params2, {"shape": "circle", "dimensions": {"radius": 5}})
 
+    def test_parse_streaming_complex_example(self):
+        """Test basic streaming parsing while parameter has list."""
+
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="list_directory",
+                    description="Lists the names of files and subdirectories directly within a specified directory path. Can optionally ignore entries matching provided glob patterns.",
+                    parameters={
+                        "properties": {
+                            "path": {
+                                "description": "The absolute path to the directory to list (must be absolute, not relative)",
+                                "type": "string",
+                            },
+                            "ignore": {
+                                "description": "List of glob patterns to ignore",
+                                "items": {"type": "string"},
+                                "type": "array",
+                            },
+                            "respect_git_ignore": {
+                                "description": "Optional: Whether to respect .gitignore patterns when listing files. Only available in git repositories. Defaults to true.",
+                                "type": "boolean",
+                            },
+                        },
+                        "required": ["path"],
+                        "type": "object",
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="read_file",
+                    description="Reads and returns the content of a specified file from the local filesystem. Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), and PDF files. For text files, it can read specific line ranges.",
+                    parameters={
+                        "properties": {
+                            "absolute_path": {
+                                "description": "The absolute path to the file to read (e.g., '/home/user/project/file.txt'). Relative paths are not supported. You must provide an absolute path.",
+                                "type": "string",
+                            },
+                            "offset": {
+                                "description": "Optional: For text files, the 0-based line number to start reading from. Requires 'limit' to be set. Use for paginating through large files.",
+                                "type": "number",
+                            },
+                            "limit": {
+                                "description": "Optional: For text files, maximum number of lines to read. Use with 'offset' to paginate through large files. If omitted, reads the entire file (if feasible, up to a default limit).",
+                                "type": "number",
+                            },
+                        },
+                        "required": ["absolute_path"],
+                        "type": "object",
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search_file_content",
+                    description="Searches for a regular expression pattern within the content of files in a specified directory (or current working directory). Can filter files by a glob pattern. Returns the lines containing matches, along with their file paths and line numbers.",
+                    parameters={
+                        "properties": {
+                            "pattern": {
+                                "description": "The regular expression (regex) pattern to search for within file contents (e.g., 'function\\s+myFunction', 'import\\s+\\{.*\\}\\s+from\\s+.*').",
+                                "type": "string",
+                            },
+                            "path": {
+                                "description": "Optional: The absolute path to the directory to search within. If omitted, searches the current working directory.",
+                                "type": "string",
+                            },
+                            "include": {
+                                "description": "Optional: A glob pattern to filter which files are searched (e.g., '*.js', '*.{ts,tsx}', 'src/**'). If omitted, searches all files (respecting potential global ignores).",
+                                "type": "string",
+                            },
+                        },
+                        "required": ["pattern"],
+                        "type": "object",
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="glob",
+                    description="Efficiently finds files matching specific glob patterns (e.g., `src/**/*.ts`, `**/*.md`), returning absolute paths sorted by modification time (newest first). Ideal for quickly locating files based on their name or path structure, especially in large codebases.",
+                    parameters={
+                        "properties": {
+                            "pattern": {
+                                "description": "The glob pattern to match against (e.g., '**/*.py', 'docs/*.md').",
+                                "type": "string",
+                            },
+                            "path": {
+                                "description": "Optional: The absolute path to the directory to search within. If omitted, searches the root directory.",
+                                "type": "string",
+                            },
+                            "case_sensitive": {
+                                "description": "Optional: Whether the search should be case-sensitive. Defaults to false.",
+                                "type": "boolean",
+                            },
+                            "respect_git_ignore": {
+                                "description": "Optional: Whether to respect .gitignore patterns when finding files. Only available in git repositories. Defaults to true.",
+                                "type": "boolean",
+                            },
+                        },
+                        "required": ["pattern"],
+                        "type": "object",
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="replace",
+                    description="Replaces text within a file. By default, replaces a single occurrence, but can replace multiple occurrences when `expected_replacements` is specified. This tool requires providing significant context around the change to ensure precise targeting. Always use the read_file tool to examine the file's current content before attempting a text replacement.\n\n      The user has the ability to modify the `new_string` content. If modified, this will be stated in the response.\n\nExpectation for required parameters:\n1. `file_path` MUST be an absolute path; otherwise an error will be thrown.\n2. `old_string` MUST be the exact literal text to replace (including all whitespace, indentation, newlines, and surrounding code etc.).\n3. `new_string` MUST be the exact literal text to replace `old_string` with (also including all whitespace, indentation, newlines, and surrounding code etc.). Ensure the resulting code is correct and idiomatic.\n4. NEVER escape `old_string` or `new_string`, that would break the exact literal text requirement.\n**Important:** If ANY of the above are not satisfied, the tool will fail. CRITICAL for `old_string`: Must uniquely identify the single instance to change. Include at least 3 lines of context BEFORE and AFTER the target text, matching whitespace and indentation precisely. If this string matches multiple locations, or does not match exactly, the tool will fail.\n**Multiple replacements:** Set `expected_replacements` to the number of occurrences you want to replace. The tool will replace ALL occurrences that match `old_string` exactly. Ensure the number of replacements matches your expectation.",
+                    parameters={
+                        "properties": {
+                            "file_path": {
+                                "description": "The absolute path to the file to modify. Must start with '/'.",
+                                "type": "string",
+                            },
+                            "old_string": {
+                                "description": "The exact literal text to replace, preferably unescaped. For single replacements (default), include at least 3 lines of context BEFORE and AFTER the target text, matching whitespace and indentation precisely. For multiple replacements, specify expected_replacements parameter. If this string is not the exact literal text (i.e. you escaped it) or does not match exactly, the tool will fail.",
+                                "type": "string",
+                            },
+                            "new_string": {
+                                "description": "The exact literal text to replace `old_string` with, preferably unescaped. Provide the EXACT text. Ensure the resulting code is correct and idiomatic.",
+                                "type": "string",
+                            },
+                            "expected_replacements": {
+                                "type": "number",
+                                "description": "Number of replacements expected. Defaults to 1 if not specified. Use when you want to replace multiple occurrences.",
+                                "minimum": 1,
+                            },
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                        "type": "object",
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="write_file",
+                    description="Writes content to a specified file in the local filesystem. \n      \n      The user has the ability to modify `content`. If modified, this will be stated in the response.",
+                    parameters={
+                        "properties": {
+                            "file_path": {
+                                "description": "The absolute path to the file to write to (e.g., '/home/user/project/file.txt'). Relative paths are not supported.",
+                                "type": "string",
+                            },
+                            "content": {
+                                "description": "The content to write to the file.",
+                                "type": "string",
+                            },
+                        },
+                        "required": ["file_path", "content"],
+                        "type": "object",
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="run_shell_command",
+                    description="This tool executes a given shell command as `bash -c <command>`. Command can start  \
+        background processes using `&`. Command is executed as a subprocess that leads its own process group. Command  \
+        process group can be terminated as `kill -- -PGID` or signaled as `kill -s SIGNAL -- -PGID`.\n\nThe following  \
+        information is returned:\n\nCommand: Executed command.\nDirectory: Directory (relative to project root) where  \
+        command was executed, or `(root)`.\nStdout: Output on stdout stream. Can be `(empty)` or partial on error and  \
+        for any unwaited background processes.\nStderr: Output on stderr stream. Can be `(empty)` or partial on error  \
+        and for any unwaited background processes.\nError: Error or `(none)` if no error was reported for the          \
+        subprocess.\nExit Code: Exit code or `(none)` if terminated by signal.\nSignal: Signal number or `(none)` if   \
+        no signal was received.\nBackground PIDs: List of background processes started or `(none)`.\nProcess Group     \
+        PGID: Process group started or `(none)`",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "Exact bash command to execute as `bash -c <command>`",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Brief description of the command for the user. Be specific and concise.  \
+        Ideally a single sentence. Can be up to 3 sentences for clarity. No line breaks.",
+                            },
+                            "directory": {
+                                "type": "string",
+                                "description": "(OPTIONAL) Directory to run the command in, if not the project root  \
+        directory. Must be relative to the project root directory and must already exist.",
+                            },
+                        },
+                        "required": ["command"],
+                    },
+                ),
+            ),
+        ]
+        model_output = """  I'll solve this step by
+step to create a command line tool for MNIST inference.
+First, let me check what we have in the directory
+and understand the existing files:
+<tool_call>
+<function=list_directory>
+<parameter=path>
+"app"
+</parameter>
+</function>
+</tool_call>
+"""
+
+        # Simulate streaming by chunks
+        chunk_size = 1
+        chunks = [
+            model_output[i : i + chunk_size]
+            for i in range(0, len(model_output), chunk_size)
+        ]
+        print(chunks)
+
+        accumulated_text = ""
+        tool_calls = []
+        chunks_count = 0
+
+        accumulated_text = ""
+        accumulated_calls = []
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, tools=tools)
+            accumulated_text += result.normal_text
+
+            # Track calls by tool_index to handle streaming properly
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+        self.assertEqual(
+            accumulated_text,
+            "  I'll solve this step by \n\
+step to create a command line tool for MNIST inference.\n\
+First, let me check what we have in the directory \n\
+and understand the existing files:\n",
+        )
+        self.assertEqual(len(tool_calls_by_index), 1)
+
+        # Get the complete tool call
+        self.assertIn(0, tool_calls_by_index)
+        tool_call = tool_calls_by_index[0]
+        self.assertEqual(tool_call["name"], "list_directory")
+
+        # Parse the accumulated parameters
+        params = json.loads(tool_call["parameters"])
+        self.assertEqual(params["path"], '"app"')
+
 
 if __name__ == "__main__":
     unittest.main()
