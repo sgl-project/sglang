@@ -7,8 +7,6 @@
 from typing import Optional
 
 import torch
-
-# from vllm import _custom_ops as ops
 from sgl_kernel import causal_conv1d_fwd
 from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 

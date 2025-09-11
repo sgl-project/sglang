@@ -34,9 +34,6 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_target_verify_cuda_graph_runner import (
-    MambaStateUpdateCudaGraphRunner,
-)
 from sglang.srt.speculative.eagle_utils import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -411,6 +408,10 @@ class EAGLEWorker(TpModelWorker):
             )
 
         if self.target_worker.model_runner.is_hybrid_gdn:
+            from sglang.srt.speculative.eagle_target_verify_cuda_graph_runner import (
+                MambaStateUpdateCudaGraphRunner,
+            )
+
             self.cuda_graph_runner_for_target_verify = MambaStateUpdateCudaGraphRunner(
                 self
             )
