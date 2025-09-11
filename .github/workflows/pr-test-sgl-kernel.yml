@@ -60,6 +60,8 @@ jobs:
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         if: github.event_name != 'push' || (matrix.cuda-version != '12.4' && matrix.cuda-version != '12.8')
         run: |
+          # https://github.com/sgl-project/sglang/blob/master/sgl-kernel/README.md
+          sudo apt install -y ccache
           export CCACHE_DIR=~/.cache/ccache_dir
           mkdir -p ${CCACHE_DIR}
           ls -alh ${CCACHE_DIR}
