@@ -60,9 +60,15 @@ jobs:
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         if: github.event_name != 'push' || (matrix.cuda-version != '12.4' && matrix.cuda-version != '12.8')
         run: |
+          export CCACHE_DIR=~/.cache/ccache_dir
+          mkdir -p ${CCACHE_DIR}
+          ls -alh ${CCACHE_DIR}
+
           cd sgl-kernel
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+
+          ls -alh ${CCACHE_DIR}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
