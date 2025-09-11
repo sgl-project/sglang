@@ -50,15 +50,14 @@ if _use_aiter:
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 _is_xpu = is_xpu()
+VLLM_AVAILABLE = False
 if not _is_xpu:
     try:
         import vllm
 
         VLLM_AVAILABLE = True
     except ImportError:
-        VLLM_AVAILABLE = False
-else:
-    VLLM_AVAILABLE = False
+        pass
 
 logger = logging.getLogger(__name__)
 

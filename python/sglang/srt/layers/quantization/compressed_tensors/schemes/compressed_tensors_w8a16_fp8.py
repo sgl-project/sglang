@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.utils import convert_to_channelwise
 from sglang.srt.utils import is_xpu
 
 _is_xpu = is_xpu()
+MARLIN_FP8_AVAILABLE = False
 if not _is_xpu:
     try:
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
@@ -27,16 +28,20 @@ if not _is_xpu:
 
         MARLIN_FP8_AVAILABLE = True
     except ImportError:
-        MARLIN_FP8_AVAILABLE = False
+        pass
 
-        def apply_fp8_marlin_linear(*args, **kwargs):
-            raise ImportError("vllm is not installed")
+if not MARLIN_FP8_AVAILABLE:
 
-        def prepare_fp8_layer_for_marlin(*args, **kwargs):
-            raise ImportError("vllm is not installed")
+    def apply_fp8_marlin_linear(*args, **kwargs):
+        raise ImportError(
+            "vllm marlin_fp8 is not installed or not supported on this device"
+        )
 
-else:
-    MARLIN_FP8_AVAILABLE = False
+    def prepare_fp8_layer_for_marlin(*args, **kwargs):
+        raise ImportError(
+            "vllm marlin_fp8 is not installed or not supported on this device"
+        )
+
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 

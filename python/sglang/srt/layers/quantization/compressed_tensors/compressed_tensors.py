@@ -41,6 +41,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import is_xpu
 
 _is_xpu = is_xpu()
+VLLM_AVAILABLE = False
 if not _is_xpu:
     try:
         from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
@@ -50,9 +51,7 @@ if not _is_xpu:
 
         VLLM_AVAILABLE = True
     except ImportError:
-        VLLM_AVAILABLE = False
-else:
-    VLLM_AVAILABLE = False
+        pass
 
 logger = logging.getLogger(__name__)
 
