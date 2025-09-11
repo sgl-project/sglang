@@ -572,6 +572,18 @@ def is_port_available(port):
             return False
 
 
+cmo_stream = None
+
+
+def get_cmo_stream(device="cuda"):
+    if is_npu():
+        device = "npu"
+    global cmo_stream
+    if cmo_stream is None:
+        cmo_stream = torch.get_device_module(device).Stream()
+    return cmo_stream
+
+
 def get_free_port():
     # try ipv4
     try:
@@ -2895,6 +2907,10 @@ def parse_module_path(module_path, function_name, create_dummy):
         return final_module, getattr(final_module, function_name)
 
     return final_module, None
+
+
+def alloc_len_per_eagle_decode(worker: "EagleWorker") -> int:
+    return max(worker.num_steps * worker.topk, worker.num_draft_tokens)
 
 
 def mxfp_supported():
