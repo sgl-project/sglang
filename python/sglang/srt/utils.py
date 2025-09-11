@@ -806,6 +806,10 @@ def suppress_other_loggers():
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
 
+    _is_xpu = is_xpu()
+    if _is_xpu:
+        return
+
     try:
         from vllm.logger import logger as vllm_default_logger
     except ImportError:
@@ -894,6 +898,9 @@ def monkey_patch_p2p_access_check():
 
 
 def monkey_patch_vllm_gguf_config():
+    if _is_xpu:
+        raise NotImplementedError("GGUF is not supported on XPU.")
+
     try:
         from vllm.model_executor.layers.quantization.gguf import (
             GGUFConfig,
@@ -1607,7 +1614,8 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
             "."
         )
-        major, minor = int(major), int(minor)
+        # Currently XPU version does not contain capability information
+        major, minor = None, None
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         try:

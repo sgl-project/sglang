@@ -27,6 +27,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     set_weight_attrs,
 )
 
@@ -48,11 +49,15 @@ if _use_aiter:
 
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
-try:
-    import vllm
+_is_xpu = is_xpu()
+if not _is_xpu:
+    try:
+        import vllm
 
-    VLLM_AVAILABLE = True
-except ImportError:
+        VLLM_AVAILABLE = True
+    except ImportError:
+        VLLM_AVAILABLE = False
+else:
     VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)

@@ -38,15 +38,20 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.utils import is_xpu
 
-try:
-    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
-        WNA16_SUPPORTED_BITS,
-        CompressedTensorsWNA16,
-    )
+_is_xpu = is_xpu()
+if not _is_xpu:
+    try:
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+            WNA16_SUPPORTED_BITS,
+            CompressedTensorsWNA16,
+        )
 
-    VLLM_AVAILABLE = True
-except ImportError:
+        VLLM_AVAILABLE = True
+    except ImportError:
+        VLLM_AVAILABLE = False
+else:
     VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
