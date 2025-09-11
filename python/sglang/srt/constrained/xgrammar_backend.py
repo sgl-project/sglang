@@ -229,7 +229,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logging.error(f"Hit invalid regex: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
-        return self._from_context(ctx, key_string)
+        return self._from_context(ctx, key_string, GrammarStats())
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
