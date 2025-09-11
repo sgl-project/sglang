@@ -230,8 +230,16 @@ except:
     is_intel_amx_backend_available = False
 
 
+try:
+    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # to support torch compile
+    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+except:
+    is_amx_tile_supported = False
+
+
 def cpu_has_amx_support():
-    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+    return is_amx_tile_supported and is_intel_amx_backend_available
 
 
 def use_intel_amx_backend(layer):
@@ -426,7 +434,9 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        free_gpu_memory = psutil.virtual_memory().available
+        total_free_memory = psutil.virtual_memory().available
+        n_numa_node: int = len(get_cpu_ids_by_node())
+        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
