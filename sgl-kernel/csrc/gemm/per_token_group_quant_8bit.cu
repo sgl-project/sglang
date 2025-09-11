@@ -8,7 +8,7 @@
 
 template <int THREADS_PER_SUBWARP>
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
-  unsigned mask = threadIdx.x % 32 >= 16 ? 0xffff0000 : 0x0000ffff;
+  unsigned mask = 0xffffffff;
 
   static_assert(
       (THREADS_PER_SUBWARP & (THREADS_PER_SUBWARP - 1)) == 0 && THREADS_PER_SUBWARP <= 16 && THREADS_PER_SUBWARP >= 1,
@@ -368,6 +368,10 @@ __global__ void per_token_group_quant_8bit_kernel(
           for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
             float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
             float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
+
+            outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
+            outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
+
             output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
           }
         } else {
