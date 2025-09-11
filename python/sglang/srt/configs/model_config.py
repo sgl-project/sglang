@@ -311,12 +311,14 @@ class ModelConfig:
         model_revision: str = None,
         **kwargs,
     ):
+        is_draft_model = kwargs.get("is_draft_model", False)
+        model_override_args = server_args.json_draft_model_override_args if is_draft_model else server_args.json_model_override_args
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
             context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
+            model_override_args=model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,

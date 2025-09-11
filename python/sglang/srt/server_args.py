@@ -235,6 +235,7 @@ class ServerArgs:
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
+    json_draft_model_override_args: str = "{}"
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
@@ -1430,6 +1431,12 @@ class ServerArgs:
             type=str,
             help="A dictionary in JSON string format used to override default model configurations.",
             default=ServerArgs.json_model_override_args,
+        )
+        parser.add_argument(
+            "--json-draft-model-override-args",
+            type=str,
+            help="A dictionary in JSON string format used to override speculative draft model configurations.",
+            default=ServerArgs.json_draft_model_override_args,
         )
         parser.add_argument(
             "--preferred-sampling-params",

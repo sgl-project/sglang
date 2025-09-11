@@ -116,7 +116,7 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
         elif server_args.speculative_token_map is not None:
             self.hot_token_id = load_token_map(server_args.speculative_token_map)
-            server_args.json_model_override_args = (
+            server_args.json_draft_model_override_args = (
                 f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
             )
         else:
