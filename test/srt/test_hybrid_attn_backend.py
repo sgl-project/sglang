@@ -111,7 +111,7 @@ class TestHybridAttnBackendTorchCompile(TestHybridAttnBackendBase):
         return DEFAULT_SERVER_ARGS + ["--enable-torch-compile"]
 
 
-class TestHybridAttnBackendSpeculativeDecoding(TestHybridAttnBackendBase):
+class TestHybridAttnBackendSpeculativeDecodingPrefillBackend(TestHybridAttnBackendBase):
     speculative_decode = True
     # This eagle test uses a very small model, so the accuracy is low.
     accuracy_threshold = 0.2
@@ -129,28 +129,7 @@ class TestHybridAttnBackendSpeculativeDecoding(TestHybridAttnBackendBase):
             "2",
             "--speculative-num-draft-tokens",
             "4",
-        ]
-
-
-class TestHybridAttnBackendSpeculativeDecodingPrefillBackend(TestHybridAttnBackendBase):
-    speculative_decode = True
-    # This eagle test uses a very small model, so the accuracy is low.
-    accuracy_threshold = 0.2
-
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_SERVER_ARGS + [
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-draft",
-            DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "2",
-            "--speculative-num-draft-tokens",
-            "4",
-            "--speculative-attention-backend",
+            "--speculative-attention-mode",
             "prefill",
         ]
 
@@ -165,7 +144,7 @@ class TestHybridAttnBackendSpeculativeDecodingDecodeBackend(TestHybridAttnBacken
         return DEFAULT_SERVER_ARGS + [
             "--speculative-algorithm",
             "EAGLE",
-            "--speculative-draft",
+            "--speculative-draft-model-path",
             DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
             "--speculative-num-steps",
             "3",
@@ -173,7 +152,7 @@ class TestHybridAttnBackendSpeculativeDecodingDecodeBackend(TestHybridAttnBacken
             "2",
             "--speculative-num-draft-tokens",
             "4",
-            "--speculative-attention-backend",
+            "--speculative-attention-mode",
             "decode",
         ]
 
