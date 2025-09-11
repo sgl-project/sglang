@@ -214,6 +214,7 @@ class EAGLEWorker(TpModelWorker):
             "triton": self._create_triton_decode_backend,
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
+            "hybrid_linear_attn": self._create_fa3_decode_backend,
             "flashmla": self._create_flashmla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
@@ -231,6 +232,7 @@ class EAGLEWorker(TpModelWorker):
             "triton": self._create_triton_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
+            "hybrid_linear_attn": self._create_fa3_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
         }
@@ -403,6 +405,15 @@ class EAGLEWorker(TpModelWorker):
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            )
+
+        if self.target_worker.model_runner.is_hybrid_gdn:
+            from sglang.srt.speculative.eagle_target_verify_cuda_graph_runner import (
+                MambaStateUpdateCudaGraphRunner,
+            )
+
+            self.cuda_graph_runner_for_target_verify = MambaStateUpdateCudaGraphRunner(
+                self
             )
 
     @property
@@ -825,6 +836,24 @@ class EAGLEWorker(TpModelWorker):
             res.accepted_indices
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+
+        # QQ: can be optimized
+        if self.target_worker.model_runner.is_hybrid_gdn:
+            # res.draft_input.accept_length is on GPU but may be empty for last verify?
+            accepted_length = (
+                torch.tensor(
+                    res.accept_length_per_req_cpu,
+                    device=logits_output.hidden_states.device,
+                    dtype=torch.int32,
+                )
+                + 1
+            )
+            if self.cuda_graph_runner_for_target_verify.can_run(accepted_length):
+                self.cuda_graph_runner_for_target_verify.replay(accepted_length)
+            else:
+                self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+                    accepted_length, self.target_worker.model_runner.model
+                )
 
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)

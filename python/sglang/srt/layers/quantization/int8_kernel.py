@@ -12,13 +12,7 @@ from sglang.srt.utils import get_device_name, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    # Temporary
-    try:
-        from sgl_kernel import sgl_per_token_group_quant_8bit
-    except ImportError:
-        from sgl_kernel import (
-            sgl_per_token_group_quant_int8 as sgl_per_token_group_quant_8bit,
-        )
+    from sgl_kernel import sgl_per_token_group_quant_int8
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +204,7 @@ def sglang_per_token_group_quant_int8(
         dtype=torch.float32,
     )
 
-    sgl_per_token_group_quant_8bit(x, x_q, x_s, group_size, eps, int8_min, int8_max)
+    sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
 
     return x_q, x_s
 
