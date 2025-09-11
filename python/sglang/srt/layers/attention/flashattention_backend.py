@@ -702,24 +702,24 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id if layer_id is None else layer_id
             )
-            key_cache = key_cache.view(-1, self.page_size, 8, 128)
-            value_cache = value_cache.view(-1, self.page_size, 8, 128)
+            key_cache = key_cache.view(-1, self.page_size, 8, 64)
+            value_cache = value_cache.view(-1, self.page_size, 8, 64)
             # if layer.is_cross_attention:
             #     page_table = metadata.encoder_page_table
             #     cache_seqlens = metadata.encoder_lens_int32
             #     cu_seqlens_k = metadata.encoder_cu_seqlens_k
             #     window_size = (-1, -1)
 
-            print("q shape", q.contiguous().view(-1, 32, 128).shape)
-            print("key_cache shape", key_cache.shape)
-            print("value_cache shape", value_cache.shape)
+            # print("q shape", q.contiguous().view(-1, 32, 64).shape)
+            # print("key_cache shape", key_cache.shape)
+            # print("value_cache shape", value_cache.shape)
             # print("cache_seqlens shape", cache_seqlens.shape)
             # print("cu_seqlens_q shape", cu_seqlens_q.shape)
             # print("cu_seqlens_k shape", cu_seqlens_k.shape)
             # print("max_seqlen_q shape", max_seqlen_q)
 
             result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, 32, 128),
+                q=q.contiguous().view(-1, 32, 64),
                 k_cache=key_cache,
                 v_cache=value_cache,
                 page_table=page_table,
@@ -736,7 +736,7 @@ class FlashAttentionBackend(AttentionBackend):
                 return_softmax_lse=use_cascade_attn,
             )
 
-            return result.view(-1, 32 * 128)
+            return result.view(-1, 32 * 64)
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result

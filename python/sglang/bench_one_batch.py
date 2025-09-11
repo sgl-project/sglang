@@ -10,7 +10,7 @@ python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruc
 ## sweep through multiple data points and store (append) the results in a jsonl file:
 python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --output-len 32 256 --run-name test_run
 ## run with profiling:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --profile
+python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --profile
 # Usage (correctness test):
 python -m sglang.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
 
@@ -50,7 +50,7 @@ import logging
 import multiprocessing
 import os
 import time
-from typing import Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -76,6 +76,61 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
+
+# ------------------------------------------------------------
+# Prefill Static Context (Option 1): persistent tensors outside backend
+# ------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class PrefillStaticCtx:
+    shape_key: Optional[Tuple[int, int]] = None  # (batch_size, input_len)
+    tensor_names: Optional[List[str]] = None  # names of bound tensors on ForwardBatch
+    static_tensors: Optional[Dict[str, torch.Tensor]] = (
+        None  # name -> persistent tensor
+    )
+
+
+def _collect_cuda_tensor_fields(fb: ForwardBatch) -> List[str]:
+    """Collect CUDA tensor attribute names on ForwardBatch to stabilize for prefill.
+    We keep it general: pick CUDA tensors from __dict__ (skip privates)."""
+    names = []
+    for k, v in vars(fb).items():
+        if k.startswith("_"):
+            continue
+        if torch.is_tensor(v) and v.is_cuda:
+            names.append(k)
+    return names
+
+
+def _alloc_static_like_from_fields(
+    fb: ForwardBatch, names: List[str]
+) -> Dict[str, torch.Tensor]:
+    static = {}
+    for n in names:
+        t = getattr(fb, n)
+        # identical shape/dtype/device; detach to avoid autograd baggage
+        static[n] = torch.empty_like(t, device=t.device, dtype=t.dtype).detach()
+    return static
+
+
+def _copy_into_static(
+    static: Dict[str, torch.Tensor], fb: ForwardBatch, names: List[str]
+) -> None:
+    for n in names:
+        static[n].copy_(getattr(fb, n), non_blocking=False)
+
+
+def _bind_forwardbatch_to_static(
+    fb: ForwardBatch, static: Dict[str, torch.Tensor], names: List[str]
+) -> None:
+    for n in names:
+        setattr(fb, n, static[n])
+
+
+# ------------------------------------------------------------
+# Bench config
+# ------------------------------------------------------------
 
 
 @dataclasses.dataclass
@@ -233,7 +288,8 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
 
 
 @torch.no_grad
-def extend(reqs, model_runner):
+def extend(reqs, model_runner, static_ctx: Optional[PrefillStaticCtx] = None):
+    # Build the usual batch/forward_batch
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
@@ -248,6 +304,36 @@ def extend(reqs, model_runner):
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+
+    # ---------- Hard-coded prefill static ctx: (bs=1, il=256) ----------
+    if static_ctx is not None:
+        # We won't infer shapes; we always treat the prefill bucket as (1, 256)
+        HARD_CODED_SHAPE_KEY = (1, 256)
+
+        # On first use, allocate persistent CUDA tensors for ALL CUDA fields in ForwardBatch
+        if (
+            static_ctx.static_tensors is None
+            or static_ctx.shape_key != HARD_CODED_SHAPE_KEY
+        ):
+            names = _collect_cuda_tensor_fields(
+                forward_batch
+            )  # gather CUDA tensor fields to stabilize
+            static_tensors = _alloc_static_like_from_fields(forward_batch, names)
+
+            static_ctx.shape_key = HARD_CODED_SHAPE_KEY
+            static_ctx.tensor_names = names
+            static_ctx.static_tensors = static_tensors
+
+        # Copy fresh values into the persistent tensors (outside compiled/captured graph)
+        _copy_into_static(
+            static_ctx.static_tensors, forward_batch, static_ctx.tensor_names
+        )
+        # Rebind ForwardBatch to point at the persistent tensors (fixed data_ptr for CG replay)
+        _bind_forwardbatch_to_static(
+            forward_batch, static_ctx.static_tensors, static_ctx.tensor_names
+        )
+
+    # Forward + sample (unchanged)
     logits_output, _ = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
@@ -342,7 +428,16 @@ def latency_test_run_once(
     log_decode_step,
     profile,
     profile_filename_prefix,
+    *,
+    prefill_static_ctx: Optional[PrefillStaticCtx] = None,
 ):
+    import os
+    import time
+
+    import numpy as np
+    import torch
+
+    # Max batch gate
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
         rank_print(
@@ -350,7 +445,7 @@ def latency_test_run_once(
         )
         return
 
-    # Clear the pools.
+    # Clear pools
     model_runner.req_to_token_pool.clear()
     model_runner.token_to_kv_pool_allocator.clear()
 
@@ -361,7 +456,7 @@ def latency_test_run_once(
         "output_len": output_len,
     }
 
-    tot_latency = 0
+    tot_latency = 0.0
 
     profiler = None
     if profile:
@@ -374,34 +469,42 @@ def latency_test_run_once(
         )
         profiler.start()
 
-    # Prefill
+    # --------------------
+    # Prefill (with static ctx to stabilize addresses)
+    # --------------------
     synchronize(device)
     tic = time.perf_counter()
-    next_token_ids, _, batch = extend(reqs, model_runner)
+    next_token_ids_dyn, _, batch = extend(
+        reqs, model_runner, static_ctx=prefill_static_ctx
+    )
     synchronize(device)
     prefill_latency = time.perf_counter() - tic
     tot_latency += prefill_latency
-    throughput = input_len * batch_size / prefill_latency
+    prefill_tput = input_len * batch_size / prefill_latency
     rank_print(
-        f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s"
+        f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {prefill_tput:9.2f} token/s"
     )
     measurement_results["prefill_latency"] = prefill_latency
-    measurement_results["prefill_throughput"] = throughput
+    measurement_results["prefill_throughput"] = prefill_tput
 
-    # Decode
+    # --------------------
+    # Decode loop (unchanged; keep your existing piecewise CG on decode if used)
+    # If you truly run prefill-only, output_len will be 1 and this won't execute.
+    # --------------------
     decode_latencies = []
-    for i in range(output_len - 1):
+    for i in range(max(0, output_len - 1)):
         synchronize(device)
         tic = time.perf_counter()
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+        next_token_ids_dyn, _ = decode(next_token_ids_dyn, batch, model_runner)
         synchronize(device)
-        latency = time.perf_counter() - tic
-        tot_latency += latency
-        throughput = batch_size / latency
-        decode_latencies.append(latency)
+        step_latency = time.perf_counter() - tic
+        tot_latency += step_latency
+        decode_latencies.append(step_latency)
+
         if i < 5 or (log_decode_step > 0 and i % log_decode_step == 0):
+            step_tput = batch_size / step_latency
             rank_print(
-                f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
+                f"Decode {i}. Batch size: {batch_size}, latency: {step_latency:6.5f} s, throughput: {step_tput:9.2f} token/s"
             )
 
     if profile:
@@ -412,9 +515,8 @@ def latency_test_run_once(
         profiler.export_chrome_trace(profile_filename)
         rank_print(f"torch profiler chrome trace saved to {profile_filename}")
 
-    # Record decode timing from 2nd output
-    if output_len > 1:
-        med_decode_latency = np.median(decode_latencies)
+    if decode_latencies:
+        med_decode_latency = float(np.median(decode_latencies))
         med_decode_throughput = batch_size / med_decode_latency
         rank_print(
             f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
@@ -453,6 +555,9 @@ def latency_test(
         bench_args.batch_size[0], bench_args.input_len[0]
     )
 
+    # Create one static ctx for this (bs, il) prefill shape and reuse it
+    prefill_static_ctx = PrefillStaticCtx()
+
     # Warm up
     rank_print("Warmup ...")
     latency_test_run_once(
@@ -462,36 +567,63 @@ def latency_test(
         reqs,
         bench_args.batch_size[0],
         bench_args.input_len[0],
-        min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
+        min(32, bench_args.output_len[0]),  # shorter decode for warmup
         server_args.device,
         log_decode_step=0,
         profile=False,
         profile_filename_prefix="",  # not used
+        prefill_static_ctx=prefill_static_ctx,
+    )
+
+    latency_test_run_once(
+        bench_args.run_name,
+        model_runner,
+        rank_print,
+        reqs,
+        bench_args.batch_size[0],
+        bench_args.input_len[0],
+        min(32, bench_args.output_len[0]),
+        server_args.device,
+        log_decode_step=0,
+        profile=False,
+        profile_filename_prefix="",
+        prefill_static_ctx=prefill_static_ctx,
+    )
+
+    latency_test_run_once(
+        bench_args.run_name,
+        model_runner,
+        rank_print,
+        reqs,
+        bench_args.batch_size[0],
+        bench_args.input_len[0],
+        min(32, bench_args.output_len[0]),
+        server_args.device,
+        log_decode_step=0,
+        profile=False,
+        profile_filename_prefix="",
+        prefill_static_ctx=prefill_static_ctx,
     )
 
     rank_print("Benchmark ...")
 
-    # Run the sweep
+    # Run the sweep (single point as in your current code)
     result_list = []
-    for bs, il, ol in itertools.product(
-        bench_args.batch_size, bench_args.input_len, bench_args.output_len
-    ):
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
-        ret = latency_test_run_once(
-            bench_args.run_name,
-            model_runner,
-            rank_print,
-            reqs,
-            bs,
-            il,
-            ol,
-            server_args.device,
-            bench_args.log_decode_step,
-            bench_args.profile if tp_rank == 0 else None,
-            bench_args.profile_filename_prefix,
-        )
-        if ret is not None:
-            result_list.append(ret)
+    ret = latency_test_run_once(
+        bench_args.run_name,
+        model_runner,
+        rank_print,
+        reqs,
+        bench_args.batch_size[0],
+        bench_args.input_len[0],
+        bench_args.output_len[0],
+        server_args.device,
+        log_decode_step=0,
+        profile=True,
+        profile_filename_prefix="",
+        prefill_static_ctx=prefill_static_ctx,
+    )
+    result_list.append(ret)
 
     # Write results in jsonlines format on rank 0.
     if tp_rank == 0 and bench_args.result_filename:

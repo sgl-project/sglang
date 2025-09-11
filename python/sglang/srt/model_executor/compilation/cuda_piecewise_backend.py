@@ -238,6 +238,7 @@ class CUDAPiecewiseBackend:
         #     return entry.runnable(*args)
 
         if entry.cudagraph is None:
+            print(f"Capturing a cudagraph for shape {runtime_shape}!")
             if entry.num_finished_warmup < 1:  # noqa
                 entry.num_finished_warmup += 1
                 if self.is_first_graph:
@@ -305,6 +306,6 @@ class CUDAPiecewiseBackend:
                 "Input addresses for cudagraphs are different during replay."
                 f" Expected {entry.input_addresses}, got {new_input_addresses}"
             )
-
+        print(f"Replaying a cudagraph for shape {runtime_shape}")
         entry.cudagraph.replay()
         return entry.output
