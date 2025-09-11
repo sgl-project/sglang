@@ -893,7 +893,7 @@ class ServerArgs:
             "1" if self.disable_outlines_disk_cache else "0"
         )
 
-        if self.schedule_policy and self.prefix_cache_backend == "lora":
+        if self.prefix_cache_backend == "lora" and self.schedule_policy != "fcfs":
             raise ValueError("LoRA radix cache only supports FCFS policy")
 
     @staticmethod
