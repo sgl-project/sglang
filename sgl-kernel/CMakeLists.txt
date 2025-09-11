@@ -270,6 +270,8 @@ set(SOURCES
     "csrc/elementwise/copy.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
+    "csrc/elementwise/fused_rms_norm_quant.cu"
+    "csrc/elementwise/fused_add_rms_norm_quant.cu"
     "csrc/elementwise/rope.cu"
     "csrc/common_extension.cc"
 
