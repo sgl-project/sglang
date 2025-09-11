@@ -58,7 +58,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.8",
+    "sgl-kernel==0.3.9.post2",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
@@ -68,7 +68,7 @@ srt = [
 
 blackwell = [
     "sglang[runtime_common]",
-    "sgl-kernel",
+    "sgl-kernel==0.3.9.post2",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
