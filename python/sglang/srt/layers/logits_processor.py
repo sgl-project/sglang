@@ -37,6 +37,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     get_global_dp_buffer,
     get_local_attention_dp_size,
+    get_dp_hidden_size,
+    get_dp_dtype,
+    get_dp_device,
     set_dp_buffer_len,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -187,18 +190,29 @@ class LogitsMetadata:
         self.dp_local_start_pos = dp_local_start_pos
         self.dp_local_num_tokens = dp_local_num_tokens
 
+        hidden_size = get_dp_hidden_size()
+        dtype = get_dp_dtype()
+        device = get_dp_device()
+
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage
-            self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
+            self.gathered_buffer = torch.empty(
+                (
+                    sum(self.global_num_tokens_for_logprob_cpu),
+                    hidden_size,
+                ),
+                dtype=dtype,
+                device=device,
+            )
         else:
-            self.global_dp_buffer_len = self.global_dp_buffer_len
-
-        set_dp_buffer_len(
-            self.global_dp_buffer_len,
-            self.dp_local_num_tokens,
-            self.global_num_tokens_for_logprob_cpu,
-        )
-
+            self.gathered_buffer = torch.empty(
+                (
+                    self.global_dp_buffer_len,
+                    hidden_size,
+                ),
+                dtype=dtype,
+                device=device,
+            )
 
 class LogitsProcessor(nn.Module):
     def __init__(
@@ -443,7 +457,7 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata()
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(),
+                logits_metadata.gathered_buffer,
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
