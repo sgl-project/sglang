@@ -1085,16 +1085,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             ) and self.flashinfer_mla_disable_ragged
 
             original_mode = getattr(forward_batch, "_original_forward_mode", None)
-            skip_chunked_mha = False
-            # TODO(shuw@nvidia.com) Only flashinfer cutlass and cutlass_mla backend has accuracy issue on blackwell.
-            if (
-                original_mode is not None
-                and original_mode.is_decode()
-                and is_sm100_supported()
-                and self.current_attention_backend in ("cutlass_mla", "flashinfer")
-            ):
-                skip_chunked_mha = True
-
             if (
                 not disable_ragged
                 and forward_batch.forward_mode.is_extend()
@@ -1107,13 +1097,20 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                     or sum_extend_prefix_lens == 0
                 )
-                and not skip_chunked_mha
+                # TODO(shuw@nvidia.com) Flashinfer cutlass and trtllm_mla backend have accuracy issue on blackwell for
+				# dp case. Redirect to mla kernel as a workaround.
+                # Tracked by https://github.com/sgl-project/sglang/issues/9806. 
+                and not (
+                    original_mode is not None
+                    and original_mode.is_decode()
+                    and is_sm100_supported()
+                    and self.current_attention_backend in ("cutlass_mla", "flashinfer")
+                )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return _dispatch_mla_subtype()
         elif attention_backend == "trtllm_mla":
-            # TODO(shuw@nvidia.com) Same reason as mentioned in flashinfer branch.
             original_mode = getattr(forward_batch, "_original_forward_mode", None)
             skip_chunked_mha = False
             if (
