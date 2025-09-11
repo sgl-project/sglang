@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from enum import Enum
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Protocol, TypeGuard, Union, runtime_checkable
 
 import torch
@@ -15,8 +15,10 @@ if TYPE_CHECKING:
         DeepEPNormalOutput,
         StandardCombineInput,
         StandardDispatchOutput,
-        MoRINormalOutput,
-        MoRILLOutput,
+        MoRIEPLLCombineInput,
+        MoRIEPLLOutput,
+        MoRIEPNormalCombineInput,
+        MoRIEPNormalOutput,
     )
     from sglang.srt.layers.moe.topk import TopKOutput
 
@@ -54,24 +56,25 @@ class DispatchOutputChecker:
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[AscendDeepEPLLOutput]:
         return dispatch_output.format.is_ascent_ll()
-
+    
+    @staticmethod
+    def format_is_mori(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[Union[MoRIEPNormalOutput, MoRIEPLLOutput]]:
+        return dispatch_output.format.is_mori()
+    
     @staticmethod
     def format_is_mori_normal(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[MoRINormalOutput]:
+    ) -> TypeGuard[MoRIEPNormalOutput]:
         return dispatch_output.format.is_mori_normal()
 
     @staticmethod
     def format_is_mori_ll(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[MoRILLOutput]:
+    ) -> TypeGuard[MoRIEPLLOutput]:
         return dispatch_output.format.is_mori_ll()
 
-    @staticmethod
-    def format_is_mori(
-        dispatch_output: DispatchOutput,
-    ) -> TypeGuard[Union[MoRINormalOutput, MoRILLOutput]]:
-        return dispatch_output.format.is_mori()
 
 class DispatchOutputFormat(Enum):
 
@@ -79,8 +82,8 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     ASCENT_LL = "ascent_ll"
-    MORI_NORMAL = "mori_normal"
-    MORI_LL = "mori_ll"
+    MORIEP_NORMAL = auto() # GW: string -> auto() from v0.5.2rc2 
+    MORIEP_LL = auto()
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -99,18 +102,19 @@ class DispatchOutputFormat(Enum):
 
     def is_ascent_ll(self) -> bool:
         return self == DispatchOutputFormat.ASCENT_LL
-
-    def is_mori_normal(self) -> bool:
-        return self == DispatchOutputFormat.MORI_NORMAL
-
-    def is_mori_ll(self) -> bool:
-        return self == DispatchOutputFormat.MORI_LL
-
+    
     def is_mori(self) -> bool:
         return self in [
-            DispatchOutputFormat.MORI_NORMAL,
-            DispatchOutputFormat.MORI_LL,
+            DispatchOutputFormat.MORIEP_NORMAL,
+            DispatchOutputFormat.MORIEP_LL,
         ]
+    
+    def is_mori_normal(self) -> bool:
+        return self == DispatchOutputFormat.MORIEP_NORMAL
+    
+    def is_mori_ll(self) -> bool:
+        return self == DispatchOutputFormat.MORIEP_LL
+
 
 @runtime_checkable
 class DispatchOutput(Protocol):
@@ -152,12 +156,36 @@ class CombineInputChecker:
             CombineInputFormat.DEEPEP_NORMAL,
             CombineInputFormat.DEEPEP_LL,
         ]
+    
+    @staticmethod
+    def format_is_mori_normal(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MoRIEPNormalCombineInput]:
+        return combine_input.format == CombineInputFormat.MORIEP_NORMAL
+
+    @staticmethod
+    def format_is_mori_ll(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MoRIEPLLCombineInput]:
+        return combine_input.format == CombineInputFormat.MORIEP_LL
+    
+    
+    @staticmethod
+    def format_is_mori(
+        combine_input: CombineInput,
+    ) -> TypeGuard[Union[MoRIEPNormalOutput, MoRIEPLLOutput]]:
+        return combine_input.format in [
+            CombineInputFormat.MORIEP_NORMAL,
+            CombineInputFormat.MORIEP_LL,
+        ]
 
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    MORIEP_NORMAL = auto()
+    MORIEP_LL = auto()
 
 
 @runtime_checkable

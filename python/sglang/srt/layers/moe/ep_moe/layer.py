@@ -451,6 +451,7 @@ class DeepEPMoE(EPMoE):
 
         if _use_aiter:
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
+            assert DispatchOutputChecker.format_is_mori(dispatch_output)
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
         if _is_npu:
@@ -776,6 +777,8 @@ class DeepEPMoE(EPMoE):
 
         return hidden_states
 
+class MoriEPMoE(EPMoE):
+    pass
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
