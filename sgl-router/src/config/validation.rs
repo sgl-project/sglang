@@ -95,6 +95,20 @@ impl ConfigValidator {
                     Self::validate_policy(d_policy)?;
                 }
             }
+            RoutingMode::OpenAI { worker_urls } => {
+                // Require exactly one worker URL for OpenAI router
+                if worker_urls.len() != 1 {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "OpenAI mode requires exactly one --worker-urls entry".to_string(),
+                    });
+                }
+                // Validate URL format
+                if let Err(e) = url::Url::parse(&worker_urls[0]) {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!("Invalid OpenAI worker URL '{}': {}", &worker_urls[0], e),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -242,6 +256,12 @@ impl ConfigValidator {
                         reason: "PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
                     });
                 }
+            }
+            RoutingMode::OpenAI { .. } => {
+                // OpenAI mode doesn't use service discovery
+                return Err(ConfigError::ValidationFailed {
+                    reason: "OpenAI mode does not support service discovery".to_string(),
+                });
             }
         }
 

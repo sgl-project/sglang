@@ -9,13 +9,12 @@ from sglang.test.run_eval import run_eval
 
 
 @pytest.mark.e2e
-def test_mmlu(e2e_router_only_rr, e2e_primary_worker, e2e_model):
-    # Attach the primary worker to a fresh router-only instance (single model)
+def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):
+    # Attach two dp=2 workers (total 4 GPUs) to a fresh router-only instance
     base = e2e_router_only_rr.url
-    r = requests.post(
-        f"{base}/add_worker", params={"url": e2e_primary_worker.url}, timeout=180
-    )
-    r.raise_for_status()
+    for w in e2e_two_workers_dp2:
+        r = requests.post(f"{base}/add_worker", params={"url": w.url}, timeout=180)
+        r.raise_for_status()
 
     args = SimpleNamespace(
         base_url=base,
@@ -27,6 +26,30 @@ def test_mmlu(e2e_router_only_rr, e2e_primary_worker, e2e_model):
     )
     metrics = run_eval(args)
     assert metrics["score"] >= 0.65
+
+
+@pytest.mark.e2e
+def test_genai_bench(
+    e2e_router_only_rr, e2e_two_workers_dp2, e2e_model, genai_bench_runner
+):
+    """Attach a worker to the regular router and run a short genai-bench."""
+    base = e2e_router_only_rr.url
+    for w in e2e_two_workers_dp2:
+        r = requests.post(f"{base}/add_worker", params={"url": w.url}, timeout=180)
+        r.raise_for_status()
+
+    genai_bench_runner(
+        router_url=base,
+        model_path=e2e_model,
+        experiment_folder="benchmark_round_robin_regular",
+        thresholds={
+            "ttft_mean_max": 6,
+            "e2e_latency_mean_max": 14,
+            "input_throughput_mean_min": 1000,
+            "output_throughput_mean_min": 12,
+        },
+        kill_procs=e2e_two_workers_dp2,
+    )
 
 
 @pytest.mark.e2e
