@@ -106,7 +106,7 @@ class MooncakeStore(HiCacheStorage):
                     "Mooncake Configuration loaded from extra_config successfully."
                 )
             else:
-                # Load from environment variables
+                # Load from config file
                 self.config = MooncakeStoreConfig.from_file()
                 logger.info("Mooncake Configuration loaded from file successfully.")
 
