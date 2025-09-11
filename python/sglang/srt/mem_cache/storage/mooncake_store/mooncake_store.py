@@ -33,8 +33,12 @@ class MooncakeStoreConfig:
             raise ValueError(
                 "The environment variable 'SGLANG_HICACHE_MOONCAKE_CONFIG_PATH' is not set."
             )
-        with open(file_path) as fin:
-            config = json.load(fin)
+        try:
+            with open(file_path) as fin:
+                config = json.load(fin)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
+        
         return MooncakeStoreConfig(
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
@@ -101,6 +105,8 @@ class MooncakeStoreConfig:
 
 
 class MooncakeStore(HiCacheStorage):
+    default_env_var: str = "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"
+
     def __init__(self, storage_config: HiCacheStorageConfig = None):
         try:
             from mooncake.store import MooncakeDistributedStore
