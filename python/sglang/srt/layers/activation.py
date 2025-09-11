@@ -33,7 +33,9 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
+    is_xpu,
     set_weight_attrs,
 )
 from sglang.utils import resolve_obj_by_qualname
@@ -42,9 +44,13 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
+_is_xpu = is_xpu()
 
-if _is_cuda:
+if _is_cuda or _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+elif _is_hip:
+    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
 
 if is_npu():
     import torch_npu
@@ -66,8 +72,6 @@ class SiluAndMul(CustomOp):
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:
-            d = x.shape[-1] // 2
-            output_shape = x.shape[:-1] + (d,)
             out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
             return out
         else:
@@ -77,17 +81,20 @@ class SiluAndMul(CustomOp):
         out = torch_npu.npu_swiglu(x)
         return out
 
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        silu_and_mul(x, out)
+        return out
+
 
 class GeluAndMul(CustomOp):
     def __init__(self, approximate="tanh"):
         super().__init__()
         self.approximate = approximate
 
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
-
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -98,6 +105,33 @@ class GeluAndMul(CustomOp):
         else:
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_cpu_amx_available and self.approximate == "tanh":
+            return torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x)
+        elif _is_cpu_amx_available and self.approximate == "none":
+            return torch.ops.sgl_kernel.gelu_and_mul_cpu(x)
+        else:
+            return self.forward_native(x)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_impl(x)
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_impl(x)
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        y_npu, gelu_npu = torch_npu.npu_geglu(
+            x,
+            dim=-1,
+            approximate=1 if self.approximate == "tanh" else 0,
+            activate_left=True,
+        )
+        return y_npu
 
 
 class NewGELU(CustomOp):
@@ -126,8 +160,15 @@ class QuickGELU(CustomOp):
         return x * torch.sigmoid(1.702 * x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO(zhyncs): Implement the CUDA kernel for QuickGELU in sgl-kernel
         return self.forward_native(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        gelu_quick(x, out)
+        return out
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        return torch_npu.npu_fast_gelu(x)
 
 
 class ScaledActivation(nn.Module):
@@ -222,8 +263,10 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         return nn.Identity()
 
 
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
+if not (
+    _is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip or _is_xpu
+):
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV, Non-AMD platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
