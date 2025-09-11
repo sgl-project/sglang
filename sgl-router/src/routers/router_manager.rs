@@ -293,11 +293,10 @@ impl RouterManager {
 
     /// List all workers
     pub fn list_workers(&self) -> WorkerListResponse {
-        let workers = self.worker_registry.get_all();
+        let workers = self.worker_registry.get_all_with_ids();
         let worker_infos: Vec<WorkerInfo> = workers
             .iter()
-            .enumerate()
-            .map(|(i, w)| self.worker_to_info(&format!("worker-{}", i), w))
+            .map(|(id, w)| self.worker_to_info(id.as_str(), w))
             .collect();
 
         let total = worker_infos.len();

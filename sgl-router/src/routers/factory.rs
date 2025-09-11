@@ -48,8 +48,7 @@ impl RouterFactory {
                 // Route to HTTP implementation based on routing mode
                 match &ctx.router_config.mode {
                     RoutingMode::Regular { worker_urls } => {
-                        Self::create_regular_router(worker_urls, &ctx.router_config.policy, ctx)
-                            .await
+                        Self::create_regular_router(worker_urls, ctx).await
                     }
                     RoutingMode::PrefillDecode {
                         prefill_urls,
@@ -75,15 +74,11 @@ impl RouterFactory {
         }
     }
 
-    /// Create a regular router with injected policy
+    /// Create a regular router
     pub async fn create_regular_router(
         worker_urls: &[String],
-        _policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // PolicyRegistry is now used for policy management
-        // The policy_config is used to initialize the default policy in PolicyRegistry
-
         // Create regular router with context
         let router = Router::new(worker_urls.to_vec(), ctx).await?;
 

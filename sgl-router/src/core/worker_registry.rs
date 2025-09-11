@@ -100,7 +100,7 @@ impl WorkerRegistry {
             .entry(model_id)
             .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
             .write()
-            .unwrap()
+            .expect("RwLock for model_index is poisoned")
             .push(worker.clone());
 
         // Update type index
@@ -134,7 +134,7 @@ impl WorkerRegistry {
                 let worker_url = worker.url();
                 model_index_entry
                     .write()
-                    .unwrap()
+                    .expect("RwLock for model_index is poisoned")
                     .retain(|w| w.url() != worker_url);
             }
 
@@ -188,7 +188,12 @@ impl WorkerRegistry {
     pub fn get_by_model_fast(&self, model_id: &str) -> Vec<Arc<dyn Worker>> {
         self.model_index
             .get(model_id)
-            .map(|workers| workers.read().unwrap().clone())
+            .map(|workers| {
+                workers
+                    .read()
+                    .expect("RwLock for model_index is poisoned")
+                    .clone()
+            })
             .unwrap_or_default()
     }
 
@@ -232,6 +237,14 @@ impl WorkerRegistry {
         self.workers
             .iter()
             .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Get all workers with their IDs
+    pub fn get_all_with_ids(&self) -> Vec<(WorkerId, Arc<dyn Worker>)> {
+        self.workers
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect()
     }
 
