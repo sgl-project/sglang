@@ -68,7 +68,8 @@ nohup mooncake_master > mooncake_master.out &
 
 **Launch Mooncake `store service`:**
 
-First, create and save a configuration file in JSON format. For example:
+1. Declare the path of the mooncake configuration file, which will read the configuration inside the file from this variable
+2. Write JSON configuration to the declared configuration file
 
 ```
 export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicache/mooncake_config.json
