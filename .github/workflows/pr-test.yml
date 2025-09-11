@@ -40,7 +40,9 @@ jobs:
               - "test/**"
               - ".github/workflows/pr-test.yml"
 
-  check-changes-sgl-kernel:
+  # =============================================== sgl-kernel ====================================================
+
+  sgl-kernel-check-changes:
     runs-on: ubuntu-latest
     outputs:
       src: ${{ steps.filter.outputs.src }}
@@ -56,10 +58,12 @@ jobs:
             src:
               - "sgl-kernel/**"
 
-  # =============================================== sgl-kernel ====================================================
-
   sgl-kernel-lint:
     runs-on: ubuntu-latest
+    needs: sgl-kernel-check-changes
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false &&
+      needs.sgl-kernel-check-changes.outputs.src == 'true'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -73,7 +77,10 @@ jobs:
           style: file
 
   sgl-kernel-build-wheels:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    needs: sgl-kernel-check-changes
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false &&
+      needs.sgl-kernel-check-changes.outputs.src == 'true'
     runs-on: sgl-kernel-build-node
     strategy:
       matrix:
@@ -113,8 +120,10 @@ jobs:
           path: sgl-kernel/dist/*
 
   sgl-kernel-unit-test:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    needs: sgl-kernel-build-wheels
+    needs: [sgl-kernel-check-changes, sgl-kernel-build-wheels]
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false &&
+      needs.sgl-kernel-check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
@@ -145,8 +154,10 @@ jobs:
           pip3 uninstall sgl-kernel -y
 
   sgl-kernel-mla-test:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    needs: sgl-kernel-build-wheels
+    needs: [sgl-kernel-check-changes, sgl-kernel-build-wheels]
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false &&
+      needs.sgl-kernel-check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
