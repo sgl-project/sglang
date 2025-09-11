@@ -5,6 +5,7 @@ on:
       - main
     paths:
       - ".github/workflows/release-docker-npu-nightly.yml"
+      - "docker/Dockerfile.npu"
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"

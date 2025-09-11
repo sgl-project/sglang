@@ -9,6 +9,7 @@ on:
       - main
     paths:
       - ".github/workflows/release-docker-npu.yml"
+      - "docker/Dockerfile.npu"
 
 jobs:
   build:

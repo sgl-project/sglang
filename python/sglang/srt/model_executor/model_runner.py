@@ -1673,10 +1673,9 @@ class ModelRunner:
 
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
+        cpu_ids_by_node = get_cpu_ids_by_node()
+        n_numa_node = len(cpu_ids_by_node)
         if omp_cpuids == "all":
-            cpu_ids_by_node = get_cpu_ids_by_node()
-            n_numa_node = len(cpu_ids_by_node)
-
             assert self.tp_size <= n_numa_node, (
                 f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
                 f"tp_size {self.tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
@@ -1693,7 +1692,18 @@ class ModelRunner:
                 )
             self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
         else:
-            self.local_omp_cpuid = omp_cpuids.split("|")[self.tp_rank]
+            threads_bind_list = omp_cpuids.split("|")
+            assert self.tp_size == len(threads_bind_list), (
+                f"SGLANG_CPU_OMP_THREADS_BIND setting must be aligned with TP size parameter ({self.tp_size}). "
+                f"Please double check your settings."
+            )
+            self.local_omp_cpuid = threads_bind_list[self.tp_rank]
+            if self.tp_size > n_numa_node:
+                logger.warning(
+                    f"TP size ({self.tp_size})is larger than numa node number ({n_numa_node}), "
+                    f"in this case the available memory amount of each rank cannot be determined in prior. "
+                    f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
+                )
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")

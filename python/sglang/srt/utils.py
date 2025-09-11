@@ -434,7 +434,9 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        free_gpu_memory = psutil.virtual_memory().available
+        total_free_memory = psutil.virtual_memory().available
+        n_numa_node: int = len(get_cpu_ids_by_node())
+        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
