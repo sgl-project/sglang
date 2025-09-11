@@ -21,7 +21,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.dp_attention import is_dp_max_padding
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -1348,7 +1348,9 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:

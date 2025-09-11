@@ -89,7 +89,7 @@ class _DpGatheredBufferWrapper:
     _device: torch.device
     _global_dp_buffer_len: int
     _local_dp_buffer_len: int
-    _dp_max_padding: bool = True
+    _dp_max_padding: bool
     _global_num_tokens: Optional[List[int]]
 
     @classmethod
@@ -299,6 +299,10 @@ def initialize_dp_attention(
 
 def is_dp_attention_enabled() -> bool:
     return _ENABLE_DP_ATTENTION_FLAG
+
+
+def is_allocation_symmetric() -> bool:
+    return not is_dp_attention_enabled() or is_dp_max_padding()
 
 
 def get_attention_tp_group() -> GroupCoordinator:

@@ -14,7 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
-    is_dp_max_padding,
+    is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -1385,7 +1385,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
                 # Quantize before comm, swizzle after.
                 with use_symmetric_memory(
-                    get_tp_group(), disabled=not is_dp_max_padding()
+                    get_tp_group(), disabled=not is_allocation_symmetric()
                 ):
                     if x.shape[0] > 0:
                         x, x_sf = fp4_quantize(
@@ -1404,7 +1404,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 x_sf = nvfp4_block_scale_interleave(x_sf)
 
-            with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
                 symm_output = torch.empty(
                     x.shape[0], output_col, dtype=output_dtype, device=x.device
                 )

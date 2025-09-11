@@ -42,7 +42,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
-from sglang.srt.layers.dp_attention import is_dp_max_padding
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
@@ -287,7 +287,9 @@ class TopK(CustomOp):
             )
         else:
             self.topk_config.torch_native = False
-            with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
                 topk_output = select_experts(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
@@ -371,7 +373,9 @@ class TopK(CustomOp):
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
-        with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
             topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
             topk_idx = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
