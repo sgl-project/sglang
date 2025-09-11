@@ -139,7 +139,7 @@ jobs:
         run: |
           mkdir -p nightly-storage/traces/${{ github.run_id }}
           if [ -d test/srt/performance_profiles_vlms ]; then
-            rsync -av --include='/' --include='.json' --include='.json.gz' --exclude='' test/srt/performance_profiles_vlms/ nightly-storage/traces/${{ github.run_id }}/
+            rsync -av --include='/' --include='.json.gz' --exclude='' test/srt/performance_profiles_vlms/ nightly-storage/traces/${{ github.run_id }}/
           fi
           cd nightly-storage
           git config user.name "github-actions[bot]"
