@@ -114,7 +114,7 @@ jobs:
           pytest -m e2e -s  -vv -o log_cli=true --log-cli-level=INFO
 
   finish:
-    needs: [unit-test-rust, e2e-python]
+    needs: [unit-test-rust, pytest-rust]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
