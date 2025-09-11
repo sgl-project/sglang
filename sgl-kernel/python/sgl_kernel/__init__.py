@@ -34,6 +34,7 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
+from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
 
 if torch.version.hip is not None:
     from sgl_kernel.elementwise import gelu_quick
@@ -57,7 +58,8 @@ from sgl_kernel.gemm import (
     scaled_fp4_grouped_quant,
     scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
-    sgl_per_token_group_quant_8bit,
+    sgl_per_token_group_quant_fp8,
+    sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
     shuffle_rows,
     silu_and_mul_scaled_fp4_grouped_quant,
