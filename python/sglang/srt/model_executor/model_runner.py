@@ -258,6 +258,7 @@ class ModelRunner:
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
+        self.dist_backend = server_args.dist_backend
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -745,7 +746,7 @@ class ModelRunner:
 
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
-                backend=backend,
+                backend=self.dist_backend,
                 world_size=self.tp_size * self.pp_size,
                 rank=self.tp_size * self.pp_rank + self.tp_rank,
                 local_rank=self.gpu_id,
