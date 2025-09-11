@@ -870,12 +870,6 @@ class ServerArgs:
             help="The path of the tokenizer.",
         )
         parser.add_argument(
-            "--tokenizer-worker-num",
-            type=int,
-            default=ServerArgs.tokenizer_worker_num,
-            help="The worker num of the tokenizer manager.",
-        )
-        parser.add_argument(
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
@@ -883,6 +877,12 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--tokenizer-worker-num",
+            type=int,
+            default=ServerArgs.tokenizer_worker_num,
+            help="The worker num of the tokenizer manager.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -1721,20 +1721,22 @@ class ServerArgs:
             default=ServerArgs.moe_dense_tp_size,
             help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
         )
+
         # Mamba Cache
         parser.add_argument(
             "--max-mamba-cache-size",
             type=int,
             default=ServerArgs.max_mamba_cache_size,
-            help="It is used for mamba cache memory static allocation.",
+            help="The maximum size of the mamba cache.",
         )
         parser.add_argument(
             "--mamba-ssm-dtype",
             type=str,
             default=ServerArgs.mamba_ssm_dtype,
             choices=["float32", "bfloat16"],
-            help="It is used to tune mamba ssm dtype",
+            help="The data type of the SSM states in mamba cache.",
         )
+
         # Hierarchical cache
         parser.add_argument(
             "--enable-hierarchical-cache",
