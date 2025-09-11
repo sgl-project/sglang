@@ -242,9 +242,7 @@ impl PDRouter {
                 .downcast_ref::<crate::policies::CacheAwarePolicy>()
             {
                 let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                let worker_refs: Vec<Box<dyn Worker>> =
-                    model_workers.iter().map(|w| w.clone_worker()).collect();
-                cache_aware.init_workers(&worker_refs);
+                cache_aware.init_workers(&model_workers);
             }
         }
 
@@ -284,9 +282,7 @@ impl PDRouter {
                 .downcast_ref::<crate::policies::CacheAwarePolicy>()
             {
                 let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                let worker_refs: Vec<Box<dyn Worker>> =
-                    model_workers.iter().map(|w| w.clone_worker()).collect();
-                cache_aware.init_workers(&worker_refs);
+                cache_aware.init_workers(&model_workers);
             }
         }
 
@@ -1202,13 +1198,9 @@ impl PDRouter {
             ));
         }
 
-        // Convert to Box for policy compatibility
-        let boxed_workers: Vec<Box<dyn Worker>> =
-            available_workers.iter().map(|w| w.clone_worker()).collect();
-
-        // Let policy select from available workers
+        // Let policy select from available workers (no conversion needed now!)
         let selected_idx = policy
-            .select_worker(&boxed_workers, request_text)
+            .select_worker(&available_workers, request_text)
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",

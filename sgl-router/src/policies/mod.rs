@@ -5,6 +5,7 @@
 
 use crate::core::Worker;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 mod cache_aware;
 mod factory;
@@ -28,9 +29,10 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a single worker from the available workers
     ///
     /// This is used for regular routing mode where requests go to a single worker.
+    /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
     fn select_worker(
         &self,
-        workers: &[Box<dyn Worker>],
+        workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
     ) -> Option<usize>;
 
@@ -40,8 +42,8 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Default implementation uses select_worker for each array independently.
     fn select_worker_pair(
         &self,
-        prefill_workers: &[Box<dyn Worker>],
-        decode_workers: &[Box<dyn Worker>],
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
     ) -> Option<(usize, usize)> {
         // Default implementation: independently select from each pool
@@ -107,7 +109,7 @@ impl Default for CacheAwareConfig {
 }
 
 /// Helper function to filter healthy workers and return their indices
-pub(crate) fn get_healthy_worker_indices(workers: &[Box<dyn Worker>]) -> Vec<usize> {
+pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
     workers
         .iter()
         .enumerate()
@@ -123,16 +125,16 @@ mod tests {
 
     #[test]
     fn test_get_healthy_worker_indices() {
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(BasicWorker::new(
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
                 "http://w1:8000".to_string(),
                 WorkerType::Regular,
             )),
-            Box::new(BasicWorker::new(
+            Arc::new(BasicWorker::new(
                 "http://w2:8000".to_string(),
                 WorkerType::Regular,
             )),
-            Box::new(BasicWorker::new(
+            Arc::new(BasicWorker::new(
                 "http://w3:8000".to_string(),
                 WorkerType::Regular,
             )),

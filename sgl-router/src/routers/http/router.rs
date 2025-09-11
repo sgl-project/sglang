@@ -109,8 +109,8 @@ impl Router {
                     .as_any()
                     .downcast_ref::<crate::policies::CacheAwarePolicy>()
                 {
-                    let worker_box = worker_arc.clone_worker();
-                    cache_aware.init_workers(&[worker_box]);
+                    let worker_dyn: Arc<dyn Worker> = worker_arc.clone();
+                    cache_aware.init_workers(std::slice::from_ref(&worker_dyn));
                 }
             }
         }
@@ -475,17 +475,17 @@ impl Router {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
-    ) -> Option<Box<dyn Worker>> {
+    ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
             None => self.worker_registry.get_all(),
         };
 
-        let available: Vec<Box<dyn Worker>> = workers
+        let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
-            .map(|w| w.clone_worker())
+            .cloned()
             .collect();
         if available.is_empty() {
             return None;
@@ -498,7 +498,7 @@ impl Router {
         };
 
         let idx = policy.select_worker(&available, text)?;
-        Some(available[idx].clone_worker())
+        Some(available[idx].clone())
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -902,11 +902,7 @@ impl Router {
                                     ) {
                                         let model_workers =
                                             self.worker_registry.get_by_model_fast(model_id);
-                                        let worker_refs: Vec<Box<dyn Worker>> = model_workers
-                                            .iter()
-                                            .map(|w| w.clone_worker())
-                                            .collect();
-                                        cache_aware.init_workers(&worker_refs);
+                                        cache_aware.init_workers(&model_workers);
                                     }
                                 }
 
@@ -944,9 +940,7 @@ impl Router {
                                     // Get all workers for this model
                                     let model_workers =
                                         self.worker_registry.get_by_model_fast(model_id);
-                                    let worker_refs: Vec<Box<dyn Worker>> =
-                                        model_workers.iter().map(|w| w.clone_worker()).collect();
-                                    cache_aware.init_workers(&worker_refs);
+                                    cache_aware.init_workers(&model_workers);
                                 }
                             }
                         }

@@ -121,10 +121,10 @@ impl CacheAwarePolicy {
     }
 
     /// Initialize the tree with worker URLs (used only during initial setup)
-    pub fn init_workers(&self, workers: &[Box<dyn Worker>]) {
+    pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
         if let Ok(mut trees) = self.trees.lock() {
             // Group workers by model
-            let mut model_workers: HashMap<String, Vec<&Box<dyn Worker>>> = HashMap::new();
+            let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
             for worker in workers {
                 // Use "default" for unknown/empty model_ids for backward compatibility
                 let model_id = worker.model_id();
@@ -213,7 +213,7 @@ impl CacheAwarePolicy {
 impl LoadBalancingPolicy for CacheAwarePolicy {
     fn select_worker(
         &self,
-        workers: &[Box<dyn Worker>],
+        workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
@@ -400,8 +400,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn select_worker_pair(
         &self,
-        prefill_workers: &[Box<dyn Worker>],
-        decode_workers: &[Box<dyn Worker>],
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
     ) -> Option<(usize, usize)> {
         // DEPRECATED: This method is no longer used when separate policies are configured.
@@ -461,12 +461,12 @@ mod tests {
             ..Default::default()
         };
         let policy = CacheAwarePolicy::with_config(config);
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(BasicWorker::new(
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
                 "http://w1:8000".to_string(),
                 WorkerType::Regular,
             )),
-            Box::new(BasicWorker::new(
+            Arc::new(BasicWorker::new(
                 "http://w2:8000".to_string(),
                 WorkerType::Regular,
             )),
@@ -506,7 +506,7 @@ mod tests {
         }
         // worker2 has load 0
 
-        let workers: Vec<Box<dyn Worker>> = vec![Box::new(worker1), Box::new(worker2)];
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
         policy.init_workers(&workers);
 
         // Should select worker2 (lower load) despite cache affinity
@@ -523,12 +523,12 @@ mod tests {
             ..Default::default()
         };
         let policy = CacheAwarePolicy::with_config(config);
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(BasicWorker::new(
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
                 "http://w1:8000".to_string(),
                 WorkerType::Regular,
             )),
-            Box::new(BasicWorker::new(
+            Arc::new(BasicWorker::new(
                 "http://w2:8000".to_string(),
                 WorkerType::Regular,
             )),

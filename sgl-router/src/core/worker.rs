@@ -1046,7 +1046,7 @@ impl HealthChecker {
 
 /// Start an async background health checker for a collection of workers
 pub fn start_health_checker(
-    workers: std::sync::Arc<std::sync::RwLock<Vec<Box<dyn Worker>>>>,
+    workers: std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<dyn Worker>>>>,
     check_interval_secs: u64,
 ) -> HealthChecker {
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1698,9 +1698,11 @@ mod tests {
     // Test HealthChecker background task
     #[tokio::test]
     async fn test_health_checker_startup() {
-        let workers = Arc::new(RwLock::new(vec![WorkerFactory::create_regular(
+        let worker = Arc::new(BasicWorker::new(
             "http://w1:8080".to_string(),
-        )]));
+            WorkerType::Regular,
+        )) as Arc<dyn Worker>;
+        let workers = Arc::new(RwLock::new(vec![worker]));
 
         let checker = start_health_checker(workers.clone(), 60);
 
@@ -1713,9 +1715,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_checker_shutdown() {
-        let workers = Arc::new(RwLock::new(vec![WorkerFactory::create_regular(
+        let worker = Arc::new(BasicWorker::new(
             "http://w1:8080".to_string(),
-        )]));
+            WorkerType::Regular,
+        )) as Arc<dyn Worker>;
+        let workers = Arc::new(RwLock::new(vec![worker]));
 
         let checker = start_health_checker(workers.clone(), 60);
 
