@@ -85,6 +85,8 @@ from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -302,6 +304,26 @@ class ModelRunner:
             architectures = self.model_config.hf_config.architectures
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
+
+        if self.is_hybrid_gdn:
+            logger.warning("Hybrid GDN model detected, disable radix cache")
+            self.server_args.disable_radix_cache = True
+            self.server_args.attention_backend = "hybrid_linear_attn"
+            if self.server_args.max_mamba_cache_size is None:
+                if self.server_args.max_running_requests is not None:
+                    self.server_args.max_mamba_cache_size = (
+                        self.server_args.max_running_requests
+                    )
+                else:
+                    self.server_args.max_mamba_cache_size = 512
+            self.server_args.max_mamba_cache_size = (
+                self.server_args.max_mamba_cache_size
+                // (
+                    self.server_args.dp_size
+                    if self.server_args.enable_dp_attention
+                    else 1
+                )
+            )
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -1080,6 +1102,8 @@ class ModelRunner:
                 "num_nextn_predict_layers",
                 self.num_effective_layers,
             )
+        elif self.is_hybrid_gdn:
+            num_layers = len(self.model_config.hf_config.full_attention_layer_ids)
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
@@ -1099,8 +1123,21 @@ class ModelRunner:
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
+        if self.is_hybrid_gdn:
+            rest_memory -= (
+                self.server_args.max_mamba_cache_size
+                * self.model_config.hf_config.mamba_cache_per_req
+                / (1 << 30)
+            )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
+
+    @property
+    def is_hybrid_gdn(self):
+        return self.model_config.hf_config.architectures[0] in [
+            "Qwen3NextForCausalLM",
+            "Qwen3NextForCausalLMMTP",
+        ]
 
     def set_num_token_hybrid(self):
         if (
@@ -1222,6 +1259,8 @@ class ModelRunner:
                 ),
                 4096,
             )
+        if self.is_hybrid_gdn:
+            max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size)
 
         if not self.spec_algorithm.is_none():
             if self.is_draft_worker:
@@ -1299,6 +1338,28 @@ class ModelRunner:
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     pre_alloc_size=pre_alloc_size,
+                )
+            elif self.is_hybrid_gdn:
+                config = self.model_config.hf_config
+                (
+                    conv_state_shape,
+                    temporal_state_shape,
+                    conv_dtype,
+                    ssm_dtype,
+                    mamba_layers,
+                ) = config.hybrid_gdn_params
+                self.req_to_token_pool = HybridReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    conv_state_shape=conv_state_shape,
+                    temporal_state_shape=temporal_state_shape,
+                    conv_dtype=conv_dtype,
+                    ssm_dtype=ssm_dtype,
+                    mamba_layers=mamba_layers,
+                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
@@ -1379,6 +1440,23 @@ class ModelRunner:
                     head_dim=self.model_config.head_dim,
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                    enable_kvcache_transpose=False,
+                    device=self.device,
+                )
+            elif self.is_hybrid_gdn:
+                self.token_to_kv_pool = HybridLinearKVPool(
+                    size=self.max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    # if draft worker, we only need 1 attention layer's kv pool
+                    full_attention_layer_ids=(
+                        [0]
+                        if self.is_draft_worker
+                        else self.model_config.hf_config.full_attention_layer_ids
+                    ),
                     enable_kvcache_transpose=False,
                     device=self.device,
                 )
@@ -1615,6 +1693,24 @@ class ModelRunner:
             )
 
             return DualChunkFlashAttentionBackend(self)
+        elif backend_str == "hybrid_linear_attn":
+            assert (
+                self.is_hybrid_gdn
+            ), "hybrid_linear_attn backend can only be used with hybrid GDN models."
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
+                MambaAttnBackend,
+            )
+
+            full_attn_backend = FlashAttentionBackend(self)
+            linear_attn_backend = MambaAttnBackend(self)
+            full_attn_layers = self.model_config.hf_config.full_attention_layer_ids
+            return HybridLinearAttnBackend(
+                full_attn_backend, linear_attn_backend, full_attn_layers
+            )
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
 
