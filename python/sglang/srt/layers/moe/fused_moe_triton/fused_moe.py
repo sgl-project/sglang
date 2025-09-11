@@ -23,7 +23,12 @@ from sglang.srt.utils import (
 )
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
-from .fused_moe_triton_kernels import invoke_fused_moe_kernel, moe_sum_reduce_triton
+from .fused_moe_triton_kernels import (
+    invoke_fused_moe_down_tma_kernel,
+    invoke_fused_moe_kernel,
+    moe_sum_reduce_triton,
+    support_tensor_descriptor,
+)
 from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
@@ -336,6 +341,11 @@ def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
+@functools.lru_cache()
+def _down_moe_use_tma():
+    return support_tensor_descriptor()
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -404,23 +414,23 @@ def fused_experts_impl(
         block_shape=block_shape,
     )
 
-    config = get_config_func(M)
-
+    config, (down_config, max_block_m) = get_config_func(M)
+    down_moe_use_tma = (
+        _down_moe_use_tma()
+        and down_config is not None
+        and down_config.pop("USE_TMA", False)
+    )
+    topk = topk_ids.shape[1]
+    # 256 is the max BLOCK_SIZE_M
+    max_padded_tokens = min(M * topk, E) * (max_block_m - 1) if down_moe_use_tma else 0
+    total_tokens = M * topk + max_padded_tokens
     cache = torch.empty(
-        M * topk_ids.shape[1] * max(N, w2.shape[1]),
+        total_tokens * max(N, w2.shape[1]),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
-        (M, topk_ids.shape[1], N),
-    )
-    intermediate_cache2 = torch.empty(
-        (M * topk_ids.shape[1], N // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
-        (M, topk_ids.shape[1], w2.shape[1]),
+    intermediate_cache3 = cache[: M * topk * w2.shape[1]].view(
+        (M, topk, w2.shape[1]),
     )
 
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
@@ -428,7 +438,7 @@ def fused_experts_impl(
     if no_combine:
         assert not inplace
         out_hidden_states = torch.empty(
-            (num_tokens, topk_ids.shape[1], w2.shape[1]),
+            (num_tokens, topk, w2.shape[1]),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -453,12 +463,28 @@ def fused_experts_impl(
             # chunk. Note that in most cases we only have one chunk
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
-            intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[
-                : tokens_in_chunk * topk_ids.shape[1]
-            ]
+            config, (down_config, _) = get_config_func(tokens_in_chunk)
+            down_moe_use_tma = (
+                _down_moe_use_tma()
+                and down_config is not None
+                and down_config.pop("USE_TMA", False)
+            )
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
-            config = get_config_func(tokens_in_chunk)
+
+        padded_tokens = (
+            min(tokens_in_chunk * topk, E) * (config["BLOCK_SIZE_M"] - 1)
+            if down_moe_use_tma
+            else 0
+        )
+        total_tokens = tokens_in_chunk * topk + padded_tokens
+        intermediate_cache1 = cache[: total_tokens * N].view(
+            (total_tokens, N),
+        )
+        intermediate_cache2 = torch.empty(
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
@@ -490,6 +516,7 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            c_sorted=down_moe_use_tma,
         )
         if activation == "silu":
             if gemm1_alpha is not None:
@@ -516,8 +543,12 @@ def fused_experts_impl(
                 )
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
-
-        invoke_fused_moe_kernel(
+        fused_moe_down_kernel = (
+            invoke_fused_moe_down_tma_kernel
+            if down_moe_use_tma
+            else invoke_fused_moe_kernel
+        )
+        fused_moe_down_kernel(
             intermediate_cache2,
             w2,
             b2,
@@ -536,7 +567,7 @@ def fused_experts_impl(
             num_tokens_post_padded,
             not apply_router_weight_on_input,
             1,
-            config,
+            down_config or config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
