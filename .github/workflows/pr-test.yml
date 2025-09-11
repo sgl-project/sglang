@@ -40,6 +40,22 @@ jobs:
               - "test/**"
               - ".github/workflows/pr-test.yml"
 
+  check-changes-sgl-kernel:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            src:
+              - "sgl-kernel/**"
+
   unit-test-frontend:
     needs: check-changes
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
