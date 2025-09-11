@@ -12,13 +12,7 @@ from sglang.srt.utils import get_device_name, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    # Temporary
-    try:
-        from sgl_kernel import sgl_per_token_group_quant_8bit
-    except ImportError:
-        from sgl_kernel import (
-            sgl_per_token_group_quant_int8 as sgl_per_token_group_quant_8bit,
-        )
+    from sgl_kernel import sgl_per_token_group_quant_8bit
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +81,7 @@ def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
         return x_q, scales
 
 
+# TODO remove and use the unified one in fp8_kernel.py
 @triton.jit
 def _per_token_group_quant_int8(
     # Pointers to inputs and output
@@ -129,6 +124,7 @@ def _per_token_group_quant_int8(
     tl.store(y_s_ptr, y_s)
 
 
+# TODO remove and use the unified one in fp8_kernel.py
 def per_token_group_quant_int8(
     x: torch.Tensor,
     group_size: int,
@@ -188,6 +184,7 @@ def per_token_group_quant_int8(
     return x_q, x_s
 
 
+# TODO unify with fp8
 def sglang_per_token_group_quant_int8(
     x: torch.Tensor,
     group_size: int,
