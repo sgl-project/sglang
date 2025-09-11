@@ -434,7 +434,7 @@ class Req:
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
-        priority: int = 0,
+        priority: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid

@@ -104,9 +104,9 @@ class TestPriorityScheduling(CustomTestCase):
 
         expected_status_and_error_messages = [
             (200, None),
-            (503, "The request is aborted based on priority."),
-            (503, "The request is aborted based on priority."),
-            (503, "The request is aborted based on priority."),
+            (503, "The request is aborted by a higher priority request."),
+            (503, "The request is aborted by a higher priority request."),
+            (503, "The request is aborted by a higher priority request."),
             (200, None),
             (200, None),
             (200, None),

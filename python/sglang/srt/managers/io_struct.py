@@ -651,8 +651,8 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
-    # The request priority.
-    priority: int = 0
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -757,8 +757,8 @@ class TokenizedEmbeddingReqInput:
     data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
-    # The request priority
-    priority: int = 0
+    # Priority for the request
+    priority: Optional[int] = None
 
 
 @dataclass

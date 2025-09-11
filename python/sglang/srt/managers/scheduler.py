@@ -1324,6 +1324,7 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
+            self._set_or_validate_priority(req)
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
@@ -1352,8 +1353,27 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
         else:
             for req in reqs:
+                self._set_or_validate_priority(req)
                 if not self._abort_on_queued_limit(req):
                     self.waiting_queue.append(req)
+
+    def _set_or_validate_priority(self, req: Req):
+        """Set the default priority value, or abort the request based on the priority scheduling mode."""
+        if self.enable_priority_scheduling and req.priority is None:
+            if self.schedule_low_priority_values_first:
+                req.priority = sys.maxsize
+            else:
+                req.priority = -sys.maxsize - 1
+        elif not self.enable_priority_scheduling and req.priority is not None:
+            abort_req = AbortReq(
+                req.rid,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": "Using priority is disabled for this server. Please send a new request without a priority.",
+                },
+            )
+            self.send_to_tokenizer.send_pyobj(abort_req)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -1368,18 +1388,21 @@ class Scheduler(
         message = "The request queue is full."
         if self.enable_priority_scheduling:
             # With priority scheduling, consider aboritng an existing request based on the priority.
-            # Request with min priority is the last index item in the waiting queue after sorting.
-            # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
             # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
             # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
             direction = 1 if self.schedule_low_priority_values_first else -1
-            key_fn = lambda item: (direction * item[1].priority, item[1].queue_time_start)
+            key_fn = lambda item: (
+                direction * item[1].priority,
+                item[1].queue_time_start,
+            )
             idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
-            abort_existing_req = direction * recv_req.priority < direction * candidate_req.priority
+            abort_existing_req = (
+                direction * recv_req.priority < direction * candidate_req.priority
+            )
             if abort_existing_req:
                 self.waiting_queue.pop(idx)
-                req_to_abort = min_priority_req
+                req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
         self.send_to_tokenizer.send_pyobj(
