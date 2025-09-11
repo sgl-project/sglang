@@ -108,7 +108,7 @@ There are three ways to prepare mooncakes:
 2. Use json configuration files;
 3. Additional configuration using the sglang parameter.
 
-**Method 1: Using env variables to configure Mooncake**
+**Using env variables to configure Mooncake**
 
 ```bash
 python -m sglang.launch_server \
@@ -125,7 +125,7 @@ Parameter Explanation:
 * `MOONCAKE_DEVICE`: The RDMA devices used by Mooncake. This parameter is required only when the protocol is set to `"rdma"`. Available devices can be listed using the `ibv_devices` command.
 * `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory (in bytes) contributed to the global memory pool. If at least one `store service` is launched, then this value could be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
 
-**Method 2: Using JSON file to configure Mooncake**
+**Using JSON file to configure Mooncake**
 
 ```bash
 export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicache/mooncake_config.json
@@ -140,7 +140,7 @@ echo '{
 }' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
 ```
 
-**Method 3: Using extra-config of sglang arguments to configure Mooncake**
+**Using extra-config of sglang arguments to configure Mooncake**
 
 ```bash
 python -m sglang.launch_server \
