@@ -52,7 +52,7 @@ SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/py
 SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
 echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
-if [ "$CUSTOM_BUILD_SGL_KERNEL" = "true" ]; then
+if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     ls -alh sgl-kernel/dist
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}*.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
