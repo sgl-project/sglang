@@ -51,15 +51,12 @@ pip install auto-round
 
 ```py
 # for LLM
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from auto_round import AutoRound
 model_id = "meta-llama/Llama-3.2-1B-Instruct"
 quant_path = "Llama-3.2-1B-Instruct-autoround-4bit"
-model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto")
-tokenizer = AutoTokenizer.from_pretrained(model_id)
 # Scheme examples: "W2A16", "W3A16", "W4A16", "W8A16", "NVFP4", "MXFP4" (no real kernels), "GGUF:Q4_K_M", etc.
-scheme,format = "W4A16", "auto_round"
-autoround = AutoRound(model, tokenizer, scheme=scheme)
+scheme, format = "W4A16", "auto_round"
+autoround = AutoRound(model_id, scheme=scheme)
 autoround.quantize_and_save(quant_path, format=format) # quantize and save
 
 ```
@@ -68,15 +65,10 @@ autoround.quantize_and_save(quant_path, format=format) # quantize and save
 ```py
 # for VLMs
 from auto_round import AutoRoundMLLM
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, AutoTokenizer
 model_name = "Qwen/Qwen2-VL-2B-Instruct"
 quant_path = "Qwen2-VL-2B-Instruct-autoround-4bit"
-model = Qwen2VLForConditionalGeneration.from_pretrained(
-    model_name, torch_dtype="auto")
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 scheme, format = "W4A16", "auto_round"
-autoround = AutoRoundMLLM(model, tokenizer, processor, scheme)
+autoround = AutoRoundMLLM(model_name, scheme)
 autoround.quantize_and_save(quant_path, format=format) # quantize and save
 
 ```
