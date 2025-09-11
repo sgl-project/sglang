@@ -54,8 +54,6 @@ jobs:
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           echo "TAG=lmsysorg/sglang:v$version-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
-          kernel_tag=$(curl -s https://api.github.com/repos/sgl-project/sgl-kernel-npu/tags | jq -r '.[0].name')
-          echo "KERNEL_NPU_TAG=${kernel_tag}" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
         id: build-and-push
@@ -70,6 +68,6 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=${{ steps.get_version.outputs.KERNEL_NPU_TAG }}
+            SGLANG_KERNEL_NPU_TAG=20250901
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
