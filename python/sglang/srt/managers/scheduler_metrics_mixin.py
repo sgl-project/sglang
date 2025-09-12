@@ -219,7 +219,7 @@ class SchedulerMetricsMixin:
             f"#queue-req: {len(self.waiting_queue)}, "
         )
 
-        self.no_cuda_graph_warner(can_run_cuda_graph)
+        self.no_cuda_graph_warner.on_step(can_run_cuda_graph)
 
         logger.info(msg)
         if self.enable_metrics:

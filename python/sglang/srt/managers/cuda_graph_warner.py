@@ -22,8 +22,10 @@ class NoCudaGraphWarner:
     def __init__(self):
         self.consecutive_no_cuda_graph_count = 0
 
-    def __call__(self, can_run_cuda_graph: bool):
-        if not can_run_cuda_graph:
+    def on_step(self, can_run_cuda_graph: bool):
+        if can_run_cuda_graph:
+            self.consecutive_no_cuda_graph_count = 0
+        else:
             self.consecutive_no_cuda_graph_count += 1
             if self.consecutive_no_cuda_graph_count % 5 == 0:
                 logger.warning(
@@ -31,5 +33,3 @@ class NoCudaGraphWarner:
                     f"This may cause significant throughput degradation. "
                     f"Check if batch size is within CUDA graph capture range."
                 )
-        else:
-            self.consecutive_no_cuda_graph_count = 0
