@@ -28,7 +28,7 @@ elif torch.version.cuda is not None:
     DENSE_TOLERANCE_MAX_DIFF = 1.5
     DENSE_TOLERANCE_MEAN_DIFF = 0.1
 else:
-    print("No GPU backend (CPU only)")
+    raise ValueError("No GPU backend")
 
 # Common configuration
 TOP_K = 20
