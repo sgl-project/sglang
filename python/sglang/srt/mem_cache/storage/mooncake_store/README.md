@@ -54,7 +54,7 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 
 ### Single Server Deployment
 
-There four components for deploying Mooncake: metadata service, master service, store service and sglang instance.
+There are four components for deploying Mooncake: metadata service, master service, store service and sglang instance.
 Note: *Only **master service** is mandatory for single server deployment.*
 
 **Launch Mooncake `metadata service`(Optional):**
