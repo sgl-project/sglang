@@ -37,7 +37,6 @@ RETRY_DELAY = 2
 
 # Test configurations
 TEST_CONFIG = {
-    "batch_size": 20,
     "num_samples": 1000,
     "logprob_sample_ratio": 0.5,
     "temperature": 2.0,
@@ -130,7 +129,7 @@ class TestLogprobsDense(unittest.TestCase):
             # Calculate how many samples should return logprobs
             logprob_count = int(len(test_records) * TEST_CONFIG["logprob_sample_ratio"])
             print(
-                f"Testing with {len(test_records)} samples, batch_size={TEST_CONFIG['batch_size']}, temperature={TEST_CONFIG['temperature']}"
+                f"Testing with {len(test_records)} samples, temperature={TEST_CONFIG['temperature']}"
             )
             print(
                 f"Will return logprobs for {logprob_count} samples (ratio: {TEST_CONFIG['logprob_sample_ratio']})"
@@ -139,82 +138,74 @@ class TestLogprobsDense(unittest.TestCase):
             all_max, all_mean = [], []
             logprob_returned_count = 0
 
-            for i in range(0, len(test_records), TEST_CONFIG["batch_size"]):
-                batch = test_records[i : i + TEST_CONFIG["batch_size"]]
-                input_ids = [rec["ids"] for rec in batch]
-                logprob_start_lens = [rec["start_pos"] for rec in batch]
+            # Process all records at once
+            input_ids = [rec["ids"] for rec in test_records]
+            logprob_start_lens = [rec["start_pos"] for rec in test_records]
 
-                # Determine which samples in this batch should return logprobs
-                batch_logprob_indices = []
-                for j in range(len(batch)):
-                    global_idx = i + j
-                    if global_idx < logprob_count:
-                        batch_logprob_indices.append(j)
+            # Determine which samples should return logprobs
+            return_logprob_array = [
+                i < logprob_count for i in range(len(test_records))
+            ]
 
-                # Create return_logprob array - only True for selected samples
-                return_logprob_array = [
-                    j in batch_logprob_indices for j in range(len(batch))
-                ]
+            # Sampling param per request
+            sampling_params = [
+                {
+                    "temperature": TEST_CONFIG["temperature"],
+                    "top_p": 1.0,
+                    "top_k": TOP_K,
+                    "max_new_tokens": 1,
+                }
+                for _ in test_records
+            ]
 
-                # Sampling param per request
-                sampling_params = [
-                    {
-                        "temperature": TEST_CONFIG["temperature"],
-                        "top_p": 1.0,
-                        "top_k": TOP_K,
-                        "max_new_tokens": 1,
-                    }
-                    for _ in batch
-                ]
+            outputs = self.engine.generate(
+                input_ids=input_ids,
+                sampling_params=sampling_params,
+                return_logprob=return_logprob_array,
+                logprob_start_len=logprob_start_lens,
+                top_logprobs_num=TOP_K,
+            )
 
-                outputs = self.engine.generate(
-                    input_ids=input_ids,
-                    sampling_params=sampling_params,
-                    return_logprob=return_logprob_array,
-                    logprob_start_len=logprob_start_lens,
-                    top_logprobs_num=TOP_K,
-                )
+            for i, (rec, output) in enumerate(zip(test_records, outputs)):
+                # Only compare logprobs for samples that should have them
+                if i < logprob_count:
+                    # Safe access to meta_info and input_top_logprobs
+                    meta_info = output.get("meta_info")
+                    input_top_logprobs = (
+                        meta_info.get("input_top_logprobs")
+                        if meta_info
+                        else None
+                    )
 
-                for j, (rec, output) in enumerate(zip(batch, outputs)):
-                    # Only compare logprobs for samples that should have them
-                    if j in batch_logprob_indices:
-                        # Safe access to meta_info and input_top_logprobs
-                        meta_info = output.get("meta_info")
-                        input_top_logprobs = (
-                            meta_info.get("input_top_logprobs")
-                            if meta_info
-                            else None
-                        )
+                    self.assertIsNotNone(
+                        input_top_logprobs,
+                        f"return_logprob enabled on this sample, but input_top_logprobs is None (length: {len(input_top_logprobs) if input_top_logprobs is not None else 'N/A'})",
+                    )
+                    metaA = rec["meta"]
+                    metaB = meta_info
 
-                        self.assertIsNotNone(
-                            input_top_logprobs,
-                            f"return_logprob enabled on this sample, but input_top_logprobs is None (length: {len(input_top_logprobs) if input_top_logprobs is not None else 'N/A'})",
-                        )
-                        metaA = rec["meta"]
-                        metaB = meta_info
+                    max_diff, mean_diff = self.compare_meta(metaA, metaB)
+                    all_max.append(max_diff)
+                    all_mean.append(mean_diff)
+                    logprob_returned_count += 1
+                else:
+                    # Verify that logprobs were not returned for this sample
+                    meta_info = output.get("meta_info")
+                    input_top_logprobs = (
+                        meta_info.get("input_top_logprobs")
+                        if meta_info
+                        else None
+                    )
+                    output_token_ids_logprobs = (
+                        meta_info.get("output_token_ids_logprobs")
+                        if meta_info
+                        else None
+                    )
 
-                        max_diff, mean_diff = self.compare_meta(metaA, metaB)
-                        all_max.append(max_diff)
-                        all_mean.append(mean_diff)
-                        logprob_returned_count += 1
-                    else:
-                        # Verify that logprobs were not returned for this sample
-                        meta_info = output.get("meta_info")
-                        input_top_logprobs = (
-                            meta_info.get("input_top_logprobs")
-                            if meta_info
-                            else None
-                        )
-                        output_token_ids_logprobs = (
-                            meta_info.get("output_token_ids_logprobs")
-                            if meta_info
-                            else None
-                        )
-
-                        self.assertFalse(
-                            input_top_logprobs,
-                            f"return_logprob is disabled on this sample, Sample {i+j} should not have logprobs, content: {output_token_ids_logprobs}",
-                        )
+                    self.assertFalse(
+                        input_top_logprobs,
+                        f"return_logprob is disabled on this sample, Sample {i} should not have logprobs, content: {output_token_ids_logprobs}",
+                    )
 
             max_of_max = max(all_max) if all_max else 0.0
             mean_of_mean = np.mean(all_mean) if all_mean else 0.0
