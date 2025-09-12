@@ -1,5 +1,5 @@
 """
-Benchmark online serving with dynamic requests.
+Benchmark online embedding serving throughput with dynamic requests.
 
 Usage:
 python3 -m sglang.bench_embedding_serving --backend sglang --num-prompt 10
@@ -404,33 +404,22 @@ async def async_request_openai_embedding(
         RequestFuncOutput: Output of the request, including generated text,
                            latency, TTFT, ITL, and success status.
     """
-    # TODO: refactor it to adapt openai embedding entrypoint: https://api.openai.com/v1/embeddings
-    raise NotImplementedError("async_request_openai_embedding not implemented yet.")
     api_url = request_func_input.api_url
-    assert api_url.endswith("completions"), "OpenAI Completions API URL must end with 'completions'."
+    assert api_url.endswith("embeddings"), "OpenAI Completions API URL must end with 'embeddings'."
 
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
         payload = {
             "model": request_func_input.model,
-            "prompt": prompt,
-            "temperature": 0.0,
-            "best_of": 1,
-            "max_tokens": request_func_input.output_len,
-            "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
+            "input": prompt,
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
 
-        generated_text = ""
-        output_len = request_func_input.output_len
-        ttft = 0.0
         st = time.perf_counter()
-        most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
@@ -438,36 +427,12 @@ async def async_request_openai_embedding(
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                         latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
+                        data = json.loads(chunk_bytes)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
-                                timestamp = time.perf_counter()
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
-
-                                most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get("completion_tokens", output_len)
-
-                    output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
-                    output.output_len = output_len
+                    output.output_len = sum(len(emb_obj["embedding"]) for emb_obj in data["data"])
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -475,6 +440,7 @@ async def async_request_openai_embedding(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+            print(f"{output.error=}")
 
     if pbar:
         pbar.update(1)
@@ -500,11 +466,6 @@ async def async_request_sglang_embedding(
     async with _create_bench_client_session() as session:
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
             **request_func_input.extra_request_body,
         }
 
@@ -524,9 +485,8 @@ async def async_request_sglang_embedding(
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
-                        data = json.loads(chunk_bytes)
-
                         latency = time.perf_counter() - st
+                        data = json.loads(chunk_bytes)
 
                     output.success = True
                     output.latency = latency
@@ -582,20 +542,6 @@ class BenchmarkMetrics:
     std_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     concurrency: float
-
-
-def is_file_valid_json(path):
-    if not os.path.isfile(path):
-        return False
-
-    # TODO can fuse into the real file open later
-    try:
-        with open(path) as f:
-            json.load(f)
-        return True
-    except JSONDecodeError as e:
-        print(f"{path} exists but json loading fails ({e=}), thus treat as invalid file")
-        return False
 
 
 def calculate_metrics(
