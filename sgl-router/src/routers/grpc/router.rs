@@ -112,6 +112,7 @@ impl GrpcRouter {
                     url.clone(),
                     WorkerType::Regular,
                     crate::core::ConnectionMode::Grpc { port: None },
+                    &ctx.router_config.api_key,
                 )
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {

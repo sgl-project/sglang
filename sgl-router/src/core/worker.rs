@@ -22,7 +22,8 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the worker's URL
     fn url(&self) -> &str;
-
+    /// Get the worker's API key
+    fn api_key(&self) -> &Option<String>;
     /// Get the worker's type (Regular, Prefill, or Decode)
     fn worker_type(&self) -> WorkerType;
 
@@ -248,6 +249,8 @@ pub struct WorkerMetadata {
     pub labels: std::collections::HashMap<String, String>,
     /// Health check configuration
     pub health_config: HealthConfig,
+    /// API key
+    pub api_key: Option<String>,
 }
 
 /// Basic worker implementation
@@ -276,14 +279,15 @@ impl fmt::Debug for BasicWorker {
 }
 
 impl BasicWorker {
-    pub fn new(url: String, worker_type: WorkerType) -> Self {
-        Self::with_connection_mode(url, worker_type, ConnectionMode::Http)
+    pub fn new(url: String, worker_type: WorkerType, api_key: &Option<String>) -> Self {
+        Self::with_connection_mode(url, worker_type, ConnectionMode::Http, api_key)
     }
 
     pub fn with_connection_mode(
         url: String,
         worker_type: WorkerType,
         connection_mode: ConnectionMode,
+        api_key: &Option<String>,
     ) -> Self {
         let metadata = WorkerMetadata {
             url: url.clone(),
@@ -291,6 +295,7 @@ impl BasicWorker {
             connection_mode,
             labels: std::collections::HashMap::new(),
             health_config: HealthConfig::default(),
+            api_key: api_key.clone(),
         };
 
         Self {
@@ -352,6 +357,10 @@ impl BasicWorker {
 impl Worker for BasicWorker {
     fn url(&self) -> &str {
         &self.metadata.url
+    }
+
+    fn api_key(&self) -> &Option<String> {
+        &self.metadata.api_key
     }
 
     fn worker_type(&self) -> WorkerType {
@@ -505,10 +514,16 @@ pub struct DPAwareWorker {
 
 impl DPAwareWorker {
     /// Create a new DP-aware worker of any type
-    pub fn new(base_url: String, dp_rank: usize, dp_size: usize, worker_type: WorkerType) -> Self {
+    pub fn new(
+        base_url: String,
+        dp_rank: usize,
+        dp_size: usize,
+        worker_type: WorkerType,
+        api_key: &Option<String>,
+    ) -> Self {
         // Create URL with DP rank suffix for identification
         let worker_url = format!("{}@{}", base_url, dp_rank);
-        let base_worker = BasicWorker::new(worker_url, worker_type);
+        let base_worker = BasicWorker::new(worker_url, worker_type, api_key);
 
         Self {
             base_worker,
@@ -523,6 +538,10 @@ impl DPAwareWorker {
 impl Worker for DPAwareWorker {
     fn url(&self) -> &str {
         self.base_worker.url()
+    }
+
+    fn api_key(&self) -> &Option<String> {
+        self.base_worker.api_key()
     }
 
     fn worker_type(&self) -> WorkerType {
@@ -626,26 +645,32 @@ pub struct WorkerFactory;
 
 impl WorkerFactory {
     /// Create a regular worker
-    pub fn create_regular(url: String) -> Box<dyn Worker> {
-        Box::new(BasicWorker::new(url, WorkerType::Regular))
+    pub fn create_regular(url: String, api_key: &Option<String>) -> Box<dyn Worker> {
+        Box::new(BasicWorker::new(url, WorkerType::Regular, api_key))
     }
 
     /// Create a regular worker with custom circuit breaker configuration
     pub fn create_regular_with_config(
         url: String,
         circuit_breaker_config: CircuitBreakerConfig,
+        api_key: &Option<String>,
     ) -> Box<dyn Worker> {
         Box::new(
-            BasicWorker::new(url, WorkerType::Regular)
+            BasicWorker::new(url, WorkerType::Regular, api_key)
                 .with_circuit_breaker_config(circuit_breaker_config),
         )
     }
 
     /// Create a prefill worker with optional bootstrap port
-    pub fn create_prefill(url: String, bootstrap_port: Option<u16>) -> Box<dyn Worker> {
+    pub fn create_prefill(
+        url: String,
+        bootstrap_port: Option<u16>,
+        api_key: &Option<String>,
+    ) -> Box<dyn Worker> {
         Box::new(BasicWorker::new(
             url,
             WorkerType::Prefill { bootstrap_port },
+            api_key,
         ))
     }
 
@@ -654,25 +679,27 @@ impl WorkerFactory {
         url: String,
         bootstrap_port: Option<u16>,
         circuit_breaker_config: CircuitBreakerConfig,
+        api_key: &Option<String>,
     ) -> Box<dyn Worker> {
         Box::new(
-            BasicWorker::new(url, WorkerType::Prefill { bootstrap_port })
+            BasicWorker::new(url, WorkerType::Prefill { bootstrap_port }, api_key)
                 .with_circuit_breaker_config(circuit_breaker_config),
         )
     }
 
     /// Create a decode worker
-    pub fn create_decode(url: String) -> Box<dyn Worker> {
-        Box::new(BasicWorker::new(url, WorkerType::Decode))
+    pub fn create_decode(url: String, api_key: &Option<String>) -> Box<dyn Worker> {
+        Box::new(BasicWorker::new(url, WorkerType::Decode, api_key))
     }
 
     /// Create a decode worker with custom circuit breaker configuration
     pub fn create_decode_with_config(
         url: String,
         circuit_breaker_config: CircuitBreakerConfig,
+        api_key: &Option<String>,
     ) -> Box<dyn Worker> {
         Box::new(
-            BasicWorker::new(url, WorkerType::Decode)
+            BasicWorker::new(url, WorkerType::Decode, api_key)
                 .with_circuit_breaker_config(circuit_breaker_config),
         )
     }
@@ -683,21 +710,26 @@ impl WorkerFactory {
         regular_urls: Vec<String>,
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
+        api_key: &Option<String>,
     ) -> (
         Vec<Box<dyn Worker>>,
         Vec<Box<dyn Worker>>,
         Vec<Box<dyn Worker>>,
     ) {
-        let regular_workers: Vec<Box<dyn Worker>> =
-            regular_urls.into_iter().map(Self::create_regular).collect();
+        let regular_workers: Vec<Box<dyn Worker>> = regular_urls
+            .into_iter()
+            .map(|url| Self::create_regular(url, api_key))
+            .collect();
 
         let prefill_workers: Vec<Box<dyn Worker>> = prefill_urls
             .into_iter()
-            .map(|(url, port)| Self::create_prefill(url, port))
+            .map(|(url, port)| Self::create_prefill(url, port, api_key))
             .collect();
 
-        let decode_workers: Vec<Box<dyn Worker>> =
-            decode_urls.into_iter().map(Self::create_decode).collect();
+        let decode_workers: Vec<Box<dyn Worker>> = decode_urls
+            .into_iter()
+            .map(|url| Self::create_decode(url, api_key))
+            .collect();
 
         (regular_workers, prefill_workers, decode_workers)
     }
@@ -708,6 +740,7 @@ impl WorkerFactory {
             url,
             worker_type,
             ConnectionMode::Grpc { port },
+            &None,
         ))
     }
 
@@ -719,8 +752,13 @@ impl WorkerFactory {
         circuit_breaker_config: CircuitBreakerConfig,
     ) -> Box<dyn Worker> {
         Box::new(
-            BasicWorker::with_connection_mode(url, worker_type, ConnectionMode::Grpc { port })
-                .with_circuit_breaker_config(circuit_breaker_config),
+            BasicWorker::with_connection_mode(
+                url,
+                worker_type,
+                ConnectionMode::Grpc { port },
+                &None,
+            )
+            .with_circuit_breaker_config(circuit_breaker_config),
         )
     }
 
@@ -730,8 +768,15 @@ impl WorkerFactory {
         dp_rank: usize,
         dp_size: usize,
         worker_type: WorkerType,
+        api_key: &Option<String>,
     ) -> Box<dyn Worker> {
-        Box::new(DPAwareWorker::new(base_url, dp_rank, dp_size, worker_type))
+        Box::new(DPAwareWorker::new(
+            base_url,
+            dp_rank,
+            dp_size,
+            worker_type,
+            api_key,
+        ))
     }
 
     /// Get DP size from a worker
@@ -791,7 +836,9 @@ impl WorkerFactory {
         let dp_size = Self::get_worker_dp_size(url, api_key).await?;
 
         let workers = (0..dp_size)
-            .map(|rank| Self::create_dp_aware(url.to_string(), rank, dp_size, worker_type.clone()))
+            .map(|rank| {
+                Self::create_dp_aware(url.to_string(), rank, dp_size, worker_type.clone(), api_key)
+            })
             .collect();
 
         Ok(workers)
@@ -846,7 +893,7 @@ impl WorkerFactory {
         } else {
             Ok(urls
                 .into_iter()
-                .map(|url| Self::create_regular(url))
+                .map(|url| Self::create_regular(url, api_key))
                 .collect())
         }
     }
@@ -882,9 +929,9 @@ impl WorkerCollection for Vec<Box<dyn Worker>> {
 }
 
 /// Convert a list of worker URLs to worker trait objects
-pub fn urls_to_workers(urls: Vec<String>) -> Vec<Box<dyn Worker>> {
+pub fn urls_to_workers(urls: Vec<String>, api_key: &Option<String>) -> Vec<Box<dyn Worker>> {
     urls.into_iter()
-        .map(WorkerFactory::create_regular)
+        .map(|url| WorkerFactory::create_regular(url, api_key))
         .collect()
 }
 
@@ -1122,7 +1169,11 @@ mod tests {
     // Test BasicWorker
     #[test]
     fn test_basic_worker_creation() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
         assert_eq!(worker.url(), "http://test:8080");
         assert_eq!(worker.worker_type(), WorkerType::Regular);
         assert!(worker.is_healthy());
@@ -1136,8 +1187,12 @@ mod tests {
         labels.insert("env".to_string(), "prod".to_string());
         labels.insert("zone".to_string(), "us-west".to_string());
 
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
-            .with_labels(labels.clone());
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        )
+        .with_labels(labels.clone());
 
         assert_eq!(worker.metadata().labels, labels);
     }
@@ -1152,8 +1207,12 @@ mod tests {
             success_threshold: 2,
         };
 
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
-            .with_health_config(custom_config.clone());
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        )
+        .with_health_config(custom_config.clone());
 
         assert_eq!(worker.metadata().health_config.timeout_secs, 15);
         assert_eq!(worker.metadata().health_config.check_interval_secs, 45);
@@ -1163,13 +1222,21 @@ mod tests {
     // Test Worker trait implementation
     #[test]
     fn test_worker_url() {
-        let worker = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
+        let worker = BasicWorker::new(
+            "http://worker1:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
         assert_eq!(worker.url(), "http://worker1:8080");
     }
 
     #[test]
     fn test_worker_type_getter() {
-        let regular = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let regular = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
         assert_eq!(regular.worker_type(), WorkerType::Regular);
 
         let prefill = BasicWorker::new(
@@ -1177,6 +1244,7 @@ mod tests {
             WorkerType::Prefill {
                 bootstrap_port: Some(9090),
             },
+            &Some("test_api_key".to_string()),
         );
         assert_eq!(
             prefill.worker_type(),
@@ -1185,13 +1253,21 @@ mod tests {
             }
         );
 
-        let decode = BasicWorker::new("http://test:8080".to_string(), WorkerType::Decode);
+        let decode = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Decode,
+            &Some("test_api_key".to_string()),
+        );
         assert_eq!(decode.worker_type(), WorkerType::Decode);
     }
 
     #[test]
     fn test_health_status() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         // Initial state is healthy
         assert!(worker.is_healthy());
@@ -1207,7 +1283,11 @@ mod tests {
 
     #[test]
     fn test_load_counter_operations() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         // Initial load is 0
         assert_eq!(worker.load(), 0);
@@ -1237,7 +1317,11 @@ mod tests {
 
     #[test]
     fn test_processed_counter() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         // Initial count is 0
         assert_eq!(worker.processed_requests(), 0);
@@ -1251,7 +1335,11 @@ mod tests {
 
     #[test]
     fn test_clone_worker() {
-        let original = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let original = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
         original.increment_load();
         original.increment_processed();
         original.set_healthy(false);
@@ -1276,6 +1364,7 @@ mod tests {
         let worker = Arc::new(BasicWorker::new(
             "http://test:8080".to_string(),
             WorkerType::Regular,
+            &Some("test_api_key".to_string()),
         ));
 
         let mut handles = vec![];
@@ -1303,6 +1392,7 @@ mod tests {
         let worker = Arc::new(BasicWorker::new(
             "http://test:8080".to_string(),
             WorkerType::Regular,
+            &Some("test_api_key".to_string()),
         ));
 
         // Set initial load to 100
@@ -1336,6 +1426,7 @@ mod tests {
         let worker = Arc::new(BasicWorker::new(
             "http://test:8080".to_string(),
             WorkerType::Regular,
+            &Some("test_api_key".to_string()),
         ));
 
         let mut handles = vec![];
@@ -1359,7 +1450,10 @@ mod tests {
     // Test WorkerFactory
     #[test]
     fn test_create_regular_worker() {
-        let worker = WorkerFactory::create_regular("http://regular:8080".to_string());
+        let worker = WorkerFactory::create_regular(
+            "http://regular:8080".to_string(),
+            &Some("test_api_key".to_string()),
+        );
         assert_eq!(worker.url(), "http://regular:8080");
         assert_eq!(worker.worker_type(), WorkerType::Regular);
     }
@@ -1367,7 +1461,11 @@ mod tests {
     #[test]
     fn test_create_prefill_worker() {
         // With bootstrap port
-        let worker1 = WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9090));
+        let worker1 = WorkerFactory::create_prefill(
+            "http://prefill:8080".to_string(),
+            Some(9090),
+            &Some("test_api_key".to_string()),
+        );
         assert_eq!(worker1.url(), "http://prefill:8080");
         assert_eq!(
             worker1.worker_type(),
@@ -1377,7 +1475,11 @@ mod tests {
         );
 
         // Without bootstrap port
-        let worker2 = WorkerFactory::create_prefill("http://prefill:8080".to_string(), None);
+        let worker2 = WorkerFactory::create_prefill(
+            "http://prefill:8080".to_string(),
+            None,
+            &Some("test_api_key".to_string()),
+        );
         assert_eq!(
             worker2.worker_type(),
             WorkerType::Prefill {
@@ -1388,7 +1490,10 @@ mod tests {
 
     #[test]
     fn test_create_decode_worker() {
-        let worker = WorkerFactory::create_decode("http://decode:8080".to_string());
+        let worker = WorkerFactory::create_decode(
+            "http://decode:8080".to_string(),
+            &Some("test_api_key".to_string()),
+        );
         assert_eq!(worker.url(), "http://decode:8080");
         assert_eq!(worker.worker_type(), WorkerType::Decode);
     }
@@ -1408,8 +1513,12 @@ mod tests {
             "http://decode2:8080".to_string(),
         ];
 
-        let (regular, prefill, decode) =
-            WorkerFactory::create_from_urls(regular_urls, prefill_urls, decode_urls);
+        let (regular, prefill, decode) = WorkerFactory::create_from_urls(
+            regular_urls,
+            prefill_urls,
+            decode_urls,
+            &Some("test_api_key".to_string()),
+        );
 
         assert_eq!(regular.len(), 2);
         assert_eq!(prefill.len(), 2);
@@ -1424,9 +1533,18 @@ mod tests {
     #[test]
     fn test_healthy_workers_filter() {
         let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
-            WorkerFactory::create_regular("http://w3:8080".to_string()),
+            WorkerFactory::create_regular(
+                "http://w1:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
+            WorkerFactory::create_regular(
+                "http://w2:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
+            WorkerFactory::create_regular(
+                "http://w3:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
         ];
 
         // Set some workers unhealthy
@@ -1441,9 +1559,18 @@ mod tests {
     #[test]
     fn test_total_load_calculation() {
         let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
-            WorkerFactory::create_regular("http://w3:8080".to_string()),
+            WorkerFactory::create_regular(
+                "http://w1:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
+            WorkerFactory::create_regular(
+                "http://w2:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
+            WorkerFactory::create_regular(
+                "http://w3:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
         ];
 
         // Set different loads
@@ -1462,9 +1589,18 @@ mod tests {
     #[test]
     fn test_find_worker() {
         let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
-            WorkerFactory::create_regular("http://w3:8080".to_string()),
+            WorkerFactory::create_regular(
+                "http://w1:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
+            WorkerFactory::create_regular(
+                "http://w2:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
+            WorkerFactory::create_regular(
+                "http://w3:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
         ];
 
         // Found case
@@ -1480,8 +1616,14 @@ mod tests {
     #[test]
     fn test_find_worker_mut() {
         let mut workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
+            WorkerFactory::create_regular(
+                "http://w1:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
+            WorkerFactory::create_regular(
+                "http://w2:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
         ];
 
         // Find and modify
@@ -1497,7 +1639,11 @@ mod tests {
     // Test WorkerLoadGuard
     #[test]
     fn test_load_guard_single_worker() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
         assert_eq!(worker.load(), 0);
 
         {
@@ -1512,9 +1658,18 @@ mod tests {
     #[test]
     fn test_load_guard_multiple_workers() {
         let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
-            WorkerFactory::create_regular("http://w3:8080".to_string()),
+            WorkerFactory::create_regular(
+                "http://w1:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
+            WorkerFactory::create_regular(
+                "http://w2:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
+            WorkerFactory::create_regular(
+                "http://w3:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
         ];
 
         let worker_refs: Vec<&dyn Worker> = workers.iter().map(|w| w.as_ref()).collect();
@@ -1538,6 +1693,7 @@ mod tests {
         let worker = Arc::new(BasicWorker::new(
             "http://test:8080".to_string(),
             WorkerType::Regular,
+            &Some("test_api_key".to_string()),
         ));
         assert_eq!(worker.load(), 0);
 
@@ -1568,7 +1724,7 @@ mod tests {
     fn test_urls_to_workers() {
         let urls = vec!["http://w1:8080".to_string(), "http://w2:8080".to_string()];
 
-        let workers = urls_to_workers(urls);
+        let workers = urls_to_workers(urls, &Some("test_api_key".to_string()));
         assert_eq!(workers.len(), 2);
         assert_eq!(workers[0].url(), "http://w1:8080");
         assert_eq!(workers[1].url(), "http://w2:8080");
@@ -1578,8 +1734,14 @@ mod tests {
     #[test]
     fn test_workers_to_urls() {
         let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
+            WorkerFactory::create_regular(
+                "http://w1:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
+            WorkerFactory::create_regular(
+                "http://w2:8080".to_string(),
+                &Some("test_api_key".to_string()),
+            ),
         ];
 
         let urls = workers_to_urls(&workers);
@@ -1591,7 +1753,11 @@ mod tests {
     fn test_check_health_sync_wrapper() {
         // We can't easily test the actual HTTP call without mocking,
         // but we can verify the sync wrapper works
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         // This will fail because there's no server at this URL,
         // but it tests that the sync wrapper doesn't panic
@@ -1604,6 +1770,7 @@ mod tests {
     async fn test_health_checker_startup() {
         let workers = Arc::new(RwLock::new(vec![WorkerFactory::create_regular(
             "http://w1:8080".to_string(),
+            &Some("test_api_key".to_string()),
         )]));
 
         let checker = start_health_checker(workers.clone(), 60);
@@ -1619,6 +1786,7 @@ mod tests {
     async fn test_health_checker_shutdown() {
         let workers = Arc::new(RwLock::new(vec![WorkerFactory::create_regular(
             "http://w1:8080".to_string(),
+            &Some("test_api_key".to_string()),
         )]));
 
         let checker = start_health_checker(workers.clone(), 60);
@@ -1633,7 +1801,11 @@ mod tests {
     fn test_load_counter_performance() {
         use std::time::Instant;
 
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
         let iterations = 1_000_000;
 
         let start = Instant::now();
@@ -1653,8 +1825,13 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_creation() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 2, 4, WorkerType::Regular);
+        let dp_worker = DPAwareWorker::new(
+            "http://worker1:8080".to_string(),
+            2,
+            4,
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@2");
         assert_eq!(dp_worker.base_url(), "http://worker1:8080");
@@ -1673,6 +1850,7 @@ mod tests {
             WorkerType::Prefill {
                 bootstrap_port: Some(9090),
             },
+            &Some("test_api_key".to_string()),
         );
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@1");
@@ -1687,8 +1865,13 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_creation_decode() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 0, 4, WorkerType::Decode);
+        let dp_worker = DPAwareWorker::new(
+            "http://worker1:8080".to_string(),
+            0,
+            4,
+            WorkerType::Decode,
+            &Some("test_api_key".to_string()),
+        );
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@0");
         assert!(dp_worker.is_dp_aware());
@@ -1697,8 +1880,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dp_aware_prepare_request() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 3, 8, WorkerType::Regular);
+        let dp_worker = DPAwareWorker::new(
+            "http://worker1:8080".to_string(),
+            3,
+            8,
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         let original_req = serde_json::json!({
             "prompt": "Hello",
@@ -1714,8 +1902,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dp_aware_prepare_request_invalid() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 0, 4, WorkerType::Regular);
+        let dp_worker = DPAwareWorker::new(
+            "http://worker1:8080".to_string(),
+            0,
+            4,
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         // Non-object JSON should fail
         let invalid_req = serde_json::json!("not an object");
@@ -1732,8 +1925,13 @@ mod tests {
 
     #[test]
     fn test_dp_aware_endpoint_url() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 1, 4, WorkerType::Regular);
+        let dp_worker = DPAwareWorker::new(
+            "http://worker1:8080".to_string(),
+            1,
+            4,
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         assert_eq!(
             dp_worker.endpoint_url("/generate"),
@@ -1747,8 +1945,13 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_delegated_methods() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 0, 2, WorkerType::Regular);
+        let dp_worker = DPAwareWorker::new(
+            "http://worker1:8080".to_string(),
+            0,
+            2,
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         // Test health status
         assert!(dp_worker.is_healthy());
@@ -1777,6 +1980,7 @@ mod tests {
             1,
             4,
             WorkerType::Regular,
+            &Some("test_api_key".to_string()),
         );
 
         assert_eq!(worker.url(), "http://worker1:8080@1");
@@ -1795,6 +1999,7 @@ mod tests {
             WorkerType::Prefill {
                 bootstrap_port: Some(8090),
             },
+            &Some("test_api_key".to_string()),
         );
 
         assert_eq!(worker.url(), "http://worker1:8080@0");
@@ -1811,7 +2016,7 @@ mod tests {
     async fn test_factory_create_workers_regular() {
         let urls = vec!["http://w1:8080".to_string(), "http://w2:8080".to_string()];
 
-        let workers = WorkerFactory::create_workers(urls, false, &None)
+        let workers = WorkerFactory::create_workers(urls, false, &Some("test_api_key".to_string()))
             .await
             .unwrap();
 
@@ -1826,7 +2031,11 @@ mod tests {
 
     #[test]
     fn test_worker_circuit_breaker() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         // Initial state should be available
         assert!(worker.is_available());
@@ -1862,8 +2071,12 @@ mod tests {
             window_duration: Duration::from_secs(60),
         };
 
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
-            .with_circuit_breaker_config(config);
+        let worker = BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        )
+        .with_circuit_breaker_config(config);
 
         // Should open after 2 failures
         worker.record_outcome(false);
@@ -1891,8 +2104,13 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_circuit_breaker() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker:8080".to_string(), 0, 2, WorkerType::Regular);
+        let dp_worker = DPAwareWorker::new(
+            "http://worker:8080".to_string(),
+            0,
+            2,
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         // Should have circuit breaker
         assert!(dp_worker.is_available());
@@ -1915,11 +2133,26 @@ mod tests {
     #[tokio::test]
     async fn test_mixed_worker_types() {
         // Create a mix of worker types
-        let regular = WorkerFactory::create_regular("http://regular:8080".to_string());
-        let prefill = WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9090));
-        let decode = WorkerFactory::create_decode("http://decode:8080".to_string());
-        let dp_aware_regular =
-            WorkerFactory::create_dp_aware("http://dp:8080".to_string(), 0, 2, WorkerType::Regular);
+        let regular = WorkerFactory::create_regular(
+            "http://regular:8080".to_string(),
+            &Some("test_api_key".to_string()),
+        );
+        let prefill = WorkerFactory::create_prefill(
+            "http://prefill:8080".to_string(),
+            Some(9090),
+            &Some("test_api_key".to_string()),
+        );
+        let decode = WorkerFactory::create_decode(
+            "http://decode:8080".to_string(),
+            &Some("test_api_key".to_string()),
+        );
+        let dp_aware_regular = WorkerFactory::create_dp_aware(
+            "http://dp:8080".to_string(),
+            0,
+            2,
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
         let dp_aware_prefill = WorkerFactory::create_dp_aware(
             "http://dp-prefill:8080".to_string(),
             1,
@@ -1927,12 +2160,14 @@ mod tests {
             WorkerType::Prefill {
                 bootstrap_port: None,
             },
+            &Some("test_api_key".to_string()),
         );
         let dp_aware_decode = WorkerFactory::create_dp_aware(
             "http://dp-decode:8080".to_string(),
             0,
             4,
             WorkerType::Decode,
+            &Some("test_api_key".to_string()),
         );
 
         let workers: Vec<Box<dyn Worker>> = vec![

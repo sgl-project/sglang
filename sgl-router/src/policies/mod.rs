@@ -125,14 +125,17 @@ mod tests {
             Box::new(BasicWorker::new(
                 "http://w1:8000".to_string(),
                 WorkerType::Regular,
+                &Some("test_api_key".to_string()),
             )),
             Box::new(BasicWorker::new(
                 "http://w2:8000".to_string(),
                 WorkerType::Regular,
+                &Some("test_api_key2".to_string()),
             )),
             Box::new(BasicWorker::new(
                 "http://w3:8000".to_string(),
                 WorkerType::Regular,
+                &None,
             )),
         ];
 
