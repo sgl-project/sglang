@@ -81,6 +81,7 @@ impl MockWorker {
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
+            .route("/v1/responses", post(responses_handler))
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
@@ -541,6 +542,91 @@ async fn completions_handler(
             "usage": {
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        }))
+        .into_response()
+    }
+}
+
+async fn responses_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "Random failure for testing",
+                    "type": "internal_error",
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    let is_stream = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    if is_stream {
+        let request_id = format!("resp-{}", Uuid::new_v4());
+
+        let stream = stream::once(async move {
+            let chunk = json!({
+                "id": request_id,
+                "object": "response",
+                "created_at": timestamp,
+                "model": "mock-model",
+                "status": "in_progress",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "This is a mock responses streamed output."
+                    }]
+                }]
+            });
+            Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
+        })
+        .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        Json(json!({
+            "id": format!("resp-{}", Uuid::new_v4()),
+            "object": "response",
+            "created_at": timestamp,
+            "model": "mock-model",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "This is a mock responses output."
+                }]
+            }],
+            "status": "completed",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
                 "total_tokens": 15
             }
         }))

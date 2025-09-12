@@ -9,8 +9,8 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
 use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, StringOrArray,
-    UserMessageContent,
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponsesRequest,
+    StringOrArray, UserMessageContent,
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1928,6 +1928,18 @@ impl RouterTrait for PDRouter {
 
         // Execute with retry and bootstrap injection
         self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_responses(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ResponsesRequest,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses endpoint not implemented for PD router",
+        )
+            .into_response()
     }
 
     async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
