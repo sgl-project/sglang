@@ -64,12 +64,28 @@ class ModelConfig:
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        tp_rank: Optional[int] = None,
+        remote_instance_weight_loader_seed_instance_ip: Optional[str] = None,
+        remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None,
+        remote_instance_weight_loader_send_weights_group_ports: Optional[
+            List[int]
+        ] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.model_impl = model_impl
+        self.tp_rank = tp_rank
+        self.remote_instance_weight_loader_seed_instance_ip = (
+            remote_instance_weight_loader_seed_instance_ip
+        )
+        self.remote_instance_weight_loader_seed_instance_service_port = (
+            remote_instance_weight_loader_seed_instance_service_port
+        )
+        self.remote_instance_weight_loader_send_weights_group_ports = (
+            remote_instance_weight_loader_send_weights_group_ports
+        )
 
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
@@ -329,6 +345,9 @@ class ModelConfig:
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
+            remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
+            remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
+            remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
             **kwargs,
         )
 
