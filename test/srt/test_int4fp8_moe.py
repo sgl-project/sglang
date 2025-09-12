@@ -13,7 +13,7 @@ from sglang.srt.utils import kill_process_tree
 class TestMixtralAccuracy(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "/large_models/mistralai_Mixtral-8x7B-Instruct-v0.1"
+        cls.model = "mistralai/Mixtral-8x7B-Instruct-v0.1"
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         other_args = [
