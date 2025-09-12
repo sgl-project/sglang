@@ -32,7 +32,6 @@ suites = {
         TestFile("models/test_generation_models.py", 103),
         # TestFile("models/test_gme_qwen_models.py", 45),
         # TestFile("models/test_grok_models.py", 60),  # Disabled due to illegal memory access
-        TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_vlm_models.py", 437),
         TestFile("models/test_transformers_models.py", 320),
@@ -132,6 +131,7 @@ suites = {
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 372),
+        TestFile("models/test_qwen_models.py", 282),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-8-gpu": [
@@ -182,7 +182,6 @@ suite_amd = {
         TestFile("lora/test_lora_qwen3.py", 97),
         TestFile("models/test_embedding_models.py", 73),
         TestFile("models/test_compressed_tensors_models.py", 42),
-        TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("openai_server/basic/test_protocol.py", 10),
@@ -255,6 +254,7 @@ suite_amd = {
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
+        TestFile("models/test_qwen_models.py", 282),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
