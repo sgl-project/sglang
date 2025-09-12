@@ -24,10 +24,14 @@ class TestDeepseekV3(CustomTestCase):
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
-            "--tp", "4",
-            "--attention-backend", "trtllm_mla",
-            "--moe-runner-backend", "flashinfer_trtllm",
-            "--quantization", "modelopt_fp4",
+            "--tp",
+            "4",
+            "--attention-backend",
+            "trtllm_mla",
+            "--moe-runner-backend",
+            "flashinfer_trtllm",
+            "--quantization",
+            "modelopt_fp4",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -80,14 +84,22 @@ class TestDeepseekV3MTP(CustomTestCase):
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
-            "--tp", "4",
-            "--attention-backend", "trtllm_mla",
-            "--moe-runner-backend", "flashinfer_trtllm",
-            "--quantization", "modelopt_fp4",
-            "--speculative-algorithm", "EAGLE",
-            "--speculative-num-steps", "3",
-            "--speculative-eagle-topk", "1",
-            "--speculative-num-draft-tokens", "4",
+            "--tp",
+            "4",
+            "--attention-backend",
+            "trtllm_mla",
+            "--moe-runner-backend",
+            "flashinfer_trtllm",
+            "--quantization",
+            "modelopt_fp4",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
         ]
         cls.process = popen_launch_server(
             cls.model,
