@@ -16,10 +16,10 @@ use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use crate::tokenizer::{factory as tokenizer_factory, traits::Tokenizer};
 use crate::tool_parser::ParserRegistry;
 use axum::{
-    extract::{Query, Request, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use reqwest::Client;
@@ -205,6 +205,52 @@ async fn v1_responses(
     state
         .router
         .route_responses(Some(&headers), &body, None)
+        .await
+}
+
+async fn v1_responses_get(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .get_response(Some(&headers), &response_id)
+        .await
+}
+
+async fn v1_responses_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .cancel_response(Some(&headers), &response_id)
+        .await
+}
+
+async fn v1_responses_delete(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    // Python server does not support this yet
+    state
+        .router
+        .delete_response(Some(&headers), &response_id)
+        .await
+}
+
+async fn v1_responses_list_input_items(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    // Python server does not support this yet
+    state
+        .router
+        .list_response_input_items(Some(&headers), &response_id)
         .await
 }
 
@@ -419,6 +465,16 @@ pub fn build_app(
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
+        .route("/v1/responses/{response_id}", get(v1_responses_get))
+        .route(
+            "/v1/responses/{response_id}/cancel",
+            post(v1_responses_cancel),
+        )
+        .route("/v1/responses/{response_id}", delete(v1_responses_delete))
+        .route(
+            "/v1/responses/{response_id}/input",
+            get(v1_responses_list_input_items),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             crate::middleware::concurrency_limit_middleware,

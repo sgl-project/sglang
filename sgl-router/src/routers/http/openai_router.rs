@@ -351,6 +351,22 @@ impl super::super::RouterTrait for OpenAIRouter {
             .into_response()
     }
 
+    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses retrieve endpoint not implemented for OpenAI router",
+        )
+            .into_response()
+    }
+
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses cancel endpoint not implemented for OpenAI router",
+        )
+            .into_response()
+    }
+
     async fn flush_cache(&self) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
