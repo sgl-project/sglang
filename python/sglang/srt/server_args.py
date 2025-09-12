@@ -97,6 +97,7 @@ ATTENTION_BACKEND_CHOICES = [
     "triton",
     "torch_native",
     "flex_attention",
+    "hip_attention",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -1896,26 +1897,6 @@ class ServerArgs:
         )
 
         # Kernel backend
-        ATTN_BACKENDS = [
-            # Common
-            "triton",
-            "torch_native",
-            "hip_attention",
-            # NVIDIA specific
-            "cutlass_mla",
-            "fa3",
-            "flashinfer",
-            "flashmla",
-            "trtllm_mla",
-            "trtllm_mha",
-            "dual_chunk_flash_attn",
-            # AMD specific
-            "aiter",
-            "wave",
-            # Other platforms
-            "intel_amx",
-            "ascend",
-        ]
         parser.add_argument(
             "--attention-backend",
             type=str,
