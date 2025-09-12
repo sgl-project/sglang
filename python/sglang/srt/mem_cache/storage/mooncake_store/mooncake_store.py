@@ -7,7 +7,12 @@ from typing import Any, List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorage,
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo
+)
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -171,7 +176,9 @@ class MooncakeStore(HiCacheStorage):
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
 
-    def register_buffer(self, buffer: torch.Tensor) -> None:
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        super().register_mem_pool_host(mem_pool_host)
+        buffer = self.mem_pool_host.kv_buffer
         try:
             buffer_ptr = buffer.data_ptr()
             buffer_size = buffer.numel() * buffer.element_size()
@@ -181,6 +188,92 @@ class MooncakeStore(HiCacheStorage):
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
+
+    def _get_mha_buffer_meta(self, keys, indices):
+        ptr_list = []
+        key_list = []
+        kv_buffer_data_ptr = self.mem_pool_host.kv_buffer.data_ptr()
+        indices = indices.tolist()
+        v_offset = (
+            self.mem_pool_host.layer_num
+            * self.mem_pool_host.size
+            * self.mem_pool_host.head_num
+            * self.mem_pool_host.head_dim
+            * self.mem_pool_host.dtype.itemsize
+        )
+        for index in range(0, len(indices), self.mem_pool_host.page_size):
+            k_ptr = (
+                kv_buffer_data_ptr
+                + indices[index]
+                * self.mem_pool_host.layer_num
+                * self.mem_pool_host.head_num
+                * self.mem_pool_host.head_dim
+                * self.mem_pool_host.dtype.itemsize
+            )
+            v_ptr = k_ptr + v_offset
+            ptr_list.append(k_ptr)
+            ptr_list.append(v_ptr)
+            key_ = keys[index // self.mem_pool_host.page_size]
+            key_list.append(f"{key_}_{self.local_rank}_k")
+            key_list.append(f"{key_}_{self.local_rank}_v")
+        element_size = (
+            self.mem_pool_host.layer_num
+            * self.mem_pool_host.dtype.itemsize
+            * self.mem_pool_host.page_size
+            * self.mem_pool_host.head_num
+            * self.mem_pool_host.head_dim
+        )
+        element_size_list = [element_size] * len(key_list)
+        return key_list, ptr_list, element_size_list
+
+    def _get_mla_buffer_meta(self, keys, indices):
+        ptr_list = []
+        key_list = []
+        kv_buffer_data_ptr = self.mem_pool_host.kv_buffer.data_ptr()
+        indices = indices.tolist()
+        for index in range(0, len(indices), self.mem_pool_host.page_size):
+            k_ptr = (
+                kv_buffer_data_ptr
+                + indices[index]
+                * self.mem_pool_host.layer_num
+                * (self.mem_pool_host.kv_lora_rank + self.mem_pool_host.qk_rope_head_dim)
+                * self.mem_pool_host.dtype.itemsize
+            )
+            ptr_list.append(k_ptr)
+            key_ = keys[index // self.mem_pool_host.page_size]
+            key_list.append(f"{key_}_k")
+        element_size = (
+            self.mem_pool_host.layer_num
+            * self.mem_pool_host.dtype.itemsize
+            * self.mem_pool_host.page_size
+            * (self.mem_pool_host.kv_lora_rank + self.mem_pool_host.qk_rope_head_dim)
+        )
+        element_size_list = [element_size] * len(key_list)
+        return key_list, ptr_list, element_size_list
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """
+        Retrieve values for multiple keys.
+        Returns a list of tensors or None for each key.
+        """
+        pass
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """
+        Retrieve values for multiple keys.
+        Returns a list of tensors or None for each key.
+        """
+        pass
 
     def set(
         self,
