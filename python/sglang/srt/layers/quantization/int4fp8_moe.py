@@ -28,6 +28,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import requantize_
 from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
+    BAR_FORMAT
 )
 
 if TYPE_CHECKING:
@@ -46,12 +47,6 @@ if _is_hip:
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
 
 logger = logging.getLogger(__name__)
-
-# explicitly use pure text format, with a newline at the end
-# this makes it impossible to see the animation in the progress bar
-# but will avoid messing up with ray or multiprocessing, which wraps
-# each line of output with some prefix.
-_BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
 
 def tqdm_reset_no_print(tqdm_bar: tqdm, total=None):
     tqdm_bar.n = 0
@@ -82,7 +77,7 @@ class QuarkInt4Fp8Config(QuantizationConfig):
 
         # The weight iterator already has a progress bar on rank=0, account for that.
         position = 1 + tqdm._get_free_pos()
-        self.online_quant_progress_bar = tqdm(total=0, desc=f"Online int4fp8_moe quantization on rank={tp_rank}", position=position, bar_format=_BAR_FORMAT, mininterval=2.)
+        self.online_quant_progress_bar = tqdm(total=0, desc=f"Online int4fp8_moe quantization on rank={tp_rank}", position=position, bar_format=BAR_FORMAT, mininterval=2.)
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
