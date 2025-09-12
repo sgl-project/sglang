@@ -87,6 +87,7 @@ class ModelConfig:
         self.remote_instance_weight_loader_send_weights_group_ports = (
             remote_instance_weight_loader_send_weights_group_ports
         )
+        self.modelopt_quant = modelopt_quant
 
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
