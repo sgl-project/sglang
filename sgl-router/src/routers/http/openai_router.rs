@@ -387,7 +387,12 @@ impl super::super::RouterTrait for OpenAIRouter {
             .into_response()
     }
 
-    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: &RerankRequest) -> Response {
+    async fn route_rerank(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &RerankRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Rerank endpoint not implemented for OpenAI backend",

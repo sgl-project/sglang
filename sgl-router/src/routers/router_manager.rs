@@ -7,7 +7,7 @@
 use crate::config::RouterConfig;
 use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest,
 };
 use crate::protocols::worker_spec::{
     ServerInfo, WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo,
@@ -678,12 +678,17 @@ impl RouterTrait for RouterManager {
     }
 
     /// Route rerank request
-    async fn route_rerank(&self, headers: Option<&HeaderMap>, body: Body) -> Response {
+    async fn route_rerank(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RerankRequest,
+        model_id: Option<&str>,
+    ) -> Response {
         // Try to select a router based on headers
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
-            router.route_rerank(headers, body).await
+            router.route_rerank(headers, body, model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,

@@ -183,7 +183,7 @@ async fn rerank(
     headers: http::HeaderMap,
     Json(body): Json<RerankRequest>,
 ) -> Response {
-    state.router.route_rerank(Some(&headers), &body).await
+    state.router.route_rerank(Some(&headers), &body, None).await
 }
 
 async fn v1_rerank(
@@ -193,7 +193,7 @@ async fn v1_rerank(
 ) -> Response {
     state
         .router
-        .route_rerank(Some(&headers), &body.into())
+        .route_rerank(Some(&headers), &body.into(), None)
         .await
 }
 

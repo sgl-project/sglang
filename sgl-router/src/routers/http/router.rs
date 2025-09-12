@@ -1314,11 +1314,18 @@ impl RouterTrait for Router {
         todo!()
     }
 
-    async fn route_rerank(&self, headers: Option<&HeaderMap>, body: &RerankRequest) -> Response {
+    async fn route_rerank(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RerankRequest,
+        model_id: Option<&str>,
+    ) -> Response {
         if let Err(e) = body.validate() {
             return (StatusCode::BAD_REQUEST, e).into_response();
         }
-        let response = self.route_typed_request(headers, body, "/v1/rerank").await;
+        let response = self
+            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {
                 Ok(rerank_response) => rerank_response,

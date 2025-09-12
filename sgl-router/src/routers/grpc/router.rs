@@ -242,6 +242,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::RerankRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }

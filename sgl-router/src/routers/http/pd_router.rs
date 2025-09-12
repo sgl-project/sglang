@@ -1926,7 +1926,12 @@ impl RouterTrait for PDRouter {
         todo!()
     }
 
-    async fn route_rerank(&self, headers: Option<&HeaderMap>, body: &RerankRequest) -> Response {
+    async fn route_rerank(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RerankRequest,
+        model_id: Option<&str>,
+    ) -> Response {
         // Extract text for cache-aware routing
         let req_text = if self.policies_need_request_text() {
             Some(body.query.clone())
@@ -1941,6 +1946,7 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            model_id,
         };
 
         // Execute with retry and bootstrap injection
