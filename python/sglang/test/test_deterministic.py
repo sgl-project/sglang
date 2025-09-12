@@ -65,7 +65,6 @@ def send_one_prompt(args):
             "max_new_tokens": args.max_new_tokens,
             "frequency_penalty": args.frequency_penalty,
             "presence_penalty": args.presence_penalty,
-            "stop": ["Question", "Assistant:", "<|separator|>", "<|eos|>"],
         },
         "return_logprob": args.return_logprob,
         "stream": args.stream,
@@ -105,7 +104,7 @@ def test_deterministic(args):
     texts = []
     for i in range(args.n_trials):
         text, speed = send_one_prompt(args)
-        print(f"Trial {i}: {speed=:.2f} token/s, {text[:50]}")
+        print(f"Trial {i}: {speed=:.2f} token/s \n Last 50 characters: {text[-50:]}")
         speeds.append(speed)
         texts.append(text)
 
