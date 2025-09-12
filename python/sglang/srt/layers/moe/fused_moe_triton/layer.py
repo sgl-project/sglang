@@ -26,6 +26,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     CombineInput,
     StandardDispatcher,
+    StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import (
@@ -981,8 +982,9 @@ class FlashInferFusedMoE(FusedMoE):
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply_with_router_logits(
             layer=self,
-            x=hidden_states,
-            topk_output=topk_output,
+            dispatch_output=StandardDispatchOutput(
+                hidden_states=hidden_states, topk_output=topk_output
+            ),
         )
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
