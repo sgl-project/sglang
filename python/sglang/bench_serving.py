@@ -1930,9 +1930,9 @@ async def benchmark(
     return result | result_details
 
 
-def check_chat_template(model_path):
+def check_chat_template(tokenizer_id):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
         return "chat_template" in tokenizer.init_kwargs
     except Exception as e:
         print(f"Fail to load tokenizer config with error={e}")
@@ -2071,7 +2071,8 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if not check_chat_template(args.model):
+    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
+    if not check_chat_template(tokenizer_id):
         print(
             "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
@@ -2082,7 +2083,6 @@ def run_benchmark(args_: argparse.Namespace):
     # Read dataset
     backend = args.backend
     model_id = args.model
-    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer)
 
