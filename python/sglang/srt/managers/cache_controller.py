@@ -275,7 +275,7 @@ class HiCacheController:
             self.storage_config = self._generate_storage_config(
                 model_name, storage_backend_extra_config
             )
-            
+
             # Get storage_backend_tag from extra_config
             storage_backend_tag = (
                 self.storage_config.extra_config.get("storage_backend_tag")
@@ -285,7 +285,7 @@ class HiCacheController:
             self.enable_storage_tag = (
                 storage_backend_tag is not None and storage_backend_tag != ""
             )
-            
+
             if self.enable_storage_tag:
                 prefix = f"{storage_backend_tag}_"
                 self.get_hash_str = HiCacheController.get_hash_str_with_prefix(
@@ -444,7 +444,6 @@ class HiCacheController:
                 extra_config = json.loads(storage_backend_extra_config)
             except Exception as e:
                 logger.error(f"Invalid backend extra config JSON: {e}")
-
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
