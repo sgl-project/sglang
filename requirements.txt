@@ -9,9 +9,6 @@ pydantic>=2.0.0
 httpx>=0.24.0
 requests>=2.31.0
 
-# Essential for async operations
-asyncio-compat>=0.1.0
-
 # SGLang will be installed separately via pip install sglang[all]
 # Uncomment the line below if you want to install SGLang via requirements
 # sglang[all]

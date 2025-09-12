@@ -93,7 +93,8 @@ def _load_deployment_config() -> DeploymentConfig:
         log_requests=os.environ.get("LOG_REQUESTS", "true").lower() in ("1", "true", "yes"),
         enable_p2p_check=os.environ.get("ENABLE_P2P_CHECK", "false").lower() in ("1", "true", "yes"),
         enable_torch_compile=os.environ.get("ENABLE_TORCH_COMPILE", "false").lower() in ("1", "true", "yes"),
-        h100_only=os.environ.get("H100_ONLY", "true").lower() in ("1", "true", "yes"),
+        # Allow L4 in prod by default; can still force H100 via env
+        h100_only=os.environ.get("H100_ONLY", "false").lower() in ("1", "true", "yes"),
         auto_use_fp8_on_h100=os.environ.get("AUTO_USE_FP8_ON_H100", "true").lower() in ("1", "true", "yes"),
         autoscale_target_tokens_per_s=(
             float(os.environ["AUTOSCALE_TARGET_TOKENS_PER_S"]) if os.environ.get("AUTOSCALE_TARGET_TOKENS_PER_S") else None
@@ -101,6 +102,15 @@ def _load_deployment_config() -> DeploymentConfig:
         autoscale_target_queue_depth=(
             int(os.environ["AUTOSCALE_TARGET_QUEUE_DEPTH"]) if os.environ.get("AUTOSCALE_TARGET_QUEUE_DEPTH") else None
         ),
+        # Speculative decoding configs (default to EAGLE for higher throughput)
+        speculative_algorithm=os.environ.get("SPECULATIVE_ALGORITHM") or "EAGLE",
+        speculative_draft_model_path=os.environ.get("SPECULATIVE_DRAFT_MODEL_PATH") or None,
+        speculative_draft_model_revision=os.environ.get("SPECULATIVE_DRAFT_MODEL_REVISION") or None,
+        speculative_num_steps=(int(os.environ["SPECULATIVE_NUM_STEPS"]) if os.environ.get("SPECULATIVE_NUM_STEPS") else 1),
+        speculative_eagle_topk=(int(os.environ["SPECULATIVE_EAGLE_TOPK"]) if os.environ.get("SPECULATIVE_EAGLE_TOPK") else 1),
+        speculative_num_draft_tokens=(int(os.environ["SPECULATIVE_NUM_DRAFT_TOKENS"]) if os.environ.get("SPECULATIVE_NUM_DRAFT_TOKENS") else 2),
+        speculative_token_map=os.environ.get("SPECULATIVE_TOKEN_MAP") or None,
+        speculative_attention_mode=os.environ.get("SPECULATIVE_ATTENTION_MODE") or "prefill",
     )
 
 
@@ -128,6 +138,16 @@ logger.info(f"  dtype: {CONFIG.dtype}, quant: {CONFIG.quantization}, kv: {CONFIG
 logger.info(f"  max_total_tokens: {CONFIG.max_total_tokens}")
 logger.info(f"  enable_metrics: {CONFIG.enable_metrics}")
 logger.info(f"  h100_only: {CONFIG.h100_only}")
+logger.info(
+    "  speculative: algo=%s, draft=%s, steps=%s, topk=%s, num_draft_tokens=%s, token_map=%s, attn_mode=%s",
+    CONFIG.speculative_algorithm,
+    CONFIG.speculative_draft_model_path,
+    CONFIG.speculative_num_steps,
+    CONFIG.speculative_eagle_topk,
+    CONFIG.speculative_num_draft_tokens,
+    CONFIG.speculative_token_map,
+    (CONFIG.speculative_attention_mode or "prefill"),
+)
 logger.info(f"  namespace: {CONFIG.namespace}, deployment_id: {CONFIG.deployment_id}, customer_id: {CONFIG.customer_id}")
 
 # Global engine instance
@@ -206,6 +226,15 @@ async def lifespan(app: FastAPI):
             enable_p2p_check=CONFIG.enable_p2p_check,
             enable_torch_compile=CONFIG.enable_torch_compile,
             log_level="error",  # Reduce SGLang internal logging
+            # Speculative decoding passthrough
+            speculative_algorithm=CONFIG.speculative_algorithm,
+            speculative_draft_model_path=CONFIG.speculative_draft_model_path,
+            speculative_draft_model_revision=CONFIG.speculative_draft_model_revision,
+            speculative_num_steps=CONFIG.speculative_num_steps,
+            speculative_eagle_topk=CONFIG.speculative_eagle_topk,
+            speculative_num_draft_tokens=CONFIG.speculative_num_draft_tokens,
+            speculative_token_map=CONFIG.speculative_token_map,
+            speculative_attention_mode=(CONFIG.speculative_attention_mode or "prefill"),
         )
         # Record chosen dtypes; send enrollment if configured
         global _chosen_dtype, _chosen_quant, _chosen_kv_dtype

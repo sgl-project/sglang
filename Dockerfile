@@ -6,14 +6,15 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # Install gcloud CLI
-RUN apt-get update && apt-get install -y curl gnupg dnsutils \
-  && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list \
-  && curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - \
-  && apt-get update && apt-get install -y google-cloud-sdk \
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg ca-certificates dnsutils \
+  && mkdir -p /usr/share/keyrings \
+  && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+  && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list \
+  && apt-get update && apt-get install -y --no-install-recommends google-cloud-sdk \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy and install requirements
-COPY requirements.txt .
+COPY app/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install SGLang - adjust this line based on your SGLang installation method
@@ -21,10 +22,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir sglang[all]
 
 # Copy the application code
-COPY serve_hathora.py .
+COPY app/serve_hathora.py .
+COPY app/hathora_config.py .
 
 # Copy entrypoint script
-COPY entrypoint.sh /entrypoint.sh
+COPY app/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Expose the port the app runs on

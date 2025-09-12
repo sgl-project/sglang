@@ -37,7 +37,7 @@ export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-4096}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 export PORT="${HATHORA_DEFAULT_PORT:-8000}"
 export ENABLE_METRICS="${ENABLE_METRICS:-true}"
-export H100_ONLY="${H100_ONLY:-true}"
+export H100_ONLY="${H100_ONLY:-false}"
 export AUTO_USE_FP8_ON_H100="${AUTO_USE_FP8_ON_H100:-true}"
 
 log "Decoding service account key from environment variable..."

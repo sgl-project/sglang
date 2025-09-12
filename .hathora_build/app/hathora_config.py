@@ -36,6 +36,16 @@ class DeploymentConfig(BaseModel):
     h100_only: bool = Field(default=True, description="Fail fast if GPUs are not H100 class")
     auto_use_fp8_on_h100: bool = Field(default=True, description="If H100, prefer fp8 weights + fp8 kv cache when safe")
 
+    # Speculative decoding (EAGLE / EAGLE3)
+    speculative_algorithm: Optional[str] = Field(default=None, description="None|EAGLE|EAGLE3|STANDALONE")
+    speculative_draft_model_path: Optional[str] = Field(default=None, description="Draft model for speculative decoding")
+    speculative_draft_model_revision: Optional[str] = Field(default=None, description="Revision of draft model")
+    speculative_num_steps: Optional[int] = Field(default=None, description="Depth of autoregressive drafting")
+    speculative_eagle_topk: Optional[int] = Field(default=None, description="Branching factor per step")
+    speculative_num_draft_tokens: Optional[int] = Field(default=None, description="Max parallel verification capacity")
+    speculative_token_map: Optional[str] = Field(default=None, description="FR-Spec vocabulary subset path")
+    speculative_attention_mode: Optional[str] = Field(default=None, description="prefill|decode; defaults to prefill")
+
     # Autoscaling hints (consumed by external autoscaler)
     autoscale_target_tokens_per_s: Optional[float] = Field(default=None)
     autoscale_target_queue_depth: Optional[int] = Field(default=None)
