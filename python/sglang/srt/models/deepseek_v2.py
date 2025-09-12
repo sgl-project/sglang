@@ -1098,8 +1098,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                     or sum_extend_prefix_lens == 0
                 )
                 # TODO(shuw@nvidia.com) Flashinfer cutlass and trtllm_mla backend have accuracy issue on blackwell for
-				# dp case. Redirect to mla kernel as a workaround.
-                # Tracked by https://github.com/sgl-project/sglang/issues/9806. 
+                # dp case. Redirect to mla kernel as a workaround.
+                # Tracked by https://github.com/sgl-project/sglang/issues/9806.
                 and not (
                     original_mode is not None
                     and original_mode.is_decode()
