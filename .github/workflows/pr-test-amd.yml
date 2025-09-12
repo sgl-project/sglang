@@ -329,8 +329,8 @@ jobs:
     needs: [
       accuracy-test-1-gpu-amd, bench-test-2-gpu-amd,
       accuracy-test-2-gpu-amd, performance-test-1-gpu-part-1-amd, performance-test-1-gpu-part-2-amd,
-      unit-test-backend-1-gpu-amd, unit-test-backend-1-gpu-amd-mi35x, unit-test-backend-2-gpu-amd,
-      unit-test-backend-8-gpu-amd, unit-test-sgl-kernel-amd
+      unit-test-backend-1-gpu-amd, unit-test-backend-2-gpu-amd, unit-test-backend-8-gpu-amd,
+      unit-test-sgl-kernel-amd
     ]
     runs-on: ubuntu-latest
     steps:
