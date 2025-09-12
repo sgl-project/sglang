@@ -185,6 +185,34 @@ jobs:
               output_display=$(printf "%.0f" "$output_throughput_mean" 2>/dev/null || echo "$output_throughput_mean")
 
               echo "| ${label} | ✅ Success | $ttft_display | $e2e_display | $input_display | $output_display |" >> $GITHUB_STEP_SUMMARY
+
+              # Optional GPU utilization table if monitor output exists
+              gpu_json="$result_folder/gpu_utilization.json"
+              if [ -f "$gpu_json" ]; then
+                overall_mean=$(jq -r '.overall.mean // 0' "$gpu_json")
+                printf "\n#### GPU Utilization — %s\n\n" "$label" >> $GITHUB_STEP_SUMMARY
+                printf "Overall mean: %.2f%%\n\n" "$overall_mean" >> $GITHUB_STEP_SUMMARY
+                echo "| GPU | Mean (%) | p5 | p10 | p25 | p50 | p75 | p90 | p95 |" >> $GITHUB_STEP_SUMMARY
+                echo "|-----|----------|----|-----|-----|-----|-----|-----|-----|" >> $GITHUB_STEP_SUMMARY
+                jq -r '
+                  .per_gpu
+                  | to_entries[]
+                  | [ .key,
+                      (.value.mean // 0),
+                      (.value.p5 // 0),
+                      (.value.p10 // 0),
+                      (.value.p25 // 0),
+                      (.value.p50 // 0),
+                      (.value.p75 // 0),
+                      (.value.p90 // 0),
+                      (.value.p95 // 0)
+                    ]
+                  | @tsv' "$gpu_json" \
+                  | while IFS=$'\t' read -r gpu m p5 p10 p25 p50 p75 p90 p95; do
+                      printf "| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f |\n" "$gpu" "$m" "$p5" "$p10" "$p25" "$p50" "$p75" "$p90" "$p95" >> $GITHUB_STEP_SUMMARY
+                    done
+                echo "" >> $GITHUB_STEP_SUMMARY
+              fi
             fi
           fi
         done
