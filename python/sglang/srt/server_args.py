@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_npu,
     is_port_available,
     is_remote_url,
     is_sm90_supported,
@@ -569,7 +570,7 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
-        if self.attention_backend == "ascend":
+        if is_npu() and self.attention_backend in ["ascend", "hybrid_linear_attn"]:
             logger.warning(
                 "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
             )

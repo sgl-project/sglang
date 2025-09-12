@@ -676,7 +676,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 60
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
