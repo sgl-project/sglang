@@ -222,7 +222,9 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash, previous_keys)
+        super().__init__(
+            host_indices, token_ids, last_hash, previous_keys=previous_keys
+        )
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -828,11 +830,14 @@ class HiCacheController:
         host_indices: torch.Tensor,
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
+        previous_keys: Optional[List[str]] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
-        operation = StorageOperation(host_indices, token_ids, hash_value=hash_value)
+        operation = StorageOperation(
+            host_indices, token_ids, hash_value=hash_value, previous_keys=previous_keys
+        )
         self.backup_queue.put(operation)
         return operation.id
 

@@ -93,11 +93,12 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
     @lru_cache(maxsize=1)
-    def get_previous_hash_values(self, parent: TreeNode) -> List[str]:
-        if parent.parent == None:
+    def get_previous_hash_values(self, node: TreeNode) -> List[str]:
+        if node is None or node.hash_value is None:
             return []
+
         # TODO: parent.hash_value can be None when prefetch
-        return parent.get_previous_hash_values(parent.parent) + parent.hash_value
+        return node.get_previous_hash_values(node.parent) + node.hash_value
 
 
 def _key_match_page_size1(key0: List, key1: List):
