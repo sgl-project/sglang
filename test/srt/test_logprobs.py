@@ -107,10 +107,13 @@ class TestLogprobsDense(unittest.TestCase):
                 dmapA = {tid: lp for lp, tid, _ in e1}
                 dmapB = {tid: lp for lp, tid, _ in e2}
                 common = dmapA.keys() & dmapB.keys()
+                self.assertGreaterEqual(
+                    len(common),
+                    TOP_K / 2,
+                    f"there are only {len(common)} common topk tokens that matches",
+                )
                 for tid in common:
                     diffs.append(abs(dmapA[tid] - dmapB[tid]))
-        if not diffs:
-            return 0.0, 0.0
         return max(diffs), float(np.mean(diffs))
 
     def test_logprobs_comparison(self):
@@ -142,9 +145,12 @@ class TestLogprobsDense(unittest.TestCase):
             input_ids = [rec["ids"] for rec in test_records]
             logprob_start_lens = [rec["start_pos"] for rec in test_records]
 
-            # Determine which samples should return logprobs
+            # Determine which samples should return logprobs (randomly selected)
+            logprob_indices = set(
+                random.sample(range(len(test_records)), logprob_count)
+            )
             return_logprob_array = [
-                i < logprob_count for i in range(len(test_records))
+                i in logprob_indices for i in range(len(test_records))
             ]
 
             # Sampling param per request
@@ -168,13 +174,11 @@ class TestLogprobsDense(unittest.TestCase):
 
             for i, (rec, output) in enumerate(zip(test_records, outputs)):
                 # Only compare logprobs for samples that should have them
-                if i < logprob_count:
+                if i in logprob_indices:
                     # Safe access to meta_info and input_top_logprobs
                     meta_info = output.get("meta_info")
                     input_top_logprobs = (
-                        meta_info.get("input_top_logprobs")
-                        if meta_info
-                        else None
+                        meta_info.get("input_top_logprobs") if meta_info else None
                     )
 
                     self.assertIsNotNone(
@@ -192,9 +196,7 @@ class TestLogprobsDense(unittest.TestCase):
                     # Verify that logprobs were not returned for this sample
                     meta_info = output.get("meta_info")
                     input_top_logprobs = (
-                        meta_info.get("input_top_logprobs")
-                        if meta_info
-                        else None
+                        meta_info.get("input_top_logprobs") if meta_info else None
                     )
                     output_token_ids_logprobs = (
                         meta_info.get("output_token_ids_logprobs")
