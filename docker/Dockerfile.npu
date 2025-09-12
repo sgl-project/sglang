@@ -93,6 +93,6 @@ RUN pip install wheel==0.45.1 && git clone  --branch $SGLANG_KERNEL_NPU_TAG http
     && cd "$(pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -s deep_ep/deep_ep_cpp*.so
 
 # Install Bisheng
-RUN wget ${BISHENG_URL} && chmod a+x Ascend-BiSheng-toolkit_aarch64.run && ./Ascend-BiSheng-toolkit_aarch64.run --install
+RUN wget ${BISHENG_URL} && chmod a+x Ascend-BiSheng-toolkit_aarch64.run && ./Ascend-BiSheng-toolkit_aarch64.run --install && rm Ascend-BiSheng-toolkit_aarch64.run
 
 CMD ["/bin/bash"]
