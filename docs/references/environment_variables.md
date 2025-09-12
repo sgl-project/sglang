@@ -40,6 +40,11 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGL_DG_USE_NVRTC` | Use NVRTC (instead of Triton) for JIT compilation (Experimental) | `"0"` |
 | `SGL_USE_DEEPGEMM_BMM` | Use DeepGEMM for Batched Matrix Multiplication (BMM) operations | `"false"` |
 
+## DeepEP Configuration
+
+| Environment Variable | Description | Default Value |
+| `SGLANG_DEEPEP_BF16_DISPATCH` | Use Bfloat16 for dispatch | `"false"` |
+
 ## Memory Management
 
 | Environment Variable | Description | Default Value |

@@ -459,6 +459,8 @@ class DeepEPMoE(EPMoE):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            if get_moe_runner_backend().is_flashinfer_cutedsl():
+                return self.forward_flashinfer_cutedsl(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -637,6 +639,22 @@ class DeepEPMoE(EPMoE):
         ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
 
         return gather_out
+
+    def forward_flashinfer_cutedsl(
+        self,
+        dispatch_output: DeepEPLLOutput,
+    ):
+        hidden_states, _, _, masked_m, _ = dispatch_output
+        assert self.quant_method is not None
+        assert self.moe_runner_config.activation == "silu"
+
+        output = self.quant_method.apply_without_routing_weights(
+            layer=self,
+            x=hidden_states,
+            masked_m=masked_m,
+            moe_runner_config=self.moe_runner_config,
+        )
+        return output
 
     def forward_deepgemm_masked(
         self,
