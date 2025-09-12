@@ -86,18 +86,21 @@ impl Router {
         let workers: Vec<Box<dyn Worker>> = worker_urls
             .iter()
             .map(|url| {
-                let worker = BasicWorker::new(url.clone(), WorkerType::Regular)
-                    .with_circuit_breaker_config(core_cb_config.clone())
-                    .with_health_config(HealthConfig {
-                        timeout_secs: ctx.router_config.health_check.timeout_secs,
-                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                        endpoint: ctx.router_config.health_check.endpoint.clone(),
-                        failure_threshold: ctx.router_config.health_check.failure_threshold,
-                        success_threshold: ctx.router_config.health_check.success_threshold,
-                    });
+                let worker =
+                    BasicWorker::new(url.clone(), WorkerType::Regular, &ctx.router_config.api_key)
+                        .with_circuit_breaker_config(core_cb_config.clone())
+                        .with_health_config(HealthConfig {
+                            timeout_secs: ctx.router_config.health_check.timeout_secs,
+                            check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                            endpoint: ctx.router_config.health_check.endpoint.clone(),
+                            failure_threshold: ctx.router_config.health_check.failure_threshold,
+                            success_threshold: ctx.router_config.health_check.success_threshold,
+                        });
                 Box::new(worker) as Box<dyn Worker>
             })
             .collect();
+        let worker_api_keys: Vec<Option<String>> =
+            workers.iter().map(|w| w.api_key().clone()).collect();
 
         // Initialize policy with workers if needed (e.g., for cache-aware)
         if let Some(cache_aware) = policy
@@ -119,6 +122,7 @@ impl Router {
 
         let load_monitor_handle = if policy.name() == "power_of_two" {
             let monitor_urls = worker_urls.clone();
+            let monitor_api_keys = worker_api_keys.clone();
             let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
             let policy_clone = Arc::clone(&policy);
             let client_clone = ctx.client.clone();
@@ -126,6 +130,7 @@ impl Router {
             Some(Arc::new(tokio::spawn(async move {
                 Self::monitor_worker_loads(
                     monitor_urls,
+                    monitor_api_keys,
                     tx,
                     monitor_interval,
                     policy_clone,
@@ -856,6 +861,7 @@ impl Router {
                                 let new_worker = WorkerFactory::create_regular_with_config(
                                     dp_url.to_string(),
                                     self.circuit_breaker_config.clone(),
+                                    &self.api_key,
                                 );
                                 workers_guard.push(new_worker);
                                 worker_added = true;
@@ -871,6 +877,7 @@ impl Router {
                             let new_worker = WorkerFactory::create_regular_with_config(
                                 worker_url.to_string(),
                                 self.circuit_breaker_config.clone(),
+                                &self.api_key,
                             );
                             workers_guard.push(new_worker);
                         }
@@ -1050,6 +1057,7 @@ impl Router {
     // Background task to monitor worker loads
     async fn monitor_worker_loads(
         worker_urls: Vec<String>,
+        worker_api_keys: Vec<Option<String>>,
         tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
         interval_secs: u64,
         policy: Arc<dyn LoadBalancingPolicy>,
@@ -1061,8 +1069,8 @@ impl Router {
             interval.tick().await;
 
             let mut loads = HashMap::new();
-            for url in &worker_urls {
-                if let Some(load) = Self::get_worker_load_static(&client, url).await {
+            for (url, api_key) in worker_urls.iter().zip(worker_api_keys.iter()) {
+                if let Some(load) = Self::get_worker_load_static(&client, url, api_key).await {
                     loads.insert(url.clone(), load);
                 }
             }
@@ -1080,7 +1088,11 @@ impl Router {
     }
 
     // Static version of get_worker_load for use in monitoring task
-    async fn get_worker_load_static(client: &reqwest::Client, worker_url: &str) -> Option<isize> {
+    async fn get_worker_load_static(
+        client: &reqwest::Client,
+        worker_url: &str,
+        api_key: &Option<String>,
+    ) -> Option<isize> {
         let worker_url = if worker_url.contains("@") {
             // Need to extract the URL from "http://host:port@dp_rank"
             let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
@@ -1095,7 +1107,11 @@ impl Router {
             worker_url
         };
 
-        match client.get(format!("{}/get_load", worker_url)).send().await {
+        let mut req_builder = client.get(format!("{}/get_load", worker_url));
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+        match req_builder.send().await {
             Ok(res) if res.status().is_success() => match res.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(data) => data
@@ -1377,8 +1393,8 @@ mod tests {
 
     fn create_test_regular_router() -> Router {
         let workers = vec![
-            WorkerFactory::create_regular("http://worker1:8080".to_string()),
-            WorkerFactory::create_regular("http://worker2:8080".to_string()),
+            WorkerFactory::create_regular("http://worker1:8080".to_string(), &None),
+            WorkerFactory::create_regular("http://worker2:8080".to_string(), &None),
         ];
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {

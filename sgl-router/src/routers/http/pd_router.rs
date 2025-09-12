@@ -48,6 +48,7 @@ pub struct PDRouter {
     pub prefill_client: Client,
     pub retry_config: RetryConfig,
     pub circuit_breaker_config: CircuitBreakerConfig,
+    pub api_key: Option<String>,
     _prefill_health_checker: Option<HealthChecker>,
     _decode_health_checker: Option<HealthChecker>,
     // Channel for sending prefill responses to background workers for draining
@@ -126,17 +127,17 @@ impl PDRouter {
         (results, errors)
     }
 
-    // Helper to get worker URLs from a worker collection
+    // Helper to get worker URLs and API keys from a worker collection
     fn get_worker_urls(
         workers: &RwLock<Vec<Box<dyn Worker>>>,
         worker_type: &str,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<(String, Option<String>)>, String> {
         workers
             .read()
             .map(|workers| {
                 workers
                     .iter()
-                    .map(|w| w.url().to_string())
+                    .map(|w| (w.url().to_string(), w.api_key().clone()))
                     .collect::<Vec<_>>()
             })
             .map_err(|_| format!("Failed to access {} workers", worker_type))
@@ -234,6 +235,7 @@ impl PDRouter {
             url.clone(),
             bootstrap_port,
             self.circuit_breaker_config.clone(),
+            &self.api_key,
         );
 
         // Add to prefill workers list
@@ -273,6 +275,7 @@ impl PDRouter {
         let worker = WorkerFactory::create_decode_with_config(
             url.clone(),
             self.circuit_breaker_config.clone(),
+            &self.api_key,
         );
 
         // Add to decode workers list
@@ -392,6 +395,7 @@ impl PDRouter {
                     WorkerType::Prefill {
                         bootstrap_port: port,
                     },
+                    &ctx.router_config.api_key,
                 )
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {
@@ -408,7 +412,7 @@ impl PDRouter {
         let decode_workers: Vec<Box<dyn Worker>> = decode_urls
             .into_iter()
             .map(|url| {
-                let worker = BasicWorker::new(url, WorkerType::Decode)
+                let worker = BasicWorker::new(url, WorkerType::Decode, &ctx.router_config.api_key)
                     .with_circuit_breaker_config(core_cb_config.clone())
                     .with_health_config(HealthConfig {
                         timeout_secs: ctx.router_config.health_check.timeout_secs,
@@ -422,10 +426,10 @@ impl PDRouter {
             .collect();
 
         // Wait for PD workers to be healthy (skip if empty - for service discovery mode)
-        let all_urls: Vec<String> = prefill_workers
+        let (all_urls, all_api_keys): (Vec<String>, Vec<Option<String>>) = prefill_workers
             .iter()
             .chain(decode_workers.iter())
-            .map(|worker| worker.url().to_string())
+            .map(|worker| (worker.url().to_string(), worker.api_key().clone()))
             .collect();
         if !all_urls.is_empty() {
             crate::routers::http::router::Router::wait_for_healthy_workers(
@@ -458,6 +462,7 @@ impl PDRouter {
         let load_monitor_handle =
             if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
                 let monitor_urls = all_urls.clone();
+                let monitor_api_keys = all_api_keys.clone();
                 let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
                 let monitor_client = ctx.client.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
@@ -466,6 +471,7 @@ impl PDRouter {
                 Some(Arc::new(tokio::spawn(async move {
                     Self::monitor_worker_loads_with_client(
                         monitor_urls,
+                        monitor_api_keys,
                         tx,
                         monitor_interval,
                         monitor_client,
@@ -585,6 +591,7 @@ impl PDRouter {
             prefill_drain_tx,
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            api_key: ctx.router_config.api_key.clone(),
             _prefill_health_checker: Some(prefill_health_checker),
             _decode_health_checker: Some(decode_health_checker),
         })
@@ -1206,6 +1213,7 @@ impl PDRouter {
     // Background task to monitor worker loads with shared client
     async fn monitor_worker_loads_with_client(
         worker_urls: Vec<String>,
+        worker_api_keys: Vec<Option<String>>,
         tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
         interval_secs: u64,
         client: Client,
@@ -1217,11 +1225,13 @@ impl PDRouter {
 
             let futures: Vec<_> = worker_urls
                 .iter()
-                .map(|url| {
+                .zip(worker_api_keys.iter())
+                .map(|(url, api_key)| {
                     let client = client.clone();
                     let url = url.clone();
+                    let api_key = api_key.clone();
                     async move {
-                        let load = get_worker_load(&client, &url).await.unwrap_or(0);
+                        let load = get_worker_load(&client, &url, &api_key).await.unwrap_or(0);
                         (url, load)
                     }
                 })
@@ -1582,8 +1592,16 @@ impl PDRouter {
 
 // Helper functions
 
-async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
-    match client.get(format!("{}/get_load", worker_url)).send().await {
+async fn get_worker_load(
+    client: &Client,
+    worker_url: &str,
+    api_key: &Option<String>,
+) -> Option<isize> {
+    let mut req_builder = client.get(format!("{}/get_load", worker_url));
+    if let Some(key) = api_key {
+        req_builder = req_builder.bearer_auth(key);
+    }
+    match req_builder.send().await {
         Ok(res) if res.status().is_success() => match res.bytes().await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(data) => data
@@ -2006,9 +2024,9 @@ impl RouterTrait for PDRouter {
 
         // Process prefill workers
         match Self::get_worker_urls(&self.prefill_workers, "prefill") {
-            Ok(urls) => {
-                for worker_url in urls {
-                    match get_worker_load(&self.client, &worker_url).await {
+            Ok(workers) => {
+                for (worker_url, api_key) in workers {
+                    match get_worker_load(&self.client, &worker_url, &api_key).await {
                         Some(load) => {
                             loads.insert(format!("prefill_{}", worker_url), load);
                         }
@@ -2023,9 +2041,9 @@ impl RouterTrait for PDRouter {
 
         // Process decode workers
         match Self::get_worker_urls(&self.decode_workers, "decode") {
-            Ok(urls) => {
-                for worker_url in urls {
-                    match get_worker_load(&self.client, &worker_url).await {
+            Ok(workers) => {
+                for (worker_url, api_key) in workers {
+                    match get_worker_load(&self.client, &worker_url, &api_key).await {
                         Some(load) => {
                             loads.insert(format!("decode_{}", worker_url), load);
                         }
@@ -2137,13 +2155,14 @@ mod tests {
             prefill_drain_tx: mpsc::channel(100).0,
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            api_key: None,
             _prefill_health_checker: None,
             _decode_health_checker: None,
         }
     }
 
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {
-        let worker = BasicWorker::new(url, worker_type);
+        let worker = BasicWorker::new(url, worker_type, &Some("test_api_key".to_string()));
         worker.set_healthy(healthy);
         Box::new(worker)
     }

@@ -337,10 +337,12 @@ mod tests {
             Box::new(BasicWorker::new(
                 "http://w1:8000".to_string(),
                 WorkerType::Regular,
+                &Some("test_api_key".to_string()),
             )),
             Box::new(BasicWorker::new(
                 "http://w2:8000".to_string(),
                 WorkerType::Regular,
+                &Some("test_api_key".to_string()),
             )),
         ];
 
@@ -369,8 +371,16 @@ mod tests {
             max_tree_size: 10000,
         });
 
-        let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
-        let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
+        let worker1 = BasicWorker::new(
+            "http://w1:8000".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
+        let worker2 = BasicWorker::new(
+            "http://w2:8000".to_string(),
+            WorkerType::Regular,
+            &Some("test_api_key".to_string()),
+        );
 
         // Create significant load imbalance
         for _ in 0..20 {
@@ -399,10 +409,12 @@ mod tests {
             Box::new(BasicWorker::new(
                 "http://w1:8000".to_string(),
                 WorkerType::Regular,
+                &Some("test_api_key".to_string()),
             )),
             Box::new(BasicWorker::new(
                 "http://w2:8000".to_string(),
                 WorkerType::Regular,
+                &Some("test_api_key".to_string()),
             )),
         ];
 
