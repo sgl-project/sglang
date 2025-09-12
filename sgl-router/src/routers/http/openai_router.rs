@@ -333,6 +333,18 @@ impl super::super::RouterTrait for OpenAIRouter {
             .into_response()
     }
 
+    async fn route_responses(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::ResponsesRequest,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses endpoint not implemented for OpenAI router",
+        )
+            .into_response()
+    }
+
     async fn flush_cache(&self) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,

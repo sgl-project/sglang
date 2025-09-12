@@ -399,6 +399,7 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_cutedsl_moe: bool = False
     enable_flashinfer_trtllm_moe: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
@@ -419,6 +420,11 @@ class ServerArgs:
             self.moe_runner_backend = "triton_kernel"
             print_deprecated_warning(
                 "NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead."
+            )
+        if self.enable_flashinfer_cutedsl_moe:
+            self.moe_runner_backend = "flashinfer_cutedsl"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-cutedsl-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutedsl' instead."
             )
         if self.enable_flashinfer_cutlass_moe:
             self.moe_runner_backend = "flashinfer_cutlass"
@@ -715,6 +721,13 @@ class ServerArgs:
             self.hicache_io_backend = "kernel"
             self.hicache_mem_layout = "page_first"
 
+        if self.hicache_mem_layout == "page_first_direct":
+            if self.hicache_io_backend != "direct":
+                self.hicache_io_backend = "direct"
+                logger.warning(
+                    "Page first direct layout only support direct io backend"
+                )
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
@@ -741,7 +754,12 @@ class ServerArgs:
                 )
 
             model_arch = self.get_hf_config().architectures[0]
-            if model_arch in ["DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"]:
+            if model_arch in [
+                "DeepseekV3ForCausalLM",
+                "Glm4MoeForCausalLM",
+                "BailingMoeForCausalLM",
+                "BailingMoeV2ForCausalLM",
+            ]:
                 # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -1074,7 +1092,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -1622,6 +1640,7 @@ class ServerArgs:
                 "flashinfer_trtllm",
                 "flashinfer_cutlass",
                 "flashinfer_mxfp4",
+                "flashinfer_cutedsl",
             ],
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
@@ -1772,7 +1791,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-mem-layout",
             type=str,
-            choices=["layer_first", "page_first"],
+            choices=["layer_first", "page_first", "page_first_direct"],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
         )
@@ -2205,6 +2224,11 @@ class ServerArgs:
             help="(Deprecated) Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
         )
         parser.add_argument(
+            "--enable-flashinfer-cutedsl-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer CuteDSL MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+        )
+        parser.add_argument(
             "--enable-flashinfer-trtllm-moe",
             action="store_true",
             help="(Deprecated) Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
@@ -2226,6 +2250,7 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -2704,6 +2729,8 @@ def auto_choose_speculative_params(self: ServerArgs):
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
     ]:
         # The default value for deepseek and gpt-oss
         return (3, 1, 4)
