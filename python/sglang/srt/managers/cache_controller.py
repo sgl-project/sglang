@@ -337,16 +337,14 @@ class HiCacheController:
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
-            self.is_3fs_zerocopy = (
-                self.storage_backend_type == "hf3fs"
-                and self.mem_pool_host.layout == "page_first"
-            )
+
             if self.storage_backend_type == "mooncake":
                 self.page_get_func = self._mooncake_page_get
                 self.page_set_func = self._mooncake_page_set
-            elif self.is_3fs_zerocopy:
-                self.page_get_func = self._zero_copy_page_get
-                self.page_set_func = self._zero_copy_page_set
+
+            if self.storage_backend_type == "hf3fs":
+                self.page_get_func = self._generic_page_get_v1
+                self.page_set_func = self._generic_page_set_v1
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -645,7 +643,7 @@ class HiCacheController:
         if get_result != 0:
             operation.increment(get_result * self.page_size)
 
-    def _zero_copy_page_get(self, operation, hash_values, host_indices):
+    def _generic_page_get_v1(self, operation, hash_values, host_indices):
         results = self.storage_backend.batch_get_v1(hash_values, host_indices)
         for i in range(len(hash_values)):
             if not results[i]:
@@ -823,7 +821,7 @@ class HiCacheController:
         return self.storage_backend.batch_set(hash_values, data)
 
     # zero copy
-    def _zero_copy_page_set(self, hash_values, host_indices) -> bool:
+    def _generic_page_set_v1(self, hash_values, host_indices) -> bool:
         return all(self.storage_backend.batch_set_v1(hash_values, host_indices))
 
     # zero copy

@@ -34,6 +34,11 @@ class HiCacheStorageConfig:
     extra_config: Optional[dict] = None
 
 
+@dataclass
+class HiCacheStorageExtraInfo:
+    extra_info: Optional[dict] = None
+
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
@@ -51,6 +56,7 @@ class HiCacheStorage(ABC):
         self,
         keys: List[str],
         host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         """
         Retrieve values for multiple keys.
@@ -63,6 +69,7 @@ class HiCacheStorage(ABC):
         self,
         keys: List[str],
         host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         """
         Retrieve values for multiple keys.
