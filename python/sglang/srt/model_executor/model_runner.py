@@ -19,18 +19,23 @@ import inspect
 import json
 import logging
 import os
+import socket
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
+import requests
 import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
+from sglang.srt.connector import ConnectorType
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
     get_pp_group,
@@ -106,6 +111,9 @@ from sglang.srt.offloader import (
     set_offloader,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.remote_instance_weight_loader_utils import (
+    trigger_init_weights_send_group_for_remote_instance_request,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -128,6 +136,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
+    parse_connector_type,
     set_cuda_arch,
 )
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -256,6 +265,7 @@ class ModelRunner:
 
         # For weight updates
         self._model_update_group = {}
+        self._weights_send_group = {}
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -551,18 +561,19 @@ class ModelRunner:
 
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
+
         # TODO(kaixih@nvidia): remove this once we have a better solution for DP attention.
         #  For more details, see: https://github.com/sgl-project/sglang/issues/8616
         elif (
             self.dp_size > 1
             and is_sm100_supported()
             and server_args.attention_backend != "triton"
+            and server_args.attention_backend == "trtllm_mla"
         ):
             logger.info(
                 "Disable chunked prefix cache when dp size > 1 and attention backend is not triton."
             )
             server_args.disable_chunked_prefix_cache = True
-
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
 
@@ -727,6 +738,20 @@ class ModelRunner:
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
 
+        if self.server_args.load_format == LoadFormat.REMOTE_INSTANCE:
+            if self.tp_rank == 0:
+                instance_ip = socket.gethostbyname(socket.gethostname())
+                t = threading.Thread(
+                    target=trigger_init_weights_send_group_for_remote_instance_request,
+                    args=(
+                        self.server_args.remote_instance_weight_loader_seed_instance_ip,
+                        self.server_args.remote_instance_weight_loader_seed_instance_service_port,
+                        self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+                        instance_ip,
+                    ),
+                )
+                t.start()
+
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
@@ -736,7 +761,7 @@ class ModelRunner:
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
+                device_config=DeviceConfig(self.device, self.gpu_id),
             )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
@@ -867,6 +892,103 @@ class ModelRunner:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def init_weights_send_group_for_remote_instance(
+        self,
+        master_address,
+        ports,
+        group_rank,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        ports_list = ports.split(",")
+        assert (
+            len(ports_list) == self.tp_size
+        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+
+        logger.info(
+            f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "
+            f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        torch.cuda.empty_cache()
+        success = False
+        message = ""
+        try:
+            self._weights_send_group[group_name] = init_custom_process_group(
+                backend=backend,
+                init_method=f"tcp://{master_address}:{group_port}",
+                world_size=world_size,
+                rank=group_rank,
+                group_name=group_name,
+                device_id=torch.device("cuda", self.gpu_id),
+            )
+            dist.barrier(group=self._weights_send_group[group_name])
+            success = True
+            message = (
+                f"Succeeded to init group through {master_address}:{group_port} group."
+            )
+        except Exception as e:
+            message = f"Failed to init group: {e}."
+            logger.error(message)
+
+        torch.cuda.empty_cache()
+        return success, message
+
+    def send_weights_to_remote_instance(
+        self,
+        master_address,
+        ports,
+        group_name,
+    ):
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        ports_list = ports.split(",")
+        assert (
+            len(ports_list) == self.tp_size
+        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+
+        if self._weights_send_group[group_name] is not None:
+            send_group = self._weights_send_group[group_name]
+        else:
+            message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
+            logger.error(message)
+            return False, message
+
+        torch.cuda.empty_cache()
+        success = False
+        message = ""
+        try:
+            for _, weights in self.model.named_parameters():
+                torch.distributed.broadcast(
+                    weights,
+                    src=0,
+                    group=send_group,
+                )
+            success = True
+            message = f"Succeeded to send weights through {master_address}:{group_port} {group_name}."
+        except Exception as e:
+            message = f"Failed to send weights: {e}."
+            logger.error(message)
+
+        # destroy the process group after sending weights
+        del self._weights_send_group[group_name]
+        torch.distributed.distributed_c10d.destroy_process_group(send_group)
+        torch.cuda.empty_cache()
+        return success, message
 
     def init_weights_update_group(
         self,
