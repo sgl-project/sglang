@@ -1,7 +1,7 @@
 //! Factory for creating router instances
 
 use super::{
-    http::{pd_router::PDRouter, router::Router},
+    http::{openai_router::OpenAIRouter, pd_router::PDRouter, router::Router},
     RouterTrait,
 };
 use crate::config::{ConnectionMode, PolicyConfig, RoutingMode};
@@ -44,6 +44,9 @@ impl RouterFactory {
                         )
                         .await
                     }
+                    RoutingMode::OpenAI { .. } => {
+                        Err("OpenAI mode requires HTTP connection_mode".to_string())
+                    }
                 }
             }
             ConnectionMode::Http => {
@@ -68,6 +71,9 @@ impl RouterFactory {
                             ctx,
                         )
                         .await
+                    }
+                    RoutingMode::OpenAI { worker_urls, .. } => {
+                        Self::create_openai_router(worker_urls.clone(), ctx).await
                     }
                 }
             }
@@ -160,6 +166,23 @@ impl RouterFactory {
             ctx,
         )
         .await?;
+
+        Ok(Box::new(router))
+    }
+
+    /// Create an OpenAI router
+    async fn create_openai_router(
+        worker_urls: Vec<String>,
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        // Use the first worker URL as the OpenAI-compatible base
+        let base_url = worker_urls
+            .first()
+            .cloned()
+            .ok_or_else(|| "OpenAI mode requires at least one worker URL".to_string())?;
+
+        let router =
+            OpenAIRouter::new(base_url, Some(ctx.router_config.circuit_breaker.clone())).await?;
 
         Ok(Box::new(router))
     }

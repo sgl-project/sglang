@@ -3,7 +3,8 @@ use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::middleware::TokenBucket;
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, V1RerankReqInput,
+    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest,
+    V1RerankReqInput,
 };
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::{RouterFactory, RouterTrait};
@@ -171,6 +172,14 @@ async fn v1_rerank(
         .await
 }
 
+async fn v1_responses(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<ResponsesRequest>,
+) -> Response {
+    state.router.route_responses(Some(&headers), &body).await
+}
+
 // Worker management endpoints
 async fn add_worker(
     State(state): State<Arc<AppState>>,
@@ -250,6 +259,7 @@ pub fn build_app(
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
+        .route("/v1/responses", post(v1_responses))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             crate::middleware::concurrency_limit_middleware,

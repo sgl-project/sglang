@@ -992,6 +992,91 @@ mod router_policy_tests {
 }
 
 #[cfg(test)]
+mod responses_endpoint_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_v1_responses_non_streaming() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18950,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "input": "Hello Responses API",
+            "model": "mock-model",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["object"], "response");
+        assert_eq!(body_json["status"], "completed");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_streaming() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18951,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "input": "Hello Responses API",
+            "model": "mock-model",
+            "stream": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Check that content-type indicates SSE
+        let headers = resp.headers().clone();
+        let ct = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("text/event-stream"));
+
+        // We don't fully consume the stream in this test harness.
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
 mod error_tests {
     use super::*;
 
