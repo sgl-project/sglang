@@ -96,6 +96,7 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "hybrid_linear_attn",
     # AMD specific
     "aiter",
     "wave",
@@ -391,10 +392,15 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # Mamba cache
+    max_mamba_cache_size: Optional[int] = None
+    mamba_ssm_dtype: str = "float32"
+
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_cutedsl_moe: bool = False
     enable_flashinfer_trtllm_moe: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
@@ -415,6 +421,11 @@ class ServerArgs:
             self.moe_runner_backend = "triton_kernel"
             print_deprecated_warning(
                 "NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead."
+            )
+        if self.enable_flashinfer_cutedsl_moe:
+            self.moe_runner_backend = "flashinfer_cutedsl"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-cutedsl-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutedsl' instead."
             )
         if self.enable_flashinfer_cutlass_moe:
             self.moe_runner_backend = "flashinfer_cutlass"
@@ -655,11 +666,13 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
-            if not self.disable_shared_experts_fusion:
-                self.disable_shared_experts_fusion = True
-                logger.warning(
-                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
-                )
+            assert (
+                self.quantization == "modelopt_fp4" or self.quantization == "fp8"
+            ), "modelopt_fp4 quantization is required for Flashinfer TRTLLM MoE"
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -834,6 +847,8 @@ class ServerArgs:
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
+        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = self.mamba_ssm_dtype
+
         # Set env var before grammar backends init
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
@@ -862,12 +877,6 @@ class ServerArgs:
             help="The path of the tokenizer.",
         )
         parser.add_argument(
-            "--tokenizer-worker-num",
-            type=int,
-            default=ServerArgs.tokenizer_worker_num,
-            help="The worker num of the tokenizer manager.",
-        )
-        parser.add_argument(
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
@@ -875,6 +884,12 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--tokenizer-worker-num",
+            type=int,
+            default=ServerArgs.tokenizer_worker_num,
+            help="The worker num of the tokenizer manager.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -1066,7 +1081,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -1614,6 +1629,7 @@ class ServerArgs:
                 "flashinfer_trtllm",
                 "flashinfer_cutlass",
                 "flashinfer_mxfp4",
+                "flashinfer_cutedsl",
             ],
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
@@ -1712,6 +1728,21 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_dense_tp_size,
             help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+        )
+
+        # Mamba Cache
+        parser.add_argument(
+            "--max-mamba-cache-size",
+            type=int,
+            default=ServerArgs.max_mamba_cache_size,
+            help="The maximum size of the mamba cache.",
+        )
+        parser.add_argument(
+            "--mamba-ssm-dtype",
+            type=str,
+            default=ServerArgs.mamba_ssm_dtype,
+            choices=["float32", "bfloat16"],
+            help="The data type of the SSM states in mamba cache.",
         )
 
         # Hierarchical cache
@@ -2180,6 +2211,11 @@ class ServerArgs:
             "--enable-flashinfer-cutlass-moe",
             action="store_true",
             help="(Deprecated) Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-cutedsl-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer CuteDSL MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
         )
         parser.add_argument(
             "--enable-flashinfer-trtllm-moe",
