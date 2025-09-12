@@ -196,23 +196,18 @@ class LogitsMetadata:
 
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage
-            self.gathered_buffer = torch.empty(
-                (
-                    sum(self.global_num_tokens_for_logprob_cpu),
-                    hidden_size,
-                ),
-                dtype=dtype,
-                device=device,
-            )
+            self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
         else:
-            self.gathered_buffer = torch.empty(
-                (
-                    self.global_dp_buffer_len,
-                    hidden_size,
-                ),
-                dtype=dtype,
-                device=device,
-            )
+            self.global_dp_buffer_len = self.global_dp_buffer_len
+
+        self.gathered_buffer = torch.empty(
+            (
+                self.global_dp_buffer_len,
+                hidden_size,
+            ),
+            dtype=dtype,
+            device=device,
+        )
 
 
 class LogitsProcessor(nn.Module):
