@@ -103,10 +103,6 @@ class SchedulerOutputProcessorMixin:
                         extend_input_len = extend_input_len_per_req[i]
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
 
-                        # For prefill-only requests, ensure logprob fields are initialized
-                        if batch.is_prefill_only:
-                            self._initialize_empty_logprob_containers(req)
-
                         if req.return_logprob:
                             self.add_logprob_return_values(
                                 i,
@@ -460,6 +456,8 @@ class SchedulerOutputProcessorMixin:
             self.add_input_logprob_return_values(
                 i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
             )
+        else:
+            self._initialize_empty_logprob_containers(req)
 
         if req.top_logprobs_num > 0:
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])

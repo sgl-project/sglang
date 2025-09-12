@@ -228,10 +228,10 @@ class TpModelWorkerClient:
             logits_output.next_token_logprobs = (
                 logits_output.next_token_logprobs.tolist()
             )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
-                )
+        if logits_output.input_token_logprobs is not None:
+            logits_output.input_token_logprobs = tuple(
+                logits_output.input_token_logprobs.tolist()
+            )
         next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids, can_run_cuda_graph
 
