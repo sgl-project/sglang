@@ -324,7 +324,7 @@ def _log_and_assert_gpu_thresholds(
 
 
 def _gpu_monitor_proc_entry(bench_pid: int, out_file: str, interval: float) -> None:
-    """Low-impact GPU utilization monitor using NVML/nvitop in a separate process.
+    """Low-impact GPU utilization monitor using NVML in a separate process.
 
     Writes JSON to out_file that includes overall and per-GPU raw samples and summary stats.
     """
@@ -333,56 +333,43 @@ def _gpu_monitor_proc_entry(bench_pid: int, out_file: str, interval: float) -> N
             os.nice(10)
         except Exception:
             pass
-        backend = os.environ.get("GPU_MONITOR_BACKEND", "nvml").lower()
         total = 0.0
         n = 0
-        if backend == "nvitop":
-            # Optional nvitop backend; may be heavier.
-            try:
-                from nvitop import Device  # type: ignore
+        try:
+            import pynvml  # type: ignore
 
-                devices = Device.all()
-            except Exception:
-                devices = None
-            if devices is None:
-                # Fall back to NVML
-                backend = "nvml"
-        if backend == "nvml":
-            try:
-                import pynvml  # type: ignore
+            pynvml.nvmlInit()
+        except Exception:
+            with open(out_file, "w") as f:
+                os.makedirs(os.path.dirname(out_file), exist_ok=True)
+                json.dump(
+                    {
+                        "count": 0,
+                        "overall": {"mean": 0.0},
+                        "per_gpu": {},
+                        "raw": {},
+                    },
+                    f,
+                )
+            return
+        try:
+            import pynvml  # type: ignore
 
-                pynvml.nvmlInit()
-            except Exception:
-                with open(out_file, "w") as f:
-                    os.makedirs(os.path.dirname(out_file), exist_ok=True)
-                    json.dump(
-                        {
-                            "count": 0,
-                            "overall": {"mean": 0.0},
-                            "per_gpu": {},
-                            "raw": {},
-                        },
-                        f,
-                    )
-                return
-            try:
-                import pynvml  # type: ignore
-
-                count = pynvml.nvmlDeviceGetCount()
-                handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
-            except Exception:
-                with open(out_file, "w") as f:
-                    os.makedirs(os.path.dirname(out_file), exist_ok=True)
-                    json.dump(
-                        {
-                            "count": 0,
-                            "overall": {"mean": 0.0},
-                            "per_gpu": {},
-                            "raw": {},
-                        },
-                        f,
-                    )
-                return
+            count = pynvml.nvmlDeviceGetCount()
+            handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
+        except Exception:
+            with open(out_file, "w") as f:
+                os.makedirs(os.path.dirname(out_file), exist_ok=True)
+                json.dump(
+                    {
+                        "count": 0,
+                        "overall": {"mean": 0.0},
+                        "per_gpu": {},
+                        "raw": {},
+                    },
+                    f,
+                )
+            return
 
         # Prepare per-GPU and overall raw collectors
         per_gpu_samples: dict[str, list[float]] = {}
@@ -393,35 +380,16 @@ def _gpu_monitor_proc_entry(bench_pid: int, out_file: str, interval: float) -> N
                 break
             try:
                 vals = []
-                if backend == "nvitop":
-                    for idx, dev in enumerate(devices):
-                        try:
-                            v = getattr(dev, "gpu_utilization_rate", None)
-                            if v is None:
-                                util = getattr(dev, "utilization", None)
-                                if util is not None:
-                                    if isinstance(util, dict):
-                                        v = util.get("gpu")
-                                    else:
-                                        v = getattr(util, "gpu", None)
-                            if v is not None:
-                                val = float(v)
-                                vals.append(val)
-                                key = str(idx)
-                                per_gpu_samples.setdefault(key, []).append(val)
-                        except Exception:
-                            continue
-                else:
-                    import pynvml  # type: ignore
+                import pynvml  # type: ignore
 
-                    for idx, h in enumerate(handles):
-                        try:
-                            util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
-                            vals.append(float(util))
-                            key = str(idx)
-                            per_gpu_samples.setdefault(key, []).append(float(util))
-                        except Exception:
-                            continue
+                for idx, h in enumerate(handles):
+                    try:
+                        util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
+                        vals.append(float(util))
+                        key = str(idx)
+                        per_gpu_samples.setdefault(key, []).append(float(util))
+                    except Exception:
+                        continue
                 if vals:
                     avg = sum(vals) / len(vals)
                     overall_samples.append(avg)
