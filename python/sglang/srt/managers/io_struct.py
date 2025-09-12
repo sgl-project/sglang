@@ -135,6 +135,9 @@ class GenerateReqInput:
     # Label for the request
     label: Optional[str] = None
 
+    # Priority for the request
+    priority: Optional[int] = None
+
     # Image gen grpc migration
     return_bytes: bool = False
 
@@ -537,6 +540,7 @@ class GenerateReqInput:
             ),
             conversation_id=self.conversation_id,
             label=self.label,
+            priority=self.priority,
             return_bytes=self.return_bytes,
         )
 
@@ -594,6 +598,9 @@ class TokenizedGenerateReqInput:
 
     # Label for the request
     label: Optional[str] = None
+
+    # Priority for the request
+    priority: Optional[int] = None
 
     # Image gen grpc migration
     return_bytes: bool = False
@@ -1009,6 +1016,44 @@ class UpdateWeightsFromTensorReqInput:
 
 @dataclass
 class UpdateWeightsFromTensorReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class InitWeightsSendGroupForRemoteInstanceReqInput:
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The rank in the communication group
+    group_rank: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_send_group"
+    # The backend
+    backend: str = "nccl"
+
+
+@dataclass
+class InitWeightsSendGroupForRemoteInstanceReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class SendWeightsToRemoteInstanceReqInput:
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The group name
+    group_name: str = "weight_send_group"
+
+
+@dataclass
+class SendWeightsToRemoteInstanceReqOutput:
     success: bool
     message: str
 

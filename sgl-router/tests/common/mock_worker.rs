@@ -81,6 +81,8 @@ impl MockWorker {
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
+            .route("/v1/rerank", post(rerank_handler))
+            .route("/v1/responses", post(responses_handler))
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
@@ -548,6 +550,91 @@ async fn completions_handler(
     }
 }
 
+async fn responses_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "Random failure for testing",
+                    "type": "internal_error",
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    let is_stream = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    if is_stream {
+        let request_id = format!("resp-{}", Uuid::new_v4());
+
+        let stream = stream::once(async move {
+            let chunk = json!({
+                "id": request_id,
+                "object": "response",
+                "created_at": timestamp,
+                "model": "mock-model",
+                "status": "in_progress",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "This is a mock responses streamed output."
+                    }]
+                }]
+            });
+            Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
+        })
+        .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        Json(json!({
+            "id": format!("resp-{}", Uuid::new_v4()),
+            "object": "response",
+            "created_at": timestamp,
+            "model": "mock-model",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "This is a mock responses output."
+                }]
+            }],
+            "status": "completed",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15
+            }
+        }))
+        .into_response()
+    }
+}
+
 async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
@@ -599,6 +686,56 @@ async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) 
         }]
     }))
     .into_response()
+}
+
+async fn rerank_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let config = config.read().await;
+
+    // Simulate response delay
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    // Simulate failure rate
+    if rand::random::<f32>() < config.fail_rate {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
+    }
+
+    // Extract documents from the request to create mock results
+    let empty_vec = vec![];
+    let documents = payload
+        .get("documents")
+        .and_then(|d| d.as_array())
+        .unwrap_or(&empty_vec);
+
+    // Create mock rerank results with scores based on document index
+    let mut mock_results = Vec::new();
+    for (i, doc) in documents.iter().enumerate() {
+        let score = 0.95 - (i as f32 * 0.1); // Decreasing scores
+        let result = serde_json::json!({
+            "score": score,
+            "document": doc.as_str().unwrap_or(""),
+            "index": i,
+            "meta_info": {
+                "confidence": if score > 0.9 { "high" } else { "medium" }
+            }
+        });
+        mock_results.push(result);
+    }
+
+    // Sort by score (highest first) to simulate proper ranking
+    mock_results.sort_by(|a, b| {
+        b["score"]
+            .as_f64()
+            .unwrap()
+            .partial_cmp(&a["score"].as_f64().unwrap())
+            .unwrap()
+    });
+
+    (StatusCode::OK, Json(mock_results)).into_response()
 }
 
 impl Default for MockWorkerConfig {
