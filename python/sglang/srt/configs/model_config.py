@@ -483,7 +483,6 @@ class ModelConfig:
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
-            modelopt_quant_config = {"quant_method": "modelopt_fp8"}
             if not is_local:
                 import huggingface_hub
 
