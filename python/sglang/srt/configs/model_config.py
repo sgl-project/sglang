@@ -710,8 +710,8 @@ multimodal_model_archs = [
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
-    "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
+    "NVILALiteForConditionalGeneration",
 ]
 
 
