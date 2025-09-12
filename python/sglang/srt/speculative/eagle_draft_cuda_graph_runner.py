@@ -238,6 +238,11 @@ class EAGLEDraftCudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
+            global_num_tokens_for_logprob_cpu=(
+                global_num_tokens_for_logprob.tolist()
+                if global_num_tokens_for_logprob is not None
+                else None
+            ),
         )
 
         # Attention backend

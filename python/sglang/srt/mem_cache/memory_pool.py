@@ -158,16 +158,23 @@ class MambaPool:
                 intermediate_ssm_state_cache,
                 intermediate_conv_window_cache,
             )
+            logger.info(
+                f"Mamba Cache is allocated. "
+                f"conv_state size: {conv_state.numel() * conv_state.itemsize / GB:.2f}GB, "
+                f"ssm_state size: {temporal_state.numel() * temporal_state.itemsize / GB:.2f}GB "
+                f"intermediate_ssm_state_cache size: {intermediate_ssm_state_cache.numel() * intermediate_ssm_state_cache.itemsize / GB:.2f}GB "
+                f"intermediate_conv_window_cache size: {intermediate_conv_window_cache.numel() * intermediate_conv_window_cache.itemsize / GB:.2f}GB "
+            )
         else:
             self.mamba_cache = (conv_state, temporal_state)
+            logger.info(
+                f"Mamba Cache is allocated. "
+                f"conv_state size: {conv_state.numel() * conv_state.itemsize / GB:.2f}GB, "
+                f"ssm_state size: {temporal_state.numel() * temporal_state.itemsize / GB:.2f}GB "
+            )
         self.size = size
         self.free_slots = list(range(size))
         self.mem_usage = self.get_mamba_size() / GB
-        logger.info(
-            f"Mamba Cache is allocated. "
-            f"conv_state size: {conv_state.numel() * conv_state.itemsize / GB:.2f}GB, "
-            f"ssm_state size: {temporal_state.numel() * temporal_state.itemsize / GB:.2f}GB "
-        )
 
     def get_mamba_params_all_layers(self):
         return [self.mamba_cache[i] for i in range(len(self.mamba_cache))]
@@ -176,10 +183,7 @@ class MambaPool:
         return [self.mamba_cache[i][layer_id] for i in range(len(self.mamba_cache))]
 
     def get_mamba_size(self):
-        return (
-            np.prod(self.mamba_cache[0].shape) * self.mamba_cache[0].dtype.itemsize
-            + np.prod(self.mamba_cache[1].shape) * self.mamba_cache[1].dtype.itemsize
-        )
+        return sum(np.prod(t.shape) * t.dtype.itemsize for t in self.mamba_cache)
 
     def available_size(self):
         return len(self.free_slots)

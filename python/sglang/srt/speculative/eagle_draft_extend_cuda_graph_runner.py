@@ -254,6 +254,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             mrope_positions=mrope_positions,
             global_num_tokens_gpu=self.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
+            global_num_tokens_for_logprob_cpu=(
+                self.global_num_tokens_for_logprob_gpu.tolist()
+                if self.global_num_tokens_for_logprob_gpu is not None
+                else None
+            ),
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,

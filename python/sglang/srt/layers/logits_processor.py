@@ -185,10 +185,9 @@ class LogitsMetadata:
             )
         else:
             dp_local_start_pos = cumtokens[dp_rank - 1]
-        dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = dp_local_num_tokens
+        self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         hidden_size = get_dp_hidden_size()
         dtype = get_dp_dtype()
