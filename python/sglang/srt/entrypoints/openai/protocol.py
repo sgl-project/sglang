@@ -228,6 +228,8 @@ class CompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -540,6 +542,8 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -641,6 +645,8 @@ class EmbeddingRequest(BaseModel):
 
     # The request id.
     rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
 
 class EmbeddingObject(BaseModel):
