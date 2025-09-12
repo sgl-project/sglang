@@ -12,12 +12,9 @@ import torch
 import sglang as sgl
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
     write_github_step_summary,
 )
 
-# MOE model configuration
-MOE_MODEL_NAME = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE
 if torch.version.hip is not None:
     print("Running on AMD ROCm GPU")
     MOE_INPUT_PKL_URL = "https://huggingface.co/datasets/yushengsu/logprobs/resolve/main/sglang_baseline_moe_v0.5.1.pkl"
@@ -77,208 +74,6 @@ TEST_CONFIGS = [
 ]
 
 os.environ["RETURN_ORIGINAL_LOGPROB"] = "True"
-
-
-@unittest.skip("Skipping MOE test case for now")
-class TestLogprobsMOE(unittest.TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        """Set up the test class - initialize the engine once for all tests."""
-        print(f"Launching SGLang Engine with {MOE_MODEL_NAME}...")
-        cls.engine = sgl.Engine(
-            model_path=MOE_MODEL_NAME,
-            random_seed=42,
-            skip_tokenizer_init=True,
-            mem_fraction_static=0.6,
-            max_running_requests=1,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        """Clean up after all tests - shutdown the engine."""
-        cls.engine.shutdown()
-        torch.cuda.empty_cache()
-
-    def load_test_data(self):
-        """Load test data from Hugging Face dataset with retry mechanism."""
-        print(f"Loading data from {MOE_INPUT_PKL_URL}...")
-
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = requests.get(MOE_INPUT_PKL_URL, timeout=30)
-                response.raise_for_status()
-
-                with io.BytesIO(response.content) as f:
-                    records = pickle.load(f)
-
-                if not records:
-                    raise ValueError("Empty dataset")
-
-                print(f"Successfully loaded {len(records)} records")
-                return records
-
-            except Exception as e:
-                print(f"Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
-                if attempt == MAX_RETRIES - 1:
-                    raise Exception(
-                        f"Failed to load data after {MAX_RETRIES} attempts: {e}"
-                    )
-                time.sleep(RETRY_DELAY)
-
-    def compare_meta(self, metaA, metaB):
-        """Compare metadata between two outputs and return max and mean differences."""
-        diffs = []
-        for key in ["input_top_logprobs", "output_top_logprobs"]:
-            arrA, arrB = metaA[key], metaB[key]
-            for e1, e2 in zip(arrA, arrB):
-                if not e1 or not e2:
-                    continue
-                dmapA = {tid: lp for lp, tid, _ in e1}
-                dmapB = {tid: lp for lp, tid, _ in e2}
-                common = dmapA.keys() & dmapB.keys()
-                for tid in common:
-                    diffs.append(abs(dmapA[tid] - dmapB[tid]))
-        if not diffs:
-            return 0.0, 0.0
-        return max(diffs), float(np.mean(diffs))
-
-    def test_logprobs_comparison(self):
-        """Test the logprobs comparison functionality with different parameter combinations."""
-        # Load test data with retry mechanism
-        records = self.load_test_data()
-
-        for config_idx, config in enumerate(TEST_CONFIGS):
-            with self.subTest(config=config):
-
-                # Sample records for this config
-                test_records = random.sample(
-                    records, k=min(config["num_samples"], len(records))
-                )
-                random.shuffle(test_records)
-
-                # Calculate how many samples should return logprobs
-                logprob_count = int(len(test_records) * config["logprob_sample_ratio"])
-                print(
-                    f"Testing with {len(test_records)} samples, batch_size={config['batch_size']}, temperature={config['temperature']}"
-                )
-                print(
-                    f"Will return logprobs for {logprob_count} samples (ratio: {config['logprob_sample_ratio']})"
-                )
-
-                all_max, all_mean = [], []
-                logprob_returned_count = 0
-
-                for i in range(0, len(test_records), config["batch_size"]):
-                    batch = test_records[i : i + config["batch_size"]]
-                    input_ids = [rec["ids"] for rec in batch]
-                    logprob_start_lens = [rec["start_pos"] for rec in batch]
-
-                    # Determine which samples in this batch should return logprobs
-                    batch_logprob_indices = []
-                    for j in range(len(batch)):
-                        global_idx = i + j
-                        if global_idx < logprob_count:
-                            batch_logprob_indices.append(j)
-
-                    # Create return_logprob array - only True for selected samples
-                    return_logprob_array = [
-                        j in batch_logprob_indices for j in range(len(batch))
-                    ]
-
-                    # Sampling param per request
-                    sampling_params = [
-                        {
-                            "temperature": config["temperature"],
-                            "top_p": 1.0,
-                            "top_k": TOP_K,
-                            "max_new_tokens": 1,
-                        }
-                        for _ in batch
-                    ]
-
-                    outputs = self.engine.generate(
-                        input_ids=input_ids,
-                        sampling_params=sampling_params,
-                        return_logprob=return_logprob_array,
-                        logprob_start_len=logprob_start_lens,
-                        top_logprobs_num=TOP_K,
-                    )
-
-                    for j, (rec, output) in enumerate(zip(batch, outputs)):
-                        # Only compare logprobs for samples that should have them
-                        if j in batch_logprob_indices:
-                            metaA = rec["meta"]
-                            metaB = output["meta_info"]
-
-                            max_diff, mean_diff = self.compare_meta(metaA, metaB)
-                            all_max.append(max_diff)
-                            all_mean.append(mean_diff)
-                            logprob_returned_count += 1
-                        else:
-                            # Verify that logprobs were not returned for this sample
-                            self.assertIsNone(
-                                output.get("meta_info"),
-                                f"Sample {i+j} should not have logprobs but meta_info is present",
-                            )
-
-                max_of_max = max(all_max) if all_max else 0.0
-                mean_of_mean = np.mean(all_mean) if all_mean else 0.0
-
-                print(f"Config {config_idx + 1} - max of max Δ={max_of_max:.6g}")
-                print(f"Config {config_idx + 1} - mean of mean Δ={mean_of_mean:.6g}")
-                print(
-                    f"Config {config_idx + 1} - logprobs returned for {logprob_returned_count} samples (expected: {logprob_count})"
-                )
-
-                # Verify correct number of logprobs returned
-                self.assertEqual(
-                    logprob_returned_count,
-                    logprob_count,
-                    f"Expected {logprob_count} samples with logprobs, got {logprob_returned_count}",
-                )
-
-                # Write results to GitHub summary
-                summary_content = f"""
-## MOE Logprobs Test - Config {config_idx + 1}
-- **Configuration**: {config}
-- **Total samples**: {len(test_records)}
-- **Logprobs returned**: {logprob_returned_count}
-- **Max of max Δ**: {max_of_max:.6g}
-- **Mean of mean Δ**: {mean_of_mean:.6g}
-- **Status**: {'✅ Passed' if max_of_max <= MOE_TOLERANCE_MAX_DIFF and mean_of_mean <= MOE_TOLERANCE_MEAN_DIFF else '❌ Failed'}
-
-"""
-                write_github_step_summary(summary_content)
-
-                # Basic validation
-                self.assertIsInstance(all_max, list)
-                self.assertIsInstance(all_mean, list)
-                self.assertGreater(
-                    len(all_max), 0, f"No test samples processed for config {config}"
-                )
-
-                # Tolerance checks with clear error messages
-                failed_samples = []
-                for i, (max_diff, mean_diff) in enumerate(zip(all_max, all_mean)):
-                    if max_diff > MOE_TOLERANCE_MAX_DIFF:
-                        failed_samples.append(
-                            f"Sample {i}: max_diff={max_diff:.6g} > {MOE_TOLERANCE_MAX_DIFF}"
-                        )
-                    if mean_diff > MOE_TOLERANCE_MEAN_DIFF:
-                        failed_samples.append(
-                            f"Sample {i}: mean_diff={mean_diff:.6g} > {MOE_TOLERANCE_MEAN_DIFF}"
-                        )
-
-                if failed_samples:
-                    self.fail(
-                        f"Config {config} - Tolerance exceeded in {len(failed_samples)} samples:\n"
-                        + "\n".join(failed_samples[:5])
-                    )
-
-                print(
-                    f"✅ Config {config_idx + 1} - All {len(all_max)} samples passed tolerance checks"
-                )
 
 
 class TestLogprobsDense(unittest.TestCase):
@@ -414,12 +209,20 @@ class TestLogprobsDense(unittest.TestCase):
                     for j, (rec, output) in enumerate(zip(batch, outputs)):
                         # Only compare logprobs for samples that should have them
                         if j in batch_logprob_indices:
+                            # Safe access to meta_info and input_top_logprobs
+                            meta_info = output.get("meta_info")
+                            input_top_logprobs = (
+                                meta_info.get("input_top_logprobs")
+                                if meta_info
+                                else None
+                            )
+
                             self.assertIsNotNone(
-                                output.get("meta_info").get("input_top_logprobs"),
-                                f"return_logprob enabled on this sample, but input_top_logprobs is None{len(output.get('meta_info').get('input_top_logprobs'))}",
+                                input_top_logprobs,
+                                f"return_logprob enabled on this sample, but input_top_logprobs is None (length: {len(input_top_logprobs) if input_top_logprobs is not None else 'N/A'})",
                             )
                             metaA = rec["meta"]
-                            metaB = output["meta_info"]
+                            metaB = meta_info
 
                             max_diff, mean_diff = self.compare_meta(metaA, metaB)
                             all_max.append(max_diff)
@@ -427,12 +230,21 @@ class TestLogprobsDense(unittest.TestCase):
                             logprob_returned_count += 1
                         else:
                             # Verify that logprobs were not returned for this sample
-                            self.assertTrue(
-                                output.get("meta_info").get("input_top_logprobs")
-                                == None
-                                or output.get("meta_info").get("input_top_logprobs")
-                                == [],
-                                f"return_logprob is disabled on this sample,Sample {i+j} should not have logprobs, content: {output.get('meta_info').get('output_token_ids_logprobs')}",
+                            meta_info = output.get("meta_info")
+                            input_top_logprobs = (
+                                meta_info.get("input_top_logprobs")
+                                if meta_info
+                                else None
+                            )
+                            output_token_ids_logprobs = (
+                                meta_info.get("output_token_ids_logprobs")
+                                if meta_info
+                                else None
+                            )
+
+                            self.assertFalse(
+                                input_top_logprobs,
+                                f"return_logprob is disabled on this sample, Sample {i+j} should not have logprobs, content: {output_token_ids_logprobs}",
                             )
 
                 max_of_max = max(all_max) if all_max else 0.0
