@@ -1,4 +1,5 @@
 from typing import List
+import json
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -18,7 +19,11 @@ class JsonArrayDetector(BaseFormatDetector):
         # Configure for JSON array parsing
         self.bot_token = "["
         self.eot_token = "]"
-        self.tool_call_separator = ", "
+        self.tool_call_separator = ","
+        # Whether we detected a valid tool-call separator that was withheld
+        # from the previous chunk and should be re-inserted before the next
+        # tool call JSON object begins.
+        self._pending_separator = False
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -31,8 +36,7 @@ class JsonArrayDetector(BaseFormatDetector):
         """
         Parse JSON tool calls using the base class implementation.
         """
-
-        return super().detect_and_parse(text, tools)
+        raise NotImplementedError("Detect and parse not supported for JSON schema constraints.")
 
     def build_ebnf(self, tools: List[Tool]) -> str:
         """
@@ -43,10 +47,67 @@ class JsonArrayDetector(BaseFormatDetector):
         raise NotImplementedError("EBNF generation is not supported for JSON schema constraints.")
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
-        """
-        Parse streaming JSON tool calls using the base class implementation.
-        """
+        # If we previously withheld a valid tool-call separator, prepend it
+        # when we see the next JSON object start (typically '{' inside array).
+        # Keep any user-provided leading whitespace by inserting before it.
+        if self._pending_separator:
+            # Find first non-space to decide if an object starts now.
+            i = 0
+            while i < len(new_text) and new_text[i].isspace():
+                i += 1
+            if i < len(new_text) and new_text[i] == '{':
+                # Re-insert the withheld separator before the new object.
+                new_text = self.tool_call_separator + new_text
+                self._pending_separator = False
 
+        # Detect the configured tool call separator within this chunk.
+        sep = self.tool_call_separator
+        sep_index = new_text.find(sep)
+        if sep_index != -1:
+            # Candidate separator found. Validate that the content before it
+            # closes a complete JSON object, using the accumulated buffer.
+            json_part_original = new_text[:sep_index]
+
+            # Build full JSON so far and exclude outer tokens the base strips.
+            full_json = self._buffer + json_part_original
+            if full_json.startswith(self.bot_token):
+                full_json = full_json[len(self.bot_token):]
+            if full_json.endswith(self.eot_token):
+                full_json = full_json[:-len(self.eot_token)]
+
+            try:
+                json.loads(full_json)
+                # It's a valid object followed by a separator. Two cases:
+                # 1) There is remainder in the same chunk → process object now,
+                #    then immediately process remainder prefixed with separator.
+                # 2) No remainder → withhold the separator and insert it when
+                #    the next object starts in a future chunk.
+                remainder = new_text[sep_index + len(sep):]
+                if remainder:
+                    # Process the object portion (without the separator)
+                    first_result = super().parse_streaming_increment(
+                        json_part_original, tools
+                    )
+                    # Immediately pass the remainder with the separator reinserted
+                    second_result = super().parse_streaming_increment(
+                        sep + remainder, tools
+                    )
+                    # Merge results
+                    merged = StreamingParseResult(
+                        normal_text=(first_result.normal_text or "")
+                        + (second_result.normal_text or ""),
+                        calls=(first_result.calls or []) + (second_result.calls or []),
+                    )
+                    return merged
+                else:
+                    # No remainder. Withhold the separator for the next chunk.
+                    self._pending_separator = True
+                    return super().parse_streaming_increment(json_part_original, tools)
+            except json.JSONDecodeError:
+                # Not a complete object yet; fall through to base handling.
+                pass
+
+        # Default: delegate to base implementation with unmodified text.
         return super().parse_streaming_increment(new_text, tools)
 
     def structure_info(self) -> callable:
