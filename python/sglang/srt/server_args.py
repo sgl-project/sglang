@@ -757,7 +757,7 @@ class ServerArgs:
             if model_arch in [
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
-                "BailingMoeV2ForCausalLM",
+                "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
             ]:
                 # Auto set draft_model_path DeepSeek-V3/R1
