@@ -7,9 +7,9 @@ python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials>
 
 import argparse
 import dataclasses
-import numpy as np
 import json
 
+import numpy as np
 import requests
 
 
@@ -23,9 +23,7 @@ class BenchArgs:
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     return_logprob: bool = False
-    prompt: str = (
-        "Tell me about Richard Feynman: "
-    )
+    prompt: str = "Tell me about Richard Feynman: "
     stream: bool = False
 
     @staticmethod
@@ -115,13 +113,16 @@ def test_deterministic(args):
     for i in range(len(texts)):
         text = texts[i]
         if text != texts[0]:
-            print(f"Test failed: Output of trial 0: {texts[0][:50]}\n Output of trial {i}: {text[:50]}\n")
+            print(
+                f"Test failed: Output of trial 0: {texts[0][:50]}\n Output of trial {i}: {text[:50]}\n"
+            )
             pass_test = False
             break
 
     if pass_test:
         print("Test passed for all trials")
     print(f"Average speed: {np.mean(speeds)=:.2f} token/s")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
