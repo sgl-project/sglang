@@ -19,6 +19,24 @@ from sglang.srt.multimodal.processors.base_processor import (
 class InternVLImageProcessor(BaseMultimodalProcessor):
     models = [InternVLChatModel, InternS1ForConditionalGeneration]
 
+    IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    IMAGENET_STD = [0.229, 0.224, 0.225]
+
+    _NORMALIZE_TENSORS = {}
+
+    @classmethod
+    def _get_normalize_tensors(cls, device="cuda", dtype=torch.float32):
+        key = (device, dtype)
+        if key not in cls._NORMALIZE_TENSORS:
+            mean = torch.tensor(cls.IMAGENET_MEAN, device=device, dtype=dtype).view(
+                -1, 1, 1
+            )
+            std = torch.tensor(cls.IMAGENET_STD, device=device, dtype=dtype).view(
+                -1, 1, 1
+            )
+            cls._NORMALIZE_TENSORS[key] = (mean, std)
+        return cls._NORMALIZE_TENSORS[key]
+
     def __init__(self, hf_config, server_args, _image_processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _image_processor, *args, **kwargs)
         image_size = (
@@ -88,6 +106,8 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             bound, fps, max_frame, first_idx=0, num_segments=num_segments
         )
 
+        mean, std = InternVLImageProcessor._get_normalize_tensors(device="cuda")
+
         for frame_index in frame_indices:
             # Load frame
             frame = vr[frame_index]
@@ -97,10 +117,6 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
                 img_np = frame.asnumpy()
                 img = torch.from_numpy(img_np).permute(2, 0, 1).cuda().float() / 255.0
 
-            # Using the mean and variance of the ImageNet dataset for all input images can lead to accuracy issues, while using the mean and variance of each input image is a more accurate choice.
-            mean = img.mean(dim=[1, 2], keepdim=True)
-            # Prevent division by zero; clamp to minimum value of 1e-6
-            std = img.std(dim=[1, 2], keepdim=True).clamp(min=1e-6)
             img = (img - mean) / std
 
             tiles = InternVLImageProcessor.dynamic_preprocess(
@@ -188,6 +204,8 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         num_patches_list = []
         pixel_values = []
 
+        mean, std = self.__class__._get_normalize_tensors(device="cuda")
+
         # Process each input with allocated frames
         for image_index, image in enumerate(base_output.images):
             try:
@@ -201,10 +219,6 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
                 else:
                     tensor = image.cuda()  # assume already tensor
 
-                # Using the mean and variance of the ImageNet dataset for all input images can lead to accuracy issues, while using the mean and variance of each input image is a more accurate choice.
-                mean = tensor.mean(dim=[1, 2], keepdim=True)
-                # Prevent division by zero; clamp to minimum value of 1e-6
-                std = tensor.std(dim=[1, 2], keepdim=True).clamp(min=1e-6)
                 tensor = (tensor - mean) / std
                 tiles = self.dynamic_preprocess(
                     tensor, image_size=448, max_num=12, use_thumbnail=True
