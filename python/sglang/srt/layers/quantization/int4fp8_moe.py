@@ -17,7 +17,7 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
 )
 
-from sglang.srt.layers.quark_utils import quantize_fp8_scale_tensorwise, quantize_int4_scale_columnwise, pack_int4_to_int32
+from sglang.srt.layers.int4fp8_utils import quantize_fp8_scale_tensorwise, quantize_int4_scale_columnwise, pack_int4_to_int32
 
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
