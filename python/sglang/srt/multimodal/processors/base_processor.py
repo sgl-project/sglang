@@ -386,7 +386,7 @@ class BaseMultimodalProcessor(ABC):
 
     def load_mm_data(
         self,
-        prompt: str,
+        prompt: str | list[int],
         multimodal_tokens: MultimodalSpecialTokens,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
