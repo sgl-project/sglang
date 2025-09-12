@@ -257,7 +257,7 @@ class TpModelWorker:
             if skip_sample:
                 next_token_ids = None
                 # For prefill-only requests, we still need to compute token_ids_logprobs even when sampling is skipped
-                if any(
+                if model_worker_batch.token_ids_logprobs is not None and any(
                     token_ids is not None
                     for token_ids in model_worker_batch.token_ids_logprobs
                 ):
