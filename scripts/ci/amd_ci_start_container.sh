@@ -27,7 +27,7 @@ fi
 
 
 # Default base tags (can be overridden by command line arguments)
-DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm630-mi30x"
+DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi35x"
 
 # Parse command line arguments
