@@ -1,8 +1,9 @@
+import os
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Dict, List, Literal, Optional
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -14,6 +15,7 @@ from sglang.test.test_utils import (
 )
 
 _base_url = DEFAULT_URL_FOR_TEST
+_is_hip = is_hip()
 
 
 class BaseTestGptOss(CustomTestCase):
@@ -36,7 +38,8 @@ class BaseTestGptOss(CustomTestCase):
 
         if model_variant == "20b":
             other_args += ["--cuda-graph-max-bs", "600"]
-
+        if _is_hip:
+            os.environ["SGLANG_USE_AITER"] = "0"
         self._run_test_raw(
             model=model,
             expected_score_of_reasoning_effort=expected_score_of_reasoning_effort,

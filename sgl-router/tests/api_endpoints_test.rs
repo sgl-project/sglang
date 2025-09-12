@@ -9,7 +9,7 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
@@ -55,6 +55,9 @@ impl TestContext {
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -989,6 +992,91 @@ mod router_policy_tests {
 }
 
 #[cfg(test)]
+mod responses_endpoint_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_v1_responses_non_streaming() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18950,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "input": "Hello Responses API",
+            "model": "mock-model",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["object"], "response");
+        assert_eq!(body_json["status"], "completed");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_streaming() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18951,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "input": "Hello Responses API",
+            "model": "mock-model",
+            "stream": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Check that content-type indicates SSE
+        let headers = resp.headers().clone();
+        let ct = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("text/event-stream"));
+
+        // We don't fully consume the stream in this test harness.
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
 mod error_tests {
     use super::*;
 
@@ -1101,6 +1189,9 @@ mod error_tests {
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1456,6 +1547,9 @@ mod pd_mode_tests {
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         // Create app context
@@ -1615,6 +1709,9 @@ mod request_id_tests {
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1651,6 +1748,335 @@ mod request_id_tests {
         let response_id = resp.headers().get("x-request-id");
         assert!(response_id.is_some());
         assert_eq!(response_id.unwrap(), "my-custom-id");
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod rerank_tests {
+    use super::*;
+    // Note: RerankRequest and RerankResult are available for future use
+
+    #[tokio::test]
+    async fn test_rerank_success() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18105,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "query": "machine learning algorithms",
+            "documents": [
+                "Introduction to machine learning concepts",
+                "Deep learning neural networks tutorial"
+            ],
+            "model": "test-rerank-model",
+            "top_k": 2,
+            "return_documents": true,
+            "rid": "test-request-123"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify response structure
+        assert!(body_json.get("results").is_some());
+        assert!(body_json.get("model").is_some());
+        assert_eq!(body_json["model"], "test-rerank-model");
+
+        let results = body_json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Verify results are sorted by score (highest first)
+        assert!(results[0]["score"].as_f64().unwrap() >= results[1]["score"].as_f64().unwrap());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rerank_with_top_k() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18106,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "query": "test query",
+            "documents": [
+                "Document 1",
+                "Document 2",
+                "Document 3"
+            ],
+            "model": "test-model",
+            "top_k": 1,
+            "return_documents": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should only return top_k results
+        let results = body_json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rerank_without_documents() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18107,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "query": "test query",
+            "documents": ["Document 1", "Document 2"],
+            "model": "test-model",
+            "return_documents": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Documents should be null when return_documents is false
+        let results = body_json["results"].as_array().unwrap();
+        for result in results {
+            assert!(result.get("document").is_none());
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rerank_worker_failure() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18108,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0, // Always fail
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "query": "test query",
+            "documents": ["Document 1"],
+            "model": "test-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should return the worker's error response
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_rerank_compatibility() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18110,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        // Test V1 API format (simplified input)
+        let payload = json!({
+            "query": "machine learning algorithms",
+            "documents": [
+                "Introduction to machine learning concepts",
+                "Deep learning neural networks tutorial",
+                "Statistical learning theory basics"
+            ]
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify response structure
+        assert!(body_json.get("results").is_some());
+        assert!(body_json.get("model").is_some());
+
+        // V1 API should use default model name
+        assert_eq!(body_json["model"], "default");
+
+        let results = body_json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3); // All documents should be returned
+
+        // Verify results are sorted by score (highest first)
+        assert!(results[0]["score"].as_f64().unwrap() >= results[1]["score"].as_f64().unwrap());
+        assert!(results[1]["score"].as_f64().unwrap() >= results[2]["score"].as_f64().unwrap());
+
+        // V1 API should return documents by default
+        for result in results {
+            assert!(result.get("document").is_some());
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rerank_invalid_request() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18111,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        // Test empty query string (validation should fail)
+        let payload = json!({
+            "query": "",
+            "documents": ["Document 1", "Document 2"],
+            "model": "test-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Test query with only whitespace (validation should fail)
+        let payload = json!({
+            "query": "   ",
+            "documents": ["Document 1", "Document 2"],
+            "model": "test-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Test empty documents list (validation should fail)
+        let payload = json!({
+            "query": "test query",
+            "documents": [],
+            "model": "test-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Test invalid top_k (validation should fail)
+        let payload = json!({
+            "query": "test query",
+            "documents": ["Document 1", "Document 2"],
+            "model": "test-model",
+            "top_k": 0
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         ctx.shutdown().await;
     }

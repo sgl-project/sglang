@@ -2,9 +2,15 @@ use crate::config::RouterConfig;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::middleware::TokenBucket;
-use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
+use crate::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest,
+    V1RerankReqInput,
+};
+use crate::reasoning_parser::ParserFactory;
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
+use crate::tokenizer::{factory as tokenizer_factory, traits::Tokenizer};
+use crate::tool_parser::ParserRegistry;
 use axum::{
     extract::{Query, Request, State},
     http::StatusCode,
@@ -27,7 +33,9 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
-    // Future dependencies can be added here
+    pub tokenizer: Option<Arc<dyn Tokenizer>>,
+    pub reasoning_parser_factory: Option<ParserFactory>,
+    pub tool_parser_registry: Option<&'static ParserRegistry>,
 }
 
 impl AppContext {
@@ -36,14 +44,45 @@ impl AppContext {
         client: Client,
         max_concurrent_requests: usize,
         rate_limit_tokens_per_second: Option<usize>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
-        Self {
+
+        // Initialize gRPC-specific components only when in gRPC mode
+        let (tokenizer, reasoning_parser_factory, tool_parser_registry) =
+            if router_config.connection_mode == crate::config::ConnectionMode::Grpc {
+                // Get tokenizer path (required for gRPC mode)
+                let tokenizer_path = router_config
+                    .tokenizer_path
+                    .clone()
+                    .or_else(|| router_config.model_path.clone())
+                    .ok_or_else(|| {
+                        "gRPC mode requires either --tokenizer-path or --model-path to be specified"
+                            .to_string()
+                    })?;
+
+                // Initialize all gRPC components
+                let tokenizer = Some(
+                    tokenizer_factory::create_tokenizer(&tokenizer_path)
+                        .map_err(|e| format!("Failed to create tokenizer: {}", e))?,
+                );
+                let reasoning_parser_factory = Some(ParserFactory::new());
+                let tool_parser_registry = Some(ParserRegistry::new());
+
+                (tokenizer, reasoning_parser_factory, tool_parser_registry)
+            } else {
+                // HTTP mode doesn't need these components
+                (None, None, None)
+            };
+
+        Ok(Self {
             client,
             router_config,
             rate_limiter,
-        }
+            tokenizer,
+            reasoning_parser_factory,
+            tool_parser_registry,
+        })
     }
 }
 
@@ -112,6 +151,33 @@ async fn v1_completions(
     Json(body): Json<CompletionRequest>,
 ) -> Response {
     state.router.route_completion(Some(&headers), &body).await
+}
+
+async fn rerank(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<RerankRequest>,
+) -> Response {
+    state.router.route_rerank(Some(&headers), &body).await
+}
+
+async fn v1_rerank(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<V1RerankReqInput>,
+) -> Response {
+    state
+        .router
+        .route_rerank(Some(&headers), &body.into())
+        .await
+}
+
+async fn v1_responses(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<ResponsesRequest>,
+) -> Response {
+    state.router.route_responses(Some(&headers), &body).await
 }
 
 // Worker management endpoints
@@ -191,6 +257,9 @@ pub fn build_app(
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
+        .route("/rerank", post(rerank))
+        .route("/v1/rerank", post(v1_rerank))
+        .route("/v1/responses", post(v1_responses))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             crate::middleware::concurrency_limit_middleware,
@@ -291,7 +360,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         client.clone(),
         config.router_config.max_concurrent_requests,
         config.router_config.rate_limit_tokens_per_second,
-    ));
+    )?);
 
     // Create router with the context
     let router = RouterFactory::create_router(&app_context).await?;

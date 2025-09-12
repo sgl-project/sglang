@@ -271,7 +271,10 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if model_runner.spec_algorithm.is_eagle():
+        if (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_standalone()
+        ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
@@ -317,7 +320,9 @@ class CudaGraphRunner:
                 (self.max_num_token,), dtype=self._cache_loc_dtype()
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_token), dtype=torch.int64
+            )
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -532,7 +537,7 @@ class CudaGraphRunner:
             encoder_lens = self.encoder_lens[:bs]
         else:
             encoder_lens = None
-        mrope_positions = self.mrope_positions[:, :bs]
+        mrope_positions = self.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = self.next_token_logits_buffer[:num_tokens]
         self.num_token_non_padded[...] = num_tokens
 
@@ -751,7 +756,7 @@ class CudaGraphRunner:
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
-            self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
+            self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
         if self.require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
             self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
@@ -825,7 +830,10 @@ class CudaGraphRunner:
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
-        if self.model_runner.spec_algorithm.is_eagle():
+        if (
+            self.model_runner.spec_algorithm.is_eagle()
+            or self.model_runner.spec_algorithm.is_standalone()
+        ):
             from sglang.srt.speculative.eagle_utils import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:

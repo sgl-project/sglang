@@ -35,6 +35,8 @@ from pydantic import (
 )
 from typing_extensions import Literal
 
+DEFAULT_MODEL_NAME = "default"
+
 
 class ModelCard(BaseModel):
     """Model cards."""
@@ -183,7 +185,7 @@ class BatchResponse(BaseModel):
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
     echo: bool = False
@@ -410,7 +412,7 @@ class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
@@ -458,6 +460,66 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "auto"
         return values
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_reasoning_inputs(cls, values: Dict):
+        r = values.get("reasoning")
+        if r is None:
+            return values
+
+        if isinstance(r, dict):
+            effort = r.get("effort") or r.get("reasoning_effort")
+            if effort in {"low", "medium", "high"}:
+                values["reasoning_effort"] = effort
+
+            enabled = (
+                r.get("enabled")
+                if r.get("enabled") is not None
+                else r.get("enable", False)
+            )
+            if isinstance(enabled, str):
+                enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
+            if enabled:
+                ctk = values.get("chat_template_kwargs")
+                if not isinstance(ctk, dict):
+                    ctk = {}
+                ctk.setdefault("thinking", True)
+                values["chat_template_kwargs"] = ctk
+
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_json_schema(cls, values):
+        response_format = values.get("response_format")
+        if not response_format:
+            return values
+
+        if response_format.get("type") != "json_schema":
+            return values
+
+        schema = response_format.pop("schema", None)
+        json_schema = response_format.get("json_schema")
+
+        if json_schema:
+            return values
+
+        if schema:
+            name_ = schema.get("title", "Schema")
+            strict_ = False
+            if "properties" in schema and "strict" in schema["properties"]:
+                item = schema["properties"].pop("strict", None)
+                if item and item.get("default", False):
+                    strict_ = True
+
+            response_format["json_schema"] = {
+                "name": name_,
+                "schema": schema,
+                "strict": strict_,
+            }
+
+        return values
+
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
     min_p: float = 0.0
@@ -480,9 +542,9 @@ class ChatCompletionRequest(BaseModel):
     rid: Optional[Union[List[str], str]] = None
 
     # For PD disaggregation
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
 
 
 class ChatMessage(BaseModel):
@@ -572,7 +634,7 @@ class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
     input: EmbeddingInput
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     encoding_format: str = "float"
     dimensions: Optional[int] = None
     user: Optional[str] = None
@@ -606,7 +668,7 @@ class ScoringRequest(BaseModel):
     )
     apply_softmax: bool = False
     item_first: bool = False
-    model: str
+    model: str = DEFAULT_MODEL_NAME
 
 
 class ScoringResponse(BaseModel):

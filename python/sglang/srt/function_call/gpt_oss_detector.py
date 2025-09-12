@@ -10,7 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.harmony_parser import HarmonyParser
+from sglang.srt.parser.harmony_parser import HarmonyParser
 
 logger = logging.getLogger(__name__)
 

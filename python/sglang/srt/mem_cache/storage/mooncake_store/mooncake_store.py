@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 import os
@@ -6,10 +5,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-import numpy as np
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
@@ -75,6 +72,26 @@ class MooncakeStoreConfig:
             master_server_address=os.getenv("MOONCAKE_MASTER"),
         )
 
+    @staticmethod
+    def load_from_extra_config(extra_config: dict) -> "MooncakeStoreConfig":
+        """Load config from extra_config dictionary."""
+        if "master_server_address" not in extra_config:
+            raise ValueError("master_server_address is required in extra_config")
+
+        return MooncakeStoreConfig(
+            local_hostname=extra_config.get("local_hostname", "localhost"),
+            metadata_server=extra_config.get("metadata_server", "P2PHANDSHAKE"),
+            global_segment_size=extra_config.get(
+                "global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE
+            ),
+            local_buffer_size=extra_config.get(
+                "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
+            ),
+            protocol=extra_config.get("protocol", "tcp"),
+            device_name=extra_config.get("device_name", "auto"),
+            master_server_address=extra_config["master_server_address"],
+        )
+
     def __post_init__(self):
         if self.device_name == "auto":
             os.environ["MC_MS_AUTO_DISC"] = "1"
@@ -96,8 +113,26 @@ class MooncakeStore(HiCacheStorage):
 
         try:
             self.store = MooncakeDistributedStore()
-            self.config = MooncakeStoreConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded from env successfully.")
+
+            extra_config = (
+                getattr(storage_config, "extra_config", None)
+                if storage_config
+                else None
+            )
+            # Load configuration with master_server_address prioritized from extra_config if available
+            if (
+                extra_config is not None
+                and extra_config.get("master_server_address") is not None
+            ):
+                # Load from extra_config
+                self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+                logger.info(
+                    "Mooncake Configuration loaded from extra_config successfully."
+                )
+            else:
+                # Load from environment variables
+                self.config = MooncakeStoreConfig.load_from_env()
+                logger.info("Mooncake Configuration loaded from env successfully.")
 
             ret_code = self.store.setup(
                 self.config.local_hostname,
@@ -154,20 +189,36 @@ class MooncakeStore(HiCacheStorage):
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
-        return self.batch_set([key], [value], [target_location], [target_sizes])
+        # Only support zero copy set for now
+        assert target_location is not None and target_sizes is not None
+        exist_result = self._batch_exist([key])
+        if exist_result[0] == 1:
+            return True
+        put_result = self._put_batch_zero_copy_impl(
+            [key], [target_location], [target_sizes]
+        )
+        return put_result[0] == 0
 
     def batch_set(
         self,
         keys: List[str],
-        target_location: Optional[List[int]] = None,
+        values: Optional[List[torch.Tensor]] = None,
+        target_locations: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
-        assert len(keys) == len(target_location) == len(target_sizes)
+        # Only support zero copy set for now
+        assert target_locations is not None and target_sizes is not None
+        assert len(keys) == len(target_locations) == len(target_sizes)
+
         if len(keys) == 0:
             return False
 
         for i in range(len(keys)):
-            if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
+            if (
+                keys[i] is None
+                or target_locations[i] is None
+                or target_sizes[i] is None
+            ):
                 return False
 
         exist_result = self._batch_exist(keys)
@@ -178,7 +229,7 @@ class MooncakeStore(HiCacheStorage):
         for i in range(len(keys)):
             if exist_result[i] != 1:
                 set_keys.append(keys[i])
-                set_target_locations.append(target_location[i])
+                set_target_locations.append(target_locations[i])
                 set_target_sizes.append(target_sizes[i])
                 set_indices.append(i)
         # Only set non-existing keys to storage
@@ -203,18 +254,24 @@ class MooncakeStore(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        return self.batch_get([key], [target_location], [target_sizes]) == 1
+        assert target_location is not None and target_sizes is not None
+        get_result = self._get_batch_zero_copy_impl(
+            [key], [target_location], [target_sizes]
+        )
+        return get_result[0] >= 0
 
     def batch_get(
         self,
         keys: List[str],
-        target_location: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> int:
-        assert len(keys) == len(target_location) == len(target_sizes)
+        assert len(keys) == len(target_locations) == len(target_sizes)
         if len(keys) == 0:
             return 0
-        get_result = self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
+        get_result = self._get_batch_zero_copy_impl(
+            keys, target_locations, target_sizes
+        )
         if self.is_mla_backend:
             key_multiplier = 1
         else:
@@ -225,7 +282,8 @@ class MooncakeStore(HiCacheStorage):
         return len(keys) // key_multiplier
 
     def exists(self, key) -> bool:
-        return self.batch_exists([key]) > 0
+        exist_result = self._batch_exist([key])
+        return exist_result[0] == 1
 
     def batch_exists(self, keys) -> int:
         if self.is_mla_backend:
@@ -244,16 +302,13 @@ class MooncakeStore(HiCacheStorage):
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
 
-    def delete(self, key) -> None:
-        raise (NotImplementedError)
-
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
         pass
 
     def clear(self) -> None:
-        raise (NotImplementedError)
+        self.store.remove_all()
 
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
