@@ -53,6 +53,7 @@ runtime_common = [
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.24",
+    "sentencepiece",
 ]
 
 srt = [
