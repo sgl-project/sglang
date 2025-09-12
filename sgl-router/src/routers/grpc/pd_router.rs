@@ -289,6 +289,14 @@ impl RouterTrait for GrpcPDRouter {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
+    async fn route_responses(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::ResponsesRequest,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
     async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
