@@ -26,6 +26,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     CombineInput,
     StandardDispatcher,
+    StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import (
@@ -503,8 +504,14 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
+        # ModelOptNvFp4FusedMoEMethod uses max of global expert scaling factors for input scaling factor
+        load_global_experts = (
+            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            and "input_scale" in weight_name
+        )
+
         global_expert_location_metadata = get_global_expert_location_metadata()
-        if global_expert_location_metadata is None:
+        if global_expert_location_metadata is None or load_global_experts:
             self._weight_loader_impl(
                 param=param,
                 loaded_weight=loaded_weight,
@@ -613,8 +620,10 @@ class FusedMoE(torch.nn.Module):
             loaded_weight = loaded_weight.to(param.data.device)
 
             if (
-                "compressed" in self.quant_method.__class__.__name__.lower()
-                or "w4afp8" in self.quant_config.get_name()
+                (
+                    "compressed" in self.quant_method.__class__.__name__.lower()
+                    or "w4afp8" in self.quant_config.get_name()
+                )
                 and (param.data[expert_id] != 1).any()
                 and ((param.data[expert_id] - loaded_weight).abs() > 1e-5).any()
             ):
@@ -973,8 +982,9 @@ class FlashInferFusedMoE(FusedMoE):
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply_with_router_logits(
             layer=self,
-            x=hidden_states,
-            topk_output=topk_output,
+            dispatch_output=StandardDispatchOutput(
+                hidden_states=hidden_states, topk_output=topk_output
+            ),
         )
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):

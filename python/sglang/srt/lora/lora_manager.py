@@ -69,7 +69,10 @@ class LoRAManager:
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
         backend_type = get_backend_from_name(lora_backend)
-        self.lora_backend: BaseLoRABackend = backend_type(lora_backend)
+        self.lora_backend: BaseLoRABackend = backend_type(
+            max_loras_per_batch=max_loras_per_batch,
+            device=self.device,
+        )
 
         # Initialize mutable internal state of the LoRAManager.
         self.init_state(
@@ -82,29 +85,22 @@ class LoRAManager:
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
         with torch.device("cuda"):
             self.cuda_graph_batch_info = LoRABatchInfo(
-                bs=self.max_bs_in_cuda_graph,
-                seg_lens=torch.zeros(self.max_bs_in_cuda_graph, dtype=torch.int32),
-                seg_indptr=torch.zeros(
-                    self.max_bs_in_cuda_graph + 1, dtype=torch.int32
-                ),
+                bs=max_bs_in_cuda_graph,
+                use_cuda_graph=True,
+                num_segments=None,
+                seg_lens=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
                 max_len=1,
-                weight_indices=torch.zeros(
-                    self.max_bs_in_cuda_graph, dtype=torch.int32
-                ),
+                weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                permutation=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
             )
 
-            # Initialize seg_lens and seg_indptr for CUDA graph as they remain constant
-            # across batches.
-            self.cuda_graph_batch_info.seg_lens[: self.max_bs_in_cuda_graph].fill_(1)
-            torch.cumsum(
-                self.cuda_graph_batch_info.seg_lens[: self.max_bs_in_cuda_graph],
-                dim=0,
-                out=self.cuda_graph_batch_info.seg_indptr[
-                    1 : self.max_bs_in_cuda_graph + 1
-                ],
-            )
+        self.lora_backend.init_cuda_graph_batch_info(
+            cuda_graph_batch_info=self.cuda_graph_batch_info,
+            max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+        )
 
     def create_lora_update_result(
         self, success: bool, error_message: str = ""
@@ -232,7 +228,6 @@ class LoRAManager:
         return required_slots <= mem_pool_vacancy
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
-
         # Load active loras into lora memory pool
         cur_uids = set(forward_batch.lora_ids)
 
@@ -247,102 +242,30 @@ class LoRAManager:
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
-        def transfer_adapter_info(
-            weight_indices_out: torch.Tensor,
-            lora_ranks_out: torch.Tensor,
-            scalings_out: torch.Tensor,
-        ):
-            """
-            Transfer adapter metadata (weight indices, LoRA rank, scalings) from host
-            to device (CUDA) asynchronously.
-            """
-            weight_indices = [0] * len(forward_batch.lora_ids)
-            lora_ranks = [0] * self.max_loras_per_batch
-            scalings = [0] * self.max_loras_per_batch
-            for i, uid in enumerate(forward_batch.lora_ids):
-                weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-                if uid is not None:
-                    lora = self.loras[uid]
-                    lora_ranks[weight_indices[i]] = lora.config.r
-                    scalings[weight_indices[i]] = lora.scaling
-
-            # Use pinned memory to avoid synchronizations during host-to-device transfer
-            weight_indices_tensor = torch.tensor(
-                weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
-            )
-            lora_ranks_tensor = torch.tensor(
-                lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
-            )
-            scalings_tensor = torch.tensor(
-                scalings, dtype=torch.float, pin_memory=True, device="cpu"
-            )
-
-            # Copy to device tensors asynchronously
-            weight_indices_out[:bs].copy_(weight_indices_tensor, non_blocking=True)
-            lora_ranks_out[: self.max_loras_per_batch].copy_(
-                lora_ranks_tensor, non_blocking=True
-            )
-            scalings_out[: self.max_loras_per_batch].copy_(
-                scalings_tensor, non_blocking=True
-            )
-
-        if (
+        use_cuda_graph = (
             hasattr(self, "max_bs_in_cuda_graph")
             and bs <= self.max_bs_in_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
-        ):
-            # Do in-place updates when CUDA graph is enabled and the batch forward mode
-            # could use CUDA graph.
+        )
 
-            transfer_adapter_info(
-                self.cuda_graph_batch_info.weight_indices,
-                self.cuda_graph_batch_info.lora_ranks,
-                self.cuda_graph_batch_info.scalings,
-            )
-
-            self.cuda_graph_batch_info.bs = bs
-            self.cuda_graph_batch_info.max_len = 1
-            batch_info = self.cuda_graph_batch_info
-        else:
-            weight_indices = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            lora_ranks = torch.zeros(
-                (self.max_loras_per_batch,), dtype=torch.int64, device=self.device
-            )
-            scalings = torch.zeros(
-                (self.max_loras_per_batch,), dtype=torch.float, device=self.device
-            )
-            transfer_adapter_info(
-                weight_indices,
-                lora_ranks,
-                scalings,
-            )
-
-            seg_lens = (
-                forward_batch.extend_seq_lens
-                if forward_batch.forward_mode.is_extend()
-                else torch.ones(bs, device=self.device)
-            )
-
-            max_len = (
-                # Calculate max_len from the CPU copy to avoid D2H transfer.
-                max(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.forward_mode.is_extend()
-                else 1
-            )
-
-            seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
-            seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
-
-            batch_info = LoRABatchInfo(
-                bs=bs,
-                seg_lens=seg_lens,
-                seg_indptr=seg_indptr,
-                max_len=max_len,
-                weight_indices=weight_indices,
-                lora_ranks=lora_ranks,
-                scalings=scalings,
-            )
-        self.lora_backend.set_batch_info(batch_info)
+        weight_indices = [0] * len(forward_batch.lora_ids)
+        lora_ranks = [0] * self.max_loras_per_batch
+        scalings = [0] * self.max_loras_per_batch
+        for i, uid in enumerate(forward_batch.lora_ids):
+            weight_indices[i] = self.memory_pool.get_buffer_id(uid)
+            if uid is not None:
+                lora = self.loras[uid]
+                lora_ranks[weight_indices[i]] = lora.config.r
+                scalings[weight_indices[i]] = lora.scaling
+        # Do in-place updates when CUDA graph is enabled and the batch forward mode
+        # could use CUDA graph.
+        self.lora_backend.prepare_lora_batch(
+            forward_batch=forward_batch,
+            weight_indices=weight_indices,
+            lora_ranks=lora_ranks,
+            scalings=scalings,
+            batch_info=self.cuda_graph_batch_info if use_cuda_graph else None,
+        )
 
     def update_lora_info(self):
         """
