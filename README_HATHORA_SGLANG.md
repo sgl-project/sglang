@@ -29,6 +29,8 @@ A high-performance, OpenAI-compatible API server powered by SGLang for deploymen
 
 ## Quick Start
 
+See also: `docs/QUICK_DEMO.md` for a walkthrough.
+
 ### 1. Environment Variables
 
 Set the required environment variables for Hathora deployment:
