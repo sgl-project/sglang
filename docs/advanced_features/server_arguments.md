@@ -121,21 +121,23 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 ## Logging
 
-| Arguments | Description | Defaults |
-|-----------|-------------|----------|
-| `--log-level` | The logging level of all loggers. | info |
-| `--log-level-http` | The logging level of HTTP server. If not set, reuse --log-level by default. | None |
-| `--log-requests` | Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level. | False |
-| `--log-requests-level` | 0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output. | 0 |
-| `--show-time-cost` | Show time cost of custom marks. | False |
-| `--enable-metrics` | Enable log prometheus metrics. | False |
-| `--bucket-time-to-first-token` | The buckets of time to first token, specified as a list of floats. | None |
-| `--bucket-inter-token-latency` | The buckets of inter-token latency, specified as a list of floats. | None |
-| `--bucket-e2e-request-latency` | The buckets of end-to-end request latency, specified as a list of floats. | None |
-| `--collect-tokens-histogram` | Collect prompt/generation tokens histogram. | False |
-| `--kv-events-config` | Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. | None |
-| `--decode-log-interval` | The log interval of decode batch. | 40 |
-| `--enable-request-time-stats-logging` | Enable per request time stats logging. | False |
+| Arguments                             | Description                                                                                                                                                                                                                                                                                                                                                                                  | Defaults |
+|---------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------|
+| `--log-level`                         | The logging level of all loggers.                                                                                                                                                                                                                                                                                                                                                            | info     |
+| `--log-level-http`                    | The logging level of HTTP server. If not set, reuse --log-level by default.                                                                                                                                                                                                                                                                                                                  | None     |
+| `--log-requests`                      | Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level.                                                                                                                                                                                                                                                                                             | False    |
+| `--log-requests-level`                | 0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.                                                                                                                                                                                                                 | 0        |
+| `--show-time-cost`                    | Show time cost of custom marks.                                                                                                                                                                                                                                                                                                                                                              | False    |
+| `--enable-metrics`                    | Enable log prometheus metrics.                                                                                                                                                                                                                                                                                                                                                               | False    |
+| `--bucket-time-to-first-token`        | The buckets of time to first token, specified as a list of floats.                                                                                                                                                                                                                                                                                                                           | None     |
+| `--bucket-inter-token-latency`        | The buckets of inter-token latency, specified as a list of floats.                                                                                                                                                                                                                                                                                                                           | None     |
+| `--bucket-e2e-request-latency`        | The buckets of end-to-end request latency, specified as a list of floats.                                                                                                                                                                                                                                                                                                                    | None     |
+| `--collect-tokens-histogram`          | Collect prompt/generation tokens histogram.                                                                                                                                                                                                                                                                                                                                                  | False    |
+| `--kv-events-config`                  | Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.                                                                                                                                                                                                                                                                                | None     |
+| `--decode-log-interval`               | The log interval of decode batch.                                                                                                                                                                                                                                                                                                                                                            | 40       |
+| `--enable-request-time-stats-logging` | Enable per request time stats logging.                                                                                                                                                                                                                                                                                                                                                       | False    |
+| `--prompt-tokens-buckets`             | The buckets rule of prompt tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'customer <value1> <value2> ...' uses custom bucket values (e.g., 'customer 10 50 100 500'). | None     |
+| `--generation-tokens-buckets`         | The buckets rule of prompt tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'customer <value1> <value2> ...' uses custom bucket values (e.g., 'customer 10 50 100 500'). | None     |
 
 ## API related
 
@@ -179,7 +181,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-lora` | Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility. | False |
 | `--max-lora-rank` | The maximum LoRA rank that should be supported. If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of larger LoRA rank after server startup. | None |
 | `--lora-target-modules` | The union set of all target modules where LoRA should be applied (e.g., `q_proj`, `k_proj`, `gate_proj`). If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of different target modules after server startup. You can also set it to `all` to enable LoRA for all supported modules. However, enabling LoRA on additional modules introduces a minor performance overhead. If your application is performance-sensitive, we recommend only specifying the modules for which you plan to load adapters. | None |
-| `--lora-paths` | The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}. | None |
+| `--lora-paths` | The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool} | None |
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | 8 |
 | `--max-loaded-loras` | If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`. | None |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | triton |
@@ -207,6 +209,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-accept-threshold-single` | Accept a draft token if its probability in the target model is greater than this threshold. | 1.0 |
 | `--speculative-accept-threshold-acc` | The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc). | 1.0 |
 | `--speculative-token-map` | The path of the draft model's small vocab table. | None |
+| `--speculative-attention-mode` | Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'. | Prefill |
 
 ## Expert parallelism
 
@@ -236,7 +239,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-hierarchical-cache` | Enable hierarchical cache. | False |
 | `--hicache-ratio` | The ratio of the size of host KV cache memory pool to the size of device pool. | 2.0 |
 | `--hicache-size` | The size of the hierarchical cache. | 0 |
-| `--hicache-write-policy` | The write policy for hierarchical cache. | write_through_selective |
+| `--hicache-write-policy` | The write policy for hierarchical cache. | write_through |
 | `--hicache-io-backend` | The IO backend for hierarchical cache. |  |
 | `--hicache-storage-backend` | The storage backend for hierarchical cache. | None |
 

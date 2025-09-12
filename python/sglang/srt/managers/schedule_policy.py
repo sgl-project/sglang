@@ -380,8 +380,9 @@ class PrefillAdder:
         self.log_input_tokens += extend_input_len
 
     def add_chunked_req(self, req: Req):
-        truncated = req.extend_input_len > self.rem_chunk_tokens
-        req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
+        _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        truncated = req.extend_input_len > _rem_tokens
+        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -549,7 +550,7 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens - self.page_size + 1
+                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 

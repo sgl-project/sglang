@@ -28,6 +28,7 @@ The core features include:
    basic_usage/deepseek.md
    basic_usage/gpt_oss.md
    basic_usage/llama4.md
+   basic_usage/qwen3.md
 
 .. toctree::
    :maxdepth: 1
@@ -38,7 +39,7 @@ The core features include:
    advanced_features/speculative_decoding.ipynb
    advanced_features/structured_outputs.ipynb
    advanced_features/structured_outputs_for_reasoning_models.ipynb
-   advanced_features/function_calling.ipynb
+   advanced_features/tool_parser.ipynb
    advanced_features/separate_reasoning.ipynb
    advanced_features/quantization.md
    advanced_features/lora.ipynb
@@ -79,6 +80,7 @@ The core features include:
    developer_guide/contribution_guide.md
    developer_guide/development_guide_using_docker.md
    developer_guide/benchmark_and_profiling.md
+   developer_guide/bench_serving.md
 
 .. toctree::
    :maxdepth: 1

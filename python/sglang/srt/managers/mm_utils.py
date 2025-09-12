@@ -20,8 +20,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
+
+_is_npu = is_npu()
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -486,6 +488,8 @@ def get_embedding_and_mask(
         if embedding is None:
             return None, None
     # 2. Get mask
+    if _is_npu:
+        torch.npu.current_stream().synchronize()
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
     embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
@@ -560,7 +564,7 @@ def embed_mm_inputs(
                 ]
                 items_size[i + 1] = len(mm_items)
                 items_offsets.append(
-                    flatten_nested_list([item.offsets for item in mm_inputs.mm_items])
+                    flatten_nested_list([item.offsets for item in mm_items])
                 )
             items_size = torch.cumsum(items_size, dim=0).tolist()
 
@@ -625,6 +629,7 @@ def general_mm_embed_routine(
     embed_tokens = language_model.get_input_embeddings()
     if (
         not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_target_verify()
         and forward_batch.contains_mm_inputs()
     ):
         mm_inputs_list = [
