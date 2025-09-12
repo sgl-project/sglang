@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 
 
-class TestDeepseekV3(CustomTestCase):
+class TestDeepseekV3FP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
@@ -78,7 +78,7 @@ class TestDeepseekV3(CustomTestCase):
             self.assertGreater(speed, 75)
 
 
-class TestDeepseekV3MTP(CustomTestCase):
+class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
