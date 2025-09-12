@@ -1,4 +1,4 @@
-SGlang exports request trace data based on the OpenTelemetry Collector. You can enable tracing by adding the `--enable-trace` and configure the OpenTelemetry Collector endpoint using `--otel-endpoint` when launching the server.
+SGlang exports request trace data based on the OpenTelemetry Collector. You can enable tracing by adding the `--enable-trace` and configure the OpenTelemetry Collector endpoint using `--oltp-traces-endpoint` when launching the server.
 
 You can find example screenshots of the visualization in https://github.com/sgl-project/sglang/issues/8965.
 
@@ -22,7 +22,7 @@ This section explains how to configure the request tracing and export the trace 
 
 3. start your SGLang server with tracing enabled
     ```bash
-    python -m sglang.launch_server --enable-trace --otel-endpoint 0.0.0.0:4317 <other option>
+    python -m sglang.launch_server --enable-trace --oltp-traces-endpoint 0.0.0.0:4317 <other option>
     ```
 
     Replace `0.0.0.0:4317` with the actual endpoint of the opentelemetry collector. If you launched the openTelemetry collector with tracing_compose.yaml, the default receiving port is 4317.
@@ -39,9 +39,9 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
 
     Every process involved in tracing during the initialization phase should execute:
     ```python
-    process_tracing_init(otel_endpoint, server_name)
+    process_tracing_init(oltp_traces_endpoint, server_name)
     ```
-    The otel_endpoint is obtained from the arguments, and you can set server_name freely, but it should remain consistent across all processes.
+    The oltp_traces_endpoint is obtained from the arguments, and you can set server_name freely, but it should remain consistent across all processes.
 
     Every thread involved in tracing during the initialization phase should execute:
     ```python

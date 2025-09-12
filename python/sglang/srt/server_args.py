@@ -210,7 +210,7 @@ class ServerArgs:
     kv_events_config: Optional[str] = None
     gc_warning_threshold_secs: float = 0.0
     enable_trace: bool = False
-    otel_endpoint: str = "localhost:4317"
+    oltp_traces_endpoint: str = "localhost:4317"
 
     # API related
     api_key: Optional[str] = None
@@ -1340,7 +1340,7 @@ class ServerArgs:
             help="Enable opentelemetry trace",
         )
         parser.add_argument(
-            "--otel-endpoint",
+            "--oltp-traces-endpoint",
             type=str,
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",

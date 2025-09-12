@@ -2590,7 +2590,7 @@ def run_scheduler_process(
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
     if server_args.enable_trace:
-        process_tracing_init(server_args.otel_endpoint, "sglang")
+        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
         if server_args.disaggregation_mode == "null":
             thread_label = "Scheduler"
             trace_set_thread_info(thread_label, tp_rank, dp_rank)
