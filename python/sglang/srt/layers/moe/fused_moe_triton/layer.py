@@ -212,14 +212,6 @@ class FusedMoE(torch.nn.Module):
         if self.quant_method is None:
             self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
 
-        moe_quant_params = {}
-        if self.quant_method.__class__.__name__ in (
-            "GPTQMarlinMoEMethod",
-            "CompressedTensorsWNA16MarlinMoEMethod",
-            "CompressedTensorsWNA16MoEMethod",
-        ):
-            moe_quant_params["intermediate_size_full"] = intermediate_size
-
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
