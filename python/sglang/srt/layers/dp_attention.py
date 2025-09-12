@@ -161,11 +161,14 @@ def get_local_dp_buffer_len() -> int:
 def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
 
+
 def get_dp_hidden_size() -> int:
     return _DpGatheredBufferWrapper.get_dp_hidden_size()
 
+
 def get_dp_dtype() -> torch.dtype:
     return _DpGatheredBufferWrapper.get_dp_dtype()
+
 
 def get_dp_device() -> torch.device:
     return _DpGatheredBufferWrapper.get_dp_device()

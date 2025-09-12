@@ -35,11 +35,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_size,
+    get_dp_device,
+    get_dp_dtype,
+    get_dp_hidden_size,
     get_global_dp_buffer,
     get_local_attention_dp_size,
-    get_dp_hidden_size,
-    get_dp_dtype,
-    get_dp_device,
     set_dp_buffer_len,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -213,6 +213,7 @@ class LogitsMetadata:
                 dtype=dtype,
                 device=device,
             )
+
 
 class LogitsProcessor(nn.Module):
     def __init__(
