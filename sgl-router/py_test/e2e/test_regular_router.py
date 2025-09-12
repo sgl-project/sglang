@@ -47,6 +47,8 @@ def test_genai_bench(
             "e2e_latency_mean_max": 14,
             "input_throughput_mean_min": 1000,
             "output_throughput_mean_min": 12,
+            # Enforce GPU utilization p50 >= 99% during the run.
+            "gpu_util_p50_min": 99,
         },
         kill_procs=e2e_two_workers_dp2,
     )

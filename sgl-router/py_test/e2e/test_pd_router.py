@@ -257,6 +257,7 @@ def test_pd_genai_bench(e2e_model: str, pd_cluster, genai_bench_runner):
             "e2e_latency_mean_max": 15,
             "input_throughput_mean_min": 400,
             "output_throughput_mean_min": 20,
+            "gpu_util_p50_min": 99,
         },
         kill_procs=pd_cluster.workers,
     )
