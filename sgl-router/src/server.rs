@@ -3,7 +3,8 @@ use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::middleware::TokenBucket;
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest,
+    V1RerankReqInput,
 };
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::{RouterFactory, RouterTrait};
@@ -152,6 +153,25 @@ async fn v1_completions(
     state.router.route_completion(Some(&headers), &body).await
 }
 
+async fn rerank(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<RerankRequest>,
+) -> Response {
+    state.router.route_rerank(Some(&headers), &body).await
+}
+
+async fn v1_rerank(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<V1RerankReqInput>,
+) -> Response {
+    state
+        .router
+        .route_rerank(Some(&headers), &body.into())
+        .await
+}
+
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -237,6 +257,8 @@ pub fn build_app(
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
+        .route("/rerank", post(rerank))
+        .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),

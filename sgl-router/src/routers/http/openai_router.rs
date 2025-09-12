@@ -2,7 +2,9 @@
 
 use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
-use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
+use crate::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest,
+};
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -381,7 +383,7 @@ impl super::super::RouterTrait for OpenAIRouter {
             .into_response()
     }
 
-    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: &RerankRequest) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Rerank endpoint not implemented for OpenAI backend",
