@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageC
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
-
+DEFAULT_MOONCAKE_CONFIG_PATH_ENV = "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"
 logger = logging.getLogger(__name__)
 
 
@@ -24,12 +24,11 @@ class MooncakeStoreConfig:
     protocol: str
     device_name: str
     master_server_address: str
-    default_env_var: str = "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
         """Load the config from a JSON file."""
-        file_path = os.getenv(MooncakeStoreConfig.default_env_var)
+        file_path = os.getenv(DEFAULT_MOONCAKE_CONFIG_PATH_ENV)
         try:
             with open(file_path) as fin:
                 config = json.load(fin)
@@ -131,7 +130,7 @@ class MooncakeStore(HiCacheStorage):
                 logger.info(
                     "Mooncake Configuration loaded from extra_config successfully."
                 )
-            elif os.getenv(MooncakeStoreConfig.default_env_var):
+            elif os.getenv(DEFAULT_MOONCAKE_CONFIG_PATH_ENV):
                 # Load from config file
                 self.config = MooncakeStoreConfig.from_file()
                 logger.info("Mooncake Configuration loaded from file successfully.")
