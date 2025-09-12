@@ -6,8 +6,7 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest,
-    ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1216,7 +1215,8 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses").await
+        self.route_typed_request(headers, body, "/v1/responses")
+            .await
     }
 
     async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {

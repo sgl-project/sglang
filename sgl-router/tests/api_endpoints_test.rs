@@ -1024,7 +1024,9 @@ mod responses_endpoint_tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body_json["object"], "response");
         assert_eq!(body_json["status"], "completed");
@@ -1063,7 +1065,10 @@ mod responses_endpoint_tests {
 
         // Check that content-type indicates SSE
         let headers = resp.headers().clone();
-        let ct = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let ct = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         assert!(ct.contains("text/event-stream"));
 
         // We don't fully consume the stream in this test harness.
