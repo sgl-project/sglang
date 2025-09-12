@@ -36,6 +36,9 @@ export TP_SIZE="${TP_SIZE:-1}"
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-4096}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 export PORT="${HATHORA_DEFAULT_PORT:-8000}"
+export ENABLE_METRICS="${ENABLE_METRICS:-true}"
+export H100_ONLY="${H100_ONLY:-true}"
+export AUTO_USE_FP8_ON_H100="${AUTO_USE_FP8_ON_H100:-true}"
 
 log "Decoding service account key from environment variable..."
 # Decode base64 string and save to temporary JSON file
@@ -53,6 +56,29 @@ log "MODEL_PATH: $MODEL_PATH"
 log "TP_SIZE: $TP_SIZE"
 log "MAX_TOTAL_TOKENS: $MAX_TOTAL_TOKENS"
 log "LOG_LEVEL: $LOG_LEVEL"
+log "ENABLE_METRICS: $ENABLE_METRICS"
+log "H100_ONLY: $H100_ONLY"
+log "AUTO_USE_FP8_ON_H100: $AUTO_USE_FP8_ON_H100"
+
+# Detect GPUs and optionally enforce H100-only
+GPU_NAMES=$(nvidia-smi --query-gpu=name --format=csv,noheader | tr '\n' ',' || true)
+log "Detected GPUs: ${GPU_NAMES}"
+if [[ "${H100_ONLY}" == "true" ]]; then
+  if ! nvidia-smi --query-gpu=name --format=csv,noheader | grep -q "H100"; then
+    log "Non-H100 GPU detected while H100_ONLY=true. Exiting."
+    exit 1
+  fi
+fi
+
+# If multiple GPUs and TP_SIZE is auto, set to number of GPUs up to 8
+if [[ -z "${TP_SIZE_USER_SET}" && "${TP_SIZE}" == "auto" ]]; then
+  NGPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
+  if [[ "$NGPU" -gt 0 ]]; then
+    if [[ "$NGPU" -gt 8 ]]; then NGPU=8; fi
+    export TP_SIZE="$NGPU"
+    log "Auto-setting TP_SIZE=${TP_SIZE} based on ${NGPU} GPUs"
+  fi
+fi
 
 log "Detecting GCP zone and VM name from public IP..."
 GCP_VM_PUBLIC_IP=$(dig +short $HATHORA_HOSTNAME)
@@ -111,6 +137,7 @@ log "Starting SGLang Hathora FastAPI server..."
 log "Server will be available at http://0.0.0.0:${PORT}"
 log "OpenAI-compatible endpoint: http://0.0.0.0:${PORT}/v1/chat/completions"
 log "Health check endpoint: http://0.0.0.0:${PORT}/health"
+log "Metrics endpoint: http://0.0.0.0:${PORT}/metrics"
 
 # Start the SGLang Hathora server
 python /app/serve_hathora.py &
