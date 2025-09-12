@@ -1414,8 +1414,8 @@ class ServerArgs:
             type=str,
             default=ServerArgs.modelopt_quant,
             help="The ModelOpt quantization configuration. "
-            "Supported values: 'fp8', 'nvfp4'. "
-            "This requires the NVIDIA Model Optimizer library to be installed.",
+            "Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. "
+            "This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt",
         )
         parser.add_argument(
             "--kv-cache-dtype",

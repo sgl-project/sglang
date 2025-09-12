@@ -97,18 +97,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
-# ModelOpt: Define placeholder for quantization config choices
-# Users will need to populate this with actual names of config objects
-# available in modelopt.torch.quantization, e.g., "FP8_DEFAULT_CONFIG"
-# For example: QUANT_CFG_CHOICES = {"fp8": "FP8_CONFIG_NAME_IN_MTQ", "int4_awq": "INT4_AWQ_CONFIG_NAME_IN_MTQ"}
-# This needs to be adapted based on the actual ModelOpt library's provided configs.
-# For demonstration, we'll assume "fp8" maps to a hypothetical "FP8_QUANT_CFG" attribute in mtq.
-QUANT_CFG_CHOICES = {
-    "fp8": "FP8_DEFAULT_CFG",  # Replace "FP8_DEFAULT_CFG" with the actual attribute name in mtq for FP8 config
-    "nvfp4": "NVFP4_DEFAULT_CFG",
-    # Add other presets like:
-    # "int4_awq": "INT4_AWQ_DEFAULT_CFG",
-}
+# ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
+# which contains the complete mapping of quantization config choices
 
 
 @contextmanager
@@ -520,7 +510,7 @@ class DefaultModelLoader(BaseModelLoader):
                 if isinstance(device, int):
                     max_memory[device] *= gpu_mem_percentage
 
-            print(
+            logger.warning(
                 "Model does not fit to the GPU mem. "
                 f"We apply the following memory limit for calibration: \n{max_memory}\n"
                 "If you hit GPU OOM issue, please adjust `gpu_mem_percentage` or "
