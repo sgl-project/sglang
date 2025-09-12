@@ -39,6 +39,8 @@ def cutlass_fused_experts_fp8(
     expert_offsets: torch.Tensor,
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
+    a_sf_layout: torch.Tensor,
+    w_sf_layout: torch.Tensor,
     use_fp8_blockscale: bool = True,
 ) -> torch.Tensor:
     """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
@@ -58,14 +60,12 @@ def cutlass_fused_experts_fp8(
             number of tokens and `k` is the hidden size. Expected dtype: `torch.half`
             or `torch.bfloat16`.
         w1_q (torch.Tensor): Pre-quantized FP8 weight tensor for the first GEMM
-            (up-projection part of SwiGLU). Expected shape: `(E, k, n*2)`, where
+            (up-projection part of SwiGLU). Expected shape: `(E, n*2, k)`, where
             `E` is the number of experts, `k` is the hidden size, and `n*2` is the
             intermediate size (`I`). Expected dtype: `torch.float8_e4m3fn`.
-            Note: This shape implies weights are stored as (num_experts, hidden_size, intermediate_size).
         w2_q (torch.Tensor): Pre-quantized FP8 weight tensor for the second GEMM
-            (down-projection). Expected shape: `(E, n, k)`, where `n` is half the
+            (down-projection). Expected shape: `(E, k, n)`, where `n` is half the
             intermediate size (`I // 2`). Expected dtype: `torch.float8_e4m3fn`.
-            Note: This shape implies weights are stored as (num_experts, intermediate_size // 2, hidden_size).
         w1_scale (torch.Tensor): Scales corresponding to `w1_q` (per-block scales).
             Shape: `(E, num_blocks_n, num_blocks_k)`. Dtype: `torch.float32`.
         w2_scale (torch.Tensor): Scales corresponding to `w2_q` (per-block scales).
@@ -92,6 +92,8 @@ def cutlass_fused_experts_fp8(
         out_ptrs (torch.Tensor): Pointers container for calculating offsets of the output activations for each expert.
         a_scales_ptrs (torch.Tensor): Pointers container for calculating offsets of the input scales for each expert.
         b_scales_ptrs (torch.Tensor): Pointers container for calculating offsets of the input scales for each expert.
+        a_sf_layout (torch.Tensor): Layout tensor for activation scales.
+        w_sf_layout (torch.Tensor): Layout tensor for weight scales.
         use_fp8_blockscale (bool, optional): Flag indicating usage of FP8 with
             block scaling. Currently, only `True` is supported. Defaults to `True`.
 
@@ -106,10 +108,9 @@ def cutlass_fused_experts_fp8(
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.float8_e4m3fn
     assert w2_q.dtype == torch.float8_e4m3fn
-    assert a.shape[1] == w1_q.shape[1], "Hidden size mismatch w1"
-    assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
+    assert a.shape[1] == w1_q.shape[2], "Hidden size mismatch w1"
+    assert w1_q.shape[1] == w2_q.shape[2] * 2, "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
-    assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
     assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
@@ -123,15 +124,17 @@ def cutlass_fused_experts_fp8(
 
     out_dtype = a.dtype
     num_experts = w1_q.size(0)
-    m = a.size(0)
-    k = w1_q.size(1)
-    n = w2_q.size(1)
+    m, k = a.shape
+    n = w2_q.size(2)
 
     topk = topk_ids.size(1)
     device = a.device
 
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    numel = topk_ids.numel()
+    maps = torch.empty(numel * 2, dtype=torch.int32, device=device)
+
+    a_map = maps[:numel]
+    c_map = maps[numel:]
 
     prepare_moe_input(
         topk_ids,
@@ -149,11 +152,11 @@ def cutlass_fused_experts_fp8(
     rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
     rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
-    c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
-    c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
-
-    a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
-    w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
+    rows = m * topk
+    c_buffer = torch.empty((rows * (n * 3 + k)), device=device, dtype=out_dtype)
+    c1 = c_buffer[: rows * n * 2].view(rows, -1)
+    c2 = c_buffer[rows * n * 2 : rows * (2 * n + k)].view(rows, -1)
+    intermediate = c_buffer[rows * (2 * n + k) :].view(rows, -1)
 
     fp8_blockwise_scaled_grouped_mm(
         c1,
@@ -176,10 +179,9 @@ def cutlass_fused_experts_fp8(
         workspace,
     )
 
-    intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
     silu_and_mul(c1, intermediate)
 
-    intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+    intermediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
 
     fp8_blockwise_scaled_grouped_mm(
         c2,
@@ -188,7 +190,7 @@ def cutlass_fused_experts_fp8(
         out_ptrs,
         a_scales_ptrs,
         b_scales_ptrs,
-        intemediate_q,
+        intermediate_q,
         w2_q,
         a2_scale,
         w2_scale,
