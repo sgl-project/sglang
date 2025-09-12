@@ -7,6 +7,9 @@ use std::collections::HashMap;
 pub struct RouterConfig {
     /// Routing mode configuration
     pub mode: RoutingMode,
+    /// Worker connection mode
+    #[serde(default)]
+    pub connection_mode: ConnectionMode,
     /// Policy configuration
     pub policy: PolicyConfig,
     /// Server host address
@@ -60,6 +63,20 @@ pub struct RouterConfig {
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
     #[serde(default)]
     pub enable_igw: bool,
+    /// Model path for loading tokenizer (can be a HuggingFace model ID or local path)
+    pub model_path: Option<String>,
+    /// Explicit tokenizer path (overrides model_path tokenizer if provided)
+    pub tokenizer_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(tag = "type")]
+pub enum ConnectionMode {
+    #[default]
+    #[serde(rename = "http")]
+    Http,
+    #[serde(rename = "grpc")]
+    Grpc,
 }
 
 /// Routing mode configuration
@@ -84,6 +101,11 @@ pub enum RoutingMode {
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
     },
+    #[serde(rename = "openai")]
+    OpenAI {
+        /// OpenAI-compatible API base(s), provided via worker URLs
+        worker_urls: Vec<String>,
+    },
 }
 
 impl RoutingMode {
@@ -99,6 +121,8 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
+            // OpenAI mode represents a single upstream
+            RoutingMode::OpenAI { .. } => 1,
         }
     }
 
@@ -336,6 +360,9 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         }
     }
 }
@@ -360,6 +387,7 @@ impl RouterConfig {
         match self.mode {
             RoutingMode::Regular { .. } => "regular",
             RoutingMode::PrefillDecode { .. } => "prefill_decode",
+            RoutingMode::OpenAI { .. } => "openai",
         }
     }
 
@@ -478,6 +506,9 @@ mod tests {
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -914,6 +945,9 @@ mod tests {
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -974,6 +1008,9 @@ mod tests {
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1030,6 +1067,9 @@ mod tests {
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         assert!(config.has_service_discovery());

@@ -11,6 +11,8 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
@@ -30,8 +32,10 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
@@ -293,14 +297,24 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 )
                 torch.cuda.empty_cache()
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton import fused_experts
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        moe_runner_config = self.moe_runner_config
 
         if (
             _use_aiter
@@ -308,7 +322,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             and moe_runner_config.apply_router_weight_on_input
         ):
             topk_weights, topk_ids, _ = topk_output
-            return rocm_fused_experts_tkw1(
+            output = rocm_fused_experts_tkw1(
                 hidden_states=x,
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
@@ -324,21 +338,20 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
+            return StandardCombineInput(hidden_states=output)
         else:
-            return fused_experts(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_output=topk_output,
-                moe_runner_config=moe_runner_config,
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
                 use_fp8_w8a8=True,
                 per_channel_quant=self.weight_quant.strategy
                 == QuantizationStrategy.CHANNEL,
-                w1_scale=layer.w13_weight_scale,
+                w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                a1_scale=layer.w13_input_scale,
+                a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
+            return self.runner.run(dispatch_output, quant_info)
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
@@ -380,8 +393,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             params_dtype == torch.float16
         ), "float16 is required for MoE compressed models. Set dtype=torch.float16"  # noqa: E501
 
-        intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
-
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
         # shard for TP along the transposed dims
@@ -415,13 +426,13 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         # In the case where we have actorder/g_idx,
         # we do not partition the w2 scales
         load_full_w2 = self.actorder and self.group_size != -1
-        w2_scales_size = (
-            intermediate_size_full if load_full_w2 else intermediate_size_per_partition
-        )
 
-        self.is_k_full = (not self.actorder) or (
-            intermediate_size_per_partition == intermediate_size_full
-        )
+        if load_full_w2:
+            w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
+        else:
+            w2_scales_size = intermediate_size_per_partition
+
+        self.is_k_full = (not self.actorder) or layer.moe_tp_size == 1
 
         if self.strategy == "channel":
             num_groups_w2 = num_groups_w13 = 1
@@ -640,21 +651,29 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         )
         replace_tensor("w2_weight_scale", marlin_w2_scales)
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
-            moe_runner_config.activation == "silu"
+            self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         topk_weights, topk_ids, router_logits = topk_output
 
-        return torch.ops.vllm.fused_marlin_moe(
+        output = torch.ops.vllm.fused_marlin_moe(
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
@@ -670,3 +689,4 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
         )
+        return StandardCombineInput(hidden_states=output)
