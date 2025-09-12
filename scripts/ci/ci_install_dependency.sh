@@ -49,7 +49,7 @@ $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org
 SGLANG_ROUTER_BUILD_NO_RUST=1 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
 
 SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
-SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
+SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
 echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
 if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
