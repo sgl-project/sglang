@@ -331,6 +331,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
+        self.app.router.add_get("/health", self._handle_health_check)
+
+    async def _handle_health_check(self, request):
+        return web.Response(text="OK", status=200)
 
     async def _handle_route(self, request: web.Request):
         method = request.method
