@@ -39,7 +39,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import is_cuda, next_power_of_2, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -74,7 +74,9 @@ except ImportError:
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
 
-CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var("SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true")
+CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
+    "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
+)
 
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
@@ -1193,9 +1195,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # All-expert-one-input-scale is mathematically different from default per-expert-input-scale
             # Thus we allow users to switch the flag to do thorough testing
             if CUTEDSL_MOE_SCALAR_INPUT_SCALE:
-                w13_input_scale = layer.w13_input_scale.max().to(torch.float32).repeat(layer.w13_input_scale.shape[0])
+                w13_input_scale = (
+                    layer.w13_input_scale.max()
+                    .to(torch.float32)
+                    .repeat(layer.w13_input_scale.shape[0])
+                )
             else:
-                w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
+                w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(
+                    torch.float32
+                )
 
             w2_input_scale = layer.w2_input_scale
 
