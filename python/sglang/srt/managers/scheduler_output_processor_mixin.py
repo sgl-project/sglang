@@ -297,6 +297,8 @@ class SchedulerOutputProcessorMixin:
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
 
+        self.no_cuda_graph_warner(can_run_cuda_graph)
+
     def add_input_logprob_return_values(
         self: Scheduler,
         i: int,

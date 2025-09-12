@@ -65,6 +65,7 @@ from sglang.srt.hf_transformers_utils import (
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.managers.cuda_graph_warner import NoCudaGraphWarner
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
@@ -518,6 +519,8 @@ class Scheduler(
         self.init_metrics(tp_rank, pp_rank, dp_rank)
         self.init_kv_events(server_args.kv_events_config)
         self.init_dp_balance(dp_balance_meta)
+
+        self.no_cuda_graph_warner = NoCudaGraphWarner()
 
         # Init disaggregation
         self.disaggregation_mode = DisaggregationMode(

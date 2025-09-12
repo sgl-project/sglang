@@ -49,7 +49,6 @@ class SchedulerMetricsMixin:
         self.cum_spec_accept_count = 0
         self.total_retracted_reqs = 0
         self.stats = SchedulerStats()
-        self.consecutive_no_cuda_graph_count = 0
         if self.enable_metrics:
             engine_type = "unified"
             labels = {
@@ -219,17 +218,6 @@ class SchedulerMetricsMixin:
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
-
-        if not can_run_cuda_graph:
-            self.consecutive_no_cuda_graph_count += 1
-            if self.consecutive_no_cuda_graph_count % 5 == 0:
-                logger.warning(
-                    f"CUDA graph disabled for {self.consecutive_no_cuda_graph_count} consecutive decode steps. "
-                    f"This may cause significant throughput degradation. "
-                    f"Check if batch size is within CUDA graph capture range."
-                )
-        else:
-            self.consecutive_no_cuda_graph_count = 0
 
         logger.info(msg)
         if self.enable_metrics:
