@@ -40,8 +40,7 @@ def _chunked_lora_expand_kernel(
     BLOCK_K: tl.constexpr,
 ):
     """
-    This kernel performs chunked SGMV (Sparse General Matrix-Vector) for LoRA
-    expand operations. The multiplication results are accumulated into the output tensor.
+    Computes a chunked SGMV for LoRA expand operations.
 
     When a sequence's rank is 0, the kernel is essentially a no-op, following
     the convention in pytorch where the product of two matrices of shape (m, 0)
