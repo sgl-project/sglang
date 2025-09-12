@@ -574,6 +574,8 @@ impl Router {
         endpoint: &str,
         method: Method,
     ) -> Response {
+        // TODO: currently the sglang worker is using in-memory state management, so this implementation has to fan out to all workers.
+        // Eventually, we need to have router to manage the chat history with a proper database, will update this implementation accordingly.
         let worker_urls = self.get_worker_urls();
         if worker_urls.is_empty() {
             return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
