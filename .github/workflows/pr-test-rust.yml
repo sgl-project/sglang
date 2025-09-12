@@ -80,7 +80,6 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  e2e-python:
   pytest-rust:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: BM.A10.4
