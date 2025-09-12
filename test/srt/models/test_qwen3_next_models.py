@@ -10,17 +10,19 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-
-class TestQwen2(CustomTestCase):
+class TestQwen3Next(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen2-7B-Instruct"
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[],
+            other_args=[
+                "--tp-size",
+                "4",
+            ],
         )
 
     @classmethod
@@ -39,19 +41,33 @@ class TestQwen2(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.78)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
-class TestQwen2FP8(CustomTestCase):
+class TestQwen3NextMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "neuralmagic/Qwen2-7B-Instruct-FP8"
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[],
+            other_args=[
+                "--trust-remote-code",
+                "--speculative-algorithm",
+                "NEXTN",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--mem-fraction-static",
+                "0.8",
+                "--tp",
+                "4",
+            ],
         )
 
     @classmethod
@@ -70,7 +86,7 @@ class TestQwen2FP8(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.78)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
 if __name__ == "__main__":
