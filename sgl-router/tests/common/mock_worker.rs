@@ -799,9 +799,7 @@ fn get_store() -> &'static Mutex<HashMap<u16, HashSet<String>>> {
 
 fn store_response_for_port(port: u16, response_id: &str) {
     let mut map = get_store().lock().unwrap();
-    map.entry(port)
-        .or_default()
-        .insert(response_id.to_string());
+    map.entry(port).or_default().insert(response_id.to_string());
 }
 
 fn response_exists_for_port(port: u16, response_id: &str) -> bool {
