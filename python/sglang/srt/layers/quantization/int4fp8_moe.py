@@ -31,6 +31,8 @@ from sglang.srt.utils import (
     BAR_FORMAT
 )
 
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         DispatchOutput,
@@ -67,8 +69,16 @@ class QuarkInt4Fp8Config(QuantizationConfig):
     - Activation: dynamic, per-token, symmetric
     """
 
-    def __init__(self):
-        self.activation_scheme = "dynamic"
+    def __init__(self,
+        is_checkpoint_fp8_serialized: bool = False,
+        activation_scheme: str = "dynamic",
+    ):
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.activation_scheme = activation_scheme
+
+        if activation_scheme != "dynamic":
+            raise NotImplementedError("QuarkInt4Fp8Config only supports activation_scheme='dynamic'.")
+
         self.weight_block_size = None
 
         self.num_quant_layers = 0
@@ -110,7 +120,7 @@ class QuarkInt4Fp8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            return QuarkInt4Fp8LinearMethod(self)
+            return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return QuarkInt4Fp8MoEMethod(self)
         
@@ -118,160 +128,6 @@ class QuarkInt4Fp8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
-
-
-class QuarkInt4Fp8LinearMethod(LinearMethodBase):
-
-    def __init__(self, quantization_config: QuarkInt4Fp8Config):
-        self.quant_config = quantization_config
-        self.online_quant_progress_bar = quantization_config.online_quant_progress_bar
-
-        if not _is_hip:
-            raise NotImplementedError("The int4fp8_moe online quantization scheme is only supported on AMD GPUs.")
-
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-
-        layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
-
-        layer.weight_scale = torch.nn.Parameter(
-            layer.weight_scale.data, requires_grad=False
-        )
-        if self.quant_config.activation_scheme == "static":
-            layer.input_scale = torch.nn.Parameter(
-                layer.input_scale.data, requires_grad=False
-            )
-
-        # Dequant -> Quant with max scale so we can run per tensor.
-        weight = layer.weight
-        weight_scale = layer.weight_scale
-        
-        # Normalize the weights and scales to e4m3fnuz.
-        if _is_hip and not ON_GFX950:
-            weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                weight=weight,
-                weight_scale=weight_scale,
-                input_scale=layer.input_scale,
-            )
-            if input_scale is not None:
-                layer.input_scale = Parameter(input_scale, requires_grad=False)
-
-        weight_scale, weight = requantize_with_max_scale(
-            weight=weight,
-            weight_scale=weight_scale,
-            logical_widths=layer.logical_widths,
-        )
-
-        # Update layer with new values.
-        layer.weight = Parameter(weight.t(), requires_grad=False)
-        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-        if self.quant_config.activation_scheme == "static":
-            layer.input_scale = Parameter(
-                layer.input_scale.max(), requires_grad=False
-            )
-
-    def get_weight_loader(self, layer, original_weight_loader):
-        def online_fp8_weight_loader(
-            param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
-            shard_id: Optional[Union[str, int]] = None,
-        ):
-            # For linear layers, we did not implement pre-sharding here, so
-            # online quantization happens before sharding is done.
-            # Online quantization also happens on CPU here.
-            # TODO: Ideally, we could pre-shard here.
-            fp8_w, fp8_scale = quantize_fp8_scale_tensorwise(loaded_weight)
-
-            if shard_id is not None:                
-                original_weight_loader(
-                    param,
-                    fp8_w,
-                    loaded_shard_id=shard_id
-                )
-
-                if isinstance(shard_id, str):
-                    shard_id = ["q", "k", "v"].index(shard_id)
-
-                assert layer.weight_scale[shard_id].shape == fp8_scale.shape
-                assert layer.weight_scale[shard_id].dtype == fp8_scale.dtype
-
-                layer.weight_scale[shard_id] = fp8_scale
-            else:
-                original_weight_loader(param, fp8_w)
-
-                fp8_scale = fp8_scale[None]
-
-                assert layer.weight_scale.shape == fp8_scale.shape
-                assert layer.weight_scale.dtype == fp8_scale.dtype
-
-                layer.weight_scale.data.copy_(fp8_scale)
-            
-            self.online_quant_progress_bar.update(1)
-
-        return online_fp8_weight_loader
-
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs
-    ):
-        output_size_per_partition = sum(output_partition_sizes)
-        
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-
-        assert "weight_loader" in extra_weight_attrs
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        online_fp8_weight_loader = self.get_weight_loader(layer, weight_loader)
-
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=torch.float8_e4m3fn,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=online_fp8_weight_loader,
-        )
-        layer.register_parameter("weight", weight)
-
-        scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-            weight_loader=online_fp8_weight_loader,
-        )
-        scale[:] = torch.finfo(torch.float32).min
-        layer.register_parameter("weight_scale", scale)
-
-        layer.register_parameter("input_scale", None)
-
-        # For example for QKVParallelLinear, we load from q_proj, k_proj, v_proj.
-        total = self.online_quant_progress_bar.total + len(output_partition_sizes)
-        tqdm_reset_no_print(self.online_quant_progress_bar, total=total)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ):  
-        return apply_fp8_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
-            bias=bias,
-            cutlass_fp8_supported=False,
-            use_per_token_if_dynamic=False
-        )
 
 
 class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
