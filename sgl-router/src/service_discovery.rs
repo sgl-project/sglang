@@ -579,9 +579,8 @@ mod tests {
 
     // Helper to create a Router instance for testing event handlers
     async fn create_test_router() -> Arc<dyn RouterTrait> {
-        use crate::config::{PolicyConfig, RouterConfig};
+        use crate::config::RouterConfig;
         use crate::middleware::TokenBucket;
-        use crate::policies::PolicyFactory;
         use crate::routers::http::router::Router;
         use crate::server::AppContext;
 
@@ -591,15 +590,19 @@ mod tests {
         // Create AppContext with minimal components
         let app_context = Arc::new(AppContext {
             client: reqwest::Client::new(),
-            router_config,
+            router_config: router_config.clone(),
             rate_limiter: Arc::new(TokenBucket::new(1000, 1000)),
+            worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
+            policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
+                router_config.policy.clone(),
+            )),
             tokenizer: None,                // HTTP mode doesn't need tokenizer
             reasoning_parser_factory: None, // HTTP mode doesn't need reasoning parser
             tool_parser_registry: None,     // HTTP mode doesn't need tool parser
+            router_manager: None,           // Test doesn't need router manager
         });
 
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::Random);
-        let router = Router::new(vec![], policy, &app_context).await.unwrap();
+        let router = Router::new(vec![], &app_context).await.unwrap();
         Arc::new(router) as Arc<dyn RouterTrait>
     }
 
