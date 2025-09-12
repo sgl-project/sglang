@@ -700,6 +700,8 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx,
                     output_hidden_states,
+                    placeholder_tokens_idx=None,
+                    placeholder_tokens_val=None,
                 )
             )
 
@@ -719,6 +721,12 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens.append(req.cached_tokens)
         self.send_to_detokenizer.send_pyobj(
             BatchEmbeddingOut(
-                rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
+                rids,
+                finished_reasons,
+                embeddings,
+                prompt_tokens,
+                cached_tokens,
+                placeholder_tokens_idx=None,
+                placeholder_tokens_val=None,
             )
         )
