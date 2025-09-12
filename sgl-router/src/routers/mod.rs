@@ -95,6 +95,34 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Retrieve a stored/background response by id
+    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
+
+    /// Cancel a background response by id
+    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
+
+    /// Delete a response by id
+    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses delete endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// List input items of a response by id
+    async fn list_response_input_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses list input items endpoint not implemented",
+        )
+            .into_response()
+    }
+
     async fn route_embeddings(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
 
     async fn route_rerank(

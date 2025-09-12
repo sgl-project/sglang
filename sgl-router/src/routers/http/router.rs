@@ -15,7 +15,9 @@ use axum::body::to_bytes;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
@@ -598,6 +600,114 @@ impl Router {
         }
 
         response
+    }
+
+    // Helper: return base worker URL (strips DP suffix when enabled)
+    fn worker_base_url(&self, worker_url: &str) -> String {
+        if self.dp_aware {
+            if let Ok((prefix, _)) = Self::extract_dp_rank(worker_url) {
+                return prefix.to_string();
+            }
+        }
+        worker_url.to_string()
+    }
+
+    // Generic simple routing for GET/POST without JSON body
+    async fn route_simple_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        endpoint: &str,
+        method: Method,
+    ) -> Response {
+        // TODO: currently the sglang worker is using in-memory state management, so this implementation has to fan out to all workers.
+        // Eventually, we need to have router to manage the chat history with a proper database, will update this implementation accordingly.
+        let worker_urls = self.get_worker_urls();
+        if worker_urls.is_empty() {
+            return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+        }
+
+        let mut last_response: Option<Response> = None;
+        for worker_url in worker_urls {
+            let base = self.worker_base_url(&worker_url);
+
+            let url = format!("{}/{}", base, endpoint);
+            let mut request_builder = match method {
+                Method::GET => self.client.get(url),
+                Method::POST => self.client.post(url),
+                _ => {
+                    return (
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "Unsupported method for simple routing",
+                    )
+                        .into_response()
+                }
+            };
+
+            if let Some(hdrs) = headers {
+                for (name, value) in hdrs {
+                    let name_lc = name.as_str().to_lowercase();
+                    if name_lc != "content-type" && name_lc != "content-length" {
+                        request_builder = request_builder.header(name, value);
+                    }
+                }
+            }
+
+            match request_builder.send().await {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let response_headers = header_utils::preserve_response_headers(res.headers());
+                    match res.bytes().await {
+                        Ok(body) => {
+                            let mut response = Response::new(axum::body::Body::from(body));
+                            *response.status_mut() = status;
+                            *response.headers_mut() = response_headers;
+                            if status.is_success() {
+                                return response;
+                            }
+                            last_response = Some(response);
+                        }
+                        Err(e) => {
+                            last_response = Some(
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("Failed to read response: {}", e),
+                                )
+                                    .into_response(),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_response = Some(
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Request failed: {}", e),
+                        )
+                            .into_response(),
+                    );
+                }
+            }
+        }
+
+        last_response
+            .unwrap_or_else(|| (StatusCode::BAD_GATEWAY, "No worker response").into_response())
+    }
+
+    // Route a GET request with provided headers to a specific endpoint
+    async fn route_get_request(&self, headers: Option<&HeaderMap>, endpoint: &str) -> Response {
+        self.route_simple_request(headers, endpoint, Method::GET)
+            .await
+    }
+
+    // Route a POST request with empty body to a specific endpoint
+    async fn route_post_empty_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        endpoint: &str,
+    ) -> Response {
+        self.route_simple_request(headers, endpoint, Method::POST)
+            .await
     }
 
     // TODO (rui): Better accommodate to the Worker abstraction
@@ -1308,6 +1418,16 @@ impl RouterTrait for Router {
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/responses", model_id)
             .await
+    }
+
+    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        let endpoint = format!("v1/responses/{}", response_id);
+        self.route_get_request(headers, &endpoint).await
+    }
+
+    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        let endpoint = format!("v1/responses/{}/cancel", response_id);
+        self.route_post_empty_request(headers, &endpoint).await
     }
 
     async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {

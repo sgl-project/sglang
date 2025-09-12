@@ -234,6 +234,14 @@ impl RouterTrait for GrpcRouter {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
+    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
     async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
