@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 
 from tqdm import tqdm
 from tqdm.std import EMA
@@ -7,56 +7,41 @@ import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 from torch.nn.parameter import Parameter
+from sglang.srt.layers.moe import MoeRunnerConfig
 
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        apply_fp8_marlin_linear,
-        prepare_fp8_layer_for_marlin,
-    )
-
-    MARLIN_FP8_AVAILABLE = True
-except ImportError:
-    MARLIN_FP8_AVAILABLE = False
-
-    def dummy_func(*args, **kwargs):
-        raise ImportError(
-            "marlin FP8 requires some operators from vllm. Please install vllm."
-        )
-
-    apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
-
-from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+    FusedMoEMethodBase,
+    LinearMethodBase,
 )
 
 from sglang.srt.layers.quark_utils import quantize_fp8_scale_tensorwise, quantize_int4_scale_columnwise, pack_int4_to_int32
 
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
 
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    convert_to_channelwise,
-    requantize_with_max_scale,
-)
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import requantize_with_max_scale
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_hip,
     set_weight_attrs,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher import (
+        DispatchOutput,
+    )
 
 _is_hip = is_hip()
 
 
 if _is_hip:
     from aiter import ActivationType, QuantType
-    from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.fused_moe import fused_moe
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
 
@@ -294,37 +279,14 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
         )
 
 
-class QuarkInt4Fp8MoEMethod:
-    """MoE method for INT8.
-    Supports loading INT8 checkpoints with static weight scale and
-    dynamic/static activation scale.
-    Also supports loading quantized FP16/BF16 model checkpoints with dynamic
-    activation scaling. The weight scaling factor will be initialized after
-    the model weights are loaded.
+class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
+    """MoE method for INT4FP8.
+
+    Supports loading BF16/FP16 checkpoints, quantizing down to INT4, and dequantizing to FP8 during inference.
+
     Args:
         quant_config: The quantization config.
     """
-
-    def __new__(cls, *args, **kwargs):
-        # TODO: fix circular imports issues in sglang forcing us to import here instead of at
-        # the top of file.
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
-
     def __init__(self, quant_config):
         self.quant_config = quant_config
 
@@ -348,13 +310,15 @@ class QuarkInt4Fp8MoEMethod:
             else:
                 shard_size = self.w2_shard_size
 
+            original_use_presharded_weights = layer.use_presharded_weights
+
             if not layer.use_presharded_weights:
                 # In case the model is not pre-sharded (most checkpoints on HF Hub),
                 # we shard the model here in order to run online quantization on
                 # already sharded weights.
                 # Some models as `lmzheng/grok-1` are already be sharded.
                 layer.use_presharded_weights = True
-        
+
                 if shard_id in ["w1", "w3"]:
                     shard_dim = 0
                     loaded_weight = loaded_weight.narrow(
@@ -365,7 +329,7 @@ class QuarkInt4Fp8MoEMethod:
                     loaded_weight = loaded_weight.narrow(
                         shard_dim, shard_size * self.tp_rank, shard_size
                     )
-            
+                        
             # We want to run online quantization on-device for speed purposes.
             loaded_weight = loaded_weight.to(param.device)
 
@@ -411,6 +375,9 @@ class QuarkInt4Fp8MoEMethod:
 
             original_weight_loader(param, int4_w, shard_id=shard_id, weight_name=weight_name, expert_id=expert_id)
 
+            # Reset `use_presharded_weights` as the same layer may load several different weights.
+            layer.use_presharded_weights = original_use_presharded_weights
+
             self.online_quant_progress_bar.update(1)
 
         return online_int4_fp8_weight_loader
@@ -420,7 +387,7 @@ class QuarkInt4Fp8MoEMethod:
         layer: torch.nn.Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
@@ -428,9 +395,10 @@ class QuarkInt4Fp8MoEMethod:
         # the top of file.
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        # print("intermediate_size_per_partition", intermediate_size_per_partition)
         # fused moe logic already hands TP logic.
-        self.w13_shard_size = intermediate_size
-        self.w2_shard_size = intermediate_size
+        self.w13_shard_size = intermediate_size_per_partition
+        self.w2_shard_size = intermediate_size_per_partition
 
         assert "weight_loader" in extra_weight_attrs
         original_weight_loader = extra_weight_attrs.get("weight_loader")
@@ -444,7 +412,7 @@ class QuarkInt4Fp8MoEMethod:
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size,
+                2 * intermediate_size_per_partition,
                 hidden_size // 8,
                 dtype=params_dtype,
             ),
@@ -452,7 +420,7 @@ class QuarkInt4Fp8MoEMethod:
         )
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, hidden_size, intermediate_size // 8, dtype=params_dtype
+                num_experts, hidden_size, intermediate_size_per_partition // 8, dtype=params_dtype
             ),
             requires_grad=False,
         )
@@ -475,7 +443,7 @@ class QuarkInt4Fp8MoEMethod:
 
         if _is_hip:
             w13_int4_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2 * intermediate_size, dtype=torch.float32),
+                torch.ones(num_experts, 2 * intermediate_size_per_partition, dtype=torch.float32),
                 requires_grad=False,
             )
             w2_int4_scale = torch.nn.Parameter(
@@ -563,56 +531,41 @@ class QuarkInt4Fp8MoEMethod:
             layer.w13_int4_scale[expert_id] *= max_w13_scales[expert_id]
             layer.w2_int4_scale[expert_id] *= layer.w2_fp8_scale[expert_id]
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-        num_fused_shared_experts: int = 0,
+        dispatch_output: "DispatchOutput",
     ) -> torch.Tensor:
         # TODO: fix circular imports issues in sglang forcing us to import here instead of at
         # the top of file.
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-        from sglang.srt.layers.moe.topk import select_experts
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-            num_fused_shared_experts=num_fused_shared_experts,
-        )
+        topk_output = dispatch_output.topk_output
+        moe_runner_config = self.moe_runner_config
 
         # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
-        assert not no_combine, f"{no_combine=} is not supported."
-        return ck_moe_2stages(
-            x,
+        assert not moe_runner_config.no_combine, f"no_combine={moe_runner_config.no_combine} is not supported."
+
+        output = fused_moe(
+            dispatch_output.hidden_states,
             layer.w13_weight,
             layer.w2_weight,
-            topk_weights,
-            topk_ids,
-            QuantType.per_Token,
-            layer.w13_int4_scale,
-            layer.w2_int4_scale,
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+            quant_type=QuantType.per_Token,
+            w1_scale=layer.w13_int4_scale,
+            w2_scale=layer.w2_int4_scale,
             activation=(
-                ActivationType.Silu if activation == "silu" else ActivationType.Gelu
+                ActivationType.Silu
+                if moe_runner_config.activation == "silu"
+                else ActivationType.Gelu
             ),
         )
+
+        return StandardCombineInput(hidden_states=output)
+
