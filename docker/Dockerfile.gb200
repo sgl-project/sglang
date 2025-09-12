@@ -4,6 +4,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 ARG BUILD_TYPE=blackwell
 ARG DEEPEP_COMMIT=1b14ad661c7640137fcfe93cccb2694ede1220b0
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
+ARG SGL_KERNEL_VERSION=0.3.9.post2
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
@@ -58,16 +59,15 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && git clone --depth 1 https://github.com/sgl-project/sglang.git \
  && cd sglang \
  && case "$CUDA_VERSION" in \
-      12.6.1) CUINDEX=126 ;; \
-      12.8.1) CUINDEX=128 ;; \
       12.9.1) CUINDEX=129 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
- && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
       python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps ; \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.3/sgl_kernel-0.3.3+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
-    fi
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+    fi \
+ && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && python3 -m flashinfer --download-cubin
 
 # Download source files
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
@@ -87,7 +87,7 @@ RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="100;120" && \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="90;100;120" && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
 # Install DeepEP
@@ -106,11 +106,6 @@ RUN python3 -m pip install --no-cache-dir \
     uv \
     wheel \
     scikit-build-core
-
-# These will be automatically installed by future versions of flashinfer after 0.2.9rc2
-RUN python3 -m pip install --no-cache-dir \
-    nvidia-cudnn-cu12 \
-    nvidia-cudnn-frontend
 
 # Install nixl kv transfer backend
 RUN python3 -m pip install --no-cache-dir \
@@ -168,12 +163,6 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     pandas \
     matplotlib \
     tabulate
-
-# Install flashinfer from source to fix a bug
-# https://github.com/flashinfer-ai/flashinfer/pull/1413
-# FIXME: remove this once flashinfer release > 0.2.10
-WORKDIR /sgl-workspace
-RUN git clone https://github.com/flashinfer-ai/flashinfer.git --recursive && cd flashinfer && python3 -m pip install -v .
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \

@@ -1,17 +1,21 @@
+import os
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Dict, List, Literal, Optional
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
 
 _base_url = DEFAULT_URL_FOR_TEST
+_is_hip = is_hip()
 
 
 class BaseTestGptOss(CustomTestCase):
@@ -34,7 +38,8 @@ class BaseTestGptOss(CustomTestCase):
 
         if model_variant == "20b":
             other_args += ["--cuda-graph-max-bs", "600"]
-
+        if _is_hip:
+            os.environ["SGLANG_USE_AITER"] = "0"
         self._run_test_raw(
             model=model,
             expected_score_of_reasoning_effort=expected_score_of_reasoning_effort,
@@ -91,9 +96,16 @@ class BaseTestGptOss(CustomTestCase):
             reasoning_effort=reasoning_effort,
         )
 
-        print(f"Evaluation start: {model=} {reasoning_effort=} {expected_score=}")
+        setup = f"model={model} reasoning_effort={reasoning_effort} expected_score={expected_score}"
+
+        print(f"Evaluation start: {setup}")
         metrics = run_eval(args)
-        print(
-            f"Evaluation end: {model=} {reasoning_effort=} {expected_score=} {metrics=}"
-        )
+        print(f"Evaluation end: {setup} {metrics=}")
         self.assertGreaterEqual(metrics["score"], expected_score)
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gpt_oss_common\n"
+                f"Setup: {setup}\n"
+                f"Score: {metrics['score']:.2f}\n"
+            )

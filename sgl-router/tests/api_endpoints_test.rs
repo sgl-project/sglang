@@ -9,7 +9,7 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
@@ -45,9 +45,19 @@ impl TestContext {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -90,12 +100,8 @@ impl TestContext {
         // Create app context
         let app_context = common::create_test_context(config.clone());
 
-        // Create router using sync factory in a blocking context
-        let router =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
-                .await
-                .unwrap()
-                .unwrap();
+        // Create router
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
 
         // Wait for router to discover workers
@@ -719,7 +725,7 @@ mod worker_management_tests {
         // Add the worker
         let req = Request::builder()
             .method("POST")
-            .uri(&format!("/add_worker?url={}", url))
+            .uri(format!("/add_worker?url={}", url))
             .body(Body::empty())
             .unwrap();
 
@@ -777,7 +783,7 @@ mod worker_management_tests {
         // Remove the worker
         let req = Request::builder()
             .method("POST")
-            .uri(&format!("/remove_worker?url={}", worker_url))
+            .uri(format!("/remove_worker?url={}", worker_url))
             .body(Body::empty())
             .unwrap();
 
@@ -857,7 +863,7 @@ mod worker_management_tests {
         // Add worker first time
         let req = Request::builder()
             .method("POST")
-            .uri(&format!("/add_worker?url={}", url))
+            .uri(format!("/add_worker?url={}", url))
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -868,7 +874,7 @@ mod worker_management_tests {
         // Try to add same worker again
         let req = Request::builder()
             .method("POST")
-            .uri(&format!("/add_worker?url={}", url))
+            .uri(format!("/add_worker?url={}", url))
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -897,7 +903,7 @@ mod worker_management_tests {
         // Try to add unhealthy worker
         let req = Request::builder()
             .method("POST")
-            .uri(&format!("/add_worker?url={}", url))
+            .uri(format!("/add_worker?url={}", url))
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1088,9 +1094,19 @@ mod error_tests {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1410,7 +1426,7 @@ mod pd_mode_tests {
         // Extract port from prefill URL
         let prefill_port = prefill_url
             .split(':')
-            .last()
+            .next_back()
             .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
             .unwrap_or(9000);
 
@@ -1436,19 +1452,26 @@ mod pd_mode_tests {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         // Create app context
         let app_context = common::create_test_context(config);
 
         // Create router - this might fail due to health check issues
-        let router_result =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
-                .await
-                .unwrap();
+        let router_result = RouterFactory::create_router(&app_context).await;
 
         // Clean up workers
         prefill_worker.stop().await;
@@ -1591,9 +1614,19 @@ mod request_id_tests {
             log_level: None,
             request_id_headers: Some(vec!["custom-id".to_string(), "trace-id".to_string()]),
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         let ctx = TestContext::new_with_config(

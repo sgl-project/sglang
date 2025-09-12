@@ -31,10 +31,14 @@ from sglang.srt.managers.io_struct import (
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+    FreezeGCReq,
+    MultiTokenizerRegisterReq,
 )
+from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
+    freeze_gc,
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
@@ -65,7 +69,7 @@ class DecodeStatus:
     sent_offset: int = 0
 
 
-class DetokenizerManager:
+class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -100,15 +104,20 @@ class DetokenizerManager:
                 (BatchEmbeddingOut, self.handle_batch_embedding_out),
                 (BatchTokenIDOut, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
+                (MultiTokenizerRegisterReq, lambda x: x),
+                (FreezeGCReq, self.handle_freeze_gc_req),
             ]
         )
+
+        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
 
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
-            self.send_to_tokenizer.send_pyobj(output)
+            if output is not None:
+                self.send_to_tokenizer.send_pyobj(output)
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -129,6 +138,9 @@ class DetokenizerManager:
 
         # Trim stop token.
         if isinstance(matched, int) and isinstance(output, list):
+            # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
+            if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
+                return output
             assert len(output) > 0
             return output[:-1]
         return output
@@ -234,6 +246,8 @@ class DetokenizerManager:
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_hidden_states=recv_obj.output_hidden_states,
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
@@ -245,7 +259,13 @@ class DetokenizerManager:
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
+
+    def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
+        freeze_gc("Detokenizer Manager")
+        return None
 
 
 class LimitedCapacityDict(OrderedDict):
@@ -272,8 +292,12 @@ def run_detokenizer_process(
 
     try:
         manager = DetokenizerManager(server_args, port_args)
-        manager.event_loop()
+        if server_args.tokenizer_worker_num > 1:
+            manager.multi_http_worker_event_loop()
+        else:
+            manager.event_loop()
     except Exception:
+        manager.socket_mapping.clear_all_sockets()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)

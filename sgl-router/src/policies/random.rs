@@ -29,8 +29,8 @@ impl LoadBalancingPolicy for RandomPolicy {
             return None;
         }
 
-        let mut rng = rand::thread_rng();
-        let random_idx = rng.gen_range(0..healthy_indices.len());
+        let mut rng = rand::rng();
+        let random_idx = rng.random_range(0..healthy_indices.len());
         let worker = workers[healthy_indices[random_idx]].url();
 
         RouterMetrics::record_processed_request(worker);

@@ -9,14 +9,16 @@ use axum::{
 };
 use std::fmt::Debug;
 
-use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
+use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 
 pub mod factory;
-pub mod pd_router;
-pub mod pd_types;
-pub mod router;
+pub mod grpc;
+pub mod header_utils;
+pub mod http;
 
 pub use factory::RouterFactory;
+// Re-export HTTP routers for convenience (keeps routers::openai_router path working)
+pub use http::{openai_router, pd_router, pd_types, router};
 
 /// Worker management trait for administrative operations
 ///
@@ -75,6 +77,10 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
     ) -> Response;
+
+    async fn route_embeddings(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
+
+    async fn route_rerank(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
 
     /// Flush cache on all workers
     async fn flush_cache(&self) -> Response;

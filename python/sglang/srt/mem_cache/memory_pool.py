@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from __future__ import annotations
+
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
@@ -27,7 +29,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import logging
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -36,12 +38,18 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
 
 
 class ReqToTokenPool:
@@ -94,6 +102,207 @@ class ReqToTokenPool:
         self.free_slots = list(range(self.size))
 
 
+class MambaPool:
+    def __init__(
+        self,
+        size: int,
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
+        num_mamba_layers: int,
+        conv_state_shape: Tuple[int, int],
+        temporal_state_shape: Tuple[int, int],
+        device: str,
+        speculative_num_draft_tokens: Optional[int] = None,
+    ):
+        conv_state = torch.zeros(
+            size=(num_mamba_layers, size + 1) + conv_state_shape,
+            dtype=conv_dtype,
+            device=device,
+        )
+        temporal_state = torch.zeros(
+            size=(num_mamba_layers, size + 1) + temporal_state_shape,
+            dtype=ssm_dtype,
+            device=device,
+        )
+        if speculative_num_draft_tokens is not None:
+            # Cache intermediate SSM states per draft token during target verify
+            # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+            intermediate_ssm_state_cache = torch.empty(
+                size=(
+                    num_mamba_layers,
+                    size + 1,
+                    speculative_num_draft_tokens,
+                    temporal_state_shape[0],
+                    temporal_state_shape[1],
+                    temporal_state_shape[2],
+                ),
+                dtype=ssm_dtype,
+                device="cuda",
+            )
+            # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
+            # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
+            intermediate_conv_window_cache = torch.empty(
+                size=(
+                    num_mamba_layers,
+                    size + 1,
+                    speculative_num_draft_tokens,
+                    conv_state_shape[0],
+                    conv_state_shape[1],
+                ),
+                dtype=conv_dtype,
+                device="cuda",
+            )
+            self.mamba_cache = (
+                conv_state,
+                temporal_state,
+                intermediate_ssm_state_cache,
+                intermediate_conv_window_cache,
+            )
+        else:
+            self.mamba_cache = (conv_state, temporal_state)
+        self.size = size
+        self.free_slots = list(range(size))
+        self.mem_usage = self.get_mamba_size() / GB
+        logger.info(
+            f"Mamba Cache is allocated. "
+            f"conv_state size: {conv_state.numel() * conv_state.itemsize / GB:.2f}GB, "
+            f"ssm_state size: {temporal_state.numel() * temporal_state.itemsize / GB:.2f}GB "
+        )
+
+    def get_mamba_params_all_layers(self):
+        return [self.mamba_cache[i] for i in range(len(self.mamba_cache))]
+
+    def get_mamba_params(self, layer_id: int):
+        return [self.mamba_cache[i][layer_id] for i in range(len(self.mamba_cache))]
+
+    def get_mamba_size(self):
+        return (
+            np.prod(self.mamba_cache[0].shape) * self.mamba_cache[0].dtype.itemsize
+            + np.prod(self.mamba_cache[1].shape) * self.mamba_cache[1].dtype.itemsize
+        )
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int) -> Optional[List[int]]:
+        if need_size > len(self.free_slots):
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        return select_index
+
+    def free(self, free_index: Union[int, List[int]]):
+        if isinstance(free_index, (int,)):
+            self.free_slots.append(free_index)
+        else:
+            self.free_slots.extend(free_index)
+        self.mamba_cache[0][:, free_index] = self.mamba_cache[1][:, free_index] = 0
+
+    def clear(self):
+        self.free_slots = list(range(self.size))
+
+
+class HybridReqToTokenPool(ReqToTokenPool):
+    """A memory pool that maps a request to its token locations."""
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
+        mamba_layers: List[int],
+        conv_state_shape: Tuple[int, int],
+        temporal_state_shape: Tuple[int, int],
+        speculative_num_draft_tokens: int,
+    ):
+        super().__init__(
+            size=size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
+
+        self.mamba_pool = MambaPool(
+            size,
+            conv_dtype,
+            ssm_dtype,
+            len(mamba_layers),
+            conv_state_shape,
+            temporal_state_shape,
+            device,
+            speculative_num_draft_tokens,
+        )
+        self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layers)}
+
+        self.device = device
+        self.req_index_to_mamba_index_mapping: torch.Tensor = torch.empty(
+            size, dtype=torch.int32, device=self.device
+        )
+
+        self.rid_to_mamba_index_mapping: Dict[str, int] = {}
+        self.mamba_index_to_rid_mapping: Dict[int, str] = {}
+
+    # For chunk prefill req, we do not need to allocate mamba cache,
+    # We could use allocated mamba cache instead.
+    def alloc(
+        self, need_size: int, reqs: Optional[List["Req"]] = None
+    ) -> Optional[List[int]]:
+        select_index = super().alloc(need_size)
+        if select_index == None:
+            return None
+
+        mamba_index = []
+        for req in reqs:
+            rid = req.rid
+            if rid in self.rid_to_mamba_index_mapping:
+                mid = self.rid_to_mamba_index_mapping[rid]
+            elif (mid := self.mamba_pool.alloc(1)) is not None:
+                mid = mid[0]
+                self.rid_to_mamba_index_mapping[rid] = mid
+                self.mamba_index_to_rid_mapping[mid] = rid
+            mamba_index.append(mid)
+        assert len(select_index) == len(
+            mamba_index
+        ), f"Not enough space for mamba cache, try to increase --max-mamba-cache-size."
+        self.req_index_to_mamba_index_mapping[select_index] = torch.tensor(
+            mamba_index, dtype=torch.int32, device=self.device
+        )
+        return select_index
+
+    def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        return self.req_index_to_mamba_index_mapping[req_indices]
+
+    def get_mamba_params(self, layer_id: int):
+        assert layer_id in self.mamba_map
+        return self.mamba_pool.get_mamba_params(self.mamba_map[layer_id])
+
+    def get_mamba_params_all_layers(self):
+        return self.mamba_pool.get_mamba_params_all_layers()
+
+    # For chunk prefill, we can not free mamba cache, we need use it in the future
+    def free(self, free_index: Union[int, List[int]], free_mamba_cache: bool = True):
+        super().free(free_index)
+        if free_mamba_cache:
+            mamba_index = self.req_index_to_mamba_index_mapping[free_index]
+            mamba_index_list = mamba_index.tolist()
+            if isinstance(mamba_index_list, int):
+                mamba_index_list = [mamba_index_list]
+            self.mamba_pool.free(mamba_index_list)
+            for mid in mamba_index_list:
+                rid = self.mamba_index_to_rid_mapping[mid]
+                self.mamba_index_to_rid_mapping.pop(mid)
+                self.rid_to_mamba_index_mapping.pop(rid)
+
+    def clear(self):
+        super().clear()
+        self.mamba_pool.clear()
+
+
 class KVCache(abc.ABC):
     @abc.abstractmethod
     def __init__(
@@ -127,6 +336,29 @@ class KVCache(abc.ABC):
         # used for chunked cpu-offloading
         self.cpu_offloading_chunk_size = 8192
 
+        # default state for optional layer-wise transfer control
+        self.layer_transfer_counter = None
+
+    def _finalize_allocation_log(self, num_tokens: int):
+        """Common logging and mem_usage computation for KV cache allocation.
+        Supports both tuple (K, V) size returns and single KV size returns.
+        """
+        kv_size_bytes = self.get_kv_size_bytes()
+        if isinstance(kv_size_bytes, tuple):
+            k_size, v_size = kv_size_bytes
+            k_size_GB = k_size / GB
+            v_size_GB = v_size / GB
+            logger.info(
+                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+            )
+            self.mem_usage = k_size_GB + v_size_GB
+        else:
+            kv_size_GB = kv_size_bytes / GB
+            logger.info(
+                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+            )
+            self.mem_usage = kv_size_GB
+
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -149,7 +381,7 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
-    def register_layer_transfer_counter(self, layer_transfer_counter):
+    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
     def get_cpu_copy(self, indices):
@@ -202,15 +434,9 @@ class MHATokenToKVPool(KVCache):
 
         self._create_buffers()
 
-        self.layer_transfer_counter = None
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
-
-        k_size, v_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
-        )
-        self.mem_usage = (k_size + v_size) / GB
+        self._finalize_allocation_log(size)
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -349,7 +575,6 @@ class MHATokenToKVPool(KVCache):
         # same applies to get_value_buffer and get_kv_buffer
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
@@ -417,42 +642,27 @@ class MHATokenToKVPool(KVCache):
         )
 
 
-class SWAKVPool(KVCache):
-    """KV cache with separate pools for full and SWA attention layers."""
+class HybridLinearKVPool(KVCache):
+    """KV cache with separate pools for full and linear attention layers."""
 
     def __init__(
         self,
         size: int,
-        size_swa: int,
         dtype: torch.dtype,
         head_num: int,
         head_dim: int,
-        swa_attention_layer_ids: List[int],
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
     ):
         self.size = size
-        self.size_swa = size_swa
         self.dtype = dtype
         self.device = device
-        self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = 1
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
-        TokenToKVPoolClass = MHATokenToKVPool
-        self.swa_kv_pool = TokenToKVPoolClass(
-            size=size_swa,
-            page_size=self.page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            layer_num=self.swa_layer_nums,
-            device=device,
-            enable_memory_saver=False,
-        )
-        self.full_kv_pool = TokenToKVPoolClass(
+        self.full_kv_pool = MHATokenToKVPool(
             size=size,
             page_size=self.page_size,
             dtype=dtype,
@@ -461,6 +671,90 @@ class SWAKVPool(KVCache):
             layer_num=self.full_layer_nums,
             device=device,
             enable_memory_saver=False,
+        )
+        self.full_attention_layer_id_mapping = {
+            id: i for i, id in enumerate(full_attention_layer_ids)
+        }
+        k_size, v_size = self.get_kv_size_bytes()
+        self.mem_usage = (k_size + v_size) / GB
+
+    def get_kv_size_bytes(self):
+        return self.full_kv_pool.get_kv_size_bytes()
+
+    def get_contiguous_buf_infos(self):
+        return self.full_kv_pool.get_contiguous_buf_infos()
+
+    def _transfer_full_attention_id(self, layer_id: int):
+        if layer_id not in self.full_attention_layer_id_mapping:
+            raise ValueError(
+                f"{layer_id=} not in full attention layers: {self.full_attention_layer_id_mapping.keys()}"
+            )
+        return self.full_attention_layer_id_mapping[layer_id]
+
+    def get_key_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_key_buffer(layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_value_buffer(layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+    ):
+        layer_id = self._transfer_full_attention_id(layer.layer_id)
+        self.full_kv_pool.set_kv_buffer(
+            None,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=layer_id,
+        )
+
+
+class SWAKVPool(KVCache):
+    """KV cache with separate pools for full and SWA attention layers."""
+
+    def __init__(
+        self,
+        size: int,
+        size_swa: int,
+        swa_attention_layer_ids: List[int],
+        full_attention_layer_ids: List[int],
+        enable_kvcache_transpose: bool,
+        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        **kwargs,
+    ):
+        self.size = size
+        self.size_swa = size_swa
+        self.swa_layer_nums = len(swa_attention_layer_ids)
+        self.full_layer_nums = len(full_attention_layer_ids)
+        kwargs["page_size"] = 1
+        kwargs["enable_memory_saver"] = False
+        # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
+        assert not enable_kvcache_transpose
+
+        self.swa_kv_pool = token_to_kv_pool_class(
+            size=size_swa,
+            layer_num=self.swa_layer_nums,
+            **kwargs,
+        )
+        self.full_kv_pool = token_to_kv_pool_class(
+            size=size,
+            layer_num=self.full_layer_nums,
+            **kwargs,
         )
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
@@ -624,8 +918,6 @@ class AscendTokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        import torch_npu
-
         torch_npu._npu_reshape_and_cache(
             key=cache_k,
             value=cache_v,
@@ -767,13 +1059,7 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        self.layer_transfer_counter = None
-
-        kv_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
-        )
-        self.mem_usage = kv_size / GB
+        self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -849,7 +1135,7 @@ class MLATokenToKVPool(KVCache):
             cache_k_rope = cache_k_rope.view(self.store_dtype)
 
         set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+            self.kv_buffer[layer_id - self.start_layer], loc, cache_k_nope, cache_k_rope
         )
 
     def get_cpu_copy(self, indices):
@@ -912,31 +1198,77 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.kv_buffer = torch.zeros(
+            self.k_buffer = torch.zeros(
                 (
                     layer_num,
                     self.size // self.page_size + 1,
                     self.page_size,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    1,
+                    self.kv_lora_rank,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self.v_buffer = torch.zeros(
+                (
+                    layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    1,
+                    self.qk_rope_head_dim,
                 ),
                 dtype=self.store_dtype,
                 device=self.device,
             )
 
-        self.layer_transfer_counter = None
+        self._finalize_allocation_log(size)
 
-        kv_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "k_buffer")
+        assert hasattr(self, "v_buffer")
+        kv_size_bytes = 0
+        for k_cache in self.k_buffer:
+            kv_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
+        for v_cache in self.v_buffer:
+            kv_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
+        return kv_size_bytes
+
+    def get_kv_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return (
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
         )
-        self.mem_usage = kv_size / GB
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if self.store_dtype != self.dtype:
+            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_value_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if self.store_dtype != self.dtype:
+            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.v_buffer[layer_id - self.start_layer]
 
     # for disagg
     def get_contiguous_buf_infos(self):
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
-        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
-        kv_item_lens = [self.kv_buffer[i][0].nbytes for i in range(self.layer_num)]
+        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
+            self.v_buffer[i].data_ptr() for i in range(self.layer_num)
+        ]
+        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)] + [
+            self.v_buffer[i].nbytes for i in range(self.layer_num)
+        ]
+        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)] + [
+            self.v_buffer[i][0].nbytes for i in range(self.layer_num)
+        ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
@@ -949,18 +1281,28 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
 
         if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(store_dtype)
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
 
-        import torch_npu
+        if cache_v is None:
+            cache_k, cache_v = cache_k.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
 
-        torch_npu._npu_reshape_and_cache_siso(
-            key=cache_k.view(-1, 1, self.kv_lora_rank + self.qk_rope_head_dim),
-            key_cache=self.kv_buffer[layer_id - self.start_layer].view(
-                -1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim
+        torch_npu.npu_scatter_nd_update_(
+            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
+            loc.view(-1, 1),
+            cache_k.view(-1, 1, self.kv_lora_rank),
+        )
+        torch_npu.npu_scatter_nd_update_(
+            self.v_buffer[layer_id - self.start_layer].view(
+                -1, 1, self.qk_rope_head_dim
             ),
-            slot_indices=loc,
+            loc.view(-1, 1),
+            cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
 
 
@@ -1070,7 +1412,7 @@ def copy_all_layer_kv_cache(
     num_loop = tl.cdiv(stride, BLOCK_SIZE)
     for i in range(num_loop):
         copy_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = (num_locs_offset < num_locs)[:, None] and (copy_offset < stride)[None, :]
+        mask = (num_locs_offset < num_locs)[:, None] & (copy_offset < stride)[None, :]
         value = tl.load(
             data_ptr + src_locs[:, None] * stride + copy_offset[None, :], mask=mask
         )

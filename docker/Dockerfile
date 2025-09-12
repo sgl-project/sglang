@@ -1,8 +1,9 @@
-ARG CUDA_VERSION=12.6.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+ARG CUDA_VERSION=12.9.1
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
 
 ARG BUILD_TYPE=all
-ARG DEEPEP_COMMIT=b6ce310bb0b75079682d09bc2ebc063a074fbd58
+ARG BRANCH_TYPE=remote
+ARG DEEPEP_COMMIT=b92d0d4860ce6866cd6d31bfbae937f9a7a3772b
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -35,7 +36,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     ibverbs-providers infiniband-diags perftest \
     libgoogle-glog-dev libgtest-dev libjsoncpp-dev libunwind-dev \
     libboost-all-dev libssl-dev \
-    libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+    libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
     pybind11-dev \
     libhiredis-dev libcurl4-openssl-dev \
     libczmq4 libczmq-dev \
@@ -58,10 +59,21 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
 # Fix DeepEP IBGDA symlink
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 
-# Clone and install SGLang
+FROM scratch AS local_src
+COPY . /src
+
+FROM base AS build-image
+# Install SGLang
 WORKDIR /sgl-workspace
+ARG BRANCH_TYPE
+COPY --from=local_src /src /tmp/local_src
+RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+        cp -r /tmp/local_src /sgl-workspace/sglang; \
+    else \
+        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    fi \
+ && rm -rf /tmp/local_src
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
- && git clone --depth=1 https://github.com/sgl-project/sglang.git \
  && cd sglang \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
@@ -72,17 +84,15 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
  && python3 -m flashinfer --download-cubin \
- && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.3/sgl_kernel-0.3.3+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
-    fi \
- && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.3/sgl_kernel-0.3.3-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+ && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.9.post2/sgl_kernel-0.3.9.post2+cu124-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi
 
 # Download source files
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
     git clone https://github.com/deepseek-ai/DeepEP.git && \
-    cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. && \
+    cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+    cd .. && \
     tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
     mv nvshmem_src nvshmem && \
     rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
@@ -97,12 +107,23 @@ RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="100;120" && \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="90" && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
 # Install DeepEP
 RUN cd /sgl-workspace/DeepEP && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
+    case "$CUDA_VERSION" in \
+      12.6.1) \
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
+        ;; \
+      12.8.1|12.9.1) \
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
+        ;; \
+      *) \
+        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+        ;; \
+    esac && \
+    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
@@ -116,7 +137,8 @@ RUN python3 -m pip install --no-cache-dir \
     uv \
     wheel \
     scikit-build-core \
-    nixl
+    nixl \
+    py-spy
 
 # Install development tools and utilities
 RUN apt-get update && apt-get install -y \
@@ -192,6 +214,19 @@ RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1
     && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
     && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
     && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
+
+# Install Rust toolchain for sgl-router
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && rustc --version && cargo --version
+
+# Build and install sgl-router
+RUN python3 -m pip install --no-cache-dir setuptools-rust \
+    && cd /sgl-workspace/sglang/sgl-router \
+    && cargo build --release \
+    && python3 -m pip install --no-cache-dir . \
+    && rm -rf /root/.cache
+
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
@@ -293,6 +328,7 @@ set-window-option -g mode-keys vi
 set-option -g escape-time 0
 set-option -g base-index 1
 set-window-option -g mouse on
+set -g history-limit 100000
 EOF
 
 # Configure Git

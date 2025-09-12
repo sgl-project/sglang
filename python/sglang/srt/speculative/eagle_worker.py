@@ -9,12 +9,12 @@ from huggingface_hub import snapshot_download
 
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     patch_tensor_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
@@ -47,6 +47,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
     is_cuda,
     next_power_of_2,
 )
@@ -55,6 +56,7 @@ if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
+RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 @contextmanager
@@ -92,7 +94,7 @@ class EAGLEWorker(TpModelWorker):
         )
         self.padded_static_len = -1
 
-        # Override context length with target model's context length
+        # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
         # Do not capture cuda graph in `super().__init__()`
@@ -138,8 +140,15 @@ class EAGLEWorker(TpModelWorker):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
         if self.speculative_algorithm.is_eagle3():
-            # EAGLE3 models don't share lm_head
-            self.draft_model_runner.model.set_embed(embed)
+            # most cases EAGLE3 models don't share lm_head
+            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+            if (
+                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                and self.draft_model_runner.model.load_lm_head_from_target
+            ):
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
+            else:
+                self.draft_model_runner.model.set_embed(embed)
 
             # grab hot token ids
             if self.draft_model_runner.model.hot_token_id is not None:
@@ -179,100 +188,189 @@ class EAGLEWorker(TpModelWorker):
         self.has_prefill_wrapper_verify = False
         self.draft_extend_attn_backend = None
 
-        if self.server_args.attention_backend == "flashinfer":
-            if not global_server_args_dict["use_mla_backend"]:
-                from sglang.srt.layers.attention.flashinfer_backend import (
-                    FlashInferAttnBackend,
-                    FlashInferMultiStepDraftBackend,
-                )
+        # Initialize decode attention backend
+        self.draft_attn_backend = self._create_decode_backend()
 
-                self.draft_attn_backend = FlashInferMultiStepDraftBackend(
-                    self.draft_model_runner,
-                    self.topk,
-                    self.speculative_num_steps,
-                )
-                self.draft_extend_attn_backend = FlashInferAttnBackend(
-                    self.draft_model_runner,
-                    skip_prefill=False,
-                )
-            else:
-                from sglang.srt.layers.attention.flashinfer_mla_backend import (
-                    FlashInferMLAAttnBackend,
-                    FlashInferMLAMultiStepDraftBackend,
-                )
-
-                self.draft_attn_backend = FlashInferMLAMultiStepDraftBackend(
-                    self.draft_model_runner,
-                    self.topk,
-                    self.speculative_num_steps,
-                )
-                self.draft_extend_attn_backend = FlashInferMLAAttnBackend(
-                    self.draft_model_runner,
-                    skip_prefill=False,
-                )
-            self.has_prefill_wrapper_verify = True
-        elif self.server_args.attention_backend == "triton":
-            from sglang.srt.layers.attention.triton_backend import (
-                TritonAttnBackend,
-                TritonMultiStepDraftBackend,
-            )
-
-            self.draft_attn_backend = TritonMultiStepDraftBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
-            self.draft_extend_attn_backend = TritonAttnBackend(
-                self.draft_model_runner,
-                skip_prefill=False,
-            )
-        elif self.server_args.attention_backend == "aiter":
-            from sglang.srt.layers.attention.aiter_backend import (
-                AiterAttnBackend,
-                AiterMultiStepDraftBackend,
-            )
-
-            self.draft_attn_backend = AiterMultiStepDraftBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
-            self.draft_extend_attn_backend = AiterAttnBackend(
-                self.draft_model_runner,
-                skip_prefill=False,
-            )
-            self.has_prefill_wrapper_verify = False
-        elif self.server_args.attention_backend == "fa3":
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-                FlashAttentionMultiStepBackend,
-            )
-
-            self.draft_attn_backend = FlashAttentionMultiStepBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
-            self.draft_extend_attn_backend = FlashAttentionBackend(
-                self.draft_model_runner,
-                skip_prefill=False,
-            )
-        elif self.server_args.attention_backend == "flashmla":
-            from sglang.srt.layers.attention.flashmla_backend import (
-                FlashMLAMultiStepDraftBackend,
-            )
-
-            self.draft_attn_backend = FlashMLAMultiStepDraftBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
-        else:
-            raise ValueError(
-                f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
-            )
+        # Initialize draft extend attention backend (respects speculative_attention_mode setting)
+        self.draft_extend_attn_backend = self._create_draft_extend_backend()
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+
+    def _create_backend(
+        self, backend_name: str, backend_map: dict, error_template: str
+    ):
+        backend_type = getattr(self.server_args, backend_name)
+        if backend_type is None:
+            backend_type = self.server_args.attention_backend
+
+        if backend_type not in backend_map:
+            raise ValueError(error_template.format(backend_type=backend_type))
+
+        return backend_map[backend_type]()
+
+    def _create_decode_backend(self):
+        backend_map = {
+            "flashinfer": self._create_flashinfer_decode_backend,
+            "triton": self._create_triton_decode_backend,
+            "aiter": self._create_aiter_decode_backend,
+            "fa3": self._create_fa3_decode_backend,
+            "hybrid_linear_attn": self._create_fa3_decode_backend,
+            "flashmla": self._create_flashmla_decode_backend,
+            "trtllm_mha": self._create_trtllm_mha_decode_backend,
+            "trtllm_mla": self._create_trtllm_mla_decode_backend,
+        }
+
+        return self._create_backend(
+            "decode_attention_backend",
+            backend_map,
+            "EAGLE is not supported in decode attention backend {backend_type}",
+        )
+
+    def _create_draft_extend_backend(self):
+        backend_map = {
+            "flashinfer": self._create_flashinfer_prefill_backend,
+            "triton": self._create_triton_prefill_backend,
+            "aiter": self._create_aiter_prefill_backend,
+            "fa3": self._create_fa3_prefill_backend,
+            "hybrid_linear_attn": self._create_fa3_prefill_backend,
+            "trtllm_mha": self._create_trtllm_mha_prefill_backend,
+            "trtllm_mla": self._create_trtllm_mla_prefill_backend,
+        }
+        backend_name = (
+            "decode_attention_backend"
+            if self.server_args.speculative_attention_mode == "decode"
+            else "prefill_attention_backend"
+        )
+        return self._create_backend(
+            backend_name,
+            backend_map,
+            "EAGLE is not supported in attention backend {backend_type}",
+        )
+
+    def _create_flashinfer_decode_backend(self):
+        if not global_server_args_dict["use_mla_backend"]:
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                FlashInferMultiStepDraftBackend,
+            )
+
+            self.has_prefill_wrapper_verify = True
+            return FlashInferMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+        else:
+            from sglang.srt.layers.attention.flashinfer_mla_backend import (
+                FlashInferMLAMultiStepDraftBackend,
+            )
+
+            self.has_prefill_wrapper_verify = True
+            return FlashInferMLAMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
+    def _create_triton_decode_backend(self):
+        from sglang.srt.layers.attention.triton_backend import (
+            TritonMultiStepDraftBackend,
+        )
+
+        return TritonMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_aiter_decode_backend(self):
+        from sglang.srt.layers.attention.aiter_backend import AiterMultiStepDraftBackend
+
+        return AiterMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_fa3_decode_backend(self):
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionMultiStepBackend,
+        )
+
+        return FlashAttentionMultiStepBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_flashmla_decode_backend(self):
+        from sglang.srt.layers.attention.flashmla_backend import (
+            FlashMLAMultiStepDraftBackend,
+        )
+
+        return FlashMLAMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_trtllm_mha_decode_backend(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import (
+            TRTLLMHAAttnMultiStepDraftBackend,
+        )
+
+        self.has_prefill_wrapper_verify = True
+        return TRTLLMHAAttnMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_trtllm_mla_decode_backend(self):
+        if not global_server_args_dict["use_mla_backend"]:
+            raise ValueError(
+                "trtllm_mla backend requires MLA model (use_mla_backend=True)."
+            )
+
+        from sglang.srt.layers.attention.trtllm_mla_backend import (
+            TRTLLMMLAMultiStepDraftBackend,
+        )
+
+        self.has_prefill_wrapper_verify = True
+        return TRTLLMMLAMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_flashinfer_prefill_backend(self):
+        if not global_server_args_dict["use_mla_backend"]:
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                FlashInferAttnBackend,
+            )
+
+            return FlashInferAttnBackend(self.draft_model_runner, skip_prefill=False)
+        else:
+            from sglang.srt.layers.attention.flashinfer_mla_backend import (
+                FlashInferMLAAttnBackend,
+            )
+
+            return FlashInferMLAAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_triton_prefill_backend(self):
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        return TritonAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_aiter_prefill_backend(self):
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        return AiterAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_fa3_prefill_backend(self):
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        return FlashAttentionBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_trtllm_mha_prefill_backend(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
+        return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_trtllm_mla_prefill_backend(self):
+        if not global_server_args_dict["use_mla_backend"]:
+            raise ValueError(
+                "trtllm_mla backend requires MLA model (use_mla_backend=True)."
+            )
+
+        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+        return TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False)
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -638,6 +736,14 @@ class EAGLEWorker(TpModelWorker):
 
             # Set inputs
             forward_batch.input_ids = input_ids
+            # This is a temporary fix for the case that the user is using standalone
+            # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
+            # rope kernel needs cache_loc to be contiguous.
+            if (
+                self.server_args.speculative_algorithm == "STANDALONE"
+                and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
+            ):
+                out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
@@ -722,6 +828,21 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
+        # QQ: can be optimized
+        if self.target_worker.model_runner.is_hybrid_gdn:
+            # res.draft_input.accept_length is on GPU but may be empty for last verify?
+            accepted_length = (
+                torch.tensor(
+                    res.accept_length_per_req_cpu,
+                    device=logits_output.hidden_states.device,
+                    dtype=torch.int32,
+                )
+                + 1
+            )
+            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+                accepted_length, self.target_worker.model_runner.model
+            )
+
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
 
@@ -745,15 +866,20 @@ class EAGLEWorker(TpModelWorker):
         token_ids_logprobs = batch.token_ids_logprobs
         accepted_indices = res.accepted_indices
         assert len(accepted_indices) == len(logits_output.next_token_logits)
+
         temperatures = batch.sampling_info.temperatures
         num_draft_tokens = batch.spec_info.draft_token_num
         # acceptance indices are the indices in a "flattened" batch.
         # dividing it to num_draft_tokens will yield the actual batch index.
         temperatures = temperatures[accepted_indices // num_draft_tokens]
-
-        logprobs = torch.nn.functional.log_softmax(
-            logits_output.next_token_logits / temperatures, dim=-1
-        )
+        if RETURN_ORIGINAL_LOGPROB:
+            logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits, dim=-1
+            )
+        else:
+            logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits / temperatures, dim=-1
+            )
         batch_next_token_ids = res.verified_id
         num_tokens_per_req = [accept + 1 for accept in res.accept_length_per_req_cpu]
 
@@ -770,13 +896,19 @@ class EAGLEWorker(TpModelWorker):
             (
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums_repeat_interleaved)
+            ) = get_top_logprobs(
+                logprobs,
+                top_logprobs_nums_repeat_interleaved,
+            )
 
         if any(x is not None for x in token_ids_logprobs):
             (
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs_repeat_interleaved)
+            ) = get_token_ids_logprobs(
+                logprobs,
+                token_ids_logprobs_repeat_interleaved,
+            )
 
         logits_output.next_token_logprobs = logprobs[
             torch.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
@@ -836,6 +968,21 @@ class EAGLEWorker(TpModelWorker):
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
+        has_finished, unfinished_req_index = False, []
+        for i, req in enumerate(batch.reqs):
+            if req.finished():
+                has_finished = True
+            else:
+                unfinished_req_index.append(i)
+        if has_finished:
+            unfinished_index_device = torch.tensor(
+                unfinished_req_index,
+                dtype=torch.int64,
+                device=batch.spec_info.topk_p.device,
+            )
+            batch.spec_info.filter_batch(
+                unfinished_index_device, has_been_filtered=False
+            )
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
@@ -966,7 +1113,9 @@ def get_last_loc_large_page_size_top_k_1(
     return prefix_lens, seq_lens, last_loc
 
 
-@torch.compile(dynamic=True)
+# Disable torch.compile for this function because it will be
+# even slower.
+# @torch.compile(dynamic=True)
 def get_last_loc_large_page_size_large_top_k(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,

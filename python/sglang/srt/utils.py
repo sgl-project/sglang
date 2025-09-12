@@ -172,6 +172,20 @@ def is_blackwell():
     return torch.cuda.get_device_capability()[0] == 10
 
 
+@lru_cache(maxsize=1)
+def is_sm100_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 10) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
+@lru_cache(maxsize=1)
+def is_sm90_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 9) and (
+        torch.version.cuda >= "12.3"
+    )
+
+
 _warned_bool_env_var_keys = set()
 
 
@@ -216,8 +230,16 @@ except:
     is_intel_amx_backend_available = False
 
 
+try:
+    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # to support torch compile
+    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+except:
+    is_amx_tile_supported = False
+
+
 def cpu_has_amx_support():
-    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+    return is_amx_tile_supported and is_intel_amx_backend_available
 
 
 def use_intel_amx_backend(layer):
@@ -412,7 +434,9 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        free_gpu_memory = psutil.virtual_memory().available
+        total_free_memory = psutil.virtual_memory().available
+        n_numa_node: int = len(get_cpu_ids_by_node())
+        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -438,70 +462,6 @@ def is_pin_memory_available() -> bool:
     return torch.cuda.is_available()
 
 
-_CPU_OFFLOAD_BYTES = 0
-_CPU_OFFLOAD_MAX_BYTES = 0
-
-
-def set_cpu_offload_max_bytes(max_bytes: int) -> None:
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-    _CPU_OFFLOAD_BYTES = 0
-    _CPU_OFFLOAD_MAX_BYTES = max_bytes
-
-
-def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
-    device = next(module.parameters()).device
-
-    if device == torch.device("cpu"):
-        return module
-
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-    if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
-        return module
-
-    pin_memory = is_pin_memory_available()
-    # offload parameters to CPU
-    # use pin_memory if possible, which helps cudagraph capture speed
-    offloaded_parameters = False
-    for p in module.parameters():
-        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
-            # we use per-parameter offloading
-            # one module might have some parameters offloaded and some not
-            break
-
-        # `torch.empty_like` does not support `pin_memory` argument
-        cpu_data = torch.empty_strided(
-            size=p.data.size(),
-            stride=p.data.stride(),
-            dtype=p.data.dtype,
-            layout=p.data.layout,
-            device="cpu",
-            pin_memory=pin_memory,
-        )
-        cpu_data.copy_(p.data)
-        p.data = cpu_data
-        _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
-        offloaded_parameters = True
-
-    if offloaded_parameters:
-        original_forward = module.forward
-
-        def forward(*args, **kwargs):
-            module.forward = original_forward
-            device_state = {
-                # here we blindly call `to(device)`
-                # if the parameter is already on the device, it will be a no-op
-                k: v.to(device, non_blocking=True)
-                for k, v in module.state_dict().items()
-            }
-            output = functional_call(module, device_state, args=args, kwargs=kwargs)
-            module.forward = forward
-            return output
-
-        module.forward = forward
-
-    return module
-
-
 class LayerFn(Protocol):
 
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
@@ -514,11 +474,13 @@ def make_layers(
     pp_size: Optional[int] = None,
     prefix: str = "",
     return_tuple: bool = False,
+    offloader_kwargs: Dict[str, Any] = {},
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
+    from sglang.srt.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
@@ -532,10 +494,13 @@ def make_layers(
     )
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + [
-            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
-            for idx in range(start_layer, end_layer)
-        ]
+        + get_offloader().wrap_modules(
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                for idx in range(start_layer, end_layer)
+            ),
+            **offloader_kwargs,
+        )
         + [
             PPMissingLayer(return_tuple=return_tuple)
             for _ in range(end_layer, num_hidden_layers)
@@ -1724,8 +1689,28 @@ def direct_register_custom_op(
     IMPORTANT: the lifetime of the operator is tied to the lifetime of the
     library object. If you want to bind the operator to a different library,
     make sure the library object is alive when the operator is used.
+
+    Note: This function will silently skip registration if the operator
+    with the same name is already registered to avoid RuntimeError in
+    multi-engine scenarios (e.g., VERL framework).
     """
     import torch.library
+
+    my_lib = target_lib or sglang_lib
+
+    # Check if operator is already registered to avoid duplicate registration
+    # This is important for scenarios where multiple SGLang engines run in the same process
+    try:
+        # Try to access the operator to see if it's already registered
+        lib_name = my_lib.m.name if hasattr(my_lib.m, "name") else "sglang"
+        if hasattr(torch.ops, lib_name) and hasattr(
+            getattr(torch.ops, lib_name), op_name
+        ):
+            # Operator already exists, skip registration
+            return
+    except (AttributeError, RuntimeError):
+        # Operator doesn't exist, proceed with registration
+        pass
 
     if hasattr(torch.library, "infer_schema"):
         schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
@@ -1735,11 +1720,22 @@ def direct_register_custom_op(
 
         schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
 
-    my_lib = target_lib or sglang_lib
-    my_lib.define(op_name + schema_str)
-    my_lib.impl(op_name, op_func, "CUDA")
-    if fake_impl is not None:
-        my_lib._register_fake(op_name, fake_impl)
+    try:
+        my_lib.define(op_name + schema_str)
+        my_lib.impl(op_name, op_func, "CUDA")
+        if fake_impl is not None:
+            my_lib._register_fake(op_name, fake_impl)
+    except RuntimeError as error:
+        if "Tried to register an operator" in str(e) and "multiple times" in str(e):
+            # Silently ignore duplicate registration errors
+            # This can happen in multi-engine scenarios
+            pass
+        else:
+            # Re-raise other RuntimeErrors
+            raise error
+    except AttributeError as error:
+        # Always re-raise AttributeError as it indicates missing dependencies
+        raise error
 
 
 def set_gpu_proc_affinity(
@@ -1978,6 +1974,15 @@ def get_ip() -> str:
     except Exception:
         pass
 
+    # try  using hostname
+    hostname = socket.gethostname()
+    try:
+        ip_addr = socket.gethostbyname(hostname)
+        warnings.warn("using local ip address: {}".format(ip_addr))
+        return ip_addr
+    except Exception:
+        pass
+
     warnings.warn(
         "Failed to get the IP address, using 0.0.0.0 by default."
         "The value can be set by the environment variable"
@@ -2059,13 +2064,6 @@ def configure_ipv6(dist_init_addr):
     except ValueError:
         raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
     return port, host
-
-
-def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() == 0:
-        logger.info(msg)
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):
@@ -2343,6 +2341,7 @@ def is_fa3_default_architecture(hf_config):
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
     return architectures[0] in default_archs
@@ -2413,7 +2412,7 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif server_args.moe_a2a_backend is None:
+        elif server_args.moe_a2a_backend == "none":
             return True
         else:
             return (
@@ -2429,7 +2428,7 @@ def require_attn_tp_gather(server_args):
     Check if the input of attention is scattered.
     """
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.moe_a2a_backend is not None or server_args.moe_dense_tp_size == 1:
+    if server_args.moe_a2a_backend != "none" or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -2599,6 +2598,50 @@ def dynamic_import(func_path: str):
     return func
 
 
+def gc_object_counts():
+    import gc
+
+    g0 = len(gc.get_objects(0))
+    g1 = len(gc.get_objects(1))
+    g2 = len(gc.get_objects(2))
+    return g0, g1, g2
+
+
+def configure_gc_warning(warn_threshold_secs):
+    import gc
+
+    gc_start_time = {}
+
+    def gc_callback(phase, info):
+        gen = info.get("generation", "?")
+        if phase == "start":
+            gc_start_time[gen] = time.time()
+        elif phase == "stop":
+            duration = time.time() - gc_start_time.get(gen, time.time())
+            if duration > warn_threshold_secs:
+                g0, g1, g2 = gc_object_counts()
+                logger.warn(
+                    f"LONG GARBAGE COLLECTION DETECTED | Generation {gen} | Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "
+                    f"This may cause latency jitter. Consider calling the freeze_gc API after sending a few warmup requests."
+                )
+
+    gc.callbacks.append(gc_callback)
+
+
+def freeze_gc(context: str):
+    import gc
+
+    g0_before, g1_before, g2_before = gc_object_counts()
+    gc.freeze()
+    g0_after, g1_after, g2_after = gc_object_counts()
+    logger.info(
+        f"Freezing GC in {context} process. "
+        f"gen0: {g0_before}->{g0_after}, "
+        f"gen1: {g1_before}->{g1_after}, "
+        f"gen2: {g2_before}->{g2_after}"
+    )
+
+
 def configure_gc_logger():
     logger.info("Enable GC Logger")
 
@@ -2754,6 +2797,10 @@ def lru_cache_frozenset(maxsize=128):
     return decorator
 
 
+def get_origin_rid(rid):
+    return rid.split("_", 1)[1] if "_" in rid else rid
+
+
 def apply_module_patch(target_module, target_function, wrappers):
     original_module, original_function = parse_module_path(
         target_module, target_function, False
@@ -2863,6 +2910,18 @@ def mxfp_supported():
         return False
 
 
+@lru_cache(maxsize=1)
+def is_gfx95_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
@@ -2872,6 +2931,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_proj",
     "up_proj",
     "down_proj",
+    "qkv_proj",
+    "gate_up_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
@@ -2960,9 +3021,28 @@ class ConcurrentCounter:
         This suspends the calling coroutine without blocking the thread, allowing
         other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
         """
-        self.wait_for(lambda count: count == 0)
+        await self.wait_for(lambda count: count == 0)
 
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
     return importlib.util.find_spec("triton_kernels") is not None
+
+
+def check_cuda_result(raw_output):
+    import cuda.bindings.runtime as cuda_rt
+
+    err, *results = raw_output
+    if err != cuda_rt.cudaError_t.cudaSuccess:
+        raise Exception(f"CUDA error: {err}")
+
+    return results
+
+
+def numa_bind_to_node(node: int):
+    libnuma = ctypes.CDLL("libnuma.so")
+    if libnuma.numa_available() < 0:
+        raise SystemError("numa not available on this system")
+
+    libnuma.numa_run_on_node(ctypes.c_int(node))
+    libnuma.numa_set_localalloc()

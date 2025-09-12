@@ -2,14 +2,21 @@ use pyo3::prelude::*;
 pub mod config;
 pub mod logging;
 use std::collections::HashMap;
+
 pub mod core;
+#[cfg(feature = "grpc-client")]
+pub mod grpc;
+pub mod mcp;
 pub mod metrics;
 pub mod middleware;
-pub mod openai_api_types;
 pub mod policies;
+pub mod protocols;
+pub mod reasoning_parser;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
+pub mod tokenizer;
+pub mod tool_parser;
 pub mod tree;
 use crate::metrics::PrometheusConfig;
 
@@ -59,9 +66,51 @@ struct Router {
     decode_policy: Option<PolicyType>,
     max_concurrent_requests: usize,
     cors_allowed_origins: Vec<String>,
+    // Retry configuration
+    retry_max_retries: u32,
+    retry_initial_backoff_ms: u64,
+    retry_max_backoff_ms: u64,
+    retry_backoff_multiplier: f32,
+    retry_jitter_factor: f32,
+    disable_retries: bool,
+    // Circuit breaker configuration
+    cb_failure_threshold: u32,
+    cb_success_threshold: u32,
+    cb_timeout_duration_secs: u64,
+    cb_window_duration_secs: u64,
+    disable_circuit_breaker: bool,
+    // Health check configuration
+    health_failure_threshold: u32,
+    health_success_threshold: u32,
+    health_check_timeout_secs: u64,
+    health_check_interval_secs: u64,
+    health_check_endpoint: String,
+    // IGW (Inference Gateway) configuration
+    enable_igw: bool,
+    queue_size: usize,
+    queue_timeout_secs: u64,
+    rate_limit_tokens_per_second: Option<usize>,
+    // Connection mode (determined from worker URLs)
+    connection_mode: config::ConnectionMode,
+    // Model path for tokenizer
+    model_path: Option<String>,
+    // Explicit tokenizer path
+    tokenizer_path: Option<String>,
 }
 
 impl Router {
+    /// Determine connection mode from worker URLs
+    fn determine_connection_mode(worker_urls: &[String]) -> config::ConnectionMode {
+        // Only consider it gRPC if explicitly specified with grpc:// or grpcs:// scheme
+        for url in worker_urls {
+            if url.starts_with("grpc://") || url.starts_with("grpcs://") {
+                return config::ConnectionMode::Grpc;
+            }
+        }
+        // Default to HTTP for all other cases (including http://, https://, or no scheme)
+        config::ConnectionMode::Http
+    }
+
     /// Convert PyO3 Router to RouterConfig
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
@@ -87,7 +136,12 @@ impl Router {
         };
 
         // Determine routing mode
-        let mode = if self.pd_disaggregation {
+        let mode = if self.enable_igw {
+            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            }
+        } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
@@ -133,6 +187,7 @@ impl Router {
             policy,
             host: self.host.clone(),
             port: self.port,
+            connection_mode: self.connection_mode.clone(),
             max_payload_size: self.max_payload_size,
             request_timeout_secs: self.request_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
@@ -145,9 +200,35 @@ impl Router {
             log_level: self.log_level.clone(),
             request_id_headers: self.request_id_headers.clone(),
             max_concurrent_requests: self.max_concurrent_requests,
+            queue_size: self.queue_size,
+            queue_timeout_secs: self.queue_timeout_secs,
+            rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
             cors_allowed_origins: self.cors_allowed_origins.clone(),
-            retry: config::RetryConfig::default(),
-            circuit_breaker: config::CircuitBreakerConfig::default(),
+            retry: config::RetryConfig {
+                max_retries: self.retry_max_retries,
+                initial_backoff_ms: self.retry_initial_backoff_ms,
+                max_backoff_ms: self.retry_max_backoff_ms,
+                backoff_multiplier: self.retry_backoff_multiplier,
+                jitter_factor: self.retry_jitter_factor,
+            },
+            circuit_breaker: config::CircuitBreakerConfig {
+                failure_threshold: self.cb_failure_threshold,
+                success_threshold: self.cb_success_threshold,
+                timeout_duration_secs: self.cb_timeout_duration_secs,
+                window_duration_secs: self.cb_window_duration_secs,
+            },
+            disable_retries: self.disable_retries,
+            disable_circuit_breaker: self.disable_circuit_breaker,
+            health_check: config::HealthCheckConfig {
+                failure_threshold: self.health_failure_threshold,
+                success_threshold: self.health_success_threshold,
+                timeout_secs: self.health_check_timeout_secs,
+                check_interval_secs: self.health_check_interval_secs,
+                endpoint: self.health_check_endpoint.clone(),
+            },
+            enable_igw: self.enable_igw,
+            model_path: self.model_path.clone(),
+            tokenizer_path: self.tokenizer_path.clone(),
         })
     }
 }
@@ -160,14 +241,14 @@ impl Router {
         policy = PolicyType::RoundRobin,
         host = String::from("127.0.0.1"),
         port = 3001,
-        worker_startup_timeout_secs = 300,
-        worker_startup_check_interval = 10,
-        cache_threshold = 0.50,
-        balance_abs_threshold = 32,
-        balance_rel_threshold = 1.0001,
-        eviction_interval_secs = 60,
-        max_tree_size = 2usize.pow(24),
-        max_payload_size = 256 * 1024 * 1024,  // 256MB default for large batches
+        worker_startup_timeout_secs = 600,
+        worker_startup_check_interval = 30,
+        cache_threshold = 0.3,
+        balance_abs_threshold = 64,
+        balance_rel_threshold = 1.5,
+        eviction_interval_secs = 120,
+        max_tree_size = 2usize.pow(26),
+        max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
         dp_aware = false,
         api_key = None,
         log_dir = None,
@@ -181,16 +262,44 @@ impl Router {
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
-        request_timeout_secs = 600,  // Add configurable request timeout
+        request_timeout_secs = 1800,  // Add configurable request timeout
         request_id_headers = None,  // Custom request ID headers
         pd_disaggregation = false,  // New flag for PD mode
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
         decode_policy = None,
-        max_concurrent_requests = 64,
-        cors_allowed_origins = vec![]
+        max_concurrent_requests = 256,
+        cors_allowed_origins = vec![],
+        // Retry defaults
+        retry_max_retries = 5,
+        retry_initial_backoff_ms = 50,
+        retry_max_backoff_ms = 30_000,
+        retry_backoff_multiplier = 1.5,
+        retry_jitter_factor = 0.2,
+        disable_retries = false,
+        // Circuit breaker defaults
+        cb_failure_threshold = 10,
+        cb_success_threshold = 3,
+        cb_timeout_duration_secs = 60,
+        cb_window_duration_secs = 120,
+        disable_circuit_breaker = false,
+        // Health check defaults
+        health_failure_threshold = 3,
+        health_success_threshold = 2,
+        health_check_timeout_secs = 5,
+        health_check_interval_secs = 60,
+        health_check_endpoint = String::from("/health"),
+        // IGW defaults
+        enable_igw = false,
+        queue_size = 100,
+        queue_timeout_secs = 60,
+        rate_limit_tokens_per_second = None,
+        // Tokenizer defaults
+        model_path = None,
+        tokenizer_path = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
@@ -226,7 +335,46 @@ impl Router {
         decode_policy: Option<PolicyType>,
         max_concurrent_requests: usize,
         cors_allowed_origins: Vec<String>,
+        retry_max_retries: u32,
+        retry_initial_backoff_ms: u64,
+        retry_max_backoff_ms: u64,
+        retry_backoff_multiplier: f32,
+        retry_jitter_factor: f32,
+        disable_retries: bool,
+        cb_failure_threshold: u32,
+        cb_success_threshold: u32,
+        cb_timeout_duration_secs: u64,
+        cb_window_duration_secs: u64,
+        disable_circuit_breaker: bool,
+        health_failure_threshold: u32,
+        health_success_threshold: u32,
+        health_check_timeout_secs: u64,
+        health_check_interval_secs: u64,
+        health_check_endpoint: String,
+        enable_igw: bool,
+        queue_size: usize,
+        queue_timeout_secs: u64,
+        rate_limit_tokens_per_second: Option<usize>,
+        model_path: Option<String>,
+        tokenizer_path: Option<String>,
     ) -> PyResult<Self> {
+        // Determine connection mode from worker URLs
+        let mut all_urls = worker_urls.clone();
+
+        // Add prefill URLs if in PD mode
+        if let Some(ref prefill_urls) = prefill_urls {
+            for (url, _) in prefill_urls {
+                all_urls.push(url.clone());
+            }
+        }
+
+        // Add decode URLs if in PD mode
+        if let Some(ref decode_urls) = decode_urls {
+            all_urls.extend(decode_urls.clone());
+        }
+
+        let connection_mode = Self::determine_connection_mode(&all_urls);
+
         Ok(Router {
             host,
             port,
@@ -262,6 +410,29 @@ impl Router {
             decode_policy,
             max_concurrent_requests,
             cors_allowed_origins,
+            retry_max_retries,
+            retry_initial_backoff_ms,
+            retry_max_backoff_ms,
+            retry_backoff_multiplier,
+            retry_jitter_factor,
+            disable_retries,
+            cb_failure_threshold,
+            cb_success_threshold,
+            cb_timeout_duration_secs,
+            cb_window_duration_secs,
+            disable_circuit_breaker,
+            health_failure_threshold,
+            health_success_threshold,
+            health_check_timeout_secs,
+            health_check_interval_secs,
+            health_check_endpoint,
+            enable_igw,
+            queue_size,
+            queue_timeout_secs,
+            rate_limit_tokens_per_second,
+            connection_mode,
+            model_path,
+            tokenizer_path,
         })
     }
 

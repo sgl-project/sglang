@@ -113,7 +113,7 @@ if supports_custom_op():
 
 
 @triton.jit
-def _per_token_group_quant_fp8(
+def _per_token_group_quant_8bit(
     # Pointers to inputs and output
     y_ptr,
     y_q_ptr,
@@ -125,8 +125,8 @@ def _per_token_group_quant_fp8(
     # Avoid to divide zero
     eps,
     # Information for float8
-    fp8_min,
-    fp8_max,
+    bit8_min,
+    bit8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
 ):
@@ -147,16 +147,16 @@ def _per_token_group_quant_fp8(
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
-    y_s = _absmax / fp8_max
+    y_s = _absmax / bit8_max
     y_s_inv = 1.0 / y_s
-    y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y * y_s_inv, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
 
 
 @triton.jit
-def _per_token_group_quant_fp8_colmajor(
+def _per_token_group_quant_8bit_colmajor(
     # Pointers to inputs and output
     y_ptr,
     y_q_ptr,
@@ -169,8 +169,8 @@ def _per_token_group_quant_fp8_colmajor(
     # Avoid to divide zero
     eps,
     # Information for float8
-    fp8_min,
-    fp8_max,
+    bit8_min,
+    bit8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
@@ -197,19 +197,20 @@ def _per_token_group_quant_fp8_colmajor(
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
-    y_s = _absmax / fp8_max
+    y_s = _absmax / bit8_max
     if SCALE_UE8M0:
         y_s = tl.exp2(tl.ceil(tl.log2(tl.abs(y_s))))
-    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y / y_s, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
 
 
-def per_token_group_quant_fp8(
+def _per_token_group_quant_8bit_raw(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
+    dtype: torch.dtype = fp8_dtype,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
@@ -223,6 +224,7 @@ def per_token_group_quant_fp8(
         x: The input tenosr with ndim >= 2.
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
+        dtype: The dype of output tensor.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
@@ -232,7 +234,21 @@ def per_token_group_quant_fp8(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
+    if _is_hip:
+        if dtype == torch.int8:
+            bit8_max = 127.0
+        else:
+            bit8_max = 224.0
+        bit8_min = -bit8_max  # TODO incorrect for int8
+    else:
+        if dtype == torch.int8:
+            info = torch.iinfo(dtype)
+        else:
+            info = torch.finfo(dtype)
+        bit8_max = info.max
+        bit8_min = info.min
+
+    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
         x_shape=x.shape,
         device=x.device,
@@ -250,7 +266,7 @@ def per_token_group_quant_fp8(
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
     if column_major_scales:
-        _per_token_group_quant_fp8_colmajor[(M,)](
+        _per_token_group_quant_8bit_colmajor[(M,)](
             x,
             x_q,
             x_s,
@@ -258,8 +274,8 @@ def per_token_group_quant_fp8(
             x.shape[1],
             x_s.stride(1),
             eps,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
+            bit8_min=bit8_min,
+            bit8_max=bit8_max,
             BLOCK=BLOCK,
             num_warps=num_warps,
             num_stages=num_stages,
@@ -267,22 +283,22 @@ def per_token_group_quant_fp8(
         )
     else:
         assert not scale_ue8m0
-        _per_token_group_quant_fp8[(M,)](
+        _per_token_group_quant_8bit[(M,)](
             x,
             x_q,
             x_s,
             group_size,
             N,
             eps,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
+            bit8_min=bit8_min,
+            bit8_max=bit8_max,
             BLOCK=BLOCK,
             num_warps=num_warps,
             num_stages=num_stages,
         )
 
     if scale_ue8m0:
-        from deep_gemm.utils.layout import transform_sf_into_required_layout
+        from deep_gemm import transform_sf_into_required_layout
 
         assert group_size == 128
         x_s = transform_sf_into_required_layout(
@@ -297,6 +313,117 @@ def per_token_group_quant_fp8(
     return x_q, x_s
 
 
+# backward compatibility
+per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
+
+
+def _per_token_group_quant_8bit_fuse_silu_and_mul(
+    x: torch.Tensor,
+    group_size: int,
+    dst_dtype: torch.dtype,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+    masked_m: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Another way to implement (can be used in e.g. comparison tests)
+    # from sgl_kernel import silu_and_mul
+    # x_after_silu_and_mul = silu_and_mul(x)
+    # return per_token_group_quant_fp8(
+    #     x_after_silu_and_mul,
+    #     group_size=group_size,
+    #     eps=eps,
+    #     column_major_scales=column_major_scales,
+    #     scale_tma_aligned=scale_tma_aligned,
+    #     scale_ue8m0=scale_ue8m0,
+    # )
+
+    from deep_gemm import transform_sf_into_required_layout
+
+    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
+
+    assert column_major_scales
+    assert scale_tma_aligned
+    assert scale_ue8m0
+
+    needs_unsqueeze = x.dim() == 2
+    if needs_unsqueeze:
+        num_tokens, _ = x.shape
+        x = x.unsqueeze(0)
+        assert masked_m is None
+        masked_m = torch.tensor([num_tokens], device=x.device, dtype=torch.int32)
+
+    # Use `zeros` for easier testing
+    output = torch.zeros(
+        (*x.shape[:-1], x.shape[-1] // 2),
+        device=x.device,
+        dtype=dst_dtype,
+    )
+    # Use `zeros` for easier testing
+    output_scale_for_kernel = torch.zeros(
+        (*x.shape[:-1], x.shape[-1] // 2 // group_size),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    silu_and_mul_masked_post_quant_fwd(
+        input=x,
+        output=output,
+        output_scale=output_scale_for_kernel,
+        quant_group_size=group_size,
+        masked_m=masked_m,
+        scale_ue8m0=scale_ue8m0,
+    )
+
+    assert group_size == 128
+    output_scale = transform_sf_into_required_layout(
+        output_scale_for_kernel,
+        num_groups=output.shape[0],
+        mn=output.shape[-2],
+        k=output.shape[-1],
+        recipe=(1, group_size, group_size),
+        is_sfa=True,
+    )
+
+    if needs_unsqueeze:
+        output = output.squeeze(0)
+        output_scale = output_scale.squeeze(0)
+
+    return output, output_scale
+
+
+def per_token_group_quant_8bit(
+    x: torch.Tensor,
+    group_size: int,
+    dst_dtype: torch.dtype,
+    eps: float = 1e-10,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if fuse_silu_and_mul:
+        return _per_token_group_quant_8bit_fuse_silu_and_mul(
+            x=x,
+            group_size=group_size,
+            dst_dtype=dst_dtype,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+            masked_m=masked_m,
+        )
+    else:
+        return _per_token_group_quant_8bit_raw(
+            x=x,
+            group_size=group_size,
+            eps=eps,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+            dtype=dst_dtype,
+        )
+
+
 def create_per_token_group_quant_fp8_output_scale(
     x_shape,
     device,
@@ -307,16 +434,16 @@ def create_per_token_group_quant_fp8_output_scale(
 ):
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
-        x_q_mn, x_q_k = x_shape
+        *x_batch, x_q_mn, x_q_k = x_shape
         x_s_mn, x_s_k = x_q_mn, x_q_k // 128
         aligned_mn = align(x_s_mn, 4)
         aligned_k = align(x_s_k, 4)
         # TODO(FIXME): Fix cuda kernel and recover here to empty.
-        return torch.zeros(
-            (aligned_k // 4, aligned_mn),
+        return torch.empty(
+            (*x_batch, aligned_k // 4, aligned_mn),
             device=device,
             dtype=torch.int,
-        ).transpose(0, 1)[:x_s_mn, :]
+        ).transpose(-1, -2)[..., :x_s_mn, :]
     elif column_major_scales:
         if scale_tma_aligned:
             # TODO extract "align" function
@@ -348,15 +475,19 @@ def sglang_per_token_group_quant_fp8(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
 ):
     assert (
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
+    out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
+
+    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=x.shape,
+        x_shape=out_shape,
         device=x.device,
         group_size=group_size,
         column_major_scales=column_major_scales,
@@ -370,6 +501,46 @@ def sglang_per_token_group_quant_fp8(
         )
 
     return x_q, x_s
+
+
+# TODO maybe unify int8 and fp8 code later
+def sglang_per_token_group_quant_8bit(
+    x: torch.Tensor,
+    group_size: int,
+    dst_dtype: torch.dtype,
+    eps: float = 1e-10,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+):
+    from sglang.srt.layers.quantization.int8_kernel import (
+        sglang_per_token_group_quant_int8,
+    )
+
+    if dst_dtype == torch.int8:
+        assert not column_major_scales
+        assert not scale_tma_aligned
+        assert not fuse_silu_and_mul
+        assert masked_m is None
+        return sglang_per_token_group_quant_int8(
+            x=x,
+            group_size=group_size,
+            eps=eps,
+            dtype=dst_dtype,
+        )
+
+    return sglang_per_token_group_quant_fp8(
+        x=x,
+        group_size=group_size,
+        eps=eps,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+        fuse_silu_and_mul=fuse_silu_and_mul,
+        masked_m=masked_m,
+    )
 
 
 def sglang_per_token_quant_fp8(
@@ -1415,3 +1586,221 @@ def per_group_transpose(
         a, trans_a, expert_offsets, k, M_ALIGNMENT, BLOCK_SIZE_M=16, BLOCK_SIZE_K=8
     )
     return trans_a
+
+
+def is_weak_contiguous(x: torch.Tensor):
+    strides = x.stride()
+    sizes = x.shape
+    is_not_transpose = strides[0] == 1 and (strides[1] >= max(1, sizes[0]))
+    is_transpose = strides[1] == 1 and (strides[0] >= max(1, sizes[1]))
+    return is_transpose or is_not_transpose
+
+
+@triton.jit
+def scaled_mm_kernel(
+    a_ptr,
+    b_ptr,
+    scale_a_ptr,
+    scale_b_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    ACCUMULATOR_DTYPE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_SCALE_A: tl.constexpr,
+    BLOCK_SIZE_SCALE_B: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    accumulator_dtype = ACCUMULATOR_DTYPE
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=accumulator_dtype)
+
+    # NOTE: Some tensor inputs are so large, they will cause int32 overflow
+    # so it is necessary to use tl.int64 for all the offsets, else SEGV will
+    # eventually occur.
+
+    # Offsets and masks.
+    offsets_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    masks_am = offsets_am < M
+
+    offsets_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    masks_bn = offsets_bn < N
+
+    offsets_k = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
+    offsets_a = stride_am * offsets_am[:, None] + stride_ak * offsets_k[None, :]
+    offsets_b = stride_bk * offsets_k[:, None] + stride_bn * offsets_bn[None, :]
+
+    # NOTE: BLOCK_SIZE_SCALE_A could be 1 or BLOCK_SIZE_M, so need to create
+    # appropriate offsets and masks for each case. Same goes for
+    # BLOCK_SIZE_SCALE_B.
+    offsets_scale_am = (
+        tl.arange(0, BLOCK_SIZE_SCALE_A)
+        + (BLOCK_SIZE_SCALE_A > 1) * pid_m * BLOCK_SIZE_M
+    )
+    masks_scale_am = offsets_scale_am < M
+
+    offsets_scale_bn = (
+        tl.arange(0, BLOCK_SIZE_SCALE_B)
+        + (BLOCK_SIZE_SCALE_B > 1) * pid_n * BLOCK_SIZE_N
+    )
+    masks_scale_bn = offsets_scale_bn < N
+
+    a_ptrs = a_ptr + offsets_a
+    b_ptrs = b_ptr + offsets_b
+
+    scale_a_ptrs = scale_a_ptr + offsets_scale_am
+    scale_b_ptrs = scale_b_ptr + offsets_scale_bn
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        masks_k = offsets_k < K
+        masks_a = masks_am[:, None] & masks_k[None, :]
+        a = tl.load(a_ptrs, mask=masks_a)
+
+        masks_b = masks_k[:, None] & masks_bn[None, :]
+        b = tl.load(b_ptrs, mask=masks_b)
+
+        # Accumulate results.
+        accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
+
+        offsets_k += BLOCK_SIZE_K
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Apply scale at end.
+    masks_scale_a = masks_scale_am[:, None] & (tl.arange(0, 1) < 1)[:, None]
+    scale_a = tl.load(scale_a_ptrs[:, None], masks_scale_a)
+    # Need to broadcast to the appropriate size, if scale_a is already
+    # (BLOCK_SIZE_M, 1) then it will broadcast to its own shape. Same goes
+    # for scale_b below.
+    scale_a = scale_a.broadcast_to((BLOCK_SIZE_M, 1))
+    accumulator = scale_a * accumulator.to(tl.float32)
+
+    masks_scale_b = masks_scale_bn[:, None] & (tl.arange(0, 1) < 1)[None, :]
+    scale_b = tl.load(scale_b_ptrs[:, None], masks_scale_b)
+    scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
+    accumulator = scale_b.T * accumulator.to(tl.float32)
+
+    # Convert to output format.
+    c = accumulator.to(c_ptr.type.element_ty)
+
+    # Add bias, it's already in output format, so add it after conversion.
+    if bias_ptr:
+        offsets_bias = offsets_bn
+        bias_ptrs = bias_ptr + offsets_bias
+        bias_mask = offsets_bias < N
+        bias = tl.load(bias_ptrs, bias_mask)
+        c += bias
+
+    # Save output
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    offs_cm = offs_cm.to(tl.int64)
+    offs_cn = offs_cn.to(tl.int64)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+# input  - [M, K]
+# weight - [K, N]
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+def triton_scaled_mm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: type[torch.dtype],
+    bias: Optional[torch.Tensor] = None,
+    block_size_m: int = 32,
+    block_size_n: int = 32,
+    block_size_k: int = 32,
+    use_heuristic=True,
+) -> torch.Tensor:
+    M, K = input.shape
+    N = weight.shape[1]
+
+    assert N > 0 and K > 0 and M > 0
+    assert weight.shape[0] == K
+    assert input.dtype == weight.dtype
+
+    scale_a = scale_a.reshape(-1, 1) if scale_a.dim() <= 1 else scale_a
+    scale_b = scale_b.reshape(-1, 1) if scale_b.dim() <= 1 else scale_b
+
+    assert scale_a.dtype == scale_b.dtype and scale_a.is_floating_point()
+    assert scale_a.shape[1] == 1 and (scale_a.shape[0] == 1 or scale_a.shape[0] == M)
+    assert scale_b.shape[1] == 1 and (scale_b.shape[0] == 1 or scale_b.shape[0] == N)
+    assert out_dtype.is_floating_point
+    assert bias is None or bias.is_floating_point()
+    assert is_weak_contiguous(input)
+    assert is_weak_contiguous(weight)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+
+    result = torch.empty((M, N), dtype=out_dtype, device=input.device)
+
+    has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
+
+    if use_heuristic:
+        is_small_N = N < 8192
+        next_power_of_2_M = max(32, triton.next_power_of_2(M))
+        if next_power_of_2_M <= 32:
+            tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
+        elif next_power_of_2_M <= 64:
+            tile_shape = (64, 64, 256)
+        elif next_power_of_2_M <= 128:
+            tile_shape = (64, 128, 128)
+        else:
+            tile_shape = (128, 128, 128)
+
+    block_size_m, block_size_n, block_size_k = tile_shape
+
+    block_size_sa = 1 if has_scalar(scale_a) else block_size_m
+    block_size_sb = 1 if has_scalar(scale_b) else block_size_n
+
+    accumulator_dtype = tl.float32 if input.is_floating_point() else tl.int32
+
+    # A = input, B = weight, C = result
+    # A = M x K, B = K x N, C = M x N
+    scaled_mm_kernel[grid](
+        input,
+        weight,
+        scale_a,
+        scale_b,
+        result,
+        bias,
+        M,
+        N,
+        K,
+        input.stride(0),
+        input.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        result.stride(0),
+        result.stride(1),
+        accumulator_dtype,
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        BLOCK_SIZE_SCALE_A=block_size_sa,
+        BLOCK_SIZE_SCALE_B=block_size_sb,
+    )
+
+    return result.to(out_dtype)

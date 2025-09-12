@@ -7,6 +7,9 @@ use std::collections::HashMap;
 pub struct RouterConfig {
     /// Routing mode configuration
     pub mode: RoutingMode,
+    /// Worker connection mode
+    #[serde(default)]
+    pub connection_mode: ConnectionMode,
     /// Policy configuration
     pub policy: PolicyConfig,
     /// Server host address
@@ -37,12 +40,43 @@ pub struct RouterConfig {
     pub request_id_headers: Option<Vec<String>>,
     /// Maximum concurrent requests allowed (for rate limiting)
     pub max_concurrent_requests: usize,
+    /// Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)
+    pub queue_size: usize,
+    /// Maximum time (in seconds) a request can wait in queue before timing out
+    pub queue_timeout_secs: u64,
+    /// Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    pub rate_limit_tokens_per_second: Option<usize>,
     /// CORS allowed origins
     pub cors_allowed_origins: Vec<String>,
     /// Retry configuration
     pub retry: RetryConfig,
     /// Circuit breaker configuration
     pub circuit_breaker: CircuitBreakerConfig,
+    /// Disable retries (overrides retry.max_retries to 1 when true)
+    #[serde(default)]
+    pub disable_retries: bool,
+    /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
+    #[serde(default)]
+    pub disable_circuit_breaker: bool,
+    /// Health check configuration
+    pub health_check: HealthCheckConfig,
+    /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
+    #[serde(default)]
+    pub enable_igw: bool,
+    /// Model path for loading tokenizer (can be a HuggingFace model ID or local path)
+    pub model_path: Option<String>,
+    /// Explicit tokenizer path (overrides model_path tokenizer if provided)
+    pub tokenizer_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(tag = "type")]
+pub enum ConnectionMode {
+    #[default]
+    #[serde(rename = "http")]
+    Http,
+    #[serde(rename = "grpc")]
+    Grpc,
 }
 
 /// Routing mode configuration
@@ -67,6 +101,11 @@ pub enum RoutingMode {
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
     },
+    #[serde(rename = "openai")]
+    OpenAI {
+        /// OpenAI-compatible API base(s), provided via worker URLs
+        worker_urls: Vec<String>,
+    },
 }
 
 impl RoutingMode {
@@ -82,6 +121,8 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
+            // OpenAI mode represents a single upstream
+            RoutingMode::OpenAI { .. } => 1,
         }
     }
 
@@ -177,7 +218,7 @@ impl Default for DiscoveryConfig {
             enabled: false,
             namespace: None,
             port: 8000,
-            check_interval_secs: 60,
+            check_interval_secs: 120,
             selector: HashMap::new(),
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
@@ -197,15 +238,51 @@ pub struct RetryConfig {
     pub max_backoff_ms: u64,
     /// Backoff multiplier for exponential backoff
     pub backoff_multiplier: f32,
+    /// Jitter factor applied to backoff (0.0 - 1.0)
+    /// Effective delay D' = D * (1 + U[-j, +j])
+    #[serde(default = "default_retry_jitter_factor")]
+    pub jitter_factor: f32,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
-            initial_backoff_ms: 100,
-            max_backoff_ms: 10000,
-            backoff_multiplier: 2.0,
+            max_retries: 5,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 30000,
+            backoff_multiplier: 1.5,
+            jitter_factor: 0.2,
+        }
+    }
+}
+
+fn default_retry_jitter_factor() -> f32 {
+    0.2
+}
+
+/// Health check configuration for worker monitoring
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheckConfig {
+    /// Number of consecutive failures before marking unhealthy
+    pub failure_threshold: u32,
+    /// Number of consecutive successes before marking healthy
+    pub success_threshold: u32,
+    /// Timeout for health check requests in seconds
+    pub timeout_secs: u64,
+    /// Interval between health checks in seconds
+    pub check_interval_secs: u64,
+    /// Health check endpoint path
+    pub endpoint: String,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 3,
+            success_threshold: 2,
+            timeout_secs: 5,
+            check_interval_secs: 60,
+            endpoint: "/health".to_string(),
         }
     }
 }
@@ -226,10 +303,10 @@ pub struct CircuitBreakerConfig {
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            failure_threshold: 5,
-            success_threshold: 2,
-            timeout_duration_secs: 30,
-            window_duration_secs: 60,
+            failure_threshold: 10,
+            success_threshold: 3,
+            timeout_duration_secs: 60,
+            window_duration_secs: 120,
         }
     }
 }
@@ -261,10 +338,10 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,
-            max_payload_size: 268_435_456, // 256MB
-            request_timeout_secs: 3600,    // 1 hour to match Python mini LB
-            worker_startup_timeout_secs: 300,
-            worker_startup_check_interval_secs: 10,
+            max_payload_size: 536_870_912, // 512MB
+            request_timeout_secs: 1800,    // 30 minutes
+            worker_startup_timeout_secs: 600,
+            worker_startup_check_interval_secs: 30,
             dp_aware: false,
             api_key: None,
             discovery: None,
@@ -272,10 +349,20 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
-            max_concurrent_requests: 64,
+            max_concurrent_requests: 256,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         }
     }
 }
@@ -300,17 +387,41 @@ impl RouterConfig {
         match self.mode {
             RoutingMode::Regular { .. } => "regular",
             RoutingMode::PrefillDecode { .. } => "prefill_decode",
+            RoutingMode::OpenAI { .. } => "openai",
         }
     }
 
     /// Check if service discovery is enabled
     pub fn has_service_discovery(&self) -> bool {
-        self.discovery.as_ref().map_or(false, |d| d.enabled)
+        self.discovery.as_ref().is_some_and(|d| d.enabled)
     }
 
     /// Check if metrics are enabled
     pub fn has_metrics(&self) -> bool {
         self.metrics.is_some()
+    }
+
+    /// Compute the effective retry config considering disable flag
+    pub fn effective_retry_config(&self) -> RetryConfig {
+        let mut cfg = self.retry.clone();
+        if self.disable_retries {
+            cfg.max_retries = 1;
+        }
+        cfg
+    }
+
+    /// Compute the effective circuit breaker config considering disable flag
+    pub fn effective_circuit_breaker_config(&self) -> CircuitBreakerConfig {
+        let mut cfg = self.circuit_breaker.clone();
+        if self.disable_circuit_breaker {
+            cfg.failure_threshold = u32::MAX;
+        }
+        cfg
+    }
+
+    /// Check if running in IGW (Inference Gateway) mode
+    pub fn is_igw_mode(&self) -> bool {
+        self.enable_igw
     }
 }
 
@@ -330,10 +441,10 @@ mod tests {
         assert!(matches!(config.policy, PolicyConfig::Random));
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 3001);
-        assert_eq!(config.max_payload_size, 268_435_456);
-        assert_eq!(config.request_timeout_secs, 3600);
-        assert_eq!(config.worker_startup_timeout_secs, 300);
-        assert_eq!(config.worker_startup_check_interval_secs, 10);
+        assert_eq!(config.max_payload_size, 536_870_912);
+        assert_eq!(config.request_timeout_secs, 1800);
+        assert_eq!(config.worker_startup_timeout_secs, 600);
+        assert_eq!(config.worker_startup_check_interval_secs, 30);
         assert!(config.discovery.is_none());
         assert!(config.metrics.is_none());
         assert!(config.log_dir.is_none());
@@ -388,6 +499,16 @@ mod tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -577,7 +698,7 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.namespace.is_none());
         assert_eq!(config.port, 8000);
-        assert_eq!(config.check_interval_secs, 60);
+        assert_eq!(config.check_interval_secs, 120);
         assert!(config.selector.is_empty());
         assert!(config.prefill_selector.is_empty());
         assert!(config.decode_selector.is_empty());
@@ -817,6 +938,16 @@ mod tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -870,6 +1001,16 @@ mod tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -919,6 +1060,16 @@ mod tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         assert!(config.has_service_discovery());

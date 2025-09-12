@@ -1,13 +1,12 @@
 #[cfg(test)]
 mod test_pd_routing {
-    use rand::Rng;
     use serde_json::json;
     use sglang_router_rs::config::{
-        CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
     };
     use sglang_router_rs::core::{WorkerFactory, WorkerType};
-    use sglang_router_rs::routers::pd_types::get_hostname;
-    use sglang_router_rs::routers::pd_types::PDSelectionPolicy;
+    use sglang_router_rs::routers::http::pd_types::get_hostname;
+    use sglang_router_rs::routers::http::pd_types::PDSelectionPolicy;
     use sglang_router_rs::routers::RouterFactory;
 
     // Test-only struct to help validate PD request parsing
@@ -109,8 +108,8 @@ mod test_pd_routing {
         }
     }
 
-    #[test]
-    fn test_pd_router_configuration() {
+    #[tokio::test]
+    async fn test_pd_router_configuration() {
         // Test PD router configuration with various policies
         // In the new structure, RoutingMode and PolicyConfig are separate
         let test_cases = vec![
@@ -179,16 +178,27 @@ mod test_pd_routing {
                 log_level: None,
                 request_id_headers: None,
                 max_concurrent_requests: 64,
+                queue_size: 0,
+                queue_timeout_secs: 60,
                 cors_allowed_origins: vec![],
                 retry: RetryConfig::default(),
                 circuit_breaker: CircuitBreakerConfig::default(),
+                disable_retries: false,
+                disable_circuit_breaker: false,
+                health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+                enable_igw: false,
+                rate_limit_tokens_per_second: None,
+                connection_mode: ConnectionMode::Http,
+                model_path: None,
+                tokenizer_path: None,
             };
 
             // Router creation will fail due to health checks, but config should be valid
             let app_context =
-                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64);
+                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64, None)
+                    .expect("Failed to create AppContext");
             let app_context = std::sync::Arc::new(app_context);
-            let result = RouterFactory::create_router(&app_context);
+            let result = RouterFactory::create_router(&app_context).await;
             assert!(result.is_err());
             let error_msg = result.unwrap_err();
             // Error should be about health/timeout, not configuration
@@ -419,41 +429,6 @@ mod test_pd_routing {
     }
 
     #[test]
-    fn test_power_of_two_load_selection() {
-        // Test the power-of-two selection logic with different load scenarios
-
-        // Scenario 1: Clear winner for both prefill and decode
-        let _loads = vec![
-            ("prefill1", 100),
-            ("prefill2", 10), // Should be selected
-            ("decode1", 50),
-            ("decode2", 5), // Should be selected
-        ];
-
-        // In actual implementation, the lower load should be selected
-        assert!(10 < 100);
-        assert!(5 < 50);
-
-        // Scenario 2: Equal loads (should select first)
-        let _equal_loads = vec![
-            ("prefill1", 20),
-            ("prefill2", 20), // Either could be selected
-            ("decode1", 30),
-            ("decode2", 30), // Either could be selected
-        ];
-
-        // When loads are equal, <= comparison means first is selected
-        assert!(20 <= 20);
-        assert!(30 <= 30);
-
-        // Scenario 3: Missing load data (should default to usize::MAX)
-        // This tests the unwrap_or(usize::MAX) behavior
-        let missing_load = usize::MAX;
-        assert!(10 < missing_load);
-        assert!(missing_load > 0);
-    }
-
-    #[test]
     fn test_load_monitoring_configuration() {
         // Test that load monitoring is only enabled for PowerOfTwo policy
         let policies = vec![
@@ -602,12 +577,10 @@ mod test_pd_routing {
     #[test]
     fn test_streaming_response_parsing() {
         // Test SSE format parsing from streaming responses
-        let sse_chunks = vec![
-            "data: {\"text\":\"Hello\",\"meta_info\":{\"completion_tokens\":1,\"finish_reason\":null}}",
+        let sse_chunks = ["data: {\"text\":\"Hello\",\"meta_info\":{\"completion_tokens\":1,\"finish_reason\":null}}",
             "data: {\"text\":\" world\",\"meta_info\":{\"completion_tokens\":2,\"finish_reason\":null}}",
             "data: {\"text\":\"!\",\"meta_info\":{\"completion_tokens\":3,\"finish_reason\":{\"type\":\"length\"}}}",
-            "data: [DONE]",
-        ];
+            "data: [DONE]"];
 
         for chunk in &sse_chunks[..3] {
             assert!(chunk.starts_with("data: "));
@@ -845,7 +818,7 @@ mod test_pd_routing {
             large_batch_request["bootstrap_host"] = json!(vec![hostname; batch_size]);
             large_batch_request["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
             large_batch_request["bootstrap_room"] = json!((0..batch_size)
-                .map(|_| rand::thread_rng().gen::<u64>())
+                .map(|_| rand::random::<u64>())
                 .collect::<Vec<_>>());
 
             let elapsed = start.elapsed();

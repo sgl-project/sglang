@@ -222,6 +222,7 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
@@ -231,8 +232,17 @@ class RotaryEmbedding(CustomOp):
                 head_size=self.head_size,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
+                # Compatible with old sgl-kernel
+                **(
+                    dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
+                    if fused_set_kv_buffer_arg is not None
+                    else {}
+                ),
             )
         else:
+            assert (
+                fused_set_kv_buffer_arg is None
+            ), "save kv cache is not supported for vllm_rotary_embedding."
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             self.vllm_rotary_embedding(
                 positions,
@@ -1019,6 +1029,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
+    @torch.compile(dynamic=True)
     def forward(
         self,
         positions: torch.Tensor,
@@ -1421,24 +1432,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                 )
 
             return position_ids, mrope_position_deltas
-
-    @staticmethod
-    def get_next_input_positions(
-        mrope_position_delta: int,
-        context_len: int,
-        seq_len: int,
-    ) -> torch.Tensor:
-        return torch.tensor(
-            [
-                list(
-                    range(
-                        context_len + mrope_position_delta,
-                        seq_len + mrope_position_delta,
-                    )
-                )
-                for _ in range(3)
-            ]
-        )
 
 
 class DualChunkRotaryEmbedding(CustomOp):
@@ -1865,7 +1858,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(
+def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
@@ -1886,6 +1879,33 @@ def apply_rotary_pos_emb(
     k_embed = k_embed.to(orig_k_dtype)
 
     return q_embed, k_embed
+
+
+def apply_rotary_pos_emb_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim=1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if q.shape[1] != 128:
+        return apply_rotary_pos_emb_native(q, k, cos, sin, unsqueeze_dim)
+    cos = cos.unsqueeze(unsqueeze_dim)
+    cos = torch.transpose(cos, 1, 2)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    sin = torch.transpose(sin, 1, 2)
+    q = torch.transpose(q, 1, 2)
+    k = torch.transpose(k, 1, 2)
+    q_embed, k_embed = torch_npu.npu_apply_rotary_pos_emb(q, k, cos, sin)
+    q_embed = torch.transpose(q_embed, 1, 2)
+    k_embed = torch.transpose(k_embed, 1, 2)
+    return q_embed, k_embed
+
+
+if _is_npu:
+    apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+else:
+    apply_rotary_pos_emb = apply_rotary_pos_emb_native
 
 
 def get_rope_cpu(
