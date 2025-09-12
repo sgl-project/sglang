@@ -77,6 +77,29 @@ jobs:
           exit 1
         fi
 
+        echo "=== GPU Process Check ==="
+        # Fail fast if any GPU compute processes are active
+        if command -v nvidia-smi >/dev/null 2>&1; then
+          # Try to query compute apps first (preferred and concise)
+          gpu_procs=$(nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid --format=csv,noheader 2>/dev/null | sed '/^$/d' || true)
+
+          # Fallback to detailed PIDS report if the query returns nothing but there might still be processes
+          if [ -z "$gpu_procs" ]; then
+            gpu_procs=$(nvidia-smi -q -d PIDS 2>/dev/null | awk '/Processes/{flag=1;next}/^$/{flag=0}flag' | sed '/^\s*Processes:/d' | sed '/^\s*$/d' || true)
+          fi
+
+          if [ -n "$gpu_procs" ]; then
+            echo "Error: Found active GPU processes using the device(s):"
+            echo "$gpu_procs"
+            exit 1
+          else
+            echo "No active GPU compute processes detected."
+          fi
+        else
+          echo "Error: nvidia-smi not found; skipping GPU process check."
+          exit 1
+        fi
+
         echo "=== RDMA Validation ==="
         if ! command -v ibv_devices >/dev/null 2>&1; then
           echo "Error: InfiniBand tools not found"
@@ -165,15 +188,25 @@ jobs:
         POLICIES=("random" "round_robin" "cache_aware" "power_of_two")
         BASE_URL="http://127.0.0.9:8000"
 
+        # Free commonly used ports for router and metrics
+        echo "Freeing ports 29000 (metrics) and 8000 (API), if in use..."
+        fuser -k -n tcp 29000 2>/dev/null || true
+        fuser -k -n tcp 8000 2>/dev/null || true
+        sleep 1
+
         for policy in "${POLICIES[@]}"; do
           echo ""
           echo "=================================================="
           echo "Testing policy: $policy"
           echo "=================================================="
 
+          # Free ports before starting router
+          fuser -k -n tcp 29000 2>/dev/null || true
+          fuser -k -n tcp 8000 2>/dev/null || true
+
           # Start router with the current policy
           echo "Starting router with policy: $policy..."
-          python3 -m sglang_router.launch_router \
+          RUST_BACKTRACE=1 python3 -m sglang_router.launch_router \
             --pd-disaggregation \
             --policy "$policy" \
             --prefill http://127.0.0.1:30001 9001 \
