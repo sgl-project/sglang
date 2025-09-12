@@ -1,13 +1,9 @@
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
-from torch.nn.parameter import Parameter
 from tqdm import tqdm
 from tqdm.std import EMA
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    requantize_with_max_scale,
-)
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.int4fp8_utils import (
@@ -16,18 +12,12 @@ from sglang.srt.layers.int4fp8_utils import (
     quantize_int4_scale_columnwise,
 )
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
-    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-from sglang.srt.layers.quantization.fp8_utils import (
-    apply_fp8_linear,
-    normalize_e4m3fn_to_e4m3fnuz,
-)
 from sglang.srt.utils import BAR_FORMAT, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
