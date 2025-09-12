@@ -1785,12 +1785,6 @@ class ServerArgs:
             help="The storage backend for hierarchical KV cache.",
         )
         parser.add_argument(
-            "--hicache-storage-backend-tag",
-            type=str,
-            default=ServerArgs.hicache_storage_backend_tag,
-            help="The storage backend tag for multiple tenant.",
-        )
-        parser.add_argument(
             "--hicache-storage-prefetch-policy",
             type=str,
             choices=["best_effort", "wait_complete", "timeout"],
