@@ -489,7 +489,7 @@ pub fn build_app(
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
-.route("/v1/responses", post(v1_responses))
+        .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
 <<<<<<< HEAD
         .route("/v1/responses/{response_id}", get(v1_responses_get))
