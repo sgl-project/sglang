@@ -6,6 +6,7 @@ from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,
@@ -24,4 +25,5 @@ __all__ = [
     "Step3VLConfig",
     "Step3TextConfig",
     "Step3VisionEncoderConfig",
+    "Qwen3NextConfig",
 ]

@@ -243,6 +243,10 @@ suite_amd = {
         TestFile("test_wave_attention_kernels.py", 2),
         TestFile("test_wave_attention_backend.py", 150),
     ],
+    "per-commit-amd-mi35x": [
+        TestFile("test_mla.py", 242),
+        TestFile("test_gpt_oss_1gpu.py", 600),
+    ],
     "per-commit-2-gpu-amd": [
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
@@ -295,6 +299,9 @@ suite_ascend = {
     "per-commit-4-ascend-npu": [
         TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
+    ],
+    "per-commit-16-ascend-a3": [
+        TestFile("ascend/test_ascend_deepep.py", 400),
     ],
 }
 
