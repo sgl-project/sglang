@@ -69,7 +69,7 @@ python -m mooncake.http_metadata_server
 mooncake_master
 ```
 
-If you want to start both metadata service and master service.
+To start both the metadata and master services together:
 ```bash
 mooncake_master --enable_http_metadata_server=true
 ```
