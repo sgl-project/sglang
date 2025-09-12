@@ -1087,7 +1087,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--schedule-low-priority-values-first",
-            type=int,
+            action="store_true",
             default=ServerArgs.schedule_low_priority_values_first,
             help="If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first.",
         )
