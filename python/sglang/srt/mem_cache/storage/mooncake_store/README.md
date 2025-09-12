@@ -57,13 +57,13 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 **Launch Mooncake `metadata service`:**
 
 ```bash
-nohup python -m mooncake.http_metadata_server > meta.out &
+python -m mooncake.http_metadata_server
 ```
 
 **Launch Mooncake `master service`:**
 
 ```bash
-nohup mooncake_master > mooncake_master.out &
+mooncake_master
 ```
 
 **Launch Mooncake `store service`:**
