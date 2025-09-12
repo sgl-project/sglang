@@ -1417,13 +1417,22 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
     ) -> Response {
 <<<<<<< HEAD
+<<<<<<< HEAD
         self.route_typed_request(headers, body, "/v1/responses", model_id)
 =======
 <<<<<<< HEAD
+=======
+>>>>>>> 32aa1d136 (resolve conflicts)
         self.route_typed_request(headers, body, "/v1/responses")
 >>>>>>> b5c21104e (apply review comments)
             .await
-=======
+    }
+
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+    ) -> Response {
         // Record embeddings-specific metrics in addition to general request metrics
         let start = Instant::now();
         let res = self
@@ -1440,6 +1449,7 @@ impl RouterTrait for Router {
         }
 
         res
+<<<<<<< HEAD
 >>>>>>> 93e97e95e (apply review comments)
     }
 
@@ -1456,6 +1466,8 @@ impl RouterTrait for Router {
     async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
         // Not implemented for regular router in this branch
         (StatusCode::NOT_IMPLEMENTED, "Embeddings not implemented").into_response()
+=======
+>>>>>>> 32aa1d136 (resolve conflicts)
     }
 
     async fn route_rerank(
