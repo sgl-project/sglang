@@ -327,7 +327,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             eps=self.layer_norm_epsilon,
             group_size=None,
             norm_before_gate=True,
-            device=torch.cuda.current_device(),
+            device=torch.get_device_module().current_device(),
             dtype=config.torch_dtype,
         )
 
@@ -454,6 +454,8 @@ class Qwen3GatedDeltaNet(nn.Module):
             "dt_bias": self.dt_bias,
             "layer_id": self.layer_id,
             "seq_len": seq_len,
+            "num_k_heads": self.num_k_heads,
+            "num_v_heads": self.num_v_heads,
             "z": z,
         }
 
