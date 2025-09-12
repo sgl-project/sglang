@@ -722,6 +722,13 @@ class ServerArgs:
             self.hicache_io_backend = "kernel"
             self.hicache_mem_layout = "page_first"
 
+        if self.hicache_mem_layout == "page_first_direct":
+            if self.hicache_io_backend != "direct":
+                self.hicache_io_backend = "direct"
+                logger.warning(
+                    "Page first direct layout only support direct io backend"
+                )
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
@@ -748,7 +755,12 @@ class ServerArgs:
                 )
 
             model_arch = self.get_hf_config().architectures[0]
-            if model_arch in ["DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"]:
+            if model_arch in [
+                "DeepseekV3ForCausalLM",
+                "Glm4MoeForCausalLM",
+                "BailingMoeV2ForCausalLM",
+                "BailingMoeV2ForCausalLM",
+            ]:
                 # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -1792,7 +1804,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-mem-layout",
             type=str,
-            choices=["layer_first", "page_first"],
+            choices=["layer_first", "page_first", "page_first_direct"],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
         )
@@ -2736,6 +2748,8 @@ def auto_choose_speculative_params(self: ServerArgs):
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
     ]:
         # The default value for deepseek and gpt-oss
         return (3, 1, 4)
