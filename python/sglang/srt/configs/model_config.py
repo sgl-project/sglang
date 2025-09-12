@@ -147,6 +147,9 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
 
+        if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
+            self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
+
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
@@ -303,11 +306,16 @@ class ModelConfig:
         ) or getattr(self.hf_config, "image_token_index", None)
 
     @staticmethod
-    def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
+    def from_server_args(
+        server_args: ServerArgs,
+        model_path: str = None,
+        model_revision: str = None,
+        **kwargs,
+    ):
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
+            revision=model_revision or server_args.revision,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
@@ -413,11 +421,20 @@ class ModelConfig:
             is_local = os.path.exists(self.model_path)
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
-                from huggingface_hub import HfApi
+                import huggingface_hub
 
-                hf_api = HfApi()
-                if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
-                    quant_cfg = modelopt_quant_config
+                try:
+                    from huggingface_hub import HfApi
+
+                    hf_api = HfApi()
+                    if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
+                        quant_cfg = modelopt_quant_config
+                except huggingface_hub.errors.OfflineModeIsEnabled:
+                    logger.warning(
+                        "Offline mode is enabled, skipping hf_quant_config.json check"
+                    )
+                    pass
+
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
                     self.model_path, "hf_quant_config.json"
