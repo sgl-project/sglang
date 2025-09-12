@@ -105,6 +105,7 @@ _is_npu = is_npu()
 # For demonstration, we'll assume "fp8" maps to a hypothetical "FP8_QUANT_CFG" attribute in mtq.
 QUANT_CFG_CHOICES = {
     "fp8": "FP8_DEFAULT_CFG",  # Replace "FP8_DEFAULT_CFG" with the actual attribute name in mtq for FP8 config
+    "nvfp4": "NVFP4_DEFAULT_CFG",
     # Add other presets like:
     # "int4_awq": "INT4_AWQ_DEFAULT_CFG",
 }
@@ -497,28 +498,6 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
-        # target_device = torch.device(device_config.device)
-        # with set_default_torch_dtype(model_config.dtype):
-        #     with target_device:
-        #         model = _initialize_model(
-        #             model_config,
-        #             self.load_config,
-        #         )
-
-        #     model.load_weights(self._get_all_weights(model_config, model))
-
-        #     for _, module in model.named_modules():
-        #         quant_method = getattr(module, "quant_method", None)
-        #         if quant_method is not None:
-        #             # When quant methods need to process weights after loading
-        #             # (for repacking, quantizing, etc), they expect parameters
-        #             # to be on the global target device. This scope is for the
-        #             # case where cpu offloading is used, where we will move the
-        #             # parameters onto device for processing and back off after.
-        #             with device_loading_context(module, target_device):
-        #                 quant_method.process_weights_after_loading(module)
-        # return model.eval()
 
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
 
