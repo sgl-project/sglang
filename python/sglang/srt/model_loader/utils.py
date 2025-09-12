@@ -85,7 +85,13 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     architectures = getattr(model_config.hf_config, "architectures", [])
     # Special handling for quantized Mixtral.
     # FIXME(woosuk): This is a temporary hack.
-    mixtral_supported = ["fp8", "compressed-tensors", "gptq_marlin", "awq_marlin", "int4fp8_moe"]
+    mixtral_supported = [
+        "fp8",
+        "compressed-tensors",
+        "gptq_marlin",
+        "awq_marlin",
+        "int4fp8_moe",
+    ]
 
     if (
         model_config.quantization is not None

@@ -50,6 +50,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+from sglang.srt.layers.quantization.int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -61,7 +62,6 @@ from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.layers.quantization.int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.utils import is_cuda, is_hip, mxfp_supported
 
 _is_mxfp_supported = mxfp_supported()

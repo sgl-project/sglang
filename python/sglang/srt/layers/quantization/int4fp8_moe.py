@@ -1,54 +1,50 @@
 import logging
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import torch
+from torch.nn.parameter import Parameter
 from tqdm import tqdm
 from tqdm.std import EMA
-import torch
-from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-from torch.nn.parameter import Parameter
-from sglang.srt.layers.moe import MoeRunnerConfig
-
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-    FusedMoEMethodBase,
-    LinearMethodBase,
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    requantize_with_max_scale,
 )
 
-from sglang.srt.layers.int4fp8_utils import quantize_fp8_scale_tensorwise, quantize_int4_scale_columnwise, pack_int4_to_int32
-
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.layers.int4fp8_utils import (
+    pack_int4_to_int32,
+    quantize_fp8_scale_tensorwise,
+    quantize_int4_scale_columnwise,
+)
+from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
+from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import requantize_with_max_scale
-from sglang.srt.utils import (
-    is_hip,
-    set_weight_attrs,
-    BAR_FORMAT
-)
-
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.utils import BAR_FORMAT, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher import (
-        DispatchOutput,
-    )
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _is_hip = is_hip()
 
 
 if _is_hip:
     from aiter import ActivationType, QuantType
-    from aiter.ops.shuffle import shuffle_weight
     from aiter.fused_moe import fused_moe
+    from aiter.ops.shuffle import shuffle_weight
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
 
 logger = logging.getLogger(__name__)
+
 
 def tqdm_reset_no_print(tqdm_bar: tqdm, total=None):
     tqdm_bar.n = 0
@@ -62,6 +58,7 @@ def tqdm_reset_no_print(tqdm_bar: tqdm, total=None):
     tqdm_bar._ema_dt = EMA(tqdm_bar.smoothing)
     tqdm_bar._ema_miniters = EMA(tqdm_bar.smoothing)
 
+
 class QuarkInt4Fp8Config(QuantizationConfig):
     """Config class for Quark Quantization.
 
@@ -69,7 +66,8 @@ class QuarkInt4Fp8Config(QuantizationConfig):
     - Activation: dynamic, per-token, symmetric
     """
 
-    def __init__(self,
+    def __init__(
+        self,
         is_checkpoint_fp8_serialized: bool = False,
         activation_scheme: str = "dynamic",
     ):
@@ -77,7 +75,9 @@ class QuarkInt4Fp8Config(QuantizationConfig):
         self.activation_scheme = activation_scheme
 
         if activation_scheme != "dynamic":
-            raise NotImplementedError("QuarkInt4Fp8Config only supports activation_scheme='dynamic'.")
+            raise NotImplementedError(
+                "QuarkInt4Fp8Config only supports activation_scheme='dynamic'."
+            )
 
         self.weight_block_size = None
 
@@ -87,7 +87,13 @@ class QuarkInt4Fp8Config(QuantizationConfig):
 
         # The weight iterator already has a progress bar on rank=0, account for that.
         position = 1 + tqdm._get_free_pos()
-        self.online_quant_progress_bar = tqdm(total=0, desc=f"Online int4fp8_moe quantization on rank={tp_rank}", position=position, bar_format=BAR_FORMAT, mininterval=2.)
+        self.online_quant_progress_bar = tqdm(
+            total=0,
+            desc=f"Online int4fp8_moe quantization on rank={tp_rank}",
+            position=position,
+            bar_format=BAR_FORMAT,
+            mininterval=2.0,
+        )
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -123,7 +129,7 @@ class QuarkInt4Fp8Config(QuantizationConfig):
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return QuarkInt4Fp8MoEMethod(self)
-        
+
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -138,6 +144,7 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
     Args:
         quant_config: The quantization config.
     """
+
     def __init__(self, quant_config):
         self.quant_config = quant_config
 
@@ -146,7 +153,9 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         if not _is_hip:
-            raise NotImplementedError("The int4fp8_moe online quantization scheme is only supported on AMD GPUs.")
+            raise NotImplementedError(
+                "The int4fp8_moe online quantization scheme is only supported on AMD GPUs."
+            )
 
     def get_weight_loader(self, layer, original_weight_loader):
         def online_int4_fp8_weight_loader(
@@ -180,14 +189,14 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
                     loaded_weight = loaded_weight.narrow(
                         shard_dim, shard_size * self.tp_rank, shard_size
                     )
-                        
+
             # We want to run online quantization on-device for speed purposes.
             loaded_weight = loaded_weight.to(param.device)
 
             _, fp8_scale = quantize_fp8_scale_tensorwise(loaded_weight)
 
             int4_w, int4_scale = quantize_int4_scale_columnwise(loaded_weight)
-            
+
             int4_w = pack_int4_to_int32(int4_w)
             int4_scale /= fp8_scale
 
@@ -196,16 +205,22 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
                     shard_slice = slice(0, shard_size)
                     idx = 0
                 else:
-                    shard_slice = slice(shard_size,  2 * shard_size)
+                    shard_slice = slice(shard_size, 2 * shard_size)
                     idx = 1
 
                 assert param[expert_id][shard_slice].dtype == int4_w.dtype
 
-                assert layer.w13_int4_scale[expert_id][shard_slice].shape == int4_scale.shape
-                assert layer.w13_int4_scale[expert_id][shard_slice].dtype == int4_scale.dtype
+                assert (
+                    layer.w13_int4_scale[expert_id][shard_slice].shape
+                    == int4_scale.shape
+                )
+                assert (
+                    layer.w13_int4_scale[expert_id][shard_slice].dtype
+                    == int4_scale.dtype
+                )
 
                 layer.w13_int4_scale[expert_id][shard_slice].copy_(int4_scale)
-                
+
                 assert layer.w13_fp8_scale[expert_id][idx].shape == fp8_scale.shape
                 assert layer.w13_fp8_scale[expert_id][idx].dtype == fp8_scale.dtype
 
@@ -224,7 +239,13 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
 
                 layer.w2_fp8_scale[expert_id].copy_(fp8_scale)
 
-            original_weight_loader(param, int4_w, shard_id=shard_id, weight_name=weight_name, expert_id=expert_id)
+            original_weight_loader(
+                param,
+                int4_w,
+                shard_id=shard_id,
+                weight_name=weight_name,
+                expert_id=expert_id,
+            )
 
             # Reset `use_presharded_weights` as the same layer may load several different weights.
             layer.use_presharded_weights = original_use_presharded_weights
@@ -254,7 +275,9 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         assert "weight_loader" in extra_weight_attrs
         original_weight_loader = extra_weight_attrs.get("weight_loader")
 
-        online_int4fp8_weight_loader = self.get_weight_loader(layer, original_weight_loader)
+        online_int4fp8_weight_loader = self.get_weight_loader(
+            layer, original_weight_loader
+        )
         extra_weight_attrs["weight_loader"] = online_int4fp8_weight_loader
 
         params_dtype = torch.uint32
@@ -271,7 +294,10 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         )
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, hidden_size, intermediate_size_per_partition // 8, dtype=params_dtype
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 8,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -294,7 +320,11 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
 
         if _is_hip:
             w13_int4_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2 * intermediate_size_per_partition, dtype=torch.float32),
+                torch.ones(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    dtype=torch.float32,
+                ),
                 requires_grad=False,
             )
             w2_int4_scale = torch.nn.Parameter(
@@ -400,7 +430,9 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
-        assert not moe_runner_config.no_combine, f"no_combine={moe_runner_config.no_combine} is not supported."
+        assert (
+            not moe_runner_config.no_combine
+        ), f"no_combine={moe_runner_config.no_combine} is not supported."
 
         output = fused_moe(
             dispatch_output.hidden_states,
@@ -419,4 +451,3 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         return StandardCombineInput(hidden_states=output)
-

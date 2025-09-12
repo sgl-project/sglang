@@ -1,13 +1,12 @@
 from types import SimpleNamespace
-from sglang.test.test_utils import CustomTestCase
-from sglang.test.few_shot_gsm8k import run_eval
 
+from sglang.srt.utils import kill_process_tree
+from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.srt.utils import kill_process_tree
 
 
 class TestMixtralAccuracy(CustomTestCase):
@@ -27,7 +26,7 @@ class TestMixtralAccuracy(CustomTestCase):
             "int4fp8_moe",
             # The default aiter attention backend raises segmentation faults and other errors - as int4fp8_moe is not related to attention, let's just use triton here.
             "--attention-backend",
-            "triton"
+            "triton",
         ]
 
         cls.process = popen_launch_server(

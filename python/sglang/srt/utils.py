@@ -121,6 +121,7 @@ builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 # each line of output with some prefix.
 BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
 
+
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda
 
