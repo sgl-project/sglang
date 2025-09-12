@@ -9,8 +9,8 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
 use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponsesRequest,
-    StringOrArray, UserMessageContent,
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
+    ResponsesRequest, StringOrArray, UserMessageContent,
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1946,8 +1946,25 @@ impl RouterTrait for PDRouter {
         todo!()
     }
 
-    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
-        todo!()
+    async fn route_rerank(&self, headers: Option<&HeaderMap>, body: &RerankRequest) -> Response {
+        // Extract text for cache-aware routing
+        let req_text = if self.policies_need_request_text() {
+            Some(body.query.clone())
+        } else {
+            None
+        };
+
+        // Create context
+        let context = PDRequestContext {
+            route: "/v1/rerank",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            request_text: req_text,
+        };
+
+        // Execute with retry and bootstrap injection
+        self.execute_dual_dispatch(headers, body, context).await
     }
 
     async fn flush_cache(&self) -> Response {

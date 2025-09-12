@@ -234,7 +234,11 @@ impl RouterTrait for GrpcRouter {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+    async fn route_rerank(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::RerankRequest,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
