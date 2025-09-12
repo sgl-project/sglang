@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     write_github_step_summary,
 )
+
 # Dense model configuration
 DENSE_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 if torch.version.hip is not None:
