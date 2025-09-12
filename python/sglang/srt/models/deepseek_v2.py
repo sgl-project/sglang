@@ -96,6 +96,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -460,8 +461,9 @@ class DeepseekV2MoE(nn.Module):
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
                 deepep_mode=get_deepep_mode(),
-                async_finish=True,
-                return_recv_hook=True,
+                async_finish=not DeepEPConfig.get_instance().return_recv_hook_normal,
+                return_recv_hook_normal=DeepEPConfig.get_instance().return_recv_hook_normal,
+                return_recv_hook_low_latency=True,
             )
 
         self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()

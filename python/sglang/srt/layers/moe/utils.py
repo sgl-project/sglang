@@ -91,7 +91,7 @@ class DeepEPMode(Enum):
             return DeepEPMode.LOW_LATENCY
 
     def is_normal(self) -> bool:
-        return self == DeepEPMode.NORMAL
+        return self == DeepEPMode.NORMAL  ## 'can_return_recv_hook_normal' for buffer init && 'return_recv_hook' for the dispatcher and dispatch
 
     def is_low_latency(self) -> bool:
         return self == DeepEPMode.LOW_LATENCY

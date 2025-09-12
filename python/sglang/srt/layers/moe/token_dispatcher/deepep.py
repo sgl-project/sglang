@@ -126,8 +126,11 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        can_return_recv_hook_normal: bool = False,
     ):
-        if cls._buffer is not None:
+        if DeepEPBuffer._can_return_recv_hook_normal == False and can_return_recv_hook_normal == True:
+            del cls._buffer
+        elif cls._buffer is not None:  ## buffer is a single instance
             return cls._buffer
 
         cls._hidden_size = hidden_size
@@ -137,6 +140,24 @@ class DeepEPBuffer:
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
+
+            if can_return_recv_hook_normal:
+                DeepEPBuffer._can_return_recv_hook_normal = True
+                for config in (
+                    DeepEPConfig.get_instance().normal_dispatch_config
+                    or Config(64, 8, group.size() * 64, 16, 128),
+                    DeepEPConfig.get_instance().normal_combine_config
+                    or Config(64, 8, group.size() * 64, 16, 128),
+                ):
+                    num_nvl_bytes = max(
+                        config.get_nvl_buffer_size_hint(hidden_bytes, group.size(), True),
+                        num_nvl_bytes,
+                    )
+                    num_rdma_bytes = max(
+                        config.get_rdma_buffer_size_hint(num_max_dispatch_tokens_per_rank, hidden_bytes, group.size(), True, True),
+                        num_rdma_bytes,
+                    )
+
             for config in (
                 DeepEPConfig.get_instance().normal_dispatch_config
                 or Buffer.get_dispatch_config(group.size()),
@@ -144,11 +165,11 @@ class DeepEPBuffer:
                 or Buffer.get_combine_config(group.size()),
             ):
                 num_nvl_bytes = max(
-                    config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
+                    config.get_nvl_buffer_size_hint(hidden_bytes, group.size(), False),
                     num_nvl_bytes,
                 )
                 num_rdma_bytes = max(
-                    config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
+                    config.get_rdma_buffer_size_hint(num_max_dispatch_tokens_per_rank, hidden_bytes, group.size(), False, False),
                     num_rdma_bytes,
                 )
         if deepep_mode.enable_low_latency():
@@ -165,7 +186,10 @@ class DeepEPBuffer:
             )
 
         if deepep_mode == DeepEPMode.NORMAL:
-            num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
+            if can_return_recv_hook_normal:
+                num_qps_per_rank = DeepEPConfig.get_instance().num_sms
+            else:
+                num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
         elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
             num_qps_per_rank = num_experts // group.size()
         else:
@@ -227,6 +251,9 @@ class DeepEPConfig(BaseDispatcherConfig):
             config_parsed = load_json_config(config_str)
             if torch.distributed.get_rank() == 0:
                 logger.info(f"Use DeepEP Config: {config_parsed}")
+            self.return_recv_hook_normal = config_parsed["return_recv_hook_normal"] if "return_recv_hook_normal" in config_parsed else None
+            config_dispatch = config_parsed["normal_dispatch_sm_free"] if self.return_recv_hook_normal else config_parsed["normal_dispatch"]
+            config_combine = config_parsed["normal_combine_sm_free"] if self.return_recv_hook_normal else config_parsed["normal_combine"]
             config_dispatch = config_parsed["normal_dispatch"]
             config_combine = config_parsed["normal_combine"]
 
@@ -238,7 +265,8 @@ class DeepEPConfig(BaseDispatcherConfig):
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
-            self.num_sms = Buffer.num_sms
+            self.num_sms = Buffer.num_sms  ## 20
+            self.return_recv_hook_normal = None  ## SM Free not enabled by user
 
     @classmethod
     def get_instance(cls):
@@ -275,6 +303,9 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
+        self.num_max_dispatch_tokens_per_rank_sm_free_prefill = get_int_env_var(
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK_SM_FREE_PREFILL", 16384
+        )
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
         )
@@ -311,10 +342,11 @@ class _DeepEPDispatcherImplBase:
 
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
-    def __init__(self, async_finish: bool, **kwargs):
+    def __init__(self, async_finish: bool, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
         self.async_finish = async_finish
+        self.return_recv_hook = return_recv_hook
         self.src2dst = None
 
     def dispatch_a(
@@ -334,17 +366,20 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
         previous_event = Buffer.capture() if self.async_finish else None
-        return hidden_states, topk_idx, topk_weights, previous_event
-
-    def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
         (
             hidden_states,
             topk_idx,
             topk_weights,
             num_recv_tokens_per_expert,
             event,
+            hook,
         ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
+
+        return hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert, event, hook
+
+    def dispatch_b(self, hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert, event, hook):
         event.current_stream_wait() if self.async_finish else ()
+        hook() if self.return_recv_hook else ()
         return DeepEPNormalOutput(
             hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
         )
@@ -369,6 +404,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
+            return_recv_hook=self.return_recv_hook,
         )
 
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
@@ -382,6 +418,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_recv_tokens_per_expert,
             self.handle,
             event,
+            hook,
         ) = buffer.dispatch(
             x,
             topk_idx=topk_idx,
@@ -392,6 +429,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_expert=num_tokens_per_expert,
             previous_event=previous_event,
             async_finish=self.async_finish,
+            return_recv_hook=self.return_recv_hook,
+            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank_sm_free_prefill,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
@@ -410,6 +449,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_topk_weights,
             num_recv_tokens_per_expert,
             event,
+            hook,
         )
 
     def combine_a(
@@ -449,26 +489,29 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     dtype=hidden_states.dtype,
                 )
         previous_event = Buffer.capture() if self.async_finish else None
-        return output, previous_event
+        hidden_states, event, hook = self._combine_core(output, previous_event)
+        return hidden_states, event, hook
 
-    def combine_b(self, output, previous_event):
-        hidden_states, event = self._combine_core(output, previous_event)
+    def combine_b(self, hidden_states, event, hook):
         event.current_stream_wait() if self.async_finish else ()
+        hook() if self.return_recv_hook else ()
+
         self.handle = None
         self.src2dst = None
         return hidden_states
 
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
-        combined_x, _, event = buffer.combine(
+        combined_x, _, event, hook = buffer.combine(
             x,
             self.handle,
             async_finish=self.async_finish,
+            return_recv_hook=self.return_recv_hook,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
             config=DeepEPConfig.get_instance().normal_combine_config,
         )
-        return combined_x, event
+        return combined_x, event, hook
 
     def _get_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_normal()
@@ -478,8 +521,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.hidden_size,
             self.params_bytes,
             self.deepep_mode,
-            self.num_max_dispatch_tokens_per_rank,
+            self.num_max_dispatch_tokens_per_rank_sm_free_prefill,
             self.num_experts,
+            self.return_recv_hook
         )
 
 
@@ -613,6 +657,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            False
         )
 
 
@@ -636,7 +681,8 @@ class DeepEPDispatcher(BaseDispatcher):
         params_dtype: torch.dtype = None,
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
-        return_recv_hook: bool = False,
+        return_recv_hook_normal: bool = False,
+        return_recv_hook_low_latency: bool = False,
     ):
         self.deepep_mode = deepep_mode
 
@@ -653,12 +699,13 @@ class DeepEPDispatcher(BaseDispatcher):
 
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
-                return_recv_hook=return_recv_hook,
+                return_recv_hook=return_recv_hook_low_latency,
                 **common_kwargs,
             )
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher = _DeepEPDispatcherImplNormal(
                 async_finish=async_finish,
+                return_recv_hook=return_recv_hook_normal,
                 **common_kwargs,
             )
 
