@@ -100,6 +100,10 @@ def send_one_prompt(args):
 
 
 def test_deterministic(args):
+    # First do some warmups
+    for i in range(3):
+        send_one_prompt(args)
+
     speeds = []
     texts = []
     for i in range(args.n_trials):
