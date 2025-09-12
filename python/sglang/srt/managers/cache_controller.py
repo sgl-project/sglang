@@ -280,7 +280,12 @@ class HiCacheController:
                 model_name, storage_backend_tag, storage_backend_extra_config
             )
             if self.enable_storage_tag:
-                prefix = f"{self.storage_config.storage_backend_tag}_"
+                storage_backend_tag = (
+                    self.storage_config.extra_config.get("storage_backend_tag")
+                    if self.storage_config.extra_config
+                    else None
+                )
+                prefix = f"{storage_backend_tag}_"
                 self.get_hash_str = HiCacheController.get_hash_str_with_prefix(
                     get_hash_str, prefix
                 )
@@ -430,7 +435,7 @@ class HiCacheController:
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
         # Parse extra config JSON if provided
-        extra_config = None
+        extra_config = {}
         if storage_backend_extra_config:
             try:
                 import json
@@ -439,13 +444,16 @@ class HiCacheController:
             except Exception as e:
                 logger.error(f"Invalid backend extra config JSON: {e}")
 
+        # Add storage_backend_tag to extra_config if provided
+        if storage_backend_tag is not None:
+            extra_config["storage_backend_tag"] = storage_backend_tag
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             is_mla_model=is_mla_backend,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
-            storage_backend_tag=storage_backend_tag,
             extra_config=extra_config,
         )
 
