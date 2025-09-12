@@ -43,10 +43,6 @@ from sglang.srt.utils import (
     is_npu,
 )
 
-_is_cuda = is_cuda()
-if _is_cuda:
-    from sgl_kernel.elementwise import copy_to_gpu_no_ce
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLOutput,
@@ -925,6 +921,8 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
 
 
 def copy_list_to_gpu_no_ce(arr: List[int]):
+    from sgl_kernel.elementwise import copy_to_gpu_no_ce
+
     tensor_cpu = torch.tensor(arr, dtype=torch.int32, device="cpu")
     tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
     copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
