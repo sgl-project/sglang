@@ -202,9 +202,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
+        return_results: bool = True,
     ):
         super().__init__()
         self.quant_config = quant_config
+        self.return_results = return_results
 
         self.enable_tp = enable_tp
         if self.enable_tp:
@@ -479,11 +481,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            # Reduce across all the model parallel GPUs.
-            output = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            output = output_parallel
-        return output
+            if self.return_results:
+                # Reduce across all the model parallel GPUs.
+                output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"
