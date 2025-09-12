@@ -204,8 +204,7 @@ python -m sglang.launch_server                 \
     --tp 6
 ```
 
-Note: Please set `--torch-compile-max-bs` value as per the maximum desired batch size
-of your deployment scenario.
+Note: Please set `--torch-compile-max-bs` to the maximum desired batch size for your deployment. The value `4` in the examples is illustrative.
 
 Then you can test with `bench_serving` command or construct your own command or script
 following [the benchmarking example](#benchmarking-with-requests).
