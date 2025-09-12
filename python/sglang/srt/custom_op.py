@@ -5,6 +5,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
 )
@@ -15,6 +16,7 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 
 
 class CustomOp(nn.Module):
@@ -87,6 +89,9 @@ class CustomOp(nn.Module):
     def forward_cpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward_musa(self, *args, **kwargs):
+        return self.forward_cuda(*args, **kwargs)
+
     def dispatch_forward(self):
         if _is_cuda:
             return self.forward_cuda
@@ -98,5 +103,7 @@ class CustomOp(nn.Module):
             return self.forward_npu
         elif _is_xpu:
             return self.forward_xpu
+        elif _is_musa:
+            return self.forward_musa
         else:
             return self.forward_native

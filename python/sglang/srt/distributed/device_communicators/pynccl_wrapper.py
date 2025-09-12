@@ -29,7 +29,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
+from bidict import bidict
 from torch.distributed import ReduceOp
+
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
+
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +61,10 @@ def find_nccl_library() -> str:
             so_file = "libnccl.so.2"
         elif torch.version.hip is not None:
             so_file = "librccl.so.1"
+        elif torch.version.musa is not None:
+            so_file = "libmccl.so.2"
         else:
-            raise ValueError("NCCL only supports CUDA and ROCm backends.")
+            raise ValueError("NCCL only supports CUDA, ROCm and MUSA backends.")
         logger.debug("Found nccl from library %s", so_file)
     return so_file
 
@@ -152,20 +160,53 @@ class Function:
     argtypes: List[Any]
 
 
+_nccl_func_keys = [
+    "ncclGetErrorString",
+    "ncclGetVersion",
+    "ncclGetUniqueId",
+    "ncclCommInitRank",
+    "ncclAllReduce",
+    "ncclAllGather",
+    "ncclReduce",
+    "ncclReduceScatter",
+    "ncclSend",
+    "ncclRecv",
+    "ncclBroadcast",
+    "ncclCommDestroy",
+    "ncclGroupStart",
+    "ncclGroupEnd",
+    "ncclCommWindowRegister",
+    "ncclCommWindowDeregister",
+]
+
+if _is_musa:
+    nccl_func_map = bidict({k: "m" + k[1:] for k in _nccl_func_keys})
+else:
+    nccl_func_map = bidict({k: k for k in _nccl_func_keys})
+
+
 class NCCLLibrary:
     exported_functions = [
         # const char* ncclGetErrorString(ncclResult_t result)
-        Function("ncclGetErrorString", ctypes.c_char_p, [ncclResult_t]),
+        Function(nccl_func_map["ncclGetErrorString"], ctypes.c_char_p, [ncclResult_t]),
         # ncclResult_t  ncclGetVersion(int *version);
-        Function("ncclGetVersion", ncclResult_t, [ctypes.POINTER(ctypes.c_int)]),
+        Function(
+            nccl_func_map["ncclGetVersion"],
+            ncclResult_t,
+            [ctypes.POINTER(ctypes.c_int)],
+        ),
         # ncclResult_t ncclGetUniqueId(ncclUniqueId* uniqueId);
-        Function("ncclGetUniqueId", ncclResult_t, [ctypes.POINTER(ncclUniqueId)]),
+        Function(
+            nccl_func_map["ncclGetUniqueId"],
+            ncclResult_t,
+            [ctypes.POINTER(ncclUniqueId)],
+        ),
         # ncclResult_t  ncclCommInitRank(
         #   ncclComm_t* comm, int nranks, ncclUniqueId commId, int rank);
         # note that ncclComm_t is a pointer type, so the first argument
         # is a pointer to a pointer
         Function(
-            "ncclCommInitRank",
+            nccl_func_map["ncclCommInitRank"],
             ncclResult_t,
             [ctypes.POINTER(ncclComm_t), ctypes.c_int, ncclUniqueId, ctypes.c_int],
         ),
@@ -176,7 +217,7 @@ class NCCLLibrary:
         # note that cudaStream_t is a pointer type, so the last argument
         # is a pointer
         Function(
-            "ncclAllReduce",
+            nccl_func_map["ncclAllReduce"],
             ncclResult_t,
             [
                 buffer_type,
@@ -195,7 +236,7 @@ class NCCLLibrary:
         # note that cudaStream_t is a pointer type, so the last argument
         # is a pointer
         Function(
-            "ncclAllGather",
+            nccl_func_map["ncclAllGather"],
             ncclResult_t,
             [
                 buffer_type,
@@ -213,7 +254,7 @@ class NCCLLibrary:
         # note that cudaStream_t is a pointer type, so the last argument
         # is a pointer
         Function(
-            "ncclReduce",
+            nccl_func_map["ncclReduce"],
             ncclResult_t,
             [
                 buffer_type,
@@ -233,7 +274,7 @@ class NCCLLibrary:
         # note that cudaStream_t is a pointer type, so the last argument
         # is a pointer
         Function(
-            "ncclReduceScatter",
+            nccl_func_map["ncclReduceScatter"],
             ncclResult_t,
             [
                 buffer_type,
@@ -249,7 +290,7 @@ class NCCLLibrary:
         #   const void* sendbuff, size_t count, ncclDataType_t datatype,
         #   int dest, ncclComm_t comm, cudaStream_t stream);
         Function(
-            "ncclSend",
+            nccl_func_map["ncclSend"],
             ncclResult_t,
             [
                 buffer_type,
@@ -264,7 +305,7 @@ class NCCLLibrary:
         #   void* recvbuff, size_t count, ncclDataType_t datatype,
         #   int src, ncclComm_t comm, cudaStream_t stream);
         Function(
-            "ncclRecv",
+            nccl_func_map["ncclRecv"],
             ncclResult_t,
             [
                 buffer_type,
@@ -280,7 +321,7 @@ class NCCLLibrary:
         #   ncclDataType_t datatype, int root, ncclComm_t comm,
         #   cudaStream_t stream);
         Function(
-            "ncclBroadcast",
+            nccl_func_map["ncclBroadcast"],
             ncclResult_t,
             [
                 buffer_type,
@@ -297,17 +338,17 @@ class NCCLLibrary:
         # because Python object destruction can happen in random order,
         # it is better not to call it at all.
         # ncclResult_t  ncclCommDestroy(ncclComm_t comm);
-        Function("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
+        Function(nccl_func_map["ncclCommDestroy"], ncclResult_t, [ncclComm_t]),
         # ncclResult_t ncclGroupStart();
-        Function("ncclGroupStart", ncclResult_t, []),
+        Function(nccl_func_map["ncclGroupStart"], ncclResult_t, []),
         # ncclResult_t ncclGroupEnd();
-        Function("ncclGroupEnd", ncclResult_t, []),
+        Function(nccl_func_map["ncclGroupEnd"], ncclResult_t, []),
     ]
 
     exported_functions_symm_mem = [
         # ncclResult_t ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, ncclWindow_t* win, int winFlags);
         Function(
-            "ncclCommWindowRegister",
+            nccl_func_map["ncclCommWindowRegister"],
             ncclResult_t,
             [
                 ncclComm_t,
@@ -318,7 +359,11 @@ class NCCLLibrary:
             ],
         ),
         # ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win);
-        Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
+        Function(
+            nccl_func_map["ncclCommWindowDeregister"],
+            ncclResult_t,
+            [ncclComm_t, ncclWindow_t],
+        ),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -330,7 +375,6 @@ class NCCLLibrary:
     path_to_dict_mapping: Dict[str, Dict[str, Any]] = {}
 
     def __init__(self, so_file: Optional[str] = None):
-
         so_file = so_file or find_nccl_library()
 
         try:
@@ -361,7 +405,7 @@ class NCCLLibrary:
                 f = getattr(self.lib, func.name)
                 f.restype = func.restype
                 f.argtypes = func.argtypes
-                _funcs[func.name] = f
+                _funcs[nccl_func_map.inv[func.name]] = f
             NCCLLibrary.path_to_dict_mapping[so_file] = _funcs
         self._funcs = NCCLLibrary.path_to_dict_mapping[so_file]
 
