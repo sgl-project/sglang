@@ -40,6 +40,7 @@ def cutlass_fused_experts_fp8(
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
     use_fp8_blockscale: bool = True,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
 
@@ -94,7 +95,7 @@ def cutlass_fused_experts_fp8(
         b_scales_ptrs (torch.Tensor): Pointers container for calculating offsets of the input scales for each expert.
         use_fp8_blockscale (bool, optional): Flag indicating usage of FP8 with
             block scaling. Currently, only `True` is supported. Defaults to `True`.
-
+        output (torch.Tensor, optional): Output tensor. If not provided, a new tensor will be created.
     Returns:
         torch.Tensor: The computed MoE layer output. Shape: `(m, k)`, dtype matches `a`.
 
@@ -202,9 +203,11 @@ def cutlass_fused_experts_fp8(
         workspace,
     )
 
-    result = torch.empty((m, k), device=device, dtype=out_dtype)
-    apply_shuffle_mul_sum(c2, result, c_map, topk_weights.to(out_dtype))
-    return result
+    if output is None:
+        output = torch.empty((m, k), device=device, dtype=out_dtype)
+
+    apply_shuffle_mul_sum(c2, output, c_map, topk_weights.to(out_dtype))
+    return output
 
 
 FLOAT4_E2M1_MAX = 6.0
