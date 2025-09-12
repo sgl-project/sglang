@@ -25,8 +25,8 @@ if torch.version.hip is not None:
 elif torch.version.cuda is not None:
     print("Running on NVIDIA CUDA GPU")
     DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000.pkl"
-    DENSE_TOLERANCE_MAX_DIFF = 10
-    DENSE_TOLERANCE_MEAN_DIFF = 1.0
+    DENSE_TOLERANCE_MAX_DIFF = 1.5
+    DENSE_TOLERANCE_MEAN_DIFF = 0.1
 else:
     print("No GPU backend (CPU only)")
 
@@ -39,11 +39,8 @@ RETRY_DELAY = 2
 TEST_CONFIG = {
     "num_samples": 1000,
     "logprob_sample_ratio": 0.5,
-    "temperature": 2.0,
+    "temperature": 1.0,
 }
-
-# Only return original logprob that are not affected by the temperature
-os.environ["RETURN_ORIGINAL_LOGPROB"] = "True"
 
 
 class TestLogprobsDense(unittest.TestCase):
