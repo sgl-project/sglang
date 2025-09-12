@@ -774,9 +774,6 @@ class DeepEPMoE(EPMoE):
         # NOTE: Ascend's Dispatch & Combine does not support FP16
         output_dtype = torch.bfloat16
 
-        pertoken_scale = hidden_states[1]
-        hidden_states = hidden_states[0]
-
         group_list_type = 1
 
         def _forward_normal(dispatch_output: DeepEPNormalOutput):
