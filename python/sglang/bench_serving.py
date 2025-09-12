@@ -1002,11 +1002,15 @@ def sample_mmmu_requests(
                             # <|endoftext10|> is the image token used in the phi-4-multimodal model.
                             content = prompt.replace("image 1", "<|endoftext10|>")
                         else:
-                            content = [
-                                {
+                            if "llama" in tokenizer.name_or_path.lower():
+                                image_field = {"type": "image", "image": image_data}
+                            else:
+                                image_field = {
                                     "type": "image_url",
                                     "image_url": {"url": image_data},
-                                },
+                                }
+                            content = [
+                                image_field,
                                 {"type": "text", "text": prompt},
                             ]
                         prompt = tokenizer.apply_chat_template(
