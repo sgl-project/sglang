@@ -1112,7 +1112,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return _dispatch_mla_subtype()
         elif attention_backend == "trtllm_mla":
             original_mode = getattr(forward_batch, "_original_forward_mode", None)
-            skip_chunked_mha = False
             if (
                 original_mode is not None
                 and original_mode.is_decode()
