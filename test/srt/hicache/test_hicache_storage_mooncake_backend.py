@@ -1,4 +1,3 @@
-
 """
 Benchmark tests for HiCache Storage with Mooncake backend.
 Usage:
@@ -13,12 +12,10 @@ import unittest
 from types import SimpleNamespace
 
 import requests
-
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import CustomTestCase, find_available_port
-
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
@@ -32,9 +29,13 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     def setUpClass(cls):
         """Set up test environment and launch Mooncake services before server setup"""
         # Find available ports for Mooncake services to avoid conflicts
-        cls.mooncake_master_port = HiCacheStorageMooncakeBackendBaseMixin.mooncake_master_port_base
+        cls.mooncake_master_port = (
+            HiCacheStorageMooncakeBackendBaseMixin.mooncake_master_port_base
+        )
         # find_available_port(cls.mooncake_master_port_base)
-        cls.mooncake_metadata_port = HiCacheStorageMooncakeBackendBaseMixin.mooncake_metadata_port_base
+        cls.mooncake_metadata_port = (
+            HiCacheStorageMooncakeBackendBaseMixin.mooncake_metadata_port_base
+        )
         # find_available_port(cls.mooncake_metadata_port_base)
 
         # Start Mooncake services first
@@ -52,12 +53,13 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         # Stop Mooncake services
         cls._stop_mooncake_services()
 
-
     @classmethod
     def _start_mooncake_services(cls):
         """Start Mooncake metadata and master services with configurable ports and readiness detection"""
         print("Starting Mooncake services...")
-        print(f"Using master port: {cls.mooncake_master_port}, metadata port: {cls.mooncake_metadata_port}")
+        print(
+            f"Using master port: {cls.mooncake_master_port}, metadata port: {cls.mooncake_metadata_port}"
+        )
 
         # Start metadata service with configurable port
         try:
@@ -65,7 +67,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             # or command line argument. We'll set the environment variable before starting.
             metadata_env = os.environ.copy()
             metadata_env["MOONCAKE_METADATA_PORT"] = str(cls.mooncake_metadata_port)
-            
+
             cls.metadata_service_process = subprocess.Popen(
                 ["python3", "-m", "mooncake.http_metadata_server"],
                 stdout=subprocess.PIPE,
@@ -84,7 +86,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             # or command line argument. We'll set the environment variable before starting.
             master_env = os.environ.copy()
             master_env["MOONCAKE_MASTER_PORT"] = str(cls.mooncake_master_port)
-            
+
             cls.master_service_process = subprocess.Popen(
                 ["mooncake_master"],
                 stdout=subprocess.PIPE,
@@ -97,7 +99,6 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             print(f"Warning: Could not start Mooncake master service: {e}")
             cls.master_service_process = None
 
-
         # Wait for services to be ready instead of fixed sleep
         cls._wait_for_mooncake_services_ready()
 
@@ -105,18 +106,23 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     def _wait_for_mooncake_services_ready(cls, timeout: int = 30) -> bool:
         """Wait for Mooncake services to be ready by checking their endpoints"""
         print("Waiting for Mooncake services to be ready...")
-        
+
         start_time = time.time()
         services_ready = False
-        
+
         while time.time() - start_time < timeout:
             try:
                 # Check metadata service
                 metadata_ready = False
-                if cls.metadata_service_process and cls.metadata_service_process.poll() is None:
+                if (
+                    cls.metadata_service_process
+                    and cls.metadata_service_process.poll() is None
+                ):
                     try:
                         # Try to connect to the metadata service
-                        metadata_url = f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata"
+                        metadata_url = (
+                            f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata"
+                        )
                         response = requests.get(metadata_url, timeout=2)
                         if response.status_code == 200:
                             metadata_ready = True
@@ -124,30 +130,37 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
                     except (requests.RequestException, ConnectionError):
                         # Service might not be fully started yet
                         pass
-                
+
                 # Check master service (if it has a health endpoint)
                 master_ready = False
-                if cls.master_service_process and cls.master_service_process.poll() is None:
+                if (
+                    cls.master_service_process
+                    and cls.master_service_process.poll() is None
+                ):
                     # For now, we'll assume master service is ready if process is running
                     # and it's been a few seconds since startup
-                    if time.time() - start_time > 5:  # Give master service time to initialize
+                    if (
+                        time.time() - start_time > 5
+                    ):  # Give master service time to initialize
                         master_ready = True
                         print("Mooncake master service is ready")
-                
+
                 # Both services should be ready
                 if metadata_ready and master_ready:
                     services_ready = True
                     print("All Mooncake services are ready")
                     break
-                    
+
             except Exception as e:
                 print(f"Error checking service readiness: {e}")
-            
+
             time.sleep(2)
-        
+
         if not services_ready:
-            print("Warning: Mooncake services may not be fully ready, continuing anyway...")
-        
+            print(
+                "Warning: Mooncake services may not be fully ready, continuing anyway..."
+            )
+
         return services_ready
 
     @classmethod
@@ -172,7 +185,6 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
                 print("Mooncake master service stopped")
             except (ProcessLookupError, subprocess.TimeoutExpired, OSError) as e:
                 print(f"Warning: Could not stop Mooncake master service: {e}")
-
 
     @classmethod
     def _get_additional_server_args_and_env(cls):
