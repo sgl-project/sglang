@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -372,8 +373,8 @@ class DeepEPMoE(EPMoE):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=self.deepep_mode,
-            async_finish=True,  # TODO
-            return_recv_hook=True,
+            async_finish=not DeepEPConfig.get_instance().return_recv_hook_normal,  # TODO
+            return_recv_hook_normal=DeepEPConfig.get_instance().return_recv_hook_normal,
         )
 
         if self.deepep_mode.enable_low_latency() and not _is_npu:

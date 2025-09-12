@@ -83,29 +83,57 @@ def _compute_moe_deepseek_blog_prefill(layer):
     device_properties = torch.cuda.get_device_properties(device="cuda")
     total_num_sms = device_properties.multi_processor_count
     deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+    return_recv_hook_normal = DeepEPConfig.get_instance().return_recv_hook_normal
 
-    return OperationsStrategy(
-        deep_gemm_num_sms=deep_gemm_num_sms,
-        tbo_delta_stages=0,
-        operations=[
-            layer.op_comm_prepare_attn,
-            layer.self_attn.op_prepare,
-            layer.self_attn.op_core,
-            layer.op_comm_prepare_mlp,
-            layer.mlp.op_gate,
-            layer.mlp.op_select_experts,
-            layer.mlp.op_dispatch_a,
-            operations.YieldOperation(),
-            layer.mlp.op_dispatch_b,
-            layer.mlp.op_experts,
-            layer.mlp.op_combine_a,
-            operations.YieldOperation(),
-            layer.mlp.op_shared_experts,
-            layer.mlp.op_combine_b,
-            layer.mlp.op_output,
-            layer.op_comm_postprocess_layer,
-        ],
-    )
+    if return_recv_hook_normal:
+        return OperationsStrategy(
+            deep_gemm_num_sms=None,
+            tbo_delta_stages=2,
+            operations=[
+                layer.op_comm_prepare_attn,
+                layer.self_attn.op_prepare,
+                operations.YieldOperation(),
+                layer.self_attn.op_core,
+                layer.op_comm_prepare_mlp,
+                layer.mlp.op_gate,
+                layer.mlp.op_select_experts,
+                operations.YieldOperation(),
+                layer.mlp.op_dispatch_a,
+                operations.YieldOperation(),
+                layer.mlp.op_dispatch_b,
+                layer.mlp.op_experts,
+                layer.mlp.op_combine_a,
+                operations.YieldOperation(),
+                layer.mlp.op_combine_b,
+                operations.YieldOperation(),
+                layer.mlp.op_shared_experts,
+                layer.mlp.op_output,
+                layer.op_comm_postprocess_layer,
+            ],
+        )
+    else:
+        return OperationsStrategy(
+            deep_gemm_num_sms=deep_gemm_num_sms,
+            tbo_delta_stages=0,
+            operations=[
+                layer.op_comm_prepare_attn,
+                layer.self_attn.op_prepare,
+                layer.self_attn.op_core,
+                layer.op_comm_prepare_mlp,
+                layer.mlp.op_gate,
+                layer.mlp.op_select_experts,
+                layer.mlp.op_dispatch_a,
+                operations.YieldOperation(),
+                layer.mlp.op_dispatch_b,
+                layer.mlp.op_experts,
+                layer.mlp.op_combine_a,
+                operations.YieldOperation(),
+                layer.mlp.op_shared_experts,
+                layer.mlp.op_combine_b,
+                layer.mlp.op_output,
+                layer.op_comm_postprocess_layer,
+            ],
+        )
 
 
 def _compute_moe_deepseek_blog_decode(layer):
