@@ -88,6 +88,7 @@ class HiCacheStorage(ABC):
         values: Optional[Any] = None,
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
+        previous_keys: Optional[List[str]] = None,
     ) -> bool:
         """
         Store multiple key-value pairs.
@@ -103,7 +104,9 @@ class HiCacheStorage(ABC):
         """
         pass
 
-    def batch_exists(self, keys: List[str]) -> int:
+    def batch_exists(
+        self, keys: List[str], previous_keys: Optional[List[str]] = None
+    ) -> int:
         """
         Check if the keys exist in the storage.
         return the number of consecutive existing keys from the start.
@@ -202,6 +205,7 @@ class HiCacheFile(HiCacheStorage):
         values: Optional[Any] = None,
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
+        previous_keys: Optional[List[str]] = None,
     ) -> bool:
         for key, value in zip(keys, values):
             if not self.set(key, value):
