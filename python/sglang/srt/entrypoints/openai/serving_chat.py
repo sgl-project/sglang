@@ -118,7 +118,6 @@ class OpenAIServingChat(OpenAIServingBase):
             processed_messages.tool_call_constraint,
         )
 
-        print(f"103 {sampling_params=}")
         # Handle single vs multiple requests
         if is_multimodal:
             prompt_kwargs = {"text": processed_messages.prompt}

@@ -664,8 +664,7 @@ class Req:
         # FIXME: To work around some bugs in logprob computation, we need to ensure each
         # request has at least one token. Later, we can relax this requirement and use `input_len`.
         max_prefix_len = input_len - 1
-        print(f"{self.sampling_params.max_new_tokens=}")
-        print(f"{self.sampling_params.max_new_tokens=}")
+
         if self.sampling_params.max_new_tokens > 0:
             # Need at least one token to compute logits
             max_prefix_len = min(max_prefix_len, input_len - 1)
