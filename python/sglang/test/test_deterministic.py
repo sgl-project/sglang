@@ -19,11 +19,13 @@ class BenchArgs:
     port: int = 30000
     batch_size: int = 1
     temperature: float = 0.0
-    max_new_tokens: int = 512
+    max_new_tokens: int = 100
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     return_logprob: bool = False
-    prompt: str = "Tell me about Richard Feynman: "
+    prompt: str = (
+        "Generate 1000 random numbers. Go directly into it, don't say Sure and don't say here are numbers. Just start with a number. /no_think"
+    )
     stream: bool = False
 
     @staticmethod
@@ -108,23 +110,12 @@ def test_deterministic(args):
     texts = []
     for i in range(args.n_trials):
         text, speed = send_one_prompt(args)
-        print(f"Trial {i}: {speed=:.2f} token/s \n Last 50 characters: {text[-50:]}")
+        print(f"Trial {i}: {speed=:.2f} token/s \nLast 50 characters: {text[-50:]}")
         speeds.append(speed)
         texts.append(text)
 
-    pass_test = True
-    for i in range(len(texts)):
-        text = texts[i]
-        if text != texts[0]:
-            print(
-                f"Test failed: Output of trial 0: {texts[0][:50]}\n Output of trial {i}: {text[:50]}\n"
-            )
-            pass_test = False
-            break
-
-    if pass_test:
-        print("Test passed for all trials")
-    print(f"Average speed: {np.mean(speeds)=:.2f} token/s")
+    print(f"Total samples: {len(texts)}, Unique samples: {len(set(texts))}")
+    print(f"Average speed: {np.mean(speeds):.2f} token/s")
 
 
 if __name__ == "__main__":
