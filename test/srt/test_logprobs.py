@@ -1,13 +1,20 @@
-import os, pickle, numpy as np
-import torch
-import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE, write_github_step_summary
-import random
-import unittest
-import requests
 import io
+import os
+import pickle
+import random
 import time
+import unittest
 
+import numpy as np
+import requests
+import torch
+
+import sglang as sgl
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
+    write_github_step_summary,
+)
 
 # MOE model configuration
 MOE_MODEL_NAME = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE
@@ -36,7 +43,6 @@ elif torch.version.cuda is not None:
     DENSE_TOLERANCE_MEAN_DIFF = 0.1
 
 
-
 # Common configuration
 TOP_K = 20
 MAX_RETRIES = 3
@@ -44,10 +50,30 @@ RETRY_DELAY = 2
 
 # Test configurations
 TEST_CONFIGS = [
-    {"batch_size": 50, "num_samples": 500, "logprob_sample_ratio": 0.5, "temperature": 0.5},
-    {"batch_size": 100, "num_samples": 500, "logprob_sample_ratio": 0.5, "temperature": 10.0},
-    {"batch_size": 20, "num_samples": 1000, "logprob_sample_ratio": 0.5, "temperature": 2.0},
-    {"batch_size": 20, "num_samples": 1000, "logprob_sample_ratio": 0.6, "temperature": 1.0},
+    {
+        "batch_size": 50,
+        "num_samples": 500,
+        "logprob_sample_ratio": 0.5,
+        "temperature": 0.5,
+    },
+    {
+        "batch_size": 100,
+        "num_samples": 500,
+        "logprob_sample_ratio": 0.5,
+        "temperature": 10.0,
+    },
+    {
+        "batch_size": 20,
+        "num_samples": 1000,
+        "logprob_sample_ratio": 0.5,
+        "temperature": 2.0,
+    },
+    {
+        "batch_size": 20,
+        "num_samples": 1000,
+        "logprob_sample_ratio": 0.6,
+        "temperature": 1.0,
+    },
 ]
 
 os.environ["RETURN_ORIGINAL_LOGPROB"] = "True"
@@ -77,25 +103,27 @@ class TestLogprobsMOE(unittest.TestCase):
     def load_test_data(self):
         """Load test data from Hugging Face dataset with retry mechanism."""
         print(f"Loading data from {MOE_INPUT_PKL_URL}...")
-        
+
         for attempt in range(MAX_RETRIES):
             try:
                 response = requests.get(MOE_INPUT_PKL_URL, timeout=30)
                 response.raise_for_status()
-                
+
                 with io.BytesIO(response.content) as f:
                     records = pickle.load(f)
-                
+
                 if not records:
                     raise ValueError("Empty dataset")
-                
+
                 print(f"Successfully loaded {len(records)} records")
                 return records
-                
+
             except Exception as e:
                 print(f"Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
                 if attempt == MAX_RETRIES - 1:
-                    raise Exception(f"Failed to load data after {MAX_RETRIES} attempts: {e}")
+                    raise Exception(
+                        f"Failed to load data after {MAX_RETRIES} attempts: {e}"
+                    )
                 time.sleep(RETRY_DELAY)
 
     def compare_meta(self, metaA, metaB):
@@ -119,24 +147,30 @@ class TestLogprobsMOE(unittest.TestCase):
         """Test the logprobs comparison functionality with different parameter combinations."""
         # Load test data with retry mechanism
         records = self.load_test_data()
-        
+
         for config_idx, config in enumerate(TEST_CONFIGS):
             with self.subTest(config=config):
-                
+
                 # Sample records for this config
-                test_records = random.sample(records, k=min(config["num_samples"], len(records)))
+                test_records = random.sample(
+                    records, k=min(config["num_samples"], len(records))
+                )
                 random.shuffle(test_records)
-                
+
                 # Calculate how many samples should return logprobs
                 logprob_count = int(len(test_records) * config["logprob_sample_ratio"])
-                print(f"Testing with {len(test_records)} samples, batch_size={config['batch_size']}, temperature={config['temperature']}")
-                print(f"Will return logprobs for {logprob_count} samples (ratio: {config['logprob_sample_ratio']})")
+                print(
+                    f"Testing with {len(test_records)} samples, batch_size={config['batch_size']}, temperature={config['temperature']}"
+                )
+                print(
+                    f"Will return logprobs for {logprob_count} samples (ratio: {config['logprob_sample_ratio']})"
+                )
 
                 all_max, all_mean = [], []
                 logprob_returned_count = 0
-                
+
                 for i in range(0, len(test_records), config["batch_size"]):
-                    batch = test_records[i:i+config["batch_size"]]
+                    batch = test_records[i : i + config["batch_size"]]
                     input_ids = [rec["ids"] for rec in batch]
                     logprob_start_lens = [rec["start_pos"] for rec in batch]
 
@@ -146,18 +180,21 @@ class TestLogprobsMOE(unittest.TestCase):
                         global_idx = i + j
                         if global_idx < logprob_count:
                             batch_logprob_indices.append(j)
-                    
+
                     # Create return_logprob array - only True for selected samples
-                    return_logprob_array = [j in batch_logprob_indices for j in range(len(batch))]
+                    return_logprob_array = [
+                        j in batch_logprob_indices for j in range(len(batch))
+                    ]
 
                     # Sampling param per request
-                    sampling_params = [ 
+                    sampling_params = [
                         {
                             "temperature": config["temperature"],
                             "top_p": 1.0,
                             "top_k": TOP_K,
-                            "max_new_tokens": 1
-                        } for _ in batch
+                            "max_new_tokens": 1,
+                        }
+                        for _ in batch
                     ]
 
                     outputs = self.engine.generate(
@@ -180,19 +217,26 @@ class TestLogprobsMOE(unittest.TestCase):
                             logprob_returned_count += 1
                         else:
                             # Verify that logprobs were not returned for this sample
-                            self.assertIsNone(output.get("meta_info"), 
-                                            f"Sample {i+j} should not have logprobs but meta_info is present")
+                            self.assertIsNone(
+                                output.get("meta_info"),
+                                f"Sample {i+j} should not have logprobs but meta_info is present",
+                            )
 
                 max_of_max = max(all_max) if all_max else 0.0
                 mean_of_mean = np.mean(all_mean) if all_mean else 0.0
-                
+
                 print(f"Config {config_idx + 1} - max of max Δ={max_of_max:.6g}")
                 print(f"Config {config_idx + 1} - mean of mean Δ={mean_of_mean:.6g}")
-                print(f"Config {config_idx + 1} - logprobs returned for {logprob_returned_count} samples (expected: {logprob_count})")
+                print(
+                    f"Config {config_idx + 1} - logprobs returned for {logprob_returned_count} samples (expected: {logprob_count})"
+                )
 
                 # Verify correct number of logprobs returned
-                self.assertEqual(logprob_returned_count, logprob_count, 
-                               f"Expected {logprob_count} samples with logprobs, got {logprob_returned_count}")
+                self.assertEqual(
+                    logprob_returned_count,
+                    logprob_count,
+                    f"Expected {logprob_count} samples with logprobs, got {logprob_returned_count}",
+                )
 
                 # Write results to GitHub summary
                 summary_content = f"""
@@ -210,20 +254,31 @@ class TestLogprobsMOE(unittest.TestCase):
                 # Basic validation
                 self.assertIsInstance(all_max, list)
                 self.assertIsInstance(all_mean, list)
-                self.assertGreater(len(all_max), 0, f"No test samples processed for config {config}")
-                
+                self.assertGreater(
+                    len(all_max), 0, f"No test samples processed for config {config}"
+                )
+
                 # Tolerance checks with clear error messages
                 failed_samples = []
                 for i, (max_diff, mean_diff) in enumerate(zip(all_max, all_mean)):
                     if max_diff > MOE_TOLERANCE_MAX_DIFF:
-                        failed_samples.append(f"Sample {i}: max_diff={max_diff:.6g} > {MOE_TOLERANCE_MAX_DIFF}")
+                        failed_samples.append(
+                            f"Sample {i}: max_diff={max_diff:.6g} > {MOE_TOLERANCE_MAX_DIFF}"
+                        )
                     if mean_diff > MOE_TOLERANCE_MEAN_DIFF:
-                        failed_samples.append(f"Sample {i}: mean_diff={mean_diff:.6g} > {MOE_TOLERANCE_MEAN_DIFF}")
-                
+                        failed_samples.append(
+                            f"Sample {i}: mean_diff={mean_diff:.6g} > {MOE_TOLERANCE_MEAN_DIFF}"
+                        )
+
                 if failed_samples:
-                    self.fail(f"Config {config} - Tolerance exceeded in {len(failed_samples)} samples:\n" + "\n".join(failed_samples[:5]))
-                
-                print(f"✅ Config {config_idx + 1} - All {len(all_max)} samples passed tolerance checks")
+                    self.fail(
+                        f"Config {config} - Tolerance exceeded in {len(failed_samples)} samples:\n"
+                        + "\n".join(failed_samples[:5])
+                    )
+
+                print(
+                    f"✅ Config {config_idx + 1} - All {len(all_max)} samples passed tolerance checks"
+                )
 
 
 class TestLogprobsDense(unittest.TestCase):
@@ -249,25 +304,27 @@ class TestLogprobsDense(unittest.TestCase):
     def load_test_data(self):
         """Load test data from Hugging Face dataset with retry mechanism."""
         print(f"Loading data from {DENSE_INPUT_PKL_URL}...")
-        
+
         for attempt in range(MAX_RETRIES):
             try:
                 response = requests.get(DENSE_INPUT_PKL_URL, timeout=30)
                 response.raise_for_status()
-                
+
                 with io.BytesIO(response.content) as f:
                     records = pickle.load(f)
-                
+
                 if not records:
                     raise ValueError("Empty dataset")
-                
+
                 print(f"Successfully loaded {len(records)} records")
                 return records
-                
+
             except Exception as e:
                 print(f"Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
                 if attempt == MAX_RETRIES - 1:
-                    raise Exception(f"Failed to load data after {MAX_RETRIES} attempts: {e}")
+                    raise Exception(
+                        f"Failed to load data after {MAX_RETRIES} attempts: {e}"
+                    )
                 time.sleep(RETRY_DELAY)
 
     def compare_meta(self, metaA, metaB):
@@ -275,7 +332,11 @@ class TestLogprobsDense(unittest.TestCase):
         diffs = []
         for key in ["input_top_logprobs", "output_top_logprobs"]:
             arrA, arrB = metaA[key], metaB[key]
-            self.assertEqual(len(arrA), len(arrB), f"Length of {key} is not equal, sglang did not return the correct number of log probs(should be top 20)")
+            self.assertEqual(
+                len(arrA),
+                len(arrB),
+                f"Length of {key} is not equal, sglang did not return the correct number of log probs(should be top 20)",
+            )
             for e1, e2 in zip(arrA, arrB):
                 if not e1 or not e2:
                     continue
@@ -292,24 +353,30 @@ class TestLogprobsDense(unittest.TestCase):
         """Test the logprobs comparison functionality with different parameter combinations."""
         # Load test data with retry mechanism
         records = self.load_test_data()
-        
+
         for config_idx, config in enumerate(TEST_CONFIGS):
             with self.subTest(config=config):
-                
+
                 # Sample records for this config
-                test_records = random.sample(records, k=min(config["num_samples"], len(records)))
+                test_records = random.sample(
+                    records, k=min(config["num_samples"], len(records))
+                )
                 random.shuffle(test_records)
-                
+
                 # Calculate how many samples should return logprobs
                 logprob_count = int(len(test_records) * config["logprob_sample_ratio"])
-                print(f"Testing with {len(test_records)} samples, batch_size={config['batch_size']}, temperature={config['temperature']}")
-                print(f"Will return logprobs for {logprob_count} samples (ratio: {config['logprob_sample_ratio']})")
+                print(
+                    f"Testing with {len(test_records)} samples, batch_size={config['batch_size']}, temperature={config['temperature']}"
+                )
+                print(
+                    f"Will return logprobs for {logprob_count} samples (ratio: {config['logprob_sample_ratio']})"
+                )
 
                 all_max, all_mean = [], []
                 logprob_returned_count = 0
-                
+
                 for i in range(0, len(test_records), config["batch_size"]):
-                    batch = test_records[i:i+config["batch_size"]]
+                    batch = test_records[i : i + config["batch_size"]]
                     input_ids = [rec["ids"] for rec in batch]
                     logprob_start_lens = [rec["start_pos"] for rec in batch]
 
@@ -319,18 +386,21 @@ class TestLogprobsDense(unittest.TestCase):
                         global_idx = i + j
                         if global_idx < logprob_count:
                             batch_logprob_indices.append(j)
-                    
+
                     # Create return_logprob array - only True for selected samples
-                    return_logprob_array = [j in batch_logprob_indices for j in range(len(batch))]
+                    return_logprob_array = [
+                        j in batch_logprob_indices for j in range(len(batch))
+                    ]
 
                     # Sampling param per request
-                    sampling_params = [ 
+                    sampling_params = [
                         {
                             "temperature": config["temperature"],
                             "top_p": 1.0,
                             "top_k": TOP_K,
-                            "max_new_tokens": 1
-                        } for _ in batch
+                            "max_new_tokens": 1,
+                        }
+                        for _ in batch
                     ]
 
                     outputs = self.engine.generate(
@@ -344,7 +414,10 @@ class TestLogprobsDense(unittest.TestCase):
                     for j, (rec, output) in enumerate(zip(batch, outputs)):
                         # Only compare logprobs for samples that should have them
                         if j in batch_logprob_indices:
-                            self.assertIsNotNone(output.get("meta_info").get("input_top_logprobs"), f"return_logprob enabled on this sample, but input_top_logprobs is None{len(output.get('meta_info').get('input_top_logprobs'))}")
+                            self.assertIsNotNone(
+                                output.get("meta_info").get("input_top_logprobs"),
+                                f"return_logprob enabled on this sample, but input_top_logprobs is None{len(output.get('meta_info').get('input_top_logprobs'))}",
+                            )
                             metaA = rec["meta"]
                             metaB = output["meta_info"]
 
@@ -354,19 +427,29 @@ class TestLogprobsDense(unittest.TestCase):
                             logprob_returned_count += 1
                         else:
                             # Verify that logprobs were not returned for this sample
-                            self.assertTrue(output.get("meta_info").get("input_top_logprobs")==None or output.get("meta_info").get("input_top_logprobs")==[], 
-                                            f"return_logprob is disabled on this sample,Sample {i+j} should not have logprobs, content: {output.get('meta_info').get('output_token_ids_logprobs')}")
+                            self.assertTrue(
+                                output.get("meta_info").get("input_top_logprobs")
+                                == None
+                                or output.get("meta_info").get("input_top_logprobs")
+                                == [],
+                                f"return_logprob is disabled on this sample,Sample {i+j} should not have logprobs, content: {output.get('meta_info').get('output_token_ids_logprobs')}",
+                            )
 
                 max_of_max = max(all_max) if all_max else 0.0
                 mean_of_mean = np.mean(all_mean) if all_mean else 0.0
-                
+
                 print(f"Config {config_idx + 1} - max of max Δ={max_of_max:.6g}")
                 print(f"Config {config_idx + 1} - mean of mean Δ={mean_of_mean:.6g}")
-                print(f"Config {config_idx + 1} - logprobs returned for {logprob_returned_count} samples (expected: {logprob_count})")
+                print(
+                    f"Config {config_idx + 1} - logprobs returned for {logprob_returned_count} samples (expected: {logprob_count})"
+                )
 
                 # Verify correct number of logprobs returned
-                self.assertEqual(logprob_returned_count, logprob_count, 
-                               f"Expected {logprob_count} samples with logprobs, got {logprob_returned_count}")
+                self.assertEqual(
+                    logprob_returned_count,
+                    logprob_count,
+                    f"Expected {logprob_count} samples with logprobs, got {logprob_returned_count}",
+                )
 
                 # Write results to GitHub summary
                 summary_content = f"""
@@ -381,20 +464,31 @@ class TestLogprobsDense(unittest.TestCase):
                 # Basic validation
                 self.assertIsInstance(all_max, list)
                 self.assertIsInstance(all_mean, list)
-                self.assertGreater(len(all_max), 0, f"No test samples processed for config {config}")
-                
+                self.assertGreater(
+                    len(all_max), 0, f"No test samples processed for config {config}"
+                )
+
                 # Tolerance checks with clear error messages
                 failed_samples = []
                 for i, (max_diff, mean_diff) in enumerate(zip(all_max, all_mean)):
                     if max_diff > DENSE_TOLERANCE_MAX_DIFF:
-                        failed_samples.append(f"Sample {i}: max_diff={max_diff:.6g} > {DENSE_TOLERANCE_MAX_DIFF}")
+                        failed_samples.append(
+                            f"Sample {i}: max_diff={max_diff:.6g} > {DENSE_TOLERANCE_MAX_DIFF}"
+                        )
                     if mean_diff > DENSE_TOLERANCE_MEAN_DIFF:
-                        failed_samples.append(f"Sample {i}: mean_diff={mean_diff:.6g} > {DENSE_TOLERANCE_MEAN_DIFF}")
-                
+                        failed_samples.append(
+                            f"Sample {i}: mean_diff={mean_diff:.6g} > {DENSE_TOLERANCE_MEAN_DIFF}"
+                        )
+
                 if failed_samples:
-                    self.fail(f"Config {config} - Tolerance exceeded in {len(failed_samples)} samples:\n" + "\n".join(failed_samples[:5]))
-                
-                print(f"✅ Config {config_idx + 1} - All {len(all_max)} samples passed tolerance checks")
+                    self.fail(
+                        f"Config {config} - Tolerance exceeded in {len(failed_samples)} samples:\n"
+                        + "\n".join(failed_samples[:5])
+                    )
+
+                print(
+                    f"✅ Config {config_idx + 1} - All {len(all_max)} samples passed tolerance checks"
+                )
 
 
 if __name__ == "__main__":
