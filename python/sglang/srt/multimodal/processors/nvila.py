@@ -6,7 +6,7 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.models.nvila_lite import NVILALiteForConditionalGeneration
+from sglang.srt.models.nvila import NVILAForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -16,8 +16,8 @@ from sglang.srt.server_args import ServerArgs
 NUM_VIDEO_FRAMES = 8
 
 
-class NVILALiteMultimodalProcessor(BaseMultimodalProcessor):
-    models: list[type[nn.Module]] = [NVILALiteForConditionalGeneration]
+class NVILAMultimodalProcessor(BaseMultimodalProcessor):
+    models: list[type[nn.Module]] = [NVILAForConditionalGeneration]
 
     def __init__(
         self,
