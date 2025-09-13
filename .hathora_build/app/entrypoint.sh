@@ -12,7 +12,9 @@ log() {
 
 # Set default SGLang configuration if not provided
 export MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
-export TP_SIZE="${TP_SIZE:-}"
+if [[ -n "${TP_SIZE}" ]]; then
+  export TP_SIZE
+fi
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-4096}"
 export MAX_QUEUED_REQUESTS="${MAX_QUEUED_REQUESTS:-100}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
@@ -24,7 +26,11 @@ export AUTO_USE_FP8_ON_H100="${AUTO_USE_FP8_ON_H100:-true}"
 
 log "Starting SGLang Hathora entrypoint script."
 log "MODEL_PATH: $MODEL_PATH"
-log "TP_SIZE: ${TP_SIZE:-auto}"
+if [[ -n "${TP_SIZE}" ]]; then
+  log "TP_SIZE: ${TP_SIZE}"
+else
+  log "TP_SIZE: auto"
+fi
 log "MAX_TOTAL_TOKENS: $MAX_TOTAL_TOKENS"
 log "MAX_QUEUED_REQUESTS: $MAX_QUEUED_REQUESTS"
 log "LOG_LEVEL: $LOG_LEVEL"
@@ -43,7 +49,7 @@ if [[ "${H100_ONLY}" == "true" ]]; then
 fi
 
 # If multiple GPUs and TP_SIZE is auto, set to number of GPUs up to 8
-if [[ -z "${TP_SIZE_USER_SET}" && "${TP_SIZE}" == "auto" ]]; then
+if [[ -z "${TP_SIZE}" ]]; then
   NGPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
   if [[ "$NGPU" -gt 0 ]]; then
     if [[ "$NGPU" -gt 8 ]]; then NGPU=8; fi

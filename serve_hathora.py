@@ -71,6 +71,8 @@ def _load_deployment_config() -> DeploymentConfig:
             logger.warning(f"Failed to parse DEPLOYMENT_CONFIG_JSON: {e}")
 
     # Fallback: individual env vars
+    tp_env = os.environ.get("TP_SIZE")
+    tp_size_val = int(tp_env) if tp_env and tp_env.strip() else 1
     return DeploymentConfig(
         hf_token=os.environ.get("HF_TOKEN"),
         model_id=os.environ.get("MODEL_PATH", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
@@ -78,7 +80,7 @@ def _load_deployment_config() -> DeploymentConfig:
         dtype=os.environ.get("DTYPE", "auto"),
         quantization=os.environ.get("QUANTIZATION") or None,
         kv_cache_dtype=os.environ.get("KV_CACHE_DTYPE", "auto"),
-        tp_size=int(os.environ.get("TP_SIZE", "1")),
+        tp_size=tp_size_val,
         max_total_tokens=int(os.environ.get("MAX_TOTAL_TOKENS", "4096")),
         mem_fraction_static=(
             float(os.environ["MEM_FRACTION_STATIC"]) if os.environ.get("MEM_FRACTION_STATIC") else None
@@ -192,8 +194,7 @@ def _send_enrollment_if_needed():
         except Exception as e:
             logger.warning(f"Enrollment callback failed: {e}")
 
-# Global engine instance
-engine = None
+ 
 
 # --- Engine Management ---
 
@@ -202,6 +203,7 @@ engine = None
 async def lifespan(app: FastAPI):
     """Manages SGLang engine lifecycle during FastAPI startup/shutdown."""
     global engine
+    global _chosen_dtype, _chosen_quant, _chosen_kv_dtype
     
     logger.info("Starting SGLang engine initialization...")
     startup_start_time = time.time()
@@ -361,7 +363,6 @@ async def lifespan(app: FastAPI):
             _decode_rr_index = 0
 
             # Record chosen dtypes; send enrollment once
-            global _chosen_dtype, _chosen_quant, _chosen_kv_dtype
             _chosen_dtype, _chosen_quant, _chosen_kv_dtype = dtype, quant, kv_dtype
             _send_enrollment_if_needed()
 
@@ -393,7 +394,6 @@ async def lifespan(app: FastAPI):
                 speculative_attention_mode=(CONFIG.speculative_attention_mode or "prefill"),
             )
             # Record chosen dtypes; send enrollment if configured
-            global _chosen_dtype, _chosen_quant, _chosen_kv_dtype
             _chosen_dtype, _chosen_quant, _chosen_kv_dtype = dtype, quant, kv_dtype
             _send_enrollment_if_needed()
         
