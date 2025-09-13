@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -663,7 +663,13 @@ class OpenAIServingChat(OpenAIServingBase):
         except ValueError as e:
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
-
+        except HTTPException as e:
+            error = self.create_streaming_error_response(
+                message=str(e.detail),
+                err_type=str(e.status_code),
+                status_code=e.status_code,
+            )
+            yield f"data: {error}\n\n"
         yield "data: [DONE]\n\n"
 
     async def _handle_non_streaming_request(
