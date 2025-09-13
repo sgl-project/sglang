@@ -5,6 +5,7 @@ on:
       - main
     paths:
       - ".github/workflows/release-docker-npu-nightly.yml"
+      - "docker/Dockerfile.npu"
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
@@ -72,5 +73,6 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
+            SGLANG_KERNEL_NPU_TAG=20250913
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
