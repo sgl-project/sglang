@@ -18,11 +18,15 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 __all__ = ["QuarkW8A8Fp8"]
 
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
+    from aiter.ops.shuffle import shuffle_weight
 
 
 class QuarkW8A8Fp8(QuarkScheme):
@@ -92,7 +96,12 @@ class QuarkW8A8Fp8(QuarkScheme):
                 weight_scale = layer.weight_scale.data
             if self.per_token:
                 weight_scale = weight_scale.view(-1, 1)
-            layer.weight = Parameter(weight.t(), requires_grad=False)
+            if _use_aiter:
+                layer.weight = Parameter(
+                    shuffle_weight(weight, (16, 16)), requires_grad=False
+                )
+            else:
+                layer.weight = Parameter(weight.t(), requires_grad=False)
             # required by torch.compile to be torch.nn.Parameter
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
@@ -170,6 +179,8 @@ class QuarkW8A8Fp8(QuarkScheme):
             x,
             layer.weight,
             layer.weight_scale,
+            input_scale=layer.input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            use_per_token_if_dynamic=self.per_token,
         )

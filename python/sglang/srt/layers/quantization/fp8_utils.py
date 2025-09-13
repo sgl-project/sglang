@@ -633,7 +633,7 @@ def apply_fp8_linear(
     # torch.scaled_mm supports per tensor weights + activations only
     # so fallback to naive if per channel or per token
     per_tensor_weights = weight_scale.numel() == 1
-    per_tensor_activations = x_scale.numel() == 1
+    per_tensor_activations = x_scale.numel() == 1 and input_2d.size(0) != 1
 
     if (
         use_per_token_if_dynamic
