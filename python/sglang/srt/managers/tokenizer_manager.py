@@ -401,7 +401,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "the engine with skip_tokenizer_init=False."
                 )
             encoded = self.tokenizer(
-                input_text, return_token_type_ids=is_cross_encoder_request
+                input_text,
+                add_special_tokens=False,
+                return_token_type_ids=is_cross_encoder_request,
             )
 
             input_ids = encoded["input_ids"]
@@ -583,7 +585,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         texts = [req.text for req in requests]
 
         # Batch tokenize all texts
-        encoded = self.tokenizer(texts)
+        encoded = self.tokenizer(texts, add_special_tokens=False)
         input_ids_list = encoded["input_ids"]
 
         # Process all requests
