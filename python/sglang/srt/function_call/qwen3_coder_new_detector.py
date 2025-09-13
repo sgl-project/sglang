@@ -147,8 +147,11 @@ class StreamingXMLToolCallParser:
         if param_value.lower() == "null":
             return None
 
+        STRING_TYPE_GROUP = ["string", "str", "text", "varchar", "char", "enum"]
+        BOOL_TYPE_GROUP = ["boolean", "bool", "binary"]
+        ARRAY_TYPE_GROUP = ["array"]
         param_type = param_type.strip().lower()
-        if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+        if param_type in STRING_TYPE_GROUP:
             return param_value
         elif (
             param_type.startswith("int")
@@ -174,10 +177,10 @@ class StreamingXMLToolCallParser:
                 logger.warning(f"Error during fallback completion: {e}")
 
             return param_value
-        elif param_type in ["boolean", "bool", "binary"]:
+        elif param_type in BOOL_TYPE_GROUP:
             param_value = param_value.lower()
             return param_value == "true"
-        elif param_type in ["array"]:
+        elif param_type in ARRAY_TYPE_GROUP:
             try:
                 # First try ast.literal_eval for safe evaluation of Python literals
                 param_value = ast.literal_eval(param_value)
@@ -393,7 +396,7 @@ class StreamingXMLToolCallParser:
             escaped text
         """
         # XML special character escape mapping
-        xml_escapes = {
+        XML_ESCAPES_MAP = {
             "&": "&amp;",
             "<": "&lt;",
             ">": "&gt;",
@@ -401,7 +404,7 @@ class StreamingXMLToolCallParser:
             "'": "&apos;",
         }
 
-        for char, escape in xml_escapes.items():
+        for char, escape in XML_ESCAPES_MAP.items():
             text = text.replace(char, escape)
 
         return text
