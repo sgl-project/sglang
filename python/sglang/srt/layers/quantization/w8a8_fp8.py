@@ -284,6 +284,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def apply(
