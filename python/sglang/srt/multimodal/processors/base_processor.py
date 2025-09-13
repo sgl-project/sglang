@@ -185,6 +185,7 @@ class BaseMultimodalProcessor(ABC):
             "aspect_ratio_mask": Modality.IMAGE,
             "num_patches": Modality.IMAGE,
             "patch_pixel_values": Modality.IMAGE,
+            "block_sizes": Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
@@ -386,7 +387,7 @@ class BaseMultimodalProcessor(ABC):
 
     def load_mm_data(
         self,
-        prompt: str,
+        prompt: str | list[int],
         multimodal_tokens: MultimodalSpecialTokens,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
