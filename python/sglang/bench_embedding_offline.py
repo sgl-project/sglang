@@ -10,19 +10,18 @@ python -m sglang.bench_embedding_offline --model-path meta-llama/Meta-Llama-3.1-
 python -m sglang.bench_embedding_offline --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024
 """
 
-import os
-import time
-import json
-import asyncio
-import logging
-import inspect
-import random
 import argparse
-import numpy as np
+import asyncio
 import dataclasses
+import inspect
+import json
+import logging
+import os
+import random
+import time
+from typing import Dict, List, Optional
 
-
-from typing import Optional, List, Dict
+import numpy as np
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.bench_serving import (
@@ -32,8 +31,8 @@ from sglang.bench_serving import (
     sample_random_requests,
     set_ulimit,
 )
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.server_args import ServerArgs
 
 
 @dataclasses.dataclass
@@ -69,7 +68,9 @@ class BenchArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        parser.add_argument("--result-filename", type=str, default=BenchArgs.result_filename)
+        parser.add_argument(
+            "--result-filename", type=str, default=BenchArgs.result_filename
+        )
         parser.add_argument(
             "--dataset-name",
             type=str,
@@ -77,7 +78,9 @@ class BenchArgs:
             choices=["sharegpt", "random", "generated-shared-prefix"],
             help="Name of the dataset to benchmark on.",
         )
-        parser.add_argument("--dataset-path", type=str, default="", help="Path to the dataset.")
+        parser.add_argument(
+            "--dataset-path", type=str, default="", help="Path to the dataset."
+        )
         parser.add_argument(
             "--num-prompts",
             type=int,
@@ -193,7 +196,9 @@ def truncate_prompts(prompts: List[str], model_path: str):
     for prompt in prompts:
         tokens = tokenizer(prompt, return_tensors="pt", truncation=False)
         if len(tokens.input_ids[0]) > max_length:
-            truncated_text = tokenizer.decode(tokens.input_ids[0][: max_length - 1], skip_special_tokens=True)
+            truncated_text = tokenizer.decode(
+                tokens.input_ids[0][: max_length - 1], skip_special_tokens=True
+            )
             truncated_prompts.append(truncated_text)
         else:
             truncated_prompts.append(prompt)
@@ -218,10 +223,14 @@ def throughput_test_once(
 
     prompts = [r.prompt for r in reqs]
     prompts = truncate_prompts(prompts, model_path)
-    image_data = [r.image_data for r in reqs] if reqs[0].image_data is not None else None
+    image_data = (
+        [r.image_data for r in reqs] if reqs[0].image_data is not None else None
+    )
 
     if profile:
-        assert "SGLANG_TORCH_PROFILER_DIR" in os.environ, "Please set SGLANG_TORCH_PROFILER_DIR."
+        assert (
+            "SGLANG_TORCH_PROFILER_DIR" in os.environ
+        ), "Please set SGLANG_TORCH_PROFILER_DIR."
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
         backend.start_profile()
 
@@ -239,14 +248,22 @@ def throughput_test_once(
 
     measurement_results["total_latency"] = latency
     measurement_results["total_output"] = sum(len(o["embedding"]) for o in gen_out)
-    measurement_results["average_e2e_latency"] = sum(o["meta_info"]["e2e_latency"] for o in gen_out) / len(gen_out)
-    measurement_results["request_throughput"] = measurement_results["successful_requests"] / latency
-    measurement_results["input_throughput"] = measurement_results["total_input_tokens"] / latency
+    measurement_results["average_e2e_latency"] = sum(
+        o["meta_info"]["e2e_latency"] for o in gen_out
+    ) / len(gen_out)
+    measurement_results["request_throughput"] = (
+        measurement_results["successful_requests"] / latency
+    )
+    measurement_results["input_throughput"] = (
+        measurement_results["total_input_tokens"] / latency
+    )
 
     if inspect.isawaitable(server_info):
         server_info = asyncio.run(server_info)
 
-    measurement_results["last_gen_throughput"] = server_info["internal_states"][0]["last_gen_throughput"]
+    measurement_results["last_gen_throughput"] = server_info["internal_states"][0][
+        "last_gen_throughput"
+    ]
 
     return measurement_results
 
@@ -335,16 +352,34 @@ def throughput_test(
         with open(bench_args.result_filename, "a") as fout:
             fout.write(json.dumps(result) + "\n")
 
-    print("\n{s:{c}^{n}}".format(s=" Offline Throughput Benchmark Result ", n=50, c="="))
+    print(
+        "\n{s:{c}^{n}}".format(s=" Offline Throughput Benchmark Result ", n=50, c="=")
+    )
     print("{:<40} {:<10}".format("Backend:", result["backend"]))
     print("{:<40} {:<10}".format("Successful requests:", result["successful_requests"]))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", result["total_latency"]))
     print("{:<40} {:<10}".format("Total input tokens:", result["total_input_tokens"]))
     print("{:<40} {:<10}".format("Total generated embeddings:", result["total_output"]))
-    print("{:<40} {:<10.2f}".format("Average e2e latency (s):", result["average_e2e_latency"]))
-    print("{:<40} {:<10.2f}".format("Last generation throughput (tok/s):", result["last_gen_throughput"]))
-    print("{:<40} {:<10.2f}".format("Request throughput (req/s):", result["request_throughput"]))
-    print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", result["input_throughput"]))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Average e2e latency (s):", result["average_e2e_latency"]
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Last generation throughput (tok/s):", result["last_gen_throughput"]
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Request throughput (req/s):", result["request_throughput"]
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Input token throughput (tok/s):", result["input_throughput"]
+        )
+    )
     print("=" * 50)
 
     return result

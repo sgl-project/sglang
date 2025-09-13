@@ -28,17 +28,17 @@ from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from sglang.bench_serving import (
-    get_dataset,
-    get_tokenizer,
-    set_ulimit,
-    _get_bool_env_var,
-    remove_prefix,
-    get_auth_headers,
-    _create_bench_client_session,
     DatasetRow,
-    check_chat_template,
+    _create_bench_client_session,
+    _get_bool_env_var,
     async_request_profile,
+    check_chat_template,
+    get_auth_headers,
+    get_dataset,
     get_request,
+    get_tokenizer,
+    remove_prefix,
+    set_ulimit,
 )
 
 ASSISTANT_SUFFIX = "Assistant:"
@@ -257,7 +257,9 @@ class BenchArgs:
             default=BenchArgs.disable_tqdm,
             help="Specify to disable tqdm progress bar.",
         )
-        parser.add_argument("--seed", type=int, default=BenchArgs.seed, help="The random seed.")
+        parser.add_argument(
+            "--seed", type=int, default=BenchArgs.seed, help="The random seed."
+        )
         parser.add_argument(
             "--disable-ignore-eos",
             action="store_true",
@@ -425,7 +427,9 @@ async def async_request_openai_embedding(
                            latency, TTFT, ITL, and success status.
     """
     api_url = request_func_input.api_url
-    assert api_url.endswith("embeddings"), "OpenAI Completions API URL must end with 'embeddings'."
+    assert api_url.endswith(
+        "embeddings"
+    ), "OpenAI Completions API URL must end with 'embeddings'."
 
     prompt = request_func_input.prompt
 
@@ -443,7 +447,9 @@ async def async_request_openai_embedding(
 
         st = time.perf_counter()
         try:
-            async with session.post(url=api_url, json=payload, headers=headers) as response:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -454,7 +460,9 @@ async def async_request_openai_embedding(
 
                     output.success = True
                     output.latency = latency
-                    output.output_len = sum(len(emb_obj["embedding"]) for emb_obj in data["data"])
+                    output.output_len = sum(
+                        len(emb_obj["embedding"]) for emb_obj in data["data"]
+                    )
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -501,7 +509,9 @@ async def async_request_sglang_embedding(
 
         st = time.perf_counter()
         try:
-            async with session.post(url=api_url, json=payload, headers=headers) as response:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -603,7 +613,8 @@ def calculate_metrics(
         output_throughput=sum(output_lens) / dur_s,
         output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
         total_throughput=(total_input + sum(output_lens)) / dur_s,
-        total_throughput_retokenized=(total_input + sum(retokenized_output_lens)) / dur_s,
+        total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
+        / dur_s,
         mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
@@ -630,13 +641,19 @@ async def benchmark(
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
-    semaphore = asyncio.Semaphore(args.max_concurrency) if args.max_concurrency else None
+    semaphore = (
+        asyncio.Semaphore(args.max_concurrency) if args.max_concurrency else None
+    )
 
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
-            return await request_func(request_func_input=request_func_input, args=args, pbar=pbar)
+            return await request_func(
+                request_func_input=request_func_input, args=args, pbar=pbar
+            )
         async with semaphore:
-            return await request_func(request_func_input=request_func_input, args=args, pbar=pbar)
+            return await request_func(
+                request_func_input=request_func_input, args=args, pbar=pbar
+            )
 
     # Warmup
     print(f"Starting warmup with {args.warmup_requests} sequences...")
@@ -660,20 +677,28 @@ async def benchmark(
     # Run warmup requests
     warmup_tasks = []
     for _ in range(args.warmup_requests):
-        warmup_tasks.append(asyncio.create_task(request_func(request_func_input=test_input, args=args)))
+        warmup_tasks.append(
+            asyncio.create_task(request_func(request_func_input=test_input, args=args))
+        )
 
     warmup_outputs: List[RequestFuncOutput] = await asyncio.gather(*warmup_tasks)
 
     # Check if at least one warmup request succeeded
-    if args.warmup_requests > 0 and not any(output.success for output in warmup_outputs):
+    if args.warmup_requests > 0 and not any(
+        output.success for output in warmup_outputs
+    ):
         raise ValueError(
             f"Warmup failed - Please make sure benchmark arguments are correctly specified. Error: {warmup_outputs[0].error}"
         )
     else:
-        print(f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run...")
+        print(
+            f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
+        )
 
     # Flush cache
-    if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or args.flush_cache:
+    if (
+        "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
+    ) or args.flush_cache:
         requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)
@@ -681,7 +706,9 @@ async def benchmark(
     # Start profiler
     if args.profile:
         print("Starting profiler...")
-        profile_output = await async_request_profile(api_url=base_url + "/start_profile")
+        profile_output = await async_request_profile(
+            api_url=base_url + "/start_profile"
+        )
         if profile_output.success:
             print("Profiler started")
 
@@ -703,7 +730,11 @@ async def benchmark(
             dimensions=args.dimensions,
         )
 
-        tasks.append(asyncio.create_task(limited_request_func(request_func_input=request_func_input, pbar=pbar)))
+        tasks.append(
+            asyncio.create_task(
+                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+            )
+        )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     # Stop profiler
@@ -722,7 +753,9 @@ async def benchmark(
             server_info_json = server_info.json()
             if "decode" in server_info_json:
                 server_info_json = server_info_json["decode"][0]
-            accept_length = server_info_json["internal_states"][0].get("avg_spec_accept_length", None)
+            accept_length = server_info_json["internal_states"][0].get(
+                "avg_spec_accept_length", None
+            )
         else:
             accept_length = None
     else:
@@ -749,17 +782,44 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total generated embeddings:", metrics.total_output))
-    print("{:<40} {:<10}".format("Total generated embeddings (retokenized):", metrics.total_output_retokenized))
-    print("{:<40} {:<10.2f}".format("Request throughput (req/s):", metrics.request_throughput))
-    print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", metrics.input_throughput))
-    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", metrics.output_throughput))
-    print("{:<40} {:<10.2f}".format("Total token throughput (tok/s):", metrics.total_throughput))
+    print(
+        "{:<40} {:<10}".format(
+            "Total generated embeddings (retokenized):",
+            metrics.total_output_retokenized,
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Request throughput (req/s):", metrics.request_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Input token throughput (tok/s):", metrics.input_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Output token throughput (tok/s):", metrics.output_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Total token throughput (tok/s):", metrics.total_throughput
+        )
+    )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Median E2E Latency (ms):", metrics.median_e2e_latency_ms))
+    print(
+        "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
+        )
+    )
     print("=" * 50)
 
     if metrics.mean_e2e_latency_ms is not None:
@@ -839,15 +899,29 @@ def run_benchmark(args: BenchArgs):
         extra_request_body = json.loads(args.extra_request_body)
 
     if args.tokenize_prompt:
-        assert args.backend == "sglang", "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        assert (
+            args.backend == "sglang"
+        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
 
     # Set url
-    model_url = f"{args.base_url}/v1/models" if args.base_url else f"http://{args.host}:{args.port}/v1/models"
+    model_url = (
+        f"{args.base_url}/v1/models"
+        if args.base_url
+        else f"http://{args.host}:{args.port}/v1/models"
+    )
 
     if args.backend in ["sglang", "sglang-native"]:
-        api_url = f"{args.base_url}/encode" if args.base_url else f"http://{args.host}:{args.port}/encode"
+        api_url = (
+            f"{args.base_url}/encode"
+            if args.base_url
+            else f"http://{args.host}:{args.port}/encode"
+        )
     elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
-        api_url = f"{args.base_url}/v1/embeddings" if args.base_url else f"http://{args.host}:{args.port}/v1/embeddings"
+        api_url = (
+            f"{args.base_url}/v1/embeddings"
+            if args.base_url
+            else f"http://{args.host}:{args.port}/v1/embeddings"
+        )
     elif args.backend == "trt":
         # TODO: find tensorRT-llm's embedding model entrypoint
         api_url = (
@@ -869,7 +943,9 @@ def run_benchmark(args: BenchArgs):
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/models/model:predict"
         )
-    base_url = f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
+    base_url = (
+        f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
+    )
 
     # Get model name
     if args.model is None:
@@ -884,7 +960,9 @@ def run_benchmark(args: BenchArgs):
             args.model = model_list[0]["id"] if model_list else None
         except Exception as e:
             print(f"Failed to fetch model from {model_url}. Error: {e}")
-            print("Please specify the correct host and port using `--host` and `--port`.")
+            print(
+                "Please specify the correct host and port using `--host` and `--port`."
+            )
             sys.exit(1)
 
     if args.model is None:
@@ -920,7 +998,9 @@ def run_benchmark(args: BenchArgs):
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Benchmark the online serving throughput for embedding models.")
+    parser = ArgumentParser(
+        description="Benchmark the online serving throughput for embedding models."
+    )
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
     bench_args = BenchArgs.from_cli_args(args)
