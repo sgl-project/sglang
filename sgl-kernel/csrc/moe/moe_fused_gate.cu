@@ -8,6 +8,9 @@
 
 #include <cfloat>
 #include <type_traits>
+#include <vector>
+
+#include "moe_fused_gate_tiled.h"
 template <typename T, int N>
 using AlignedArray = cutlass::AlignedArray<T, N>;
 using bfloat16_t = cutlass::bfloat16_t;
@@ -398,8 +401,11 @@ std::vector<at::Tensor> moe_fused_gate(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
 
-  // Check 1: Ensure that num_experts is a power of 2.
-  TORCH_CHECK((num_experts & (num_experts - 1)) == 0, "num_experts must be a power of 2, but got ", num_experts);
+  // Check 1: Ensure that num_experts is a power of 2, except allow 384 (Kimi K2) as a special case.
+  TORCH_CHECK(
+      ((num_experts & (num_experts - 1)) == 0) || (num_experts == 384),
+      "num_experts must be a power of 2 or 384 (Kimi K2), but got ",
+      num_experts);
 
   // Check 2: Ensure that num_experts is divisible by num_expert_group. (this also means num_expert_group is power of 2)
   TORCH_CHECK(
@@ -410,15 +416,8 @@ std::vector<at::Tensor> moe_fused_gate(
       num_expert_group);
 
   int computed_vpt = num_experts / num_expert_group;
-  // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=32. Maximum VPT indicate max value per
-  // threads we can process.
-  TORCH_CHECK(
-      computed_vpt <= MAX_VPT,
-      "Per group experts: num_experts / num_expert_group = (",
-      computed_vpt,
-      ") exceeds the maximum supported (",
-      MAX_VPT,
-      ")");
+  // Ensure subgroup width fits within a warp for shuffle operations
+  TORCH_CHECK(num_expert_group <= WARP_SIZE, "num_expert_group must be <= ", WARP_SIZE, ", but got ", num_expert_group);
 
   // Dispatch to templated kernel for known compile-time configurations.
   // We currently only support for:
@@ -427,6 +426,18 @@ std::vector<at::Tensor> moe_fused_gate(
   //   Case 3: other cases, require 8 <= num_experts / num_expert_group <= 32
   bool dispatched = false;
   switch (num_experts) {
+    case 384:
+      if (num_expert_group == 1) {
+        // Static tiled specialization for THREADS_PER_ROW==1
+        LAUNCH_MOE_GATE_TILED_CONFIG(384, 1, 32);
+      }
+      break;
+    case 64:
+      if (num_expert_group == 1) {
+        // Static tiled specialization for THREADS_PER_ROW==1
+        LAUNCH_MOE_GATE_TILED_CONFIG(64, 1, 32);
+      }
+      break;
     case 256:
       if (num_expert_group == 8)
         // This is deepseek v3 case. Here VPT = 256/8 = 32, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
@@ -467,6 +478,11 @@ std::vector<at::Tensor> moe_fused_gate(
       break;
     default:
       break;
+  }
+  // If VPT exceeds native path (32), dispatch to tiled kernel which supports larger VPT
+  if (computed_vpt > MAX_VPT) {
+    return moe_fused_gate_tiled(
+        input, bias, num_expert_group, topk_group, topk, num_fused_shared_experts, routed_scaling_factor);
   }
   if (!dispatched) {
     // Fallback to the dynamic kernel if none of the supported combinations match.
