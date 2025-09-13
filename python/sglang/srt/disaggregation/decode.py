@@ -612,11 +612,14 @@ class DecodeTransferQueue:
                     output_top_logprobs_val,
                     output_top_logprobs_idx,
                     output_hidden_states,
+                    cached_tokens,
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())
                 if not self.spec_algorithm.is_none():
                     decode_req.req.hidden_states_tensor = output_hidden_states
+
+                decode_req.req.cached_tokens = cached_tokens[0].item()
                 if decode_req.req.return_logprob:
                     decode_req.req.output_token_logprobs_val.append(
                         output_token_logprobs_val[0].item()
@@ -704,12 +707,15 @@ class SchedulerDisaggregationDecodeMixin:
             elif prepare_mlp_sync_flag:
                 batch, _ = self._prepare_idle_batch_and_run(None)
 
-            if batch is None and (
+            queue_size = (
                 len(self.waiting_queue)
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
-                == 0
-            ):
+            )
+            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                queue_size += len(self.decode_offload_manager.ongoing_offload)
+
+            if batch is None and queue_size == 0:
                 self.self_check_during_idle()
 
             self.last_batch = batch
@@ -778,12 +784,15 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 self.process_batch_result(tmp_batch, tmp_result)
 
-            if batch is None and (
+            queue_size = (
                 len(self.waiting_queue)
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
-                == 0
-            ):
+            )
+            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                queue_size += len(self.decode_offload_manager.ongoing_offload)
+
+            if batch is None and queue_size == 0:
                 self.self_check_during_idle()
 
             self.last_batch = batch
@@ -892,3 +901,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
         self.waiting_queue.extend(alloc_reqs)
+
+        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            self.decode_offload_manager.check_offload_progress()
