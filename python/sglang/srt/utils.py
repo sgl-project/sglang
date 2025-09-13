@@ -1259,7 +1259,7 @@ def set_prometheus_multiproc_dir():
         )
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
-        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
     logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
