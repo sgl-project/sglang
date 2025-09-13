@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
+    get_attention_tp_size,
     point_to_point_pyobj,
     require_mlp_sync,
 )
@@ -132,6 +133,13 @@ class PrefillBootstrapQueue:
         kv_args.kv_item_lens = kv_item_lens
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
+        else:
+            # For MLA backend, we need to calculate head_num from model config
+
+            kv_args.kv_head_num = (
+                self.scheduler.model_config.num_attention_heads
+                // get_attention_tp_size()
+            )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
