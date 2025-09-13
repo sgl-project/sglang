@@ -180,22 +180,5 @@ class NVILALiteForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def _vision_tower_output_to_mm_projector_input(
-        self,
-        vision_tower_output: BaseModelOutputWithPooling,
-    ) -> Tensor:
-        assert vision_tower_output.hidden_states is not None
-
-        selected_layer_hidden_states = vision_tower_output.hidden_states[
-            self.config.mm_vision_select_layer
-        ]
-
-        if self.config.mm_vision_select_feature == "cls_patch":
-            return selected_layer_hidden_states
-        else:
-            raise NotImplementedError(
-                f"Unsupported mm_vision_select_feature: {self.config.mm_vision_select_feature}"
-            )
-
 
 EntryClass = [NVILALiteForConditionalGeneration]
