@@ -8,6 +8,7 @@ python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials>
 import argparse
 import dataclasses
 import json
+import random
 
 import numpy as np
 import requests
@@ -33,7 +34,6 @@ class BenchArgs:
         parser.add_argument("--host", type=str, default=BenchArgs.host)
         parser.add_argument("--port", type=int, default=BenchArgs.port)
         parser.add_argument("--n-trials", type=int, default=50)
-        parser.add_argument("--batch-size", type=int, default=BenchArgs.batch_size)
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
         parser.add_argument(
             "--max-new-tokens", type=int, default=BenchArgs.max_new_tokens
@@ -57,8 +57,8 @@ class BenchArgs:
 def send_one_prompt(args):
 
     prompt = args.prompt
-    if args.batch_size > 1:
-        prompt = [prompt] * args.batch_size
+    batch_size = random.randint(1, 256)
+    prompt = [prompt] * batch_size
 
     json_data = {
         "text": prompt,
@@ -88,17 +88,13 @@ def send_one_prompt(args):
     else:
         ret = response.json()
 
-    if args.batch_size > 1:
-        ret = ret[0]
+    ret = ret[0]
 
     if response.status_code != 200:
         print(ret)
         return 0, 0
 
-    latency = ret["meta_info"]["e2e_latency"]
-    speed = ret["meta_info"]["completion_tokens"] / latency
-
-    return ret["text"], speed
+    return ret["text"]
 
 
 def test_deterministic(args):
@@ -106,16 +102,13 @@ def test_deterministic(args):
     for i in range(3):
         send_one_prompt(args)
 
-    speeds = []
     texts = []
     for i in range(args.n_trials):
-        text, speed = send_one_prompt(args)
-        print(f"Trial {i}: {speed=:.2f} token/s \nLast 50 characters: {text[-50:]}")
-        speeds.append(speed)
+        text = send_one_prompt(args)
+        print(f"Trial {i}: {text.replace('\n', ' ')}")
         texts.append(text)
 
     print(f"Total samples: {len(texts)}, Unique samples: {len(set(texts))}")
-    print(f"Average speed: {np.mean(speeds):.2f} token/s")
 
 
 if __name__ == "__main__":
