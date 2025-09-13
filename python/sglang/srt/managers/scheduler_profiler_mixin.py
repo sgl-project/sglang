@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 class SchedulerProfilerMixin:
 
-    def init_profier(self):
+    def init_profiler(self):
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
         self.profiler_activities: Optional[List[str]] = None

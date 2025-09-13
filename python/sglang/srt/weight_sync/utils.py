@@ -6,7 +6,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.managers.tokenizer_manager import UpdateWeightsFromTensorReqInput
+from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.utils import MultiprocessingSerializer
 

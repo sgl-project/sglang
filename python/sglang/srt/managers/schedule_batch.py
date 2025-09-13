@@ -38,7 +38,7 @@ import threading
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -52,7 +52,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.layers.moe import is_tbo_enabled
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -60,7 +59,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.lora_radix_cache import LoRAKey, LoRARadixCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -99,6 +98,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "sampling_backend",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
+    "speculative_attention_mode",
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
@@ -911,7 +911,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_prefill_only: bool = False
 
     # hicache pointer for synchronizing data loading from CPU to GPU
-    hicache_consumer_index: int = 0
+    hicache_consumer_index: int = -1
 
     @classmethod
     def init_new(
@@ -962,8 +962,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
-    def alloc_req_slots(self, num_reqs: int):
-        req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
+    def alloc_req_slots(self, num_reqs: int, reqs: Optional[List[Req]] = None):
+        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
+        else:
+            req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
         if req_pool_indices is None:
             raise RuntimeError(
                 "alloc_req_slots runs out of memory. "
@@ -1138,7 +1141,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate req slots
         bs = len(self.reqs)
-        req_pool_indices = self.alloc_req_slots(bs)
+        req_pool_indices = self.alloc_req_slots(bs, self.reqs)
 
         # Init tensors
         reqs = self.reqs
@@ -1372,21 +1375,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
-    def new_page_count_next_decode(self):
+    def new_page_count_next_decode(self, selected_indices: Optional[List[int]] = None):
         page_size = self.token_to_kv_pool_allocator.page_size
+        requests = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
         if page_size == 1:
-            return len(self.reqs)
+            return len(requests)
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
         return (
-            sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+            sum(1 for req in requests if req.seqlen % page_size == 0)
             if self.enable_overlap
-            else sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+            else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
         )
 
-    def check_decode_mem(self, buf_multiplier=1):
+    def check_decode_mem(
+        self, buf_multiplier=1, selected_indices: Optional[List[int]] = None
+    ):
         num_tokens = (
-            self.new_page_count_next_decode()
+            self.new_page_count_next_decode(selected_indices)
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
@@ -1412,34 +1422,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 reverse=True,
             )
 
-        def get_required_tokens(num_reqs: int):
-            headroom_for_spec_decode = 0
-            if server_args.speculative_algorithm:
-                headroom_for_spec_decode += (
-                    num_reqs
-                    * server_args.speculative_eagle_topk
-                    * server_args.speculative_num_steps
-                    + num_reqs * server_args.speculative_num_draft_tokens
-                )
-            return (
-                num_reqs * global_config.retract_decode_steps + headroom_for_spec_decode
-            )
-
-        def _get_available_size():
-            if self.is_hybrid:
-                return min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                return self.token_to_kv_pool_allocator.available_size()
-
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
-        while (
-            _get_available_size() < get_required_tokens(len(sorted_indices))
-            or first_iter
+        while first_iter or (
+            not self.check_decode_mem(selected_indices=sorted_indices)
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
@@ -1493,10 +1480,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else:
                     self.tree_cache.dec_lock_ref(req.last_node)
 
-                # NOTE(lsyin): we should use the newly evictable memory instantly.
-                num_tokens = len(sorted_indices) * global_config.retract_decode_steps
-                self._evict_tree_cache_if_needed(num_tokens)
-
             req.reset_for_retract()
 
             if len(retracted_reqs) == 0:
@@ -1540,7 +1523,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.spec_algorithm.is_eagle():
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
@@ -1917,7 +1900,7 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-    hicache_consumer_index: int = 0
+    hicache_consumer_index: int = -1
 
     # Overlap event
     launch_done: Optional[threading.Event] = None

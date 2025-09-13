@@ -37,6 +37,7 @@ jobs:
               - "python/sglang/srt/models/deepseek*"
               - "python/sglang/srt/layers/moe/**"
               - ".github/workflows/pr-test-h20.yml"
+              - "python/pyproject.toml"
 
   per-commit-8-gpu-h20:
     needs: [check-changes]

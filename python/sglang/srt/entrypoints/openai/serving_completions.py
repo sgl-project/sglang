@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -20,12 +22,14 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.template_manager import TemplateManager
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
 from sglang.utils import convert_json_schema_to_str
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.template_manager import TemplateManager
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
