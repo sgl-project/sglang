@@ -413,6 +413,7 @@ class HiCacheHF3FS(HiCacheStorage):
         values: Optional[Any] = None,
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
+        previous_keys: Optional[List[str]] = None,
     ) -> bool:
         # In MLA backend, only one rank needs to backup the KV cache
         if self.skip_backup:
@@ -483,7 +484,9 @@ class HiCacheHF3FS(HiCacheStorage):
         result = self.metadata_client.exists(self.rank, [key])
         return result[0] if result else False
 
-    def batch_exists(self, keys: List[str]) -> int:
+    def batch_exists(
+        self, keys: List[str], previous_keys: Optional[List[str]] = None
+    ) -> int:
         results = self.metadata_client.exists(self.rank, keys)
         for i in range(len(keys)):
             if not results[i]:

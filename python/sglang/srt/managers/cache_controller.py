@@ -191,12 +191,14 @@ class StorageOperation:
         token_ids: List[int],
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
+        previous_keys: Optional[List[str]] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
+        self.previous_keys = previous_keys
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -212,6 +214,7 @@ class PrefetchOperation(StorageOperation):
         host_indices: torch.Tensor,
         token_ids: List[int],
         last_hash: Optional[str] = None,
+        previous_keys: Optional[List[str]] = None,
     ):
         self.request_id = request_id
 
@@ -219,7 +222,9 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash)
+        super().__init__(
+            host_indices, token_ids, last_hash, previous_keys=previous_keys
+        )
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -611,12 +616,13 @@ class HiCacheController:
         host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
+        previous_keys: Optional[List[str]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash
+            request_id, host_indices, new_input_tokens, last_hash, previous_keys
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -630,9 +636,14 @@ class HiCacheController:
         for chunk in chunks:
             self.host_mem_release_queue.put(chunk)
 
-    def _3fs_zero_copy_batch_exists(self, batch_hashes):
+    def _3fs_zero_copy_batch_exists(self, batch_hashes, previous_keys=None):
         _batch_hashes, _, factor = self.mem_pool_host.get_buffer_with_hash(batch_hashes)
-        hit_page_num = self.storage_backend.batch_exists(_batch_hashes) // factor
+        hit_page_num = (
+            self.storage_backend.batch_exists(
+                _batch_hashes, previous_keys=previous_keys
+            )
+            // factor
+        )
         return hit_page_num
 
     def _3fs_zero_copy_page_get(self, operation, hash_values, host_indices):
@@ -738,6 +749,7 @@ class HiCacheController:
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
+        previous_keys = operation.previous_keys
 
         storage_query_count = 0
         hash_value = []
@@ -755,11 +767,16 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            hit_page_num = self.batch_exists_func(batch_hashes)
+            hit_page_num = self.batch_exists_func(
+                batch_hashes, previous_keys=previous_keys
+            )
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
                 break
+            if previous_keys:
+                previous_keys += batch_hashes
+
         return hash_value, storage_query_count
 
     def prefetch_thread_func(self):
@@ -816,24 +833,29 @@ class HiCacheController:
         host_indices: torch.Tensor,
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
+        previous_keys: Optional[List[str]] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
-        operation = StorageOperation(host_indices, token_ids, hash_value=hash_value)
+        operation = StorageOperation(
+            host_indices, token_ids, hash_value=hash_value, previous_keys=previous_keys
+        )
         self.backup_queue.put(operation)
         return operation.id
 
     # non-zero copy
-    def _generic_page_set(self, hash_values, host_indices) -> bool:
+    def _generic_page_set(self, hash_values, host_indices, previous_keys=None) -> bool:
         data = [
             self.mem_pool_host.get_flat_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
-        return self.storage_backend.batch_set(hash_values, data)
+        return self.storage_backend.batch_set(
+            hash_values, data, previous_keys=previous_keys
+        )
 
     # zero copy
-    def _mooncake_page_set(self, hash_values, host_indices) -> bool:
+    def _mooncake_page_set(self, hash_values, host_indices, previous_keys=None) -> bool:
         key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
             hash_values,
             host_indices,
@@ -843,19 +865,23 @@ class HiCacheController:
             key_strs,
             target_locations=buffer_ptrs,
             target_sizes=buffer_sizes,
+            previous_keys=previous_keys,
         )
         return success
 
     # zero copy
-    def _3fs_zero_copy_page_set(self, hash_values, host_indices) -> bool:
+    def _3fs_zero_copy_page_set(
+        self, hash_values, host_indices, previous_keys=None
+    ) -> bool:
         hashes, dsts, _ = self.mem_pool_host.get_buffer_with_hash(
             hash_values, host_indices
         )
-        return self.storage_backend.batch_set(hashes, dsts)
+        return self.storage_backend.batch_set(hashes, dsts, previous_keys=previous_keys)
 
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
+        previous_keys = operation.previous_keys
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             batch_host_indices = operation.host_indices[
@@ -863,12 +889,17 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            success = self.page_set_func(batch_hashes, batch_host_indices)
+            success = self.page_set_func(
+                batch_hashes, batch_host_indices, previous_keys=previous_keys
+            )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
+
+            if previous_keys:
+                previous_keys += batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
     def backup_thread_func(self):
