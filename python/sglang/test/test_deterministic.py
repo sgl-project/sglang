@@ -105,7 +105,8 @@ def test_deterministic(args):
     texts = []
     for i in range(args.n_trials):
         text = send_one_prompt(args)
-        print(f"Trial {i}: {text.replace('\n', ' ')}")
+        text = text.replace("\n", " ")
+        print(f"Trial {i}: {text}")
         texts.append(text)
 
     print(f"Total samples: {len(texts)}, Unique samples: {len(set(texts))}")
