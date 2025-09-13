@@ -159,8 +159,8 @@ class StreamingXMLToolCallParser:
         ):
             try:
                 param_value = int(param_value)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Error during fallback completion: {e}")
             return param_value
         elif param_type.startswith("num") or param_type.startswith("float"):
             try:
@@ -170,8 +170,9 @@ class StreamingXMLToolCallParser:
                     if float_param_value - int(float_param_value) != 0
                     else int(float_param_value)
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Error during fallback completion: {e}")
+
             return param_value
         elif param_type in ["boolean", "bool", "binary"]:
             param_value = param_value.lower()
@@ -188,9 +189,9 @@ class StreamingXMLToolCallParser:
                     param_value = json.loads(param_value)
                     if not isinstance(param_value, list):
                         param_value = list(param_value)
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError) as e:
                     # If both parsing methods fail, keep as string
-                    pass
+                    logger.warning(f"Error during fallback completion: {e}")
             return param_value
         else:
             return param_value
@@ -335,8 +336,8 @@ class StreamingXMLToolCallParser:
                         if self.current_function_name:
                             self._end_element("function")
                         self._end_element("tool_call")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Error during fallback completion: {e}")
             # Merge newly generated deltas into a single response
             return self._merge_new_deltas_to_single_response(initial_delta_count)
         else:
@@ -477,8 +478,6 @@ class StreamingXMLToolCallParser:
                     preprocessed_element.strip().startswith("<tool_call>")
                     and self.tool_call_index > 0
                 ):
-                    # New tool_call starts, reset parser state but keep generated deltas
-                    # print(f"reset parser for new tool call")
                     self._reset_parser_for_new_tool_call()
 
                 # Parse preprocessed element
@@ -486,8 +485,9 @@ class StreamingXMLToolCallParser:
                 found_any = True
 
             except Exception as e:
-                print(f"exception occurs: {e}, preprocessed_element: {repr(element)}")
-                pass
+                logger.warning(
+                    f"exception occurs: {e}, preprocessed_element: {repr(element)}"
+                )
 
             # Update processed position
             self.last_processed_pos = end_pos
@@ -849,9 +849,8 @@ class StreamingXMLToolCallParser:
             new_deltas = self.deltas[previous_deltas_count:]
             return new_deltas
 
-        except Exception:
-            # If parsing fails, might be due to incomplete XML, return empty list
-            # print(f"Incremental parsing failed: {e}")
+        except Exception as e:
+            logger.warning(f"exception occurred in _parse_incremental_xml: {e}")
             return []
 
     def _preprocess_xml_chunk(self, chunk: str) -> str:
@@ -1370,9 +1369,8 @@ class StreamingXMLToolCallParser:
         try:
             # End current XML document
             self.parser.Parse("", True)
-        except Exception:
-            # Ignore errors when ending document
-            pass
+        except Exception as e:
+            logger.warning(f"Error during fallback completion: {e}")
 
         # Recreate XML parser
         self.parser = ParserCreate()
