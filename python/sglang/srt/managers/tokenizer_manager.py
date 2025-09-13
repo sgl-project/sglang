@@ -396,7 +396,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if isinstance(texts, str):
             return "single_string"
 
-        if is_cross_encoder and len(texts) > 0 and isinstance(texts[0], list):
+        if (
+            is_cross_encoder
+            and len(texts) > 0
+            and isinstance(texts[0], list)
+            and len(texts[0]) == 2
+        ):
             return "cross_encoder_pairs"
 
         return "batch_strings"
