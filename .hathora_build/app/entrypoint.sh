@@ -12,7 +12,7 @@ log() {
 
 # Set default SGLang configuration if not provided
 export MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
-export TP_SIZE="${TP_SIZE:-1}"
+export TP_SIZE="${TP_SIZE:-}"
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-4096}"
 export MAX_QUEUED_REQUESTS="${MAX_QUEUED_REQUESTS:-100}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
@@ -24,7 +24,7 @@ export AUTO_USE_FP8_ON_H100="${AUTO_USE_FP8_ON_H100:-true}"
 
 log "Starting SGLang Hathora entrypoint script."
 log "MODEL_PATH: $MODEL_PATH"
-log "TP_SIZE: $TP_SIZE"
+log "TP_SIZE: ${TP_SIZE:-auto}"
 log "MAX_TOTAL_TOKENS: $MAX_TOTAL_TOKENS"
 log "MAX_QUEUED_REQUESTS: $MAX_QUEUED_REQUESTS"
 log "LOG_LEVEL: $LOG_LEVEL"

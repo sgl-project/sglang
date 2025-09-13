@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -150,8 +151,14 @@ logger.info(
 )
 logger.info(f"  namespace: {CONFIG.namespace}, deployment_id: {CONFIG.deployment_id}, customer_id: {CONFIG.customer_id}")
 
-# Global engine instance
+# Global engine instances
 engine = None
+prefill_engine = None
+decode_engines = []
+_pd_mode_enabled = False
+_pd_bootstrap_port = 8998
+_decode_rr_index = 0
+_decode_rr_lock = None
 # Enrollment state and chosen runtime params
 _enrollment_sent = False
 _chosen_dtype = None
@@ -206,40 +213,189 @@ async def lifespan(app: FastAPI):
         quant = CONFIG.quantization
         if _is_h100_only() and CONFIG.auto_use_fp8_on_h100:
             if dtype == "auto" and (not quant or quant == "auto"):
-                # prefer fp8 weights when available
                 quant = "fp8"
             if kv_dtype == "auto":
                 kv_dtype = "fp8_e5m2"
 
-        engine = sgl.Engine(
-            model_path=CONFIG.model_id,
-            revision=CONFIG.revision,
-            dtype=dtype,
-            quantization=quant,
-            kv_cache_dtype=kv_dtype,
-            tp_size=CONFIG.tp_size,
-            max_total_tokens=CONFIG.max_total_tokens,
-            mem_fraction_static=CONFIG.mem_fraction_static,
-            schedule_conservativeness=CONFIG.schedule_conservativeness,
-            max_queued_requests=CONFIG.max_queued_requests,
-            enable_metrics=CONFIG.enable_metrics,
-            enable_p2p_check=CONFIG.enable_p2p_check,
-            enable_torch_compile=CONFIG.enable_torch_compile,
-            log_level="error",  # Reduce SGLang internal logging
-            # Speculative decoding passthrough
-            speculative_algorithm=CONFIG.speculative_algorithm,
-            speculative_draft_model_path=CONFIG.speculative_draft_model_path,
-            speculative_draft_model_revision=CONFIG.speculative_draft_model_revision,
-            speculative_num_steps=CONFIG.speculative_num_steps,
-            speculative_eagle_topk=CONFIG.speculative_eagle_topk,
-            speculative_num_draft_tokens=CONFIG.speculative_num_draft_tokens,
-            speculative_token_map=CONFIG.speculative_token_map,
-            speculative_attention_mode=(CONFIG.speculative_attention_mode or "prefill"),
-        )
-        # Record chosen dtypes; send enrollment if configured
-        global _chosen_dtype, _chosen_quant, _chosen_kv_dtype
-        _chosen_dtype, _chosen_quant, _chosen_kv_dtype = dtype, quant, kv_dtype
-        _send_enrollment_if_needed()
+        # Determine PD defaults based on GPU count and GPU type (H100) unless explicitly disabled
+        enable_pd_defaults = os.environ.get("ENABLE_PD_DEFAULTS", "true").lower() in ("1", "true", "yes")
+        explicit_tp_env = os.environ.get("TP_SIZE")
+        gpu_names = _detect_gpu_names()
+        num_gpus = len(gpu_names)
+
+        def choose_pd_split(n: int):
+            if n == 8:
+                return 2, 6
+            if n == 4:
+                return 1, 3
+            if n == 2:
+                return 1, 1
+            return None
+
+        pd_split = None
+        if enable_pd_defaults and not explicit_tp_env and _is_h100_only() and num_gpus in (2, 4, 8):
+            pd_split = choose_pd_split(num_gpus)
+
+        global engine, prefill_engine, decode_engines, _pd_mode_enabled, _pd_bootstrap_port, _decode_rr_index
+        _pd_mode_enabled = False
+
+        if pd_split is not None:
+            prefill_tp, decode_tp = pd_split
+            _pd_bootstrap_port = int(os.environ.get("DISAGG_BOOTSTRAP_PORT", "8998"))
+
+            logger.info(
+                f"PD disaggregation enabled by default (GPUs={num_gpus}): prefill_tp={prefill_tp}, decode_tp={decode_tp}, bootstrap_port={_pd_bootstrap_port}"
+            )
+
+            # Initialize RR lock when PD is on
+            global _decode_rr_lock
+            if _decode_rr_lock is None:
+                _decode_rr_lock = asyncio.Lock()
+
+            # Launch prefill engine (first GPUs)
+            prefill_engine = sgl.Engine(
+                model_path=CONFIG.model_id,
+                revision=CONFIG.revision,
+                dtype=dtype,
+                quantization=quant,
+                kv_cache_dtype=kv_dtype,
+                tp_size=prefill_tp,
+                base_gpu_id=0,
+                max_total_tokens=CONFIG.max_total_tokens,
+                mem_fraction_static=CONFIG.mem_fraction_static,
+                schedule_conservativeness=CONFIG.schedule_conservativeness,
+                max_queued_requests=CONFIG.max_queued_requests,
+                enable_metrics=CONFIG.enable_metrics,
+                enable_p2p_check=CONFIG.enable_p2p_check,
+                enable_torch_compile=CONFIG.enable_torch_compile,
+                log_level="error",
+                # PD disaggregation
+                disaggregation_mode="prefill",
+                disaggregation_bootstrap_port=_pd_bootstrap_port,
+                disaggregation_ib_device=os.environ.get("DISAGG_IB_DEVICE"),
+                disaggregation_decode_tp=decode_tp,
+                disaggregation_decode_dp=1,
+                # Speculative decoding passthrough
+                speculative_algorithm=CONFIG.speculative_algorithm,
+                speculative_draft_model_path=CONFIG.speculative_draft_model_path,
+                speculative_draft_model_revision=CONFIG.speculative_draft_model_revision,
+                speculative_num_steps=CONFIG.speculative_num_steps,
+                speculative_eagle_topk=CONFIG.speculative_eagle_topk,
+                speculative_num_draft_tokens=CONFIG.speculative_num_draft_tokens,
+                speculative_token_map=CONFIG.speculative_token_map,
+                speculative_attention_mode=(CONFIG.speculative_attention_mode or "prefill"),
+                host="127.0.0.1",
+            )
+
+            # Launch decode engine(s) (remaining GPUs). For 8 GPUs, create two replicas (TP=3 each)
+            decode_engines = []
+            if num_gpus == 8 and decode_tp == 6:
+                replica_tp = 3
+                num_replicas = 2
+                for r in range(num_replicas):
+                    base_id = prefill_tp + r * replica_tp
+                    inst = sgl.Engine(
+                        model_path=CONFIG.model_id,
+                        revision=CONFIG.revision,
+                        dtype=dtype,
+                        quantization=quant,
+                        kv_cache_dtype=kv_dtype,
+                        tp_size=replica_tp,
+                        base_gpu_id=base_id,
+                        max_total_tokens=CONFIG.max_total_tokens,
+                        mem_fraction_static=CONFIG.mem_fraction_static,
+                        schedule_conservativeness=CONFIG.schedule_conservativeness,
+                        max_queued_requests=CONFIG.max_queued_requests,
+                        enable_metrics=CONFIG.enable_metrics,
+                        enable_p2p_check=CONFIG.enable_p2p_check,
+                        enable_torch_compile=CONFIG.enable_torch_compile,
+                        log_level="error",
+                        disaggregation_mode="decode",
+                        disaggregation_bootstrap_port=_pd_bootstrap_port,
+                        speculative_algorithm=CONFIG.speculative_algorithm,
+                        speculative_draft_model_path=CONFIG.speculative_draft_model_path,
+                        speculative_draft_model_revision=CONFIG.speculative_draft_model_revision,
+                        speculative_num_steps=CONFIG.speculative_num_steps,
+                        speculative_eagle_topk=CONFIG.speculative_eagle_topk,
+                        speculative_num_draft_tokens=CONFIG.speculative_num_draft_tokens,
+                        speculative_token_map=CONFIG.speculative_token_map,
+                        speculative_attention_mode=(CONFIG.speculative_attention_mode or "prefill"),
+                        host="127.0.0.1",
+                        disaggregation_ib_device=os.environ.get("DISAGG_IB_DEVICE"),
+                    )
+                    decode_engines.append(inst)
+            else:
+                # Single decode engine for 4 and 2 GPU configs
+                inst = sgl.Engine(
+                    model_path=CONFIG.model_id,
+                    revision=CONFIG.revision,
+                    dtype=dtype,
+                    quantization=quant,
+                    kv_cache_dtype=kv_dtype,
+                    tp_size=decode_tp,
+                    base_gpu_id=prefill_tp,
+                    max_total_tokens=CONFIG.max_total_tokens,
+                    mem_fraction_static=CONFIG.mem_fraction_static,
+                    schedule_conservativeness=CONFIG.schedule_conservativeness,
+                    max_queued_requests=CONFIG.max_queued_requests,
+                    enable_metrics=CONFIG.enable_metrics,
+                    enable_p2p_check=CONFIG.enable_p2p_check,
+                    enable_torch_compile=CONFIG.enable_torch_compile,
+                    log_level="error",
+                    disaggregation_mode="decode",
+                    disaggregation_bootstrap_port=_pd_bootstrap_port,
+                    speculative_algorithm=CONFIG.speculative_algorithm,
+                    speculative_draft_model_path=CONFIG.speculative_draft_model_path,
+                    speculative_draft_model_revision=CONFIG.speculative_draft_model_revision,
+                    speculative_num_steps=CONFIG.speculative_num_steps,
+                    speculative_eagle_topk=CONFIG.speculative_eagle_topk,
+                    speculative_num_draft_tokens=CONFIG.speculative_num_draft_tokens,
+                    speculative_token_map=CONFIG.speculative_token_map,
+                    speculative_attention_mode=(CONFIG.speculative_attention_mode or "prefill"),
+                    disaggregation_ib_device=os.environ.get("DISAGG_IB_DEVICE"),
+                    host="127.0.0.1",
+                )
+                decode_engines.append(inst)
+
+            _pd_mode_enabled = True
+            _decode_rr_index = 0
+
+            # Record chosen dtypes; send enrollment once
+            global _chosen_dtype, _chosen_quant, _chosen_kv_dtype
+            _chosen_dtype, _chosen_quant, _chosen_kv_dtype = dtype, quant, kv_dtype
+            _send_enrollment_if_needed()
+
+        else:
+            # Fallback: single unified engine
+            engine = sgl.Engine(
+                model_path=CONFIG.model_id,
+                revision=CONFIG.revision,
+                dtype=dtype,
+                quantization=quant,
+                kv_cache_dtype=kv_dtype,
+                tp_size=CONFIG.tp_size,
+                max_total_tokens=CONFIG.max_total_tokens,
+                mem_fraction_static=CONFIG.mem_fraction_static,
+                schedule_conservativeness=CONFIG.schedule_conservativeness,
+                max_queued_requests=CONFIG.max_queued_requests,
+                enable_metrics=CONFIG.enable_metrics,
+                enable_p2p_check=CONFIG.enable_p2p_check,
+                enable_torch_compile=CONFIG.enable_torch_compile,
+                log_level="error",  # Reduce SGLang internal logging
+                # Speculative decoding passthrough
+                speculative_algorithm=CONFIG.speculative_algorithm,
+                speculative_draft_model_path=CONFIG.speculative_draft_model_path,
+                speculative_draft_model_revision=CONFIG.speculative_draft_model_revision,
+                speculative_num_steps=CONFIG.speculative_num_steps,
+                speculative_eagle_topk=CONFIG.speculative_eagle_topk,
+                speculative_num_draft_tokens=CONFIG.speculative_num_draft_tokens,
+                speculative_token_map=CONFIG.speculative_token_map,
+                speculative_attention_mode=(CONFIG.speculative_attention_mode or "prefill"),
+            )
+            # Record chosen dtypes; send enrollment if configured
+            global _chosen_dtype, _chosen_quant, _chosen_kv_dtype
+            _chosen_dtype, _chosen_quant, _chosen_kv_dtype = dtype, quant, kv_dtype
+            _send_enrollment_if_needed()
         
         startup_duration = time.time() - startup_start_time
         logger.info(f"SGLang engine loaded successfully in {startup_duration:.2f}s")
@@ -251,11 +407,22 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    logger.info("Shutting down SGLang engine...")
+    logger.info("Shutting down SGLang engine(s)...")
     try:
-        if hasattr(engine, 'shutdown'):
-            engine.shutdown()
-        logger.info("SGLang engine shutdown completed")
+        if _pd_mode_enabled:
+            if hasattr(prefill_engine, 'shutdown'):
+                prefill_engine.shutdown()
+            for inst in decode_engines:
+                try:
+                    if hasattr(inst, 'shutdown'):
+                        inst.shutdown()
+                except Exception as e:
+                    logger.warning(f"Error shutting down a decode engine: {e}")
+            logger.info("PD engines shutdown completed")
+        else:
+            if hasattr(engine, 'shutdown'):
+                engine.shutdown()
+            logger.info("SGLang engine shutdown completed")
     except Exception as e:
         logger.warning(f"Error during engine shutdown: {e}")
 
@@ -366,11 +533,47 @@ async def generate_response_sglang(
         
         logger.debug(f"[{request_id}] Sampling params: {sampling_params}")
         
-        # Use SGLang async_generate
-        result = await engine.async_generate(
-            prompt,
-            sampling_params=sampling_params
-        )
+        # PD disaggregation path
+        if _pd_mode_enabled and prefill_engine is not None and len(decode_engines) > 0:
+            bootstrap_host = "127.0.0.1"
+            bootstrap_port = _pd_bootstrap_port
+            bootstrap_room = random.randint(0, 2**63 - 1)
+
+            # Launch prefill and decode concurrently; use decode result
+            prefill_coro = prefill_engine.async_generate(
+                prompt,
+                sampling_params=sampling_params,
+                stream=False,
+                bootstrap_host=bootstrap_host,
+                bootstrap_port=bootstrap_port,
+                bootstrap_room=bootstrap_room,
+            )
+            # Round-robin pick a decode engine
+            global _decode_rr_index
+            async with _decode_rr_lock:
+                idx = _decode_rr_index % len(decode_engines)
+                _decode_rr_index = _decode_rr_index + 1
+            decode_coro = decode_engines[idx].async_generate(
+                prompt,
+                sampling_params=sampling_params,
+                stream=False,
+                bootstrap_host=bootstrap_host,
+                bootstrap_port=bootstrap_port,
+                bootstrap_room=bootstrap_room,
+            )
+
+            # Ensure both run; take decode result as authoritative
+            results = await asyncio.gather(prefill_coro, decode_coro, return_exceptions=True)
+            # results[1] expected to be decode result dict
+            if isinstance(results[1], Exception):
+                raise results[1]
+            result = results[1]
+        else:
+            # Unified engine path
+            result = await engine.async_generate(
+                prompt,
+                sampling_params=sampling_params
+            )
         
         inference_end_time = time.time()
         total_inference_latency_ms = (inference_end_time - inference_start_time) * 1000
@@ -439,11 +642,46 @@ async def stream_response_sglang(
         start_time = time.time()
         
         # Use SGLang async_generate with streaming
-        async_generator = await engine.async_generate(
-            prompt,
-            sampling_params=sampling_params,
-            stream=True
-        )
+        if _pd_mode_enabled and prefill_engine is not None and len(decode_engines) > 0:
+            bootstrap_host = "127.0.0.1"
+            bootstrap_port = _pd_bootstrap_port
+            bootstrap_room = random.randint(0, 2**63 - 1)
+
+            # Kick off prefill in background
+            async def _run_prefill():
+                try:
+                    await prefill_engine.async_generate(
+                        prompt,
+                        sampling_params=sampling_params,
+                        stream=False,
+                        bootstrap_host=bootstrap_host,
+                        bootstrap_port=bootstrap_port,
+                        bootstrap_room=bootstrap_room,
+                    )
+                except Exception as e:
+                    logger.warning(f"Prefill task error: {e}")
+
+            asyncio.create_task(_run_prefill())
+
+            # Round-robin pick a decode engine
+            global _decode_rr_index
+            async with _decode_rr_lock:
+                idx = _decode_rr_index % len(decode_engines)
+                _decode_rr_index = _decode_rr_index + 1
+            async_generator = await decode_engines[idx].async_generate(
+                prompt,
+                sampling_params=sampling_params,
+                stream=True,
+                bootstrap_host=bootstrap_host,
+                bootstrap_port=bootstrap_port,
+                bootstrap_room=bootstrap_room,
+            )
+        else:
+            async_generator = await engine.async_generate(
+                prompt,
+                sampling_params=sampling_params,
+                stream=True
+            )
         
         token_count = 0
         
@@ -565,9 +803,14 @@ async def log_requests(request: Request, call_next):
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest):
     """OpenAI-compatible chat completion endpoint with SGLang backend."""
-    if not engine:
-        logger.error("Engine not initialized - cannot process request")
-        raise HTTPException(status_code=503, detail="Engine not initialized")
+    if _pd_mode_enabled:
+        if not (prefill_engine and len(decode_engines) > 0):
+            logger.error("PD engines not initialized - cannot process request")
+            raise HTTPException(status_code=503, detail="PD engines not initialized")
+    else:
+        if not engine:
+            logger.error("Engine not initialized - cannot process request")
+            raise HTTPException(status_code=503, detail="Engine not initialized")
     
     logger.info(f"Chat completion request: model={request.model}, messages={len(request.messages)}, "
                 f"max_tokens={request.max_tokens}, stream={request.stream}")
@@ -612,7 +855,12 @@ async def health_check():
     """Health check endpoint."""
     logger.debug("Health check requested")
     
-    engine_status = "ready" if engine else "not_initialized"
+    if _pd_mode_enabled:
+        engine_status = (
+            "ready" if (prefill_engine is not None and len(decode_engines) > 0) else "not_initialized"
+        )
+    else:
+        engine_status = "ready" if engine else "not_initialized"
     
     health_info = {
         "status": "ok",
@@ -622,6 +870,8 @@ async def health_check():
         "namespace": CONFIG.namespace,
         "deployment_id": CONFIG.deployment_id,
         "customer_id": CONFIG.customer_id,
+        "pd_mode": _pd_mode_enabled,
+        "pd_bootstrap_port": _pd_bootstrap_port if _pd_mode_enabled else None,
         "timestamp": time.time()
     }
     
