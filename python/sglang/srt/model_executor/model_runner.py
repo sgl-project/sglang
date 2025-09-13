@@ -127,6 +127,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_blackwell,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
@@ -1832,6 +1833,10 @@ class ModelRunner:
                 from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
 
                 full_attn_backend = AscendAttnBackend(self)
+            elif is_blackwell():
+                from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+                full_attn_backend = TritonAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.flashattention_backend import (
                     FlashAttentionBackend,

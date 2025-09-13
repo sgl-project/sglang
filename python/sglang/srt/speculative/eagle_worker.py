@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     get_bool_env_var,
+    is_blackwell,
     is_cuda,
     next_power_of_2,
 )
@@ -214,7 +215,11 @@ class EAGLEWorker(TpModelWorker):
             "triton": self._create_triton_decode_backend,
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
-            "hybrid_linear_attn": self._create_fa3_decode_backend,
+            "hybrid_linear_attn": (
+                self._create_fa3_decode_backend
+                if not is_blackwell()
+                else self._create_triton_decode_backend
+            ),
             "flashmla": self._create_flashmla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
@@ -232,7 +237,11 @@ class EAGLEWorker(TpModelWorker):
             "triton": self._create_triton_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
-            "hybrid_linear_attn": self._create_fa3_prefill_backend,
+            "hybrid_linear_attn": (
+                self._create_fa3_prefill_backend
+                if not is_blackwell()
+                else self._create_triton_prefill_backend
+            ),
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
         }
