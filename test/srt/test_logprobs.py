@@ -34,13 +34,9 @@ else:
 TOP_K = 20
 MAX_RETRIES = 3
 RETRY_DELAY = 2
-
-# Test configurations
-TEST_CONFIG = {
-    "num_samples": 1000,
-    "logprob_sample_ratio": 0.5,
-    "temperature": 1.0,
-}
+NUM_SAMPLES = 1000
+LOGPROB_SAMPLE_RATIO = 0.5
+TEMPERATURE = 1.0
 
 
 class TestLogprobsDense(unittest.TestCase):
@@ -88,29 +84,29 @@ class TestLogprobsDense(unittest.TestCase):
                     )
                 time.sleep(RETRY_DELAY)
 
-    def compare_meta(self, metaA, metaB):
+    def compare_meta(self, baseline_meta, sglang_meta):
         """Compare metadata between two outputs and return max and mean differences."""
         diffs = []
         for key in ["input_top_logprobs", "output_top_logprobs"]:
-            arrA, arrB = metaA[key], metaB[key]
+            baseline_logprobs, sglang_logprobs = baseline_meta[key], sglang_meta[key]
             self.assertEqual(
-                len(arrA),
-                len(arrB),
+                len(baseline_logprobs),
+                len(sglang_logprobs),
                 f"Length of {key} is not equal, sglang did not return the correct number of log probs(should be top 20)",
             )
-            for e1, e2 in zip(arrA, arrB):
-                if not e1 or not e2:
+            for baseline_entry, sglang_entry in zip(baseline_logprobs, sglang_logprobs):
+                if not baseline_entry or not sglang_entry:
                     continue
-                dmapA = {tid: lp for lp, tid, _ in e1}
-                dmapB = {tid: lp for lp, tid, _ in e2}
-                common = dmapA.keys() & dmapB.keys()
+                baseline_token_map = {tid: lp for lp, tid, _ in baseline_entry}
+                sglang_token_map = {tid: lp for lp, tid, _ in sglang_entry}
+                common_tokens = baseline_token_map.keys() & sglang_token_map.keys()
                 self.assertGreaterEqual(
-                    len(common),
+                    len(common_tokens),
                     TOP_K / 2,
-                    f"there are only {len(common)} common topk tokens that matches",
+                    f"there are only {len(common_tokens)} common topk tokens that matches",
                 )
-                for tid in common:
-                    diffs.append(abs(dmapA[tid] - dmapB[tid]))
+                for token_id in common_tokens:
+                    diffs.append(abs(baseline_token_map[token_id] - sglang_token_map[token_id]))
         return max(diffs), float(np.mean(diffs))
 
     def test_logprobs_comparison(self):
@@ -118,21 +114,21 @@ class TestLogprobsDense(unittest.TestCase):
         # Load test data with retry mechanism
         records = self.load_test_data()
 
-        with self.subTest(config=TEST_CONFIG):
+        with self.subTest(config={"num_samples": NUM_SAMPLES, "logprob_sample_ratio": LOGPROB_SAMPLE_RATIO, "temperature": TEMPERATURE}):
 
             # Sample records for this config
             test_records = random.sample(
-                records, k=min(TEST_CONFIG["num_samples"], len(records))
+                records, k=min(NUM_SAMPLES, len(records))
             )
             random.shuffle(test_records)
 
             # Calculate how many samples should return logprobs
-            logprob_count = int(len(test_records) * TEST_CONFIG["logprob_sample_ratio"])
+            logprob_count = int(len(test_records) * LOGPROB_SAMPLE_RATIO)
             print(
-                f"Testing with {len(test_records)} samples, temperature={TEST_CONFIG['temperature']}"
+                f"Testing with {len(test_records)} samples, temperature={TEMPERATURE}"
             )
             print(
-                f"Will return logprobs for {logprob_count} samples (ratio: {TEST_CONFIG['logprob_sample_ratio']})"
+                f"Will return logprobs for {logprob_count} samples (ratio: {LOGPROB_SAMPLE_RATIO})"
             )
 
             all_max, all_mean = [], []
@@ -147,13 +143,13 @@ class TestLogprobsDense(unittest.TestCase):
                 random.sample(range(len(test_records)), logprob_count)
             )
             return_logprob_array = [
-                i in logprob_indices for i in range(len(test_records))
+                sample_idx in logprob_indices for sample_idx in range(len(test_records))
             ]
 
             # Sampling param per request
             sampling_params = [
                 {
-                    "temperature": TEST_CONFIG["temperature"],
+                    "temperature": TEMPERATURE,
                     "top_p": 1.0,
                     "top_k": TOP_K,
                     "max_new_tokens": 1,
@@ -169,9 +165,9 @@ class TestLogprobsDense(unittest.TestCase):
                 top_logprobs_num=TOP_K,
             )
 
-            for i, (rec, output) in enumerate(zip(test_records, outputs)):
+            for sample_idx, (rec, output) in enumerate(zip(test_records, outputs)):
                 # Only compare logprobs for samples that should have them
-                if i in logprob_indices:
+                if sample_idx in logprob_indices:
                     # Safe access to meta_info and input_top_logprobs
                     meta_info = output.get("meta_info")
                     input_top_logprobs = (
@@ -182,10 +178,10 @@ class TestLogprobsDense(unittest.TestCase):
                         input_top_logprobs,
                         f"return_logprob enabled on this sample, but input_top_logprobs is None (length: {len(input_top_logprobs) if input_top_logprobs is not None else 'N/A'})",
                     )
-                    metaA = rec["meta"]
-                    metaB = meta_info
+                    baseline_meta = rec["meta"]
+                    sglang_meta = meta_info
 
-                    max_diff, mean_diff = self.compare_meta(metaA, metaB)
+                    max_diff, mean_diff = self.compare_meta(baseline_meta, sglang_meta)
                     all_max.append(max_diff)
                     all_mean.append(mean_diff)
                     logprob_returned_count += 1
@@ -203,7 +199,7 @@ class TestLogprobsDense(unittest.TestCase):
 
                     self.assertFalse(
                         input_top_logprobs,
-                        f"return_logprob is disabled on this sample, Sample {i} should not have logprobs, content: {output_token_ids_logprobs}",
+                        f"return_logprob is disabled on this sample, Sample {sample_idx} should not have logprobs, content: {output_token_ids_logprobs}",
                     )
 
             max_of_max = max(all_max) if all_max else 0.0
@@ -224,7 +220,7 @@ class TestLogprobsDense(unittest.TestCase):
 
             # Write results to GitHub summary
             summary_content = f"""
-- **Configuration**: {TEST_CONFIG}
+- **Configuration**: {{"num_samples": {NUM_SAMPLES}, "logprob_sample_ratio": {LOGPROB_SAMPLE_RATIO}, "temperature": {TEMPERATURE}}}
 - **Max of max Δ**: {max_of_max:.6g}
 - **Mean of mean Δ**: {mean_of_mean:.6g}
 - **Status**: {'✅ Passed' if max_of_max <= DENSE_TOLERANCE_MAX_DIFF and mean_of_mean <= DENSE_TOLERANCE_MEAN_DIFF else '❌ Failed'}
@@ -235,24 +231,24 @@ class TestLogprobsDense(unittest.TestCase):
             self.assertIsInstance(all_max, list)
             self.assertIsInstance(all_mean, list)
             self.assertGreater(
-                len(all_max), 0, f"No test samples processed for config {TEST_CONFIG}"
+                len(all_max), 0, f"No test samples processed for config {{'num_samples': {NUM_SAMPLES}, 'logprob_sample_ratio': {LOGPROB_SAMPLE_RATIO}, 'temperature': {TEMPERATURE}}}"
             )
 
             # Tolerance checks with clear error messages
             failed_samples = []
-            for i, (max_diff, mean_diff) in enumerate(zip(all_max, all_mean)):
+            for sample_idx, (max_diff, mean_diff) in enumerate(zip(all_max, all_mean)):
                 if max_diff > DENSE_TOLERANCE_MAX_DIFF:
                     failed_samples.append(
-                        f"Sample {i}: max_diff={max_diff:.6g} > {DENSE_TOLERANCE_MAX_DIFF}"
+                        f"Sample {sample_idx}: max_diff={max_diff:.6g} > {DENSE_TOLERANCE_MAX_DIFF}"
                     )
                 if mean_diff > DENSE_TOLERANCE_MEAN_DIFF:
                     failed_samples.append(
-                        f"Sample {i}: mean_diff={mean_diff:.6g} > {DENSE_TOLERANCE_MEAN_DIFF}"
+                        f"Sample {sample_idx}: mean_diff={mean_diff:.6g} > {DENSE_TOLERANCE_MEAN_DIFF}"
                     )
 
             if failed_samples:
                 self.fail(
-                    f"Config {TEST_CONFIG} - Tolerance exceeded in {len(failed_samples)} samples:\n"
+                    f"Config {{'num_samples': {NUM_SAMPLES}, 'logprob_sample_ratio': {LOGPROB_SAMPLE_RATIO}, 'temperature': {TEMPERATURE}}} - Tolerance exceeded in {len(failed_samples)} samples:\n"
                     + "\n".join(failed_samples[:5])
                 )
 
