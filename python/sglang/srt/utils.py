@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import builtins
 import ctypes
@@ -230,8 +231,16 @@ except:
     is_intel_amx_backend_available = False
 
 
+try:
+    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # to support torch compile
+    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+except:
+    is_amx_tile_supported = False
+
+
 def cpu_has_amx_support():
-    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+    return is_amx_tile_supported and is_intel_amx_backend_available
 
 
 def use_intel_amx_backend(layer):
@@ -426,7 +435,9 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        free_gpu_memory = psutil.virtual_memory().available
+        total_free_memory = psutil.virtual_memory().available
+        n_numa_node: int = len(get_cpu_ids_by_node())
+        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -1421,6 +1432,7 @@ def init_custom_process_group(
     store=None,
     group_name=None,
     pg_options=None,
+    device_id=None,
 ):
     from torch.distributed.distributed_c10d import (
         Backend,
@@ -1474,6 +1486,7 @@ def init_custom_process_group(
         group_name=group_name,
         **{pg_options_param_name: pg_options},
         timeout=timeout,
+        device_id=device_id,
     )
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
@@ -3027,3 +3040,21 @@ def check_cuda_result(raw_output):
         raise Exception(f"CUDA error: {err}")
 
     return results
+
+
+def numa_bind_to_node(node: int):
+    libnuma = ctypes.CDLL("libnuma.so")
+    if libnuma.numa_available() < 0:
+        raise SystemError("numa not available on this system")
+
+    libnuma.numa_run_on_node(ctypes.c_int(node))
+    libnuma.numa_set_localalloc()
+
+
+def json_list_type(value):
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid JSON list: {value}. Please provide a valid JSON list."
+        )
