@@ -383,6 +383,59 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ):
                     yield response
 
+    def _detect_input_format(
+        self, texts: Union[str, List[str]], is_cross_encoder: bool
+    ) -> str:
+        """Detect the format of input texts for proper tokenization handling.
+
+        Returns:
+            - "single_string": Regular single text like "Hello world"
+            - "batch_strings": Regular batch like ["Hello", "World"]
+            - "cross_encoder_pairs": Cross-encoder pairs like [["query", "document"]]
+        """
+        if isinstance(texts, str):
+            return "single_string"
+
+        if is_cross_encoder and len(texts) > 0 and isinstance(texts[0], list):
+            return "cross_encoder_pairs"
+
+        return "batch_strings"
+
+    def _prepare_tokenizer_input(
+        self, texts: Union[str, List[str]], input_format: str
+    ) -> Union[List[str], List[List[str]]]:
+        """Prepare input for the tokenizer based on detected format."""
+        if input_format == "single_string":
+            return [texts]  # Wrap single string for batch processing
+        elif input_format == "cross_encoder_pairs":
+            return texts  # Already in correct format: [["query", "doc"]]
+        else:  # batch_strings
+            return texts  # Already in correct format: ["text1", "text2"]
+
+    def _extract_tokenizer_results(
+        self,
+        input_ids: List[List[int]],
+        token_type_ids: Optional[List[List[int]]],
+        input_format: str,
+        original_batch_size: int,
+    ) -> Union[
+        Tuple[List[int], Optional[List[int]]],
+        Tuple[List[List[int]], Optional[List[List[int]]]],
+    ]:
+        """Extract results from tokenizer output based on input format."""
+
+        # For single inputs (string or single cross-encoder pair), extract first element
+        if (
+            input_format in ["single_string", "cross_encoder_pairs"]
+            and original_batch_size == 1
+        ):
+            single_input_ids = input_ids[0] if input_ids else []
+            single_token_type_ids = token_type_ids[0] if token_type_ids else None
+            return single_input_ids, single_token_type_ids
+
+        # For true batches, return as-is
+        return input_ids, token_type_ids
+
     async def _tokenize_texts(
         self, texts: Union[str, List[str]], is_cross_encoder: bool = False
     ) -> Union[
@@ -392,72 +445,76 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """
         Tokenize text(s) using the appropriate tokenizer strategy.
 
-        This method chooses between async dynamic batch tokenizer (for single texts only)
-        and regular tokenizer (for batch texts or fallback).
+        This method handles multiple input formats and chooses between async dynamic
+        batch tokenizer (for single texts only) and regular tokenizer.
 
         Args:
-            texts: Single string or list of strings to tokenize.
+            texts: Text input in various formats:
+
+                   Regular cases:
+                   - Single string: "How are you?"
+                   - Batch of strings: ["Hello", "World", "How are you?"]
+
+                   Cross-encoder cases (sentence pairs for similarity/ranking):
+                   - Single pair: [["query text", "document text"]]
+                   - Multiple pairs: [["q1", "d1"], ["q2", "d2"], ["q3", "d3"]]
+
             is_cross_encoder: Whether to return token_type_ids for cross-encoder models.
-                             Used for tasks like sentence similarity where token types matter.
+                             Enables proper handling of sentence pairs with segment IDs.
 
         Returns:
-            For single text input:
+            Single input cases:
                 Tuple[List[int], Optional[List[int]]]: (input_ids, token_type_ids)
-            For batch text input:
-                Tuple[List[List[int]], Optional[List[List[int]]]]: (input_ids_batch, token_type_ids_batch)
+                Example: ([101, 2129, 102], [0, 0, 0]) for single text
+                Example: ([101, 2129, 102, 4068, 102], [0, 0, 0, 1, 1]) for cross-encoder pair
 
-            token_type_ids is None unless is_cross_encoder=True.
+            Batch input cases:
+                Tuple[List[List[int]], Optional[List[List[int]]]]: (batch_input_ids, batch_token_type_ids)
+                Example: ([[101, 2129, 102], [101, 4068, 102]], None) for regular batch
+
+            Note: token_type_ids is None unless is_cross_encoder=True.
         """
         if not texts or self.tokenizer is None:
             raise ValueError("texts cannot be empty and tokenizer must be initialized")
 
-        is_single: bool = isinstance(texts, str)
-        # normalized to list format
-        text_list: List[str] = [texts] if is_single else texts
-        kwargs: Dict[str, Any] = (
+        # Step 1: Detect input format and prepare for tokenization
+        input_format = self._detect_input_format(texts, is_cross_encoder)
+        tokenizer_input = self._prepare_tokenizer_input(texts, input_format)
+        original_batch_size = len(texts) if not isinstance(texts, str) else 1
+
+        # Step 2: Set up tokenizer arguments
+        tokenizer_kwargs = (
             {"return_token_type_ids": is_cross_encoder} if is_cross_encoder else {}
         )
 
-        # Use async dynamic batch tokenizer only for single texts
-        # For multiple texts in a batch, use regular tokenizer which is efficient
-        if self.async_dynamic_batch_tokenizer is not None and is_single:
-            logger.debug("Using async dynamic batch tokenizer for single text")
-            result: Dict[str, Any] = await self.async_dynamic_batch_tokenizer.encode(
-                text_list[0], **kwargs
-            )
+        # Step 3: Choose tokenization strategy
+        use_async_tokenizer = (
+            self.async_dynamic_batch_tokenizer is not None
+            and input_format == "single_string"
+        )
 
-            # Extract and wrap in batch format for consistency
-            input_ids: List[List[int]] = [result["input_ids"]]
-            token_type_ids: Optional[List[List[int]]] = (
+        if use_async_tokenizer:
+            logger.debug("Using async dynamic batch tokenizer for single text")
+            result = await self.async_dynamic_batch_tokenizer.encode(
+                tokenizer_input[0], **tokenizer_kwargs
+            )
+            # Convert to batch format for consistency
+            input_ids = [result["input_ids"]]
+            token_type_ids = (
                 [result["token_type_ids"]]
                 if is_cross_encoder and result.get("token_type_ids")
                 else None
             )
         else:
-            # Use regular tokenizer - much more efficient for batch requests
-            logger.debug(f"Using regular tokenizer for {len(text_list)} texts")
-            encoded: Dict[str, Any] = self.tokenizer(text_list, **kwargs)
+            logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
+            encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+            input_ids = encoded["input_ids"]
+            token_type_ids = encoded.get("token_type_ids") if is_cross_encoder else None
 
-            # input_ids is nested since we pass List[str] to tokenizer
-            # Example: [[101, 7592, 102]] or [[101, 7592, 102], [101, 2088, 102]]
-            input_ids: List[List[int]] = encoded["input_ids"]
-
-            # token_type_ids is nested as well
-            # Example: [[0, 0, 0]] or [[0, 0, 0], [0, 0, 0]] or None
-            token_type_ids: Optional[List[List[int]]] = (
-                encoded.get("token_type_ids") if is_cross_encoder else None
-            )
-
-        # Return in the expected format
-        if is_single:
-            # Extract single sequence from batch format
-            single_input_ids: List[int] = input_ids[0]
-            single_token_type_ids: Optional[List[int]] = (
-                token_type_ids[0] if token_type_ids else None
-            )
-            return single_input_ids, single_token_type_ids
-        else:
-            return input_ids, token_type_ids
+        # Step 4: Extract results based on input format
+        return self._extract_tokenizer_results(
+            input_ids, token_type_ids, input_format, original_batch_size
+        )
 
     async def _tokenize_one_request(
         self,
