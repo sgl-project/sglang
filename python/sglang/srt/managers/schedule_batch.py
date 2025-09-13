@@ -688,10 +688,8 @@ class Req:
                 self.origin_input_ids_unpadded[self.surr_offset :] + self.output_ids
             )
             self.cur_decode_ids_len = len(self.output_ids)
-
-        extend_len = len(self.output_ids) - self.cur_decode_ids_len
-        if extend_len > 0:
-            self.surr_and_decode_ids.extend(self.output_ids[-extend_len:])
+        else:
+            self.surr_and_decode_ids.extend(self.output_ids[self.cur_decode_ids_len :])
             self.cur_decode_ids_len = len(self.output_ids)
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
