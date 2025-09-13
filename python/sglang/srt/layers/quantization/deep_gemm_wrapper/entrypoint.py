@@ -9,6 +9,7 @@ from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     DEEPGEMM_BLACKWELL,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
+    DEEPGEMM_MIN_BLOCK_M,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -47,6 +48,42 @@ def grouped_gemm_nt_f8f8bf16_masked(
             masked_m,
             expected_m,
         )
+
+
+def grouped_gemm_nt_f8f8bf16_signal(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    signal: torch.Tensor,
+    expected_m: int,
+    gemm_start_event: torch.cuda.Event = None,
+    num_sms_sbo_comm: int = None,
+    max_block_n: int = None,
+):
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_OVERLAP
+    if num_sms_sbo_comm is None:
+        num_sms_sbo_comm = compile_utils._NUM_SMS_SBO_COMM
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        with configure_deep_gemm_num_invalid_sms(num_sms_sbo_comm):
+            if gemm_start_event is not None:
+                gemm_start_event.record()
+
+            return deep_gemm.m_grouped_fp8_gemm_nt_masked(
+                lhs,
+                rhs,
+                out,
+                masked_m,
+                expected_m,
+                max_block_n=max_block_n,
+                enable_overlap=True,
+                signal=signal,
+            )
 
 
 def grouped_gemm_nt_f8f8bf16_contig(
@@ -98,6 +135,19 @@ def configure_deep_gemm_num_sms(num_sms):
     else:
         original_num_sms = deep_gemm.get_num_sms()
         deep_gemm.set_num_sms(num_sms)
+        try:
+            yield
+        finally:
+            deep_gemm.set_num_sms(original_num_sms)
+
+
+@contextmanager
+def configure_deep_gemm_num_invalid_sms(num_invalid_sms):
+    if num_invalid_sms is None:
+        yield
+    else:
+        original_num_sms = deep_gemm.get_num_sms()
+        deep_gemm.set_num_sms(original_num_sms - num_invalid_sms)
         try:
             yield
         finally:
