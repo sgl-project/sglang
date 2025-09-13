@@ -728,6 +728,9 @@ class HybridLinearKVPool(KVCache):
             layer_id_override=layer_id,
         )
 
+    def get_v_head_dim(self):
+        return self.full_kv_pool.get_value_buffer(0).shape[-1]
+
 
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
