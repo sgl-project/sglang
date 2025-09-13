@@ -7,7 +7,7 @@ A high-performance, OpenAI-compatible API server powered by SGLang for deploymen
 - **SGLang Backend**: High-performance inference engine replacing HuggingFace Transformers
 - **OpenAI Compatible**: Drop-in replacement for OpenAI's chat completions API
 - **Comprehensive Logging**: Detailed request tracking and performance monitoring
-- **Hathora Integration**: Native support for Hathora Cloud deployment with GCP networking
+- **Hathora Integration**: Native support for Hathora Cloud deployment
 - **Streaming Support**: Real-time token streaming for better user experience
 - **Health Monitoring**: Built-in health checks and metrics endpoints
 - **Graceful Shutdown**: Proper cleanup of resources and network endpoints
@@ -37,10 +37,8 @@ Set the required environment variables for Hathora deployment:
 
 ```bash
 # Required for Hathora
-export HATHORA_HOSTNAME="your-app.hathora.dev"
 export HATHORA_DEFAULT_PORT="8000"
 export HATHORA_REGION="seattle"
-export GCP_SERVICE_ACCOUNT_KEY_BASE64="<base64-encoded-service-account-key>"
 
 # SGLang Configuration
 export MODEL_PATH="meta-llama/Meta-Llama-3.1-8B-Instruct"
@@ -146,10 +144,8 @@ Response:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HATHORA_HOSTNAME` | Hathora app hostname | **Required** |
 | `HATHORA_DEFAULT_PORT` | Port for the service | **Required** |
 | `HATHORA_REGION` | Hathora deployment region | **Required** |
-| `GCP_SERVICE_ACCOUNT_KEY_BASE64` | Base64-encoded GCP service account key | **Required** |
 | `MODEL_PATH` | HuggingFace model path for SGLang | `meta-llama/Meta-Llama-3.1-8B-Instruct` |
 | `TP_SIZE` | Tensor parallelism size | `1` |
 | `MAX_TOTAL_TOKENS` | Maximum total tokens per request | `4096` |

@@ -6,31 +6,33 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # Install gcloud CLI
-RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg ca-certificates dnsutils \
-  && mkdir -p /usr/share/keyrings \
-  && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
-  && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list \
-  && apt-get update && apt-get install -y --no-install-recommends google-cloud-sdk \
-  && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg ca-certificates dnsutils libnuma1 numactl \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copy and install requirements
-COPY app/requirements.txt ./requirements.txt
+# Install NVIDIA CUDA Toolkit 12.8 (for DeepGEMM JIT and CUDA tools)
+RUN apt-get update && apt-get install -y --no-install-recommends wget && \
+    wget -qO /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i /tmp/cuda-keyring.deb && rm -f /tmp/cuda-keyring.deb && \
+    apt-get update && apt-get install -y --no-install-recommends cuda-toolkit-12-8 && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# Copy the application code
+COPY .hathora_build/app/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install SGLang - adjust this line based on your SGLang installation method
 # For development, you might want to install from source or a specific version
 RUN pip install --no-cache-dir sglang[all]
 
-# Copy the application code
-COPY app/serve_hathora.py .
-COPY app/hathora_config.py .
-
-# Copy entrypoint script
-COPY app/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY .hathora_build/app/* .
+RUN chmod +x ./entrypoint.sh
 
 # Expose the port the app runs on
 EXPOSE 8000
 
 # Use entrypoint script
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["./entrypoint.sh"]
