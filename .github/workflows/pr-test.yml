@@ -109,6 +109,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cleanup
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -142,6 +147,11 @@ jobs:
     runs-on: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cleanup
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
