@@ -17,6 +17,10 @@ def create_flashinfer_kv_indices_triton(
     kv_indices_ptr,
     req_to_token_ptr_stride: tl.constexpr,
 ):
+    """
+    Fill kv_indices with token page indices from `req_to_token_pool`, which
+    will be used to index into `token_to_kv_pool`.
+    """
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
 
@@ -32,6 +36,7 @@ def create_flashinfer_kv_indices_triton(
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
 
     num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
+    # Load all kv indices for a request
     for i in range(num_loop):
         # index into req_to_token_ptr needs to be int64
         offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
