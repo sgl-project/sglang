@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 import triton.language as tl
 
+import sglang.srt.layers.moe.fused_moe_triton.modular_kernel as mk
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.utils import _resize_cache
 from sglang.srt.utils import (
     cpu_has_amx_support,
     direct_register_custom_op,
@@ -75,6 +77,7 @@ def inplace_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
@@ -131,6 +134,7 @@ def inplace_fused_experts_fake(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
@@ -241,6 +245,22 @@ direct_register_custom_op(
 )
 
 
+def torch_sglang_inplace_fused_experts(**kwargs) -> torch.Tensor:
+    torch.ops.sglang.inplace_fused_experts(**kwargs)
+    hidden_states = kwargs["hidden_states"]
+    return hidden_states
+
+
+def torch_sglang_outplace_fused_experts(**kwargs) -> torch.Tensor:
+    return torch.ops.sglang.outplace_fused_experts(**kwargs)
+
+
+def dispatch_fused_experts_func(inplace: bool) -> Callable[..., torch.Tensor]:
+    if inplace:
+        return torch_sglang_inplace_fused_experts
+    return torch_sglang_outplace_fused_experts
+
+
 def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -263,63 +283,37 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
+
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
-        torch.ops.sglang.inplace_fused_experts(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            b1,
-            b2,
-            moe_runner_config.activation,
-            moe_runner_config.apply_router_weight_on_input,
-            use_fp8_w8a8,
-            use_int8_w8a8,
-            use_int8_w8a16,
-            use_int4_w4a16,
-            per_channel_quant,
-            w1_scale,
-            w2_scale,
-            w1_zp,
-            w2_zp,
-            a1_scale,
-            a2_scale,
-            block_shape,
-            moe_runner_config.routed_scaling_factor,
-            moe_runner_config.gemm1_alpha,
-            moe_runner_config.gemm1_clamp_limit,
-        )
-        return hidden_states
-    else:
-        return torch.ops.sglang.outplace_fused_experts(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            b1,
-            b2,
-            moe_runner_config.activation,
-            moe_runner_config.apply_router_weight_on_input,
-            use_fp8_w8a8,
-            use_int8_w8a8,
-            use_int8_w8a16,
-            use_int4_w4a16,
-            per_channel_quant,
-            w1_scale,
-            w2_scale,
-            w1_zp,
-            w2_zp,
-            a1_scale,
-            a2_scale,
-            block_shape,
-            no_combine=moe_runner_config.no_combine,
-            routed_scaling_factor=moe_runner_config.routed_scaling_factor,
-            gemm1_alpha=moe_runner_config.gemm1_alpha,
-            gemm1_limit=moe_runner_config.gemm1_clamp_limit,
-        )
+
+    return dispatch_fused_experts_func(moe_runner_config.inplace)(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        b1=b1,
+        b2=b2,
+        activation=moe_runner_config.activation,
+        apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_shape=block_shape,
+        no_combine=moe_runner_config.no_combine,
+        routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+        gemm1_alpha=moe_runner_config.gemm1_alpha,
+        gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+    )
 
 
 @torch.compile
@@ -381,8 +375,10 @@ def fused_experts_impl(
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
-    num_tokens, _ = hidden_states.shape
-    E, N, _ = w1.shape
+    E, num_tokens, N, K, top_k_num = mk._moe_problem_size(
+        hidden_states, w1, w2, topk_ids
+    )
+
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
     CHUNK_SIZE = 64 * 1024
@@ -399,36 +395,34 @@ def fused_experts_impl(
         try_get_optimal_moe_config,
         w1.shape,
         (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size),
-        topk_ids.shape[1],
+        top_k_num,
         config_dtype,
         block_shape=block_shape,
     )
 
     config = get_config_func(M)
 
-    cache = torch.empty(
-        M * topk_ids.shape[1] * max(N, w2.shape[1]),
+    workspace2 = torch.empty(
+        M * top_k_num * max(N, w2.shape[1]),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
-        (M, topk_ids.shape[1], N),
-    )
-    intermediate_cache2 = torch.empty(
-        (M * topk_ids.shape[1], N // 2),
+    workspace13 = torch.empty(
+        (M * top_k_num, N // 2),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
-        (M, topk_ids.shape[1], w2.shape[1]),
-    )
+
+    intermediate_cache1 = _resize_cache(workspace2, (M, top_k_num, N))
+    intermediate_cache2 = _resize_cache(workspace13, (M * top_k_num, N // 2))
+    intermediate_cache3 = _resize_cache(workspace2, (M, top_k_num, K))
 
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
     if no_combine:
         assert not inplace
         out_hidden_states = torch.empty(
-            (num_tokens, topk_ids.shape[1], w2.shape[1]),
+            (num_tokens, top_k_num, w2.shape[1]),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -454,9 +448,7 @@ def fused_experts_impl(
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[
-                : tokens_in_chunk * topk_ids.shape[1]
-            ]
+            intermediate_cache2 = intermediate_cache2[: tokens_in_chunk * top_k_num]
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
             config = get_config_func(tokens_in_chunk)
 
