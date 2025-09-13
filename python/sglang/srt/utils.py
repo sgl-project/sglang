@@ -1404,6 +1404,15 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def get_xpu_memory_capacity():
+    assert torch.xpu.is_available(), "XPU device is not available"
+    memory_values = [
+        torch.xpu.get_device_properties(i).total_memory
+        for i in range(torch.xpu.device_count())
+    ]
+    return min(memory_values) // 1024 // 1024  # unit: MB
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1413,6 +1422,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
         gpu_mem = get_npu_memory_capacity()
+    elif device == "xpu":
+        gpu_mem = get_xpu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
