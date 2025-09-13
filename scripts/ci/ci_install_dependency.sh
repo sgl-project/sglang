@@ -54,7 +54,7 @@ echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNE
 
 if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     ls -alh sgl-kernel/dist
-    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}*.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+cu124-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
     if [ "$IS_BLACKWELL" = "1" ]; then
         $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION_FROM_SRT}/sgl_kernel-${SGL_KERNEL_VERSION_FROM_SRT}+cu128-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
