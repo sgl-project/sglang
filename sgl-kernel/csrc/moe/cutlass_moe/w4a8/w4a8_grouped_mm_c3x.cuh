@@ -209,7 +209,7 @@ void cutlass_w4a8_group_gemm_caller(
 
   Args arguments;
   decltype(arguments.epilogue.thread) fusion_args;
-  fusion_args.alpha = 1.0f;
+  fusion_args.alpha = 0;
   fusion_args.beta = 0;
   fusion_args.alpha_ptr = a_scales.data_ptr<float>();
   ;
