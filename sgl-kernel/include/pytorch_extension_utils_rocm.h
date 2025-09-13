@@ -1,6 +1,10 @@
 #include <torch/library.h>
 
+#ifdef USE_MUSA
+#define CHECK_CUDA(x) TORCH_CHECK(true, #x " must be a CUDA tensor")
+#else
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#endif
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_LAST_DIM_CONTIGUOUS(x) \

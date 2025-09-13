@@ -398,6 +398,10 @@ class ModelRunner:
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
+        elif self.device == "musa":
+            self.init_mublas()
+            self.init_attention_backend()
+            self.init_device_graphs()
         else:
             self.graph_runner = None
             self.graph_mem_usage = 0
@@ -623,6 +627,8 @@ class ModelRunner:
             backend = "gloo"
         elif self.device == "npu":
             backend = "hccl"
+        elif self.device == "musa":
+            backend = "mccl"
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
@@ -1656,6 +1662,15 @@ class ModelRunner:
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16
         device = "cuda"
+        a = torch.ones((16, 16), dtype=dtype, device=device)
+        b = torch.ones((16, 16), dtype=dtype, device=device)
+        c = a @ b
+        return c
+
+    def init_mublas(self):
+        """We need to run a small matmul to init mublas. Otherwise, it will raise some errors later."""
+        dtype = torch.float16
+        device = "musa"
         a = torch.ones((16, 16), dtype=dtype, device=device)
         b = torch.ones((16, 16), dtype=dtype, device=device)
         c = a @ b

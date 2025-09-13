@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import sentencepiece as spm
 from transformers import (
     TOKENIZER_MAPPING,
-    GptOssConfig,
     LlamaConfig,
     PretrainedConfig,
     PreTrainedTokenizer,
@@ -15,7 +14,13 @@ from transformers import (
     Qwen3MoeConfig,
 )
 
+from sglang.srt.utils import is_musa
 from sglang.utils import logger
+
+if not is_musa():
+    # XXX (MUSA): vllm base image pins to transformers==4.52.4
+    from transformers import GptOssConfig
+
 
 # Copied from: https://github.com/OpenGVLab/InternVL/blob/34a81000402bf8f716bab8c9b57aff1f6b436bd0/internvl_chat/internvl/model/internvl_chat/configuration_internvl_chat.py#L21
 
