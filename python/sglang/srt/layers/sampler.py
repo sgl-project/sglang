@@ -192,23 +192,35 @@ class Sampler(nn.Module):
             logger.warning("No logits available for logprob computation")
             return
 
-        # Check if any requests actually need token ID logprobs
-        needs_computation = any(
+        # Check if any requests actually need logprobs computation
+        needs_token_ids_logprobs = any(
             token_ids is not None and len(token_ids) > 0
             for token_ids in token_ids_logprobs
         )
-        if not needs_computation:
+        needs_top_logprobs = any(x > 0 for x in top_logprobs_nums)
+
+        if not (needs_token_ids_logprobs or needs_top_logprobs):
             return
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits_output.next_token_logits, sampling_info)
 
-        # Compute logprobs and extract token_ids_logprobs using optimized batch processing
+        # Compute logprobs
         logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-        (
-            logits_output.next_token_token_ids_logprobs_val,
-            logits_output.next_token_token_ids_logprobs_idx,
-        ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+
+        # Handle top logprobs if requested
+        if needs_top_logprobs:
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(logprobs, top_logprobs_nums)
+
+        # Handle token_ids logprobs if requested
+        if needs_token_ids_logprobs:
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
