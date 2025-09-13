@@ -55,6 +55,10 @@ class BenchArgs:
     model: Optional[str] = None
     tokenizer: Optional[str] = None
 
+    # compatibility for openai apis
+    encoding_format: str = "float"
+    dimensions: Optional[int] = None
+
     # ShareGPT dataset args
     sharegpt_output_len: Optional[int] = None
     sharegpt_context_len: Optional[int] = None
@@ -149,6 +153,19 @@ class BenchArgs:
             type=str,
             default=BenchArgs.tokenizer,
             help="Name or path of the tokenizer. If not set, using the model conf.",
+        )
+        parser.add_argument(
+            "--encoding-format",
+            type=str,
+            default=BenchArgs.encoding_format,
+            choices=["float", "base64"],
+            help="The format to return the embeddings in. Can be either float or base64. NOTE: sglang does not support now",
+        )
+        parser.add_argument(
+            "--dimensions",
+            type=int,
+            default=BenchArgs.dimensions,
+            help="The number of dimensions the resulting output embeddings should have. NOTE: sglang does not support now",
         )
         parser.add_argument(
             "--sharegpt-output-len",
@@ -361,6 +378,9 @@ class RequestFuncInput:
     model: str
     image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
+    # compatibility for openai apis
+    encoding_format: str
+    dimensions: Optional[int]
 
 
 @dataclass
@@ -413,6 +433,8 @@ async def async_request_openai_embedding(
         payload = {
             "model": request_func_input.model,
             "input": prompt,
+            "encoding_format": request_func_input.encoding_format,
+            "dimensions": request_func_input.dimensions,
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
@@ -631,6 +653,8 @@ async def benchmark(
         output_len=min(test_request.output_len, 32),
         image_data=test_request.image_data,
         extra_request_body=extra_request_body,
+        encoding_format=args.encoding_format,
+        dimensions=args.dimensions,
     )
 
     # Run warmup requests
@@ -675,6 +699,8 @@ async def benchmark(
             output_len=request.output_len,
             image_data=request.image_data,
             extra_request_body=extra_request_body,
+            encoding_format=args.encoding_format,
+            dimensions=args.dimensions,
         )
 
         tasks.append(asyncio.create_task(limited_request_func(request_func_input=request_func_input, pbar=pbar)))
