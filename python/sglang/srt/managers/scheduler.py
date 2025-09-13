@@ -1087,7 +1087,7 @@ class Scheduler(
                 cfg_parent_rid=recv_req.rid,
             )
             for recv_req in recv_reqs
-            if recv_req.cfg_params
+            if isinstance(recv_req, TokenizedGenerateReqInput) and recv_req.cfg_params
         ]
         recv_reqs.extend(cfg_reqs)
 

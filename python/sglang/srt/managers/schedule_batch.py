@@ -929,7 +929,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
-        cfg_rid_map: Dict[str, str],
+        cfg_rid_map: Optional[Dict[str, str]] = None,
         chunked_req: Optional[Req] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)

@@ -586,7 +586,7 @@ class TokenizerManager:
                 token_type_ids = encoded.get("token_type_ids", [None])[0]
 
         # Tokenize cfg_text
-        if "cfg_text" in obj.cfg_params:
+        if isinstance(obj, GenerateReqInput) and "cfg_text" in obj.cfg_params:
             if self.tokenizer is None:
                 raise ValueError(
                     "The engine initialized with skip_tokenizer_init=True cannot "
