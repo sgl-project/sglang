@@ -28,6 +28,7 @@ The core features include:
    basic_usage/deepseek.md
    basic_usage/gpt_oss.md
    basic_usage/llama4.md
+   basic_usage/qwen3.md
 
 .. toctree::
    :maxdepth: 1
