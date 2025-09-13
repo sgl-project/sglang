@@ -45,5 +45,37 @@ jobs:
 
       - name: Build and Push Dev Image
         run: |
-          docker buildx build --output type=image,compression=zstd . -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }} --no-cache
+          # Build with both the original tag and a commit-based tag
+          docker buildx build --output type=image,compression=zstd . -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }} -t lmsysorg/sglang:nightly-${{ matrix.variant.tag }}-${{ github.sha }} --no-cache
+
           docker push lmsysorg/sglang:${{ matrix.variant.tag }}
+          docker push lmsysorg/sglang:nightly-${{ matrix.variant.tag }}-${{ github.sha }}
+
+      - name: Cleanup Old Nightly Builds
+        run: |
+          # Get JWT token for Docker Hub API
+          TOKEN=$(curl -s -H "Content-Type: application/json" -X POST -d '{"username": "${{ secrets.DOCKERHUB_USERNAME }}", "password": "${{ secrets.DOCKERHUB_TOKEN }}"}' https://hub.docker.com/v2/users/login/ | jq -r .token)
+
+          # Get all tags for the repository
+          TAGS_RESPONSE=$(curl -s -H "Authorization: JWT $TOKEN" "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/?page_size=100")
+
+          # Extract tags that match our pattern and sort by last_updated timestamp (most recent first)
+          TAGS=$(echo "$TAGS_RESPONSE" | jq -r '.results[] | select(.name | test("^nightly-${{ matrix.variant.tag }}-[a-f0-9]{7}$")) | [.last_updated, .name] | @tsv' | sort -r | cut -f2)
+
+          # Count total tags and keep only the 14 most recent
+          TAG_COUNT=$(echo "$TAGS" | wc -l)
+          if [ "$TAG_COUNT" -gt 14 ]; then
+            echo "Found $TAG_COUNT nightly builds, keeping only the 14 most recent"
+            TAGS_TO_DELETE=$(echo "$TAGS" | tail -n +15)
+            echo "Tags to delete: $TAGS_TO_DELETE"
+
+            # Delete old tags
+            for tag in $TAGS_TO_DELETE; do
+              echo "Deleting tag: $tag"
+              curl -X DELETE \
+                -H "Authorization: JWT $TOKEN" \
+                "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/$tag/"
+            done
+          else
+            echo "Only $TAG_COUNT nightly builds found, no cleanup needed"
+          fi
