@@ -1324,6 +1324,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
+                elif isinstance(pixel_values, dict):
+                    assert (
+                        "pixel_values" in pixel_values
+                    ), "cache image mode should load image data directly"
+                    mm_item.feature = pixel_values["pixel_values"].to(
+                        self.device, non_blocking=True
+                    )
+
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
