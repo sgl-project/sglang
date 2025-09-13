@@ -172,6 +172,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--json-model-override-args` | A dictionary in JSON string format used to override default model configurations. | {} |
+| `--json-draft-model-override-args` | A dictionary in JSON string format used to override speculative draft model configurations. | {} |
+
 | `--preferred-sampling-params` | json-formatted sampling settings that will be returned in /get_model_info. | None |
 
 ## LoRA
