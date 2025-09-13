@@ -30,6 +30,12 @@ import torch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import (
+    BaseKey,
+    _key_match_page_size1,
+    _key_match_paged,
+    get_child_key,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -47,7 +53,7 @@ class TreeNode:
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
-        self.key: List[int] = None
+        self.key: BaseKey = None
         self.value: Optional[torch.Tensor] = None
         # swa_tombstone is used to indicate the kv indices have been freed for swa layers
         self.swa_tombstone = False
@@ -85,27 +91,6 @@ class TreeNode:
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
-
-
-def _key_match_page_size1(key0: List, key1: List):
-    i = 0
-    for k0, k1 in zip(key0, key1):
-        if k0 != k1:
-            break
-        i += 1
-    return i
-
-
-def _key_match_paged(key0: List, key1: List, page_size: int):
-    min_len = min(len(key0), len(key1))
-
-    i = 0
-    while i < min_len:
-        if key0[i : i + page_size] != key1[i : i + page_size]:
-            break
-        i += page_size
-
-    return i
 
 
 def gen_swa_uuid() -> int:
@@ -356,10 +341,10 @@ class SWARadixCache(BasePrefixCache):
 
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1
-            self.get_child_key_fn = lambda key: key[0]
+            self.get_child_key_fn = get_child_key
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
-            self.get_child_key_fn = lambda key: tuple(key[:page_size])
+            self.get_child_key_fn = partial(get_child_key, page_size=page_size)
 
         self.sliding_window_size = sliding_window_size
         self.reset()
@@ -380,10 +365,10 @@ class SWARadixCache(BasePrefixCache):
         self.full_lru_list = LRUList(swa=False)
         self.swa_lru_list = LRUList(swa=True)
 
-    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
+    def match_prefix(self, key: BaseKey, **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
-            key: A list of token IDs to find a matching prefix.
+            key: A BaseKey contains token IDs to find a matching prefix.
         Returns:
             A tuple of a tensor of matching prefix token IDs and
             the last node that contains the prefix values. Note that
@@ -404,7 +389,7 @@ class SWARadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
+            key = BaseKey(key.token_ids[:page_aligned_len], key.extra_key)
 
         value, last_node = self._match_prefix_helper(key)
         if value:
@@ -417,12 +402,12 @@ class SWARadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: List, value=None, prev_prefix_len: int = 0) -> int:
+    def insert(self, key: BaseKey, value=None, prev_prefix_len: int = 0) -> int:
         if self.disable:
             return 0
 
         if value is None:
-            value = [x for x in key]
+            value = [x for x in key.token_ids]
         return self._insert_helper(self.root_node, key, value, prev_prefix_len)
 
     def cache_finished_req(self, req: Req) -> None:
@@ -453,7 +438,7 @@ class SWARadixCache(BasePrefixCache):
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
         new_prefix_len = self.insert(
-            token_ids[:page_aligned_len],
+            BaseKey(token_ids[:page_aligned_len], req.extra_key),
             page_aligned_kv_indices,
             len(req.prefix_indices),
         )
@@ -489,11 +474,15 @@ class SWARadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
         new_prefix_len = self.insert(
-            page_aligned_token_ids, page_aligned_kv_indices, len(req.prefix_indices)
+            BaseKey(page_aligned_token_ids, req.extra_key),
+            page_aligned_kv_indices,
+            len(req.prefix_indices),
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
+        new_indices, new_last_node, _, _ = self.match_prefix(
+            BaseKey(page_aligned_token_ids, req.extra_key)
+        )
         assert len(req.prefix_indices) <= len(
             new_indices
         ), f"{req.prefix_indices=}, {new_indices=}"
@@ -732,7 +721,7 @@ class SWARadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, key: List) -> Tuple[List[torch.Tensor], TreeNode]:
+    def _match_prefix_helper(self, key: BaseKey) -> Tuple[List[torch.Tensor], TreeNode]:
         """
         SWA prefix matching helper. It factors in the sliding window size such that
         the matched node is guaranteed to either 1. connected to root without swa tombstone,
@@ -772,7 +761,7 @@ class SWARadixCache(BasePrefixCache):
                 if not child.swa_tombstone:
                     match_len_since_tombstone += len(child.value)
                 node = child
-                key = key[prefix_len:]
+                key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
@@ -796,15 +785,19 @@ class SWARadixCache(BasePrefixCache):
 
         return value[:best_value_len], best_last_node
 
-    def _split_node(self, key: List[int], child: TreeNode, split_len: int) -> TreeNode:
+    def _split_node(self, key: BaseKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
         new_node = TreeNode()
-        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
+        new_node.children = {
+            self.get_child_key_fn(
+                BaseKey(key.token_ids[split_len:], key.extra_key)
+            ): child
+        }
         new_node.parent = child.parent
         new_node.swa_tombstone = child.swa_tombstone
         new_node.full_lock_ref = child.full_lock_ref
         new_node.swa_lock_ref = child.swa_lock_ref
-        new_node.key = child.key[:split_len]
+        new_node.key = BaseKey(child.key.token_ids[:split_len], child.key.extra_key)
         new_node.value = child.value[:split_len]
         # parent inherits the swa_uuid from child for swa lock ref
         new_node.swa_uuid = child.swa_uuid
@@ -817,7 +810,7 @@ class SWARadixCache(BasePrefixCache):
         if not new_node.swa_tombstone:
             self.swa_lru_list.remove_node(child)
         child.parent = new_node
-        child.key = child.key[split_len:]
+        child.key = BaseKey(child.key.token_ids[split_len:], child.key.extra_key)
         child.value = child.value[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
@@ -831,7 +824,7 @@ class SWARadixCache(BasePrefixCache):
         return new_node
 
     def _insert_helper(
-        self, node: TreeNode, key: List, value, update_kv_after_len: int
+        self, node: TreeNode, key: BaseKey, value, update_kv_after_len: int
     ) -> int:
         # Update the last access time from root to leaf, so that
         # swa will tombstone the node closer to root first
@@ -882,7 +875,7 @@ class SWARadixCache(BasePrefixCache):
                     )
 
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
+            key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
             value = value[prefix_len:]
 
             if len(key):

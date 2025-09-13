@@ -27,7 +27,7 @@ import torch
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import BaseKey, RadixCache, TreeNode
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -164,10 +164,13 @@ class SchedulePolicy:
 
         for r in waiting_queue:
             prefix_ids = r.adjust_max_prefix_ids()
+            extra_key = r.extra_key
 
             # NOTE: the prefix_indices must always be aligned with last_node
             r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
-                self.tree_cache.match_prefix(rid=r.rid, key=prefix_ids)
+                self.tree_cache.match_prefix(
+                    rid=r.rid, key=BaseKey(token_ids=prefix_ids, extra_key=extra_key)
+                )
             )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
@@ -180,7 +183,8 @@ class SchedulePolicy:
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 in_batch_matching_prefixes, _, _, _ = (
                     self.waiting_queue_radix_tree.match_prefix(
-                        rid=r.rid, key=prefix_ids
+                        rid=r.rid,
+                        key=BaseKey(token_ids=prefix_ids, extra_key=extra_key),
                     )
                 )
                 if (
@@ -191,7 +195,8 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        prefix_ids, torch.empty(len(prefix_ids), dtype=torch.bool)
+                        BaseKey(token_ids=prefix_ids, extra_key=extra_key),
+                        torch.empty(len(prefix_ids), dtype=torch.bool),
                     )
         return temporary_deprioritized
 
