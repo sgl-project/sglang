@@ -173,6 +173,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         if hasattr(tokenizer, "init_xgrammar"):
             # For special tokenizer
             tokenizer_info, override_stop_tokens = tokenizer.init_xgrammar()
+
+            if tokenizer_info is None:
+                # Not supported tokenizer
+                return
         else:
             # Create TokenizerInfo with model's EOS tokens as the authoritative stop tokens
             # This ensures consistency between what the model considers EOS and what XGrammar uses
