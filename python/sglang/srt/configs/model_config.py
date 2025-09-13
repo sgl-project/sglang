@@ -488,6 +488,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "mxfp4",
+            "int4fp8_moe",
         ]
         optimized_quantization_methods = [
             "fp8",

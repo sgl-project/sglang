@@ -50,6 +50,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+from sglang.srt.layers.quantization.int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -86,6 +87,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
     "fbgemm_fp8": FBGEMMFp8Config,
+    "int4fp8_moe": QuarkInt4Fp8Config,
 }
 
 
