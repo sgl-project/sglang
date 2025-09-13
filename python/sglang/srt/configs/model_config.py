@@ -95,6 +95,7 @@ class ModelConfig:
         self.modelopt_quant = modelopt_quant
         self.modelopt_checkpoint_restore_path = modelopt_checkpoint_restore_path
         self.modelopt_checkpoint_save_path = modelopt_checkpoint_save_path
+        self.modelopt_quant = modelopt_quant
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
