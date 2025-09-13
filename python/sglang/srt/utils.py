@@ -42,9 +42,11 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 import uuid
 import warnings
 from collections import OrderedDict, defaultdict
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -82,11 +84,9 @@ from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
 from torch import nn
-from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-from triton.runtime.cache import FileCacheManager
 from typing_extensions import Literal
 
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -2368,6 +2368,13 @@ def log_info_on_rank0(logger, msg):
 
     if get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
+
+
+def log_warning_on_rank0(logger, msg):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.warning(msg)
 
 
 def load_json_config(data: str):
