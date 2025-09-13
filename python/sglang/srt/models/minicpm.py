@@ -440,7 +440,7 @@ class MiniCPMForCausalLM(nn.Module):
 
         self.capture_aux_hidden_states = True
         if layer_ids is None:
-            # 规定捕捉哪些hidden states的layers
+            # Specify which layers' hidden states to capture.
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [
                 2,
