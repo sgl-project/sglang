@@ -258,17 +258,36 @@ class MooncakeStore(HiCacheStorage):
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
 
+    def _batch_preprocess(self, keys, host_indices):
+        if self.is_mla_backend:
+            return self._get_mla_buffer_meta(keys, host_indices)
+        else:
+            return self._get_mha_buffer_meta(keys, host_indices)
+
+    def _batch_postprocess(self, results: List[int], is_set_operate=False):
+        if self.is_mla_backend:
+            return [
+                k_res == 0 if is_set_operate else k_res > 0
+                for k_res in results
+            ]
+        else:
+            kv_pairs = zip(results[::2], results[1::2])
+            return [
+                (k_res == 0 and v_res == 0) if is_set_operate
+                else (k_res > 0 and v_res > 0)
+                for k_res, v_res in kv_pairs
+            ]
+
     def batch_get_v1(
         self,
         keys: List[str],
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        """
-        Retrieve values for multiple keys.
-        Returns a list of tensors or None for each key.
-        """
-        pass
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        get_results = self._get_batch_zero_copy_impl(key_strs, buffer_ptrs, buffer_sizes)
+        return self._batch_postprocess(get_results, is_set_operate=False)
+
 
     def batch_set_v1(
         self,
@@ -276,11 +295,9 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        """
-        Retrieve values for multiple keys.
-        Returns a list of tensors or None for each key.
-        """
-        pass
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        put_results = self._put_batch_zero_copy_impl(key_strs, buffer_ptrs, buffer_sizes)
+        return self._batch_postprocess(put_results, is_set_operate=True)
 
     def set(
         self,

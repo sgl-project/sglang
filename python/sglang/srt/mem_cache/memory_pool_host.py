@@ -497,43 +497,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_buffer_meta(self, keys, indices, local_rank):
-        ptr_list = []
-        key_list = []
-        kv_buffer_data_ptr = self.kv_buffer.data_ptr()
-        indices = indices.tolist()
-        v_offset = (
-            self.layer_num
-            * self.size
-            * self.head_num
-            * self.head_dim
-            * self.dtype.itemsize
-        )
-        for index in range(0, len(indices), self.page_size):
-            k_ptr = (
-                kv_buffer_data_ptr
-                + indices[index]
-                * self.layer_num
-                * self.head_num
-                * self.head_dim
-                * self.dtype.itemsize
-            )
-            v_ptr = k_ptr + v_offset
-            ptr_list.append(k_ptr)
-            ptr_list.append(v_ptr)
-            key_ = keys[index // self.page_size]
-            key_list.append(f"{key_}_{local_rank}_k")
-            key_list.append(f"{key_}_{local_rank}_v")
-        element_size = (
-            self.layer_num
-            * self.dtype.itemsize
-            * self.page_size
-            * self.head_num
-            * self.head_dim
-        )
-        element_size_list = [element_size] * len(key_list)
-        return key_list, ptr_list, element_size_list
-
     def get_page_buffer_list(self, indices):
         assert len(indices) % self.page_size == 0
         page_buffer_list = []
@@ -765,31 +728,6 @@ class MLATokenToKVPoolHost(HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-
-    def get_buffer_meta(self, keys, indices, local_rank):
-        ptr_list = []
-        key_list = []
-        kv_buffer_data_ptr = self.kv_buffer.data_ptr()
-        indices = indices.tolist()
-        for index in range(0, len(indices), self.page_size):
-            k_ptr = (
-                kv_buffer_data_ptr
-                + indices[index]
-                * self.layer_num
-                * (self.kv_lora_rank + self.qk_rope_head_dim)
-                * self.dtype.itemsize
-            )
-            ptr_list.append(k_ptr)
-            key_ = keys[index // self.page_size]
-            key_list.append(f"{key_}_k")
-        element_size = (
-            self.layer_num
-            * self.dtype.itemsize
-            * self.page_size
-            * (self.kv_lora_rank + self.qk_rope_head_dim)
-        )
-        element_size_list = [element_size] * len(key_list)
-        return key_list, ptr_list, element_size_list
 
     def get_page_buffer_list(self, indices):
         assert len(indices) % self.page_size == 0

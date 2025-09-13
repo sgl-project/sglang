@@ -337,11 +337,7 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if self.storage_backend_type == "mooncake":
-                self.page_get_func = self._mooncake_page_get
-                self.page_set_func = self._mooncake_page_set
-
-            if self.storage_backend_type == "hf3fs":
+            if self.storage_backend_type in ["hf3fs", "mooncake"]:
                 self.page_get_func = self._generic_page_get_v1
                 self.page_set_func = self._generic_page_set_v1
 
@@ -627,24 +623,6 @@ class HiCacheController:
         for chunk in chunks:
             self.host_mem_release_queue.put(chunk)
 
-    def _mooncake_page_get(self, operation, hash_values, host_indices):
-        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-            hash_values,
-            host_indices,
-            self.storage_config.tp_rank,
-        )
-        get_result = self.storage_backend.batch_get(
-            key_strs,
-            target_locations=buffer_ptrs,
-            target_sizes=buffer_sizes,
-        )
-        if get_result != len(hash_values):
-            logger.warning(
-                f"Prefetch operation {operation.request_id} failed or partially failed."
-            )
-        if get_result != 0:
-            operation.increment(get_result * self.page_size)
-
     def _generic_page_get_v1(self, operation, hash_values, host_indices):
         results = self.storage_backend.batch_get_v1(hash_values, host_indices)
         for i in range(len(hash_values)):
@@ -825,20 +803,6 @@ class HiCacheController:
     # zero copy
     def _generic_page_set_v1(self, hash_values, host_indices) -> bool:
         return all(self.storage_backend.batch_set_v1(hash_values, host_indices))
-
-    # zero copy
-    def _mooncake_page_set(self, hash_values, host_indices) -> bool:
-        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-            hash_values,
-            host_indices,
-            self.storage_config.tp_rank,
-        )
-        success = self.storage_backend.batch_set(
-            key_strs,
-            target_locations=buffer_ptrs,
-            target_sizes=buffer_sizes,
-        )
-        return success
 
     # Backup batch by batch
     def _page_backup(self, operation):
