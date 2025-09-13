@@ -154,30 +154,27 @@ class EagleDraftInput:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        page_size: int = 1,
     ):
         bs = self.accept_length.numel()
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
-        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-
-        if paged_kernel_lens_sum is None:
-            paged_kernel_lens_sum = cum_kv_seq_len[-1]
-
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
-        )
+        kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
+        num_pages_per_req = (paged_kernel_lens + page_size - 1) // page_size
+        kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)
+        kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
 
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
-            cum_kv_seq_len,
+            kv_indptr,
             None,
             kv_indices,
             req_to_token.size(1),
+            page_size,
         )
-        return kv_indices, cum_kv_seq_len, qo_indptr, None
+        return kv_indices, kv_indptr, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if has_been_filtered:
@@ -310,37 +307,52 @@ class EagleVerifyInput:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        page_size: int = 1,
     ):
+
+        device = req_to_token.device
         batch_size = len(req_pool_indices)
+
         qo_indptr = torch.arange(
             0,
             (1 + batch_size) * self.draft_token_num,
             step=self.draft_token_num,
             dtype=torch.int32,
-            device="cuda",
+            device=device,
         )
         cum_kv_seq_len = torch.zeros(
-            (batch_size + 1,), dtype=torch.int32, device="cuda"
+            (batch_size + 1,), dtype=torch.int32, device=device
         )
 
-        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+        seq_lens_with_draft_tokens = paged_kernel_lens + self.draft_token_num
+        cum_kv_seq_len[1:] = torch.cumsum(seq_lens_with_draft_tokens, dim=0)
+
+        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device=device)
+        num_pages_per_req = (seq_lens_with_draft_tokens + page_size - 1) // page_size
+        kv_indptr[1 : batch_size + 1] = torch.cumsum(num_pages_per_req, dim=0)
 
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * batch_size,
+            kv_indptr[-1],
             dtype=torch.int32,
-            device="cuda",
+            device=device,
         )
+
         create_flashinfer_kv_indices_triton[(batch_size,)](
             req_to_token,
             req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
+            seq_lens_with_draft_tokens,
+            kv_indptr,
             None,
             kv_indices,
             req_to_token.size(1),
+            page_size,
         )
-        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
+        return (
+            kv_indices,
+            kv_indptr,
+            qo_indptr,
+            self.custom_mask,
+        )
 
     def verify(
         self,
@@ -879,6 +891,22 @@ def generate_draft_decode_kv_indices(
     num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
 ):
+    """
+    **Args:**
+        req_pool_indices: Request pool indices for each sequence [num_seqs]
+        req_to_token: Token location lookup table [max_batch, max_context_len]
+        paged_kernel_lens: Sequence lengths per request [num_seqs]
+        kv_indices: Output KV indices buffer [num_steps, max_tokens]
+        kv_indptr: Output KV index pointers [num_steps, num_seqs*topk+1]
+        positions: Position offsets for each sequence [num_seqs*topk]
+        pool_len: Maximum context length per pool
+        kv_indices_stride: Stride for kv_indices buffer
+        kv_indptr_stride: Stride for kv_indptr buffer
+        bs_upper: Upper bound for batch size (power of 2)
+        iter_upper: Upper bound for iterations (power of 2)
+        num_tokens_upper: Upper bound for token count (power of 2)
+        page_size: Number of tokens per page (1 for no paging)
+    """
     BLOCK_SIZE: tl.constexpr = 128
     iters = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
