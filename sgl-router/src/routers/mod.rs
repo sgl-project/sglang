@@ -96,17 +96,8 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response;
 
-<<<<<<< HEAD
     /// Retrieve a stored/background response by id
     async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
-=======
-    /// Route embedding requests (OpenAI-compatible /v1/embeddings)
-    async fn route_embeddings(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &EmbeddingRequest,
-    ) -> Response;
->>>>>>> 32aa1d136 (resolve conflicts)
 
     /// Cancel a background response by id
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;

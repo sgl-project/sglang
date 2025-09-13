@@ -3,18 +3,12 @@ use crate::core::WorkerRegistry;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::middleware::TokenBucket;
-<<<<<<< HEAD
 use crate::policies::PolicyRegistry;
-=======
->>>>>>> b5c21104e (apply review comments)
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesRequest, V1RerankReqInput,
 };
-<<<<<<< HEAD
 use crate::protocols::worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse};
-=======
->>>>>>> b5c21104e (apply review comments)
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::router_manager::{RouterId, RouterManager};
 use crate::routers::{RouterFactory, RouterTrait};
@@ -271,14 +265,6 @@ async fn v1_responses_list_input_items(
         .await
 }
 
-async fn v1_embeddings(
-    State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    Json(body): Json<EmbeddingRequest>,
-) -> Response {
-    state.router.route_embeddings(Some(&headers), &body).await
-}
-
 // Worker management endpoints
 async fn add_worker(
     State(state): State<Arc<AppState>>,
@@ -491,7 +477,6 @@ pub fn build_app(
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
-<<<<<<< HEAD
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",
@@ -502,8 +487,6 @@ pub fn build_app(
             "/v1/responses/{response_id}/input",
             get(v1_responses_list_input_items),
         )
-=======
->>>>>>> 32aa1d136 (resolve conflicts)
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             crate::middleware::concurrency_limit_middleware,

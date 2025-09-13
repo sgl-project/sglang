@@ -399,6 +399,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::EmbeddingRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
