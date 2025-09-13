@@ -217,7 +217,7 @@ class GenerateReqInput:
         if self.sampling_params is None:
             self.parallel_sample_num = 1
             return
-        elif isinstance(self.sampling_params, dict):
+        elif isinstance(self.sampling_params, (dict, SamplingParams)):
             self.parallel_sample_num = self.sampling_params.get("n", 1)
         else:  # isinstance(self.sampling_params, list):
             self.parallel_sample_num = self.sampling_params[0].get("n", 1)
@@ -366,7 +366,7 @@ class GenerateReqInput:
         """Normalize sampling parameters for batch processing."""
         if self.sampling_params is None:
             self.sampling_params = [{}] * num
-        elif isinstance(self.sampling_params, dict):
+        elif isinstance(self.sampling_params, (dict, SamplingParams)):
             self.sampling_params = [self.sampling_params] * num
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
