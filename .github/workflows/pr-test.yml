@@ -679,7 +679,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.8
 
       - name: Install dependencies
         run: |
