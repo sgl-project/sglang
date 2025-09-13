@@ -284,12 +284,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # Metrics
         if self.enable_metrics:
+            labels = {
+                "model_name": self.server_args.served_model_name,
+                # TODO: Add lora name/path in the future,
+            }
+            if server_args.tokenizer_metrics_allowed_customer_labels:
+                for label in server_args.tokenizer_metrics_allowed_customer_labels:
+                    labels[label] = ""
             self.metrics_collector = TokenizerMetricsCollector(
                 server_args=server_args,
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    # TODO: Add lora name/path in the future,
-                },
+                labels=labels,
                 bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
                 bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
                 bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
@@ -847,7 +851,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             return
         req = AbortReq(rid, abort_all)
         self.send_to_scheduler.send_pyobj(req)
-
         if self.enable_metrics:
             self.metrics_collector.observe_one_aborted_request()
 
@@ -1421,6 +1424,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else 0
         )
 
+        customer_labels = getattr(state.obj, "customer_labels", None)
+        labels = (
+            {**self.metrics_collector.labels, **customer_labels}
+            if customer_labels
+            else self.metrics_collector.labels
+        )
         if (
             state.first_token_time == 0.0
             and self.disaggregation_mode != DisaggregationMode.PREFILL
@@ -1428,7 +1437,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             state.first_token_time = state.last_time = time.time()
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
-                state.first_token_time - state.created_time
+                labels, state.first_token_time - state.created_time
             )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
@@ -1436,6 +1445,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 new_time = time.time()
                 interval = new_time - state.last_time
                 self.metrics_collector.observe_inter_token_latency(
+                    labels,
                     interval,
                     num_new_tokens,
                 )
@@ -1450,6 +1460,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 or state.obj.sampling_params.get("structural_tag", None)
             )
             self.metrics_collector.observe_one_finished_request(
+                labels,
                 recv_obj.prompt_tokens[i],
                 completion_tokens,
                 recv_obj.cached_tokens[i],
