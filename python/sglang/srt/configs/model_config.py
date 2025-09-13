@@ -566,7 +566,7 @@ class ModelConfig:
         if self.quantization == "modelopt_fp8":
             return "fp8"
         elif self.quantization == "modelopt_fp4":
-            return "fp4"
+            return "nvfp4"
         elif self.quantization == "modelopt":
             # Auto-detect from model config
             quant_cfg = self._parse_quant_hf_config()
