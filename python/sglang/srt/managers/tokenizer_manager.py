@@ -533,6 +533,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
+        # if none, set max_new_tokens to default value: context_len
+        sampling_params.max_new_tokens = (
+            sampling_params.max_new_tokens or self.model_config.context_len
+        )
+
         # Build return object
         if isinstance(obj, GenerateReqInput):
             session_params = (
