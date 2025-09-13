@@ -388,6 +388,7 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
+    enable_pd_convert: bool = False
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -2216,6 +2217,11 @@ class ServerArgs:
             default=ServerArgs.num_reserved_decode_tokens,
             help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
         )
+        parser.add_argument(
+            "--enable-pd-convert",
+            action="store_true",
+            help="Enable convert pd role when server is running (for disaggregation only).",
+        )
 
         # Custom weight loader
         parser.add_argument(
@@ -2358,6 +2364,18 @@ class ServerArgs:
         self.validate_buckets_rule(
             "--generation-tokens-buckets", self.generation_tokens_buckets
         )
+
+        # check pd disaggregation args
+        assert (
+            not self.enable_pd_convert or self.disaggregation_mode != "null"
+        ), "Only disaggregation mode is supported when enable_pd_convert is set"
+        assert (
+            not self.enable_pd_convert or self.pp_size == 1
+        ), "Pipeline parallelism is not supported when enable_pd_convert is set"
+        assert (
+            not self.enable_pd_convert
+            or self.disaggregation_transfer_backend == "mooncake"
+        ), "Only mooncake backend is supported currently when enable_pd_convert is set"
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

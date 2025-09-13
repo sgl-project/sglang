@@ -47,6 +47,23 @@ class MiniLoadBalancer:
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
 
+    def add_prefill_server(self, new_prefill_config: tuple):
+        self.prefill_urls.append(new_prefill_config[0])
+        self.prefill_bootstrap_ports.append(new_prefill_config[1])
+
+    def add_decode_server(self, new_decode_server: str):
+        self.decode_urls.append(new_decode_server)
+
+    def remove_prefill_server(self, prefill_url: str):
+        index_to_remove = self.prefill_urls.index(prefill_url)
+        bootstrap_port = self.prefill_bootstrap_ports[index_to_remove]
+        del self.prefill_bootstrap_ports[index_to_remove]
+        del self.prefill_urls[index_to_remove]
+        return bootstrap_port
+
+    def remove_decode_server(self, decode_url: str):
+        self.decode_urls.remove(decode_url)
+
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
             "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
@@ -393,3 +410,62 @@ async def get_models():
             return ORJSONResponse(content=await response.json())
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/convert_pd_role")
+async def convert_pd_role(request: dict):
+    """Convert role of a P/D server"""
+
+    server_url = request.get("server_url")
+    if server_url in lb.prefill_urls:
+        if len(lb.prefill_urls) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot convert {server_url} to decode, at least one prefill server is required.",
+            )
+        current_role = "prefill"
+        bootstrap_port = lb.remove_prefill_server(server_url)
+    elif server_url in lb.decode_urls:
+        if len(lb.decode_urls) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot convert {server_url} to prefill, at least one decode server is required.",
+            )
+        current_role = "decode"
+        lb.remove_decode_server(server_url)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid URL:{server_url}. The server may be not registered.",
+        )
+
+    # Convert P/D role
+    async with aiohttp.ClientSession() as session:
+        response = await session.post(f"{server_url}/convert_pd_role", json=request)
+        content = await response.json()
+
+    # clean connection pool in decode server
+    if current_role == "prefill":
+        parsed_url = urllib.parse.urlparse(server_url)
+        hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
+        request["failed_bootstrap_addr"] = f"{hostname}:{bootstrap_port}"
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for decode_server in lb.decode_urls:
+                tasks.append(
+                    session.post(f"{decode_server}/convert_pd_role", json=request)
+                )
+            for i, response in enumerate(asyncio.as_completed(tasks)):
+                await response
+
+    if content["success"]:
+        if current_role == "prefill":
+            lb.add_decode_server(server_url)
+        else:
+            lb.add_prefill_server((server_url, content["bootstrap_port"]))
+        return Response(status_code=200)
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to convert identity for server: {server_url}",
+        )

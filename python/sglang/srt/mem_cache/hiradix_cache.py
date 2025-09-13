@@ -847,3 +847,7 @@ class HiRadixCache(RadixCache):
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+    def __del__(self):
+        # Stop the threads in cache controller
+        self.cache_controller.reset(del_controller=True)

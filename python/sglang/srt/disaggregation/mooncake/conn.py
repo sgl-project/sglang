@@ -161,6 +161,7 @@ class AuxDataCodec:
 
 class MooncakeKVManager(BaseKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    EXIT_MSG = b"__EXIT__"
 
     def __init__(
         self,
@@ -193,6 +194,7 @@ class MooncakeKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
+        self.stop_event = threading.Event()
         if is_valid_ipv6_address(self.local_ip):
             self.server_socket.setsockopt(zmq.IPV6, 1)
 
@@ -673,6 +675,8 @@ class MooncakeKVManager(BaseKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if kv_chunk is None:
+                    break
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
@@ -814,6 +818,8 @@ class MooncakeKVManager(BaseKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                if waiting_req_bytes[0] == MooncakeKVManager.EXIT_MSG:
+                    break
                 room = waiting_req_bytes[0].decode("ascii")
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -841,6 +847,7 @@ class MooncakeKVManager(BaseKVManager):
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.update_status(room, KVPoll.WaitingForInput)
+            self.server_socket.close()
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -874,6 +881,8 @@ class MooncakeKVManager(BaseKVManager):
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
+                elif msg[0] == MooncakeKVManager.EXIT_MSG:
+                    break
 
                 (bootstrap_room, status, prefill_rank) = msg
                 status = int(status.decode("ascii"))
@@ -897,10 +906,13 @@ class MooncakeKVManager(BaseKVManager):
                         f"Failed to get kvcache from prefill instance, it might be dead",
                     )
                     self.update_status(bootstrap_room, status)
+            self.server_socket.close()
 
         def heartbeat_checker():
             while True:
-                time.sleep(self.heartbeat_interval)
+                self.stop_event.wait(self.heartbeat_interval)
+                if self.stop_event.is_set():
+                    break
                 with self.connection_lock:
                     addresses = list(self.prefill_dp_size_table.keys())
 
@@ -1100,6 +1112,40 @@ class MooncakeKVManager(BaseKVManager):
                 affected_rooms.append(room)
         logger.error(
             f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), {len(affected_rooms)} requests affected"
+        )
+
+    def stop_all_threads(self):
+        self._connect(f"tcp://{self.local_ip}:{self.rank_port}").send_multipart(
+            [MooncakeKVManager.EXIT_MSG]
+        )
+        if hasattr(self, "transfer_queues"):
+            # quit all transfer threads, for prefill
+            for queue in self.transfer_queues:
+                queue.put(None)
+        else:
+            self.stop_event.set()
+
+        self._connect.cache_clear()
+
+    def __del__(self):
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for executor in self.executors:
+                executor.shutdown(wait=True)
+        else:
+            with self.session_pool_lock:
+                for session in self.session_pool.values():
+                    session.close()
+                self.session_pool.clear()
+
+        if self.kv_args.kv_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+
+        if self.kv_args.aux_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+
+        del self.engine
+        logger.info(
+            "MooncakeKVManager is destroyed, all resources and thread released."
         )
 
 

@@ -70,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    ConvertDisaggregationRoleReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -762,6 +763,20 @@ async def update_weights_from_distributed(
         message += f" Weight version updated to {obj.weight_version}."
 
     content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/convert_pd_role")
+async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
+    """Convert the role of the current PD server."""
+    success, message, bootstrap_port = (
+        await _global_state.tokenizer_manager.convert_pd_role(obj)
+    )
+    logger.info(f"{message}")
+    content = {"success": success, "message": message, "bootstrap_port": bootstrap_port}
     if success:
         return ORJSONResponse(content, status_code=200)
     else:
