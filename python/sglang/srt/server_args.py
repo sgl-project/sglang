@@ -373,6 +373,11 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
 
+    # Dynamic batch tokenizer
+    enable_dynamic_batch_tokenizer: bool = False
+    dynamic_batch_tokenizer_batch_size: int = 32
+    dynamic_batch_tokenizer_batch_timeout: float = 0.002
+
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
     debug_tensor_dump_input_file: Optional[str] = None
@@ -873,6 +878,13 @@ class ServerArgs:
 
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
+
+        # Validation: prevent both tokenizer batching features from being enabled
+        if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
+            raise ValueError(
+                "Cannot enable both --enable-tokenizer-batch-encode and --enable-dynamic-batch-tokenizer. "
+                "Please choose one tokenizer batching approach."
+            )
 
         # Propagate env vars
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
@@ -2161,6 +2173,23 @@ class ServerArgs:
             "--debug-tensor-dump-prefill-only",
             action="store_true",
             help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
+        )
+        parser.add_argument(
+            "--enable-dynamic-batch-tokenizer",
+            action="store_true",
+            help="Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-tokenizer-batch-size",
+            type=int,
+            default=ServerArgs.dynamic_batch_tokenizer_batch_size,
+            help="[Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-tokenizer-batch-timeout",
+            type=float,
+            default=ServerArgs.dynamic_batch_tokenizer_batch_timeout,
+            help="[Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests.",
         )
 
         # PD disaggregation
