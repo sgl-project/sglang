@@ -93,20 +93,21 @@ class SchedulerOutputProcessorMixin:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
 
-                    if req.return_logprob:
+                    if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
                         assert extend_input_len_per_req is not None
                         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                         extend_input_len = extend_input_len_per_req[i]
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_logprob_return_values(
-                            i,
-                            req,
-                            logprob_pt,
-                            next_token_ids,
-                            num_input_logprobs,
-                            logits_output,
-                        )
+                        if req.return_logprob:
+                            self.add_logprob_return_values(
+                                i,
+                                req,
+                                logprob_pt,
+                                next_token_ids,
+                                num_input_logprobs,
+                                logits_output,
+                            )
                         logprob_pt += num_input_logprobs
 
                     if (
@@ -146,7 +147,7 @@ class SchedulerOutputProcessorMixin:
                     skip_stream_req = req
 
                     # Incrementally update input logprobs.
-                    if req.return_logprob:
+                    if batch.return_logprob:
                         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                         extend_input_len = extend_input_len_per_req[i]
                         if extend_logprob_start_len < extend_input_len:
@@ -154,14 +155,15 @@ class SchedulerOutputProcessorMixin:
                             num_input_logprobs = (
                                 extend_input_len - extend_logprob_start_len
                             )
-                            self.add_input_logprob_return_values(
-                                i,
-                                req,
-                                logits_output,
-                                logprob_pt,
-                                num_input_logprobs,
-                                last_prefill_chunk=False,
-                            )
+                            if req.return_logprob:
+                                self.add_input_logprob_return_values(
+                                    i,
+                                    req,
+                                    logits_output,
+                                    logprob_pt,
+                                    num_input_logprobs,
+                                    last_prefill_chunk=False,
+                                )
                             logprob_pt += num_input_logprobs
 
             self.set_next_batch_sampling_info_done(batch)
@@ -698,6 +700,8 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx,
                     output_hidden_states,
+                    placeholder_tokens_idx=None,
+                    placeholder_tokens_val=None,
                 )
             )
 
@@ -717,6 +721,12 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens.append(req.cached_tokens)
         self.send_to_detokenizer.send_pyobj(
             BatchEmbeddingOut(
-                rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
+                rids,
+                finished_reasons,
+                embeddings,
+                prompt_tokens,
+                cached_tokens,
+                placeholder_tokens_idx=None,
+                placeholder_tokens_val=None,
             )
         )
