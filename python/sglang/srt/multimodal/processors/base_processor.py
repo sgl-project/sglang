@@ -185,6 +185,7 @@ class BaseMultimodalProcessor(ABC):
             "aspect_ratio_mask": Modality.IMAGE,
             "num_patches": Modality.IMAGE,
             "patch_pixel_values": Modality.IMAGE,
+            "block_sizes": Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,

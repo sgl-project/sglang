@@ -244,10 +244,28 @@ class TestKimiVLServer(ImageOpenAITestMixin):
 #         self._test_video_chat_completion()
 
 
+class TestNVILAServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Efficient-Large-Model/NVILA-8B-hf"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--trust-remote-code",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
 class TestNVILALiteServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0904"
+        cls.model = "Efficient-Large-Model/NVILA-Lite-2B-hf"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(

@@ -113,8 +113,8 @@ class NVILALiteForConditionalGeneration(nn.Module):
 
         self.config = config
 
-        self.mm_projector = NVILALiteMultiModalProjector(config)
         self.vision_tower = SiglipVisionModel(config.vision_config)
+        self.mm_projector = NVILALiteMultiModalProjector(config)
         self.llm = Qwen2ForCausalLM(
             config=config.text_config,
             quant_config=quant_config,
