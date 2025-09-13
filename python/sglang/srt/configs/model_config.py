@@ -357,6 +357,7 @@ class ModelConfig:
             modelopt_quant=server_args.modelopt_quant,
             modelopt_checkpoint_restore_path=server_args.modelopt_checkpoint_restore_path,
             modelopt_checkpoint_save_path=server_args.modelopt_checkpoint_save_path,
+            modelopt_quant=server_args.modelopt_quant,
             **kwargs,
         )
 
