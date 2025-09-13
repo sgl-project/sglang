@@ -249,7 +249,11 @@ class DeepseekV2MLP(nn.Module):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        if gemm_output_zero_allocator != None and x.shape[0] <= 256:
+        if (
+            gemm_output_zero_allocator is not None
+            and x.shape[0] <= 256
+            and self.gate_up_proj.weight.dtype == torch.uint8
+        ):
             y = gemm_output_zero_allocator.allocate(
                 x.shape[0] * self.gate_up_proj.output_size_per_partition
             ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
@@ -669,10 +673,14 @@ class DeepseekV2MoE(nn.Module):
 
         if shared_output is not None:
             x = shared_output
-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            if self.experts.should_fuse_routed_scaling_factor_in_topk():
+                x.add_(final_hidden_states)
+            else:
+                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            final_hidden_states *= self.routed_scaling_factor
+            if not self.experts.should_fuse_routed_scaling_factor_in_topk():
+                final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
 
@@ -1041,6 +1049,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         # Determine attention backend used by current forward batch
         if forward_batch.forward_mode.is_decode_or_idle():
             attention_backend = global_server_args_dict["decode_attention_backend"]
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
+            # Use the specified backend for speculative operations (both verify and draft extend)
+            if global_server_args_dict["speculative_attention_mode"] == "decode":
+                attention_backend = global_server_args_dict["decode_attention_backend"]
+            else:  # default to prefill
+                attention_backend = global_server_args_dict["prefill_attention_backend"]
         else:
             attention_backend = global_server_args_dict["prefill_attention_backend"]
         self.current_attention_backend = attention_backend
@@ -1070,6 +1087,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             disable_ragged = (
                 attention_backend == "flashinfer" or attention_backend == "flashmla"
             ) and self.flashinfer_mla_disable_ragged
+
+            original_mode = getattr(forward_batch, "_original_forward_mode", None)
             if (
                 not disable_ragged
                 and forward_batch.forward_mode.is_extend()
@@ -1082,15 +1101,40 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                     or sum_extend_prefix_lens == 0
                 )
+                # TODO(shuw@nvidia.com) Flashinfer cutlass and trtllm_mla backend have accuracy issue on blackwell for
+                # dp case. Redirect to mla kernel as a workaround.
+                # Tracked by https://github.com/sgl-project/sglang/issues/9806.
+                and not (
+                    original_mode is not None
+                    and original_mode.is_decode()
+                    and is_sm100_supported()
+                    and self.current_attention_backend in ("cutlass_mla", "flashinfer")
+                )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return _dispatch_mla_subtype()
         elif attention_backend == "trtllm_mla":
+            original_mode = getattr(forward_batch, "_original_forward_mode", None)
+            if (
+                original_mode is not None
+                and original_mode.is_decode()
+                and is_sm100_supported()
+            ):
+                return _dispatch_mla_subtype()
+
+            sum_extend_prefix_lens = (
+                sum(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.extend_prefix_lens_cpu is not None
+                else 0
+            )
             if (
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
+                and (
+                    not self.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
+                )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
@@ -2014,7 +2058,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         quant_format = (
             "mxfp4"
             if _is_gfx95_supported
-            and self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8
+            and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None) is not None
+            and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
+            is not None
+            and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
             else ""
         )
 
@@ -2569,7 +2616,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
-            if _use_aiter_gfx95 and self.quant_config.get_name() == "quark":
+            if (
+                _use_aiter_gfx95
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "quark"
+            ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )
