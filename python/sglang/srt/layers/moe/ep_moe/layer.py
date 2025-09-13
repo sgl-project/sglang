@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
@@ -125,7 +126,15 @@ class EPMoE(FusedMoE):
             self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
+            self.use_w4afp8 = False
+        elif isinstance(quant_config, W4AFp8Config):
+            self.use_w4afp8 = True
+            self.use_fp8_w8a8 = False
+            self.use_block_quant = False
+            self.block_shape = None
+            self.activation_scheme = None
         else:
+            self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
             self.block_shape = None
@@ -399,7 +408,7 @@ class DeepEPMoE(EPMoE):
                 self.w13_weight,
                 (
                     self.w13_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or self.use_w4afp8
                     else self.w13_weight_scale
                 ),
             )
@@ -407,7 +416,7 @@ class DeepEPMoE(EPMoE):
                 self.w2_weight,
                 (
                     self.w2_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or self.use_w4afp8
                     else self.w2_weight_scale
                 ),
             )
@@ -453,14 +462,14 @@ class DeepEPMoE(EPMoE):
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
         if _is_npu:
-            assert DispatchOutputChecker.format_is_deepep(dispatch_output)
+            assert DispatchOutputChecker.format_is_ascent_ll(dispatch_output)
             return self.forward_npu(dispatch_output)
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            if self.use_w4afp8:
+                return self.forward_cutlass_w4afp8(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-            if get_moe_runner_backend().is_flashinfer_cutedsl():
-                return self.forward_flashinfer_cutedsl(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -733,6 +742,17 @@ class DeepEPMoE(EPMoE):
 
         return down_output
 
+    def forward_cutlass_w4afp8(
+        self,
+        dispatch_output: DeepEPNormalOutput,
+    ):
+        assert self.moe_runner_config.activation == "silu"
+        assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        return self.quant_method.apply_deepep_normal(
+            layer=self,
+            dispatch_output=dispatch_output,
+        )
+
     def forward_npu(
         self,
         dispatch_output: Union[DeepEPNormalOutput, DeepEPLLOutput],
@@ -746,6 +766,7 @@ class DeepEPMoE(EPMoE):
 
         # NOTE: Ascend's Dispatch & Combine does not support FP16
         output_dtype = torch.bfloat16
+
         group_list_type = 1
 
         def _forward_normal(dispatch_output: DeepEPNormalOutput):
