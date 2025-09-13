@@ -1235,6 +1235,26 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+
+            from sglang.srt.utils import is_cuda
+
+            if (
+                self.kv_cache_dtype == getattr(torch, "float4_e2m1fn_x2", None)
+                and is_cuda()
+            ):
+                # kv_scale_buffer
+                scale_block_size = 16
+                cell_size = (cell_size // 2) + (
+                    (
+                        (
+                            self.model_config.kv_lora_rank
+                            + self.model_config.qk_rope_head_dim
+                        )
+                        // scale_block_size
+                    )
+                    * num_layers
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
@@ -1363,6 +1383,14 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype == "fp4_e2m1":
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                self.kv_cache_dtype = torch.float4_e2m1fn_x2
+            else:
+                logging.warning(
+                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
+                )
+                self.kv_cache_dtype = self.dtype
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
