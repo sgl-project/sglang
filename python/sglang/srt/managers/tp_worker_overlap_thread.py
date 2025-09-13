@@ -26,8 +26,10 @@ import torch
 
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -265,6 +267,20 @@ class TpModelWorkerClient:
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.worker.init_weights_update_group(recv_req)
+        return success, message
+
+    def init_weights_send_group_for_remote_instance(
+        self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        success, message = self.worker.init_weights_send_group_for_remote_instance(
+            recv_req
+        )
+        return success, message
+
+    def send_weights_to_remote_instance(
+        self, recv_req: SendWeightsToRemoteInstanceReqInput
+    ):
+        success, message = self.worker.send_weights_to_remote_instance(recv_req)
         return success, message
 
     def update_weights_from_distributed(
