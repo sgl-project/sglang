@@ -658,7 +658,47 @@ impl RouterTrait for RouterManager {
         _body: &ResponsesRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        todo!()
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "responses api not yet implemented in inference gateway mode",
+        )
+            .into_response()
+    }
+
+    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "responses api not yet implemented in inference gateway mode",
+        )
+            .into_response()
+    }
+
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "responses api not yet implemented in inference gateway mode",
+        )
+            .into_response()
+    }
+
+    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "responses api not yet implemented in inference gateway mode",
+        )
+            .into_response()
+    }
+
+    async fn list_response_input_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "responses api not yet implemented in inference gateway mode",
+        )
+            .into_response()
     }
 
     /// Route embeddings request
