@@ -309,8 +309,6 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
-    hack_num_tokens_before_pad: int = None
-
     @classmethod
     def init_new(
         cls,
@@ -735,7 +733,6 @@ class ForwardBatch:
                     bs = self.batch_size = num_tokens
 
         # padding
-        self.hack_num_tokens_before_pad = len(self.input_ids)
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
 
