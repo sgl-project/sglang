@@ -649,7 +649,7 @@ class Req:
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         return self.sampling_params.max_new_tokens == 0
-    
+
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
             return
