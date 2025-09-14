@@ -106,7 +106,9 @@ class TestLogprobsDense(unittest.TestCase):
                     f"there are only {len(common_tokens)} common topk tokens that matches",
                 )
                 for token_id in common_tokens:
-                    diffs.append(abs(baseline_token_map[token_id] - sglang_token_map[token_id]))
+                    diffs.append(
+                        abs(baseline_token_map[token_id] - sglang_token_map[token_id])
+                    )
         return max(diffs), float(np.mean(diffs))
 
     def test_logprobs_comparison(self):
@@ -114,12 +116,16 @@ class TestLogprobsDense(unittest.TestCase):
         # Load test data with retry mechanism
         records = self.load_test_data()
 
-        with self.subTest(config={"num_samples": NUM_SAMPLES, "logprob_sample_ratio": LOGPROB_SAMPLE_RATIO, "temperature": TEMPERATURE}):
+        with self.subTest(
+            config={
+                "num_samples": NUM_SAMPLES,
+                "logprob_sample_ratio": LOGPROB_SAMPLE_RATIO,
+                "temperature": TEMPERATURE,
+            }
+        ):
 
             # Sample records for this config
-            test_records = random.sample(
-                records, k=min(NUM_SAMPLES, len(records))
-            )
+            test_records = random.sample(records, k=min(NUM_SAMPLES, len(records)))
             random.shuffle(test_records)
 
             # Calculate how many samples should return logprobs
@@ -231,7 +237,9 @@ class TestLogprobsDense(unittest.TestCase):
             self.assertIsInstance(all_max, list)
             self.assertIsInstance(all_mean, list)
             self.assertGreater(
-                len(all_max), 0, f"No test samples processed for config {{'num_samples': {NUM_SAMPLES}, 'logprob_sample_ratio': {LOGPROB_SAMPLE_RATIO}, 'temperature': {TEMPERATURE}}}"
+                len(all_max),
+                0,
+                f"No test samples processed for config {{'num_samples': {NUM_SAMPLES}, 'logprob_sample_ratio': {LOGPROB_SAMPLE_RATIO}, 'temperature': {TEMPERATURE}}}",
             )
 
             # Tolerance checks with clear error messages
