@@ -95,6 +95,15 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flash-attention)
 
+# flash-attention origin
+FetchContent_Declare(
+    repo-flash-attention-origin
+    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
+    GIT_TAG        203b9b3dba39d5d08dffb49c09aa622984dff07d
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-flash-attention-origin)
+
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
@@ -148,7 +157,11 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
-    "--threads=32"
+
+    # The following flag leads to the CMAKE_BUILD_PARALLEL_LEVEL breaking,
+    # it triggers OOM with low memory host. Extract the threads number to
+    # option named SGL_KERNEL_COMPILE_THREADS, default value 32.
+    # "--threads=32"
 
     # Supress warnings
     "-Xcompiler=-Wno-clang-format-violations"
@@ -157,11 +170,26 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-Xcompiler=-Wno-terminate"
     "-Xcompiler=-Wfatal-errors"
     "-Xcompiler=-ftemplate-backtrace-limit=1"
-    "-Xcudafe=--diag_suppress=177"  # variable was declared but never referenced
+    "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
+    "-Xcudafe=--diag_suppress=2361"  # invalid narrowing conversion from "char" to "signed char"
 
     # uncomment to debug
     # "--ptxas-options=-v"
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
+)
+
+set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default 32")
+
+# When SGL_KERNEL_COMPILE_THREADS value is less than 1, set it to 1
+if (NOT SGL_KERNEL_COMPILE_THREADS MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "SGL_KERNEL_COMPILE_THREADS must be an integer, but was set to '${SGL_KERNEL_COMPILE_THREADS}'.")
+elseif (SGL_KERNEL_COMPILE_THREADS LESS 1)
+    message(STATUS "SGL_KERNEL_COMPILE_THREADS was set to a value less than 1. Using 1 instead.")
+    set(SGL_KERNEL_COMPILE_THREADS 1)
+endif()
+
+list(APPEND SGL_KERNEL_CUDA_FLAGS
+    "--threads=${SGL_KERNEL_COMPILE_THREADS}"
 )
 
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
@@ -194,26 +222,20 @@ endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_120,code=sm_120"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
 
     # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
     if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_103,code=sm_103"
             "-gencode=arch=compute_103a,code=sm_103a"
-            "-gencode=arch=compute_110,code=sm_110"
             "-gencode=arch=compute_110a,code=sm_110a"
-            "-gencode=arch=compute_121,code=sm_121"
             "-gencode=arch=compute_121a,code=sm_121a"
             "--compress-mode=size"
         )
     else()
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_101,code=sm_101"
             "-gencode=arch=compute_101a,code=sm_101a"
         )
     endif()
@@ -247,6 +269,8 @@ set(SOURCES
     "csrc/attention/vertical_slash_index.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/cast.cu"
+    "csrc/elementwise/copy.cu"
+    "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/common_extension.cc"
@@ -277,6 +301,8 @@ set(SOURCES
 
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
+    "csrc/mamba/causal_conv1d.cu"
+
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
@@ -287,8 +313,6 @@ set(SOURCES
     "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
-    "csrc/moe/ep_moe_reorder_kernel.cu"
-    "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
 
     "csrc/memory/store.cu"
     "csrc/kvcacheio/transfer.cu"
@@ -501,3 +525,13 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
         DESTINATION "triton_kernels"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
+
+# flash attention 4
+# TODO: find a better install condition.
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+    # flash_attn/cute
+    install(DIRECTORY "${repo-flash-attention-origin_SOURCE_DIR}/flash_attn/cute/"
+            DESTINATION "flash_attn/cute"
+            PATTERN ".git*" EXCLUDE
+            PATTERN "__pycache__" EXCLUDE)
+    endif()
