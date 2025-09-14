@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 import requests
 import torch
 import torch.distributed as dist
+from batch_invariant_ops import enable_batch_invariant_mode
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -266,6 +267,8 @@ class ModelRunner:
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+
+        enable_batch_invariant_mode()
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args

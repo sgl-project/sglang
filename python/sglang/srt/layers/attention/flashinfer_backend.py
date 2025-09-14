@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+
 if is_flashinfer_available():
     from flashinfer import (
         BatchDecodeWithPagedKVCacheWrapper,
@@ -87,14 +88,15 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
 
         # Parse constants
-        self.decode_use_tensor_cores = should_use_tensor_core(
-            kv_cache_dtype=model_runner.kv_cache_dtype,
-            num_attention_heads=model_runner.model_config.num_attention_heads
-            // get_attention_tp_size(),
-            num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                get_attention_tp_size()
-            ),
-        )
+        # self.decode_use_tensor_cores = should_use_tensor_core(
+        #     kv_cache_dtype=model_runner.kv_cache_dtype,
+        #     num_attention_heads=model_runner.model_config.num_attention_heads
+        #     // get_attention_tp_size(),
+        #     num_kv_heads=model_runner.model_config.get_num_kv_heads(
+        #         get_attention_tp_size()
+        #     ),
+        # )
+        self.decode_use_tensor_cores = True
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -127,7 +129,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if global_workspace_buffer is None:
             # different from flashinfer zero_init_global_workspace_buffer
             global_workspace_buffer = torch.empty(
-                global_config.flashinfer_workspace_size,
+                1024 * 1024 * 1024,
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
@@ -257,7 +259,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = False
                 extend_no_prefix = False
             else:
-                use_ragged = True
+                use_ragged = False
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             self.indices_updater_prefill.update(
@@ -347,10 +349,10 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
-            for i in range(self.num_wrappers):
-                decode_wrappers[i].begin_forward = partial(
-                    fast_decode_plan, decode_wrappers[i]
-                )
+            # for i in range(self.num_wrappers):
+            #     decode_wrappers[i].begin_forward = partial(
+            #         fast_decode_plan, decode_wrappers[i]
+            #     )
         elif forward_mode.is_target_verify():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -630,6 +632,8 @@ class FlashInferIndicesUpdaterDecode:
             assert self.attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
 
+        self.fixed_split_size = 2048
+
     def update(
         self,
         req_pool_indices: torch.Tensor,
@@ -663,6 +667,7 @@ class FlashInferIndicesUpdaterDecode:
             None,
             spec_info,
             seq_lens_cpu,
+            fixed_split_size=self.fixed_split_size,
         )
 
     def update_sliding_window(
@@ -756,6 +761,7 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
         use_sliding_window_kv_pool: bool = False,
+        fixed_split_size: int = 2048,
     ):
         if spec_info is None:
             bs = len(req_pool_indices)
@@ -810,6 +816,7 @@ class FlashInferIndicesUpdaterDecode:
             data_type=self.data_type,
             q_data_type=self.q_data_type,
             non_blocking=True,
+            fixed_split_size=fixed_split_size,
         )
 
         if locally_override:
@@ -847,6 +854,8 @@ class FlashInferIndicesUpdaterPrefill:
         else:
             assert self.attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
+
+        self.fixed_split_size = 4096
 
     def update(
         self,
@@ -897,6 +906,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.qo_indptr[0],
             use_ragged,
             spec_info,
+            fixed_split_size=self.fixed_split_size,
         )
 
     def update_sliding_window(
@@ -999,6 +1009,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         use_sliding_window_kv_pool: bool = False,
+        fixed_split_size: int = 4096,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1069,6 +1080,7 @@ class FlashInferIndicesUpdaterPrefill:
             kv_data_type=self.data_type,
             custom_mask=custom_mask,
             non_blocking=True,
+            fixed_split_size=fixed_split_size,
         )
 
 
