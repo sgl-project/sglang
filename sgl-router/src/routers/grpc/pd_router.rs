@@ -27,9 +27,9 @@ use tracing::{info, warn};
 #[allow(dead_code)] // Fields will be used once implementation is complete
 pub struct GrpcPDRouter {
     /// Prefill worker connections
-    prefill_workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
+    prefill_workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
     /// Decode worker connections
-    decode_workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
+    decode_workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
     /// gRPC clients for prefill workers
     prefill_grpc_clients: Arc<RwLock<HashMap<String, SglangSchedulerClient>>>,
     /// gRPC clients for decode workers
@@ -127,7 +127,7 @@ impl GrpcPDRouter {
         }
 
         // Create Prefill Worker trait objects with gRPC connection mode
-        let prefill_workers: Vec<Box<dyn Worker>> = prefill_urls
+        let prefill_workers: Vec<Arc<dyn Worker>> = prefill_urls
             .iter()
             .map(|(url, bootstrap_port)| {
                 let worker = BasicWorker::with_connection_mode(
@@ -147,12 +147,12 @@ impl GrpcPDRouter {
                     failure_threshold: ctx.router_config.health_check.failure_threshold,
                     success_threshold: ctx.router_config.health_check.success_threshold,
                 });
-                Box::new(worker) as Box<dyn Worker>
+                Arc::new(worker) as Arc<dyn Worker>
             })
             .collect();
 
         // Create Decode Worker trait objects with gRPC connection mode
-        let decode_workers: Vec<Box<dyn Worker>> = decode_urls
+        let decode_workers: Vec<Arc<dyn Worker>> = decode_urls
             .iter()
             .map(|url| {
                 let worker = BasicWorker::with_connection_mode(
@@ -168,7 +168,7 @@ impl GrpcPDRouter {
                     failure_threshold: ctx.router_config.health_check.failure_threshold,
                     success_threshold: ctx.router_config.health_check.success_threshold,
                 });
-                Box::new(worker) as Box<dyn Worker>
+                Arc::new(worker) as Arc<dyn Worker>
             })
             .collect();
 
@@ -269,6 +269,7 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::GenerateRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -277,6 +278,7 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ChatCompletionRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -285,6 +287,7 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::CompletionRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -293,7 +296,16 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ResponsesRequest,
+        _model_id: Option<&str>,
     ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
@@ -301,7 +313,12 @@ impl RouterTrait for GrpcPDRouter {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+    async fn route_rerank(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::RerankRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
