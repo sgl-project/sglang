@@ -73,6 +73,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -80,6 +81,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
@@ -673,6 +675,38 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         )
 
 
+@app.post("/init_weights_send_group_for_remote_instance")
+async def init_weights_send_group_for_remote_instance(
+    obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/send_weights_to_remote_instance")
+async def send_weights_to_remote_instance(
+    obj: SendWeightsToRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/init_weights_update_group")
 async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
@@ -1160,7 +1194,6 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     if server_args.tokenizer_worker_num > 1:
-        setproctitle.setproctitle(f"sglang::http_server/multi_tokenizer_router")
         port_args = PortArgs.init_new(server_args)
         port_args.tokenizer_worker_ipc_name = (
             f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -1169,7 +1202,6 @@ def launch_server(
             server_args=server_args, port_args=port_args
         )
     else:
-        setproctitle.setproctitle(f"sglang::http_server/tokenizer_manager")
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
         )

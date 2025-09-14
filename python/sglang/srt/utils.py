@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import builtins
 import ctypes
@@ -434,7 +435,9 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        free_gpu_memory = psutil.virtual_memory().available
+        total_free_memory = psutil.virtual_memory().available
+        n_numa_node: int = len(get_cpu_ids_by_node())
+        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -1429,6 +1432,7 @@ def init_custom_process_group(
     store=None,
     group_name=None,
     pg_options=None,
+    device_id=None,
 ):
     from torch.distributed.distributed_c10d import (
         Backend,
@@ -1482,6 +1486,7 @@ def init_custom_process_group(
         group_name=group_name,
         **{pg_options_param_name: pg_options},
         timeout=timeout,
+        device_id=device_id,
     )
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
@@ -3044,3 +3049,12 @@ def numa_bind_to_node(node: int):
 
     libnuma.numa_run_on_node(ctypes.c_int(node))
     libnuma.numa_set_localalloc()
+
+
+def json_list_type(value):
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid JSON list: {value}. Please provide a valid JSON list."
+        )

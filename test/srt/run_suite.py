@@ -123,6 +123,7 @@ suites = {
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_dp_attention.py", 277),
+        TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 127),
         TestFile("hicache/test_hicache_storage_file_backend.py", 400),
@@ -132,6 +133,7 @@ suites = {
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 372),
+        TestFile("models/test_qwen3_next_models.py", 200),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-8-gpu": [
@@ -146,6 +148,7 @@ suites = {
     "per-commit-8-gpu-b200": [
         # add more here
         TestFile("test_gpt_oss_4gpu.py", 600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 600),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -251,6 +254,7 @@ suite_amd = {
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
+        TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
     ],
     "per-commit-4-gpu-amd": [

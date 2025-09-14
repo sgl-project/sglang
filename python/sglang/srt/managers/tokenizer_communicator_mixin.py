@@ -34,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     LoadLoRAAdapterReqInput,
@@ -47,6 +49,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    SendWeightsToRemoteInstanceReqInput,
+    SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -148,6 +152,12 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_distributed_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.init_weights_send_group_for_remote_instance_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.send_weights_to_remote_instance_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.update_weights_from_tensor_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -200,6 +210,14 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromDistributedReqOutput,
                     self.update_weights_from_distributed_communicator.handle_recv,
+                ),
+                (
+                    InitWeightsSendGroupForRemoteInstanceReqOutput,
+                    self.init_weights_send_group_for_remote_instance_communicator.handle_recv,
+                ),
+                (
+                    SendWeightsToRemoteInstanceReqOutput,
+                    self.send_weights_to_remote_instance_communicator.handle_recv,
                 ),
                 (
                     UpdateWeightsFromTensorReqOutput,
@@ -345,6 +363,34 @@ class TokenizerCommunicatorMixin:
         async with self.model_update_lock.writer_lock:
             result = (await self.update_weights_from_distributed_communicator(obj))[0]
             return result.success, result.message
+
+    async def init_weights_send_group_for_remote_instance(
+        self,
+        obj: InitWeightsSendGroupForRemoteInstanceReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        # TODO: support DP
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for init_weights_send_group_for_remote_instance"
+        result = (
+            await self.init_weights_send_group_for_remote_instance_communicator(obj)
+        )[0]
+        return result.success, result.message
+
+    async def send_weights_to_remote_instance(
+        self,
+        obj: SendWeightsToRemoteInstanceReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        # TODO: support DP
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for send_weights_to_remote_instance"
+        result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
+        return result.success, result.message
 
     async def update_weights_from_tensor(
         self: TokenizerManager,
