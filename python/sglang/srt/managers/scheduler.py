@@ -1163,7 +1163,7 @@ class Scheduler(
                 else 1 << 30
             ),
             self.max_req_len - len(req.origin_input_ids) - 1,
-            )
+        )
 
     def handle_generate_request(
         self,
@@ -1287,17 +1287,6 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
-
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
-            self.max_req_len - len(req.origin_input_ids) - 1,
-        )
-        print(f"setting max_new_tokens to {req.sampling_params.max_new_tokens=}")
-        print(f"setting max_new_tokens to {req.rid=}")
 
         # Init grammar cache for this request
         add_to_grammar_queue = False
