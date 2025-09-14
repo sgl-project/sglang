@@ -104,7 +104,7 @@ class TestW8A8Fp8MoE(BaseW8A8Test):
     model = "RedHatAI/Qwen3-30B-A3B-FP8-dynamic"
     quantization = "w8a8_fp8"
     gsm8k_accuracy_threshold = 0.88
-    throughput_threshold = 160
+    throughput_threshold = 180
 
 
 if __name__ == "__main__":
