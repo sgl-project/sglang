@@ -53,9 +53,16 @@ SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' p
 echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
 if [ "$IS_BLACKWELL" = "1" ]; then
-    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION_FROM_SRT}/sgl_kernel-${SGL_KERNEL_VERSION_FROM_SRT}+cu128-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    SGL_KERNEL_CUDA_VERSION=cu128
 else
-    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION_FROM_SRT}/sgl_kernel-${SGL_KERNEL_VERSION_FROM_SRT}+cu124-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    SGL_KERNEL_CUDA_VERSION=cu124
+fi
+
+if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
+    ls -alh sgl-kernel/dist
+    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${SGL_KERNEL_CUDA_VERSION}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+else
+    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION_FROM_SRT}/sgl_kernel-${SGL_KERNEL_VERSION_FROM_SRT}+${SGL_KERNEL_CUDA_VERSION}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages
