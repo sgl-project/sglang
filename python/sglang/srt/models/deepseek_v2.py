@@ -154,6 +154,7 @@ if _is_cuda:
     from sgl_kernel import (
         awq_dequantize,
         bmm_fp8,
+        concat_mla_k,
         dsv3_fused_a_gemm,
         dsv3_router_gemm,
         merge_state_v2,
@@ -675,10 +676,14 @@ class DeepseekV2MoE(nn.Module):
 
         if shared_output is not None:
             x = shared_output
-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            if self.experts.should_fuse_routed_scaling_factor_in_topk():
+                x.add_(final_hidden_states)
+            else:
+                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            final_hidden_states *= self.routed_scaling_factor
+            if not self.experts.should_fuse_routed_scaling_factor_in_topk():
+                final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
 
@@ -1085,6 +1090,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             disable_ragged = (
                 attention_backend == "flashinfer" or attention_backend == "flashmla"
             ) and self.flashinfer_mla_disable_ragged
+
+            original_mode = getattr(forward_batch, "_original_forward_mode", None)
             if (
                 not disable_ragged
                 and forward_batch.forward_mode.is_extend()
@@ -1097,15 +1104,40 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                     or sum_extend_prefix_lens == 0
                 )
+                # TODO(shuw@nvidia.com) Flashinfer cutlass and trtllm_mla backend have accuracy issue on blackwell for
+                # dp case. Redirect to mla kernel as a workaround.
+                # Tracked by https://github.com/sgl-project/sglang/issues/9806.
+                and not (
+                    original_mode is not None
+                    and original_mode.is_decode()
+                    and is_sm100_supported()
+                    and self.current_attention_backend in ("cutlass_mla", "flashinfer")
+                )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return _dispatch_mla_subtype()
         elif attention_backend == "trtllm_mla":
+            original_mode = getattr(forward_batch, "_original_forward_mode", None)
+            if (
+                original_mode is not None
+                and original_mode.is_decode()
+                and is_sm100_supported()
+            ):
+                return _dispatch_mla_subtype()
+
+            sum_extend_prefix_lens = (
+                sum(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.extend_prefix_lens_cpu is not None
+                else 0
+            )
             if (
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
+                and (
+                    not self.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
+                )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
@@ -1266,8 +1298,18 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
-        k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+
+        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
+        if (
+            _is_cuda
+            and (self.num_local_heads == 128)
+            and (self.qk_nope_head_dim == 128)
+            and (self.qk_rope_head_dim == 64)
+        ):
+            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
+        else:
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_pe
 
         if not _is_npu:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
@@ -2029,7 +2071,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         quant_format = (
             "mxfp4"
             if _is_gfx95_supported
-            and self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8
+            and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None) is not None
+            and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
+            is not None
+            and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
             else ""
         )
 
@@ -2201,8 +2246,15 @@ class DeepseekV2Model(nn.Module):
                     [
                         "w13_weight",
                         "w2_weight",
-                        "w13_blockscale_swizzled",
-                        "w2_blockscale_swizzled",
+                        # only for nvfp4
+                        *(
+                            [
+                                "w13_blockscale_swizzled",
+                                "w2_blockscale_swizzled",
+                            ]
+                            if hasattr(module, "w13_blockscale_swizzled")
+                            else []
+                        ),
                     ]
                     if isinstance(module, FusedMoE)
                     else []
@@ -2584,7 +2636,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
-            if _use_aiter_gfx95 and self.quant_config.get_name() == "quark":
+            if (
+                _use_aiter_gfx95
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "quark"
+            ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )
