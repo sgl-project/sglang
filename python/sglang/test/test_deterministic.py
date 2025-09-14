@@ -52,10 +52,9 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def send_one_prompt(args):
+def send_one_prompt(args, batch_size: int):
 
     prompt = args.prompt
-    batch_size = random.randint(1, 256)
     prompt = [prompt] * batch_size
 
     json_data = {
@@ -92,17 +91,18 @@ def send_one_prompt(args):
         print(ret)
         return 0, 0
 
-    return ret["text"], batch_size
+    return ret["text"]
 
 
 def test_deterministic(args):
     # First do some warmups
     for i in range(3):
-        send_one_prompt(args)
+        send_one_prompt(args, 16)
 
     texts = []
-    for i in range(args.n_trials):
-        text, batch_size = send_one_prompt(args)
+    for i in range(1, args.n_trials + 1):
+        batch_size = i
+        text = send_one_prompt(args, batch_size)
         text = text.replace("\n", " ")
         print(f"Trial {i} with batch size {batch_size}: {text}")
         texts.append(text)
