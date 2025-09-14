@@ -1,5 +1,5 @@
 """
-Send the same prompt for multiple times and test if the results are deterministic.
+Batch the same prompt in random batch sizes, and test if the results are consistent across different trials.
 
 Usage:
 python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials>
@@ -24,9 +24,7 @@ class BenchArgs:
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     return_logprob: bool = False
-    prompt: str = (
-        "Generate 1000 random numbers. Go directly into it, don't say Sure and don't say here are numbers. Just start with a number. /no_think"
-    )
+    prompt: str = "Tell me about Richard Feynman: "
     stream: bool = False
 
     @staticmethod
@@ -94,7 +92,7 @@ def send_one_prompt(args):
         print(ret)
         return 0, 0
 
-    return ret["text"]
+    return ret["text"], batch_size
 
 
 def test_deterministic(args):
@@ -104,9 +102,9 @@ def test_deterministic(args):
 
     texts = []
     for i in range(args.n_trials):
-        text = send_one_prompt(args)
+        text, batch_size = send_one_prompt(args)
         text = text.replace("\n", " ")
-        print(f"Trial {i}: {text}")
+        print(f"Trial {i} with batch size {batch_size}: {text}")
         texts.append(text)
 
     print(f"Total samples: {len(texts)}, Unique samples: {len(set(texts))}")
