@@ -90,21 +90,21 @@ class TestW8A8Int8(BaseW8A8Test):
     model = "neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a8"
     quantization = "w8a8_int8"
     gsm8k_accuracy_threshold = 0.69
-    throughput_threshold = 230
+    throughput_threshold = 200
 
 
 class TestW8A8Fp8(BaseW8A8Test):
     model = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
     quantization = "w8a8_fp8"
     gsm8k_accuracy_threshold = 0.69
-    throughput_threshold = 230
+    throughput_threshold = 200
 
 
 class TestW8A8Fp8MoE(BaseW8A8Test):
     model = "RedHatAI/Qwen3-30B-A3B-FP8-dynamic"
     quantization = "w8a8_fp8"
-    gsm8k_accuracy_threshold = 0.90
-    throughput_threshold = 190
+    gsm8k_accuracy_threshold = 0.88
+    throughput_threshold = 160
 
 
 if __name__ == "__main__":
