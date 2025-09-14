@@ -353,7 +353,7 @@ class DeepseekV2MoE(nn.Module):
         if config.hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {config.hidden_act}. "
-                "Only silu is supported for now."
+                "Only silu is supported for now.  "
             )
 
         self.gate = MoEGate(
