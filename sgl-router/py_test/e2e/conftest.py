@@ -128,6 +128,7 @@ def _popen_launch_router_only(
     timeout: float = 120.0,
     *,
     dp_aware: bool = False,
+    enable_igw: bool = False,
     api_key: str | None = None,
 ) -> subprocess.Popen:
     host, port = _parse_url(base_url)
@@ -146,6 +147,8 @@ def _popen_launch_router_only(
     ]
     if dp_aware:
         cmd += ["--dp-aware"]
+    if enable_igw:
+        cmd += ["--enable-igw"]
     if api_key is not None:
         cmd += ["--api-key", api_key]
     cmd += [
