@@ -46,7 +46,7 @@ class BaseW8A8Test(CustomTestCase):
     def test_gsm8k(self):
         if self.gsm8k_accuracy_threshold is None:
             self.skipTest("gsm8k_accuracy_threshold not set for this test")
-        
+
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -105,6 +105,7 @@ class TestW8A8Fp8MoE(BaseW8A8Test):
     quantization = "w8a8_fp8"
     gsm8k_accuracy_threshold = 0.90
     throughput_threshold = 190
+
 
 if __name__ == "__main__":
     unittest.main()
