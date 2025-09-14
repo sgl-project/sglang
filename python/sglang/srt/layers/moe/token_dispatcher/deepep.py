@@ -568,7 +568,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
-                use_nvfp4=use_nvfp4,
+                **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                 x_global_scale=input_global_scale,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
