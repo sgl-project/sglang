@@ -82,6 +82,13 @@ from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicat
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.tracing.trace import (
+    trace_get_proc_propagate_context,
+    trace_req_finish,
+    trace_req_start,
+    trace_slice_end,
+    trace_slice_start,
+)
 from sglang.srt.utils import (
     configure_gc_warning,
     dataclass_to_string_truncated,
@@ -358,6 +365,24 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # If it's a single value, add worker_id prefix
                 obj.rid = f"{self.worker_id}_{obj.rid}"
 
+        if obj.is_single:
+            bootstrap_room = (
+                obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
+            )
+            trace_req_start(obj.rid, bootstrap_room, ts=int(created_time * 1e9))
+            trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
+        else:
+            for i in range(len(obj.rid)):
+                bootstrap_room = (
+                    obj.bootstrap_room[i]
+                    if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
+                    else None
+                )
+                trace_req_start(obj.rid[i], bootstrap_room, ts=int(created_time * 1e9))
+                trace_slice_start(
+                    "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
+                )
+
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
@@ -574,6 +599,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
+        trace_slice_end("tokenize", obj.rid)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -752,6 +778,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )
+            trace_slice_end("tokenize", req.rid)
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -779,9 +806,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        trace_slice_start("dispatch", obj.rid)
+        tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
+        trace_slice_end("dispatch", obj.rid, thread_finish_flag=True)
         return state
 
     def _send_batch_request(
@@ -1429,6 +1459,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+
+                trace_req_finish(rid, ts=int(state.finished_time * 1e9))
+
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
