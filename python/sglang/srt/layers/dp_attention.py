@@ -51,7 +51,12 @@ class DpPaddingMode(IntEnum):
         return self == DpPaddingMode.SUM_LEN
 
     @classmethod
-    def get_dp_padding_mode(cls, global_num_tokens: List[int]) -> DpPaddingMode:
+    def get_dp_padding_mode(
+        cls, forward_mode, global_num_tokens: List[int]
+    ) -> DpPaddingMode:
+        if forward_mode.is_extend():
+            return DpPaddingMode.SUM_LEN
+
         # we choose the mode that minimizes the communication cost
         max_len = max(global_num_tokens)
         sum_len = sum(global_num_tokens)
