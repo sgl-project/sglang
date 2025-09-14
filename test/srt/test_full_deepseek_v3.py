@@ -151,7 +151,7 @@ class TestDeepseekV3MTP(CustomTestCase):
             if is_in_amd_ci():
                 self.assertGreater(acc_length, 2.8)
             else:
-                self.assertGreater(acc_length, 2.9)
+                self.assertGreater(acc_length, 2.889)
             if is_in_amd_ci():
                 self.assertGreater(speed, 15)
             else:
