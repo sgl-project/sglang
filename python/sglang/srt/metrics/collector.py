@@ -252,14 +252,13 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-        # Disaggregation queue metrics
+        # PD disaggregation
         self.num_prefill_prealloc_queue_reqs = Gauge(
             name="sglang:num_prefill_prealloc_queue_reqs",
-            documentation="The number of requests in the prefill bootstrap queue.",
+            documentation="The number of requests in the prefill prealloc queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
         self.num_prefill_inflight_queue_reqs = Gauge(
             name="sglang:num_prefill_inflight_queue_reqs",
             documentation="The number of requests in the prefill inflight queue.",
