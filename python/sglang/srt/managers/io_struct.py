@@ -148,6 +148,9 @@ class GenerateReqInput:
             or has_valid_data(self.audio_data)
         )
 
+    # Each individual request's cfg_params will be a dictionary with keys cfg_input_ids and cfg_weight
+    cfg_params: Optional[Union[List[Dict], Dict]] = None
+
     def normalize_batch_and_arguments(self):
         """
         Normalize the batch size and arguments for the request.
@@ -163,6 +166,7 @@ class GenerateReqInput:
         """
         self._validate_inputs()
         self._determine_batch_size()
+        self._validate_cfg_inputs()
         self._handle_parallel_sampling()
 
         if self.is_single:
@@ -211,6 +215,52 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
+    def _validate_cfg_inputs(self):
+        """Validate that the CFG input configuration is valid."""
+        # Verify cfg_params
+        if self.cfg_params is not None:
+            if (self.is_single and not isinstance(self.cfg_params, dict)) or (
+                not self.is_single and self.batch_size != len(self.cfg_params)
+            ):
+                raise ValueError("cfg_params doesn't match input_ids in dimension")
+
+            correct_keys = set(["cfg_text", "cfg_input_ids", "cfg_weight"])
+            if (
+                self.is_single
+                and not set(self.cfg_params.keys()).issubset(correct_keys)
+            ) or (
+                not self.is_single
+                and not all(
+                    set(param.keys()).issubset(correct_keys)
+                    for param in self.cfg_params
+                )
+            ):
+                raise ValueError(
+                    "cfg_params has keys outside of: cfg_text, cfg_input_ids, cfg_weight"
+                )
+
+            norm_params = (
+                [self.cfg_params]
+                if isinstance(self.cfg_params, dict)
+                else self.cfg_params
+            )
+            for param in norm_params:
+                if not param:
+                    continue
+
+                if param.get("cfg_weight") is None:
+                    raise ValueError("cfg_weight must be provided for a CFG request")
+
+                if param["cfg_weight"] < 0.0:
+                    raise ValueError(
+                        "All cfg_weights must be greater than or equal to 0.0"
+                    )
+
+                if ("cfg_text" in param) == ("cfg_input_ids" in param):
+                    raise ValueError(
+                        "exactly one of cfg_text and cfg_input_ids must be provided"
+                    )
+
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
@@ -251,6 +301,8 @@ class GenerateReqInput:
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        if self.cfg_params is None:
+            self.cfg_params = {}
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -272,6 +324,7 @@ class GenerateReqInput:
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_cfg_params(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -474,6 +527,13 @@ class GenerateReqInput:
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+    def _normalize_cfg_params(self, num):
+        """Normalize CFG parameters for batch processing."""
+        if self.cfg_params is None:
+            self.cfg_params = [{}] * num
+        else:
+            assert self.batch_size == len(self.cfg_params)
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -542,6 +602,7 @@ class GenerateReqInput:
             label=self.label,
             priority=self.priority,
             return_bytes=self.return_bytes,
+            cfg_params=self.cfg_params[i],
         )
 
 
@@ -604,6 +665,11 @@ class TokenizedGenerateReqInput:
 
     # Image gen grpc migration
     return_bytes: bool = False
+
+    # Parameters for classifier-free guidance
+    cfg_params: Optional[Dict] = None
+    # Stores the parent CFG rid if `self` is the unconditioned half of a CFG prompt
+    cfg_parent_rid: Optional[str] = None
 
 
 @dataclass

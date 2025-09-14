@@ -556,6 +556,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 input_text, is_cross_encoder_request
             )
 
+        # Tokenize cfg_text
+        if isinstance(obj, GenerateReqInput) and "cfg_text" in obj.cfg_params:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "The engine initialized with skip_tokenizer_init=True cannot "
+                    "accept cfg text prompts. Please provide cfg_input_ids or re-initialize "
+                    "the engine with skip_tokenizer_init=False."
+                )
+            obj.cfg_params["cfg_input_ids"] = self.tokenizer.encode(
+                obj.cfg_params["cfg_text"]
+            )
+
         if self.mm_processor and obj.contains_mm_input():
             if not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
@@ -706,6 +718,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
+                cfg_params=obj.cfg_params,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
