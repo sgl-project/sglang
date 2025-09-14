@@ -78,6 +78,66 @@ class TestDeepseekV3FP4(CustomTestCase):
             self.assertGreater(speed, 75)
 
 
+class TestDeepseekV3EP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--tp",
+            "4",
+            "--ep",
+            "4",
+            "--moe-runner-backend",
+            "flashinfer_cutlass",
+            "--quantization",
+            "modelopt_fp4",
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        args = SimpleNamespace(
+            num_shots=8,
+            data_path=None,
+            num_questions=1319,
+            parallel=1319,
+            max_new_tokens=512,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"{metrics=}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["accuracy"]=:.3f}\n'
+            )
+            self.assertGreater(metrics["accuracy"], 0.935)
+
+    def test_bs_1_speed(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
+
+        print(f"{speed=:.2f}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_bs_1_speed (deepseek-v3-fp4)\n" f"{speed=:.2f} token/s\n"
+            )
+            self.assertGreater(speed, 75)
+
+
 class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
