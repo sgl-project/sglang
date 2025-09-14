@@ -546,8 +546,7 @@ class SchedulerMetricsCollector:
 
         # PD disaggregation
         self._log_gauge(
-            self.num_prefill_prealloc_queue_reqs,
-            stats.num_prefill_prealloc_queue_reqs,
+            self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
         )
         self._log_gauge(
             self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
