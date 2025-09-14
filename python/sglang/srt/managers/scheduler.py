@@ -1514,7 +1514,7 @@ class Scheduler(
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_bootstrap_queue_reqs = len(
+                self.stats.num_prefill_prealloc_queue_reqs = len(
                     self.disagg_prefill_bootstrap_queue.queue
                 )
                 self.stats.num_prefill_inflight_queue_reqs = len(
