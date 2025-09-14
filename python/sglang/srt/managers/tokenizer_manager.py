@@ -648,7 +648,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             ):
                 raise ValueError(
                     "The server is not configured to enable custom logit processor. "
-                    "Please set `--enable-custom-logits-processor` to enable this feature."
+                    "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
 
     def _validate_input_ids_in_vocab(
