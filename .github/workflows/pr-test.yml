@@ -219,7 +219,8 @@ jobs:
 
   unit-test-frontend:
     needs: [check-changes, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
@@ -228,7 +229,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -247,7 +248,8 @@ jobs:
 
   unit-test-backend-1-gpu:
     needs: [check-changes, unit-test-frontend, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
@@ -260,7 +262,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -279,7 +281,8 @@ jobs:
 
   unit-test-backend-2-gpu:
     needs: [check-changes, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 2-gpu-runner
@@ -292,7 +295,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -311,7 +314,8 @@ jobs:
 
   unit-test-backend-4-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 4-gpu-runner
@@ -324,7 +328,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -343,7 +347,8 @@ jobs:
 
   unit-test-backend-8-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 8-gpu-runner
@@ -356,7 +361,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -375,7 +380,8 @@ jobs:
 
   performance-test-1-gpu-part-1:
     needs: [check-changes, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
@@ -384,7 +390,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -435,7 +441,8 @@ jobs:
 
   performance-test-1-gpu-part-2:
     needs: [check-changes, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
@@ -444,7 +451,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -487,7 +494,8 @@ jobs:
 
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 2-gpu-runner
@@ -496,7 +504,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -545,7 +553,8 @@ jobs:
 
   accuracy-test-1-gpu:
     needs: [check-changes, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
@@ -554,7 +563,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -576,7 +585,8 @@ jobs:
 
   accuracy-test-2-gpu:
     needs: [check-changes, accuracy-test-1-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 2-gpu-runner
@@ -585,7 +595,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -607,7 +617,8 @@ jobs:
 
   unit-test-deepep-4-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 4-gpu-runner
@@ -616,7 +627,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -635,7 +646,8 @@ jobs:
 
   unit-test-deepep-8-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 8-gpu-runner
@@ -644,7 +656,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -663,7 +675,8 @@ jobs:
 
   unit-test-backend-8-gpu-b200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: always() && !failure() && !cancelled() &&
+      (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false &&
       needs.check-changes.outputs.src == 'true'
     runs-on: b200-runner
@@ -674,7 +687,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.check-changes.outputs.src == 'true'
+        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
