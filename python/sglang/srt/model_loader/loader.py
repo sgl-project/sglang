@@ -1632,6 +1632,56 @@ class RemoteModelLoader(BaseModelLoader):
         return model.eval()
 
 
+class CkptEngineModelLoader(BaseModelLoader):
+    """Model loader for checkpoint engine format."""
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        if load_config.model_loader_extra_config:
+            raise ValueError(
+                f"Model loader extra config is not supported for "
+                f"load format {load_config.load_format}"
+            )
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        """Download model for checkpoint engine format."""
+        # TODO: Implement download logic for checkpoint engine format
+        pass
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        """Load model using checkpoint engine format."""
+        logger.info("Loading weights from checkpoint engine format ...")
+        
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(model_config, self.load_config)
+
+            # TODO: Implement checkpoint engine specific weight loading logic
+            # For now, use default weight loading as placeholder
+            # This is a placeholder implementation - actual logic will be implemented later
+            weights = []  # Placeholder for weights iterator
+            model.load_weights(weights)
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    # When quant methods need to process weights after loading
+                    # (for repacking, quantizing, etc), they expect parameters
+                    # to be on the global target device. This scope is for the
+                    # case where cpu offloading is used, where we will move the
+                    # parameters onto device for processing and back off after.
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+
+        return model.eval()
+
+
 def load_model_with_cpu_quantization(
     self,
     *,
@@ -1690,5 +1740,8 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
         return RemoteInstanceModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.CKPT_ENGINE:
+        return CkptEngineModelLoader(load_config)
 
     return DefaultModelLoader(load_config)

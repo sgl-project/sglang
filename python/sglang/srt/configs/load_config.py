@@ -24,6 +24,7 @@ class LoadFormat(str, enum.Enum):
     JAX = "jax"
     REMOTE = "remote"
     REMOTE_INSTANCE = "remote_instance"
+    CKPT_ENGINE = "ckpt_engine"
 
 
 @dataclass
