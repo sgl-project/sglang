@@ -687,7 +687,7 @@ class ForwardBatch:
             ) * attn_tp_size
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
-            self.forward_mode, global_num_tokens
+            self.is_extend_in_batch, global_num_tokens
         )
         self.dp_padding_mode = dp_padding_mode
 

@@ -52,9 +52,9 @@ class DpPaddingMode(IntEnum):
 
     @classmethod
     def get_dp_padding_mode(
-        cls, forward_mode, global_num_tokens: List[int]
+        cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        if forward_mode.is_extend():
+        if is_extend_in_batch:
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
