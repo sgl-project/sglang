@@ -13,9 +13,9 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda
+from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_musa
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sgl_kernel import (
         min_p_sampling_from_probs,
         top_k_renorm_prob,

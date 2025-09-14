@@ -73,6 +73,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
@@ -97,6 +98,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_musa = is_musa()
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
@@ -156,7 +158,10 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 80
+        if _is_musa:
+            return 31
+        else:
+            return 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -410,12 +415,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale = layer.weight_scale
                     # If ROCm, normalize the weights and scales to e4m3fnuz
                     if _is_fp8_fnuz:
-                        weight, weight_scale, input_scale = (
-                            normalize_e4m3fn_to_e4m3fnuz(
-                                weight=weight,
-                                weight_scale=weight_scale,
-                                input_scale=layer.input_scale,
-                            )
+                        (
+                            weight,
+                            weight_scale,
+                            input_scale,
+                        ) = normalize_e4m3fn_to_e4m3fnuz(
+                            weight=weight,
+                            weight_scale=weight_scale,
+                            input_scale=layer.input_scale,
                         )
                         if input_scale is not None:
                             layer.input_scale = Parameter(
@@ -831,12 +838,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             for expert in range(layer.num_local_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
+                (
+                    w13_weight[expert, :, :],
+                    layer.w13_weight_scale[expert],
+                ) = scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                (
+                    w2_weight[expert, :, :],
+                    layer.w2_weight_scale[expert],
+                ) = scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
@@ -874,15 +883,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
                 # Normalize the weights and scales
-                w13_weight, w13_weight_scale, w13_input_scale = (
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
-                    )
+                (
+                    w13_weight,
+                    w13_weight_scale,
+                    w13_input_scale,
+                ) = normalize_e4m3fn_to_e4m3fnuz(
+                    layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
                 )
-                w2_weight, w2_weight_scale, w2_input_scale = (
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
-                    )
+                (
+                    w2_weight,
+                    w2_weight_scale,
+                    w2_input_scale,
+                ) = normalize_e4m3fn_to_e4m3fnuz(
+                    layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
                 )
                 # Reset the parameter
                 layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
@@ -1014,7 +1027,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states

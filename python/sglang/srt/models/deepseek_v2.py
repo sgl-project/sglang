@@ -117,6 +117,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_musa,
     is_non_idle_and_non_empty,
     is_npu,
     is_sm100_supported,
@@ -133,6 +134,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
+_is_musa = is_musa()
 _is_gfx95_supported = is_gfx95_supported()
 
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
@@ -150,7 +152,7 @@ if _use_aiter_gfx95:
         get_dsv3_gemm_output_zero_allocator_size,
     )
 
-if _is_cuda:
+if _is_cuda or _is_musa:
     from sgl_kernel import (
         awq_dequantize,
         bmm_fp8,
@@ -300,11 +302,10 @@ class MoEGate(nn.Module):
 
         # NOTE: For some unknown reason, router_gemm seems degrade accept length.
         if (
-            _is_cuda
+            ((_is_cuda and _device_sm >= 90) or (_is_musa or _device_sm >= 31))
             and hidden_states.shape[0] <= 16
             and hidden_states.shape[1] == 7168
             and self.weight.shape[0] == 256
-            and _device_sm >= 90
         ):
             # router gemm output float32
             logits = dsv3_router_gemm(
@@ -321,7 +322,6 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -513,7 +513,6 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(
@@ -802,7 +801,6 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 
 class DeepseekV2AttentionMLA(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -994,8 +992,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
-            and _is_cuda
-            and _device_sm >= 90
+            and ((_is_cuda and _device_sm >= 90) or (_is_musa or _device_sm >= 31))
         )
 
         self.qkv_proj_with_rope_is_int8 = (
@@ -1246,9 +1243,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         return None, attn_forward_method, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
-        hidden_states, attn_forward_method, forward_batch, inner_state = (
-            intermediate_state
-        )
+        (
+            hidden_states,
+            attn_forward_method,
+            forward_batch,
+            inner_state,
+        ) = intermediate_state
         if inner_state is None:
             return hidden_states
 
@@ -1402,9 +1402,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         if self.use_deep_gemm_bmm:
-            q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
-            )
+            (
+                q_nope_val,
+                q_nope_scale,
+                masked_m,
+                expected_m,
+                aligned_m,
+            ) = per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             q_nope_out = q_nope.new_empty(
                 (self.num_local_heads, aligned_m, self.kv_lora_rank)
             )
@@ -1506,10 +1510,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
-            attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(
-                    attn_output.transpose(0, 1)
-                )
+            (
+                attn_output_val,
+                attn_output_scale,
+                masked_m,
+                expected_m,
+                aligned_m,
+            ) = per_token_group_quant_mla_deep_gemm_masked_fp8(
+                attn_output.transpose(0, 1)
             )
             attn_bmm_output = attn_output.new_empty(
                 (self.num_local_heads, aligned_m, self.v_head_dim)
@@ -1573,12 +1581,23 @@ class DeepseekV2AttentionMLA(nn.Module):
                 dtype=attn_output.dtype,
                 device=attn_output.device,
             )
+            input = attn_output.transpose(0, 1)
+            mat2 = self.w_vc
+            out = attn_bmm_output.view(
+                -1, self.num_local_heads, self.v_head_dim
+            ).transpose(0, 1)
+            if _is_musa:
+                # XXX (MUSA): Revisit this.
+                if not input.is_contiguous():
+                    input = input.contiguous()
+                if not mat2.is_contiguous():
+                    mat2 = mat2.contiguous()
+                if not out.is_contiguous():
+                    out = out.contiguous()
             torch.bmm(
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                out=attn_bmm_output.view(
-                    -1, self.num_local_heads, self.v_head_dim
-                ).transpose(0, 1),
+                input,
+                mat2,
+                out=out,
             )
         output, _ = self.o_proj(attn_bmm_output)
 
@@ -1652,9 +1671,15 @@ class DeepseekV2AttentionMLA(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
-        attn_logits, _, kv_indptr, kv_indices, _, _, _ = (
-            forward_batch.attn_backend.forward_metadata
-        )
+        (
+            attn_logits,
+            _,
+            kv_indptr,
+            kv_indices,
+            _,
+            _,
+            _,
+        ) = forward_batch.attn_backend.forward_metadata
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         num_kv_split = forward_batch.attn_backend.num_kv_splits
         sm_scale = self.attn_mqa.scaling
@@ -1709,43 +1734,45 @@ class DeepseekV2AttentionMLA(nn.Module):
             self
         ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
 
-        q_input, k_input, v_input = (
-            torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
-                hidden_states,
-                self.fused_qkv_a_proj_with_mqa.weight,
-                self.q_b_proj.weight,
-                self.w_kc,
-                self.q_a_layernorm.weight,
-                self.kv_a_layernorm.weight,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                self.kv_a_layernorm.variance_epsilon,
-                self.qkv_proj_with_rope_is_int8,
-                self.qkv_proj_with_rope_is_fp8,
-                (
-                    self.fused_qkv_a_proj_with_mqa.weight_scale
-                    if self.qkv_proj_with_rope_is_int8
-                    else (
-                        self.fused_qkv_a_proj_with_mqa.weight_scale_inv
-                        if self.qkv_proj_with_rope_is_fp8
-                        else None
-                    )
-                ),
-                (
-                    self.q_b_proj.weight_scale
-                    if self.qkv_proj_with_rope_is_int8
-                    else (
-                        self.q_b_proj.weight_scale_inv
-                        if self.qkv_proj_with_rope_is_fp8
-                        else None
-                    )
-                ),
-                True,  # is_vnni
-                self.weight_block_size,
-                self.q_lora_rank,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-            )
+        (
+            q_input,
+            k_input,
+            v_input,
+        ) = torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
+            hidden_states,
+            self.fused_qkv_a_proj_with_mqa.weight,
+            self.q_b_proj.weight,
+            self.w_kc,
+            self.q_a_layernorm.weight,
+            self.kv_a_layernorm.weight,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.kv_a_layernorm.variance_epsilon,
+            self.qkv_proj_with_rope_is_int8,
+            self.qkv_proj_with_rope_is_fp8,
+            (
+                self.fused_qkv_a_proj_with_mqa.weight_scale
+                if self.qkv_proj_with_rope_is_int8
+                else (
+                    self.fused_qkv_a_proj_with_mqa.weight_scale_inv
+                    if self.qkv_proj_with_rope_is_fp8
+                    else None
+                )
+            ),
+            (
+                self.q_b_proj.weight_scale
+                if self.qkv_proj_with_rope_is_int8
+                else (
+                    self.q_b_proj.weight_scale_inv
+                    if self.qkv_proj_with_rope_is_fp8
+                    else None
+                )
+            ),
+            True,  # is_vnni
+            self.weight_block_size,
+            self.q_lora_rank,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
         )
         return (q_input, k_input, v_input, forward_batch, zero_allocator)
 
@@ -1866,7 +1893,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
             forward_batch.set_prefix_chunk_idx(i)
@@ -1960,7 +1986,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2065,7 +2090,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-
         quant_format = (
             "mxfp4"
             if _is_gfx95_supported
@@ -2136,9 +2160,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
     ):
-        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
-        )
+        (
+            state.hidden_states_after_comm_pre_attn,
+            state.residual_after_input_ln,
+        ) = self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         state.update(
             dict(
                 forward_batch=forward_batch,
@@ -2149,12 +2174,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_comm_prepare_mlp(self, state):
-        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.prepare_mlp(
-                state.pop("hidden_states_after_attn"),
-                state.pop("residual_after_input_ln"),
-                state.forward_batch,
-            )
+        (
+            state.hidden_states_mlp_input,
+            state.residual_after_comm_pre_mlp,
+        ) = self.layer_communicator.prepare_mlp(
+            state.pop("hidden_states_after_attn"),
+            state.pop("residual_after_input_ln"),
+            state.forward_batch,
         )
 
     def op_mlp(self, state):
@@ -2510,7 +2536,6 @@ class DeepseekV2ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-
         # Perform post-processing after loading weights
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
@@ -2639,9 +2664,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
             ):
-                w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
-                    quark_post_load_weights(self_attn, w, "mxfp4")
-                )
+                (
+                    w_kc,
+                    self_attn.w_scale_k,
+                    w_vc,
+                    self_attn.w_scale_v,
+                ) = quark_post_load_weights(self_attn, w, "mxfp4")
 
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(
@@ -2759,7 +2787,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                     )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers

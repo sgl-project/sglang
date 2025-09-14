@@ -16,7 +16,30 @@ limitations under the License.
 #pragma once
 
 #include <ATen/Tensor.h>
+#ifdef USE_MUSA
+#include <musa_runtime.h>
+#define CU_POINTER_ATTRIBUTE_RANGE_START_ADDR MU_POINTER_ATTRIBUTE_RANGE_START_ADDR
+#define CUdeviceptr MUdeviceptr
+#define CUDA_SUCCESS MUSA_SUCCESS
+#define cuPointerGetAttribute muPointerGetAttribute
+#define cudaDevAttrComputeCapabilityMajor musaDevAttrComputeCapabilityMajor
+#define cudaDevAttrComputeCapabilityMinor musaDevAttrComputeCapabilityMinor
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
+#define cudaDeviceProp musaDeviceProp
+#define cudaError_t musaError_t
+#define cudaGetDevice musaGetDevice
+#define cudaGetDeviceCount musaGetDeviceCount
+#define cudaGetDeviceProperties musaGetDeviceProperties
+#define cudaGetErrorString musaGetErrorString
+#define cudaSuccess musaSuccess
+using __nv_bfloat16 = __mt_bfloat16;
+using __nv_bfloat162 = __mt_bfloat162;
+using nv_bfloat16 = __mt_bfloat16;
+using nv_bfloat162 = __mt_bfloat162;
+using nv_half = __half;
+#else
 #include <cuda_runtime.h>
+#endif
 #include <torch/all.h>
 
 #ifdef USE_ROCM
@@ -186,7 +209,11 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
       num_kv_heads,                                          \
       ")")
 
+#ifdef USE_MUSA
+#define CHECK_CUDA(x) TORCH_CHECK(true, #x " must be a CUDA tensor")
+#else
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#endif
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_LAST_DIM_CONTIGUOUS(x) \
@@ -328,14 +355,20 @@ inline bool getEnvEnablePDL() {
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
-#ifndef USE_ROCM
-#define WARP_SIZE 32
-#else
-#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
-#define WARP_SIZE 64
-#else
-#define WARP_SIZE 32
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
+#  define WARP_SIZE 32
+#elif defined(USE_ROCM)
+#  if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+#    define WARP_SIZE 64
+#  else
+#    define WARP_SIZE 32
 #endif
+#else
+#  if defined(__MUSA_ARCH__) && __MUSA_ARCH__ <= 220
+#    define WARP_SIZE 128
+#  else
+#    define WARP_SIZE 32
+#  endif
 #endif
 
 #ifdef USE_ROCM

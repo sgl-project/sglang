@@ -15,6 +15,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
 )
 
@@ -24,6 +25,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_musa = is_musa()
 
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
@@ -165,6 +167,8 @@ class RotaryEmbedding(CustomOp):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    forward_musa = forward_native
 
     def forward_npu(
         self,
@@ -671,8 +675,15 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
-        device: Optional[str] = "cuda" if not _is_npu else "npu",
+        device: Optional[str] = None,
     ) -> None:
+        if device is None:
+            if _is_npu:
+                device = "npu"
+            elif _is_musa:
+                device = "musa"
+            else:
+                device = "cuda"
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
         self.attn_factor = attn_factor
@@ -832,7 +843,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,
@@ -879,7 +889,6 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 
 
 class Llama4VisionRotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,
@@ -1458,9 +1467,13 @@ class DualChunkRotaryEmbedding(CustomOp):
         self.local_size = local_size
         self.dtype = dtype
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        (q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache) = (
-            self._compute_cos_sin_cache()
-        )
+        (
+            q_cache,
+            qc_cache,
+            k_cache,
+            qc_no_clamp_cache,
+            q_inter_cache,
+        ) = self._compute_cos_sin_cache()
 
         self.register_buffer("cos_sin_q_cache", q_cache, persistent=False)
         self.register_buffer("cos_sin_qc_cache", qc_cache, persistent=False)

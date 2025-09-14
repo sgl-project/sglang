@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
 )
 
@@ -64,11 +65,12 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_musa = is_musa()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
 
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import topk_softmax
 if _use_aiter:
     try:
@@ -100,7 +102,6 @@ class TopKConfig:
 
 
 class TopKOutputChecker:
-
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
         return topk_output.format.is_standard()
@@ -183,7 +184,6 @@ class BypassedTopKOutput(NamedTuple):
 
 
 class TopK(CustomOp):
-
     def __init__(
         self,
         top_k: int,
@@ -305,7 +305,6 @@ class TopK(CustomOp):
 
         # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
         if global_num_experts == 256:
-
             routed_scaling_factor = self.topk_config.routed_scaling_factor or 1
             router_logits = router_logits.to(torch.float32)
 
@@ -778,7 +777,6 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
-
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group
@@ -793,12 +791,13 @@ def select_experts(
         topk_config.apply_routed_scaling_factor_on_output
     )
 
-    router_logits, correction_bias = (
-        expert_location_dispatch.transform_select_experts_inputs(
-            router_logits=router_logits,
-            correction_bias=correction_bias,
-            info=expert_location_dispatch_info,
-        )
+    (
+        router_logits,
+        correction_bias,
+    ) = expert_location_dispatch.transform_select_experts_inputs(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        info=expert_location_dispatch_info,
     )
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k

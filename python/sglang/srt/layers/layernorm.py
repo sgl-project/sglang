@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
     supports_custom_op,
@@ -41,8 +42,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 
-if _is_cuda:
+if _is_cuda or _is_musa:
     if _is_flashinfer_available:
         from flashinfer.norm import fused_add_rmsnorm
     else:
@@ -57,6 +59,7 @@ elif _is_hip:
     from vllm._custom_ops import fused_add_rms_norm, rms_norm
 
     _vllm_version = Version(vllm.__version__)
+
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +331,12 @@ class Gemma3RMSNorm(CustomOp):
 
 
 if not (
-    _is_cuda or _is_hip or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_xpu
+    _is_cuda
+    or _is_hip
+    or _is_npu
+    or (_is_cpu and _is_cpu_amx_available)
+    or _is_xpu
+    or _is_musa
 ):
     logger.info(
         "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."

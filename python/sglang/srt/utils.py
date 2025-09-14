@@ -136,6 +136,10 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
+def is_musa() -> bool:
+    return hasattr(torch, "musa") and torch.musa.is_available()
+
+
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
@@ -175,6 +179,8 @@ def is_blackwell():
 
 @lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
+    if not is_cuda():
+        return False
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
     )
@@ -182,6 +188,8 @@ def is_sm100_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
+    if not is_cuda():
+        return False
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
     )
@@ -448,6 +456,16 @@ def get_available_gpu_memory(
                 "which may cause useless memory allocation for torch NPU context.",
             )
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+    elif device == "musa":
+        num_gpus = torch.musa.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.musa.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.musa.current_device()}, ",
+                "which may cause useless memory allocation for torch MUSA context.",
+            )
+        free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -464,8 +482,8 @@ def is_pin_memory_available() -> bool:
 
 
 class LayerFn(Protocol):
-
-    def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
+    def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module:
+        ...
 
 
 def make_layers(
@@ -1404,6 +1422,15 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def get_musa_memory_capacity():
+    try:
+        import torch_musa
+
+        return torch.musa.mem_get_info()[1] // 1024 // 1024  # unit: MB
+    except ImportError as e:
+        raise ImportError("torch_musa is required when run on musa device.")
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1413,6 +1440,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
         gpu_mem = get_npu_memory_capacity()
+    elif device == "musa":
+        gpu_mem = get_musa_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1510,6 +1539,9 @@ def print_info_once(msg: str) -> None:
 
 
 def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        return torch.musa.get_device_name(device_id)
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)
 
@@ -1539,6 +1571,11 @@ def get_device(device_id: Optional[int] = None) -> str:
             )
         return "cpu"
 
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        if device_id is None:
+            return "musa"
+        return "musa:{}".format(device_id)
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
             return "cuda"
@@ -1567,11 +1604,17 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, MUSA) is available.")
 
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        try:
+            return torch.musa.device_count()
+        except RuntimeError:
+            return 0
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         try:
             return torch.cuda.device_count()
@@ -1597,6 +1640,9 @@ def get_device_count() -> int:
 
 
 def get_device_core_count(device_id: int = 0) -> int:
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        return torch.musa.get_device_properties(device_id).multi_processor_count
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
 
@@ -1605,6 +1651,9 @@ def get_device_core_count(device_id: int = 0) -> int:
 
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        major, minor = torch.musa.get_device_capability(device_id)
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability(device_id)
 
@@ -1668,7 +1717,8 @@ sglang_lib = Library("sglang", "FRAGMENT")  # noqa
 # Some backends use pytorch version < 2.4.0 which doesn't
 # support `torch.library.custom_op`.
 def supports_custom_op() -> bool:
-    return hasattr(torch.library, "custom_op")
+    return False
+    # return hasattr(torch.library, "custom_op")
 
 
 def direct_register_custom_op(
@@ -1725,7 +1775,10 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA")
+        backend = "CUDA"
+        if is_musa():
+            backend = "MUSA"
+        my_lib.impl(op_name, op_func, backend)
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:

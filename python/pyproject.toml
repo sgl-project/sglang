@@ -54,6 +54,7 @@ runtime_common = [
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.24",
+    "bidict",
 ]
 
 srt = [
@@ -84,6 +85,11 @@ srt_hip = [
     "torch",
     "petit_kernel==0.0.2",
     "wave-lang==3.7.0",
+]
+
+srt_musa = [
+    "sglang[runtime_common]",
+    "torch",
 ]
 
 # https://docs.sglang.ai/platforms/cpu_server.html
@@ -122,12 +128,14 @@ all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[dec
 all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[decord]"]
 all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[decord]"]
 all_npu = ["sglang[srt_npu]", "sglang[openai]", "sglang[anthropic]", "sglang[decord]"]
+all_musa = ["sglang[srt_musa]", "sglang[openai]", "sglang[anthropic]", "sglang[decord]"]
 
 dev = ["sglang[all]", "sglang[test]"]
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_xpu = ["sglang[all_xpu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 dev_cpu = ["sglang[all_cpu]", "sglang[test]"]
+dev_musa = ["sglang[all_musa]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

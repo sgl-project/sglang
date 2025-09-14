@@ -1190,7 +1190,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
+            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -2630,7 +2630,9 @@ class ServerArgs:
 
         # weight params count
         current_complexity_score = vit_num_layers * (vit_hidden_size**2)
-        baseline_complexity_score = baseline_vit_layers * (baseline_vit_hidden_size**2)
+        baseline_complexity_score = baseline_vit_layers * (
+            baseline_vit_hidden_size**2
+        )
         complexity_ratio = (
             current_complexity_score / baseline_complexity_score
             if baseline_complexity_score > 0

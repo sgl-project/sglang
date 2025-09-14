@@ -12,6 +12,11 @@ from typing import Any, Dict, List, Optional
 
 # this line makes it possible to directly load `libcudart.so` using `ctypes`
 import torch  # noqa
+from bidict import bidict
+
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
@@ -61,43 +66,64 @@ def find_loaded_library(lib_name) -> Optional[str]:
     return path
 
 
+_cudart_func_keys = [
+    "cudaSetDevice",
+    "cudaDeviceSynchronize",
+    "cudaDeviceReset",
+    "cudaGetErrorString",
+    "cudaMalloc",
+    "cudaFree",
+    "cudaMemset",
+    "cudaMemcpy",
+    "cudaIpcGetMemHandle",
+    "cudaIpcOpenMemHandle",
+]
+
+if _is_musa:
+    cudart_func_map = bidict({k: "musa" + k[4:] for k in _cudart_func_keys})
+else:
+    cudart_func_map = bidict({k: k for k in _cudart_func_keys})
+
+
 class CudaRTLibrary:
     exported_functions = [
         # ​cudaError_t cudaSetDevice ( int  device )
-        Function("cudaSetDevice", cudaError_t, [ctypes.c_int]),
+        Function(cudart_func_map["cudaSetDevice"], cudaError_t, [ctypes.c_int]),
         # cudaError_t 	cudaDeviceSynchronize ( void )
-        Function("cudaDeviceSynchronize", cudaError_t, []),
+        Function(cudart_func_map["cudaDeviceSynchronize"], cudaError_t, []),
         # ​cudaError_t cudaDeviceReset ( void )
-        Function("cudaDeviceReset", cudaError_t, []),
+        Function(cudart_func_map["cudaDeviceReset"], cudaError_t, []),
         # const char* 	cudaGetErrorString ( cudaError_t error )
-        Function("cudaGetErrorString", ctypes.c_char_p, [cudaError_t]),
+        Function(cudart_func_map["cudaGetErrorString"], ctypes.c_char_p, [cudaError_t]),
         # ​cudaError_t 	cudaMalloc ( void** devPtr, size_t size )
         Function(
-            "cudaMalloc",
+            cudart_func_map["cudaMalloc"],
             cudaError_t,
             [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t],
         ),
         # ​cudaError_t 	cudaFree ( void* devPtr )
-        Function("cudaFree", cudaError_t, [ctypes.c_void_p]),
+        Function(cudart_func_map["cudaFree"], cudaError_t, [ctypes.c_void_p]),
         # ​cudaError_t cudaMemset ( void* devPtr, int  value, size_t count )
         Function(
-            "cudaMemset", cudaError_t, [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+            cudart_func_map["cudaMemset"],
+            cudaError_t,
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t],
         ),
         # ​cudaError_t cudaMemcpy ( void* dst, const void* src, size_t count, cudaMemcpyKind kind ) # noqa
         Function(
-            "cudaMemcpy",
+            cudart_func_map["cudaMemcpy"],
             cudaError_t,
             [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, cudaMemcpyKind],
         ),
         # cudaError_t cudaIpcGetMemHandle ( cudaIpcMemHandle_t* handle, void* devPtr ) # noqa
         Function(
-            "cudaIpcGetMemHandle",
+            cudart_func_map["cudaIpcGetMemHandle"],
             cudaError_t,
             [ctypes.POINTER(cudaIpcMemHandle_t), ctypes.c_void_p],
         ),
         # ​cudaError_t cudaIpcOpenMemHandle ( void** devPtr, cudaIpcMemHandle_t handle, unsigned int  flags ) # noqa
         Function(
-            "cudaIpcOpenMemHandle",
+            cudart_func_map["cudaIpcOpenMemHandle"],
             cudaError_t,
             [ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint],
         ),
@@ -113,8 +139,13 @@ class CudaRTLibrary:
 
     def __init__(self, so_file: Optional[str] = None):
         if so_file is None:
-            so_file = find_loaded_library("libcudart")
-            assert so_file is not None, "libcudart is not loaded in the current process"
+            lib_name = "libcudart"
+            if _is_musa:
+                lib_name = "libmusart"
+            so_file = find_loaded_library(lib_name)
+            assert (
+                so_file is not None
+            ), f"{lib_name} is not loaded in the current process"
         if so_file not in CudaRTLibrary.path_to_library_cache:
             lib = ctypes.CDLL(so_file)
             CudaRTLibrary.path_to_library_cache[so_file] = lib
@@ -126,7 +157,7 @@ class CudaRTLibrary:
                 f = getattr(self.lib, func.name)
                 f.restype = func.restype
                 f.argtypes = func.argtypes
-                _funcs[func.name] = f
+                _funcs[cudart_func_map.inv[func.name]] = f
             CudaRTLibrary.path_to_dict_mapping[so_file] = _funcs
         self.funcs = CudaRTLibrary.path_to_dict_mapping[so_file]
 

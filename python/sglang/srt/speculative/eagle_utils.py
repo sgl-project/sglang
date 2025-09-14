@@ -24,9 +24,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, next_power_of_2
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sgl_kernel import (
         fast_topk,
         top_k_renorm_prob,
@@ -34,6 +34,10 @@ if is_cuda():
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
     )
+
+    _device = "cuda"
+    if is_musa():
+        _device = "musa"
 elif is_hip():
     from sgl_kernel import fast_topk, verify_tree_greedy
 
@@ -81,7 +85,6 @@ class EagleDraftInput:
     req_pool_indices_for_draft_extend: torch.Tensor = None
 
     def prepare_for_extend(self, batch: ScheduleBatch):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -120,7 +123,6 @@ class EagleDraftInput:
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -154,16 +156,16 @@ class EagleDraftInput:
         req_to_token: torch.Tensor,
     ):
         bs = self.accept_length.numel()
-        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
+        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=_device)
         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
-        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
+        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=_device)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         if paged_kernel_lens_sum is None:
             paged_kernel_lens_sum = cum_kv_seq_len[-1]
 
         kv_indices = torch.empty(
-            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+            paged_kernel_lens_sum, dtype=torch.int32, device=_device
         )
 
         create_flashinfer_kv_indices_triton[(bs,)](
@@ -247,17 +249,17 @@ class EagleVerifyInput:
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=_device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=_device),
+            positions=torch.empty((0,), dtype=torch.int64, device=_device),
             retrive_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=_device
             ),
             retrive_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=_device
             ),
             retrive_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=_device
             ),
             retrive_cum_len=None,
             topk=topk,
@@ -269,7 +271,6 @@ class EagleVerifyInput:
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -315,10 +316,10 @@ class EagleVerifyInput:
             (1 + batch_size) * self.draft_token_num,
             step=self.draft_token_num,
             dtype=torch.int32,
-            device="cuda",
+            device=_device,
         )
         cum_kv_seq_len = torch.zeros(
-            (batch_size + 1,), dtype=torch.int32, device="cuda"
+            (batch_size + 1,), dtype=torch.int32, device=_device
         )
 
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
@@ -327,7 +328,7 @@ class EagleVerifyInput:
         kv_indices = torch.empty(
             paged_kernel_lens_sum + self.draft_token_num * batch_size,
             dtype=torch.int32,
-            device="cuda",
+            device=_device,
         )
         create_flashinfer_kv_indices_triton[(batch_size,)](
             req_to_token,
@@ -384,11 +385,11 @@ class EagleVerifyInput:
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
-        predict = torch.empty(predict_shape, dtype=torch.int32, device="cuda")
+        predict = torch.empty(predict_shape, dtype=torch.int32, device=_device)
         accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=_device
         )
-        accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
+        accept_length = torch.empty((bs,), dtype=torch.int32, device=_device)
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
@@ -409,7 +410,7 @@ class EagleVerifyInput:
             linear_penalty = torch.zeros(
                 (bs, logits_output.next_token_logits.shape[1]),
                 dtype=torch.float32,
-                device="cuda",
+                device=_device,
             )
             sampling_info.apply_logits_bias(linear_penalty)
             logits_output.next_token_logits.add_(
@@ -470,14 +471,14 @@ class EagleVerifyInput:
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
             draft_probs = torch.zeros(
-                target_probs.shape, dtype=torch.float32, device="cuda"
+                target_probs.shape, dtype=torch.float32, device=_device
             )
 
             # coins for rejection sampling
-            coins = torch.rand_like(candidates, dtype=torch.float32, device="cuda")
+            coins = torch.rand_like(candidates, dtype=torch.float32, device=_device)
             # coins for final sampling
             coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device="cuda"
+                (bs,), dtype=torch.float32, device=_device
             )
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
@@ -1095,7 +1096,7 @@ def select_top_k_tokens(
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device="cuda")
+            torch.arange(-1, topk, dtype=torch.long, device=_device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )
@@ -1114,7 +1115,7 @@ def select_top_k_tokens(
 
         if hidden_states.shape[0] > 0:
             selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device="cuda"
+                0, hidden_states.shape[0], step=topk, device=_device
             ).repeat_interleave(topk)
             hidden_states = hidden_states[selected_input_index, :]
 
@@ -1168,7 +1169,7 @@ def _generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device=_device
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
