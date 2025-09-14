@@ -674,7 +674,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-deepep
 
   unit-test-backend-8-gpu-b200:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes]
     if: always() && !failure() && !cancelled() &&
       (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false &&

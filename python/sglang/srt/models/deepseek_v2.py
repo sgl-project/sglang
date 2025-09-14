@@ -1351,6 +1351,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
+
             if (
                 (not isinstance(hidden_states, tuple))
                 and hidden_states.shape[0] <= 16
