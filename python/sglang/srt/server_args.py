@@ -215,6 +215,8 @@ class ServerArgs:
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
     gc_warning_threshold_secs: float = 0.0
+    enable_trace: bool = False
+    oltp_traces_endpoint: str = "localhost:4317"
 
     # API related
     api_key: Optional[str] = None
@@ -393,6 +395,9 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
+
+    # FIXME: hack to reduce ITL when decode bs is small
+    disaggregation_decode_polling_interval: int = 1
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -1387,6 +1392,17 @@ class ServerArgs:
             default=None,
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         )
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            "--oltp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
+        )
 
         # API related
         parser.add_argument(
@@ -2244,6 +2260,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.num_reserved_decode_tokens,
             help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-polling-interval",
+            type=int,
+            default=ServerArgs.disaggregation_decode_polling_interval,
+            help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
         )
 
         # Custom weight loader
