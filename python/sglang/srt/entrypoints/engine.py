@@ -364,9 +364,9 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
-    def start_profile(self):
+    def start_profile(self, **kwargs):
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.start_profile())
+        loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
 
     def stop_profile(self):
         loop = asyncio.get_event_loop()
@@ -682,7 +682,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.8",
+            "0.3.9.post2",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

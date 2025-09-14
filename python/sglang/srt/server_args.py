@@ -19,10 +19,12 @@ import json
 import logging
 import os
 import random
+import socket
 import sys
 import tempfile
 from typing import List, Literal, Optional, Union
 
+from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.lora.lora_registry import LoRARef
@@ -36,14 +38,18 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_npu,
     is_port_available,
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
     is_triton_kernels_available,
     is_valid_ipv6_address,
+    json_list_type,
     nullable_str,
+    parse_connector_type,
 )
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,7 @@ LOAD_FORMAT_CHOICES = [
     "bitsandbytes",
     "layered",
     "remote",
+    "remote_instance",
 ]
 
 QUANTIZATION_CHOICES = [
@@ -94,6 +101,7 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "hybrid_linear_attn",
     # AMD specific
     "aiter",
     "wave",
@@ -223,6 +231,8 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
+    prefill_round_robin_balance: bool = False
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -364,6 +374,11 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
 
+    # Dynamic batch tokenizer
+    enable_dynamic_batch_tokenizer: bool = False
+    dynamic_batch_tokenizer_batch_size: int = 32
+    dynamic_batch_tokenizer_batch_timeout: float = 0.002
+
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
     debug_tensor_dump_input_file: Optional[str] = None
@@ -380,18 +395,31 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
 
+    # FIXME: hack to reduce ITL when decode bs is small
+    disaggregation_decode_polling_interval: int = 1
+
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
+
+    # Remote instance weight loading
+    remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
+    remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
+    remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # Mamba cache
+    max_mamba_cache_size: Optional[int] = None
+    mamba_ssm_dtype: str = "float32"
+
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_cutedsl_moe: bool = False
     enable_flashinfer_trtllm_moe: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
@@ -413,6 +441,11 @@ class ServerArgs:
             print_deprecated_warning(
                 "NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead."
             )
+        if self.enable_flashinfer_cutedsl_moe:
+            self.moe_runner_backend = "flashinfer_cutedsl"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-cutedsl-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutedsl' instead."
+            )
         if self.enable_flashinfer_cutlass_moe:
             self.moe_runner_backend = "flashinfer_cutlass"
             print_deprecated_warning(
@@ -432,6 +465,7 @@ class ServerArgs:
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+
         if self.served_model_name is None:
             self.served_model_name = self.model_path
         if self.device is None:
@@ -525,7 +559,8 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
         # Model-specific adjustments
-        self.model_specific_adjustments()
+        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+            self.model_specific_adjustments()
 
         # Set kernel backends
         if self.device == "cpu":
@@ -544,7 +579,7 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
-        if self.attention_backend == "ascend":
+        if is_npu() and self.attention_backend in ["ascend", "hybrid_linear_attn"]:
             logger.warning(
                 "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
             )
@@ -624,12 +659,12 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        if self.dp_size == 1:
+            self.enable_dp_attention = False
+
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
-            assert (
-                self.dp_size > 1
-            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
             assert self.tp_size % self.dp_size == 0
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
@@ -652,11 +687,13 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
-            if not self.disable_shared_experts_fusion:
-                self.disable_shared_experts_fusion = True
-                logger.warning(
-                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
-                )
+            assert (
+                self.quantization == "modelopt_fp4" or self.quantization == "fp8"
+            ), "modelopt_fp4 quantization is required for Flashinfer TRTLLM MoE"
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -706,6 +743,13 @@ class ServerArgs:
             self.hicache_io_backend = "kernel"
             self.hicache_mem_layout = "page_first"
 
+        if self.hicache_mem_layout == "page_first_direct":
+            if self.hicache_io_backend != "direct":
+                self.hicache_io_backend = "direct"
+                logger.warning(
+                    "Page first direct layout only support direct io backend"
+                )
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
@@ -732,7 +776,12 @@ class ServerArgs:
                 )
 
             model_arch = self.get_hf_config().architectures[0]
-            if model_arch in ["DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"]:
+            if model_arch in [
+                "DeepseekV3ForCausalLM",
+                "Glm4MoeForCausalLM",
+                "BailingMoeForCausalLM",
+                "BailingMoeV2ForCausalLM",
+            ]:
                 # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -791,11 +840,18 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
-        # Model loading
         if is_remote_url(self.model_path):
             self.load_format = "remote"
         if self.custom_weight_loader is None:
             self.custom_weight_loader = []
+
+        if self.load_format == "remote_instance":
+            if (
+                self.remote_instance_weight_loader_seed_instance_ip is None
+                or self.remote_instance_weight_loader_seed_instance_service_port is None
+                or self.remote_instance_weight_loader_send_weights_group_ports is None
+            ):
+                self.load_format = "auto"
 
         # PD disaggregation
         if self.disaggregation_mode == "decode":
@@ -808,6 +864,13 @@ class ServerArgs:
 
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+
+            if self.dp_size > 1 and not is_in_ci():
+                assert self.prefill_round_robin_balance, (
+                    "Prefill round robin balance is required when dp size > 1. "
+                    "Please make sure that the prefill instance is launched with `--load-balance-method round_robin`"
+                    " and `--prefill-round-robin-balance` is set for decode server."
+                )
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
@@ -820,10 +883,19 @@ class ServerArgs:
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
 
+        # Validation: prevent both tokenizer batching features from being enabled
+        if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
+            raise ValueError(
+                "Cannot enable both --enable-tokenizer-batch-encode and --enable-dynamic-batch-tokenizer. "
+                "Please choose one tokenizer batching approach."
+            )
+
         # Propagate env vars
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
+        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = self.mamba_ssm_dtype
+
         # Set env var before grammar backends init
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
@@ -846,16 +918,28 @@ class ServerArgs:
             required=True,
         )
         parser.add_argument(
+            "--remote-instance-weight-loader-seed-instance-ip",
+            type=str,
+            default=ServerArgs.remote_instance_weight_loader_seed_instance_ip,
+            help="The ip of the seed instance for loading weights from remote instance.",
+        )
+        parser.add_argument(
+            "--remote-instance-weight-loader-seed-instance-service-port",
+            type=int,
+            default=ServerArgs.remote_instance_weight_loader_seed_instance_service_port,
+            help="The service port of the seed instance for loading weights from remote instance.",
+        )
+        parser.add_argument(
+            "--remote-instance-weight-loader-send-weights-group-ports",
+            type=json_list_type,
+            default=ServerArgs.remote_instance_weight_loader_send_weights_group_ports,
+            help="The communication group ports for loading weights from remote instance.",
+        )
+        parser.add_argument(
             "--tokenizer-path",
             type=str,
             default=ServerArgs.tokenizer_path,
             help="The path of the tokenizer.",
-        )
-        parser.add_argument(
-            "--tokenizer-worker-num",
-            type=int,
-            default=ServerArgs.tokenizer_worker_num,
-            help="The worker num of the tokenizer manager.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -865,6 +949,12 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--tokenizer-worker-num",
+            type=int,
+            default=ServerArgs.tokenizer_worker_num,
+            help="The worker num of the tokenizer manager.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -1056,7 +1146,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -1385,6 +1475,12 @@ class ServerArgs:
                 "minimum_tokens",
             ],
         )
+        parser.add_argument(
+            "--prefill-round-robin-balance",
+            default=ServerArgs.prefill_round_robin_balance,
+            action="store_true",
+            help="Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank.",
+        )
 
         # Multi-node distributed serving
         parser.add_argument(
@@ -1516,6 +1612,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--speculative-draft-model-path",
+            "--speculative-draft-model",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
         )
@@ -1597,6 +1694,7 @@ class ServerArgs:
                 "flashinfer_trtllm",
                 "flashinfer_cutlass",
                 "flashinfer_mxfp4",
+                "flashinfer_cutedsl",
             ],
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
@@ -1604,7 +1702,7 @@ class ServerArgs:
         parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
-            choices=["mxfp4", "bf16"],
+            choices=["default", "bf16"],
             default=ServerArgs.flashinfer_mxfp4_moe_precision,
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
@@ -1697,6 +1795,21 @@ class ServerArgs:
             help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
         )
 
+        # Mamba Cache
+        parser.add_argument(
+            "--max-mamba-cache-size",
+            type=int,
+            default=ServerArgs.max_mamba_cache_size,
+            help="The maximum size of the mamba cache.",
+        )
+        parser.add_argument(
+            "--mamba-ssm-dtype",
+            type=str,
+            default=ServerArgs.mamba_ssm_dtype,
+            choices=["float32", "bfloat16"],
+            help="The data type of the SSM states in mamba cache.",
+        )
+
         # Hierarchical cache
         parser.add_argument(
             "--enable-hierarchical-cache",
@@ -1740,7 +1853,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-mem-layout",
             type=str,
-            choices=["layer_first", "page_first"],
+            choices=["layer_first", "page_first", "page_first_direct"],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
         )
@@ -2073,6 +2186,23 @@ class ServerArgs:
             action="store_true",
             help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
         )
+        parser.add_argument(
+            "--enable-dynamic-batch-tokenizer",
+            action="store_true",
+            help="Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-tokenizer-batch-size",
+            type=int,
+            default=ServerArgs.dynamic_batch_tokenizer_batch_size,
+            help="[Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-tokenizer-batch-timeout",
+            type=float,
+            default=ServerArgs.dynamic_batch_tokenizer_batch_timeout,
+            help="[Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests.",
+        )
 
         # PD disaggregation
         parser.add_argument(
@@ -2127,6 +2257,12 @@ class ServerArgs:
             default=ServerArgs.num_reserved_decode_tokens,
             help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
         )
+        parser.add_argument(
+            "--disaggregation-decode-polling-interval",
+            type=int,
+            default=ServerArgs.disaggregation_decode_polling_interval,
+            help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
 
         # Custom weight loader
         parser.add_argument(
@@ -2173,6 +2309,11 @@ class ServerArgs:
             help="(Deprecated) Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
         )
         parser.add_argument(
+            "--enable-flashinfer-cutedsl-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer CuteDSL MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+        )
+        parser.add_argument(
             "--enable-flashinfer-trtllm-moe",
             action="store_true",
             help="(Deprecated) Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
@@ -2194,6 +2335,7 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -2672,6 +2814,8 @@ def auto_choose_speculative_params(self: ServerArgs):
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
     ]:
         # The default value for deepseek and gpt-oss
         return (3, 1, 4)

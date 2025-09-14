@@ -105,10 +105,13 @@ def remove_suffix(text: str, suffix: str) -> str:
 
 
 def get_auth_headers() -> Dict[str, str]:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        return {"Authorization": f"Bearer {api_key}"}
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    if openai_api_key:
+        return {"Authorization": f"Bearer {openai_api_key}"}
     else:
+        api_key = os.environ.get("API_KEY")
+        if api_key:
+            return {"Authorization": f"{api_key}"}
         return {}
 
 
@@ -995,17 +998,25 @@ def sample_mmmu_requests(
                 prompt = f"Question: {question}\n\nAnswer: "
                 if apply_chat_template:
                     try:
+                        is_phi4_multimodal = (
+                            "phi-4-multimodal" in tokenizer.name_or_path.lower()
+                        )
+                        if is_phi4_multimodal:
+                            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
+                            content = prompt.replace("image 1", "<|endoftext10|>")
+                        else:
+                            content = [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": image_data},
+                                },
+                                {"type": "text", "text": prompt},
+                            ]
                         prompt = tokenizer.apply_chat_template(
                             [
                                 {
                                     "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "image_url",
-                                            "image_url": {"url": image_data},
-                                        },
-                                        {"type": "text", "text": prompt},
-                                    ],
+                                    "content": content,
                                 }
                             ],
                             add_generation_prompt=True,
