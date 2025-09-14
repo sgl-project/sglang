@@ -477,7 +477,9 @@ class DeepEPMoE(EPMoE):
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if get_moe_runner_backend().is_flashinfer_cutedsl():
-                return self.forward_flashinfer_cutedsl(dispatch_output)
+                return self.forward_flashinfer_cutedsl(
+                    dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
+                )
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
