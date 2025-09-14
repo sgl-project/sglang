@@ -26,6 +26,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     CombineInput,
     StandardDispatcher,
+    StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import (
@@ -541,10 +542,12 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        # WARN: This makes the `expert_id` mean "local" and "global" in different cases
+        if not getattr(param, "_sglang_require_global_experts", False):
+            expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+            if expert_id == -1:
+                return
 
-        expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-        if expert_id == -1:
-            return
         self._weight_loader_impl(
             param=param,
             loaded_weight=loaded_weight,
@@ -975,8 +978,9 @@ class FlashInferFusedMoE(FusedMoE):
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply_with_router_logits(
             layer=self,
-            x=hidden_states,
-            topk_output=topk_output,
+            dispatch_output=StandardDispatchOutput(
+                hidden_states=hidden_states, topk_output=topk_output
+            ),
         )
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):

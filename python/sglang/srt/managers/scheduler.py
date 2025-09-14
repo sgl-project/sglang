@@ -81,6 +81,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
@@ -93,6 +95,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    SendWeightsToRemoteInstanceReqInput,
+    SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -538,6 +542,14 @@ class Scheduler(
                 (CloseSessionReqInput, self.close_session),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
+                (
+                    InitWeightsSendGroupForRemoteInstanceReqInput,
+                    self.init_weights_send_group_for_remote_instance,
+                ),
+                (
+                    SendWeightsToRemoteInstanceReqInput,
+                    self.send_weights_to_remote_instance,
+                ),
                 (
                     UpdateWeightsFromDistributedReqInput,
                     self.update_weights_from_distributed,
@@ -1249,11 +1261,19 @@ class Scheduler(
         # Copy more attributes
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
             # By default, only return the logprobs for output tokens
-            req.logprob_start_len = len(req.origin_input_ids) - 1
+            # For prefill-only requests with logprob_start_len == -1, set logprob_start_len beyond input sequence
+            # to skip input logprob computation entirely
+            if req.is_prefill_only:
+                req.logprob_start_len = len(req.origin_input_ids)
+            else:
+                # TODO: For text generation, evaluate setting logprob_start_len to len(req.origin_input_ids) as well
+                req.logprob_start_len = len(req.origin_input_ids) - 1
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
-        if req.logprob_start_len >= len(req.origin_input_ids):
+        if not req.is_prefill_only and req.logprob_start_len >= len(
+            req.origin_input_ids
+        ):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = len(req.origin_input_ids) - 1
             req.set_finish_with_abort(error_msg)
@@ -2428,6 +2448,22 @@ class Scheduler(
     def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
         self.send_to_detokenizer.send_pyobj(recv_req)
         return recv_req
+
+    def init_weights_send_group_for_remote_instance(
+        self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        """Init the seed and client instance communication group."""
+        success, message = self.tp_worker.init_weights_send_group_for_remote_instance(
+            recv_req
+        )
+        return InitWeightsSendGroupForRemoteInstanceReqOutput(success, message)
+
+    def send_weights_to_remote_instance(
+        self, recv_req: SendWeightsToRemoteInstanceReqInput
+    ):
+        """Send the seed instance weights to the destination instance."""
+        success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
+        return SendWeightsToRemoteInstanceReqOutput(success, message)
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
