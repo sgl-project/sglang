@@ -434,7 +434,7 @@ class TestChunkedSGMV(unittest.TestCase):
         if batch_composition == BatchComposition.UNIFORM:
             lora_assignments = ["lora_A"] * batch_size
         elif batch_composition == BatchComposition.MIXED:
-            lora_names = ["lora_A", "lora_B", "lora_C"]
+            lora_names = ["lora_A", "lora_B", "lora_C", None]
             lora_assignments = [
                 lora_names[i % len(lora_names)] for i in range(batch_size)
             ]

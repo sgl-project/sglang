@@ -12,6 +12,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class ChunkedSgmvLoRABackend(BaseLoRABackend):
+    """
+    Chunked LoRA backend using segmented matrix-vector multiplication.
+
+    This backend is largely based on the SGMV (Segmented Gather Matrix-Vector multiplication) algorithm
+    introduced in the Punica paper (https://arxiv.org/pdf/2310.18547). One main variation made here is to
+    segment the input sequences into fixed-size chunks, which reduces excessive kernel launches especially
+    when the LoRA distribution is skewed.
+    """
+
     name = "csgmv"
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
@@ -184,6 +193,31 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
     @staticmethod
     def _get_permutation(seq_weight_indices, forward_batch: ForwardBatch):
+        """
+        Computes permutation indices for reordering tokens by their LoRA adapter assignments.
+
+        This function implements the "gather" step in Chunked Segmented Gather Matrix Vector
+        multiplication by creating a permutation that groups tokens by their LoRA adapter.
+        Tokens using the same LoRA adapter are placed together to enable efficient batched
+        computation.
+
+        Example:
+            seq_weight_indices = [0, 1, 0]  # 3 sequences using adapters [0, 1, 0]
+            extend_seq_lens = [2, 1, 3]     # sequence lengths [2, 1, 3 tokens]
+
+            # Creates row_weight_indices: [0, 0, 1, 0, 0, 0] (6 tokens total)
+            # Returns permutation: [0, 1, 3, 4, 5, 2] (groups adapter 0 tokens together)
+            # weights_reordered: [0, 0, 0, 0, 0, 1] (sorted by adapter)
+
+        Args:
+            seq_weight_indices: List of LoRA adapter indices for each sequence
+            forward_batch (ForwardBatch): Batch information containing sequence lengths
+
+        Returns:
+            tuple: (permutation, weights_reordered) where:
+                - permutation: Token reordering indices to group by adapter
+                - weights_reordered: Sorted adapter indices for each token
+        """
         with torch.device("cpu"):
             seq_weight_indices = torch.tensor(seq_weight_indices, dtype=torch.int32)
 
@@ -208,6 +242,39 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             return permutation, weights_reordered
 
     def _get_segments_info(self, weights_reordered: torch.Tensor):
+        """
+        Computes segment information for chunked SGMV operations.
+
+        This function takes the reordered weight indices and creates segments of fixed size
+        (self.segment_size) for efficient kernel execution. Each segment contains tokens
+        that use the same LoRA adapter, enabling vectorized computation.
+
+        The segmentation is necessary because:
+        1. GPU kernels work efficiently on fixed-size blocks
+        2. Large groups of tokens using the same adapter are split into manageable chunks
+        3. Each segment can be processed independently in parallel
+
+        Example:
+            weights_reordered = [0, 0, 0, 0, 0, 1]  # 5 tokens with adapter 0, 1 with adapter 1
+            segment_size = 3
+
+            # Creates segments:
+            # Segment 0: tokens 0-2 (adapter 0), length=3
+            # Segment 1: tokens 3-4 (adapter 0), length=2
+            # Segment 2: token 5 (adapter 1), length=1
+
+            # Returns:
+            # weight_indices_list: [0, 0, 1] (adapter for each segment)
+            # seg_indptr: [0, 3, 5, 6] (cumulative segment boundaries)
+
+        Args:
+            weights_reordered (torch.Tensor): Sorted adapter indices for each token
+
+        Returns:
+            tuple: (weight_indices_list, seg_indptr) where:
+                - weight_indices_list: LoRA adapter index for each segment
+                - seg_indptr: Cumulative segment boundaries (CSR-style indptr)
+        """
         with torch.device("cpu"):
             unique_weights, counts = torch.unique_consecutive(
                 weights_reordered, return_counts=True

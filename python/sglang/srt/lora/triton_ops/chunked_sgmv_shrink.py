@@ -132,6 +132,7 @@ def chunked_sgmv_lora_shrink_forward(
     assert len(weights.shape) == 3
 
     # Block shapes
+    # TODO (lifuhuang): experiment with split-k
     BLOCK_S = 16
     BLOCK_N = 16
     BLOCK_K = 256
