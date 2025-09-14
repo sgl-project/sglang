@@ -11,6 +11,7 @@ from typing import AsyncGenerator, List, Optional
 
 import sglang as sgl
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -520,6 +521,15 @@ async def stream_response_sglang(
 
 # --- FastAPI App and Endpoints ---
 app = FastAPI(lifespan=lifespan, title="SGLang Hathora Serve", version="1.0.0")
+
+# Enable CORS (match root server behavior)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Attach Prometheus metrics endpoint if enabled
 if CONFIG.enable_metrics:
