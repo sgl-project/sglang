@@ -2065,6 +2065,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             else ""
         )
 
+        def hack_setpad(x):
+            if x is None:
+                return
+            assert len(x) == len(forward_batch.input_ids)  # the padded len
+            num_real_tokens = forward_batch.hack_num_tokens_before_pad
+            x[num_real_tokens:] = 0.0
+
+        if forward_batch.forward_mode.is_extend():
+            hack_setpad(hidden_states)
+            hack_setpad(residual)
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
@@ -2072,12 +2083,20 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_format,
         )
 
+        if forward_batch.forward_mode.is_extend():
+            hack_setpad(hidden_states)
+            hack_setpad(residual)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+
+        if forward_batch.forward_mode.is_extend():
+            hack_setpad(hidden_states)
+            hack_setpad(residual)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -2097,6 +2116,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
+        if forward_batch.forward_mode.is_extend():
+            hack_setpad(hidden_states)
+            hack_setpad(residual)
+
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
@@ -2112,6 +2135,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        if forward_batch.forward_mode.is_extend():
+            hack_setpad(hidden_states)
+            hack_setpad(residual)
 
         return hidden_states, residual
 
