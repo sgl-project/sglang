@@ -2244,8 +2244,15 @@ class DeepseekV2Model(nn.Module):
                     [
                         "w13_weight",
                         "w2_weight",
-                        "w13_blockscale_swizzled",
-                        "w2_blockscale_swizzled",
+                        # only for nvfp4
+                        *(
+                            [
+                                "w13_blockscale_swizzled",
+                                "w2_blockscale_swizzled",
+                            ]
+                            if hasattr(module, "w13_blockscale_swizzled")
+                            else []
+                        ),
                     ]
                     if isinstance(module, FusedMoE)
                     else []
