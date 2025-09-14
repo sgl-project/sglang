@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe import (
@@ -31,7 +33,15 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+from sglang.srt.offloader import get_offloader
+from sglang.srt.utils import (
+    ceil_div,
+    dispose_tensor,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -535,6 +545,24 @@ class DeepEPMoE(EPMoE):
         N = self.w13_weight.size(1)
         scale_block_size = 128
 
+        # TODO also unify other branches (e.g. `EPMoE.forward_deepgemm` sets the field on forward pass)
+        w13_weight_fp8 = (
+            self.w13_weight,
+            (
+                self.w13_weight_scale_inv
+                if self.use_block_quant
+                else self.w13_weight_scale
+            ),
+        )
+        w2_weight_fp8 = (
+            self.w2_weight,
+            (
+                self.w2_weight_scale_inv
+                if self.use_block_quant
+                else self.w2_weight_scale
+            ),
+        )
+
         hidden_states_fp8_shape = hidden_states_fp8.shape
         hidden_states_fp8_device = hidden_states_fp8.device
         hidden_states_fp8_dtype = hidden_states_fp8.dtype
@@ -565,12 +593,17 @@ class DeepEPMoE(EPMoE):
         )
         output_index = torch.empty_like(topk_idx)
 
-        num_recv_tokens_per_expert_gpu = torch.tensor(
-            num_recv_tokens_per_expert,
-            dtype=torch.int32,
-            pin_memory=True,
-            device="cpu",
-        ).cuda(non_blocking=True)
+        if get_offloader().forbid_copy_engine_usage:
+            num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
+                num_recv_tokens_per_expert
+            )
+        else:
+            num_recv_tokens_per_expert_gpu = torch.tensor(
+                num_recv_tokens_per_expert,
+                dtype=torch.int32,
+                pin_memory=True,
+                device="cpu",
+            ).cuda(non_blocking=True)
         expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
 
         ep_scatter(
@@ -595,7 +628,7 @@ class DeepEPMoE(EPMoE):
         if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             input_tensor[1] = tma_align_input_scale(input_tensor[1])
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            input_tensor, self.w13_weight_fp8, gateup_output, m_indices
+            input_tensor, w13_weight_fp8, gateup_output, m_indices
         )
         del input_tensor
         down_input = torch.empty(
@@ -625,7 +658,7 @@ class DeepEPMoE(EPMoE):
             down_input_scale = tma_align_input_scale(down_input_scale)
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
-            self.w2_weight_fp8,
+            w2_weight_fp8,
             down_output,
             m_indices,
         )
@@ -885,3 +918,12 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
     if get_moe_expert_parallel_world_size() > 1:
         return EPMoE
     return FusedMoE
+
+
+def copy_list_to_gpu_no_ce(arr: List[int]):
+    from sgl_kernel.elementwise import copy_to_gpu_no_ce
+
+    tensor_cpu = torch.tensor(arr, dtype=torch.int32, device="cpu")
+    tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
+    copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
+    return tensor_gpu
