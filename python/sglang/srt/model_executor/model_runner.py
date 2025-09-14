@@ -2158,6 +2158,38 @@ class ModelRunner:
         )
         return next_token_ids
 
+    def compute_logprobs_only(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """
+        Compute token_ids_logprobs without performing sampling.
+
+        Optimized path for prefill-only requests that need token_ids_logprobs but don't
+        require next token generation. Skips expensive sampling operations
+        while still providing requested probability information.
+
+        Args:
+            logits_output: The logits output from the model forward
+            forward_batch: The forward batch that generates logits_output
+        """
+        if not forward_batch.token_ids_logprobs:
+            return
+
+        # Preprocess logits (same as in sample method)
+        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+
+        # Delegate to sampler for logprob-only computation
+        # This populates logits_output with requested token probabilities
+        self.sampler.compute_logprobs_only(
+            logits_output,
+            forward_batch.sampling_info,
+            forward_batch.return_logprob,
+            forward_batch.top_logprobs_nums,
+            forward_batch.token_ids_logprobs,
+        )
+
     @property
     def model_is_mrope(self) -> bool:
         """Detect if the model has "mrope" rope_scaling type.
