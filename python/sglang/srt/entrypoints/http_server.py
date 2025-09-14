@@ -1361,8 +1361,8 @@ def _execute_server_warmup(
                     "ignore_eos": True,
                 },
                 "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
-                # This is a hack to ensure fake transfer is enabled during prefill warmup
-                # ensure each dp rank has a unique bootstrap_room during prefill warmup
+                # This is a hack to ensure fake transfer is enabled during warmup
+                # ensure each dp rank has a unique bootstrap_room during warmup
                 "bootstrap_room": [
                     i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
                     for i in range(server_args.dp_size)

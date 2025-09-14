@@ -358,6 +358,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # If it's a single value, add worker_id prefix
                 obj.rid = f"{self.worker_id}_{obj.rid}"
 
+        if self.disaggregation_mode != DisaggregationMode.NULL and (
+            obj.bootstrap_host is None or obj.bootstrap_room is None
+        ):
+            raise ValueError(
+                "bootstrap_host and bootstrap_room are required fields in PD disaggregation mode."
+            )
+
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
