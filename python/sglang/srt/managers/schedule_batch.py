@@ -36,6 +36,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
+import re
 import threading
 import time
 from enum import Enum, auto
@@ -140,6 +141,18 @@ class FINISH_MATCHED_TOKEN(BaseFinishReason):
 
 
 class FINISH_MATCHED_STR(BaseFinishReason):
+    def __init__(self, matched: str):
+        super().__init__()
+        self.matched = matched
+
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
+
+
+class FINISHED_MATCHED_REGEX(BaseFinishReason):
     def __init__(self, matched: str):
         super().__init__()
         self.matched = matched
@@ -795,6 +808,19 @@ class Req:
             for stop_str in self.sampling_params.stop_strs:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                    return
+
+        # Check stop regex
+        if self.sampling_params.stop_regex_strs:
+            tail_str = self.tokenizer.decode(
+                self.output_ids[-(self.sampling_params.stop_regex_max_len + 1) :]
+            )
+
+            for stop_regex_str in self.sampling_params.stop_regex_strs:
+                if re.search(stop_regex_str, tail_str):
+                    self.finished_reason = FINISHED_MATCHED_REGEX(
+                        matched=stop_regex_str
+                    )
                     return
 
     def reset_for_retract(self):

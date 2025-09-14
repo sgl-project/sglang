@@ -391,6 +391,7 @@ class OpenAIServingChat(OpenAIServingBase):
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
+            "stop_regex": request.stop_regex,
             "top_p": request.top_p,
             "top_k": request.top_k,
             "min_p": request.min_p,
