@@ -686,7 +686,10 @@ class ForwardBatch:
                 (global_num_tokens[i] - 1) // attn_tp_size + 1
             ) * attn_tp_size
 
-        dp_padding_mode = DpPaddingMode.get_dp_padding_mode(global_num_tokens)
+        if self.forward_mode.is_extend():
+            dp_padding_mode = DpPaddingMode.SUM_LEN
+        else:
+            dp_padding_mode = DpPaddingMode.get_dp_padding_mode(global_num_tokens)
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
