@@ -585,8 +585,10 @@ mod tests {
         use crate::server::AppContext;
 
         // Create a minimal RouterConfig for testing with very short timeout
-        let mut router_config = RouterConfig::default();
-        router_config.worker_startup_timeout_secs = 1; // Very short timeout for tests
+        let router_config = RouterConfig {
+            worker_startup_timeout_secs: 1,
+            ..Default::default()
+        }; // Very short timeout for tests
 
         // Create AppContext with minimal components
         let app_context = Arc::new(AppContext {

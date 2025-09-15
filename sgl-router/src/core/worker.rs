@@ -1120,10 +1120,8 @@ pub fn start_health_checker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::RwLock;
     use std::thread;
     use std::time::Duration;
-    use tokio::time::timeout;
 
     // Test WorkerType
     #[test]
@@ -1661,41 +1659,6 @@ mod tests {
         // but it tests that the sync wrapper doesn't panic
         let result = worker.check_health();
         assert!(result.is_err());
-    }
-
-    // Test HealthChecker background task
-    #[tokio::test]
-    #[ignore = "Requires mock server or will timeout on health checks"]
-    async fn test_health_checker_startup() {
-        let worker = Arc::new(BasicWorker::new(
-            "http://w1:8080".to_string(),
-            WorkerType::Regular,
-        )) as Arc<dyn Worker>;
-        let workers = Arc::new(RwLock::new(vec![worker]));
-
-        let checker = start_health_checker(workers.clone(), 60);
-
-        // Verify it starts without panic
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Shutdown
-        checker.shutdown().await;
-    }
-
-    #[tokio::test]
-    #[ignore = "Requires mock server or will timeout on health checks"]
-    async fn test_health_checker_shutdown() {
-        let worker = Arc::new(BasicWorker::new(
-            "http://w1:8080".to_string(),
-            WorkerType::Regular,
-        )) as Arc<dyn Worker>;
-        let workers = Arc::new(RwLock::new(vec![worker]));
-
-        let checker = start_health_checker(workers.clone(), 60);
-
-        // Shutdown should complete quickly
-        let shutdown_result = timeout(Duration::from_secs(1), checker.shutdown()).await;
-        assert!(shutdown_result.is_ok());
     }
 
     // Performance test for load counter
