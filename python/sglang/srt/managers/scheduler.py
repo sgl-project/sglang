@@ -1155,7 +1155,7 @@ class Scheduler(
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
 
-    def update_req_max_new_tokens(self, req):
+    def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
             (
                 req.sampling_params.max_new_tokens
@@ -1228,7 +1228,7 @@ class Scheduler(
                 req.set_finish_with_abort(
                     f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
-                self.update_req_max_new_tokens(req)
+                self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
         else:
@@ -1236,7 +1236,7 @@ class Scheduler(
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
-                self.update_req_max_new_tokens(req)
+                self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
 
@@ -1256,12 +1256,12 @@ class Scheduler(
                         f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
                     )
                 )
-                self.update_req_max_new_tokens(req)
+                self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
 
         # initialize before returning
-        self.update_req_max_new_tokens(req)
+        self.init_req_max_new_tokens(req)
 
         # Validate prompt length
         error_msg = validate_input_length(
