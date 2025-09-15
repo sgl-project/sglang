@@ -375,8 +375,6 @@ class DeepseekV2MoE(nn.Module):
         )
 
         correction_bias = self.gate.e_score_correction_bias
-        if _is_fp4_quantization_enabled():
-            correction_bias = correction_bias.to(torch.bfloat16)
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             renormalize=config.norm_topk_prob,
