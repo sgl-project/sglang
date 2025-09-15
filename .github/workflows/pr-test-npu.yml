@@ -10,6 +10,7 @@ on:
       - ".github/workflows/pr-test-npu.yml"
   pull_request:
     branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - "python/**"
       - "scripts/ci/**"
@@ -23,8 +24,8 @@ concurrency:
 
 jobs:
   per-commit-1-ascend-npu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+    if: github.event.pull_request.draft == false &&
+        !(github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: linux-arm64-npu-1
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
@@ -58,8 +59,8 @@ jobs:
           python3 run_suite.py --suite per-commit-1-ascend-npu
 
   per-commit-2-ascend-npu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+    if: github.event.pull_request.draft == false &&
+        !(github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: linux-arm64-npu-2
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
@@ -93,8 +94,8 @@ jobs:
           python3 run_suite.py --suite per-commit-2-ascend-npu
 
   per-commit-4-ascend-npu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+    if: github.event.pull_request.draft == false &&
+        !(github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: linux-arm64-npu-4
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
@@ -128,8 +129,8 @@ jobs:
           python3 run_suite.py --suite per-commit-4-ascend-npu --timeout-per-file 3600
 
   per-commit-16-ascend-a3:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+    if: github.event.pull_request.draft == false &&
+        !(github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: linux-aarch64-a3-16
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-a3-ubuntu22.04-py3.11
