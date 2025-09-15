@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   vllm-dependency-test:
-    if: (github.event_name == "push") || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: (github.event_name == "push") || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
