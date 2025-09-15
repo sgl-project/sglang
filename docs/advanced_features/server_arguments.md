@@ -270,6 +270,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-custom-all-reduce` | Disable the custom all-reduce kernel and fall back to NCCL. | False |
 | `--enable-mscclpp` | Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL. | False |
 | `--disable-overlap-schedule` | Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker. | False |
+| `--enable-pp-sleep-on-idle` | Enable pipeline parallel sleep while idle, preventing costly GPU polling during idle periods. | False |
 | `--enable-mixed-chunk` | Enabling mixing prefill and decode in a batch when using chunked prefill. | False |
 | `--enable-dp-attention` | Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported. | False |
 | `--enable-dp-lm-head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | False |
