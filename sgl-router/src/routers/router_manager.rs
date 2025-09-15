@@ -420,34 +420,12 @@ impl RouterManager {
             })
             .unwrap_or(false);
 
-        // If model specified, determine router based on worker types
+        // If model specified, use get_router_for_model
         let candidate_routers = if let Some(model) = model_id {
-            // Query workers for this model
-            let workers = self.worker_registry.get_by_model(model);
-
-            if workers.is_empty() {
-                Vec::new()
+            if let Some(router) = self.get_router_for_model(model) {
+                vec![router]
             } else {
-                // Determine router based on worker types
-                let has_pd_workers = workers.iter().any(|w| {
-                    matches!(
-                        w.worker_type(),
-                        WorkerType::Prefill { .. } | WorkerType::Decode
-                    )
-                });
-
-                let router_id = if has_pd_workers {
-                    RouterId::new("http-pd".to_string())
-                } else {
-                    RouterId::new("http-regular".to_string())
-                };
-
-                // Get the appropriate router
-                if let Some(router) = self.routers.get(&router_id) {
-                    vec![router.clone()]
-                } else {
-                    Vec::new()
-                }
+                Vec::new()
             }
         } else {
             // No model specified, consider all routers
