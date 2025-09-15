@@ -371,6 +371,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     disable_overlap_schedule: bool = False
+    enable_pp_sleep_on_idle: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
@@ -772,6 +773,14 @@ class ServerArgs:
             self.disable_overlap_schedule = True
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
+            )
+
+        if self.enable_pp_sleep_on_idle and (
+            (pp_size_per_node := max(self.pp_size // self.nnodes, 1)) <= 1
+        ):
+            self.enable_pp_sleep_on_idle = False
+            logger.warning(
+                "Pipeline parallelism sleep on idle is only compatible for pipeline parallelism occurring within nodes."
             )
 
         # Hicache
@@ -2227,6 +2236,11 @@ class ServerArgs:
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
+            "--enable-pp-sleep-on-idle",
+            action="store_true",
+            help="Enable pipeline parallel sleep while idle, preventing costly GPU polling during idle periods.",
+        )
+        parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
@@ -2922,8 +2936,17 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # The ipc filenames for PP ranks succeeding other stages on same node (zmq)
+    pp_idle_wakeup_listeners_ipc_names: Optional[
+        dict[tuple[Optional[int], int], str]
+    ] = dataclasses.field(default_factory=dict)
+    # The ipc filenames for PP ranks preceding other stages on same node (zmq)
+    pp_idle_wakeup_notifiers_ipc_names: Optional[
+        dict[tuple[Optional[int], int], str]
+    ] = dataclasses.field(default_factory=dict)
+
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def init_new(server_args: ServerArgs, dp_rank: Optional[int] = None) -> "PortArgs":
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
@@ -2946,6 +2969,8 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=None,
+                pp_idle_wakeup_listeners_ipc_names={},
+                pp_idle_wakeup_notifiers_ipc_names={},
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -2980,6 +3005,8 @@ class PortArgs:
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=None,
+                pp_idle_wakeup_listeners_ipc_names={},
+                pp_idle_wakeup_notifiers_ipc_names={},
             )
 
 
