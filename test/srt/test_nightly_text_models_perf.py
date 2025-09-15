@@ -57,9 +57,9 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "1024"))
         os.makedirs(PROFILE_DIR, exist_ok=True)
+        cls.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self, batch_sizes: tuple = None):
-        full_report = f"## {self.__class__.__name__}\n"
 
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
@@ -138,15 +138,15 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                         report_part = generate_markdown_report_nightly(
                             model, model_results, self.input_lens, self.output_lens
                         )
-                        full_report += report_part + "\n"
+                        self.full_report += report_part + "\n"
 
         # Persist the report for later substitution of artifact URL in the workflow
         with open(REPORT_MD_FILENAME, "w") as f:
             print(f"results written to {REPORT_MD_FILENAME=}")
-            f.write(full_report)
+            f.write(self.full_report)
 
         if is_in_ci():
-            write_github_step_summary(full_report)
+            write_github_step_summary(self.full_report)
 
 
 if __name__ == "__main__":

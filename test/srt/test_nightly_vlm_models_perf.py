@@ -65,11 +65,9 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,2,8,16")
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "1024"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "16"))
+        cls.full_report = f"## {cls.__name__}\n"
 
     def test_vlm_models_mmmu_performance(self):
-        full_report = (
-            "## TestNightlyVLMModelsPerformance (with bench_one_batch_server)\n"
-        )
         for model in self.models:
             model_results = []
             with self.subTest(model=model):
@@ -135,7 +133,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
 
                         # because the profile_id dir under PROFILE_DIR
                         extend_trace_file_relative_path_from_profile_dir = trace_dir[
-                            trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1:
+                            trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1 :
                         ]
 
                         model_results.append(
@@ -155,14 +153,14 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                     self.input_lens,
                     self.output_lens,
                 )
-                full_report += report_part + "\n"
+                self.full_report += report_part + "\n"
 
         with open(REPORT_MD_FILENAME, "w") as f:
             print(f"results written to {REPORT_MD_FILENAME=}")
-            f.write(full_report)
+            f.write(self.full_report)
 
         if is_in_ci():
-            write_github_step_summary(full_report)
+            write_github_step_summary(self.full_report)
 
 
 if __name__ == "__main__":
