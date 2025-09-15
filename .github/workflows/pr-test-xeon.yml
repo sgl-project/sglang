@@ -17,6 +17,7 @@ on:
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-xeon.yml"
+    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -25,8 +26,7 @@ concurrency:
 
 jobs:
   build-test:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: xeon-gnr
     env:
       HF_HOME: /home/sdp/.cache/huggingface
@@ -87,20 +87,3 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglang_xeon || true
-
-  pr-test-xeon-finish:
-    if: always()
-    needs: [build-test]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check all dependent job statuses
-        run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
