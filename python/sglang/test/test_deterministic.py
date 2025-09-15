@@ -2,7 +2,7 @@
 Batch the same prompt in random batch sizes, and test if the results are consistent across different trials.
 
 Usage:
-python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials> --test-mode <simple|hard>
+python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials> --test-mode <single|mixed>
 """
 
 import argparse
@@ -17,7 +17,7 @@ import requests
 PROMPT_1 = "Tell me about Richard Feynman: "
 PROMPT_2 = "Generate 1000 random numbers. Go directly into it, don't say Sure and don't say here are numbers. Just start with a number."
 dirpath = os.path.dirname(__file__)
-with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
+with open("python/sglang/test/long_prompt.txt", "r") as f:
     LONG_PROMPT = f.read()
 
 
@@ -32,7 +32,7 @@ class BenchArgs:
     presence_penalty: float = 0.0
     return_logprob: bool = False
     stream: bool = False
-    test_mode: str = "simple"
+    test_mode: str = "single"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -55,7 +55,7 @@ class BenchArgs:
             "--test-mode",
             type=str,
             default=BenchArgs.test_mode,
-            choices=["simple", "hard"],
+            choices=["single", "mixed"],
         )
 
     @classmethod
@@ -64,7 +64,7 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def send_simple(args, batch_size: int):
+def send_single(args, batch_size: int):
 
     prompt = [PROMPT_1] * batch_size
 
@@ -104,19 +104,15 @@ def send_simple(args, batch_size: int):
     return ret["text"]
 
 
-def send_hard(args, batch_size: int):
-    send_long_prompt = batch_size % 10 == 0
-    if send_long_prompt:
-        num_prompt_1 = random.randint(1, batch_size - 1)
-        num_prompt_2 = batch_size - 1 - num_prompt_1
-    else:
-        num_prompt_1 = random.randint(1, batch_size)
-        num_prompt_2 = batch_size - num_prompt_1
+def send_mixed(args, batch_size: int):
+    num_long_prompt = 0 if batch_size < 10 else random.randint(1, 10)
+    num_prompt_1 = random.randint(1, batch_size - num_long_prompt)
+    num_prompt_2 = batch_size - num_prompt_1 - num_long_prompt
 
     json_data = {
         "text": [PROMPT_1] * num_prompt_1
         + [PROMPT_2] * num_prompt_2
-        + [LONG_PROMPT] * int(send_long_prompt),
+        + [LONG_PROMPT] * num_long_prompt,
         "sampling_params": {
             "temperature": args.temperature,
             "max_new_tokens": args.max_new_tokens,
@@ -141,7 +137,12 @@ def send_hard(args, batch_size: int):
     prompt_2_ret = [
         ret[i]["text"] for i in range(num_prompt_1, num_prompt_1 + num_prompt_2)
     ]
-    long_prompt_ret = [ret[-1]["text"]] if send_long_prompt else None
+    long_prompt_ret = [
+        ret[i]["text"]
+        for i in range(
+            num_prompt_1 + num_prompt_2, num_prompt_1 + num_prompt_2 + num_long_prompt
+        )
+    ]
 
     return prompt_1_ret, prompt_2_ret, long_prompt_ret
 
@@ -149,34 +150,33 @@ def send_hard(args, batch_size: int):
 def test_deterministic(args):
     # First do some warmups
     for i in range(3):
-        send_simple(args, 16)
+        send_single(args, 16)
 
-    if args.test_mode == "simple":
-        # In simple mode, we test the deterministic behavior by sending the same prompt in batch sizes ranging from 1 to n_trials.
+    if args.test_mode == "single":
+        # In single mode, we test the deterministic behavior by sending the same prompt in batch sizes ranging from 1 to n_trials.
         texts = []
         for i in range(1, args.n_trials + 1):
             batch_size = i
-            text = send_simple(args, batch_size)
+            text = send_single(args, batch_size)
             text = text.replace("\n", " ")
             print(f"Trial {i} with batch size {batch_size}: {text}")
             texts.append(text)
 
         print(f"Total samples: {len(texts)}, Unique samples: {len(set(texts))}")
-    elif args.test_mode == "hard":
-        # In hard mode, we send a mixture of two short prompts and one long prompt in the same batch with batch size ranging from 1 to n_trials.
+    elif args.test_mode == "mixed":
+        # In mixed mode, we send a mixture of two short prompts and one long prompt in the same batch with batch size ranging from 1 to n_trials.
         output_prompt_1 = []
         output_prompt_2 = []
         output_long_prompt = []
         for i in range(1, args.n_trials + 1):
             batch_size = i
-            ret_prompt_1, ret_prompt_2, ret_long_prompt = send_hard(args, batch_size)
+            ret_prompt_1, ret_prompt_2, ret_long_prompt = send_mixed(args, batch_size)
             output_prompt_1.extend(ret_prompt_1)
             output_prompt_2.extend(ret_prompt_2)
-            if ret_long_prompt is not None:
-                output_long_prompt.extend(ret_long_prompt)
+            output_long_prompt.extend(ret_long_prompt)
 
             print(
-                f"Testing Trial {i} with batch size {batch_size}, number of prompt 1: {len(ret_prompt_1)}, number of prompt 2: {len(ret_prompt_2)}, number of long prompt: {int(ret_long_prompt is not None)}"
+                f"Testing Trial {i} with batch size {batch_size}, number of prompt 1: {len(ret_prompt_1)}, number of prompt 2: {len(ret_prompt_2)}, number of long prompt: {len(ret_long_prompt)}"
             )
 
         print(
@@ -188,6 +188,8 @@ def test_deterministic(args):
         print(
             f"Long prompt: total samples: {len(output_long_prompt)}, Unique samples: {len(set(output_long_prompt))}"
         )
+        x = list(set(output_long_prompt))
+        print(x[0], x[1])
 
     else:
         raise ValueError(f"Invalid test mode: {args.test_mode}")
