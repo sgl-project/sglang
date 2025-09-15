@@ -129,7 +129,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if global_workspace_buffer is None:
             # different from flashinfer zero_init_global_workspace_buffer
             global_workspace_buffer = torch.empty(
-                1024 * 1024 * 1024,
+                2048 * 1024 * 1024,
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
