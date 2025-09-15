@@ -8,7 +8,6 @@ on:
 # which uses the default GITHUB_TOKEN to verify the actor's permissions.
 permissions:
   pull-requests: read
-  members: read
 
 jobs:
   labeler:
