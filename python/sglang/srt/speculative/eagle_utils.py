@@ -83,7 +83,6 @@ class EagleDraftInput:
     req_pool_indices_for_draft_extend: torch.Tensor = None
 
     def prepare_for_extend(self, batch: ScheduleBatch):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -122,7 +121,6 @@ class EagleDraftInput:
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -271,7 +269,6 @@ class EagleVerifyInput:
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -432,7 +429,7 @@ class EagleVerifyInput:
                 "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
                 "Falling back to greedy verification."
             )
-
+        # is_all_greedy = False
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
@@ -481,6 +478,7 @@ class EagleVerifyInput:
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device="cuda"
             )
+            # logger.info("junmingc debug: tree_speculative_sampling_target_only")
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -538,9 +536,7 @@ class EagleVerifyInput:
                         try:
                             req.grammar.accept_token(id)
                         except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                            )
+                            logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                             raise e
             if not req.finished():
                 unfinished_index.append(i)

@@ -19,7 +19,12 @@
     "forwardPorts": [],
     "runArgs": [
         "--gpus",
-        "all"
+        "all",
+        "--mount",
+        "type=bind,source=/shared,target=/shared",
+        "--mount",
+        "type=bind,source=/dev/shm,target=/host-shm",
+        "--shm-size=128g"
     ],
     // The two lines below ensures that your local changes in the sglang
     // repo is automatically synced to the sglang pip package installed

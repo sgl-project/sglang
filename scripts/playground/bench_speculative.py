@@ -37,7 +37,29 @@ def node0_print(msg):
         print(msg)
 
 
-prompts = [
+def load_prompts_from_file(dataset_path):
+    """
+    Load prompts from a text file, one prompt per line.
+    """
+    prompts = []
+    try:
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if line:  # Skip empty lines
+                    prompts.append(line)
+        print(f"Loaded {len(prompts)} prompts from {dataset_path}")
+        return prompts
+    except FileNotFoundError:
+        print(f"Error: Dataset file not found: {dataset_path}")
+        return []
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        return []
+
+
+# Default hardcoded prompts (fallback)
+DEFAULT_PROMPTS = [
     "Human: Give me a fully functional FastAPI server. Show the full, long python code without stop.\n\nAssistant:",
     "Human: Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.\n\nAssistant:",
     "Human: Write a travel blog post to Hawaii.\n\nAssistant:",
@@ -54,7 +76,9 @@ class FakeTokenizer:
         return []
 
 
-def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
+def send_one_batch(
+    base_url, num_prompts, batch_size, tokenizer, is_multimodal, prompts
+):
     # format: (prompt, input_len, output len). We set input_len as a dummy value 0.
     if is_multimodal:
         input_requests = sample_mmmu_requests(
@@ -69,8 +93,8 @@ def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
         padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
             :num_prompts
         ]
-        input_requests: List[DatasetRow] = [
-            DatasetRow(p, 0, 512) for p in padded_prompts
+        input_requests: list[DatasetRow] = [
+            DatasetRow(p, 0, 5120) for p in padded_prompts
         ]
         backend = "sglang"
         api_url = f"{base_url}/generate"
@@ -132,6 +156,16 @@ def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
 
 def main(args, server_args):
     base_url = "http://127.0.0.1:20000"
+
+    # Load prompts from dataset file or use default
+    if args.dataset_path:
+        prompts = load_prompts_from_file(args.dataset_path)
+        if not prompts:
+            print("Failed to load prompts from dataset, using default prompts")
+            prompts = DEFAULT_PROMPTS
+    else:
+        prompts = DEFAULT_PROMPTS
+        print(f"Using {len(prompts)} default prompts")
 
     configs = []
     for batch_size in args.batch_size:
@@ -214,6 +248,13 @@ def main(args, server_args):
                 ]
             )
 
+        if server_args.enable_ep_moe:
+            other_args.extend(
+                [
+                    "--enable-ep-moe",
+                ]
+            )
+
         process = popen_launch_server(
             args.model_path,
             base_url,
@@ -232,7 +273,7 @@ def main(args, server_args):
         try:
             # Warmup
             send_one_batch(
-                base_url, batch_size, batch_size, tokenizer, args.is_multimodal
+                base_url, batch_size, batch_size, tokenizer, args.is_multimodal, prompts
             )
 
             # Benchmark
@@ -242,6 +283,7 @@ def main(args, server_args):
                 batch_size,
                 tokenizer,
                 args.is_multimodal,
+                prompts,
             )
         finally:
             kill_process_tree(process.pid)
@@ -302,6 +344,11 @@ if __name__ == "__main__":
     parser.add_argument("--end", type=int)
     parser.add_argument("--output", type=str, default="output.jsonl")
     parser.add_argument("--is-multimodal", action="store_true", default=False)
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        help="Path to text file containing prompts (one per line)",
+    )
     args = parser.parse_args()
     server_args: ServerArgs = ServerArgs.from_cli_args(args)
 
