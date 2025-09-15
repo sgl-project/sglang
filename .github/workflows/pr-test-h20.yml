@@ -23,17 +23,29 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      src: ${{ steps.filter.outputs.src }}
+      h20_files: ${{ steps.filter.outputs.h20_files }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Fail if the PR does not have the 'run-ci' label
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
+        run: |
+          echo "This pull request does not have the 'run-ci' label. Failing the workflow."
+          exit 1
+
+      - name: Fail if the PR is a draft
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+        run: |
+          echo "This pull request is a draft. Failing the workflow."
+          exit 1
 
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
         with:
           filters: |
-            src:
+            h20_files:
               - "python/sglang/srt/models/deepseek*"
               - "python/sglang/srt/layers/moe/**"
               - ".github/workflows/pr-test-h20.yml"
@@ -41,9 +53,7 @@ jobs:
 
   per-commit-8-gpu-h20:
     needs: [check-changes]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    if: needs.check-changes.outputs.h20_files == 'true'
     runs-on: 8-gpu-h20
     steps:
       - name: Checkout code
@@ -59,23 +69,3 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-h20
-
-  pr-test-h20-finish:
-    needs: [
-      check-changes,
-      per-commit-8-gpu-h20,
-    ]
-    if: needs.check-changes.outputs.src == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check all dependent job statuses
-        run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
