@@ -1,9 +1,13 @@
 import json
 import unittest
+from io import BytesIO
 from typing import Optional
 
+import requests
 import torch
+from PIL import Image
 from transformers import (
+    AutoModel,
     AutoProcessor,
     Gemma3ForConditionalGeneration,
     Qwen2_5_VLForConditionalGeneration,
@@ -12,9 +16,9 @@ from transformers import (
 from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
-from sglang.test.test_utils import download_image_with_retry
 
-TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
+IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
+IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
 
 
 class VLMInputTestBase:
@@ -27,9 +31,12 @@ class VLMInputTestBase:
     def setUpClass(cls):
         assert cls.model_path is not None, "Set model_path in subclass"
         assert cls.chat_template is not None, "Set chat_template in subclass"
-        cls.image_url = TEST_IMAGE_URL
+        cls.image_urls = [IMAGE_MAN_IRONING_URL, IMAGE_SGL_LOGO_URL]
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cls.main_image = download_image_with_retry(cls.image_url)
+        cls.main_image = []
+        for image_url in cls.image_urls:
+            response = requests.get(image_url)
+            cls.main_image.append(Image.open(BytesIO(response.content)))
         cls.processor = AutoProcessor.from_pretrained(
             cls.model_path, trust_remote_code=True, use_fast=True
         )
@@ -55,8 +62,30 @@ class VLMInputTestBase:
         self.engine.shutdown()
 
     def verify_response(self, output):
+        # The goal is to check that the model roughly understands:
+        #   - image 1: taxi / car scene
+        #   - image 2: SGL logo / company
+        # We intentionally keep the check keyword-based and loose to avoid
+        # overfitting to a specific phrasing.
         out_text = output["text"].lower()
-        assert "taxi" in out_text or "cab" in out_text or "car" in out_text, out_text
+
+        assert any(w in out_text for w in ("taxi", "cab", "car")), out_text
+
+        has_sg_or_logo_side = any(
+            kw in out_text
+            for kw in (
+                "sg ",
+                "sgl",
+                " sgl",
+                "logo",
+                "software guidance",
+                "labs",
+                "laborator",
+                "company",
+                " text",
+            )
+        )
+        assert has_sg_or_logo_side, out_text
 
     def get_completion_request(self) -> ChatCompletionRequest:
         json_structure = {
@@ -65,8 +94,9 @@ class VLMInputTestBase:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": self.image_url}},
-                        {"type": "text", "text": "What's in this picture?"},
+                        {"type": "image_url", "image_url": {"url": self.image_urls[0]}},
+                        {"type": "image_url", "image_url": {"url": self.image_urls[1]}},
+                        {"type": "text", "text": "What are in these pictures?"},
                     ],
                 }
             ],
@@ -83,26 +113,26 @@ class VLMInputTestBase:
         # Process inputs using processor
         inputs = self.processor(
             text=[text],
-            images=[self.main_image],
+            images=self.main_image,
             return_tensors="pt",
         ).to(self.device)
 
-        return inputs
+        return inputs, text
 
-    async def test_understands_image(self):
+    async def test_accepts_image(self):
         req = self.get_completion_request()
         conv = generate_chat_conv(req, template_name=self.chat_template)
         text = conv.get_prompt()
         output = await self.engine.async_generate(
             prompt=text,
-            image_data=[self.main_image],
+            image_data=self.main_image,
             sampling_params=dict(temperature=0.0),
         )
         self.verify_response(output)
 
-    async def test_understands_precomputed_embeddings(self):
+    async def test_accepts_precomputed_embeddings(self):
         req = self.get_completion_request()
-        processor_output = self.get_processor_output(req=req)
+        processor_output, _ = self.get_processor_output(req=req)
         with torch.inference_mode():
             precomputed_embeddings = self.__class__.visual(processor_output)
         output = await self.engine.async_generate(
@@ -114,12 +144,12 @@ class VLMInputTestBase:
         )
         self.verify_response(output)
 
-    async def test_understands_pixel_values(self):
+    async def test_accepts_processor_output(self):
         req = self.get_completion_request()
-        processor_output = self.get_processor_output(req=req)
+        processor_output, prompt = self.get_processor_output(req=req)
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
-            image_data=[self._pixel_values_image_data(processor_output)],
+            image_data=[self._processor_output_image_data(processor_output)],
             sampling_params=dict(temperature=0.0),
         )
         self.verify_response(output)
@@ -127,11 +157,12 @@ class VLMInputTestBase:
     def _precomputed_image_data(self, processor_output, precomputed_embeddings):
         """This should not be overridden."""
         return dict(
-            modality="IMAGE",
-            precomputed_embeddings=precomputed_embeddings,
+            processor_output,
+            format="precomputed_embedding",
+            feature=precomputed_embeddings,
         )
 
-    def _pixel_values_image_data(self, processor_output):
+    def _processor_output_image_data(self, processor_output):
         """Override in subclass to pass the correct set of arguments."""
         raise NotImplementedError
 
@@ -153,12 +184,8 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
             processor_output["pixel_values"], processor_output["image_grid_thw"]
         )
 
-    def _pixel_values_image_data(self, processor_output):
-        return dict(
-            modality="IMAGE",
-            image_grid_thw=processor_output["image_grid_thw"],
-            pixel_values=processor_output["pixel_values"],
-        )
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
 
 
 class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
@@ -178,39 +205,28 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
             ).last_hidden_state
         )
 
-    def _pixel_values_image_data(self, processor_output):
-        return dict(
-            modality="IMAGE",
-            pixel_values=processor_output["pixel_values"][0],
-        )
+    # Temporarily skip Kimi-VL for CI test due to issue in transformers=4.57.0
+    # class TestKimiVLImageUnderstandsImage(
+    #     VLMInputTestBase, unittest.IsolatedAsyncioTestCase
+    # ):
+    #     model_path = "moonshotai/Kimi-VL-A3B-Instruct"
+    #     chat_template = "kimi-vl"
 
+    #     @classmethod
+    #     def _init_visual(cls):
+    #         model = AutoModel.from_pretrained(cls.model_path, trust_remote_code=True)
+    #         cls.vision_tower = model.vision_tower.eval().to(cls.device)
+    #         cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
 
-# Temporarily skip Kimi-VL for CI test due to issue in transformers=4.57.0
-# class TestKimiVLImageUnderstandsImage(
-#     VLMInputTestBase, unittest.IsolatedAsyncioTestCase
-# ):
-#     model_path = "moonshotai/Kimi-VL-A3B-Instruct"
-#     chat_template = "kimi-vl"
+    #         cls.visual = lambda tokenizer_output: cls.mm_projector(
+    #             cls.vision_tower(
+    #                 pixel_values=tokenizer_output["pixel_values"],
+    #                 grid_hws=tokenizer_output["image_grid_hws"],
+    #             )
+    #         )
 
-#     @classmethod
-#     def _init_visual(cls):
-#         model = AutoModel.from_pretrained(cls.model_path, trust_remote_code=True)
-#         cls.vision_tower = model.vision_tower.eval().to(cls.device)
-#         cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
-
-#         cls.visual = lambda tokenizer_output: cls.mm_projector(
-#             cls.vision_tower(
-#                 pixel_values=tokenizer_output["pixel_values"],
-#                 grid_hws=tokenizer_output["image_grid_hws"],
-#             )
-#         )
-
-#     def _pixel_values_image_data(self, processor_output):
-#         return dict(
-#             modality="IMAGE",
-#             pixel_values=processor_output["pixel_values"],
-#             image_grid_hws=processor_output["image_grid_hws"],
-#         )
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
 
 
 # not for CI: too large
@@ -249,6 +265,45 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
 #             modality="IMAGE",
 #             pixel_values=processor_output["pixel_values"],
 #         )
+
+
+class TestLlavaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+    model_path = "llava-hf/llava-1.5-7b-hf"
+    chat_template = "vicuna_v1"
+
+    @classmethod
+    def _init_visual(cls):
+        from transformers import LlavaForConditionalGeneration
+
+        model = LlavaForConditionalGeneration.from_pretrained(
+            cls.model_path,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+        )
+        cls.vision_tower = model.vision_tower.eval().to(cls.device)
+        cls.multi_modal_projector = model.multi_modal_projector.eval().to(cls.device)
+        cls.config = model.config
+
+        def visual_func(processor_output):
+            pixel_values = processor_output["pixel_values"].to(
+                cls.device, dtype=torch.float16
+            )
+
+            vision_outputs = cls.vision_tower(pixel_values, output_hidden_states=True)
+            image_features = vision_outputs.hidden_states[-2]
+
+            if cls.config.vision_feature_select_strategy == "default":
+                image_features = image_features[:, 1:]
+            elif cls.config.vision_feature_select_strategy == "full":
+                image_features = image_features
+
+            image_features = cls.multi_modal_projector(image_features)
+            return image_features
+
+        cls.visual = visual_func
+
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
 
 
 if __name__ == "__main__":
