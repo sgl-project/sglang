@@ -1043,6 +1043,7 @@ class FlashInferFP4MoE(FusedMoE):
 
         router_logits = router_logits.to(torch.float32)
 
+        print(f"hi going to call trtllm_fp4_block_scale_moe {topk_config.correction_bias=}")
         result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
