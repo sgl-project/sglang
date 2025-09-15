@@ -127,6 +127,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_blackwell,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
@@ -1581,6 +1582,7 @@ class ModelRunner:
                 )
             elif self.is_hybrid_gdn:
                 self.token_to_kv_pool = HybridLinearKVPool(
+                    page_size=self.page_size if _is_npu else 1,
                     size=self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
@@ -1615,7 +1617,10 @@ class ModelRunner:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if self.server_args.attention_backend == "ascend":
+            if _is_npu and self.server_args.attention_backend in [
+                "ascend",
+                "hybrid_linear_attn",
+            ]:
                 self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1833,15 +1838,26 @@ class ModelRunner:
             assert (
                 self.is_hybrid_gdn
             ), "hybrid_linear_attn backend can only be used with hybrid GDN models."
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
                 HybridLinearAttnBackend,
                 MambaAttnBackend,
             )
 
-            full_attn_backend = FlashAttentionBackend(self)
+            if _is_npu:
+                from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+
+                full_attn_backend = AscendAttnBackend(self)
+            elif is_blackwell():
+                from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+                full_attn_backend = TritonAttnBackend(self)
+            else:
+                from sglang.srt.layers.attention.flashattention_backend import (
+                    FlashAttentionBackend,
+                )
+
+                full_attn_backend = FlashAttentionBackend(self)
+
             linear_attn_backend = MambaAttnBackend(self)
             full_attn_layers = self.model_config.hf_config.full_attention_layer_ids
             return HybridLinearAttnBackend(
@@ -2155,6 +2171,38 @@ class ModelRunner:
             forward_batch.token_ids_logprobs,
         )
         return next_token_ids
+
+    def compute_logprobs_only(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """
+        Compute token_ids_logprobs without performing sampling.
+
+        Optimized path for prefill-only requests that need token_ids_logprobs but don't
+        require next token generation. Skips expensive sampling operations
+        while still providing requested probability information.
+
+        Args:
+            logits_output: The logits output from the model forward
+            forward_batch: The forward batch that generates logits_output
+        """
+        if not forward_batch.token_ids_logprobs:
+            return
+
+        # Preprocess logits (same as in sample method)
+        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+
+        # Delegate to sampler for logprob-only computation
+        # This populates logits_output with requested token probabilities
+        self.sampler.compute_logprobs_only(
+            logits_output,
+            forward_batch.sampling_info,
+            forward_batch.return_logprob,
+            forward_batch.top_logprobs_nums,
+            forward_batch.token_ids_logprobs,
+        )
 
     @property
     def model_is_mrope(self) -> bool:

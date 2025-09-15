@@ -170,6 +170,7 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
 
         # Check model type
         self.is_generation = is_generation_model(

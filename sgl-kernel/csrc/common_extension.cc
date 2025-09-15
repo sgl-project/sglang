@@ -99,6 +99,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "mult, int offset, int cuda_stream) -> ()");
   m.impl("downcast_fp8", torch::kCUDA, &downcast_fp8);
 
+  m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
+  m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
+  m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
+  m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
+
   /*
    * From csrc/gemm
    */
@@ -446,11 +451,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "qserve_w4a8_per_group_gemm(Tensor _in_feats, Tensor _kernel, Tensor _zeros, Tensor _scales_i8, Tensor _wscales, "
       "Tensor _ascales, Tensor! _out_feats) -> ()");
   m.impl("qserve_w4a8_per_group_gemm", torch::kCUDA, &qserve_w4a8_per_group_gemm);
-
-  m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
-  m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
-  m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
-  m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
 
   /*
    * From csrc/mamba
