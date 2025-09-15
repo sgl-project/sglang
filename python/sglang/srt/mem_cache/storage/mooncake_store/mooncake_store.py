@@ -10,7 +10,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
-    HiCacheStorageExtraInfo
+    HiCacheStorageExtraInfo,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
@@ -243,7 +243,10 @@ class MooncakeStore(HiCacheStorage):
                 kv_buffer_data_ptr
                 + indices[index]
                 * self.mem_pool_host.layer_num
-                * (self.mem_pool_host.kv_lora_rank + self.mem_pool_host.qk_rope_head_dim)
+                * (
+                    self.mem_pool_host.kv_lora_rank
+                    + self.mem_pool_host.qk_rope_head_dim
+                )
                 * self.mem_pool_host.dtype.itemsize
             )
             ptr_list.append(k_ptr)
@@ -266,15 +269,15 @@ class MooncakeStore(HiCacheStorage):
 
     def _batch_postprocess(self, results: List[int], is_set_operate=False):
         if self.is_mla_backend:
-            return [
-                k_res == 0 if is_set_operate else k_res > 0
-                for k_res in results
-            ]
+            return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results]
         else:
             kv_pairs = zip(results[::2], results[1::2])
             return [
-                (k_res == 0 and v_res == 0) if is_set_operate
-                else (k_res > 0 and v_res > 0)
+                (
+                    (k_res == 0 and v_res == 0)
+                    if is_set_operate
+                    else (k_res > 0 and v_res > 0)
+                )
                 for k_res, v_res in kv_pairs
             ]
 
@@ -285,9 +288,10 @@ class MooncakeStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        get_results = self._get_batch_zero_copy_impl(key_strs, buffer_ptrs, buffer_sizes)
+        get_results = self._get_batch_zero_copy_impl(
+            key_strs, buffer_ptrs, buffer_sizes
+        )
         return self._batch_postprocess(get_results, is_set_operate=False)
-
 
     def batch_set_v1(
         self,
@@ -296,7 +300,9 @@ class MooncakeStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        put_results = self._put_batch_zero_copy_impl(key_strs, buffer_ptrs, buffer_sizes)
+        put_results = self._put_batch_zero_copy_impl(
+            key_strs, buffer_ptrs, buffer_sizes
+        )
         return self._batch_postprocess(put_results, is_set_operate=True)
 
     def set(
