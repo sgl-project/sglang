@@ -17,7 +17,7 @@ on:
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
-    types: [opened, synchronize, reopened, labeled]
+    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
