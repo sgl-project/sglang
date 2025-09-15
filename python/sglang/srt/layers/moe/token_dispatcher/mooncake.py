@@ -17,6 +17,7 @@ from sglang.srt.utils import get_int_env_var
 
 try:
     from mooncake.mooncake_ep_buffer import Buffer
+
     use_mooncake_ep = True
 except ImportError:
     use_mooncake_ep = False
@@ -94,7 +95,9 @@ class EPBuffer:
 
         num_ep_buffer_bytes = 0
         if deepep_mode.enable_normal():
-            raise NotImplementedError("Normal mode is not supported for Mooncake EP yet.")
+            raise NotImplementedError(
+                "Normal mode is not supported for Mooncake EP yet."
+            )
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
