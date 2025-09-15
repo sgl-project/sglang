@@ -133,8 +133,7 @@ impl Router {
                 .map(|url| {
                     ctx.worker_registry
                         .get_by_url(url)
-                        .map(|w| w.api_key().clone())
-                        .flatten()
+                        .and_then(|w| w.api_key().clone())
                 })
                 .collect::<Vec<Option<String>>>();
             let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
