@@ -282,8 +282,13 @@ class MoEGate(nn.Module):
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
         if config.topk_method == "noaux_tc":
+            correction_bias_dtype = (
+                torch.bfloat16
+                if _is_fp4_quantization_enabled() and should_use_flashinfer_trtllm_moe()
+                else torch.float32
+            )
             self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=torch.float32)
+                torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
             )
         else:
             self.e_score_correction_bias = None
@@ -375,10 +380,6 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        correction_bias = self.gate.e_score_correction_bias
-        # https://github.com/sgl-project/sglang/pull/9834#discussion_r2324480643
-        if _is_fp4_quantization_enabled() and should_use_flashinfer_trtllm_moe():
-            correction_bias = correction_bias.to(torch.bfloat16)
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             renormalize=config.norm_topk_prob,
@@ -386,7 +387,7 @@ class DeepseekV2MoE(nn.Module):
             num_expert_group=config.n_group,
             num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=config.topk_group,
-            correction_bias=correction_bias,
+            correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk(),
             force_topk=quant_config is None,
