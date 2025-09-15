@@ -64,7 +64,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather, should_use_flashinfer_trtllm_moe,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
