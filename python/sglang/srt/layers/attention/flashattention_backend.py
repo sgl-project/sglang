@@ -345,11 +345,10 @@ class FlashAttentionBackend(AttentionBackend):
             page_size=self.page_size,
             retrive_budget_per_seq=1024,
             device=model_runner.device,
-            async_retrive=False,
+            async_retrive=True,
             req_to_token=model_runner.req_to_token_pool.req_to_token,
             max_seq_len=self.max_context_len,
         )
-        
         self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)
         self.sparse_cache_updater.cache_manager.start_retrive_loop()
 
@@ -634,7 +633,7 @@ class FlashAttentionBackend(AttentionBackend):
             ]
 
         # Convert the page table to a strided format which is needed by FA3 API
-        if self.page_size > 1:
+        if self.page_size > 1 and not self.sparse_attn:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )

@@ -1,6 +1,6 @@
 """
 Usage:
-python3 offline_batch_inference.py  --model Qwen/Qwen3-8B
+python3 offline_batch_inference.py  --model /mnt/cephfs/kavioyu/models/Qwen3-8B
 """
 
 import argparse
@@ -19,9 +19,10 @@ def main(
     prompts = [open('prompt.txt', 'r').read() + '请直接回答：张无忌会什么武功？']
     # Create a sampling params object.
     #sampling_params = {"temperature": 0.8, "top_p": 0.95, "max_new_tokens": 2048}
-    sampling_params = {"top_k": 1, "max_new_tokens": 512}
+    sampling_params = {"top_k": 1, "max_new_tokens": 128}
     server_args.disable_cuda_graph = True
     server_args.is_sparse_attn = True
+    server_args.page_size = 32
 
     # Create an LLM.
     llm = sgl.Engine(**dataclasses.asdict(server_args))
