@@ -159,6 +159,22 @@ def gemma_fused_add_rmsnorm(
     )
 
 
+def gated_rmsnorm(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    if out is None:
+        out = torch.empty_like(x)
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
+    torch.ops.sgl_kernel.gated_rmsnorm.default(out, x, z, weight, eps, enable_pdl)
+    return out
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert (

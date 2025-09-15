@@ -78,6 +78,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
+  m.def(
+      "gated_rmsnorm(Tensor! output, Tensor x, Tensor z, Tensor weight, float eps, bool enable_pdl) -> ()");
+  m.impl("gated_rmsnorm", torch::kCUDA, &gated_rmsnorm);
 
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);

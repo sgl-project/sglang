@@ -1,15 +1,20 @@
 import enum
 import logging
+import os
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
-from sglang.srt.distributed import divide, get_pp_group
+from sglang.srt.distributed import (
+    divide,
+    get_pp_group,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.srt.layers.attention.fla.layernorm_gated import rmsnorm_fn
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -52,6 +57,12 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+# Optional fast fused gated RMSNorm from sgl-kernel
+try:
+    from sgl_kernel.elementwise import gated_rmsnorm as sgl_gated_rmsnorm  # type: ignore
+except Exception:  # pragma: no cover - optional dep during dev
+    sgl_gated_rmsnorm = None
 
 import triton
 import triton.language as tl
@@ -347,6 +358,11 @@ class Qwen3GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
+        # Feature flag for fused RMSNorm(+gate) + Linear path
+        self.enable_fused_rmsnorm_linear = (
+            os.environ.get("SGLANG_ENABLE_FUSED_RMSNORM_LINEAR", "0") == "1"
+        )
+
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
@@ -478,6 +494,31 @@ class Qwen3GatedDeltaNet(nn.Module):
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
+
+        if sgl_gated_rmsnorm is not None:
+            y2d = sgl_gated_rmsnorm(
+                core_attn_out, z, self.norm.weight, eps=float(self.layer_norm_epsilon)
+            )
+            y2d = y2d.reshape(z_shape_og)
+            y2d = y2d.reshape(*y2d.shape[:-2], -1)
+            output, _ = self.out_proj(y2d)
+            return output
+
+        if self.enable_fused_rmsnorm_linear:
+            normed = rmsnorm_fn(
+                core_attn_out,
+                self.norm.weight,
+                None,
+                z=z,
+                eps=self.layer_norm_epsilon,
+                group_size=None,
+                norm_before_gate=True,
+            )
+            normed = normed.reshape(z_shape_og)
+            normed = normed.reshape(*normed.shape[:-2], -1)
+            output, _ = self.out_proj(normed)
+            return output
+
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)

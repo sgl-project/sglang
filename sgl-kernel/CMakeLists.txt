@@ -189,7 +189,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
 
-set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default 32")
+set(SGL_KERNEL_COMPILE_THREADS 16 CACHE STRING "Set compilation threads, default 16")
 
 # When SGL_KERNEL_COMPILE_THREADS value is less than 1, set it to 1
 if (NOT SGL_KERNEL_COMPILE_THREADS MATCHES "^[0-9]+$")
@@ -252,8 +252,7 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
-    set(SGL_KERNEL_ENABLE_FA3 ON)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
@@ -277,6 +276,7 @@ set(SOURCES
     "csrc/elementwise/cast.cu"
     "csrc/elementwise/copy.cu"
     "csrc/elementwise/concat_mla.cu"
+    "csrc/elementwise/gated_rms_norm_kernel.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/elementwise/topk.cu"
@@ -441,6 +441,13 @@ install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 # set flash-attention sources file
 # Now FA3 support sm80/sm86/sm90
 if (SGL_KERNEL_ENABLE_FA3)
+    message(STATUS "SGL_KERNEL_ENABLE_FA3 is ON, but temporarily disabled to avoid Hopper/CUDA 12.6 nvcc segfaults. Set -Ccmake.define.SGL_KERNEL_ENABLE_FA3=0 to silence this.")
+endif()
+
+# Force FA3 off by default to avoid nvcc segfaults on Hopper/CUDA 12.6
+set(SGL_KERNEL_ENABLE_FA3 OFF CACHE BOOL "Enable FA3" FORCE)
+
+if (0) # FA3 disabled
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
         "-DOPERATOR_NAMESPACE=sgl-kernel"
