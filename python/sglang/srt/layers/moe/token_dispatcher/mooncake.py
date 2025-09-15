@@ -17,8 +17,9 @@ from sglang.srt.utils import get_int_env_var
 
 try:
     from mooncake.mooncake_ep_buffer import Buffer
+    use_mooncake_ep = True
 except ImportError:
-    raise ImportError("Mooncake EP is not installed. TODO: add message")
+    use_mooncake_ep = False
 
 from enum import Enum, IntEnum, auto
 
@@ -93,7 +94,7 @@ class EPBuffer:
 
         num_ep_buffer_bytes = 0
         if deepep_mode.enable_normal():
-            raise NotImplementedError
+            raise NotImplementedError("Normal mode is not supported for Mooncake EP yet.")
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
@@ -121,6 +122,12 @@ class _MooncakeEPDispatcherImpl:
         return_recv_hook: bool,
         deepep_mode: DeepEPMode,
     ):
+        if not use_mooncake_ep:
+            raise ImportError(
+                "Mooncake EP is not installed. Please install Mooncake package at "
+                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "
+                "with EP support to run SGLang with Mooncake EP."
+            )
         self.group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
@@ -133,9 +140,9 @@ class _MooncakeEPDispatcherImpl:
 
         self.params_bytes = 2
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+            "SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
         )
-        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
+        # Mooncake EP dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
 

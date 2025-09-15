@@ -438,9 +438,9 @@ class DeepseekV2MoE(nn.Module):
         self.top_k = config.num_experts_per_tok
 
         if get_moe_a2a_backend().is_none():
-            self._enable_deepep_moe = False
+            self._enable_a2a_moe = False
         else:
-            self._enable_deepep_moe = True
+            self._enable_a2a_moe = True
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -484,7 +484,7 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-        if not self._enable_deepep_moe:
+        if not self._enable_a2a_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
             if (
                 self.alt_stream is not None
