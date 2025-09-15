@@ -62,23 +62,24 @@ class VLMInputTestBase:
         out_text = output["text"].lower()
         assert "taxi" in out_text or "cab" in out_text or "car" in out_text, out_text
 
-    def get_completion_request(self) -> ChatCompletionRequest:
+    def get_completion_request(self, image_count=1) -> ChatCompletionRequest:
         json_structure = {
             "model": self.model_path,
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": self.image_url}},
-                        {"type": "text", "text": "What's in this picture?"},
-                    ],
+                                   {"type": "image_url", "image_url": {"url": self.image_url}}
+                               ] * image_count + [
+                                   {"type": "text", "text": "What's in this picture?"},
+                               ],
                 }
             ],
         }
         json_str = json.dumps(json_structure)
         return ChatCompletionRequest.model_validate_json(json_str)
 
-    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None):
+    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None, image_count = 1):
         if req is None:
             req = self.get_completion_request()
         conv = generate_chat_conv(req, template_name=self.chat_template)
@@ -87,7 +88,7 @@ class VLMInputTestBase:
         # Process inputs using processor
         inputs = self.processor(
             text=[text],
-            images=[self.main_image],
+            images=[self.main_image] * image_count,
             return_tensors="pt",
         ).to(self.device)
 
@@ -119,8 +120,9 @@ class VLMInputTestBase:
         self.verify_response(output)
 
     async def test_understands_pixel_values(self):
-        req = self.get_completion_request()
-        processor_output = self.get_processor_output(req=req)
+        image_count = 2
+        req = self.get_completion_request(image_count=image_count)
+        processor_output = self.get_processor_output(req=req, image_count = image_count)
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
             image_data=[self._pixel_values_image_data(processor_output)],
