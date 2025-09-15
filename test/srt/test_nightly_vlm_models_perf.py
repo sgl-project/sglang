@@ -126,10 +126,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                             )
                         )
 
-                        print(f"{trace_dir=}")
-
                         trace_files = find_traces_under_path(trace_dir)
-                        print(f"{trace_files=}")
                         extend_trace_filename = [
                             trace_file
                             for trace_file in trace_files
@@ -141,7 +138,6 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                             trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1 :
                         ]
 
-                        print(f"{extend_trace_file_relative_path_from_profile_dir}")
                         model_results.append(
                             {
                                 "output": result.stdout,

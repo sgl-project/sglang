@@ -8,6 +8,8 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     _parse_int_list_env,
+    extract_trace_link_from_bench_one_batch_server_output,
+    find_traces_under_path,
     generate_markdown_report_nightly,
     is_in_ci,
     parse_models,
@@ -105,10 +107,28 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                         print(f"Output for {model} with batch size {batch_size}:")
                         print(result.stdout)
 
+                        trace_dir = (
+                            extract_trace_link_from_bench_one_batch_server_output(
+                                result.stdout
+                            )
+                        )
+
+                        trace_files = find_traces_under_path(trace_dir)
+                        extend_trace_filename = [
+                            trace_file
+                            for trace_file in trace_files
+                            if trace_file.endswith(".EXTEND.trace.json.gz")
+                        ][0]
+
+                        # because the profile_id dir under PROFILE_DIR
+                        extend_trace_file_relative_path_from_profile_dir = trace_dir[
+                            trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1 :
+                        ]
+
                         model_results.append(
                             {
                                 "output": result.stdout,
-                                "trace_filename": f"{trace_filename}.json",
+                                "trace_link": f"{extend_trace_file_relative_path_from_profile_dir}/{extend_trace_filename}",
                             }
                         )
 
