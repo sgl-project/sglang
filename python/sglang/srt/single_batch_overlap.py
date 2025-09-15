@@ -43,7 +43,7 @@ class CombineOverlapArgs:
     wait_event: torch.cuda.Event
     num_sms: int
     signal: Optional[torch.Tensor] = None
-    threshold: int = -1
+    threshold: int = 0
 
 
 @dataclass
