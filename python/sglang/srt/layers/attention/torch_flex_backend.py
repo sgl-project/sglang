@@ -25,33 +25,48 @@ class TorchFlexAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        # TODO: find a more elegant way to save memory
+        # Currently maintain the same memory as torch_native_backend
         torch.cuda.empty_cache()
 
-        self.block_masks = []
-        for seq_idx in range(len(forward_batch.seq_lens)):
-            if forward_batch.forward_mode.is_extend():
-                seq_len = forward_batch.seq_lens[seq_idx]
-                prefix_len = forward_batch.extend_prefix_lens[seq_idx]
-            elif forward_batch.forward_mode.is_decode():
-                seq_len = forward_batch.seq_lens[seq_idx]
-                prefix_len = seq_len - 1
+        # Provide two block_mask Lists per seq_idx for lower latency, later will support per layer level mask generation
+        self.extend_block_masks = []
+        self.decode_block_masks = []
 
-            q_len = seq_len - prefix_len
-            self.q_offset = prefix_len
-            self.block_masks.append(create_block_mask(
-                self._causal_mask,
-                None,
-                None,
-                q_len,
-                seq_len,
-                device=self.device,
-                BLOCK_SIZE=128,
-                _compile=False,
-            ))
+        if forward_batch.forward_mode.is_extend():
+            for seq_idx in range(forward_batch.seq_lens.shape[0]):
+                seq_len_kv = forward_batch.seq_lens[seq_idx]
+                seq_len_q = seq_len_kv
+                self.extend_block_masks.append(create_block_mask(
+                    self._causal_mask,
+                    None,
+                    None,
+                    seq_len_q,
+                    seq_len_kv,
+                    device=self.device,
+                    _compile=False,
+                ))
 
+        elif forward_batch.forward_mode.is_decode():
+            for seq_idx in range(forward_batch.seq_lens.shape[0]):
+                seq_len_q = 1
+                seq_len_kv = forward_batch.seq_lens[seq_idx]
+
+                self.decode_block_masks.append(create_block_mask(
+                    self._decode_mask,
+                    None,
+                    None,
+                    seq_len_q,
+                    seq_len_kv,
+                    device=self.device,
+                    _compile=False,
+                ))
 
     def _causal_mask(self, b, h, q_idx, kv_idx):
-        return self.q_offset + q_idx >= kv_idx
+        return q_idx >= kv_idx
+
+    def _decode_mask(self, b, h, q_idx, kv_idx):
+        return q_idx <= kv_idx
 
     def _run_flex_forward_extend(
         self,
@@ -100,12 +115,20 @@ class TorchFlexAttnBackend(AttentionBackend):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
             extend_seq_len_q = extend_seq_lens[seq_idx]
+            prefill_seq_len_q = extend_prefix_lens[seq_idx]
 
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q
             end_kv = start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
+            per_req_query_redudant = torch.empty(
+                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
+                dtype=per_req_query.dtype,
+                device=per_req_query.device,
+            )
+
+            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -114,18 +137,22 @@ class TorchFlexAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            output[start_q:end_q, :, :] = (
+            if not causal:
+                raise NotImplementedError("Non-causal mode is not yet implemented.")
+            
+            per_req_out_redudant = (
                 self.flex_attention(
-                    per_req_query.unsqueeze(0),
+                    per_req_query_redudant.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
-                    block_mask=self.block_masks[seq_idx],
+                    block_mask=self.extend_block_masks[seq_idx],
                     scale=scaling,
                     enable_gqa=enable_gqa,
                 )
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
+            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
             start_q, start_kv = end_q, end_kv
         return output
 
@@ -187,7 +214,7 @@ class TorchFlexAttnBackend(AttentionBackend):
                     per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
-                    block_mask=self.block_masks[seq_idx],
+                    block_mask=self.decode_block_masks[seq_idx],
                     scale=scaling,
                     enable_gqa=enable_gqa,
                 )
