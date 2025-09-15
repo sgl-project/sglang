@@ -19,6 +19,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_use_aiter,
 )
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config

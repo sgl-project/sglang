@@ -37,6 +37,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_use_aiter
 
 _use_aiter = is_use_aiter()
 
