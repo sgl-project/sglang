@@ -676,6 +676,7 @@ class DeepEPMoE(EPMoE):
             scale_tma_aligned=True,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             fuse_silu_and_mul=True,
+            enable_v2=True,
         )
         del gateup_output
 
