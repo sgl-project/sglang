@@ -5,8 +5,8 @@ use crate::metrics::{self, PrometheusConfig};
 use crate::middleware::TokenBucket;
 use crate::policies::PolicyRegistry;
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest,
-    V1RerankReqInput,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+    ResponsesRequest, V1RerankReqInput,
 };
 use crate::protocols::worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse};
 use crate::reasoning_parser::ParserFactory;
@@ -205,6 +205,17 @@ async fn v1_responses(
     state
         .router
         .route_responses(Some(&headers), &body, None)
+        .await
+}
+
+async fn v1_embeddings(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<EmbeddingRequest>,
+) -> Response {
+    state
+        .router
+        .route_embeddings(Some(&headers), &body, None)
         .await
 }
 
@@ -465,6 +476,7 @@ pub fn build_app(
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
+        .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",
@@ -513,11 +525,12 @@ pub fn build_app(
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
-        // Request ID layer - must be added AFTER logging layer in the code
-        // so it executes BEFORE logging layer at runtime (layers execute bottom-up)
-        .layer(crate::middleware::RequestIdLayer::new(request_id_headers))
-        // Custom logging layer that can now see request IDs from extensions
+        // Logging layer - must be added BEFORE request ID layer in the code
+        // so it executes AFTER request ID layer at runtime (layers execute bottom-up)
+        // This way the TraceLayer can see the request ID that was added to extensions
         .layer(crate::middleware::create_logging_layer())
+        // Request ID layer - adds request ID to extensions first
+        .layer(crate::middleware::RequestIdLayer::new(request_id_headers))
         // CORS (should be outermost)
         .layer(create_cors_layer(cors_allowed_origins))
         // Fallback
