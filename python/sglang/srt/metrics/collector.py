@@ -17,11 +17,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
+from sglang.environ import envs
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var
 
-SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+SGLANG_TEST_REQUEST_TIME_STATS = envs.SGLANG_TEST_REQUEST_TIME_STATS.value
 
 
 @dataclass

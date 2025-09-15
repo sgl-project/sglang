@@ -6,16 +6,16 @@ import sys
 import torch
 import torch.nn.functional as F
 import triton
-import triton.language as tl
 from tqdm import tqdm
 from transformers import AutoConfig
 
+from sglang.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe,
     get_config_file_name,
 )
 
-padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+padding_size = 128 if envs.SGLANG_MOE_PADDING.value else 0
 
 
 def main(model, tp_size, dtype: str, batches):

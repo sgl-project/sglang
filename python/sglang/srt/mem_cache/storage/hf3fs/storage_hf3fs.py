@@ -2,7 +2,6 @@ import atexit
 import concurrent.futures
 import json
 import logging
-import os
 import signal
 import threading
 import time
@@ -12,6 +11,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.environ import envs
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
 from sglang.srt.metrics.collector import StorageMetrics
@@ -144,8 +144,6 @@ def create_hf3fs_client(
 class HiCacheHF3FS(HiCacheStorage):
     """HiCache backend that stores KV cache pages in HF3FS files."""
 
-    default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
-
     def __init__(
         self,
         rank: int,
@@ -229,6 +227,7 @@ class HiCacheHF3FS(HiCacheStorage):
         Raises:
             ValueError: If MLA Model is requested without global metadata server or required keys are missing.
         """
+        config_path = envs.SGLANG_HICACHE_HF3FS_CONFIG_PATH.value
         from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
             Hf3fsGlobalMetadataClient,
             Hf3fsLocalMetadataClient,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 # ruff: noqa: SIM117
 import collections
-import concurrent
 import dataclasses
 import fnmatch
 import glob
@@ -17,7 +16,6 @@ import socket
 import threading
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
@@ -39,10 +37,10 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
-from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
+from sglang.environ import envs
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.connector import (
     ConnectorType,
@@ -81,7 +79,6 @@ from sglang.srt.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_device_capability,
     is_npu,
     is_pin_memory_available,
@@ -304,7 +301,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         Returns the path to the downloaded model, or None if the model is not
         downloaded from ModelScope."""
-        if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+        if envs.SGLANG_USE_MODELSCOPE.value:
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
             # pylint: disable=C.
@@ -603,7 +600,7 @@ class DummyModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
 
-        if get_bool_env_var("SGL_CPU_QUANTIZATION"):
+        if envs.SGLANG_CPU_QUANTIZATION.value:
             return load_model_with_cpu_quantization(
                 self, model_config=model_config, device_config=device_config
             )

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
+from sglang.environ import envs
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
@@ -14,14 +15,13 @@ from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.managers.utils import DPBalanceMeta
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
-from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
-RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
+RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.value
 
 
 class KvMetrics:

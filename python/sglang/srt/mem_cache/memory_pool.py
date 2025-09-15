@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,8 +14,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-
-from __future__ import annotations
 
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -36,9 +36,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.environ import envs
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -428,9 +429,7 @@ class MHATokenToKVPool(KVCache):
         self.head_dim = head_dim
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
-        )
+        self.enable_custom_mem_pool = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.value
         if self.enable_custom_mem_pool:
             # TODO(shangming): abstract custom allocator class for more backends
             from mooncake.allocator import NVLinkAllocator
@@ -1046,9 +1045,7 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
-        )
+        self.enable_custom_mem_pool = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.value
         if self.enable_custom_mem_pool:
             # TODO(shangming): abstract custom allocator class for more backends
             from mooncake.allocator import NVLinkAllocator

@@ -88,13 +88,13 @@ class TestMSCCLAllReduce(CustomTestCase):
         # 1KB to 1MB
         cls.test_sizes = [512, 4096, 32768, 262144, 524288]
         cls.world_sizes = [8]
-        TEST_TP16 = int(os.getenv("SGL_MSCCLPP_TEST_TP16", "0"))
+        TEST_TP16 = int(os.getenv("SGLANG_MSCCLPP_TEST_TP16", "0"))
         if TEST_TP16:
             cls.world_sizes = [16]
         cls.test_loop = 10
 
     def test_graph_allreduce(self):
-        TEST_MASTER_ADDR = os.getenv("SGL_MSCCLPP_TEST_MASTER_ADDR", "localhost")
+        TEST_MASTER_ADDR = os.getenv("SGLANG_MSCCLPP_TEST_MASTER_ADDR", "localhost")
         for world_size in self.world_sizes:
             if world_size not in [8, 16]:
                 continue
@@ -103,7 +103,7 @@ class TestMSCCLAllReduce(CustomTestCase):
             )
 
     def test_eager_allreduce(self):
-        TEST_MASTER_ADDR = os.getenv("SGL_MSCCLPP_TEST_MASTER_ADDR", "localhost")
+        TEST_MASTER_ADDR = os.getenv("SGLANG_MSCCLPP_TEST_MASTER_ADDR", "localhost")
         for world_size in self.world_sizes:
             if world_size not in [8, 16]:
                 continue

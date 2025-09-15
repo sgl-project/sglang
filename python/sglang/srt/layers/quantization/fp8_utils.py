@@ -2,6 +2,7 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.environ import envs
 from sglang.srt import offloader
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
@@ -29,20 +30,19 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.utils import (
     align,
-    ceil_div,
-    get_bool_env_var,
     get_cuda_version,
     get_device_capability,
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_use_aiter,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = is_use_aiter()
 
 if _use_aiter:
     import aiter
@@ -53,8 +53,8 @@ if _use_aiter:
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
-use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
-use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
+use_vllm_cutlass_w8a8_fp8_kernel = envs.USE_VLLM_CUTLASS_W8A8_FP8_KERNEL.value
+use_triton_w8a8_fp8_kernel = envs.USE_TRITON_W8A8_FP8_KERNEL
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
@@ -117,7 +117,7 @@ def normalize_e4m3fn_to_e4m3fnuz(
 
 # TODO(ch-wan): define these backends in --moe-runner-backend
 def cutlass_block_fp8_supported() -> bool:
-    if not get_bool_env_var("SGLANG_SUPPORT_CUTLASS_BLOCK_FP8"):
+    if not envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.value:
         return False
     if _is_cuda:
         major, minor = torch.cuda.get_device_capability()
@@ -130,10 +130,11 @@ def cutlass_block_fp8_supported() -> bool:
 
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
 ENABLE_FLASHINFER_GEMM = (
-    get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
+    envs.SGLANG_ENABLE_FLASHINFER_GEMM.value
     and is_sm100_supported()
     and is_flashinfer_available()
 )
+
 if ENABLE_FLASHINFER_GEMM:
     from flashinfer.gemm import gemm_fp8_nt_groupwise
 
@@ -553,8 +554,7 @@ def apply_fp8_linear(
     # as it breaks with dynamic shapes.
     if pad_output is None:
         pad_output = (
-            not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
-            and not cutlass_fp8_supported
+            not envs.SGLANG_ENABLE_TORCH_COMPILE.value and not cutlass_fp8_supported
         )
     output_padding = 17 if pad_output else None
 

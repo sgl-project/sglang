@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from sglang.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
@@ -348,7 +349,7 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
 class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TEST_RETRACT"] = "true"
+        envs.SGLANG_TEST_RETRACT.set(True)
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname

@@ -57,6 +57,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.environ import envs
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
@@ -71,7 +72,6 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
-    get_bool_env_var,
     kill_process_tree,
     require_mlp_sync,
     require_mlp_tp_gather,
@@ -513,7 +513,7 @@ def latency_test(
     initialize_moe_config(server_args)
 
     # Set CPU affinity
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+    if envs.SGLANG_SET_CPU_AFFINITY.value:
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)
 
     # Configure the logger

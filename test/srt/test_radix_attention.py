@@ -1,9 +1,9 @@
-import os
 import random
 import unittest
 
 import requests
 
+from sglang.environ import envs
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -132,5 +132,5 @@ class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
 
 
 if __name__ == "__main__":
-    os.environ["SGLANG_TEST_RETRACT"] = "true"
+    envs.SGLANG_TEST_RETRACT.set(True)
     unittest.main()

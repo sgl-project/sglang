@@ -1,6 +1,7 @@
 import os
 import time
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
@@ -18,8 +19,8 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        cls._exit_stack = ExitStack()
+        cls._exit_stack.enter_context(envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False))
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
@@ -101,8 +102,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        cls._exit_stack = ExitStack()
+        cls._exit_stack.enter_context(envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False))
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)

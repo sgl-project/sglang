@@ -24,6 +24,7 @@ import sys
 import tempfile
 from typing import List, Literal, Optional, Union
 
+from sglang.environ import envs
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
@@ -897,15 +898,9 @@ class ServerArgs:
             )
 
         # Propagate env vars
-        os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
-            "1" if self.enable_torch_compile else "0"
-        )
+        envs.SGLANG_ENABLE_TORCH_COMPILE.set(self.enable_torch_compile)
+        envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(self.disable_outlines_disk_cache)
         os.environ["SGLANG_MAMBA_SSM_DTYPE"] = self.mamba_ssm_dtype
-
-        # Set env var before grammar backends init
-        os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
-            "1" if self.disable_outlines_disk_cache else "0"
-        )
 
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(

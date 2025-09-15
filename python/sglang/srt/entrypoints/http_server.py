@@ -31,6 +31,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
 import setproctitle
 
+from sglang.environ import envs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 
 # Fix a bug of Python threading
@@ -111,7 +112,6 @@ from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
-    get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
@@ -289,7 +289,7 @@ async def lifespan(fast_api_app: FastAPI):
 # Fast API
 app = FastAPI(
     lifespan=lifespan,
-    openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
+    openapi_url=None if envs.DISABLE_OPENAPI_DOC.value else "/openapi.json",
 )
 app.add_middleware(
     CORSMiddleware,

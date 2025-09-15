@@ -15,13 +15,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
 from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_int_env_var,
-    is_hip,
-    is_npu,
-    load_json_config,
-)
+from sglang.srt.utils import get_int_env_var, is_hip, is_npu, load_json_config
 
 _is_npu = is_npu()
 
@@ -43,8 +37,9 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_use_aiter
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter = is_use_aiter()
 
 logger = logging.getLogger(__name__)
 

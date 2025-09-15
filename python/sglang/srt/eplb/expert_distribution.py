@@ -30,7 +30,7 @@ import torch.distributed
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_bool_env_var, is_npu
+from sglang.srt.utils import Withable, is_npu
 
 _is_npu = is_npu()
 

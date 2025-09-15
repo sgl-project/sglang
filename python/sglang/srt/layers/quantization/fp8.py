@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.environ import envs
+
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
@@ -69,13 +71,13 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
+    is_use_aiter,
     log_info_on_rank0,
     next_power_of_2,
     print_warning_once,
@@ -100,8 +102,8 @@ _is_cpu = is_cpu()
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
-_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_hip_int4 = envs.SGLANG_INT4_WEIGHT.value
+_use_aiter = is_use_aiter()
 
 if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter import ActivationType, QuantType
@@ -220,7 +222,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
         if _is_cuda and MARLIN_FP8_AVAILABLE:
-            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            force_marlin = envs.SGLANG_FORCE_FP8_MARLIN.value
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
 
@@ -990,7 +992,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
             layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
-        elif get_bool_env_var("SGLANG_MOE_PADDING"):
+        elif envs.SGLANG_MOE_PADDING.value:
             # If ROCm, apply weight padding (min. Mem channel contention) only if set
             layer.w13_weight = torch.nn.Parameter(
                 F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
