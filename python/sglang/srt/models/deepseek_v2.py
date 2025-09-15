@@ -672,7 +672,9 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_batch=forward_batch,
                 # SBO args
-                forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
+                forward_shared_experts=lambda: self._forward_shared_experts(
+                    hidden_states
+                ),
                 experts=self.experts,
                 alt_stream=self.alt_stream,
             ),
