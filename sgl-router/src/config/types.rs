@@ -101,6 +101,11 @@ pub enum RoutingMode {
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
     },
+    #[serde(rename = "openai")]
+    OpenAI {
+        /// OpenAI-compatible API base(s), provided via worker URLs
+        worker_urls: Vec<String>,
+    },
 }
 
 impl RoutingMode {
@@ -116,6 +121,8 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
+            // OpenAI mode represents a single upstream
+            RoutingMode::OpenAI { .. } => 1,
         }
     }
 
@@ -380,6 +387,7 @@ impl RouterConfig {
         match self.mode {
             RoutingMode::Regular { .. } => "regular",
             RoutingMode::PrefillDecode { .. } => "prefill_decode",
+            RoutingMode::OpenAI { .. } => "openai",
         }
     }
 
