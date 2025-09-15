@@ -10,7 +10,6 @@ import torch
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.evict_policy import EvictionStrategy, LFUStrategy, LRUStrategy
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -40,7 +39,7 @@ class HiRadixCache(RadixCache):
         hicache_io_backend: str,
         hicache_mem_layout: str,
         enable_metrics: bool,
-        hicache_eviction_policy: str = "lru",
+        eviction_policy: str = "lru",
         hicache_storage_backend: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
         model_name: Optional[str] = None,
@@ -119,16 +118,13 @@ class HiRadixCache(RadixCache):
             1 if hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
-        if hicache_eviction_policy.lower() == "lru":
-            self.eviction_strategy: EvictionStrategy = LRUStrategy()
-        elif hicache_eviction_policy.lower() == "lfu":
-            self.eviction_strategy: EvictionStrategy = LFUStrategy()
-        else:
-            raise ValueError(
-                f"Unknown eviction policy: {hicache_eviction_policy}. Supported policies: 'lru', 'lfu'."
-            )
+
         super().__init__(
-            req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            page_size,
+            disable=False,
+            eviction_policy=eviction_policy,
         )
 
     def reset(self):

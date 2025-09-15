@@ -642,11 +642,11 @@ class Scheduler(
                         else self.tp_cpu_group
                     ),
                     page_size=self.page_size,
+                    eviction_policy=server_args.eviction_policy,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
                     hicache_io_backend=server_args.hicache_io_backend,
-                    hicache_eviction_policy=server_args.hicache_eviction_policy,
                     hicache_mem_layout=server_args.hicache_mem_layout,
                     enable_metrics=self.enable_metrics,
                     hicache_storage_backend=server_args.hicache_storage_backend,
@@ -695,6 +695,7 @@ class Scheduler(
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
+                    eviction_policy=server_args.eviction_policy,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -703,6 +704,7 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
+                    eviction_policy=server_args.eviction_policy,
                 )
 
         self.decode_mem_cache_buf_multiplier = (

@@ -179,6 +179,7 @@ class ServerArgs:
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
+    eviction_policy: str = "lru"
 
     # Runtime options
     device: Optional[str] = None
@@ -309,7 +310,6 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
-    hicache_eviction_policy: str = "lru"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
@@ -1836,10 +1836,10 @@ class ServerArgs:
             help="The write policy of hierarchical cache.",
         )
         parser.add_argument(
-            "--hicache-eviction-policy",
+            "--eviction-policy",
             type=str,
             choices=["lru", "lfu"],
-            default=ServerArgs.hicache_eviction_policy,
+            default=ServerArgs.eviction_policy,
             help="The eviction policy of hierarchical cache. 'lru' stands for "
             "Least Recently Used, 'lfu' stands for Least Frequently Used.",
         )
