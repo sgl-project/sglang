@@ -62,7 +62,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
-        cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1")
+        cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,2,8,16")
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "1024"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "16"))
 
@@ -135,7 +135,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
 
                         # because the profile_id dir under PROFILE_DIR
                         extend_trace_file_relative_path_from_profile_dir = trace_dir[
-                            trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1 :
+                            trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1:
                         ]
 
                         model_results.append(
