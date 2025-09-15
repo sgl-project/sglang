@@ -2,16 +2,23 @@
 Batch the same prompt in random batch sizes, and test if the results are consistent across different trials.
 
 Usage:
-python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials>
+python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials> --test-mode <simple|hard>
 """
 
 import argparse
 import dataclasses
 import json
+import os
 import random
 
 import numpy as np
 import requests
+
+PROMPT_1 = "Tell me about Richard Feynman: "
+PROMPT_2 = "Generate 1000 random numbers. Go directly into it, don't say Sure and don't say here are numbers. Just start with a number."
+dirpath = os.path.dirname(__file__)
+with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
+    LONG_PROMPT = f.read()
 
 
 @dataclasses.dataclass
@@ -24,8 +31,8 @@ class BenchArgs:
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     return_logprob: bool = False
-    prompt: str = "Tell me about Richard Feynman: "
     stream: bool = False
+    test_mode: str = "simple"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -43,8 +50,13 @@ class BenchArgs:
             "--presence-penalty", type=float, default=BenchArgs.presence_penalty
         )
         parser.add_argument("--return-logprob", action="store_true")
-        parser.add_argument("--prompt", type=str, default=BenchArgs.prompt)
         parser.add_argument("--stream", action="store_true")
+        parser.add_argument(
+            "--test-mode",
+            type=str,
+            default=BenchArgs.test_mode,
+            choices=["simple", "hard"],
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -52,10 +64,9 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def send_one_prompt(args, batch_size: int):
+def send_simple(args, batch_size: int):
 
-    prompt = args.prompt
-    prompt = [prompt] * batch_size
+    prompt = [PROMPT_1] * batch_size
 
     json_data = {
         "text": prompt,
@@ -84,30 +95,102 @@ def send_one_prompt(args, batch_size: int):
                 ret = json.loads(chunk[5:].strip("\n"))
     else:
         ret = response.json()
-
     ret = ret[0]
 
     if response.status_code != 200:
         print(ret)
-        return 0, 0
+        return -1
 
     return ret["text"]
+
+
+def send_hard(args, batch_size: int):
+    send_long_prompt = batch_size % 10 == 0
+    if send_long_prompt:
+        num_prompt_1 = random.randint(1, batch_size - 1)
+        num_prompt_2 = batch_size - 1 - num_prompt_1
+    else:
+        num_prompt_1 = random.randint(1, batch_size)
+        num_prompt_2 = batch_size - num_prompt_1
+
+    json_data = {
+        "text": [PROMPT_1] * num_prompt_1
+        + [PROMPT_2] * num_prompt_2
+        + [LONG_PROMPT] * int(send_long_prompt),
+        "sampling_params": {
+            "temperature": args.temperature,
+            "max_new_tokens": args.max_new_tokens,
+            "frequency_penalty": args.frequency_penalty,
+            "presence_penalty": args.presence_penalty,
+        },
+        "return_logprob": args.return_logprob,
+        "stream": args.stream,
+    }
+
+    response = requests.post(
+        f"http://{args.host}:{args.port}/generate",
+        json=json_data,
+        stream=args.stream,
+    )
+    ret = response.json()
+    if response.status_code != 200:
+        print(ret)
+        return -1, -1, -1
+
+    prompt_1_ret = [ret[i]["text"] for i in range(num_prompt_1)]
+    prompt_2_ret = [
+        ret[i]["text"] for i in range(num_prompt_1, num_prompt_1 + num_prompt_2)
+    ]
+    long_prompt_ret = [ret[-1]["text"]] if send_long_prompt else None
+
+    return prompt_1_ret, prompt_2_ret, long_prompt_ret
 
 
 def test_deterministic(args):
     # First do some warmups
     for i in range(3):
-        send_one_prompt(args, 16)
+        send_simple(args, 16)
 
-    texts = []
-    for i in range(1, args.n_trials + 1):
-        batch_size = i
-        text = send_one_prompt(args, batch_size)
-        text = text.replace("\n", " ")
-        print(f"Trial {i} with batch size {batch_size}: {text}")
-        texts.append(text)
+    if args.test_mode == "simple":
+        # In simple mode, we test the deterministic behavior by sending the same prompt in batch sizes ranging from 1 to n_trials.
+        texts = []
+        for i in range(1, args.n_trials + 1):
+            batch_size = i
+            text = send_simple(args, batch_size)
+            text = text.replace("\n", " ")
+            print(f"Trial {i} with batch size {batch_size}: {text}")
+            texts.append(text)
 
-    print(f"Total samples: {len(texts)}, Unique samples: {len(set(texts))}")
+        print(f"Total samples: {len(texts)}, Unique samples: {len(set(texts))}")
+    elif args.test_mode == "hard":
+        # In hard mode, we send a mixture of two short prompts and one long prompt in the same batch with batch size ranging from 1 to n_trials.
+        output_prompt_1 = []
+        output_prompt_2 = []
+        output_long_prompt = []
+        for i in range(1, args.n_trials + 1):
+            batch_size = i
+            ret_prompt_1, ret_prompt_2, ret_long_prompt = send_hard(args, batch_size)
+            output_prompt_1.extend(ret_prompt_1)
+            output_prompt_2.extend(ret_prompt_2)
+            if ret_long_prompt is not None:
+                output_long_prompt.extend(ret_long_prompt)
+
+            print(
+                f"Testing Trial {i} with batch size {batch_size}, number of prompt 1: {len(ret_prompt_1)}, number of prompt 2: {len(ret_prompt_2)}, number of long prompt: {int(ret_long_prompt is not None)}"
+            )
+
+        print(
+            f"Prompt 1: total samples: {len(output_prompt_1)}, Unique samples: {len(set(output_prompt_1))}"
+        )
+        print(
+            f"Prompt 2: total samples: {len(output_prompt_2)}, Unique samples: {len(set(output_prompt_2))}"
+        )
+        print(
+            f"Long prompt: total samples: {len(output_long_prompt)}, Unique samples: {len(set(output_long_prompt))}"
+        )
+
+    else:
+        raise ValueError(f"Invalid test mode: {args.test_mode}")
 
 
 if __name__ == "__main__":
