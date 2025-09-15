@@ -211,18 +211,21 @@ impl RouterManager {
         }
 
         // Create worker based on type
-        // Note: For prefill and decode workers, we can't easily add labels after creation
-        // since they return Box<dyn Worker>. We'll need to enhance WorkerFactory in the future.
         let worker = match config.worker_type.as_deref() {
             Some("prefill") => {
-                // For now, prefill workers won't have custom labels
-                // TODO: Enhance WorkerFactory to accept labels for prefill workers
-                WorkerFactory::create_prefill(config.url.clone(), config.bootstrap_port)
+                WorkerFactory::create_prefill_with_labels(
+                    config.url.clone(),
+                    config.bootstrap_port,
+                    labels.clone(),
+                    CircuitBreakerConfig::default(),
+                )
             }
             Some("decode") => {
-                // For now, decode workers won't have custom labels
-                // TODO: Enhance WorkerFactory to accept labels for decode workers
-                WorkerFactory::create_decode(config.url.clone())
+                WorkerFactory::create_decode_with_labels(
+                    config.url.clone(),
+                    labels.clone(),
+                    CircuitBreakerConfig::default(),
+                )
             }
             _ => {
                 // Regular workers can have labels
