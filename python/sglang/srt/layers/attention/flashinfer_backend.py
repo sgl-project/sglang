@@ -26,11 +26,14 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import is_flashinfer_available, next_power_of_2
+from sglang.srt.utils import (
+    is_flashinfer_available,
+    is_sm100_supported,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -122,6 +125,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
+            # different from flashinfer zero_init_global_workspace_buffer
             global_workspace_buffer = torch.empty(
                 global_config.flashinfer_workspace_size,
                 dtype=torch.uint8,
@@ -497,8 +501,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 window_left=layer.sliding_window_size,
                 logits_soft_cap=logits_soft_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
             )
         else:
             causal = True
@@ -576,8 +581,9 @@ class FlashInferAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
-            k_scale=layer.k_scale,
-            v_scale=layer.v_scale,
+            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -870,6 +876,8 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         if use_ragged:
+            # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
+            # and forward_batch.extend_seq_lens_cpu
             paged_kernel_lens = prefix_lens
             paged_kernel_lens_sum = paged_kernel_lens.sum().item()
         else:
@@ -1260,11 +1268,12 @@ def should_use_tensor_core(
     # Calculate GQA group size
     gqa_group_size = num_attention_heads // num_kv_heads
 
-    # Determine based on dtype and GQA group size
+    # For Flashinfer, a GQA group size of at least 4 is needed to efficiently
+    # use Tensor Cores, as it fuses the head group with the token dimension in MMA.
     if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         return True
     elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
-        return gqa_group_size > 4
+        return gqa_group_size >= 4
     else:
         return False
 
@@ -1369,7 +1378,14 @@ def fast_decode_plan(
 
         if self.use_tensor_cores:
             # ALSO convert last_page_len to CPU
-            last_page_len_host = last_page_len.cpu()
+            if page_size == 1:
+                # When page size is 1, last_page_len is always 1.
+                # Directly construct the host tensor rather than executing a device-to-host copy.
+                last_page_len_host = torch.ones(
+                    (batch_size,), dtype=torch.int32, device="cpu"
+                )
+            else:
+                last_page_len_host = last_page_len.cpu()
 
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 

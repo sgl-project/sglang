@@ -27,7 +27,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.dp_attention import (
-    DPPaddingMode,
+    DpPaddingMode,
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -35,7 +35,12 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_size,
+    get_dp_device,
+    get_dp_dtype,
+    get_dp_hidden_size,
+    get_global_dp_buffer,
     get_local_attention_dp_size,
+    set_dp_buffer_len,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -44,9 +49,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import dump_to_file, use_intel_amx_backend
+from sglang.srt.utils import dump_to_file, is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 @dataclasses.dataclass
@@ -59,13 +66,16 @@ class LogitsProcessorOutput:
     hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
-    # The logprobs of the next tokens.                              shape: [#seq]
+    # he log probs of output tokens, if RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
-    next_token_token_ids_logprobs_val: Optional[List] = None
+    # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
+    next_token_token_ids_logprobs_val: Optional[
+        List[Union[List[float], torch.Tensor]]
+    ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -108,14 +118,12 @@ class LogitsMetadata:
     # The start position of local hidden states.
     dp_local_start_pos: Optional[torch.Tensor] = None
     dp_local_num_tokens: Optional[torch.Tensor] = None
-    gathered_buffer: Optional[torch.Tensor] = None
-    # Buffer to gather logits from all ranks.
-    forward_batch_gathered_buffer: Optional[torch.Tensor] = None
+    global_dp_buffer_len: Optional[int] = None
     # Number of tokens to sample per DP rank
     global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The gather mode for DP attention
-    dp_padding_mode: Optional[DPPaddingMode] = None
+    dp_padding_mode: Optional[DpPaddingMode] = None
     # for padding
     padded_static_len: int = -1
 
@@ -164,11 +172,10 @@ class LogitsMetadata:
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
-            gathered_buffer=forward_batch.gathered_buffer,
-            forward_batch_gathered_buffer=forward_batch.gathered_buffer,
+            global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DPPaddingMode.SUM_LEN,
+            dp_padding_mode=DpPaddingMode.SUM_LEN,
         )
 
     def compute_dp_attention_metadata(self):
@@ -181,23 +188,28 @@ class LogitsMetadata:
             )
         else:
             dp_local_start_pos = cumtokens[dp_rank - 1]
-        dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = dp_local_num_tokens
+        self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+
+        hidden_size = get_dp_hidden_size()
+        dtype = get_dp_dtype()
+        device = get_dp_device()
 
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage
-            self.gathered_buffer = torch.empty(
-                (
-                    sum(self.global_num_tokens_for_logprob_cpu),
-                    self.gathered_buffer.shape[1],
-                ),
-                dtype=self.gathered_buffer.dtype,
-                device=self.gathered_buffer.device,
-            )
+            self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
         else:
-            self.gathered_buffer = torch.empty_like(self.gathered_buffer)
+            self.global_dp_buffer_len = self.global_dp_buffer_len
+
+        self.gathered_buffer = torch.empty(
+            (
+                self.global_dp_buffer_len,
+                hidden_size,
+            ),
+            dtype=dtype,
+            device=device,
+        )
 
 
 class LogitsProcessor(nn.Module):
@@ -519,7 +531,12 @@ class LogitsProcessor(nn.Module):
             logits = logits[:, : self.config.vocab_size].float()
 
         if self.final_logit_softcapping:
-            fused_softcap(logits, self.final_logit_softcapping)
+            if not _is_npu:
+                fused_softcap(logits, self.final_logit_softcapping)
+            else:
+                logits = self.final_logit_softcapping * torch.tanh(
+                    logits / self.final_logit_softcapping
+                )
 
         return logits
 

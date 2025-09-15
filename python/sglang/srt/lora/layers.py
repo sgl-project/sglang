@@ -66,6 +66,15 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         lora_backend: BaseLoRABackend,
     ) -> None:
         super().__init__(base_layer, lora_backend)
+        shard_size = self.base_layer.output_partition_sizes[0]
+        self.output_offset = torch.tensor(
+            [
+                0,
+                shard_size,
+            ],
+            dtype=torch.int32,
+            device=next(self.base_layer.parameters()).device,
+        )
 
     def set_lora_info(
         self,
@@ -81,6 +90,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
             weights=self.B_buffer,
+            output_offset=self.output_offset,
             base_output=base_output,
         )
         return lora_output
@@ -130,11 +140,23 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.A_buffer_gate_up = A_buffer
         self.B_buffer_gate_up = B_buffer
 
+        shard_size = self.base_layer.output_partition_sizes[0]
+        self.output_offset = torch.tensor(
+            [
+                0,
+                shard_size,
+                2 * shard_size,
+            ],
+            dtype=torch.int32,
+            device=next(self.base_layer.parameters()).device,
+        )
+
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_output = self.lora_backend.run_gate_up_lora(
             x=x,
             gate_up_lora_a=self.A_buffer_gate_up,
             gate_up_lora_b=self.B_buffer_gate_up,
+            output_offset=self.output_offset,
             base_output=base_output,
         )
         return lora_output
@@ -243,17 +265,27 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
+        output_size = self.base_layer.output_size
+        self.output_offset = torch.tensor(
+            [
+                0,
+                output_size,
+            ],
+            dtype=torch.int32,
+            device=next(self.base_layer.parameters()).device,
+        )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
             weights=self.B_buffer,
+            output_offset=self.output_offset,
             base_output=base_output,
         )
         return lora_output
 
-    def forward(self, input_: torch.Tensor):
+    def forward(self, input_: torch.Tensor, skip_all_reduce=False):
         # duplicate the logic in RowParallelLinear
         if self.base_layer.input_is_parallel:
             input_parallel = input_
@@ -270,7 +302,11 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         if self.set_lora:
             output_parallel = self.apply_lora(output_parallel, input_parallel)
 
-        if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
+        if (
+            self.base_layer.reduce_results
+            and self.base_layer.tp_size > 1
+            and not skip_all_reduce
+        ):
             output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output_ = output_parallel

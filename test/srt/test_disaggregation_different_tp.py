@@ -1,26 +1,21 @@
 import os
-import subprocess
 import time
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-import requests
-
-from sglang.environ import envs
-from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_pd_server,
 )
 
 
-class TestDisaggregationMooncakePrefillLargerTP(CustomTestCase):
+class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         # Temporarily disable JIT DeepGEMM
@@ -47,25 +42,7 @@ class TestDisaggregationMooncakePrefillLargerTP(CustomTestCase):
         cls.wait_server_ready(cls.prefill_url + "/health")
         cls.wait_server_ready(cls.decode_url + "/health")
 
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang.srt.disaggregation.mini_lb",
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
-
-        print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        cls.wait_server_ready(cls.lb_url + "/health")
+        cls.launch_lb()
 
     @classmethod
     def start_prefill(cls):
@@ -105,36 +82,6 @@ class TestDisaggregationMooncakePrefillLargerTP(CustomTestCase):
             other_args=decode_args,
         )
 
-    @classmethod
-    def wait_server_ready(cls, url, timeout=60):
-        start_time = time.perf_counter()
-        while True:
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    print(f"Server {url} is ready")
-                    return
-            except Exception:
-                pass
-
-            if time.perf_counter() - start_time > timeout:
-                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
-            time.sleep(1)
-
-    @classmethod
-    def tearDownClass(cls):
-        # Restore JIT DeepGEMM environment variable
-        cls._exit_stack.close()
-
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
-            if process:
-                try:
-                    kill_process_tree(process.pid)
-                except Exception as e:
-                    print(f"Error killing process {process.pid}: {e}")
-        # wait for 5 seconds
-        time.sleep(5)
-
     def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=5,
@@ -151,7 +98,7 @@ class TestDisaggregationMooncakePrefillLargerTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-class TestDisaggregationMooncakeDecodeLargerTP(CustomTestCase):
+class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         # Temporarily disable JIT DeepGEMM
@@ -178,25 +125,7 @@ class TestDisaggregationMooncakeDecodeLargerTP(CustomTestCase):
         cls.wait_server_ready(cls.prefill_url + "/health")
         cls.wait_server_ready(cls.decode_url + "/health")
 
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang.srt.disaggregation.mini_lb",
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
-
-        print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        cls.wait_server_ready(cls.lb_url + "/health")
+        cls.launch_lb()
 
     @classmethod
     def start_prefill(cls):
@@ -235,36 +164,6 @@ class TestDisaggregationMooncakeDecodeLargerTP(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
         )
-
-    @classmethod
-    def wait_server_ready(cls, url, timeout=60):
-        start_time = time.perf_counter()
-        while True:
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    print(f"Server {url} is ready")
-                    return
-            except Exception:
-                pass
-
-            if time.perf_counter() - start_time > timeout:
-                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
-            time.sleep(1)
-
-    @classmethod
-    def tearDownClass(cls):
-        # Restore JIT DeepGEMM environment variable
-        cls._exit_stack.close()
-
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
-            if process:
-                try:
-                    kill_process_tree(process.pid)
-                except Exception as e:
-                    print(f"Error killing process {process.pid}: {e}")
-        # wait for 5 seconds
-        time.sleep(5)
 
     def test_gsm8k(self):
         args = SimpleNamespace(

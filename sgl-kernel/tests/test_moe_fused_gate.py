@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
     ],
 )
 @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
-@pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [True, False])
+@pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
 def test_moe_fused_gate_combined(
     seq_length, params, num_fused_shared_experts, apply_routed_scaling_factor_on_output
 ):
