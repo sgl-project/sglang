@@ -26,8 +26,6 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
-logger = logging.getLogger(__name__)
-
 if is_cuda():
     from sgl_kernel import (
         fast_topk,

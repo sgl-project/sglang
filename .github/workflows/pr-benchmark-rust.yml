@@ -9,7 +9,7 @@ on:
     branches: [ main ]
     paths:
       - "sgl-router/**"
-    types: [opened, synchronize, reopened, labeled]
+    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -24,11 +24,11 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+
 jobs:
   # Quick check job that always runs on PRs
   benchmark-compile-check:
     name: Benchmark Compilation Check
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
