@@ -261,7 +261,10 @@ class MooncakeStore(HiCacheStorage):
             self.mem_pool_host.layer_num
             * self.mem_pool_host.dtype.itemsize
             * self.mem_pool_host.page_size
-            * (self.mem_pool_host.kv_lora_rank + self.mem_pool_host.qk_rope_head_dim)
+            * (
+                self.mem_pool_host.kv_lora_rank
+               + self.mem_pool_host.qk_rope_head_dim
+            )
         )
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
@@ -320,7 +323,6 @@ class MooncakeStore(HiCacheStorage):
         set_buffer_ptrs = []
         set_buffer_sizes = []
         set_indices = []
-        #
         set_results = [-1] * len(keys)
         for i in range(len(keys)):
             if exist_result[i] != 1:
