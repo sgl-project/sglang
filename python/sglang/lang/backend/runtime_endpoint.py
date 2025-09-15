@@ -113,7 +113,6 @@ class RuntimeEndpoint(BaseBackend):
         )
         self._assert_success(res)
 
-    # not used anywhere?
     def fill_image(self, s: StreamExecutor):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
         self._add_images(s, data)
@@ -228,7 +227,6 @@ class RuntimeEndpoint(BaseBackend):
         self._add_images(s, data)
         self._add_videos(s, data)
 
-
         res = http_request(
             self.base_url + "/generate",
             json=data,
@@ -291,9 +289,9 @@ class RuntimeEndpoint(BaseBackend):
             if s.text_.endswith(healed_token_str):
                 healed_token_logprob = input_token_logprobs[i][0][0]
                 normalized_prompt_logprobs[i] = (
-                    normalized_prompt_logprobs[i] * len(input_token_logprobs[i])
-                    - healed_token_logprob
-                ) / (len(input_token_logprobs[i]) - 1)
+                                                    normalized_prompt_logprobs[i] * len(input_token_logprobs[i])
+                                                    - healed_token_logprob
+                                                ) / (len(input_token_logprobs[i]) - 1)
                 input_token_logprobs[i] = input_token_logprobs[i][1:]
 
         # Compute unconditional logprobs if required
@@ -347,9 +345,8 @@ class RuntimeEndpoint(BaseBackend):
             data["image_data"] = s.images_[0][1]
 
     def _add_videos(self, s: StreamExecutor, data):
-        if s.videos:
-            assert len(s.videos) == 1, "Only support one video."
-            data["video_data"] = s.videos
+        if s.videos_:
+            data["video_data"] = data.get("video_data", []) + [s.videos_]
 
     def _assert_success(self, res):
         if res.status_code != 200:

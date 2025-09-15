@@ -285,7 +285,7 @@ class StreamExecutor:
         # For vision
         self.images_ = []
         self.cur_images = []
-        self.videos = []
+        self.videos_ = []
 
 
         # For fork/join
@@ -373,7 +373,7 @@ class StreamExecutor:
             exes[i].cur_role_begin_pos = self.cur_role_begin_pos
             exes[i].fork_start_text_pos = len(self.text_)
             exes[i].images_ = list(self.images_)
-            exes[i].videos = list(self.videos)
+            exes[i].videos_ = list(self.videos_)
 
             # TODO(ying): handle API speculative execution
 
@@ -510,10 +510,8 @@ class StreamExecutor:
 
     def _execute_video(self, expr: SglVideo):
         path = expr.path
-        # TODO: do we still need this?
-        _num_frames = expr.num_frames
 
-        self.videos.append(path)
+        self.videos_.append(path)
         self.text_ += self.chat_template.video_token
 
     def _spec_gen(self, sampling_params):
