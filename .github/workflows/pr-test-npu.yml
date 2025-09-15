@@ -15,7 +15,7 @@ on:
       - "scripts/ci/**"
       - "test/**"
       - ".github/workflows/pr-test-npu.yml"
-    types: [opened, synchronize, reopened, labeled]
+    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:

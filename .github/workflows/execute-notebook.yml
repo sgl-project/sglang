@@ -6,7 +6,7 @@ on:
     paths:
       - "python/sglang/**"
       - "docs/**"
-    types: [opened, synchronize, reopened, labeled]
+    types: [synchronize, labeled]
   workflow_dispatch:
 
 
