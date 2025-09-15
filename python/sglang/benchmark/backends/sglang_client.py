@@ -107,7 +107,6 @@ class SglangClient(BaseBackendClient):
                 output.success = False
                 exc_info = sys.exc_info()
                 output.error = "".join(traceback.format_exception(*exc_info))
-                print(f"{output.error=}")
 
         if pbar:
             pbar.update(1)

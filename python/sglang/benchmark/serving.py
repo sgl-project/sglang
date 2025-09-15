@@ -3,7 +3,6 @@ import asyncio
 import json
 import random
 import sys
-from argparse import ArgumentParser
 from types import SimpleNamespace
 
 import click
