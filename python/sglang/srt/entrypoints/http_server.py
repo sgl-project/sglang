@@ -27,9 +27,11 @@ import tempfile
 import threading
 import time
 from http import HTTPStatus
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
 import setproctitle
+
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -73,6 +75,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -80,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
@@ -92,6 +96,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerManager,
+    MultiTokenizerRouter,
     get_main_process_id,
     monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
@@ -123,7 +128,9 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: TokenizerManager
+    tokenizer_manager: Union[
+        TokenizerManager, MultiTokenizerRouter, MultiTokenizerManager
+    ]
     template_manager: TemplateManager
     scheduler_info: Dict
 
@@ -177,6 +184,13 @@ async def init_multi_tokenizer() -> ServerArgs:
             scheduler_info=scheduler_info,
         )
     )
+
+    if server_args.enable_trace:
+        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "null":
+            thread_label = f"MultiTokenizer-{tokenizer_manager.worker_id}"
+            trace_set_thread_info(thread_label)
+
     return server_args
 
 
@@ -668,6 +682,38 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+@app.post("/init_weights_send_group_for_remote_instance")
+async def init_weights_send_group_for_remote_instance(
+    obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/send_weights_to_remote_instance")
+async def send_weights_to_remote_instance(
+    obj: SendWeightsToRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/init_weights_update_group")
@@ -1168,6 +1214,12 @@ def launch_server(
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
         )
+
+        if server_args.enable_trace:
+            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+            if server_args.disaggregation_mode == "null":
+                thread_label = "Tokenizer"
+                trace_set_thread_info(thread_label)
 
     set_global_state(
         _GlobalState(

@@ -365,7 +365,20 @@ def _handle_output_by_index(output, i):
 class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for MultiTokenizerManager and DetokenizerManager"""
 
-    def multi_http_worker_event_loop(self, detokenizer_worker_num):
+    def get_worker_ids_from_req_rids(self, rids):
+        if isinstance(rids, list):
+            worker_ids = [int(rid.split("_")[0]) for rid in rids]
+        elif isinstance(rids, str):
+            worker_ids = [int(rids.split("_")[0])]
+        else:
+            worker_ids = []
+        return worker_ids
+
+    def maybe_clear_socket_mapping(self):
+        if hasattr(self, "socket_mapping"):
+            self.socket_mapping.clear_all_sockets()
+
+    def multi_http_worker_event_loop(self):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
