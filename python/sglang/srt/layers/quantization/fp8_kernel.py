@@ -483,7 +483,7 @@ def sglang_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
-    enable_v2: bool = get_bool_env_var("SGLANG_PER_TOKEN_GROUP_QUANT_FP8_V2"),
+    enable_v2: Optional[bool] = None,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -538,6 +538,7 @@ def sglang_per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
 ):
     from sglang.srt.layers.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
@@ -553,6 +554,7 @@ def sglang_per_token_group_quant_8bit(
             group_size=group_size,
             eps=eps,
             dtype=dst_dtype,
+            enable_v2=enable_v2,
         )
 
     return sglang_per_token_group_quant_fp8(
@@ -564,6 +566,7 @@ def sglang_per_token_group_quant_8bit(
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
+        enable_v2=enable_v2,
     )
 
 

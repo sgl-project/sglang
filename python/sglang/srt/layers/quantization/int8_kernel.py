@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_device_name, is_cuda
+from sglang.srt.utils import get_device_name, is_cuda, get_bool_env_var
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -193,6 +193,7 @@ def sglang_per_token_group_quant_int8(
     group_size: int,
     eps: float = 1e-10,
     dtype: torch.dtype = torch.int8,
+    enable_v2: Optional[bool] = None,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -210,7 +211,7 @@ def sglang_per_token_group_quant_int8(
         dtype=torch.float32,
     )
 
-    sgl_per_token_group_quant_8bit(x, x_q, x_s, group_size, eps, int8_min, int8_max)
+    sgl_per_token_group_quant_8bit(x, x_q, x_s, group_size, eps, int8_min, int8_max, enable_v2=enable_v2)
 
     return x_q, x_s
 
