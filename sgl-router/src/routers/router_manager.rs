@@ -7,7 +7,8 @@
 use crate::config::RouterConfig;
 use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+    ResponsesRequest,
 };
 use crate::protocols::worker_spec::{
     ServerInfo, WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo,
@@ -665,22 +666,6 @@ impl RouterTrait for RouterManager {
             .into_response()
     }
 
-    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
-    }
-
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
-    }
-
     async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -701,17 +686,51 @@ impl RouterTrait for RouterManager {
             .into_response()
     }
 
-    /// Route embeddings request
-    async fn route_embeddings(&self, headers: Option<&HeaderMap>, body: Body) -> Response {
-        // Try to select a router based on headers
+    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
         let router = self.select_router_for_request(headers, None);
-
         if let Some(router) = router {
-            router.route_embeddings(headers, body).await
+            router.get_response(headers, response_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
-                "No router available for embeddings request",
+                format!("No router available to get response '{}'", response_id),
+            )
+                .into_response()
+        }
+    }
+
+    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.cancel_response(headers, response_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("No router available to cancel response '{}'", response_id),
+            )
+                .into_response()
+        }
+    }
+
+    /// Route embeddings request
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        // Select router based on headers and model
+        let router = self.select_router_for_request(headers, Some(&body.model));
+
+        if let Some(router) = router {
+            router
+                .route_embeddings(headers, body, Some(&body.model))
+                .await
+        } else {
+            // Return 404 when the specified model is not found
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
             )
                 .into_response()
         }
