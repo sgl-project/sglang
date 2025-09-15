@@ -240,6 +240,39 @@ impl RouterManager {
         let policy_hint = labels.get("policy").map(|s| s.as_str());
         let policy = self.policy_registry.on_worker_added(&model_id, policy_hint);
 
+        // Update model_routers mapping based on worker type
+        // Determine which router should handle this worker
+        let router_id = match config.worker_type.as_deref() {
+            Some("prefill") | Some("decode") => {
+                // PD workers should be handled by http-pd router
+                RouterId::new("http-pd".to_string())
+            }
+            _ => {
+                // Regular workers should be handled by http-regular router
+                RouterId::new("http-regular".to_string())
+            }
+        };
+
+        // Add model to router mapping if router exists
+        if self.routers.contains_key(&router_id) {
+            self.model_routers
+                .entry(model_id.clone())
+                .or_default()
+                .push(router_id.clone());
+
+            info!(
+                "Added model '{}' to router '{}' mapping",
+                model_id,
+                router_id.as_str()
+            );
+        } else {
+            warn!(
+                "Router '{}' not found for model '{}', worker will be in registry but not routable",
+                router_id.as_str(),
+                model_id
+            );
+        }
+
         info!(
             "Added worker {} with URL {} for model {} using policy {}",
             worker_id.as_str(),
@@ -272,8 +305,24 @@ impl RouterManager {
 
         if let Some(_worker) = self.worker_registry.remove_by_url(url) {
             // Notify PolicyRegistry about worker removal
-            if let Some(model_id) = model_id {
-                self.policy_registry.on_worker_removed(&model_id);
+            if let Some(ref model_id) = model_id {
+                self.policy_registry.on_worker_removed(model_id);
+
+                // Remove model from model_routers if no other workers serve it
+                let workers_for_model = self
+                    .worker_registry
+                    .get_all()
+                    .iter()
+                    .any(|w| w.model_id() == model_id);
+
+                if !workers_for_model {
+                    self.model_routers.remove(model_id);
+                    info!(
+                        "Removed model '{}' from router mappings (no remaining workers)",
+                        model_id
+                    );
+                }
+
                 info!("Removed worker with URL {} for model {}", url, model_id);
             } else {
                 info!("Removed worker with URL {}", url);
