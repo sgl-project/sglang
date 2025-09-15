@@ -87,20 +87,3 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglang_xeon || true
-
-  pr-test-xeon-finish:
-    if: always()
-    needs: [build-test]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check all dependent job statuses
-        run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
