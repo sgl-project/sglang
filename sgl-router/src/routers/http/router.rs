@@ -6,8 +6,8 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest, RerankRequest,
-    RerankResponse, RerankResult, ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
+    RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1430,8 +1430,28 @@ impl RouterTrait for Router {
         self.route_post_empty_request(headers, &endpoint).await
     }
 
-    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
-        todo!()
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        // Record embeddings-specific metrics in addition to general request metrics
+        let start = Instant::now();
+        let res = self
+            .route_typed_request(headers, body, "/v1/embeddings", model_id)
+            .await;
+
+        // Embedding specific metrics
+        if res.status().is_success() {
+            RouterMetrics::record_embeddings_request();
+            RouterMetrics::record_embeddings_duration(start.elapsed());
+        } else {
+            let error_type = format!("http_{}", res.status().as_u16());
+            RouterMetrics::record_embeddings_error(&error_type);
+        }
+
+        res
     }
 
     async fn route_rerank(
