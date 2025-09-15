@@ -96,6 +96,7 @@ class OpenAIServingChat(OpenAIServingBase):
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
+        raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
@@ -127,6 +128,9 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
+        # Extract customer labels from raw request headers
+        customer_labels = self.extract_customer_labels(raw_request)
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -146,6 +150,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             priority=request.priority,
+            customer_labels=customer_labels,
         )
 
         return adapted_request, request
