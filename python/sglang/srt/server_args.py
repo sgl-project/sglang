@@ -2472,6 +2472,13 @@ class ServerArgs:
             "--generation-tokens-buckets", self.generation_tokens_buckets
         )
 
+        # Check scheduling policy
+        if self.enable_priority_scheduling:
+            assert self.schedule_policy in [
+                "fcfs",
+                "lof",
+            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 

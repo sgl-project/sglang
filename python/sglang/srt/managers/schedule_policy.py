@@ -654,18 +654,18 @@ class PrefillAdder:
         if len(preemptible_reqs) == 0 or min_tokens_to_remove > 0:
             return False
 
-        # Preempt running requests. Unbudget allocated resources for immediate usage.
+        # Preempt running requests. Release allocated resources for immediate usage.
         preemptible_reqs = set(preemptible_reqs)
         keep_indices = []
-        unbudget_counter = 0
+        release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
                 self.rem_total_token_offset -= (
                     self._get_running_request_total_token_offset(req)
                 )
-                unbudget_counter += 1
-                self.running_batch.unbudget_req(
-                    i, len(self.running_batch.reqs) - unbudget_counter, server_args
+                release_counter += 1
+                self.running_batch.release_req(
+                    i, len(self.running_batch.reqs) - release_counter, server_args
                 )
             else:
                 keep_indices.append(i)

@@ -1486,7 +1486,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
-            self.unbudget_req(idx, len(sorted_indices), server_args)
+            self.release_req(idx, len(sorted_indices), server_args)
 
             if len(retracted_reqs) == 0:
                 # Corner case: only one request left
@@ -1507,7 +1507,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return retracted_reqs, new_estimate_ratio
 
-    def unbudget_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
         seq_lens_cpu = self.seq_lens.cpu().numpy()
 
