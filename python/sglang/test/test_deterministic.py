@@ -188,8 +188,6 @@ def test_deterministic(args):
         print(
             f"Long prompt: total samples: {len(output_long_prompt)}, Unique samples: {len(set(output_long_prompt))}"
         )
-        x = list(set(output_long_prompt))
-        print(x[0], x[1])
 
     else:
         raise ValueError(f"Invalid test mode: {args.test_mode}")
