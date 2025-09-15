@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional, Union
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
 import triton
@@ -35,10 +36,12 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.offloader import get_offloader
+from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
     get_bool_env_var,
+    get_int_env_var,
     is_cuda,
     is_hip,
     is_npu,
@@ -456,7 +459,11 @@ class DeepEPMoE(EPMoE):
             forward_batch=forward_batch,
         )
 
-    def moe_impl(self, dispatch_output: DispatchOutput):
+    def moe_impl(
+        self,
+        dispatch_output: DispatchOutput,
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
+    ):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         if _use_aiter:
@@ -471,7 +478,9 @@ class DeepEPMoE(EPMoE):
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if get_moe_runner_backend().is_flashinfer_cutedsl():
-                return self.forward_flashinfer_cutedsl(dispatch_output)
+                return self.forward_flashinfer_cutedsl(
+                    dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
+                )
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -485,12 +494,14 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        overlap_args: Optional[Dict[str, Any]] = None,
     ):
         return self.deepep_dispatcher.combine(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
+            overlap_args=overlap_args,
         )
 
     def forward_aiter(
@@ -677,6 +688,7 @@ class DeepEPMoE(EPMoE):
     def forward_flashinfer_cutedsl(
         self,
         dispatch_output: DeepEPLLOutput,
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
     ):
         hidden_states, _, _, masked_m, _ = dispatch_output
         assert self.quant_method is not None
@@ -687,6 +699,7 @@ class DeepEPMoE(EPMoE):
             x=hidden_states,
             masked_m=masked_m,
             moe_runner_config=self.moe_runner_config,
+            down_gemm_overlap_args=down_gemm_overlap_args,
         )
         return output
 

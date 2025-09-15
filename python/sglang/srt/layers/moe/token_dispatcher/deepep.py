@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -24,6 +25,9 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+
+if TYPE_CHECKING:
+    from sglang.srt.single_batch_overlap import CombineOverlapArgs
 
 try:
     from deep_ep import Buffer, Config
@@ -300,6 +304,7 @@ class _DeepEPDispatcherImplBase:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_args: Optional["CombineOverlapArgs"],
     ):
         raise NotImplementedError
 
@@ -417,6 +422,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_args: Optional["CombineOverlapArgs"],
     ):
         from sglang.srt.layers.moe.ep_moe.kernels import (
             deepep_post_reorder_triton_kernel,
@@ -492,6 +498,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         """
         self.return_recv_hook = return_recv_hook
+        self.device_module = torch.get_device_module()
 
     def dispatch_a(
         self,
@@ -553,7 +560,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
-        packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
+        packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_idx,
@@ -568,23 +575,29 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
         )
-        return packed_recv_hidden, packed_recv_count, event, hook
+        return packed_recv_hidden, self.packed_recv_count, event, hook
 
     def combine_a(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_args: Optional["CombineOverlapArgs"],
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_idx,
             topk_weights,
+            overlap_args=overlap_args,
         )
-        return hidden_states, event, hook
+        return hidden_states, event, hook, overlap_args
 
-    def combine_b(self, hidden_states, event, hook):
+    def combine_b(self, hidden_states, event, hook, overlap_args):
         hook() if self.return_recv_hook else event.current_stream_wait()
+
+        if overlap_args is not None:
+            self.device_module.current_stream().wait_stream(overlap_args.stream)
+
         return hidden_states
 
     def _combine_core(
@@ -592,17 +605,35 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_args: Optional["CombineOverlapArgs"],
     ):
         buffer = self._get_buffer()
-        combined_hidden_states, event, hook = buffer.low_latency_combine(
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            self.handle,
-            async_finish=not self.return_recv_hook,
-            return_recv_hook=self.return_recv_hook,
-        )
-        self.handle = None
+
+        ctx = nullcontext()
+        if overlap_args is not None:
+            overlap_args.stream.wait_event(overlap_args.wait_event)
+            ctx = torch.cuda.stream(overlap_args.stream)
+
+        with ctx:
+            combined_hidden_states, event, hook = buffer.low_latency_combine(
+                x=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                handle=self.handle,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+                **(
+                    dict(
+                        overlap=overlap_args.overlap,
+                        src_signals=overlap_args.signal,
+                        src_signal_expect_value=overlap_args.threshold,
+                    )
+                    if overlap_args is not None
+                    else {}
+                ),
+            )
+
+        self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
@@ -702,12 +733,14 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        overlap_args: Optional["CombineOverlapArgs"] = None,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl(forward_batch).combine_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
+            overlap_args=overlap_args,
         )
         self._combine_intermediate_state = forward_batch, inner_state
 
