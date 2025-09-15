@@ -191,7 +191,6 @@ _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
-
     value = os.getenv(name, default)
     value = value.lower()
 
