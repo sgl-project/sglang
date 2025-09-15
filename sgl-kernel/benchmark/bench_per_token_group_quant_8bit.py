@@ -231,7 +231,7 @@ def benchmark(
             "_per_token_group_quant_8bit|_silu_and_mul_post_quant_kernel",
         ),
         "sglang": (
-            sglang_per_token_group_quant_8bit,
+            partial(sglang_per_token_group_quant_8bit, enable_v2=True),
             "per_token_group_quant_8bit_kernel",
         ),
     }[provider]
