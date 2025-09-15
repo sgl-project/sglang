@@ -19,17 +19,23 @@ import inspect
 import json
 import logging
 import os
+import socket
+import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
+import requests
 import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
+from sglang.srt.connector import ConnectorType
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
     get_pp_group,
@@ -84,11 +90,14 @@ from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
@@ -102,6 +111,9 @@ from sglang.srt.offloader import (
     set_offloader,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.remote_instance_weight_loader_utils import (
+    trigger_init_weights_send_group_for_remote_instance_request,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -115,6 +127,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_blackwell,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
@@ -124,6 +137,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
+    parse_connector_type,
     set_cuda_arch,
 )
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -252,6 +266,7 @@ class ModelRunner:
 
         # For weight updates
         self._model_update_group = {}
+        self._weights_send_group = {}
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -300,6 +315,26 @@ class ModelRunner:
             architectures = self.model_config.hf_config.architectures
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
+
+        if self.is_hybrid_gdn:
+            logger.warning("Hybrid GDN model detected, disable radix cache")
+            self.server_args.disable_radix_cache = True
+            self.server_args.attention_backend = "hybrid_linear_attn"
+            if self.server_args.max_mamba_cache_size is None:
+                if self.server_args.max_running_requests is not None:
+                    self.server_args.max_mamba_cache_size = (
+                        self.server_args.max_running_requests
+                    )
+                else:
+                    self.server_args.max_mamba_cache_size = 512
+            self.server_args.max_mamba_cache_size = (
+                self.server_args.max_mamba_cache_size
+                // (
+                    self.server_args.dp_size
+                    if self.server_args.enable_dp_attention
+                    else 1
+                )
+            )
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -360,12 +395,12 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             self.init_device_graphs()
-        elif self.device == "npu":
+        elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
         else:
             self.graph_runner = None
-            self.cuda_graph_mem_usage = 0
+            self.graph_mem_usage = 0
             self.init_attention_backend()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
@@ -526,18 +561,19 @@ class ModelRunner:
 
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
+
         # TODO(kaixih@nvidia): remove this once we have a better solution for DP attention.
         #  For more details, see: https://github.com/sgl-project/sglang/issues/8616
         elif (
             self.dp_size > 1
             and is_sm100_supported()
             and server_args.attention_backend != "triton"
+            and server_args.attention_backend == "trtllm_mla"
         ):
             logger.info(
                 "Disable chunked prefix cache when dp size > 1 and attention backend is not triton."
             )
             server_args.disable_chunked_prefix_cache = True
-
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
 
@@ -608,6 +644,11 @@ class ModelRunner:
                     # Set local size to hint SGLang to use shared memory based AllReduce
                     os.environ["LOCAL_SIZE"] = str(self.tp_size)
                     torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
+
+                    @torch.library.register_fake("sgl_kernel::shm_allgather")
+                    def _(data, dim):
+                        return torch.cat([data] * self.tp_size, dim=dim)
+
                 else:
                     logger.warning(
                         "init_cpu_threads_env and shared memory based AllReduce is disabled since intel amx backend is not available"
@@ -697,6 +738,20 @@ class ModelRunner:
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
 
+        if self.server_args.load_format == LoadFormat.REMOTE_INSTANCE:
+            if self.tp_rank == 0:
+                instance_ip = socket.gethostbyname(socket.gethostname())
+                t = threading.Thread(
+                    target=trigger_init_weights_send_group_for_remote_instance_request,
+                    args=(
+                        self.server_args.remote_instance_weight_loader_seed_instance_ip,
+                        self.server_args.remote_instance_weight_loader_seed_instance_service_port,
+                        self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+                        instance_ip,
+                    ),
+                )
+                t.start()
+
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
@@ -706,7 +761,7 @@ class ModelRunner:
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
+                device_config=DeviceConfig(self.device, self.gpu_id),
             )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
@@ -837,6 +892,103 @@ class ModelRunner:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def init_weights_send_group_for_remote_instance(
+        self,
+        master_address,
+        ports,
+        group_rank,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        ports_list = ports.split(",")
+        assert (
+            len(ports_list) == self.tp_size
+        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+
+        logger.info(
+            f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "
+            f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        torch.cuda.empty_cache()
+        success = False
+        message = ""
+        try:
+            self._weights_send_group[group_name] = init_custom_process_group(
+                backend=backend,
+                init_method=f"tcp://{master_address}:{group_port}",
+                world_size=world_size,
+                rank=group_rank,
+                group_name=group_name,
+                device_id=torch.device("cuda", self.gpu_id),
+            )
+            dist.barrier(group=self._weights_send_group[group_name])
+            success = True
+            message = (
+                f"Succeeded to init group through {master_address}:{group_port} group."
+            )
+        except Exception as e:
+            message = f"Failed to init group: {e}."
+            logger.error(message)
+
+        torch.cuda.empty_cache()
+        return success, message
+
+    def send_weights_to_remote_instance(
+        self,
+        master_address,
+        ports,
+        group_name,
+    ):
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        ports_list = ports.split(",")
+        assert (
+            len(ports_list) == self.tp_size
+        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+
+        if self._weights_send_group[group_name] is not None:
+            send_group = self._weights_send_group[group_name]
+        else:
+            message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
+            logger.error(message)
+            return False, message
+
+        torch.cuda.empty_cache()
+        success = False
+        message = ""
+        try:
+            for _, weights in self.model.named_parameters():
+                torch.distributed.broadcast(
+                    weights,
+                    src=0,
+                    group=send_group,
+                )
+            success = True
+            message = f"Succeeded to send weights through {master_address}:{group_port} {group_name}."
+        except Exception as e:
+            message = f"Failed to send weights: {e}."
+            logger.error(message)
+
+        # destroy the process group after sending weights
+        del self._weights_send_group[group_name]
+        torch.distributed.distributed_c10d.destroy_process_group(send_group)
+        torch.cuda.empty_cache()
+        return success, message
 
     def init_weights_update_group(
         self,
@@ -1073,6 +1225,8 @@ class ModelRunner:
                 "num_nextn_predict_layers",
                 self.num_effective_layers,
             )
+        elif self.is_hybrid_gdn:
+            num_layers = len(self.model_config.hf_config.full_attention_layer_ids)
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
@@ -1092,8 +1246,21 @@ class ModelRunner:
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
+        if self.is_hybrid_gdn:
+            rest_memory -= (
+                self.server_args.max_mamba_cache_size
+                * self.model_config.hf_config.mamba_cache_per_req
+                / (1 << 30)
+            )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
+
+    @property
+    def is_hybrid_gdn(self):
+        return self.model_config.hf_config.architectures[0] in [
+            "Qwen3NextForCausalLM",
+            "Qwen3NextForCausalLMMTP",
+        ]
 
     def set_num_token_hybrid(self):
         if (
@@ -1215,6 +1382,8 @@ class ModelRunner:
                 ),
                 4096,
             )
+        if self.is_hybrid_gdn:
+            max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size)
 
         if not self.spec_algorithm.is_none():
             if self.is_draft_worker:
@@ -1253,6 +1422,16 @@ class ModelRunner:
             // self.server_args.page_size
             * self.server_args.page_size
         )
+        # different pp rank may have different num of layers, so we need to reduce the max_total_num_tokens
+        if self.pp_size > 1:
+            tensor = torch.tensor(self.max_total_num_tokens, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            self.max_total_num_tokens = tensor.item()
+
         # create token size for hybrid cache
         if self.is_hybrid:
             self.set_num_token_hybrid()
@@ -1282,6 +1461,28 @@ class ModelRunner:
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     pre_alloc_size=pre_alloc_size,
+                )
+            elif self.is_hybrid_gdn:
+                config = self.model_config.hf_config
+                (
+                    conv_state_shape,
+                    temporal_state_shape,
+                    conv_dtype,
+                    ssm_dtype,
+                    mamba_layers,
+                ) = config.hybrid_gdn_params
+                self.req_to_token_pool = HybridReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    conv_state_shape=conv_state_shape,
+                    temporal_state_shape=temporal_state_shape,
+                    conv_dtype=conv_dtype,
+                    ssm_dtype=ssm_dtype,
+                    mamba_layers=mamba_layers,
+                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
@@ -1365,6 +1566,24 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                 )
+            elif self.is_hybrid_gdn:
+                self.token_to_kv_pool = HybridLinearKVPool(
+                    page_size=self.page_size if _is_npu else 1,
+                    size=self.max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    # if draft worker, we only need 1 attention layer's kv pool
+                    full_attention_layer_ids=(
+                        [0]
+                        if self.is_draft_worker
+                        else self.model_config.hf_config.full_attention_layer_ids
+                    ),
+                    enable_kvcache_transpose=False,
+                    device=self.device,
+                )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,
@@ -1384,7 +1603,10 @@ class ModelRunner:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if self.server_args.attention_backend == "ascend":
+            if _is_npu and self.server_args.attention_backend in [
+                "ascend",
+                "hybrid_linear_attn",
+            ]:
                 self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1598,6 +1820,35 @@ class ModelRunner:
             )
 
             return DualChunkFlashAttentionBackend(self)
+        elif backend_str == "hybrid_linear_attn":
+            assert (
+                self.is_hybrid_gdn
+            ), "hybrid_linear_attn backend can only be used with hybrid GDN models."
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
+                MambaAttnBackend,
+            )
+
+            if _is_npu:
+                from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+
+                full_attn_backend = AscendAttnBackend(self)
+            elif is_blackwell():
+                from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+                full_attn_backend = TritonAttnBackend(self)
+            else:
+                from sglang.srt.layers.attention.flashattention_backend import (
+                    FlashAttentionBackend,
+                )
+
+                full_attn_backend = FlashAttentionBackend(self)
+
+            linear_attn_backend = MambaAttnBackend(self)
+            full_attn_layers = self.model_config.hf_config.full_attention_layer_ids
+            return HybridLinearAttnBackend(
+                full_attn_backend, linear_attn_backend, full_attn_layers
+            )
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
 
@@ -1619,38 +1870,46 @@ class ModelRunner:
             )
 
     def init_device_graphs(self):
-        """Capture cuda graphs."""
+        """Capture device graphs."""
         self.graph_runner = None
-        self.cuda_graph_mem_usage = 0
+        self.graph_mem_usage = 0
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
-        if self.server_args.disable_cuda_graph:
+        if self.device != "cpu" and self.server_args.disable_cuda_graph:
+            return
+
+        if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.graph_runner = (
-            CudaGraphRunner(self) if not _is_npu else NPUGraphRunner(self)
+        graph_runners = defaultdict(
+            lambda: CudaGraphRunner,
+            {
+                "cpu": CPUGraphRunner,
+                "npu": NPUGraphRunner,
+            },
         )
+        self.graph_runner = graph_runners[self.device](self)
+
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.cuda_graph_mem_usage = before_mem - after_mem
+        self.graph_mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+            f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
+        cpu_ids_by_node = get_cpu_ids_by_node()
+        n_numa_node = len(cpu_ids_by_node)
         if omp_cpuids == "all":
-            cpu_ids_by_node = get_cpu_ids_by_node()
-            n_numa_node = len(cpu_ids_by_node)
-
             assert self.tp_size <= n_numa_node, (
                 f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
                 f"tp_size {self.tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
@@ -1667,7 +1926,18 @@ class ModelRunner:
                 )
             self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
         else:
-            self.local_omp_cpuid = omp_cpuids.split("|")[self.tp_rank]
+            threads_bind_list = omp_cpuids.split("|")
+            assert self.tp_size == len(threads_bind_list), (
+                f"SGLANG_CPU_OMP_THREADS_BIND setting must be aligned with TP size parameter ({self.tp_size}). "
+                f"Please double check your settings."
+            )
+            self.local_omp_cpuid = threads_bind_list[self.tp_rank]
+            if self.tp_size > n_numa_node:
+                logger.warning(
+                    f"TP size ({self.tp_size})is larger than numa node number ({n_numa_node}), "
+                    f"in this case the available memory amount of each rank cannot be determined in prior. "
+                    f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
+                )
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
@@ -1787,18 +2057,24 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
-        can_run_cuda_graph = bool(
-            forward_batch.forward_mode.is_cuda_graph()
+        mode_check = (
+            forward_batch.forward_mode.is_cpu_graph
+            if self.device == "cpu"
+            else forward_batch.forward_mode.is_cuda_graph
+        )
+        can_run_graph = bool(
+            mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
-        if can_run_cuda_graph:
+
+        if can_run_graph:
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return ret, can_run_cuda_graph
+            return ret, can_run_graph
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
@@ -1833,7 +2109,7 @@ class ModelRunner:
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
-        return ret, can_run_cuda_graph
+        return ret, can_run_graph
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
@@ -1881,6 +2157,38 @@ class ModelRunner:
             forward_batch.token_ids_logprobs,
         )
         return next_token_ids
+
+    def compute_logprobs_only(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """
+        Compute token_ids_logprobs without performing sampling.
+
+        Optimized path for prefill-only requests that need token_ids_logprobs but don't
+        require next token generation. Skips expensive sampling operations
+        while still providing requested probability information.
+
+        Args:
+            logits_output: The logits output from the model forward
+            forward_batch: The forward batch that generates logits_output
+        """
+        if not forward_batch.token_ids_logprobs:
+            return
+
+        # Preprocess logits (same as in sample method)
+        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+
+        # Delegate to sampler for logprob-only computation
+        # This populates logits_output with requested token probabilities
+        self.sampler.compute_logprobs_only(
+            logits_output,
+            forward_batch.sampling_info,
+            forward_batch.return_logprob,
+            forward_batch.top_logprobs_nums,
+            forward_batch.token_ids_logprobs,
+        )
 
     @property
     def model_is_mrope(self) -> bool:
