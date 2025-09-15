@@ -17,6 +17,7 @@ fn create_test_worker() -> BasicWorker {
         WorkerType::Prefill {
             bootstrap_port: Some(5678),
         },
+        None,
     )
 }
 
