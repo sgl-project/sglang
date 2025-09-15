@@ -82,6 +82,12 @@ test = [
   "pytest",
   "tabulate",
 ]
+tracing = [
+    "opentelemetry-sdk",
+    "opentelemetry-api",
+    "opentelemetry-exporter-otlp",
+    "opentelemetry-exporter-otlp-proto-grpc",
+]
 all = ["sglang[test]"]
 blackwell = ["nvidia-cutlass-dsl==4.1.0", "sglang[test]"]
 dev = ["sglang[test]"]
