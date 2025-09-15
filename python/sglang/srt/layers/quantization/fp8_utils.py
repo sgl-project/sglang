@@ -633,7 +633,7 @@ def apply_fp8_linear(
     # torch.scaled_mm supports per tensor weights + activations only
     # so fallback to naive if per channel or per token
     per_tensor_weights = weight_scale.numel() == 1
-    per_tensor_activations = x_scale.numel() == 1 and input_2d.size(0) != 1
+    per_tensor_activations = x_scale.numel() == 1
 
     if (
         use_per_token_if_dynamic
@@ -653,16 +653,14 @@ def apply_fp8_linear(
             # dtype -> output dtype
             output = gemm_a8w8_bpreshuffle(
                 XQ=qinput,
-                WQ=weight,
+                WQ=weight.T,
                 x_scale=x_scale,
                 w_scale=weight_scale,
                 dtype=input.dtype,
             )
             if bias is not None:
                 output += bias
-            return _process_scaled_mm_output(
-                output, input_2d.shape, [*input.shape[:-1], weight.shape[0]]
-            )
+            return _process_scaled_mm_output(output, input_2d.shape, output_shape)
         else:
             # For now validated on ROCm platform
             # fp8 rowwise scaling in torch._scaled_mm is introduced in
