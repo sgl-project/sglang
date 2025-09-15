@@ -391,7 +391,7 @@ class ServerArgs:
     debug_tensor_dump_prefill_only: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
-    disaggregation_mode: str = "null"
+    disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_decode_tp: Optional[int] = None
@@ -2252,7 +2252,7 @@ class ServerArgs:
         parser.add_argument(
             "--disaggregation-mode",
             type=str,
-            default="null",
+            default=ServerArgs.disaggregation_mode,
             choices=["null", "prefill", "decode"],
             help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
         )
@@ -2436,7 +2436,8 @@ class ServerArgs:
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
-        if self.chunked_prefill_size > 0:
+        # Skip validation if disaggregation mode is decode.
+        if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
