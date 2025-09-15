@@ -525,11 +525,12 @@ pub fn build_app(
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
-        // Request ID layer - must be added AFTER logging layer in the code
-        // so it executes BEFORE logging layer at runtime (layers execute bottom-up)
-        .layer(crate::middleware::RequestIdLayer::new(request_id_headers))
-        // Custom logging layer that can now see request IDs from extensions
+        // Logging layer - must be added BEFORE request ID layer in the code
+        // so it executes AFTER request ID layer at runtime (layers execute bottom-up)
+        // This way the TraceLayer can see the request ID that was added to extensions
         .layer(crate::middleware::create_logging_layer())
+        // Request ID layer - adds request ID to extensions first
+        .layer(crate::middleware::RequestIdLayer::new(request_id_headers))
         // CORS (should be outermost)
         .layer(create_cors_layer(cors_allowed_origins))
         // Fallback
