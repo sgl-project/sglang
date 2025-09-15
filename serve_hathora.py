@@ -685,26 +685,30 @@ async def stream_response_sglang(
             )
         
         token_count = 0
+        sent_len = 0
         
         # Stream the tokens
         async for chunk in async_generator:
             token_count += 1
             time_to_token = (time.time() - start_time) * 1000
-            
-            # Extract the new content from the chunk
-            # The chunk should contain the incremental text
+
             content = chunk.get("text", "")
-            if content and len(content) > len(prompt):
-                new_content = content[len(prompt):]
-                if token_count == 1:
-                    # First token, remove any previous content
-                    new_content = new_content
-                else:
-                    # Get only the new part since last chunk
-                    # This is a simplified approach; in practice, you'd want more sophisticated diff
-                    pass
+            if not content:
+                continue
+
+            if prompt and content.startswith(prompt):
+                cumulative = content[len(prompt):]
             else:
-                new_content = ""
+                cumulative = content
+
+            if sent_len <= len(cumulative):
+                new_content = cumulative[sent_len:]
+            else:
+                new_content = cumulative
+            sent_len = len(cumulative)
+
+            if not new_content:
+                continue
             
             stream_choice = ChatCompletionStreamChoice(
                 index=0,
