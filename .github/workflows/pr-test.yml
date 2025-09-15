@@ -641,6 +641,7 @@ jobs:
 
             # Check for failure or cancellation and exit if found
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
               exit 1
             fi
           done
