@@ -267,7 +267,7 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
-        # todo: move backend initialization to storage backend module
+
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
             from sglang.srt.mem_cache.hicache_storage import get_hash_str
@@ -436,7 +436,7 @@ class HiCacheController:
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
         # Parse extra config JSON if provided
-        extra_config = {}
+        extra_config = None
         if storage_backend_extra_config:
             try:
                 import json
