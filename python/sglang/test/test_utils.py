@@ -1473,7 +1473,7 @@ def _ensure_remove_suffix(text: str, suffix: str):
 def generate_markdown_report_nightly(model, results, input_len, output_len):
     summary = f"### {model}\n"
     summary += f"Input lens: {input_len}. Output lens: {output_len}.\n"
-    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profiled trace |\n"
+    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | trace |\n"
     summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
 
     base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
