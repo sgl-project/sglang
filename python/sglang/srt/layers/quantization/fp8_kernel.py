@@ -483,6 +483,7 @@ def sglang_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    enable_v2: bool = get_bool_env_var("SGLANG_PER_TOKEN_GROUP_QUANT_FP8_V2"),
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -515,9 +516,10 @@ def sglang_per_token_group_quant_fp8(
                 scale_ue8m0,
                 fuse_silu_and_mul,
                 masked_m,
-                enable_v2=TODO,
+                enable_v2=enable_v2,
             )
         else:
+            assert not enable_v2
             sgl_per_token_group_quant_fp8(
                 x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
             )

@@ -153,7 +153,7 @@ def test_per_token_group_quant_with_column_major(
         *triton_per_token_group_quant_8bit(**execute_kwargs)
     )
     x_q_sglang, x_s_sglang = _postprocess(
-        *sglang_per_token_group_quant_8bit(**execute_kwargs)
+        *sglang_per_token_group_quant_8bit(**execute_kwargs, enable_v2=True)
     )
 
     try:
