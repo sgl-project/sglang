@@ -234,6 +234,7 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    load_watch_interval: float = 0.1
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -363,6 +364,7 @@ class ServerArgs:
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     triton_attention_num_kv_splits: int = 8
+    triton_attention_split_tile_size: Optional[int] = None
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
@@ -663,6 +665,7 @@ class ServerArgs:
 
         if self.dp_size == 1:
             self.enable_dp_attention = False
+            self.enable_dp_lm_head = False
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -1502,6 +1505,12 @@ class ServerArgs:
             ],
         )
         parser.add_argument(
+            "--load-watch-interval",
+            type=float,
+            default=ServerArgs.load_watch_interval,
+            help="The interval of load watching in seconds.",
+        )
+        parser.add_argument(
             "--prefill-round-robin-balance",
             default=ServerArgs.prefill_round_robin_balance,
             action="store_true",
@@ -2113,6 +2122,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.triton_attention_num_kv_splits,
             help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
+        )
+        parser.add_argument(
+            "--triton-attention-split-tile-size",
+            type=int,
+            default=ServerArgs.triton_attention_split_tile_size,
+            help="The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference.",
         )
         parser.add_argument(
             "--num-continuous-decode-steps",

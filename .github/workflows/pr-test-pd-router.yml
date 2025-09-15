@@ -155,32 +155,34 @@ jobs:
       id: start_servers
       run: |
         echo "Starting disaggregation servers..."
-        bash scripts/ci/ci_start_disaggregation_servers.sh &
+        READY_FILE=".disagg_ready"
+        rm -f "$READY_FILE"
+        DISAGG_READY_FILE="$READY_FILE" bash scripts/ci/ci_start_disaggregation_servers.sh &
         SERVER_PID=$!
         echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
 
-        # Wait for all 8 servers to be healthy (script already does this)
-        wait_count=0
-        while [ $wait_count -lt 30 ]; do
-          if ps -p $SERVER_PID > /dev/null; then
-            # Check if the startup script printed success message
-            sleep 2
-            wait_count=$((wait_count + 1))
-          else
-            # Script exited - check if it was successful
-            wait $SERVER_PID
-            exit_code=$?
-            if [ $exit_code -eq 0 ]; then
-              echo "✓ All disaggregation servers are healthy"
-              break
-            else
-              echo "Error: Server startup failed with code $exit_code"
-              exit 1
-            fi
+        # Wait until script signals readiness (8/8 healthy) or timeout
+        TIMEOUT=300
+        ELAPSED=0
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          if [ -f "$READY_FILE" ]; then
+            echo "✓ All disaggregation servers are healthy (signal detected)"
+            break
           fi
+          if ! ps -p $SERVER_PID > /dev/null; then
+            echo "Error: server bootstrap script exited prematurely"
+            exit 1
+          fi
+          sleep 5
+          ELAPSED=$((ELAPSED + 5))
         done
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "❌ Timeout waiting for disaggregation servers to be healthy"
+          exit 1
+        fi
 
         echo "✓ Servers started (PID: $SERVER_PID)"
+
 
     - name: Test all policies sequentially
       timeout-minutes: 30
