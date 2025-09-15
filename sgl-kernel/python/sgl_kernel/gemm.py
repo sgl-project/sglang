@@ -113,6 +113,7 @@ def sgl_per_token_group_quant_8bit(
 ) -> None:
     if enable_v2 is None:
         from sglang.srt.utils import get_bool_env_var
+
         enable_v2 = get_bool_env_var("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
 
     if enable_v2:
