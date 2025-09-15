@@ -191,9 +191,6 @@ _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
-    warnings.warn(
-        f"\x1b[33mget_bool_env_var and os.environ manner for env vars will be deprecated soon, please use sglang.environ instead.\x1b[0m",
-    )
 
     value = os.getenv(name, default)
     value = value.lower()
@@ -212,9 +209,6 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
 
 
 def get_int_env_var(name: str, default: int = 0) -> int:
-    warnings.warn(
-        f"\x1b[33mget_int_env_var and os.environ manner for env vars will be deprecated soon, please use sglang.environ instead.\x1b[0m",
-    )
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
