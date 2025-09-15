@@ -2160,6 +2160,7 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ):
+
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
