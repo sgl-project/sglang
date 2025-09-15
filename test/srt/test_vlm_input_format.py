@@ -14,8 +14,8 @@ from transformers import (
 )
 
 from sglang import Engine
+from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.parser.conversation import generate_chat_conv
 
 TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 
@@ -69,17 +69,21 @@ class VLMInputTestBase:
                 {
                     "role": "user",
                     "content": [
-                                   {"type": "image_url", "image_url": {"url": self.image_url}}
-                               ] * image_count + [
-                                   {"type": "text", "text": "What's in this picture?"},
-                               ],
+                        {"type": "image_url", "image_url": {"url": self.image_url}}
+                    ]
+                    * image_count
+                    + [
+                        {"type": "text", "text": "What's in this picture?"},
+                    ],
                 }
             ],
         }
         json_str = json.dumps(json_structure)
         return ChatCompletionRequest.model_validate_json(json_str)
 
-    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None, image_count = 1):
+    def get_processor_output(
+        self, req: Optional[ChatCompletionRequest] = None, image_count=1
+    ):
         if req is None:
             req = self.get_completion_request()
         conv = generate_chat_conv(req, template_name=self.chat_template)
@@ -94,7 +98,7 @@ class VLMInputTestBase:
 
         return inputs
 
-    async def test_understands_image(self):
+    async def test_accepts_image(self):
         req = self.get_completion_request()
         conv = generate_chat_conv(req, template_name=self.chat_template)
         text = conv.get_prompt()
@@ -105,7 +109,7 @@ class VLMInputTestBase:
         )
         self.verify_response(output)
 
-    async def test_understands_precomputed_embeddings(self):
+    async def test_accepts_precomputed_embeddings(self):
         req = self.get_completion_request()
         processor_output = self.get_processor_output(req=req)
         with torch.inference_mode():
@@ -119,10 +123,10 @@ class VLMInputTestBase:
         )
         self.verify_response(output)
 
-    async def test_understands_pixel_values(self):
+    async def test_accepts_processor_output(self):
         image_count = 2
         req = self.get_completion_request(image_count=image_count)
-        processor_output = self.get_processor_output(req=req, image_count = image_count)
+        processor_output = self.get_processor_output(req=req, image_count=image_count)
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
             image_data=[self._pixel_values_image_data(processor_output)],
@@ -130,12 +134,9 @@ class VLMInputTestBase:
         )
         self.verify_response(output)
 
-    def _precomputed_image_data(self, processor_output, precomputed_embeddings):
+    def _precomputed_image_data(self, _processor_output, precomputed_embeddings):
         """This should not be overridden."""
-        return dict(
-            modality="IMAGE",
-            precomputed_embeddings=precomputed_embeddings,
-        )
+        return dict(format="precomputed_embedding", feature=precomputed_embeddings)
 
     def _pixel_values_image_data(self, processor_output):
         """Override in subclass to pass the correct set of arguments."""
@@ -160,11 +161,7 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
         )
 
     def _pixel_values_image_data(self, processor_output):
-        return dict(
-            modality="IMAGE",
-            image_grid_thw=processor_output["image_grid_thw"],
-            pixel_values=processor_output["pixel_values"],
-        )
+        return dict(processor_output, format="processor_output")
 
 
 class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
@@ -185,10 +182,7 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
         )
 
     def _pixel_values_image_data(self, processor_output):
-        return dict(
-            modality="IMAGE",
-            pixel_values=processor_output["pixel_values"][0],
-        )
+        return dict(processor_output, format="processor_output")
 
 
 class TestKimiVLImageUnderstandsImage(
@@ -211,11 +205,7 @@ class TestKimiVLImageUnderstandsImage(
         )
 
     def _pixel_values_image_data(self, processor_output):
-        return dict(
-            modality="IMAGE",
-            pixel_values=processor_output["pixel_values"],
-            image_grid_hws=processor_output["image_grid_hws"],
-        )
+        return dict(processor_output, format="processor_output")
 
 
 # not for CI: too large

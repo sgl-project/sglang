@@ -348,12 +348,12 @@ def _get_precomputed_embedding(
     If some but not all have precomputed_embeddings, raise NotImplementedError.
     If none have precomputed_embeddings, return None.
     """
-    precomputed_embeddings = [item.precomputed_embeddings for item in items]
+    precomputed_embeddings = [
+        item.feature for item in items if item.is_precomputed_embedding()
+    ]
     if any(feature is not None for feature in precomputed_embeddings):
-        if not all(feature is not None for feature in precomputed_embeddings):
-            raise NotImplementedError(
-                "MM inputs where only some items are precomputed."
-            )
+        if len(precomputed_embeddings) != len(items):
+            raise NotImplementedError("Expect none or all mm items to be precomputed.")
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
@@ -518,7 +518,7 @@ def embed_mm_inputs(
     Returns:
         Combined embedding tensor with multimodal content integrated
     """
-
+    print(f"{mm_inputs_list=}")
     if mm_inputs_list is None:
         return None
 
@@ -640,16 +640,20 @@ def general_mm_embed_routine(
             for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
             if forward_batch.mm_inputs[i] is not None
         ]
-        inputs_embeds = embed_mm_inputs(
-            mm_inputs_list=mm_inputs_list,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-            input_ids=input_ids,
-            input_embedding=embed_tokens,
-            multimodal_model=multimodal_model,
-            data_embedding_func_mapping=data_embedding_funcs,
-            placeholder_tokens=placeholder_tokens,
-        )
+        try:
+            inputs_embeds = embed_mm_inputs(
+                mm_inputs_list=mm_inputs_list,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens=extend_seq_lens,
+                input_ids=input_ids,
+                input_embedding=embed_tokens,
+                multimodal_model=multimodal_model,
+                data_embedding_func_mapping=data_embedding_funcs,
+                placeholder_tokens=placeholder_tokens,
+            )
+        except Exception as e:
+            inputs_embeds = None
+            print(f"Error when embedding multimodal: {e}")
         # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
         # just being defensive here
         forward_batch.mm_inputs = None
