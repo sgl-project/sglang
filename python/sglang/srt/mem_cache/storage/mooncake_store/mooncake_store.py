@@ -182,9 +182,14 @@ class MooncakeStore(HiCacheStorage):
         assert self.store.put(warmup_key, warmup_value) == 0
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
+        # delete warmup key
+        self.store.remove(warmup_key)
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        assert (
+            self.mem_pool_host.layout == "page_first"
+        ), "mooncake store storage backend only support page first layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
             buffer_ptr = buffer.data_ptr()
@@ -262,12 +267,21 @@ class MooncakeStore(HiCacheStorage):
         return key_list, ptr_list, element_size_list
 
     def _batch_preprocess(self, keys, host_indices):
+        assert len(keys) > 0
+        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
             return self._get_mha_buffer_meta(keys, host_indices)
 
     def _batch_postprocess(self, results: List[int], is_set_operate=False):
+        """
+        refer to https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store/include/pybind_client.h
+        for batch_get_into, results is Vector of integers,
+            where each element is the number of bytes read on success, or a negative value on error
+        for batch_put_from, results is Vector of integers,
+            where each element is 0 on success, or a negative value on error
+        """
         if self.is_mla_backend:
             return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results]
         else:
@@ -300,10 +314,32 @@ class MooncakeStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        put_results = self._put_batch_zero_copy_impl(
-            key_strs, buffer_ptrs, buffer_sizes
-        )
-        return self._batch_postprocess(put_results, is_set_operate=True)
+        exist_result = self._batch_exist(key_strs)
+
+        set_keys = []
+        set_buffer_ptrs = []
+        set_buffer_sizes = []
+        set_indices = []
+        #
+        set_results = [-1] * len(keys)
+        for i in range(len(keys)):
+            if exist_result[i] != 1:
+                set_keys.append(keys[i])
+                set_buffer_ptrs.append(buffer_ptrs[i])
+                set_buffer_sizes.append(buffer_sizes[i])
+                set_indices.append(i)
+            else:
+                set_results[i] = 0
+
+        # Only set non-existing keys to storage
+        if len(set_keys) > 0:
+            put_results = self._put_batch_zero_copy_impl(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+            for i in range(len(set_indices)):
+                set_results[set_indices[i]] = put_results[i]
+
+        return self._batch_postprocess(set_results, is_set_operate=True)
 
     def set(
         self,

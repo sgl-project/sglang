@@ -289,7 +289,6 @@ class HiCacheController:
                 )
 
                 self.storage_backend = MooncakeStore(self.storage_config)
-                assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":
                 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
                     HiCacheHF3FS,
