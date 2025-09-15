@@ -48,6 +48,8 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
 
+if is_flashinfer_available():
+    import flashinfer
 
 @dataclass
 class DecodeMetadata:
@@ -154,7 +156,8 @@ class FlashInferMhaChunkKVRunner:
             chunk_idx = forward_batch.prefix_chunk_idx
             assert chunk_idx >= 0
             wrapper = self.chunk_ragged_wrappers[chunk_idx]
-            o1, s1 = wrapper.forward_return_lse(
+            # ref
+            o1_ref, s1_ref = wrapper.forward_return_lse(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
@@ -162,6 +165,51 @@ class FlashInferMhaChunkKVRunner:
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
+
+            # test
+            kv_indptr = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
+            actual_seq_lens_kv = kv_indptr[1:] - kv_indptr[:-1]
+
+            prefix_lens = forward_batch.extend_prefix_lens
+            seq_lens = forward_batch.seq_lens
+
+            bs = len(seq_lens)
+            qo_indptr = self.qo_indptr
+            qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+            qo_indptr = qo_indptr[: bs + 1]
+            actual_seq_lens_qo = qo_indptr[1:] - qo_indptr[:-1]
+            o1, s1 = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                key=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                value=v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
+                workspace_buffer=self.workspace_buffer,
+                seq_lens=actual_seq_lens_kv,
+                max_q_len=actual_seq_lens_qo.max().item(),#self.forward_prefill_metadata.max_seq_len,
+                max_kv_len=actual_seq_lens_kv.max().item(),#self.forward_prefill_metadata.max_seq_len,
+                bmm1_scale=layer.scaling,
+                bmm2_scale=1.0,
+                o_sf_scale=-1.0,#1.0,
+                batch_size=qo_indptr[-1],#len(actual_seq_lens_qo),#forward_batch.batch_size,
+                window_left=-1,
+                cum_seq_lens_q=qo_indptr,#self.forward_prefill_metadata.cum_seq_lens,
+                cum_seq_lens_kv=kv_indptr,#self.forward_prefill_metadata.cum_seq_lens,
+                enable_pdl=False,
+                is_causal=False,
+                return_lse=True,
+            )
+
+            if not torch.allclose(o1[:qo_indptr[-1].item()], o1_ref[:qo_indptr[-1].item()], atol=1e-2, rtol=1e-2):
+                print("MHA Chunk: Flashinfer output not matches the wrapper output!")
+                print(f"first dim of q:{q.view(-1, layer.tp_q_head_num, layer.head_dim).shape}")
+                print(f"sum of actual so: {qo_indptr[-1].item()}")
+                print(f"o1: {o1[:qo_indptr[-1].item()]}")
+                print(f"o1_ref: {o1_ref[:qo_indptr[-1].item()]}")
+            if not torch.allclose(
+                s1[:qo_indptr[-1].item()], s1_ref[:qo_indptr[-1].item()], atol=1e-2, rtol=1e-2
+            ):
+                print("MHA Chunk: Flashinfer ls not matches the wrapper lse!")
+                print(f"s1: {s1[:qo_indptr[-1].item()]}")
+                print(f"s1_ref: {s1_ref[:qo_indptr[-1].item()]}")
         else:
             o1, s1 = self.ragged_wrapper.forward_return_lse(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
