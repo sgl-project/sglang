@@ -1,4 +1,4 @@
-# Code Structures
+# Code Structure
 
 - `eval`: The evaluation utilities.
 - `lang`: The frontend language.
