@@ -158,24 +158,3 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 5400
-
-  pr-test-npu-finish:
-    if: always()
-    needs:
-      - per-commit-1-ascend-npu
-      - per-commit-2-ascend-npu
-      - per-commit-4-ascend-npu
-      - per-commit-16-ascend-a3
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check all dependent job statuses
-        run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0

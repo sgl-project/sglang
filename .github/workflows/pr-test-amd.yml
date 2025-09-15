@@ -343,25 +343,3 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
-
-  pr-test-amd-finish:
-    if: always()
-    needs: [
-      accuracy-test-1-gpu-amd, mla-test-1-gpu-amd, bench-test-2-gpu-amd,
-      accuracy-test-2-gpu-amd, performance-test-1-gpu-part-1-amd, performance-test-1-gpu-part-2-amd,
-      unit-test-backend-1-gpu-amd, unit-test-backend-1-gpu-amd-mi35x, unit-test-backend-2-gpu-amd,
-      unit-test-backend-8-gpu-amd, unit-test-sgl-kernel-amd
-    ]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check all dependent job statuses
-        run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
