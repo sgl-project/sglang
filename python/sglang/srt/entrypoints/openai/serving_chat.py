@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import copy
 import json
 import logging
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -33,12 +35,14 @@ from sglang.srt.entrypoints.openai.utils import (
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.template_manager import TemplateManager
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.template_manager import TemplateManager
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +96,7 @@ class OpenAIServingChat(OpenAIServingBase):
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
+        raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
@@ -123,6 +128,9 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
+        # Extract customer labels from raw request headers
+        customer_labels = self.extract_customer_labels(raw_request)
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -141,6 +149,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
+            customer_labels=customer_labels,
         )
 
         return adapted_request, request
