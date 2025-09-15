@@ -441,19 +441,21 @@ class CudaGraphRunner:
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
-        is_token_num_supported = True
-        if self.model_runner.spec_algorithm.is_lookahead():
-            is_token_num_supported = (
+        is_lookahead_supported = (
+            (
                 forward_batch.batch_size * self.num_tokens_per_bs
                 == forward_batch.input_ids.numel()
             )
+            if self.model_runner.spec_algorithm.is_lookahead()
+            else True
+        )
 
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
-            and is_token_num_supported
+            and is_lookahead_supported
         )
 
     def capture(self) -> None:
