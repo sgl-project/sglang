@@ -1,6 +1,5 @@
-name: Label PRs for CI
+name: Label PR for CI
 
-# This workflow runs on pull requests that are opened or reopened.
 on:
   pull_request_target:
     types: [opened, reopened]
@@ -13,12 +12,17 @@ jobs:
   labeler:
     runs-on: ubuntu-latest
     steps:
-      - name: Add 'run-ci' label for authors with write access
-        # This 'if' condition checks the PR author's association with the repository.
-        # It proceeds only if the author is an OWNER, MEMBER, or COLLABORATOR.
-        if: >
-          contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'),
-          github.event.pull_request.author_association)
+      - name: Check user permission
+        id: checkAccess
+        uses: actions-cool/check-user-permission@v2
+        with:
+          require: write
+          username: ${{ github.triggering_actor }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add run-ci label
+        if: steps.checkAccess.outputs.require-result == 'true'
         uses: actions/github-script@v7
         with:
           script: |
