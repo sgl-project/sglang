@@ -201,7 +201,7 @@ class OffloaderV2(BaseOffloader):
         alt_stream = torch.cuda.Stream()
 
         all_modules = []
-        hook_modules = []
+        offload_submodules = []
         for module_index, module in enumerate(all_modules_generator):
             all_modules.append(module)
             if module_index % self.group_size >= self.group_size - self.num_in_group:
@@ -210,7 +210,7 @@ class OffloaderV2(BaseOffloader):
                 logger.info(
                     f"[offloader] offload {module_index=} submodule={type(submodule)} params={whitelist_param_names} memory_allocated={torch.cuda.memory_allocated()}"
                 )
-                hook_modules.append(module)
+                offload_submodules.append(submodule)
                 self.offloaders.append(
                     _ModuleOffloader(
                         debug_name=f"mod{module_index}",
@@ -221,7 +221,7 @@ class OffloaderV2(BaseOffloader):
                     )
                 )
 
-        for index, module in enumerate(hook_modules):
+        for index, module in enumerate(offload_submodules):
             _hook_module_forward_for_offloader(
                 index=index,
                 module=module,
