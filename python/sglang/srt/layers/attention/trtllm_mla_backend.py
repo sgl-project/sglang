@@ -32,6 +32,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInfo
 
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import concat_mla_absorb_q
+
 # Constants
 DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 
@@ -482,7 +487,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
+            if _is_cuda:
+                query = concat_mla_absorb_q(q_nope, q_rope_reshaped)
+            else:
+                query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
         else:
             # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
