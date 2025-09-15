@@ -515,6 +515,7 @@ def sglang_per_token_group_quant_fp8(
                 scale_ue8m0,
                 fuse_silu_and_mul,
                 masked_m,
+                enable_v2=TODO,
             )
         else:
             sgl_per_token_group_quant_fp8(
