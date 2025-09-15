@@ -141,6 +141,9 @@ class GenerateReqInput:
     # Image gen grpc migration
     return_bytes: bool = False
 
+    # For customer metric labels
+    customer_labels: Optional[Dict[str, str]] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -1374,3 +1377,21 @@ class BlockReqType(Enum):
 @dataclass
 class BlockReqInput:
     type: BlockReqType
+
+
+@dataclass
+class GetLoadReqInput:
+    pass
+
+
+@dataclass
+class GetLoadReqOutput:
+    dp_rank: int
+    num_reqs: int
+    num_waiting_reqs: int
+    num_tokens: int
+
+
+@dataclass
+class WatchLoadUpdateReq:
+    loads: List[GetLoadReqOutput]
