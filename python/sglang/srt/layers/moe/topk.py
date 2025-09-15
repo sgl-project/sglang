@@ -675,7 +675,7 @@ def biased_grouped_topk_gpu(
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
-            correction_bias.to(dtype=torch.float32),
+            correction_bias,
             num_expert_group,
             topk_group,
             topk,
