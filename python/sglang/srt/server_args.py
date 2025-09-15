@@ -233,6 +233,7 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    load_watch_interval: float = 0.1
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -663,6 +664,7 @@ class ServerArgs:
 
         if self.dp_size == 1:
             self.enable_dp_attention = False
+            self.enable_dp_lm_head = False
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -1487,6 +1489,12 @@ class ServerArgs:
                 "shortest_queue",
                 "minimum_tokens",
             ],
+        )
+        parser.add_argument(
+            "--load-watch-interval",
+            type=float,
+            default=ServerArgs.load_watch_interval,
+            help="The interval of load watching in seconds.",
         )
         parser.add_argument(
             "--prefill-round-robin-balance",

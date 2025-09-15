@@ -1374,3 +1374,21 @@ class BlockReqType(Enum):
 @dataclass
 class BlockReqInput:
     type: BlockReqType
+
+
+@dataclass
+class GetLoadReqInput:
+    pass
+
+
+@dataclass
+class GetLoadReqOutput:
+    dp_rank: int
+    num_reqs: int
+    num_waiting_reqs: int
+    num_tokens: int
+
+
+@dataclass
+class WatchLoadUpdateReq:
+    loads: List[GetLoadReqOutput]

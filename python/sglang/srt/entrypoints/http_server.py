@@ -27,7 +27,7 @@ import tempfile
 import threading
 import time
 from http import HTTPStatus
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
 import setproctitle
 
@@ -96,6 +96,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerManager,
+    MultiTokenizerRouter,
     get_main_process_id,
     monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
@@ -127,7 +128,9 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: TokenizerManager
+    tokenizer_manager: Union[
+        TokenizerManager, MultiTokenizerRouter, MultiTokenizerManager
+    ]
     template_manager: TemplateManager
     scheduler_info: Dict
 
