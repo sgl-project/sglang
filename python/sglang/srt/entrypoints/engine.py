@@ -33,6 +33,8 @@ import zmq
 import zmq.asyncio
 from PIL.Image import Image
 
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -60,6 +62,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -136,6 +139,12 @@ class Engine(EngineBase):
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
+
+        if server_args.enable_trace:
+            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+            if server_args.disaggregation_mode == "null":
+                thread_label = "Tokenizer"
+                trace_set_thread_info(thread_label)
 
     def generate(
         self,
@@ -363,9 +372,9 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
-    def start_profile(self):
+    def start_profile(self, **kwargs):
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.start_profile())
+        loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
 
     def stop_profile(self):
         loop = asyncio.get_event_loop()
@@ -654,7 +663,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
     # flashinfer uses this environment variable for various kernels from MoE to quant kernels
-    os.environ["TRTLLM_ENABLE_PDL"] = "1"
+    if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
+        os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
     # Can also be passed as argument
     os.environ["SGLANG_RUN_ID"] = (
@@ -672,7 +682,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.14.post1",
+            "0.3.1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -680,7 +690,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.7",
+            "0.3.9.post2",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -700,6 +710,24 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
+
+def _init_tokenizer_manager(
+    server_args: ServerArgs, port_args: PortArgs
+) -> TokenizerManager:
+    # Launch tokenizer process
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+
+    # Initialize templates
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
+
+    return tokenizer_manager, template_manager
 
 
 def _launch_subprocesses(
@@ -815,17 +843,15 @@ def _launch_subprocesses(
     )
     detoken_proc.start()
 
-    # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
-
-    # Initialize templates
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
-    )
+    # Init tokenizer manager first, as the bootstrap server is initialized here
+    if server_args.tokenizer_worker_num > 1:
+        # Launch multi-tokenizer router
+        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+        template_manager = None
+    else:
+        tokenizer_manager, template_manager = _init_tokenizer_manager(
+            server_args, port_args
+        )
 
     # Wait for the model to finish loading
     scheduler_infos = []
@@ -848,5 +874,7 @@ def _launch_subprocesses(
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
+
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
     return tokenizer_manager, template_manager, scheduler_info

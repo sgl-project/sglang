@@ -38,9 +38,12 @@ from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
+    DotsVLMConfig,
     ExaoneConfig,
     KimiVLConfig,
+    LongcatFlashConfig,
     MultiModalityConfig,
+    Qwen3NextConfig,
     Step3VLConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
@@ -56,6 +59,9 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
     Step3VLConfig.model_type: Step3VLConfig,
+    LongcatFlashConfig.model_type: LongcatFlashConfig,
+    Qwen3NextConfig.model_type: Qwen3NextConfig,
+    DotsVLMConfig.model_type: DotsVLMConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
