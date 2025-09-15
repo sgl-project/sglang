@@ -436,7 +436,11 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        hack_real_fn = None,
     ):
+        if hack_real_fn is not None:
+            return hack_real_fn()
+
         dispatch_output = self.dispatch(
             hidden_states, topk_idx, topk_weights, forward_batch
         )
