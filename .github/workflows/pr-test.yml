@@ -161,7 +161,8 @@ jobs:
 
   unit-test-frontend:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -187,7 +188,8 @@ jobs:
 
   unit-test-backend-1-gpu:
     needs: [check-changes, unit-test-frontend, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
@@ -217,7 +219,8 @@ jobs:
 
   unit-test-backend-2-gpu:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 2-gpu-runner
     strategy:
       fail-fast: false
@@ -247,7 +250,8 @@ jobs:
 
   unit-test-backend-4-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 4-gpu-runner
     strategy:
       fail-fast: false
@@ -277,7 +281,8 @@ jobs:
 
   unit-test-backend-8-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 8-gpu-runner
     strategy:
       fail-fast: false
@@ -307,7 +312,8 @@ jobs:
 
   performance-test-1-gpu-part-1:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -365,7 +371,8 @@ jobs:
 
   performance-test-1-gpu-part-2:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -415,7 +422,8 @@ jobs:
 
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -471,7 +479,8 @@ jobs:
 
   accuracy-test-1-gpu:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -500,7 +509,8 @@ jobs:
 
   accuracy-test-2-gpu:
     needs: [check-changes, accuracy-test-1-gpu, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -529,7 +539,8 @@ jobs:
 
   unit-test-deepep-4-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 4-gpu-runner
     steps:
       - name: Checkout code
@@ -555,7 +566,8 @@ jobs:
 
   unit-test-deepep-8-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 8-gpu-runner
     steps:
       - name: Checkout code
@@ -581,7 +593,8 @@ jobs:
 
   unit-test-backend-8-gpu-b200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: always() && !failure() && !cancelled() &&
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: b200-runner
     strategy:
       fail-fast: false
