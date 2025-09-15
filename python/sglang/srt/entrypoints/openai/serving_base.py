@@ -11,6 +11,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -24,6 +25,14 @@ class OpenAIServingBase(ABC):
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
+        self.allowed_custom_labels = (
+            set(
+                self.tokenizer_manager.server_args.tokenizer_metrics_allowed_customer_labels
+            )
+            if isinstance(self.tokenizer_manager.server_args, ServerArgs)
+            and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_customer_labels
+            else None
+        )
 
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
@@ -37,7 +46,7 @@ class OpenAIServingBase(ABC):
 
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
-                request
+                request, raw_request
             )
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
@@ -81,6 +90,7 @@ class OpenAIServingBase(ABC):
     def _convert_to_internal_request(
         self,
         request: OpenAIServingRequest,
+        raw_request: Request = None,
     ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
         """Convert OpenAI request to internal format"""
         pass
@@ -154,3 +164,32 @@ class OpenAIServingBase(ABC):
             code=status_code,
         )
         return json.dumps({"error": error.model_dump()})
+
+    def extract_customer_labels(self, raw_request):
+        if (
+            not self.allowed_custom_labels
+            or not self.tokenizer_manager.server_args.tokenizer_metrics_custom_labels_header
+        ):
+            return None
+
+        customer_labels = None
+        header = (
+            self.tokenizer_manager.server_args.tokenizer_metrics_custom_labels_header
+        )
+        try:
+            raw_labels = (
+                json.loads(raw_request.headers.get(header))
+                if raw_request and raw_request.headers.get(header)
+                else None
+            )
+        except json.JSONDecodeError as e:
+            logger.exception(f"Error in request: {e}")
+            raw_labels = None
+
+        if isinstance(raw_labels, dict):
+            customer_labels = {
+                label: value
+                for label, value in raw_labels.items()
+                if label in self.allowed_custom_labels
+            }
+        return customer_labels
