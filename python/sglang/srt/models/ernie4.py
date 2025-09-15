@@ -92,7 +92,7 @@ class Ernie4Moe(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
         )
 
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.moe_num_experts,
             top_k=config.moe_k,
             hidden_size=config.hidden_size,

@@ -2,9 +2,10 @@ name: PR Test
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+    types: [synchronize, labeled]
   workflow_dispatch:
     inputs:
       version:
@@ -21,47 +22,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # =============================================== sgl-kernel ====================================================
-
-  sgl-kernel-check-changes:
+  # =============================================== check changes ====================================================
+  check-changes:
     runs-on: ubuntu-latest
     outputs:
-      src: ${{ steps.filter.outputs.src }}
+      main_package: ${{ steps.filter.outputs.main_package }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Fail if the PR does not have the 'run-ci' label
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
+        run: |
+          echo "This pull request does not have the 'run-ci' label. Failing the workflow."
+          exit 1
+
+      - name: Fail if the PR is a draft
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+        run: |
+          echo "This pull request is a draft. Failing the workflow."
+          exit 1
 
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
         with:
           filters: |
-            src:
+            main_package:
+              - "python/**"
+              - "scripts/ci/**"
+              - "test/**"
+              - ".github/workflows/pr-test.yml"
+            sgl_kernel:
               - "sgl-kernel/**"
 
-  sgl-kernel-lint:
-    runs-on: ubuntu-latest
-    needs: sgl-kernel-check-changes
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.sgl-kernel-check-changes.outputs.src == 'true'
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Check clang-format
-        uses: DoozyX/clang-format-lint-action@v0.18.1
-        with:
-          source: sgl-kernel
-          extensions: h,c,cpp,hpp,cu,cuh,cc
-          clangFormatVersion: 18
-          style: file
+  # =============================================== sgl-kernel ====================================================
 
   sgl-kernel-build-wheels:
-    needs: sgl-kernel-check-changes
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.sgl-kernel-check-changes.outputs.src == 'true'
+    needs: [check-changes]
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: sgl-kernel-build-node
     strategy:
       matrix:
@@ -91,7 +91,6 @@ jobs:
         if: github.event_name != 'push' || (matrix.cuda-version != '11.8')
         run: |
           cd sgl-kernel
-          chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
 
       - name: Upload artifacts
@@ -101,10 +100,8 @@ jobs:
           path: sgl-kernel/dist/*
 
   sgl-kernel-unit-test:
-    needs: [sgl-kernel-check-changes, sgl-kernel-build-wheels]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.sgl-kernel-check-changes.outputs.src == 'true'
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
@@ -121,13 +118,9 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
-      - name: Install
+      - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
-          pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126 && pip3 install pytest
-          pip3 uninstall sgl-kernel -y || true
-          pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
-          pip3 list | grep sgl-kernel
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -135,15 +128,9 @@ jobs:
           cd sgl-kernel
           pytest tests/
 
-      - name: Uninstall dependencies
-        run: |
-          pip3 uninstall sgl-kernel -y
-
   sgl-kernel-mla-test:
-    needs: [sgl-kernel-check-changes, sgl-kernel-build-wheels]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.sgl-kernel-check-changes.outputs.src == 'true'
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
@@ -160,13 +147,9 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
-      - name: Install
+      - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
-          pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
-          pip3 uninstall sgl-kernel -y || true
-          pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
-          pip3 list | grep sgl-kernel
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -174,62 +157,19 @@ jobs:
           cd test/srt
           python3 test_mla_deepseek_v3.py
 
-      - name: Uninstall dependencies
-        run: |
-          pip3 uninstall sgl-kernel -y
-
-  sgl-kernel-finish:
-    needs: [sgl-kernel-unit-test, sgl-kernel-mla-test, sgl-kernel-lint, sgl-kernel-build-wheels]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check all dependent job statuses
-        run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
-
   # =============================================== primary ====================================================
 
-  check-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      src: ${{ steps.filter.outputs.src }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Detect file changes
-        id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            src:
-              - "python/**"
-              - "scripts/ci/**"
-              - "test/**"
-              - ".github/workflows/pr-test.yml"
-              - "sgl-kernel/**"
-
   unit-test-frontend:
-    needs: [check-changes, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -238,7 +178,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
@@ -247,11 +187,9 @@ jobs:
           python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
-    needs: [check-changes, unit-test-frontend, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, unit-test-frontend, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
@@ -262,7 +200,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -271,7 +209,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -280,11 +218,9 @@ jobs:
           python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 10
 
   unit-test-backend-2-gpu:
-    needs: [check-changes, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 2-gpu-runner
     strategy:
       fail-fast: false
@@ -295,7 +231,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -304,7 +240,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -313,11 +249,9 @@ jobs:
           python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-4-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 4-gpu-runner
     strategy:
       fail-fast: false
@@ -328,7 +262,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -337,7 +271,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -346,11 +280,9 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-8-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 8-gpu-runner
     strategy:
       fail-fast: false
@@ -361,7 +293,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -370,7 +302,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -379,18 +311,16 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   performance-test-1-gpu-part-1:
-    needs: [check-changes, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -399,7 +329,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark single latency
         timeout-minutes: 10
@@ -440,18 +370,16 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
 
   performance-test-1-gpu-part-2:
-    needs: [check-changes, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -460,7 +388,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 10
@@ -493,18 +421,16 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
   performance-test-2-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -513,7 +439,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark single latency (TP=2)
         timeout-minutes: 10
@@ -552,18 +478,16 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
   accuracy-test-1-gpu:
-    needs: [check-changes, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -572,7 +496,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -584,18 +508,16 @@ jobs:
           python3 test_eval_accuracy_large.py
 
   accuracy-test-2-gpu:
-    needs: [check-changes, accuracy-test-1-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, accuracy-test-1-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -604,7 +526,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -616,18 +538,16 @@ jobs:
           python3 test_moe_eval_accuracy_large.py
 
   unit-test-deepep-4-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 4-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -636,7 +556,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_deepep.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -645,18 +565,16 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-deepep
 
   unit-test-deepep-8-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-        (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: 8-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -665,7 +583,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} bash scripts/ci/ci_install_deepep.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -674,11 +592,9 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-deepep
 
   unit-test-backend-8-gpu-b200:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-check-changes, sgl-kernel-finish]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
-      (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false &&
-      needs.check-changes.outputs.src == 'true'
+        needs.check-changes.outputs.main_package == 'true'
     runs-on: b200-runner
     strategy:
       fail-fast: false
@@ -687,7 +603,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        if: needs.sgl-kernel-check-changes.outputs.src == 'true'
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -696,7 +612,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.sgl-kernel-check-changes.outputs.src}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 60
@@ -704,10 +620,13 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
 
-
   pr-test-finish:
     needs: [
       check-changes,
+
+      sgl-kernel-build-wheels,
+      sgl-kernel-unit-test, sgl-kernel-mla-test,
+
       unit-test-frontend, unit-test-backend-1-gpu,
       unit-test-backend-2-gpu, unit-test-backend-4-gpu, unit-test-backend-8-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
@@ -720,12 +639,26 @@ jobs:
     steps:
       - name: Check all dependent job statuses
         run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
+          # Convert the 'needs' context to a JSON string
+          json_needs='${{ toJson(needs) }}'
+
+          # Get a list of all job names from the JSON keys
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            # For each job, extract its result
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+
+            # Print the job name and its result
+            echo "$job: $result"
+
+            # Check for failure or cancellation and exit if found
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
               exit 1
             fi
           done
+
+          # If the loop completes, all jobs were successful
           echo "All jobs completed successfully"
           exit 0
