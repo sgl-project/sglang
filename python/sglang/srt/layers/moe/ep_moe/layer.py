@@ -480,6 +480,8 @@ class DeepEPMoE(EPMoE):
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if get_moe_runner_backend().is_flashinfer_cutedsl():
                 return self.forward_flashinfer_cutedsl(dispatch_output)
+            elif self.use_w4afp8:
+                return self.forward_cutlass_w4afp8_masked(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
