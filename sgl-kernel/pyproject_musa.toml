@@ -1,0 +1,31 @@
+[build-system]
+requires = [
+  "setuptools>=75.0",
+  "scikit-build-core>=0.10",
+  "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sgl-kernel"
+version = "0.3.7"
+description = "Kernel Library for SGLang"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Environment :: GPU :: NVIDIA CUDA"
+]
+dependencies = []
+
+[project.urls]
+"Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"
+"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[tool.wheel]
+exclude = [
+  "dist*",
+  "tests*",
+]

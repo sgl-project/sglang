@@ -6,9 +6,9 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
-if is_cuda() or is_hip():
+if is_cuda() or is_hip() or is_musa():
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
@@ -62,14 +62,16 @@ def build_tree_kernel_efficient(
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
 ):
-    parent_list, top_scores_index, draft_tokens = (
-        build_tree_kernel_efficient_preprocess(
-            verified_id,
-            score_list,
-            token_list,
-            parents_list,
-            num_verify_tokens,
-        )
+    (
+        parent_list,
+        top_scores_index,
+        draft_tokens,
+    ) = build_tree_kernel_efficient_preprocess(
+        verified_id,
+        score_list,
+        token_list,
+        parents_list,
+        num_verify_tokens,
     )
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
