@@ -289,9 +289,9 @@ class RuntimeEndpoint(BaseBackend):
             if s.text_.endswith(healed_token_str):
                 healed_token_logprob = input_token_logprobs[i][0][0]
                 normalized_prompt_logprobs[i] = (
-                                                    normalized_prompt_logprobs[i] * len(input_token_logprobs[i])
-                                                    - healed_token_logprob
-                                                ) / (len(input_token_logprobs[i]) - 1)
+                    normalized_prompt_logprobs[i] * len(input_token_logprobs[i])
+                    - healed_token_logprob
+                ) / (len(input_token_logprobs[i]) - 1)
                 input_token_logprobs[i] = input_token_logprobs[i][1:]
 
         # Compute unconditional logprobs if required
@@ -346,7 +346,8 @@ class RuntimeEndpoint(BaseBackend):
 
     def _add_videos(self, s: StreamExecutor, data):
         if s.videos_:
-            data["video_data"] = data.get("video_data", []) + [s.videos_]
+            assert len(s.videos_) == 1, "Only support one video."
+            data["video_data"] = s.videos_
 
     def _assert_success(self, res):
         if res.status_code != 200:

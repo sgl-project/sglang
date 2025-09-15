@@ -209,7 +209,6 @@ def encode_frame(frame):
     return frame_bytes
 
 
-
 def _is_chinese_char(cp: int):
     """Checks whether CP is the codepoint of a CJK character."""
     # This defines a "chinese character" as anything in the CJK Unicode block:

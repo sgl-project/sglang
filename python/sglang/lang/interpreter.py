@@ -32,10 +32,7 @@ from sglang.lang.ir import (
     SglVarScopeEnd,
     SglVideo,
 )
-from sglang.utils import (
-    encode_image_base64,
-    get_exception_traceback,
-)
+from sglang.utils import encode_image_base64, get_exception_traceback
 
 
 def run_internal(state, program, func_args, func_kwargs, sync):
@@ -286,7 +283,6 @@ class StreamExecutor:
         self.images_ = []
         self.cur_images = []
         self.videos_ = []
-
 
         # For fork/join
         self.fork_start_text_pos = None
