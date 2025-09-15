@@ -5,16 +5,15 @@
 [![PyPI](https://img.shields.io/pypi/v/sgl-kernel)](https://pypi.org/project/sgl-kernel)
 
 ## Installation
-For CUDA 12.1 and above:
 
 ```bash
 pip3 install sgl-kernel
 ```
 
-For CUDA 11.8:
+For CUDA 12.4:
 
 ```bash
-pip3 install sgl-kernel -i https://docs.sglang.ai/whl/cu118
+pip3 install sgl-kernel -i https://docs.sglang.ai/whl/cu124
 ```
 
 ## Build from source
@@ -52,10 +51,12 @@ See CMakeLists.txt for more options.
 ### Parallel Build
 
 We highly recommend you build sgl-kernel with Ninja. Ninja can automatically build sgl-kernel in parallel.
-And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLEL_LEVEL` for parallel build like:
+And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLEL_LEVEL` and limit the
+nvcc threads to a single thread by setting `SGL_KERNEL_COMPILE_THREADS=1` for parallel build like:
 
 ```bash
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build \
+-Ccmake.define.SGL_KERNEL_COMPILE_THREADS=1 --color=always .
 ```
 
 ### ⚠️ Compilation Issue with `sgl-kernel` and CUDA 12.6

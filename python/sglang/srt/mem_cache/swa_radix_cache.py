@@ -60,8 +60,6 @@ class TreeNode:
         self.last_access_time = time.monotonic()
 
         self.hit_count = 0
-        # indicating the node is loading KV cache from host
-        self.loading = False
         # store the host indices of KV cache
         self.host_value = None
 

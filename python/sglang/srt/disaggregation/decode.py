@@ -24,7 +24,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
 import torch
 from torch.distributed import ProcessGroup
@@ -218,8 +218,10 @@ class DecodePreallocQueue:
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
-        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(
+        kv_manager_class: Type[BaseKVManager] = get_kv_class(
+            self.transfer_backend, KVClassType.MANAGER
+        )
+        kv_manager: BaseKVManager = kv_manager_class(
             kv_args,
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
@@ -248,7 +250,7 @@ class DecodePreallocQueue:
                 mgr=self.kv_manager,
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
-                data_parallel_rank=req.data_parallel_rank,
+                prefill_dp_rank=req.data_parallel_rank,
             )
 
             self.queue.append(
@@ -884,9 +886,18 @@ class SchedulerDisaggregationDecodeMixin:
             # if there are still retracted requests, we do not allocate new requests
             return
 
-        req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
-        self.disagg_decode_transfer_queue.extend(req_conns)
-        alloc_reqs = (
-            self.disagg_decode_transfer_queue.pop_transferred()
-        )  # the requests which kv has arrived
-        self.waiting_queue.extend(alloc_reqs)
+        if not hasattr(self, "polling_count"):
+            self.polling_count = 0
+            self.polling_interval = (
+                self.server_args.disaggregation_decode_polling_interval
+            )
+
+        self.polling_count = (self.polling_count + 1) % self.polling_interval
+
+        if self.polling_count % self.polling_interval == 0:
+            req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
+            self.disagg_decode_transfer_queue.extend(req_conns)
+            alloc_reqs = (
+                self.disagg_decode_transfer_queue.pop_transferred()
+            )  # the requests which kv has arrived
+            self.waiting_queue.extend(alloc_reqs)
