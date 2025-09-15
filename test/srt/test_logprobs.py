@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 DENSE_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 if torch.version.hip is not None:
     print("Running on AMD ROCm GPU")
-    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/yushengsu/logprobs/resolve/main/sglang_baseline_v0.5.1.pkl"
+    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/yushengsu/logprobs/resolve/main/sglang_baseline_2000_amd.pkl"
     DENSE_TOLERANCE_MAX_DIFF = 1.4
     DENSE_TOLERANCE_MEAN_DIFF = 0.1
 elif torch.version.cuda is not None:
