@@ -64,6 +64,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
+    GetLoadReqInput,
     HealthCheckOutput,
     MultiTokenizerWrapper,
     OpenSessionReqInput,
@@ -73,6 +74,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    WatchLoadUpdateReq,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -1240,6 +1242,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.watch_load_thread))
+        )
 
     def dump_requests_before_crash(self):
         if self.crash_dump_performed:
@@ -1843,6 +1848,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             scores.append(score_list)
 
         return scores
+
+    async def watch_load_thread(self):
+        # Only for dp_controller when dp_size > 1
+        if (
+            self.server_args.dp_size == 1
+            or self.server_args.load_balance_method == "round_robin"
+        ):
+            return
+
+        while True:
+            await asyncio.sleep(self.server_args.load_watch_interval)
+            loads = await self.get_load_communicator(GetLoadReqInput())
+            load_udpate_req = WatchLoadUpdateReq(loads=loads)
+            self.send_to_scheduler.send_pyobj(load_udpate_req)
 
 
 class ServerStatus(Enum):
