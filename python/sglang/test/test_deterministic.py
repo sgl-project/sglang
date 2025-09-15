@@ -105,7 +105,7 @@ def send_single(args, batch_size: int):
 
 
 def send_mixed(args, batch_size: int):
-    num_long_prompt = 0 if batch_size < 10 else random.randint(1, 10)
+    num_long_prompt = 0 if batch_size <= 10 else random.randint(1, 10)
     num_prompt_1 = random.randint(1, batch_size - num_long_prompt)
     num_prompt_2 = batch_size - num_prompt_1 - num_long_prompt
 
