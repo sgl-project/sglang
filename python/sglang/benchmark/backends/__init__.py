@@ -1,5 +1,5 @@
 from argparse import Namespace
-from typing import Type
+from typing import Tuple, Type
 
 from sglang.benchmark.backends.base_client import BaseBackendClient
 from sglang.benchmark.backends.sglang_client import SglangClient
@@ -17,7 +17,7 @@ def get_backend_client(args: Namespace) -> BaseBackendClient:
     return backend_class(args)
 
 
-def get_api_url(args: Namespace) -> (str, str):
+def get_api_url(args: Namespace) -> Tuple[str, str]:
     base_url = args.base_url or f"http://{args.host}:{args.port}"
 
     if args.backend in ["sglang", "sglang-native"]:

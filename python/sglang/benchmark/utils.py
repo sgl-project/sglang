@@ -6,7 +6,7 @@ import os
 import resource
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 import aiohttp
 import requests
@@ -85,7 +85,7 @@ def is_file_valid_json(path):
         return False
 
 
-def download_and_cache_file(url: str, filename: str):
+def download_and_cache_file(url: str, filename: Optional[str] = None):
     """Read and cache a file from a url."""
     if filename is None:
         filename = os.path.join("/tmp", url.split("/")[-1])

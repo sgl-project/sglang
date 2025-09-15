@@ -6,7 +6,6 @@ import click
 
 from sglang.benchmark.backends import BACKEND_MAPPING
 from sglang.benchmark.datasets import DATASET_MAPPING
-from sglang.srt.server_args import ServerArgs
 
 
 def composite_options(options: List[Callable]):
