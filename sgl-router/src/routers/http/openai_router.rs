@@ -67,7 +67,11 @@ impl OpenAIRouter {
 
 #[async_trait]
 impl super::super::WorkerManagement for OpenAIRouter {
-    async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
+    async fn add_worker(
+        &self,
+        _worker_url: &str,
+        _api_key: &Option<String>,
+    ) -> Result<String, String> {
         Err("Cannot add workers to OpenAI router".to_string())
     }
 
@@ -186,6 +190,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &GenerateRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         // Generate endpoint is SGLang-specific, not supported for OpenAI backend
         (
@@ -199,6 +204,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         if !self.circuit_breaker.can_execute() {
             return (StatusCode::SERVICE_UNAVAILABLE, "Circuit breaker open").into_response();
@@ -326,6 +332,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &CompletionRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         // Completion endpoint not implemented for OpenAI backend
         (
@@ -339,10 +346,27 @@ impl super::super::RouterTrait for OpenAIRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ResponsesRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Responses endpoint not implemented for OpenAI router",
+        )
+            .into_response()
+    }
+
+    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses retrieve endpoint not implemented for OpenAI router",
+        )
+            .into_response()
+    }
+
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses cancel endpoint not implemented for OpenAI router",
         )
             .into_response()
     }
@@ -375,7 +399,12 @@ impl super::super::RouterTrait for OpenAIRouter {
         }
     }
 
-    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+    async fn route_embeddings(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::EmbeddingRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Embeddings endpoint not implemented for OpenAI backend",
@@ -383,7 +412,12 @@ impl super::super::RouterTrait for OpenAIRouter {
             .into_response()
     }
 
-    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: &RerankRequest) -> Response {
+    async fn route_rerank(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &RerankRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Rerank endpoint not implemented for OpenAI backend",

@@ -27,7 +27,7 @@ use tracing::{info, warn};
 #[allow(dead_code)] // Fields will be used once implementation is complete
 pub struct GrpcRouter {
     /// Worker connections
-    workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
+    workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
     /// gRPC clients for each worker
     grpc_clients: Arc<RwLock<HashMap<String, SglangSchedulerClient>>>,
     /// Load balancing policy
@@ -103,7 +103,7 @@ impl GrpcRouter {
         }
 
         // Create Worker trait objects with gRPC connection mode
-        let mut workers: Vec<Box<dyn Worker>> = Vec::new();
+        let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
 
         // Move clients from the HashMap to the workers
         for url in &worker_urls {
@@ -112,7 +112,7 @@ impl GrpcRouter {
                     url.clone(),
                     WorkerType::Regular,
                     crate::core::ConnectionMode::Grpc { port: None },
-                    &ctx.router_config.api_key,
+                    ctx.router_config.api_key.clone(),
                 )
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {
@@ -124,7 +124,7 @@ impl GrpcRouter {
                 })
                 .with_grpc_client(client);
 
-                workers.push(Box::new(worker) as Box<dyn Worker>);
+                workers.push(Arc::new(worker) as Arc<dyn Worker>);
             } else {
                 warn!("No gRPC client for worker {}, skipping", url);
             }
@@ -203,6 +203,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::GenerateRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -211,6 +212,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ChatCompletionRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -219,6 +221,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::CompletionRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -227,11 +230,25 @@ impl RouterTrait for GrpcRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ResponsesRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn route_embeddings(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::EmbeddingRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
@@ -239,6 +256,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::RerankRequest,
+        _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -262,7 +280,11 @@ impl RouterTrait for GrpcRouter {
 
 #[async_trait]
 impl WorkerManagement for GrpcRouter {
-    async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
+    async fn add_worker(
+        &self,
+        _worker_url: &str,
+        _api_key: &Option<String>,
+    ) -> Result<String, String> {
         Err("Not implemented".to_string())
     }
 

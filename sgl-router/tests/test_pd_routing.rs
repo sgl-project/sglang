@@ -52,7 +52,7 @@ mod test_pd_routing {
         let prefill_worker = WorkerFactory::create_prefill(
             "http://prefill:8080".to_string(),
             Some(9000),
-            &Some("test_api_key".to_string()),
+            Some("test_api_key".to_string()),
         );
         assert_eq!(prefill_worker.url(), "http://prefill:8080");
         match prefill_worker.worker_type() {
@@ -65,7 +65,7 @@ mod test_pd_routing {
         // Test worker creation for decode servers
         let decode_worker = WorkerFactory::create_decode(
             "http://decode:8080".to_string(),
-            &Some("test_api_key".to_string()),
+            Some("test_api_key".to_string()),
         );
         assert_eq!(decode_worker.url(), "http://decode:8080");
         match decode_worker.worker_type() {
@@ -76,7 +76,7 @@ mod test_pd_routing {
         // Test regular worker creation
         let regular_worker = WorkerFactory::create_regular(
             "http://regular:8080".to_string(),
-            &Some("test_api_key".to_string()),
+            Some("test_api_key".to_string()),
         );
         assert_eq!(regular_worker.url(), "http://regular:8080");
         match regular_worker.worker_type() {
@@ -288,7 +288,7 @@ mod test_pd_routing {
         let prefill_worker = WorkerFactory::create_prefill(
             "http://prefill1:8080".to_string(),
             Some(9000),
-            &Some("test_api_key".to_string()),
+            Some("test_api_key".to_string()),
         );
 
         // Extract bootstrap port from worker type
@@ -689,7 +689,7 @@ mod test_pd_routing {
         let prefill_worker = WorkerFactory::create_prefill(
             "http://prefill:8080".to_string(),
             Some(9000),
-            &Some("test_api_key".to_string()),
+            Some("test_api_key".to_string()),
         );
 
         // Extract bootstrap port from worker type
@@ -821,7 +821,7 @@ mod test_pd_routing {
 
             // Create a prefill worker to simulate injection
             let prefill_worker =
-                WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000), &None);
+                WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000), None);
 
             // Extract bootstrap port from worker type
             let bootstrap_port = match prefill_worker.worker_type() {
