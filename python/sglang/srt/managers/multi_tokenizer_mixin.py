@@ -195,6 +195,8 @@ def _handle_output_by_index(output, i):
                 if output.output_hidden_states
                 else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchEmbeddingOut):
         new_output = BatchEmbeddingOut(
@@ -211,6 +213,8 @@ def _handle_output_by_index(output, i):
             cached_tokens=(
                 [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchStrOut):
         new_output = BatchStrOut(
@@ -307,6 +311,8 @@ def _handle_output_by_index(output, i):
                 if output.output_hidden_states
                 else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchMultimodalOut):
         new_output = BatchMultimodalOut(
@@ -328,6 +334,8 @@ def _handle_output_by_index(output, i):
             cached_tokens=(
                 [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     else:
         new_output = output
@@ -345,6 +353,10 @@ class MultiHttpWorkerDetokenizerMixin:
         else:
             worker_ids = []
         return worker_ids
+
+    def maybe_clear_socket_mapping(self):
+        if hasattr(self, "socket_mapping"):
+            self.socket_mapping.clear_all_sockets()
 
     def multi_http_worker_event_loop(self):
         """The event loop that handles requests, for multi multi-http-worker mode"""
@@ -450,9 +462,7 @@ class MultiTokenizerManager(TokenizerManager):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        setproctitle.setproctitle(
-            f"sglang::http_server/multi_tokenizer_manager:{os.getpid()}"
-        )
+        setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
         server_args.disaggregation_mode = "null"

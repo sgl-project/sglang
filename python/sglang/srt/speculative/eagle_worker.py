@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     get_bool_env_var,
+    is_blackwell,
     is_cuda,
     next_power_of_2,
 )
@@ -191,7 +192,7 @@ class EAGLEWorker(TpModelWorker):
         # Initialize decode attention backend
         self.draft_attn_backend = self._create_decode_backend()
 
-        # Initialize draft extend attention backend (respects speculative_attention_backend setting)
+        # Initialize draft extend attention backend (respects speculative_attention_mode setting)
         self.draft_extend_attn_backend = self._create_draft_extend_backend()
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
@@ -214,6 +215,11 @@ class EAGLEWorker(TpModelWorker):
             "triton": self._create_triton_decode_backend,
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
+            "hybrid_linear_attn": (
+                self._create_fa3_decode_backend
+                if not is_blackwell()
+                else self._create_triton_decode_backend
+            ),
             "flashmla": self._create_flashmla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
@@ -231,12 +237,17 @@ class EAGLEWorker(TpModelWorker):
             "triton": self._create_triton_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
+            "hybrid_linear_attn": (
+                self._create_fa3_prefill_backend
+                if not is_blackwell()
+                else self._create_triton_prefill_backend
+            ),
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
-            if self.server_args.speculative_attention_backend == "decode"
+            if self.server_args.speculative_attention_mode == "decode"
             else "prefill_attention_backend"
         )
         return self._create_backend(
@@ -825,6 +836,21 @@ class EAGLEWorker(TpModelWorker):
             res.accepted_indices
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+
+        # QQ: can be optimized
+        if self.target_worker.model_runner.is_hybrid_gdn:
+            # res.draft_input.accept_length is on GPU but may be empty for last verify?
+            accepted_length = (
+                torch.tensor(
+                    res.accept_length_per_req_cpu,
+                    device=logits_output.hidden_states.device,
+                    dtype=torch.int32,
+                )
+                + 1
+            )
+            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+                accepted_length, self.target_worker.model_runner.model
+            )
 
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
