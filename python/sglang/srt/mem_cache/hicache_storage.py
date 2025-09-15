@@ -51,7 +51,6 @@ class HiCacheStorage(ABC):
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
 
-    @abstractmethod
     def batch_get_v1(
         self,
         keys: List[str],
@@ -64,7 +63,6 @@ class HiCacheStorage(ABC):
         """
         pass
 
-    @abstractmethod
     def batch_set_v1(
         self,
         keys: List[str],
