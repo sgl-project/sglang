@@ -39,6 +39,7 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from python.sglang.srt.utils import get_bool_env_var
 from sglang.environ import envs
 from sglang.srt.utils import (
     direct_register_custom_op,

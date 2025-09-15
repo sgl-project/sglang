@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from python.sglang.srt.utils import get_bool_env_var
 from sglang.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
