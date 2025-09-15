@@ -757,7 +757,6 @@ multimodal_model_archs = [
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
-
 ]
 
 
