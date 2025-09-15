@@ -77,8 +77,9 @@ logger = logging.getLogger(__name__)
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
+# TODO make it true by default when the DeepEP PR is merged
 CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
-    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "true"
+    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
 )
 
 # Supported activation schemes for the current configuration
