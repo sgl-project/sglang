@@ -2270,7 +2270,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
 
             if self.draft_worker:
-                self.draft_worker.reset()
+                self.draft_worker.clear_cache_pool()
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0

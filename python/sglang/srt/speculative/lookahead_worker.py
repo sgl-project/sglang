@@ -58,7 +58,7 @@ class LOOKAHEADWorker:
             draft_token_num=server_args.speculative_num_draft_tokens,
         )
 
-    def reset(self):
+    def clear_cache_pool(self):
         self.lookahead_cache.reset()
 
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
