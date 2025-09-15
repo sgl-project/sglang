@@ -765,11 +765,11 @@ class ServerArgs:
             self.speculative_algorithm = "EAGLE"
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
-            if self.speculative_algorithm == "STANDALONE":
+            if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
-                assert (
-                    self.enable_dp_attention is False
-                ), "Currently standalone speculative decoding does not support dp attention."
+                raise ValueError(
+                    "Currently standalone speculative decoding does not support dp attention."
+                )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
@@ -849,6 +849,9 @@ class ServerArgs:
             self.disable_overlap_schedule = True
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_lookahead_max_bfs_breadth
+            if self.speculative_num_draft_tokens is None:
+                # TODO: Do better auto choose in the future
+                self.speculative_num_draft_tokens = 16
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
                 "using lookahead speculative decoding."
@@ -862,6 +865,11 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
+            if self.enable_dp_attention:
+                # TODO: support dp attention for lookahead speculative decoding
+                raise ValueError(
+                    "Currently lookahead speculative decoding does not support dp attention."
+                )
         # GGUF
         if (
             self.load_format == "auto" or self.load_format == "gguf"
