@@ -4,9 +4,11 @@ on:
   pull_request_target:
     types: [opened, reopened]
 
-# Sets the permissions for the GITHUB_TOKEN to allow adding labels.
+# This permission is still needed for the 'check-user-permission' action,
+# which uses the default GITHUB_TOKEN to verify the actor's permissions.
 permissions:
-  pull-requests: write
+  pull-requests: read
+  members: read
 
 jobs:
   labeler:
@@ -25,6 +27,7 @@ jobs:
         if: steps.checkAccess.outputs.require-result == 'true'
         uses: actions/github-script@v7
         with:
+          token: ${{ secrets.GH_PAT_FOR_TAGGING }}
           script: |
             github.rest.issues.addLabels({
               owner: context.repo.owner,
