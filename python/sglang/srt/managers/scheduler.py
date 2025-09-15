@@ -79,6 +79,8 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetLoadReqInput,
+    GetLoadReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -149,6 +151,15 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.tracing.trace import (
+    process_tracing_init,
+    trace_event,
+    trace_set_proc_propagate_context,
+    trace_set_thread_info,
+    trace_slice,
+    trace_slice_end,
+    trace_slice_start,
+)
 from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -568,6 +579,7 @@ class Scheduler(
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
+                (GetLoadReqInput, self.get_load),
             ]
         )
 
@@ -827,6 +839,10 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                for req in batch.reqs:
+                    trace_event("schedule", req.rid)
+
+            if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -846,6 +862,10 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+
+            if batch:
+                for req in batch.reqs:
+                    trace_event("schedule", req.rid)
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -1110,6 +1130,12 @@ class Scheduler(
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                trace_set_proc_propagate_context(req.rid, req.trace_context)
+                trace_slice_start("", req.rid, anonymous=True)
+
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -1154,6 +1180,16 @@ class Scheduler(
                         self.recv_from_rpc.send_pyobj(output)
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
+
+    def init_req_max_new_tokens(self, req):
+        req.sampling_params.max_new_tokens = min(
+            (
+                req.sampling_params.max_new_tokens
+                if req.sampling_params.max_new_tokens is not None
+                else 1 << 30
+            ),
+            self.max_req_len - len(req.origin_input_ids) - 1,
+        )
 
     def handle_generate_request(
         self,
@@ -1218,6 +1254,7 @@ class Scheduler(
                 req.set_finish_with_abort(
                     f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
+                self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
         else:
@@ -1225,6 +1262,7 @@ class Scheduler(
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
+                self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
 
@@ -1244,8 +1282,12 @@ class Scheduler(
                         f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
                     )
                 )
+                self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+
+        # initialize before returning
+        self.init_req_max_new_tokens(req)
 
         # Validate prompt length
         error_msg = validate_input_length(
@@ -1261,25 +1303,24 @@ class Scheduler(
         # Copy more attributes
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
             # By default, only return the logprobs for output tokens
-            req.logprob_start_len = len(req.origin_input_ids) - 1
+            # For prefill-only requests with logprob_start_len == -1, set logprob_start_len beyond input sequence
+            # to skip input logprob computation entirely
+            if req.is_prefill_only:
+                req.logprob_start_len = len(req.origin_input_ids)
+            else:
+                # TODO: For text generation, evaluate setting logprob_start_len to len(req.origin_input_ids) as well
+                req.logprob_start_len = len(req.origin_input_ids) - 1
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
-        if req.logprob_start_len >= len(req.origin_input_ids):
+        if not req.is_prefill_only and req.logprob_start_len >= len(
+            req.origin_input_ids
+        ):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = len(req.origin_input_ids) - 1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
-
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
-            self.max_req_len - len(req.origin_input_ids) - 1,
-        )
 
         # Init grammar cache for this request
         add_to_grammar_queue = False
@@ -1339,6 +1380,7 @@ class Scheduler(
         else:
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
+            trace_slice_end("process req", req.rid, auto_next_anon=True)
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
@@ -1505,6 +1547,20 @@ class Scheduler(
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.stats.num_prefill_prealloc_queue_reqs = len(
+                    self.disagg_prefill_bootstrap_queue.queue
+                )
+                self.stats.num_prefill_inflight_queue_reqs = len(
+                    self.disagg_prefill_inflight_queue
+                )
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.stats.num_decode_prealloc_queue_reqs = len(
+                    self.disagg_decode_prealloc_queue.queue
+                )
+                self.stats.num_decode_transfer_queue_reqs = len(
+                    self.disagg_decode_transfer_queue.queue
+                )
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
 
@@ -1892,8 +1948,23 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
+            for req in batch.reqs:
+                trace_slice(
+                    "decode loop",
+                    req.rid,
+                    auto_next_anon=not req.finished(),
+                    thread_finish_flag=req.finished(),
+                )
+
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)
+            for req in batch.reqs:
+                trace_slice(
+                    "prefill",
+                    req.rid,
+                    auto_next_anon=not req.finished(),
+                    thread_finish_flag=req.finished(),
+                )
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
@@ -2219,39 +2290,50 @@ class Scheduler(
             if_success = False
         return if_success
 
-    def get_load(self):
+    def get_load(self, recv_req: GetLoadReqInput = None) -> GetLoadReqOutput:
         # TODO(lsyin): use dynamically maintained num_waiting_tokens
+
         if self.is_hybrid:
-            load_full = (
+            num_tokens_full = (
                 self.full_tokens_per_layer
                 - self.token_to_kv_pool_allocator.full_available_size()
                 - self.tree_cache.full_evictable_size()
             )
-            load_swa = (
+            num_tokens_swa = (
                 self.swa_tokens_per_layer
                 - self.token_to_kv_pool_allocator.swa_available_size()
                 - self.tree_cache.swa_evictable_size()
             )
-            load = max(load_full, load_swa)
+            num_tokens = max(num_tokens_full, num_tokens_swa)
         else:
-            load = (
+            num_tokens = (
                 self.max_total_num_tokens
                 - self.token_to_kv_pool_allocator.available_size()
                 - self.tree_cache.evictable_size()
             )
-        load += sum(len(req.origin_input_ids) for req in self.waiting_queue)
+
+        # Tokens in waiting queue, bootstrap queue, prealloc queue
+        num_tokens += sum(len(req.origin_input_ids) for req in self.waiting_queue)
+        num_waiting_reqs = len(self.waiting_queue)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            load += sum(
+            num_tokens += sum(
                 len(req.origin_input_ids)
                 for req in self.disagg_prefill_bootstrap_queue.queue
             )
+            num_waiting_reqs += len(self.disagg_prefill_bootstrap_queue.queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            load += sum(
+            num_tokens += sum(
                 len(req.req.origin_input_ids)
                 for req in self.disagg_decode_prealloc_queue.queue
             )
+            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue)
 
-        return load
+        return GetLoadReqOutput(
+            dp_rank=self.dp_rank,
+            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
+            num_waiting_reqs=num_waiting_reqs,
+            num_tokens=num_tokens,
+        )
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
@@ -2276,8 +2358,6 @@ class Scheduler(
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
-
-        ret["load"] = self.get_load()
 
         return GetInternalStateReqOutput(internal_state=ret)
 
@@ -2579,6 +2659,12 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
+    if server_args.enable_trace:
+        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "null":
+            thread_label = "Scheduler"
+            trace_set_thread_info(thread_label, tp_rank, dp_rank)
+
     if (numa_node := server_args.numa_node) is not None:
         numa_bind_to_node(numa_node[gpu_id])
 
