@@ -109,18 +109,24 @@ def sgl_per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    enable_v2: bool = False,
 ) -> None:
+    if enable_v2:
+        return torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
+            input,
+            output_q,
+            output_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            fuse_silu_and_mul,
+            masked_m,
+        )
+
     torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
-        input,
-        output_q,
-        output_s,
-        group_size,
-        eps,
-        fp8_min,
-        fp8_max,
-        scale_ue8m0,
-        fuse_silu_and_mul,
-        masked_m,
+        input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
     )
 
 
