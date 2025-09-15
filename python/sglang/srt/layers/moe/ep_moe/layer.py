@@ -461,7 +461,7 @@ class DeepEPMoE(EPMoE):
     def moe_impl(
         self,
         dispatch_output: DispatchOutput,
-        down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
     ):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
