@@ -29,7 +29,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
-    sglang_per_token_group_quant_fp8, sglang_per_token_group_quant_8bit,
+    sglang_per_token_group_quant_8bit,
+    sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
