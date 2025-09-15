@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import torch
 
 from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.utils import is_sbo_enabled
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -19,14 +20,14 @@ class SboFlags:
     @classmethod
     def enable_combine_down_gemm_two_stream_overlap(cls):
         return (
-            global_server_args_dict["enable_single_batch_overlap"]
+            is_sbo_enabled()
             # currently only cutedsl backend supports it
             and get_moe_runner_backend().is_flashinfer_cutedsl()
         )
 
     @classmethod
     def enable_combine_shared_two_stream_overlap(cls):
-        return global_server_args_dict["enable_single_batch_overlap"]
+        return is_sbo_enabled()
 
     @classmethod
     def fuse_shared_experts_inside_sbo(cls):
