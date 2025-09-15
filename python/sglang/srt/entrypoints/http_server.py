@@ -31,6 +31,8 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 import setproctitle
 
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -73,6 +75,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -80,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
@@ -177,6 +181,13 @@ async def init_multi_tokenizer() -> ServerArgs:
             scheduler_info=scheduler_info,
         )
     )
+
+    if server_args.enable_trace:
+        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "null":
+            thread_label = f"MultiTokenizer-{tokenizer_manager.worker_id}"
+            trace_set_thread_info(thread_label)
+
     return server_args
 
 
@@ -670,6 +681,38 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         )
 
 
+@app.post("/init_weights_send_group_for_remote_instance")
+async def init_weights_send_group_for_remote_instance(
+    obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/send_weights_to_remote_instance")
+async def send_weights_to_remote_instance(
+    obj: SendWeightsToRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/init_weights_update_group")
 async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
@@ -1157,7 +1200,6 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     if server_args.tokenizer_worker_num > 1:
-        setproctitle.setproctitle(f"sglang::http_server/multi_tokenizer_router")
         port_args = PortArgs.init_new(server_args)
         port_args.tokenizer_worker_ipc_name = (
             f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -1166,10 +1208,15 @@ def launch_server(
             server_args=server_args, port_args=port_args
         )
     else:
-        setproctitle.setproctitle(f"sglang::http_server/tokenizer_manager")
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
         )
+
+        if server_args.enable_trace:
+            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+            if server_args.disaggregation_mode == "null":
+                thread_label = "Tokenizer"
+                trace_set_thread_info(thread_label)
 
     set_global_state(
         _GlobalState(

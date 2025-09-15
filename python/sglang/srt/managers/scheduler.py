@@ -81,6 +81,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
@@ -93,6 +95,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    SendWeightsToRemoteInstanceReqInput,
+    SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     SlowDownReqInput,
@@ -145,6 +149,15 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.tracing.trace import (
+    process_tracing_init,
+    trace_event,
+    trace_set_proc_propagate_context,
+    trace_set_thread_info,
+    trace_slice,
+    trace_slice_end,
+    trace_slice_start,
+)
 from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -539,6 +552,14 @@ class Scheduler(
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
                 (
+                    InitWeightsSendGroupForRemoteInstanceReqInput,
+                    self.init_weights_send_group_for_remote_instance,
+                ),
+                (
+                    SendWeightsToRemoteInstanceReqInput,
+                    self.send_weights_to_remote_instance,
+                ),
+                (
                     UpdateWeightsFromDistributedReqInput,
                     self.update_weights_from_distributed,
                 ),
@@ -815,6 +836,10 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                for req in batch.reqs:
+                    trace_event("schedule", req.rid)
+
+            if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -834,6 +859,10 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+
+            if batch:
+                for req in batch.reqs:
+                    trace_event("schedule", req.rid)
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -1098,6 +1127,12 @@ class Scheduler(
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                trace_set_proc_propagate_context(req.rid, req.trace_context)
+                trace_slice_start("", req.rid, anonymous=True)
+
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -1249,11 +1284,19 @@ class Scheduler(
         # Copy more attributes
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
             # By default, only return the logprobs for output tokens
-            req.logprob_start_len = len(req.origin_input_ids) - 1
+            # For prefill-only requests with logprob_start_len == -1, set logprob_start_len beyond input sequence
+            # to skip input logprob computation entirely
+            if req.is_prefill_only:
+                req.logprob_start_len = len(req.origin_input_ids)
+            else:
+                # TODO: For text generation, evaluate setting logprob_start_len to len(req.origin_input_ids) as well
+                req.logprob_start_len = len(req.origin_input_ids) - 1
         else:
             req.logprob_start_len = recv_req.logprob_start_len
 
-        if req.logprob_start_len >= len(req.origin_input_ids):
+        if not req.is_prefill_only and req.logprob_start_len >= len(
+            req.origin_input_ids
+        ):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = len(req.origin_input_ids) - 1
             req.set_finish_with_abort(error_msg)
@@ -1327,6 +1370,7 @@ class Scheduler(
         else:
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
+            trace_slice_end("process req", req.rid, auto_next_anon=True)
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
@@ -1493,6 +1537,20 @@ class Scheduler(
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.stats.num_prefill_prealloc_queue_reqs = len(
+                    self.disagg_prefill_bootstrap_queue.queue
+                )
+                self.stats.num_prefill_inflight_queue_reqs = len(
+                    self.disagg_prefill_inflight_queue
+                )
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.stats.num_decode_prealloc_queue_reqs = len(
+                    self.disagg_decode_prealloc_queue.queue
+                )
+                self.stats.num_decode_transfer_queue_reqs = len(
+                    self.disagg_decode_transfer_queue.queue
+                )
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
 
@@ -1540,7 +1598,12 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
-            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+            if self.tp_worker.worker.model_runner.is_hybrid_gdn:
+                self.req_to_token_pool.free(
+                    self.chunked_req.req_pool_idx, free_mamba_cache=False
+                )
+            else:
+                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
@@ -1875,8 +1938,23 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
+            for req in batch.reqs:
+                trace_slice(
+                    "decode loop",
+                    req.rid,
+                    auto_next_anon=not req.finished(),
+                    thread_finish_flag=req.finished(),
+                )
+
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)
+            for req in batch.reqs:
+                trace_slice(
+                    "prefill",
+                    req.rid,
+                    auto_next_anon=not req.finished(),
+                    thread_finish_flag=req.finished(),
+                )
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
@@ -2424,6 +2502,22 @@ class Scheduler(
         self.send_to_detokenizer.send_pyobj(recv_req)
         return recv_req
 
+    def init_weights_send_group_for_remote_instance(
+        self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        """Init the seed and client instance communication group."""
+        success, message = self.tp_worker.init_weights_send_group_for_remote_instance(
+            recv_req
+        )
+        return InitWeightsSendGroupForRemoteInstanceReqOutput(success, message)
+
+    def send_weights_to_remote_instance(
+        self, recv_req: SendWeightsToRemoteInstanceReqInput
+    ):
+        """Send the seed instance weights to the destination instance."""
+        success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
+        return SendWeightsToRemoteInstanceReqOutput(success, message)
+
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
         if t is not None and t <= 0:
@@ -2545,6 +2639,12 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
+    if server_args.enable_trace:
+        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "null":
+            thread_label = "Scheduler"
+            trace_set_thread_info(thread_label, tp_rank, dp_rank)
+
     if (numa_node := server_args.numa_node) is not None:
         numa_bind_to_node(numa_node[gpu_id])
 
