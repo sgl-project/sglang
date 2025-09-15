@@ -205,7 +205,7 @@ envs = Envs()
 def _convert_SGL_to_SGLANG():
     for key, value in os.environ.items():
         if key.startswith("SGL_"):
-            new_key = key.replace("SGL_", "SGLANG_")
+            new_key = key.replace("SGL_", "SGLANG_", 1)
             warnings.warn(
                 f"Environment variable {key} is deprecated, please use {new_key}"
             )
