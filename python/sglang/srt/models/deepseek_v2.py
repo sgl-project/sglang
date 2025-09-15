@@ -2072,7 +2072,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-        print(f"[{torch.distributed.get_rank()}] layer.forward {self.layer_id=}", flush=True)
 
         quant_format = (
             "mxfp4"

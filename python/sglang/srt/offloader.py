@@ -213,7 +213,6 @@ class OffloaderV2(BaseOffloader):
                 offload_submodules.append(submodule)
                 self.offloaders.append(
                     _ModuleOffloader(
-                        debug_name=f"mod{module_index}",
                         mode=self.mode,
                         module=submodule,
                         alt_stream=alt_stream,
@@ -232,8 +231,6 @@ class OffloaderV2(BaseOffloader):
         return all_modules
 
     def post_init(self):
-        print(f"[{torch.distributed.get_rank()}] offloader.post_init", flush=True)
-
         for offloader in self.offloaders:
             offloader.post_init()
 
@@ -267,7 +264,6 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
         output = functional_call(
             module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
         )
-        print(f"[{torch.distributed.get_rank()}] _hook_module_forward_raw on-forward-end", flush=True)
         module._sglang_on_forward_end_hook()
         module.forward = forward
         return output
@@ -279,13 +275,11 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
 class _ModuleOffloader(ABC):
     def __init__(
         self,
-        debug_name: str,
         mode: str,
         module: torch.nn.Module,
         alt_stream: torch.cuda.Stream,
         whitelist_param_names: List[str],
     ):
-        self.debug_name = debug_name
         self.mode = mode
         self.module = module
         self.device = next(module.parameters()).device
@@ -313,7 +307,6 @@ class _ModuleOffloader(ABC):
             param_offloader.post_init()
 
     def start_onload(self):
-        print(f"[{torch.distributed.get_rank()}, {self.debug_name}] start_onload", flush=True)
         self.alt_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.alt_stream):
             self._device_tensors = self._create_device_tensors()
@@ -321,12 +314,10 @@ class _ModuleOffloader(ABC):
             self._load_event.record()
 
     def offload(self):
-        print(f"[{torch.distributed.get_rank()}, {self.debug_name}] offload", flush=True)
         self._device_tensors = None
         self._load_event = None
 
     def wait_and_get_device_tensors(self):
-        print(f"[{torch.distributed.get_rank()}, {self.debug_name}] wait_and_get_device_tensors", flush=True)
         assert self._device_tensors is not None
         self._load_event.wait()
         return self._device_tensors
