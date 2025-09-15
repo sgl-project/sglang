@@ -572,7 +572,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 **(
                     dict(x_global_scale=input_global_scale)
                     if input_global_scale is not None
-                    else None
+                    else dict()
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
