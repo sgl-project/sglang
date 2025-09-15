@@ -196,6 +196,27 @@ def is_sm90_supported(device=None) -> bool:
 _warned_bool_env_var_keys = set()
 
 
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    warnings.warn(
+        "\x1b[33mget_bool_env_var will be deprecated soon, please move/add the environ var in sglang.environ\x1b[0m"
+    )
+
+    value = os.getenv(name, default)
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
+
+
 def get_int_env_var(name: str, default: int = 0) -> int:
     value = os.getenv(name)
     if value is None or not value.strip():
