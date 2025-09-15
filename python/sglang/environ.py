@@ -67,6 +67,7 @@ class EnvField:
 
     def clear(self):
         os.environ.pop(self.name, None)
+        self._set_to_none = False
 
     @property
     def value(self):
@@ -245,13 +246,18 @@ def examples():
     assert envs.SGLANG_TEST_RETRACT.value is False
 
     envs.SGLANG_TEST_RETRACT.set(None)
-    assert envs.SGLANG_TEST_RETRACT.value is None
+    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
+
+    envs.SGLANG_TEST_RETRACT.clear()
+    assert not envs.SGLANG_TEST_RETRACT.is_set()
 
     envs.SGLANG_TEST_RETRACT.set(True)
     assert envs.SGLANG_TEST_RETRACT.value is True
 
     with envs.SGLANG_TEST_RETRACT.override(None):
-        assert envs.SGLANG_TEST_RETRACT.value is None
+        assert (
+            envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
+        )
 
     assert envs.SGLANG_TEST_RETRACT.value is True
 
@@ -259,7 +265,7 @@ def examples():
     with envs.SGLANG_TEST_RETRACT.override(True):
         assert envs.SGLANG_TEST_RETRACT.value is True
 
-    assert envs.SGLANG_TEST_RETRACT.value is None
+    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
 
     example_with_exit_stack()
     example_with_subprocess()
