@@ -475,14 +475,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
 
-        def get_tensor_info(x):
-            if not isinstance(x, torch.Tensor):
-                return f"type={type(x)} value={x}"
-            min = x.float().min() if x.numel() > 0 else None
-            max = x.float().max() if x.numel() > 0 else None
-            mean = x.float().mean() if x.numel() > 0 else None
-            return f"shape={x.shape} dtype={x.dtype} device={x.device} stride={x.stride()} min={min} max={max} mean={mean}"
-
         # Prepare query tensor inline
         if merge_query:
             # For FP16 path, we merge the query and rope parts into a single tensor
@@ -490,7 +482,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            print(f"torch.cat {get_tensor_info(q_nope)=} {get_tensor_info(q_rope_reshaped)=}")
             query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
         else:
             # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
