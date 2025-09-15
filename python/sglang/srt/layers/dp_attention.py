@@ -38,6 +38,7 @@ _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
+_USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
 
 class DpPaddingMode(IntEnum):
@@ -72,7 +73,7 @@ class DpPaddingMode(IntEnum):
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A"):
+        if _USE_ROCM700A_WA:
             return cls.SUM_LEN
         else:
             return cls.MAX_LEN
