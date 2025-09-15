@@ -163,6 +163,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
             reduce_results=False,
+            layer_id=layer_id,
             quant_config=quant_config,
         )
 

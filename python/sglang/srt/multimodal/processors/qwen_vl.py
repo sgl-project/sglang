@@ -67,10 +67,15 @@ def smart_resize(
     return h_bar, w_bar
 
 
-def resize_image(image, size_factor: int = IMAGE_FACTOR) -> Image.Image:
+def resize_image(
+    image,
+    min_pixels: int = MIN_PIXELS,
+    max_pixels: int = MAX_PIXELS,
+    size_factor: int = IMAGE_FACTOR,
+) -> Image.Image:
     width, height = image.size
-    min_pixels = MIN_PIXELS
-    max_pixels = MAX_PIXELS
+    min_pixels = min_pixels
+    max_pixels = max_pixels
     resized_height, resized_width = smart_resize(
         height,
         width,
@@ -97,8 +102,13 @@ def floor_by_factor(number: int, factor: int) -> int:
     return math.floor(number / factor) * factor
 
 
-async def resize_image_async(image):
-    return resize_image(image)
+async def resize_image_async(
+    image,
+    min_pixels: int = MIN_PIXELS,
+    max_pixels: int = MAX_PIXELS,
+    size_factor: int = IMAGE_FACTOR,
+):
+    return resize_image(image, min_pixels, max_pixels, size_factor)
 
 
 def smart_nframes(
@@ -201,8 +211,8 @@ async def preprocess_video(
 class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         # The regex that matches expanded image tokens.
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id

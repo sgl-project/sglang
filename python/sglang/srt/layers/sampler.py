@@ -1,12 +1,15 @@
 import logging
-from typing import List
+from typing import List, Tuple
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import get_attention_tp_group
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -24,6 +27,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 class Sampler(nn.Module):
@@ -32,8 +36,27 @@ class Sampler(nn.Module):
         self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
         self.tp_sync_group = get_tp_group().device_group
 
-        if global_server_args_dict["enable_dp_attention"]:
+        if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
+
+    def _preprocess_logits(
+        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
+    ) -> torch.Tensor:
+        """Apply custom logit processors and handle NaN detection."""
+        # Apply the custom logit processors if registered in the sampling info
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(logits, sampling_info)
+
+        # Detect and handle NaN values in logits
+        if self.use_nan_detection and torch.any(torch.isnan(logits)):
+            logger.warning("Detected errors during sampling! NaN in the logits.")
+            logits = torch.where(
+                torch.isnan(logits), torch.full_like(logits, -1e5), logits
+            )
+            if crash_on_warnings():
+                raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+        return logits
 
     def forward(
         self,
@@ -57,24 +80,20 @@ class Sampler(nn.Module):
         """
         logits = logits_output.next_token_logits
 
-        # Apply the custom logit processors if registered in the sampling info.
-        if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(logits, sampling_info)
-
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning("Detected errors during sampling! NaN in the logits.")
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
-            )
-            if crash_on_warnings():
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
+        # Preprocess logits (custom processors and NaN handling)
+        logits = self._preprocess_logits(logits, sampling_info)
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+
         else:
+            # If requested, cache probabilities from original logits before temperature scaling.
+            if return_logprob and RETURN_ORIGINAL_LOGPROB:
+                probs_without_temp_scaling = torch.softmax(logits, dim=-1)
+
             # Post process logits
             logits.div_(sampling_info.temperatures)
             logits[:] = torch.softmax(logits, dim=-1)
@@ -113,7 +132,13 @@ class Sampler(nn.Module):
 
             if return_logprob:
                 # clamp to avoid -inf
-                logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
+                if RETURN_ORIGINAL_LOGPROB:
+                    logprobs = torch.log(probs_without_temp_scaling).clamp(
+                        min=torch.finfo(probs_without_temp_scaling.dtype).min
+                    )
+                    del probs_without_temp_scaling
+                else:
+                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
@@ -149,6 +174,54 @@ class Sampler(nn.Module):
             )
 
         return batch_next_token_ids
+
+    def compute_logprobs_only(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        return_logprob: bool,
+        top_logprobs_nums: List[int],
+        token_ids_logprobs: List[List[int]],
+    ) -> None:
+        """
+        Compute logprobs for requested token IDs without performing sampling.
+
+        Optimized for prefill-only scoring requests that need token probabilities
+        but don't require next token generation.
+        """
+        if logits_output.next_token_logits is None:
+            logger.warning("No logits available for logprob computation")
+            return
+
+        # Check if any requests actually need logprobs computation
+        needs_token_ids_logprobs = any(
+            token_ids is not None and len(token_ids) > 0
+            for token_ids in token_ids_logprobs
+        )
+        needs_top_logprobs = any(x > 0 for x in top_logprobs_nums)
+
+        if not (needs_token_ids_logprobs or needs_top_logprobs):
+            return
+
+        # Preprocess logits (custom processors and NaN handling)
+        logits = self._preprocess_logits(logits_output.next_token_logits, sampling_info)
+
+        # Compute logprobs
+        logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        # Handle top logprobs if requested
+        if needs_top_logprobs:
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(logprobs, top_logprobs_nums)
+
+        # Handle token_ids logprobs if requested
+        if needs_token_ids_logprobs:
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
@@ -198,7 +271,10 @@ def top_p_normalize_probs_torch(
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
 
-def get_top_logprobs(logprobs: torch.Tensor, top_logprobs_nums: List[int]):
+def get_top_logprobs(
+    logprobs: torch.Tensor,
+    top_logprobs_nums: List[int],
+):
     max_k = max(top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()
@@ -209,7 +285,99 @@ def get_top_logprobs(logprobs: torch.Tensor, top_logprobs_nums: List[int]):
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-    return output_top_logprobs_val, output_top_logprobs_idx
+
+    return (
+        output_top_logprobs_val,
+        output_top_logprobs_idx,
+    )
+
+
+def get_token_ids_logprobs_batch_optimized(
+    logprobs: torch.Tensor,
+    token_ids_logprobs: List[List[int]],
+) -> Tuple[List, List]:
+    """
+    Vectorized batch processing for token ID logprobs extraction.
+
+    Uses a single GPU kernel call for the entire batch instead of multiple
+    separate calls, significantly improving performance for large batches.
+
+    Args:
+        logprobs: Log probabilities tensor [batch_size, vocab_size]
+        token_ids_logprobs: List of token IDs to extract logprobs for
+
+    Example:
+        # Input: batch_size=3, vocab_size=5
+        logprobs = torch.tensor([
+            [-1.2, -2.1, -0.8, -3.0, -1.5],  # batch 0
+            [-0.5, -1.8, -2.2, -1.1, -2.7],  # batch 1
+            [-2.0, -0.9, -1.4, -2.8, -1.6],  # batch 2
+        ])
+        token_ids_logprobs = [[1, 3], [2], [0, 2, 4]]
+
+        # Output:
+        # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
+        # indices = [[1, 3], [2], [0, 2, 4]]
+    """
+    batch_size = len(token_ids_logprobs)
+    device = logprobs.device
+
+    # Step 1: Calculate lengths for each request, treating None as empty list
+    # Example: [[1, 3], [2], [0, 2, 4]] -> token_lengths = tensor([2, 1, 3])
+    token_lengths = torch.tensor(
+        [len(token_ids or []) for token_ids in token_ids_logprobs], device=device
+    )
+    total_tokens = int(token_lengths.sum().item())  # 2 + 1 + 3 = 6
+
+    # Handle edge case where no tokens are requested
+    if total_tokens == 0:
+        return [logprobs.new_empty(0) for _ in token_ids_logprobs], [
+            [] for _ in token_ids_logprobs
+        ]
+
+    # Step 2: Build flattened indices using torch operations
+    # Example: row_indices = [0, 0, 1, 2, 2, 2] (batch indices repeated by their lengths)
+    row_indices = torch.repeat_interleave(
+        torch.arange(batch_size, device=device), token_lengths
+    )
+    # Example: col_indices = [1, 3, 2, 0, 2, 4] (flattened token IDs from all requests)
+    col_indices = torch.tensor(
+        [
+            token_id
+            for token_ids in token_ids_logprobs
+            for token_id in (token_ids or [])
+        ],
+        device=device,
+        dtype=torch.long,
+    )
+
+    # Step 3: Single vectorized gather operation
+    # Example: logprobs[row_indices, col_indices] -> [-2.1, -3.0, -2.2, -2.0, -1.4, -1.6]
+    gathered_logprobs = logprobs[row_indices, col_indices]
+
+    # Step 4: Split results back per request using torch operations
+    # Example: split tensor [6] into chunks of sizes [2, 1, 3] -> [tensor(2), tensor(1), tensor(3)]
+    split_logprobs = torch.split_with_sizes(
+        gathered_logprobs, token_lengths.tolist(), dim=0
+    )
+
+    # Step 5: Format output to match expected return structure
+    # Example: Convert split tensors back to list format with proper empty handling
+    # i=0: [1,3] -> append split_logprobs[0] and [1,3]
+    # i=1: [2] -> append split_logprobs[1] and [2]
+    # i=2: [0,2,4] -> append split_logprobs[2] and [0,2,4]
+    output_token_ids_logprobs_val = []
+    output_token_ids_logprobs_idx = []
+
+    for i, token_ids in enumerate(token_ids_logprobs):
+        if token_ids is not None and len(token_ids) > 0:
+            output_token_ids_logprobs_val.append(split_logprobs[i])
+            output_token_ids_logprobs_idx.append(token_ids)
+        else:
+            output_token_ids_logprobs_val.append(logprobs.new_empty(0))
+            output_token_ids_logprobs_idx.append([])
+
+    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
 
 
 def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]]):
@@ -223,7 +391,10 @@ def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List
             output_token_ids_logprobs_val.append([])
             output_token_ids_logprobs_idx.append([])
 
-    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
+    return (
+        output_token_ids_logprobs_val,
+        output_token_ids_logprobs_idx,
+    )
 
 
 def apply_custom_logit_processor(
