@@ -7,7 +7,6 @@ import requests
 import torch
 from PIL import Image
 from transformers import (
-    AutoModel,
     AutoProcessor,
     Gemma3ForConditionalGeneration,
     Qwen2_5_VLForConditionalGeneration,

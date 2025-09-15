@@ -259,6 +259,8 @@ class Engine(EngineBase):
         # - Single image for a single request
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
+        # - List of preprocessed pixel values, each in the format of dict containing field `type` : processor_output
+        # - List of precomputed image embeddings, each in the format of dict containing field `type` : embedding
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,

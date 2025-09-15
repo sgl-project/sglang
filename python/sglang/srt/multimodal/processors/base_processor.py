@@ -333,11 +333,16 @@ class BaseMultimodalProcessor(ABC):
         """
         Load a single multimodal data.
 
-        If data is precomputed, returns directly.
+        If data is processor_output or precomputed embedding, return directly.
 
         Static method that can be pickled for multiprocessing"""
         if isinstance(data, dict):
-            return data
+            data_format = data.get("format")
+            if (
+                data_format == "processor_output"
+                or data_format == "precomputed_embedding"
+            ):
+                return data
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data)
@@ -483,12 +488,15 @@ class BaseMultimodalProcessor(ABC):
             try:
                 if multimodal_tokens_pattern.match(text_part):
                     modality, raw_data, frame_limit = next(task_info_iter)
-                    is_precomputed = isinstance(raw_data, dict)
+                    is_precomputed = isinstance(raw_data, dict) and (
+                        raw_data.get("format") == "processor_output"
+                        or raw_data.get("format") == "precomputed_embedding"
+                    )
                     result = next(futures_iter).result()
-
+                    print(f"{result=}")
                     if modality == Modality.IMAGE:
-                        # If data is already processed it will be a
-                        # dictionary(precomputed). In this case we want to keep the
+                        # If data is already processed or embedded, it will be a
+                        # dictionary(processed, or precomputed). In this case we want to keep the
                         # expanded tokens in text_part. Otherwise, we will
                         # call the processor code, so keep only a single image
                         # token.
@@ -562,16 +570,22 @@ class BaseMultimodalProcessor(ABC):
         return list(zip(indices_start.tolist(), indices_end.tolist()))
 
     def collect_mm_items_from_processor_output(
-        self, data_dict: dict
+        self, data_dict: dict, modality: Modality = None
     ) -> List[MultimodalDataItem]:
-        """Create mm_items directly from processor output."""
+        """
+        Create mm_items directly from processor output, with one item for each modality
+
+        Note that the data_dict can be passed via offline engine api
+        """
+
+        print(f"collect_mm_items_from_processor_output")
         items: dict[Modality, MultimodalDataItem] = {}
         for attr_name, value in data_dict.items():
             if attr_name == "input_ids":
                 continue
 
             # Get modality for this attribute
-            modality = self.ATTR_NAME_TO_MODALITY.get(attr_name)
+            modality = modality or self.ATTR_NAME_TO_MODALITY.get(attr_name)
 
             if attr_name == "precomputed_embeddings":
                 modality_str = data_dict.get("modality")
@@ -626,9 +640,9 @@ class BaseMultimodalProcessor(ABC):
             Tuple of (list of mm_items, input_ids)
         """
         # Collect all items and categorize them
-        all_items = base_output.organize_results()
+        all_loaded_data = base_output.organize_results()
         # Handle text-only case
-        if not all_items:
+        if not all_loaded_data:
             input_ids = self._processor.tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
@@ -637,9 +651,9 @@ class BaseMultimodalProcessor(ABC):
             return [], input_ids, {}
 
         dict_items, raw_images, raw_audios, raw_videos = [], [], [], []
-        for modality, item in all_items:
+        for modality, item in all_loaded_data:
             if isinstance(item, dict):
-                dict_items.append(item)
+                dict_items.append((modality, item))
             elif modality == Modality.IMAGE:
                 raw_images.append(item)
             elif modality == Modality.AUDIO:
@@ -665,11 +679,21 @@ class BaseMultimodalProcessor(ABC):
         else:
             ret = None
 
-        # Handle dict items (already processed)
-        for dict_item in dict_items:
-            all_collected_items.extend(
-                self.collect_mm_items_from_processor_output(dict_item)
-            )
+        # Handle dict items (processed or precomputed)
+        for modality, dict_item in dict_items:
+            if dict_item.get("format", None) == "processor_output":
+                all_collected_items.extend(
+                    self.collect_mm_items_from_processor_output(dict_item)
+                )
+            elif dict_item.get("format", None) == "precomputed_embedding":
+                all_collected_items.append(
+                    MultimodalDataItem(
+                        modality=modality,
+                        feature=dict_item["feature"],
+                        format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
+                        model_specific_data=dict_item,
+                    )
+                )
 
         # Fallback tokenization if no raw items were processed
         if input_ids is None:
