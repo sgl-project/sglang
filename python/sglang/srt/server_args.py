@@ -215,6 +215,8 @@ class ServerArgs:
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
     gc_warning_threshold_secs: float = 0.0
+    enable_trace: bool = False
+    oltp_traces_endpoint: str = "localhost:4317"
 
     # API related
     api_key: Optional[str] = None
@@ -231,6 +233,7 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    load_watch_interval: float = 0.1
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -360,6 +363,7 @@ class ServerArgs:
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     triton_attention_num_kv_splits: int = 8
+    triton_attention_split_tile_size: Optional[int] = None
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
@@ -372,6 +376,11 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
+
+    # Dynamic batch tokenizer
+    enable_dynamic_batch_tokenizer: bool = False
+    dynamic_batch_tokenizer_batch_size: int = 32
+    dynamic_batch_tokenizer_batch_timeout: float = 0.002
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -388,6 +397,9 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
+
+    # FIXME: hack to reduce ITL when decode bs is small
+    disaggregation_decode_polling_interval: int = 1
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -652,6 +664,7 @@ class ServerArgs:
 
         if self.dp_size == 1:
             self.enable_dp_attention = False
+            self.enable_dp_lm_head = False
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -873,6 +886,13 @@ class ServerArgs:
 
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
+
+        # Validation: prevent both tokenizer batching features from being enabled
+        if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
+            raise ValueError(
+                "Cannot enable both --enable-tokenizer-batch-encode and --enable-dynamic-batch-tokenizer. "
+                "Please choose one tokenizer batching approach."
+            )
 
         # Propagate env vars
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
@@ -1375,6 +1395,17 @@ class ServerArgs:
             default=None,
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         )
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            "--oltp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
+        )
 
         # API related
         parser.add_argument(
@@ -1458,6 +1489,12 @@ class ServerArgs:
                 "shortest_queue",
                 "minimum_tokens",
             ],
+        )
+        parser.add_argument(
+            "--load-watch-interval",
+            type=float,
+            default=ServerArgs.load_watch_interval,
+            help="The interval of load watching in seconds.",
         )
         parser.add_argument(
             "--prefill-round-robin-balance",
@@ -2073,6 +2110,12 @@ class ServerArgs:
             help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
         )
         parser.add_argument(
+            "--triton-attention-split-tile-size",
+            type=int,
+            default=ServerArgs.triton_attention_split_tile_size,
+            help="The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference.",
+        )
+        parser.add_argument(
             "--num-continuous-decode-steps",
             type=int,
             default=ServerArgs.num_continuous_decode_steps,
@@ -2162,6 +2205,23 @@ class ServerArgs:
             action="store_true",
             help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
         )
+        parser.add_argument(
+            "--enable-dynamic-batch-tokenizer",
+            action="store_true",
+            help="Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-tokenizer-batch-size",
+            type=int,
+            default=ServerArgs.dynamic_batch_tokenizer_batch_size,
+            help="[Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-tokenizer-batch-timeout",
+            type=float,
+            default=ServerArgs.dynamic_batch_tokenizer_batch_timeout,
+            help="[Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests.",
+        )
 
         # PD disaggregation
         parser.add_argument(
@@ -2215,6 +2275,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.num_reserved_decode_tokens,
             help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-polling-interval",
+            type=int,
+            default=ServerArgs.disaggregation_decode_polling_interval,
+            help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
         )
 
         # Custom weight loader

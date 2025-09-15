@@ -49,6 +49,7 @@ from sglang.srt.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -63,6 +64,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
+    GetLoadReqInput,
     HealthCheckOutput,
     MultiTokenizerWrapper,
     OpenSessionReqInput,
@@ -72,6 +74,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    WatchLoadUpdateReq,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -81,6 +84,13 @@ from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicat
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.tracing.trace import (
+    trace_get_proc_propagate_context,
+    trace_req_finish,
+    trace_req_start,
+    trace_slice_end,
+    trace_slice_start,
+)
 from sglang.srt.utils import (
     configure_gc_warning,
     dataclass_to_string_truncated,
@@ -216,6 +226,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
+        # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
+        if (
+            server_args.enable_dynamic_batch_tokenizer
+            and not server_args.skip_tokenizer_init
+        ):
+            self.async_dynamic_batch_tokenizer = AsyncDynamicbatchTokenizer(
+                self.tokenizer,
+                max_batch_size=server_args.dynamic_batch_tokenizer_batch_size,
+                batch_wait_timeout_s=server_args.dynamic_batch_tokenizer_batch_timeout,
+            )
+        else:
+            self.async_dynamic_batch_tokenizer = None
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -345,6 +367,24 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # If it's a single value, add worker_id prefix
                 obj.rid = f"{self.worker_id}_{obj.rid}"
 
+        if obj.is_single:
+            bootstrap_room = (
+                obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
+            )
+            trace_req_start(obj.rid, bootstrap_room, ts=int(created_time * 1e9))
+            trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
+        else:
+            for i in range(len(obj.rid)):
+                bootstrap_room = (
+                    obj.bootstrap_room[i]
+                    if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
+                    else None
+                )
+                trace_req_start(obj.rid[i], bootstrap_room, ts=int(created_time * 1e9))
+                trace_slice_start(
+                    "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
+                )
+
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
@@ -369,6 +409,144 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     obj, request, created_time
                 ):
                     yield response
+
+    def _detect_input_format(
+        self, texts: Union[str, List[str]], is_cross_encoder: bool
+    ) -> str:
+        """Detect the format of input texts for proper tokenization handling.
+
+        Returns:
+            - "single_string": Regular single text like "Hello world"
+            - "batch_strings": Regular batch like ["Hello", "World"]
+            - "cross_encoder_pairs": Cross-encoder pairs like [["query", "document"]]
+        """
+        if isinstance(texts, str):
+            return "single_string"
+
+        if (
+            is_cross_encoder
+            and len(texts) > 0
+            and isinstance(texts[0], list)
+            and len(texts[0]) == 2
+        ):
+            return "cross_encoder_pairs"
+
+        return "batch_strings"
+
+    def _prepare_tokenizer_input(
+        self, texts: Union[str, List[str]], input_format: str
+    ) -> Union[List[str], List[List[str]]]:
+        """Prepare input for the tokenizer based on detected format."""
+        if input_format == "single_string":
+            return [texts]  # Wrap single string for batch processing
+        elif input_format == "cross_encoder_pairs":
+            return texts  # Already in correct format: [["query", "doc"]]
+        else:  # batch_strings
+            return texts  # Already in correct format: ["text1", "text2"]
+
+    def _extract_tokenizer_results(
+        self,
+        input_ids: List[List[int]],
+        token_type_ids: Optional[List[List[int]]],
+        input_format: str,
+        original_batch_size: int,
+    ) -> Union[
+        Tuple[List[int], Optional[List[int]]],
+        Tuple[List[List[int]], Optional[List[List[int]]]],
+    ]:
+        """Extract results from tokenizer output based on input format."""
+
+        # For single inputs (string or single cross-encoder pair), extract first element
+        if (
+            input_format in ["single_string", "cross_encoder_pairs"]
+            and original_batch_size == 1
+        ):
+            single_input_ids = input_ids[0] if input_ids else []
+            single_token_type_ids = token_type_ids[0] if token_type_ids else None
+            return single_input_ids, single_token_type_ids
+
+        # For true batches, return as-is
+        return input_ids, token_type_ids
+
+    async def _tokenize_texts(
+        self, texts: Union[str, List[str]], is_cross_encoder: bool = False
+    ) -> Union[
+        Tuple[List[int], Optional[List[int]]],
+        Tuple[List[List[int]], Optional[List[List[int]]]],
+    ]:
+        """
+        Tokenize text(s) using the appropriate tokenizer strategy.
+
+        This method handles multiple input formats and chooses between async dynamic
+        batch tokenizer (for single texts only) and regular tokenizer.
+
+        Args:
+            texts: Text input in various formats:
+
+                   Regular cases:
+                   - Single string: "How are you?"
+                   - Batch of strings: ["Hello", "World", "How are you?"]
+
+                   Cross-encoder cases (sentence pairs for similarity/ranking):
+                   - Single pair: [["query text", "document text"]]
+                   - Multiple pairs: [["q1", "d1"], ["q2", "d2"], ["q3", "d3"]]
+
+            is_cross_encoder: Whether to return token_type_ids for cross-encoder models.
+                             Enables proper handling of sentence pairs with segment IDs.
+
+        Returns:
+            Single input cases:
+                Tuple[List[int], Optional[List[int]]]: (input_ids, token_type_ids)
+                Example: ([101, 2129, 102], [0, 0, 0]) for single text
+                Example: ([101, 2129, 102, 4068, 102], [0, 0, 0, 1, 1]) for cross-encoder pair
+
+            Batch input cases:
+                Tuple[List[List[int]], Optional[List[List[int]]]]: (batch_input_ids, batch_token_type_ids)
+                Example: ([[101, 2129, 102], [101, 4068, 102]], None) for regular batch
+
+            Note: token_type_ids is None unless is_cross_encoder=True.
+        """
+        if not texts or self.tokenizer is None:
+            raise ValueError("texts cannot be empty and tokenizer must be initialized")
+
+        # Step 1: Detect input format and prepare for tokenization
+        input_format = self._detect_input_format(texts, is_cross_encoder)
+        tokenizer_input = self._prepare_tokenizer_input(texts, input_format)
+        original_batch_size = len(texts) if not isinstance(texts, str) else 1
+
+        # Step 2: Set up tokenizer arguments
+        tokenizer_kwargs = (
+            {"return_token_type_ids": is_cross_encoder} if is_cross_encoder else {}
+        )
+
+        # Step 3: Choose tokenization strategy
+        use_async_tokenizer = (
+            self.async_dynamic_batch_tokenizer is not None
+            and input_format == "single_string"
+        )
+
+        if use_async_tokenizer:
+            logger.debug("Using async dynamic batch tokenizer for single text")
+            result = await self.async_dynamic_batch_tokenizer.encode(
+                tokenizer_input[0], **tokenizer_kwargs
+            )
+            # Convert to batch format for consistency
+            input_ids = [result["input_ids"]]
+            token_type_ids = (
+                [result["token_type_ids"]]
+                if is_cross_encoder and result.get("token_type_ids")
+                else None
+            )
+        else:
+            logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
+            encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+            input_ids = encoded["input_ids"]
+            token_type_ids = encoded.get("token_type_ids") if is_cross_encoder else None
+
+        # Step 4: Extract results based on input format
+        return self._extract_tokenizer_results(
+            input_ids, token_type_ids, input_format, original_batch_size
+        )
 
     async def _tokenize_one_request(
         self,
@@ -400,14 +578,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "accept text prompts. Please provide input_ids or re-initialize "
                     "the engine with skip_tokenizer_init=False."
                 )
-            encoded = self.tokenizer(
-                input_text, return_token_type_ids=is_cross_encoder_request
-            )
 
-            input_ids = encoded["input_ids"]
-            if is_cross_encoder_request:
-                input_ids = encoded["input_ids"][0]
-                token_type_ids = encoded.get("token_type_ids", [None])[0]
+            input_ids, token_type_ids = await self._tokenize_texts(
+                input_text, is_cross_encoder_request
+            )
 
         if self.mm_processor and obj.contains_mm_input():
             if not isinstance(obj.image_data, list):
@@ -427,6 +601,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
+        trace_slice_end("tokenize", obj.rid)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -501,7 +676,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             ):
                 raise ValueError(
                     "The server is not configured to enable custom logit processor. "
-                    "Please set `--enable-custom-logits-processor` to enable this feature."
+                    "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
 
     def _validate_input_ids_in_vocab(
@@ -582,19 +757,30 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         requests = [obj[i] for i in range(batch_size)]
         texts = [req.text for req in requests]
 
-        # Batch tokenize all texts
-        encoded = self.tokenizer(texts)
-        input_ids_list = encoded["input_ids"]
+        # Check if any request is a cross-encoder request
+        is_cross_encoder_request = any(
+            isinstance(req, EmbeddingReqInput) and req.is_cross_encoder_request
+            for req in requests
+        )
+
+        # Batch tokenize all texts using unified method
+        input_ids_list, token_type_ids_list = await self._tokenize_texts(
+            texts, is_cross_encoder_request
+        )
 
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
             self._validate_one_request(obj[i], input_ids_list[i])
+            token_type_ids = (
+                token_type_ids_list[i] if token_type_ids_list is not None else None
+            )
             tokenized_objs.append(
                 self._create_tokenized_object(
-                    req, req.text, input_ids_list[i], None, None
+                    req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )
+            trace_slice_end("tokenize", req.rid)
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -622,9 +808,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        trace_slice_start("dispatch", obj.rid)
+        tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
+        trace_slice_end("dispatch", obj.rid, thread_finish_flag=True)
         return state
 
     def _send_batch_request(
@@ -1053,6 +1242,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.watch_load_thread))
+        )
 
     def dump_requests_before_crash(self):
         if self.crash_dump_performed:
@@ -1272,6 +1464,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+
+                trace_req_finish(rid, ts=int(state.finished_time * 1e9))
+
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
@@ -1621,11 +1816,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # the next position after the last token in the prompt
             output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
 
-            # Throw an error here if output_logprobs is None
-            if output_logprobs is None:
+            # Check if output_logprobs is properly populated
+            if (
+                output_logprobs is None
+                or not output_logprobs
+                or len(output_logprobs) == 0
+            ):
                 raise RuntimeError(
-                    f"output_logprobs is None for request {result['meta_info'].get('id', '<unknown>')}. "
-                    "This usually indicates a problem with the scoring request or the backend output."
+                    f"output_logprobs is empty for request {result['meta_info'].get('id', '<unknown>')}. "
+                    "This indicates token_ids_logprobs were not computed properly for the scoring request."
                 )
 
             for logprob, token_id, _ in output_logprobs[0]:
@@ -1649,6 +1848,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             scores.append(score_list)
 
         return scores
+
+    async def watch_load_thread(self):
+        # Only for dp_controller when dp_size > 1
+        if (
+            self.server_args.dp_size == 1
+            or self.server_args.load_balance_method == "round_robin"
+        ):
+            return
+
+        while True:
+            await asyncio.sleep(self.server_args.load_watch_interval)
+            loads = await self.get_load_communicator(GetLoadReqInput())
+            load_udpate_req = WatchLoadUpdateReq(loads=loads)
+            self.send_to_scheduler.send_pyobj(load_udpate_req)
 
 
 class ServerStatus(Enum):
