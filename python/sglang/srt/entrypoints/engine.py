@@ -33,6 +33,8 @@ import zmq
 import zmq.asyncio
 from PIL.Image import Image
 
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -137,6 +139,12 @@ class Engine(EngineBase):
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
+
+        if server_args.enable_trace:
+            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+            if server_args.disaggregation_mode == "null":
+                thread_label = "Tokenizer"
+                trace_set_thread_info(thread_label)
 
     def generate(
         self,

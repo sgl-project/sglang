@@ -309,7 +309,12 @@ impl RouterTrait for GrpcPDRouter {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+    async fn route_embeddings(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::EmbeddingRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 

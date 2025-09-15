@@ -215,6 +215,8 @@ class ServerArgs:
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
     gc_warning_threshold_secs: float = 0.0
+    enable_trace: bool = False
+    oltp_traces_endpoint: str = "localhost:4317"
 
     # API related
     api_key: Optional[str] = None
@@ -360,6 +362,7 @@ class ServerArgs:
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     triton_attention_num_kv_splits: int = 8
+    triton_attention_split_tile_size: Optional[int] = None
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
@@ -1390,6 +1393,17 @@ class ServerArgs:
             default=None,
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         )
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            "--oltp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
+        )
 
         # API related
         parser.add_argument(
@@ -2086,6 +2100,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.triton_attention_num_kv_splits,
             help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
+        )
+        parser.add_argument(
+            "--triton-attention-split-tile-size",
+            type=int,
+            default=ServerArgs.triton_attention_split_tile_size,
+            help="The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference.",
         )
         parser.add_argument(
             "--num-continuous-decode-steps",
