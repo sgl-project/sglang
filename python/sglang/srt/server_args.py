@@ -205,6 +205,8 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
+    tokenizer_metrics_custom_labels_header: str = "x-customer-labels"
+    tokenizer_metrics_allowed_customer_labels: Optional[List[str]] = None
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
@@ -911,6 +913,14 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if (
+            not self.tokenizer_metrics_custom_labels_header
+            and self.tokenizer_metrics_allowed_customer_labels
+        ):
+            raise ValueError(
+                "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-customer-labels."
+            )
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and tokenizer
@@ -1323,6 +1333,21 @@ class ServerArgs:
             help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
             "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
             "otherwise all metrics appear to come from TP 0.",
+        )
+        parser.add_argument(
+            "--tokenizer-metrics-custom-labels-header",
+            type=str,
+            default=ServerArgs.tokenizer_metrics_custom_labels_header,
+            help="Specify the HTTP header for passing customer labels for tokenizer metrics.",
+        )
+        parser.add_argument(
+            "--tokenizer-metrics-allowed-customer-labels",
+            type=str,
+            nargs="+",
+            default=ServerArgs.tokenizer_metrics_allowed_customer_labels,
+            help="The customer labels allowed for tokenizer metrics. The labels are specified via a dict in "
+            "'--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': "
+            "'value2'} is allowed if '--tokenizer-metrics-allowed-labels label1 label2' is set.",
         )
         parser.add_argument(
             "--bucket-time-to-first-token",
