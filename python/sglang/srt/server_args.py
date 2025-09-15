@@ -524,7 +524,7 @@ class ServerArgs:
                         # Standalone speculative decoding needs more memory than other speculative
                         # decoding algorithms since the draft model is typically larger.
                         reserved_mem += 6 * 1024
-                    else:
+                    elif self.speculative_algorithm != "LOOKAHEAD":
                         reserved_mem += 2 * 1024
                 if self.enable_dp_attention:
                     reserved_mem += 4 * 1024
