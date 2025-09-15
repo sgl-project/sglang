@@ -268,10 +268,11 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
             module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
         )
         print(f"[{torch.distributed.get_rank()}] _hook_module_forward_raw on-forward-end", flush=True)
-        on_forward_end()
+        module._sglang_on_forward_end_hook()
         module.forward = forward
         return output
 
+    module._sglang_on_forward_end_hook = on_forward_end
     module.forward = forward
 
 

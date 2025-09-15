@@ -93,6 +93,9 @@ def execute_sbo(
         overlap_args=combine_overlap_args,
     )
 
+    if (hook := getattr(experts, "_sglang_on_forward_end_hook")) is not None:
+        hook()
+
     return hidden_states, shared_output
 
 
