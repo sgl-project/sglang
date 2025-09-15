@@ -8,7 +8,6 @@ on:
 # which uses the default GITHUB_TOKEN to verify the actor's permissions.
 permissions:
   pull-requests: read
-  members: read
 
 jobs:
   labeler:
@@ -27,7 +26,7 @@ jobs:
         if: steps.checkAccess.outputs.require-result == 'true'
         uses: actions/github-script@v7
         with:
-          token: ${{ secrets.GH_PAT_FOR_TAGGING }}
+          github-token: ${{ secrets.GH_PAT_FOR_TAGGING }}
           script: |
             github.rest.issues.addLabels({
               owner: context.repo.owner,
