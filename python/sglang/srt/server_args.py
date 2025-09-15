@@ -205,6 +205,8 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
+    tokenizer_metrics_custom_labels_header: str = "x-customer-labels"
+    tokenizer_metrics_allowed_customer_labels: Optional[List[str]] = None
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
@@ -390,7 +392,7 @@ class ServerArgs:
     debug_tensor_dump_prefill_only: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
-    disaggregation_mode: str = "null"
+    disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_decode_tp: Optional[int] = None
@@ -912,6 +914,14 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if (
+            not self.tokenizer_metrics_custom_labels_header
+            and self.tokenizer_metrics_allowed_customer_labels
+        ):
+            raise ValueError(
+                "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-customer-labels."
+            )
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and tokenizer
@@ -1324,6 +1334,21 @@ class ServerArgs:
             help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
             "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
             "otherwise all metrics appear to come from TP 0.",
+        )
+        parser.add_argument(
+            "--tokenizer-metrics-custom-labels-header",
+            type=str,
+            default=ServerArgs.tokenizer_metrics_custom_labels_header,
+            help="Specify the HTTP header for passing customer labels for tokenizer metrics.",
+        )
+        parser.add_argument(
+            "--tokenizer-metrics-allowed-customer-labels",
+            type=str,
+            nargs="+",
+            default=ServerArgs.tokenizer_metrics_allowed_customer_labels,
+            help="The customer labels allowed for tokenizer metrics. The labels are specified via a dict in "
+            "'--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': "
+            "'value2'} is allowed if '--tokenizer-metrics-allowed-labels label1 label2' is set.",
         )
         parser.add_argument(
             "--bucket-time-to-first-token",
@@ -2233,7 +2258,7 @@ class ServerArgs:
         parser.add_argument(
             "--disaggregation-mode",
             type=str,
-            default="null",
+            default=ServerArgs.disaggregation_mode,
             choices=["null", "prefill", "decode"],
             help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
         )
@@ -2417,7 +2442,8 @@ class ServerArgs:
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
-        if self.chunked_prefill_size > 0:
+        # Skip validation if disaggregation mode is decode.
+        if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
