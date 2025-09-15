@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, is_cuda
 
 if is_flashinfer_available():
     import flashinfer
@@ -487,7 +487,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            if _is_cuda:
+            if _is_cuda and q_nope.shape[-1] == 512 and q_rope_reshaped.shape[-1] == 64:
                 query = concat_mla_absorb_q(q_nope, q_rope_reshaped)
             else:
                 query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
