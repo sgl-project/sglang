@@ -390,7 +390,6 @@ The continuous integration pipeline includes comprehensive testing, benchmarking
 - **Container Images**: Docker images published using `/docker/Dockerfile.router`
 
 ## Features
-
 - **High Performance**: Rust-based routing with connection pooling and optimized request handling
 - **Advanced Load Balancing**: Multiple algorithms including:
   - **Cache-Aware**: Intelligent routing based on cache locality for optimal performance

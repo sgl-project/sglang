@@ -3,6 +3,7 @@ use axum::{
     response::IntoResponse, response::Response,
 };
 use rand::Rng;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -13,6 +14,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 
+use crate::metrics::RouterMetrics;
 use crate::server::AppState;
 
 /// Generate OpenAI-compatible request ID based on endpoint
@@ -111,38 +113,14 @@ where
 
         let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
 
-        // Insert request ID into request extensions
+        // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));
-
-        // Create a span with the request ID for this request
-        let span = tracing::info_span!(
-            "http_request",
-            method = %req.method(),
-            uri = %req.uri(),
-            version = ?req.version(),
-            request_id = %request_id
-        );
-
-        // Log within the span
-        let _enter = span.enter();
-        tracing::info!(
-            target: "sglang_router_rs::request",
-            "started processing request"
-        );
-        drop(_enter);
-
-        // Capture values we need in the async block
-        let method = req.method().clone();
-        let uri = req.uri().clone();
-        let version = req.version();
 
         // Call the inner service
         let future = self.inner.call(req);
 
         Box::pin(async move {
-            let start_time = Instant::now();
             let mut response = future.await?;
-            let latency = start_time.elapsed();
 
             // Add request ID to response headers
             response.headers_mut().insert(
@@ -150,36 +128,6 @@ where
                 HeaderValue::from_str(&request_id)
                     .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
             );
-
-            // Log the response with proper request ID in span
-            let status = response.status();
-            let span = tracing::info_span!(
-                "http_request",
-                method = %method,
-                uri = %uri,
-                version = ?version,
-                request_id = %request_id,
-                status = %status,
-                latency = ?latency
-            );
-
-            let _enter = span.enter();
-            if status.is_server_error() {
-                tracing::error!(
-                    target: "sglang_router_rs::response",
-                    "request failed with server error"
-                );
-            } else if status.is_client_error() {
-                tracing::warn!(
-                    target: "sglang_router_rs::response",
-                    "request failed with client error"
-                );
-            } else {
-                tracing::info!(
-                    target: "sglang_router_rs::response",
-                    "finished processing request"
-                );
-            }
 
             Ok(response)
         })
@@ -223,7 +171,11 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
-        // Don't log here - we already log in RequestIdService with the proper request_id
+        // Log the request start
+        info!(
+            target: "sglang_router_rs::request",
+            "started processing request"
+        );
     }
 }
 
@@ -249,7 +201,24 @@ impl<B> OnResponse<B> for ResponseLogger {
         span.record("status_code", status.as_u16());
         span.record("latency", format!("{:?}", latency));
 
-        // Don't log here - RequestIdService handles all logging with proper request IDs
+        // Log the response completion
+        let _enter = span.enter();
+        if status.is_server_error() {
+            error!(
+                target: "sglang_router_rs::response",
+                "request failed with server error"
+            );
+        } else if status.is_client_error() {
+            warn!(
+                target: "sglang_router_rs::response",
+                "request failed with client error"
+            );
+        } else {
+            info!(
+                target: "sglang_router_rs::response",
+                "finished processing request"
+            );
+        }
     }
 }
 
@@ -441,6 +410,11 @@ pub async fn concurrency_limit_middleware(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    // Static counter for embeddings queue size
+    static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
+
+    // Identify if this is an embeddings request based on path
+    let is_embeddings = request.uri().path().contains("/v1/embeddings");
     let token_bucket = app_state.context.rate_limiter.clone();
 
     // Try to acquire token immediately
@@ -468,10 +442,23 @@ pub async fn concurrency_limit_middleware(
             // Try to send to queue
             match queue_tx.try_send(queued) {
                 Ok(_) => {
+                    // On successful enqueue, update embeddings queue gauge if applicable
+                    if is_embeddings {
+                        let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed) + 1;
+                        RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                    }
+
                     // Wait for token from queue processor
                     match permit_rx.await {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
+                            // Dequeue for embeddings
+                            if is_embeddings {
+                                let new_val =
+                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
+                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                            }
+
                             let response = next.run(request).await;
 
                             // Return the token to the bucket
@@ -481,10 +468,22 @@ pub async fn concurrency_limit_middleware(
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
+                            // Dequeue for embeddings on error
+                            if is_embeddings {
+                                let new_val =
+                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
+                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                            }
                             status.into_response()
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
+                            // Dequeue for embeddings on channel error
+                            if is_embeddings {
+                                let new_val =
+                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
+                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                            }
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
                     }

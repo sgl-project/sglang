@@ -5,6 +5,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
@@ -71,6 +73,7 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions
             logprob_pt = 0
+
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.is_retracted:
                     continue
@@ -99,6 +102,7 @@ class SchedulerOutputProcessorMixin:
                         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                         extend_input_len = extend_input_len_per_req[i]
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
+
                         if req.return_logprob:
                             self.add_logprob_return_values(
                                 i,
@@ -441,26 +445,58 @@ class SchedulerOutputProcessorMixin:
         output: LogitsProcessorOutput,
     ):
         """Attach logprobs to the return values."""
-        req.output_token_logprobs_val.append(output.next_token_logprobs[i])
-        req.output_token_logprobs_idx.append(next_token_ids[i])
+        if output.next_token_logprobs is not None:
+            req.output_token_logprobs_val.append(output.next_token_logprobs[i])
+            req.output_token_logprobs_idx.append(next_token_ids[i])
 
-        self.add_input_logprob_return_values(
-            i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
-        )
+        # Only add input logprobs if there are input tokens to process
+        # Note: For prefill-only requests with default logprob_start_len, this will be 0,
+        # meaning we only compute output logprobs (which is the intended behavior)
+        if num_input_logprobs > 0:
+            self.add_input_logprob_return_values(
+                i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
+            )
+        else:
+            self._initialize_empty_logprob_containers(req)
 
         if req.top_logprobs_num > 0:
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
             req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
 
-        if req.token_ids_logprob is not None:
-            req.output_token_ids_logprobs_val.append(
-                output.next_token_token_ids_logprobs_val[i]
-            )
+        if (
+            req.token_ids_logprob is not None
+            and output.next_token_token_ids_logprobs_val is not None
+        ):
+            # Convert GPU tensor to list if needed
+            logprobs_val = output.next_token_token_ids_logprobs_val[i]
+            if isinstance(logprobs_val, torch.Tensor):
+                logprobs_val = logprobs_val.tolist()
+            req.output_token_ids_logprobs_val.append(logprobs_val)
             req.output_token_ids_logprobs_idx.append(
                 output.next_token_token_ids_logprobs_idx[i]
             )
 
         return num_input_logprobs
+
+    def _initialize_empty_logprob_containers(self, req: Req) -> None:
+        """
+        Initialize logprob fields to empty lists if unset.
+
+        This is needed for prefill-only requests where the normal initialization
+        flow might be bypassed, but downstream code expects these fields to be lists.
+        """
+        if req.input_token_logprobs_val is None:
+            req.input_token_logprobs_val = []
+        if req.input_token_logprobs_idx is None:
+            req.input_token_logprobs_idx = []
+        if req.input_top_logprobs_val is None:
+            req.input_top_logprobs_val = []
+        if req.input_top_logprobs_idx is None:
+            req.input_top_logprobs_idx = []
+        if req.input_token_ids_logprobs_val is None:
+            req.input_token_ids_logprobs_val = []
+        if req.input_token_ids_logprobs_idx is None:
+            req.input_token_ids_logprobs_idx = []
 
     def stream_output(
         self: Scheduler,

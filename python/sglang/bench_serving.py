@@ -105,10 +105,13 @@ def remove_suffix(text: str, suffix: str) -> str:
 
 
 def get_auth_headers() -> Dict[str, str]:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        return {"Authorization": f"Bearer {api_key}"}
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    if openai_api_key:
+        return {"Authorization": f"Bearer {openai_api_key}"}
     else:
+        api_key = os.environ.get("API_KEY")
+        if api_key:
+            return {"Authorization": f"{api_key}"}
         return {}
 
 

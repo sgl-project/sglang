@@ -5,7 +5,7 @@ use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use rand::Rng;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tracing::info;
 
 /// Power-of-two choices policy
@@ -41,7 +41,7 @@ impl PowerOfTwoPolicy {
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
     fn select_worker(
         &self,
-        workers: &[Box<dyn Worker>],
+        workers: &[Arc<dyn Worker>],
         _request_text: Option<&str>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
@@ -137,8 +137,8 @@ mod tests {
         }
         // worker3 has load 0
 
-        let workers: Vec<Box<dyn Worker>> =
-            vec![Box::new(worker1), Box::new(worker2), Box::new(worker3)];
+        let workers: Vec<Arc<dyn Worker>> =
+            vec![Arc::new(worker1), Arc::new(worker2), Arc::new(worker3)];
 
         // Run multiple selections
         let mut selected_counts = [0; 3];
@@ -156,12 +156,12 @@ mod tests {
     #[test]
     fn test_power_of_two_with_cached_loads() {
         let policy = PowerOfTwoPolicy::new();
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(BasicWorker::new(
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
                 "http://w1:8000".to_string(),
                 WorkerType::Regular,
             )),
-            Box::new(BasicWorker::new(
+            Arc::new(BasicWorker::new(
                 "http://w2:8000".to_string(),
                 WorkerType::Regular,
             )),
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn test_power_of_two_single_worker() {
         let policy = PowerOfTwoPolicy::new();
-        let workers: Vec<Box<dyn Worker>> = vec![Box::new(BasicWorker::new(
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
             "http://w1:8000".to_string(),
             WorkerType::Regular,
         ))];

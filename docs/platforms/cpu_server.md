@@ -139,9 +139,10 @@ Notes:
     You may need to set proper `--max-total-tokens` to avoid the out-of-memory error.
 
 3. For optimizing decoding with torch.compile, please add the flag `--enable-torch-compile`.
-    To specify the maximum batch size when using torch compile, set the flag `--torch-compile-max-bs`.
-    For example, `--enable-torch-compile --torch-compile-max-bs 4` means using torch compile and setting the
-    maximum batch size to 4.
+    To specify the maximum batch size when using `torch.compile`, set the flag `--torch-compile-max-bs`.
+    For example, `--enable-torch-compile --torch-compile-max-bs 4` means using `torch.compile`
+    and setting the maximum batch size to 4. Currently the maximum applicable batch size
+    for optimizing with `torch.compile` is 16.
 
 4. A warmup step is automatically triggered when the service is started.
     The server is ready when you see the log `The server is fired up and ready to roll!`.
@@ -184,6 +185,8 @@ python -m sglang.launch_server                 \
     --quantization w8a8_int8                   \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
+    --enable-torch-compile                     \
+    --torch-compile-max-bs 4                   \
     --tp 6
 ```
 
@@ -197,8 +200,13 @@ python -m sglang.launch_server                 \
     --device cpu                               \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
+    --enable-torch-compile                     \
+    --torch-compile-max-bs 4                   \
     --tp 6
 ```
+
+Note: Please set `--torch-compile-max-bs` to the maximum desired batch size for your deployment,
+which can be up to 16. The value `4` in the examples is illustrative.
 
 Then you can test with `bench_serving` command or construct your own command or script
 following [the benchmarking example](#benchmarking-with-requests).

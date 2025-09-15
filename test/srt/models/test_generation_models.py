@@ -90,6 +90,11 @@ ALL_MODELS = [
         trust_remote_code=True,
         skip_long_prompt=True,
     ),
+    ModelCase(
+        "swiss-ai/Apertus-8B",
+        trust_remote_code=True,
+        skip_long_prompt=True,
+    ),
 ]
 
 TORCH_DTYPES = [torch.float16]
