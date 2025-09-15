@@ -352,6 +352,9 @@ class Fp8LinearMethod(LinearMethodBase):
                     _is_cpu_amx_available
                 ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
                 _amx_process_weight_after_loading(layer, ["weight"])
+                layer.weight_scale_inv = torch.nn.Parameter(
+                    layer.weight_scale_inv.data, requires_grad=False
+                )
                 return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
@@ -635,11 +638,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-            if (
-                get_bool_env_var("SGLANG_CUTLASS_MOE")
-                and self.cutlass_fp8_supported
-                and (is_sm100_supported() or is_sm90_supported())
-            ):
+            if self.use_cutlass_fused_experts_fp8:
                 self.ab_strides1 = torch.full(
                     (num_experts,),
                     hidden_size,
@@ -660,7 +659,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 self.c_strides2 = torch.full(
                     (num_experts,),
-                    intermediate_size_per_partition,
+                    hidden_size,
                     device=w2_weight.device,
                     dtype=torch.int64,
                 )
@@ -1136,10 +1135,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and topk_config.topk_group is not None
         ), "Current trtllm_fp8_block_scale_moe kernel does not support these two arguments as None"
 
-        if topk_config.correction_bias is None:
-            correction_bias = topk_config.correction_bias.to(x.dtype)
-        else:
-            correction_bias = None
+        correction_bias = (
+            None
+            if topk_config.correction_bias is None
+            else topk_config.correction_bias.to(x.dtype)
+        )
+
         return trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
             routing_bias=correction_bias,

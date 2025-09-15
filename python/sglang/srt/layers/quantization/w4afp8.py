@@ -9,7 +9,6 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
-from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -18,7 +17,11 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import is_npu, set_weight_attrs
+
+_is_npu = is_npu()
+if not _is_npu:
+    from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -297,6 +300,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states

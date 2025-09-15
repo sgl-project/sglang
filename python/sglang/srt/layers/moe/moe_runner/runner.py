@@ -10,15 +10,11 @@ from sglang.srt.layers.moe.moe_runner.base import (
     PermuteMethodPool,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
-from sglang.srt.layers.moe.token_dispatcher.base import (
-    CombineInput,
-    CombineInputFormat,
-    DispatchOutput,
-)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
+    from sglang.srt.layers.moe.token_dispatcher.base import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 logger = logging.getLogger(__name__)

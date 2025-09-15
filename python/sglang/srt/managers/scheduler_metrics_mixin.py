@@ -214,7 +214,7 @@ class SchedulerMetricsMixin:
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         msg += (
-            f"cuda graph: {can_run_cuda_graph}, "
+            f"{'cpu graph' if self.device == 'cpu' else 'cuda graph'}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
@@ -230,7 +230,7 @@ class SchedulerMetricsMixin:
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
             self.stats.total_retracted_reqs = self.total_retracted_reqs
-            self.metrics_collector.log_stats(self.stats)
+            self.stats.avg_request_queue_latency = 0.0
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
@@ -238,6 +238,7 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
                 )
+            self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
 
@@ -278,7 +279,7 @@ class SchedulerMetricsMixin:
             self.server_args.load_balance_method == "minimum_tokens"
             and self.forward_ct % 40 == 0
         ):
-            holding_tokens = self.get_load()
+            holding_tokens = self.get_load().num_tokens
 
             new_recv_dp_balance_id_list, holding_token_list = (
                 self.gather_dp_balance_info(holding_tokens)
