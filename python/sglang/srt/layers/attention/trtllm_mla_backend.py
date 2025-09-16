@@ -626,6 +626,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 k = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype)
                 v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype)
+                output_shape = (qall.shape[0], layer.tp_q_head_num, layer.v_head_dim)
                 o1, s1 = flashinfer.prefill.trtllm_ragged_attention_deepseek(
                     query=qall,
                     key=k,
@@ -644,12 +645,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     enable_pdl=False,
                     is_causal=False,
                     return_lse=True,
+                    out=torch.zeros(*output_shape, dtype=q.dtype, device=q.device)
                 )
-                # TODO(shuw@nvidia.com): Depends on resolution of https://github.com/flashinfer-ai/flashinfer/issues/1663.
-                # The out-of-bounds writes in flashinfer's trtllm_ragged_attention_deepseek.
-                if actual_seq_lens_kv[-1].item() == 0:
-                    o1[qo_indptr[-2].item() :] = 0
-                output = (o1, s1)
         return output
 
 
