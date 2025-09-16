@@ -1938,8 +1938,17 @@ impl RouterTrait for PDRouter {
             .into_response()
     }
 
-    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
-        todo!()
+    async fn route_embeddings(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::EmbeddingRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Embeddings endpoint not implemented for PD router",
+        )
+            .into_response()
     }
 
     async fn route_rerank(

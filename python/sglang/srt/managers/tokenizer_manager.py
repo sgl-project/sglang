@@ -64,6 +64,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
+    GetLoadReqInput,
     HealthCheckOutput,
     MultiTokenizerWrapper,
     OpenSessionReqInput,
@@ -73,6 +74,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    WatchLoadUpdateReq,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -82,6 +84,13 @@ from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicat
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.tracing.trace import (
+    trace_get_proc_propagate_context,
+    trace_req_finish,
+    trace_req_start,
+    trace_slice_end,
+    trace_slice_start,
+)
 from sglang.srt.utils import (
     configure_gc_warning,
     dataclass_to_string_truncated,
@@ -297,12 +306,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # Metrics
         if self.enable_metrics:
+            labels = {
+                "model_name": self.server_args.served_model_name,
+                # TODO: Add lora name/path in the future,
+            }
+            if server_args.tokenizer_metrics_allowed_customer_labels:
+                for label in server_args.tokenizer_metrics_allowed_customer_labels:
+                    labels[label] = ""
             self.metrics_collector = TokenizerMetricsCollector(
                 server_args=server_args,
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    # TODO: Add lora name/path in the future,
-                },
+                labels=labels,
                 bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
                 bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
                 bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
@@ -357,6 +370,24 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else:
                 # If it's a single value, add worker_id prefix
                 obj.rid = f"{self.worker_id}_{obj.rid}"
+
+        if obj.is_single:
+            bootstrap_room = (
+                obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
+            )
+            trace_req_start(obj.rid, bootstrap_room, ts=int(created_time * 1e9))
+            trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
+        else:
+            for i in range(len(obj.rid)):
+                bootstrap_room = (
+                    obj.bootstrap_room[i]
+                    if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
+                    else None
+                )
+                trace_req_start(obj.rid[i], bootstrap_room, ts=int(created_time * 1e9))
+                trace_slice_start(
+                    "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
+                )
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -574,6 +605,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
+        trace_slice_end("tokenize", obj.rid)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -648,7 +680,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             ):
                 raise ValueError(
                     "The server is not configured to enable custom logit processor. "
-                    "Please set `--enable-custom-logits-processor` to enable this feature."
+                    "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
 
     def _validate_input_ids_in_vocab(
@@ -752,6 +784,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )
+            trace_slice_end("tokenize", req.rid)
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -779,9 +812,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        trace_slice_start("dispatch", obj.rid)
+        tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
+        trace_slice_end("dispatch", obj.rid, thread_finish_flag=True)
         return state
 
     def _send_batch_request(
@@ -1004,7 +1040,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             return
         req = AbortReq(rid, abort_all)
         self.send_to_scheduler.send_pyobj(req)
-
         if self.enable_metrics:
             self.metrics_collector.observe_one_aborted_request()
 
@@ -1209,6 +1244,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
+        )
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.watch_load_thread))
         )
 
     def dump_requests_before_crash(self):
@@ -1429,6 +1467,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+
+                trace_req_finish(rid, ts=int(state.finished_time * 1e9))
+
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
@@ -1578,6 +1619,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else 0
         )
 
+        customer_labels = getattr(state.obj, "customer_labels", None)
+        labels = (
+            {**self.metrics_collector.labels, **customer_labels}
+            if customer_labels
+            else self.metrics_collector.labels
+        )
         if (
             state.first_token_time == 0.0
             and self.disaggregation_mode != DisaggregationMode.PREFILL
@@ -1585,7 +1632,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             state.first_token_time = state.last_time = time.time()
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
-                state.first_token_time - state.created_time
+                labels, state.first_token_time - state.created_time
             )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
@@ -1593,6 +1640,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 new_time = time.time()
                 interval = new_time - state.last_time
                 self.metrics_collector.observe_inter_token_latency(
+                    labels,
                     interval,
                     num_new_tokens,
                 )
@@ -1607,6 +1655,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 or state.obj.sampling_params.get("structural_tag", None)
             )
             self.metrics_collector.observe_one_finished_request(
+                labels,
                 recv_obj.prompt_tokens[i],
                 completion_tokens,
                 recv_obj.cached_tokens[i],
@@ -1810,6 +1859,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             scores.append(score_list)
 
         return scores
+
+    async def watch_load_thread(self):
+        # Only for dp_controller when dp_size > 1
+        if (
+            self.server_args.dp_size == 1
+            or self.server_args.load_balance_method == "round_robin"
+        ):
+            return
+
+        while True:
+            await asyncio.sleep(self.server_args.load_watch_interval)
+            loads = await self.get_load_communicator(GetLoadReqInput())
+            load_udpate_req = WatchLoadUpdateReq(loads=loads)
+            self.send_to_scheduler.send_pyobj(load_udpate_req)
 
 
 class ServerStatus(Enum):
