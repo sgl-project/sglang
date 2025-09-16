@@ -4,8 +4,12 @@
 # [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.1.0.
 
 
+import logging
 import math
 from typing import Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -18,6 +22,22 @@ from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _reason_recompile(compile_key, jit_func):
+    compile_cache = jit_func.compile_cache
+    compile_key_map = jit_func.compile_key_map
+    if not compile_cache:
+        return "not compiled yet"
+    for k, v in compile_cache.items():
+        if k == compile_key:
+            continue
+        if len(k) != len(compile_key):
+            continue
+        for i in range(len(k)):
+            if k[i] != compile_key[i]:
+                return f"diff at '{compile_key_map[i]}': {k[i]} vs {compile_key[i]} "
+    return "unknown reason"
 
 
 torch2cute_dtype_map = {
@@ -254,6 +274,9 @@ def _flash_attn_fwd(
         compute_capability,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
+        logger.info(
+            f"Compiling FA4 kernel with reason: {_reason_recompile(compile_key, _flash_attn_fwd)}"
+        )
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
@@ -335,6 +358,28 @@ def _flash_attn_fwd(
 
 
 _flash_attn_fwd.compile_cache = {}
+_flash_attn_fwd.compile_key_map = [
+    "dtype",
+    "head_dim",
+    "head_dim_v",
+    "qhead_per_kvhead",
+    "causal",
+    "softcap is not None",
+    "lse is None",
+    "cu_seqlens_q is None",
+    "cu_seqlens_k is None",
+    "seqused_q is None",
+    "seqused_k is None",
+    "page_table is not None",
+    "window_size_left is not None",
+    "window_size_right is not None",
+    "learnable_sink is not None",
+    "m_block_size",
+    "n_block_size",
+    "num_threads",
+    "pack_gqa",
+    "compute_capability",
+]
 
 
 def flash_attn_varlen_func(
