@@ -5,7 +5,7 @@
 //! - Multi-Router Mode (enable_igw=true): RouterManager coordinates everything
 
 use crate::config::RouterConfig;
-use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry};
+use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesRequest,
@@ -41,7 +41,6 @@ impl RouterId {
 }
 
 /// Router Manager - Central coordinator for routers and workers
-/// Only created when enable_igw=true
 pub struct RouterManager {
     /// Worker registry (single source of truth in multi-router mode)
     worker_registry: Arc<WorkerRegistry>,
@@ -49,16 +48,12 @@ pub struct RouterManager {
     /// Policy registry for managing model-to-policy mappings
     policy_registry: Arc<crate::policies::PolicyRegistry>,
 
-    /// All routers managed by this manager (max 4 routers in Phase 2)
+    /// All routers managed by this manager
     /// RouterId examples: "http-regular", "http-pd", "grpc-regular", "grpc-pd"
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
 
     /// Default router for requests without specific routing
     default_router: Option<RouterId>,
-
-    /// Model to router mapping for model-aware routing
-    /// Multiple models can be served by the same router
-    model_routers: Arc<DashMap<String, Vec<RouterId>>>,
 
     /// HTTP client for querying worker info
     client: reqwest::Client,
@@ -81,29 +76,15 @@ impl RouterManager {
             policy_registry,
             routers: Arc::new(DashMap::new()),
             default_router: None,
-            model_routers: Arc::new(DashMap::new()),
             client,
             config,
         }
     }
 
     /// Register a router with the manager
-    pub fn register_router(
-        &mut self,
-        id: RouterId,
-        router: Arc<dyn RouterTrait>,
-        models: Vec<String>,
-    ) {
+    pub fn register_router(&mut self, id: RouterId, router: Arc<dyn RouterTrait>) {
         // Store router
         self.routers.insert(id.clone(), router);
-
-        // Update model mappings
-        for model in models {
-            self.model_routers
-                .entry(model)
-                .or_default()
-                .push(id.clone());
-        }
 
         // Set as default if first router
         if self.default_router.is_none() {
@@ -122,14 +103,29 @@ impl RouterManager {
         self.routers.len()
     }
 
-    /// Get router for a specific model
+    /// Get router for a specific model based on worker types
     pub fn get_router_for_model(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
-        // First try model-specific routers
-        if let Some(router_ids) = self.model_routers.get(model_id) {
-            if let Some(router_id) = router_ids.first() {
-                if let Some(router) = self.routers.get(router_id) {
-                    return Some(router.clone());
-                }
+        // Query workers for this model from registry
+        let workers = self.worker_registry.get_by_model(model_id);
+
+        if !workers.is_empty() {
+            // Determine router based on worker types
+            let has_pd_workers = workers.iter().any(|w| {
+                matches!(
+                    w.worker_type(),
+                    WorkerType::Prefill { .. } | WorkerType::Decode
+                )
+            });
+
+            let router_id = if has_pd_workers {
+                RouterId::new("http-pd".to_string())
+            } else {
+                RouterId::new("http-regular".to_string())
+            };
+
+            // Return the router if it exists
+            if let Some(router) = self.routers.get(&router_id) {
+                return Some(router.clone());
             }
         }
 
@@ -208,37 +204,44 @@ impl RouterManager {
             labels.insert("chat_template".to_string(), chat_template);
         }
 
-        // Create worker based on type
-        // Note: For prefill and decode workers, we can't easily add labels after creation
-        // since they return Box<dyn Worker>. We'll need to enhance WorkerFactory in the future.
         let worker = match config.worker_type.as_deref() {
-            Some("prefill") => {
-                // For now, prefill workers won't have custom labels
-                // TODO: Enhance WorkerFactory to accept labels for prefill workers
-                WorkerFactory::create_prefill(config.url.clone(), config.bootstrap_port)
-            }
-            Some("decode") => {
-                // For now, decode workers won't have custom labels
-                // TODO: Enhance WorkerFactory to accept labels for decode workers
-                WorkerFactory::create_decode(config.url.clone())
-            }
-            _ => {
-                // Regular workers can have labels
-                WorkerFactory::create_regular_with_labels(
-                    config.url.clone(),
-                    labels.clone(),
-                    CircuitBreakerConfig::default(),
-                )
-            }
+            Some("prefill") => WorkerFactory::create_prefill_with_labels(
+                config.url.clone(),
+                config.bootstrap_port,
+                labels.clone(),
+                CircuitBreakerConfig::default(),
+            ),
+            Some("decode") => WorkerFactory::create_decode_with_labels(
+                config.url.clone(),
+                labels.clone(),
+                CircuitBreakerConfig::default(),
+            ),
+            _ => WorkerFactory::create_regular_with_labels(
+                config.url.clone(),
+                labels.clone(),
+                CircuitBreakerConfig::default(),
+            ),
         };
 
         // Register worker
-        let worker_id = self.worker_registry.register(Arc::from(worker));
+        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker_id = self.worker_registry.register(worker_arc.clone());
 
         // Notify PolicyRegistry about the new worker
         // Extract policy hint from labels if provided
         let policy_hint = labels.get("policy").map(|s| s.as_str());
         let policy = self.policy_registry.on_worker_added(&model_id, policy_hint);
+
+        // Log which type of router would handle this worker (for debugging)
+        let expected_router = match config.worker_type.as_deref() {
+            Some("prefill") | Some("decode") => "http-pd",
+            _ => "http-regular",
+        };
+
+        info!(
+            "Worker for model '{}' would be handled by '{}' router based on type",
+            model_id, expected_router
+        );
 
         info!(
             "Added worker {} with URL {} for model {} using policy {}",
@@ -249,7 +252,6 @@ impl RouterManager {
         );
 
         // Return worker info
-        let worker_arc = self.worker_registry.get(&worker_id).unwrap();
         let worker_info = self.worker_to_info(worker_id.as_str(), &worker_arc);
 
         Ok(WorkerApiResponse {
@@ -272,8 +274,9 @@ impl RouterManager {
 
         if let Some(_worker) = self.worker_registry.remove_by_url(url) {
             // Notify PolicyRegistry about worker removal
-            if let Some(model_id) = model_id {
-                self.policy_registry.on_worker_removed(&model_id);
+            if let Some(ref model_id) = model_id {
+                self.policy_registry.on_worker_removed(model_id);
+
                 info!("Removed worker with URL {} for model {}", url, model_id);
             } else {
                 info!("Removed worker with URL {}", url);
@@ -361,7 +364,11 @@ impl RouterManager {
             model_id: worker.model_id().to_string(),
             priority: worker.priority(),
             cost: worker.cost(),
-            worker_type: format!("{:?}", worker.worker_type()),
+            worker_type: match worker.worker_type() {
+                WorkerType::Regular => "regular".to_string(),
+                WorkerType::Prefill { .. } => "prefill".to_string(),
+                WorkerType::Decode => "decode".to_string(),
+            },
             is_healthy: worker.is_healthy(),
             load: worker.load(),
             connection_mode: format!("{:?}", worker.connection_mode()),
@@ -372,11 +379,6 @@ impl RouterManager {
             metadata: metadata.labels.clone(),
         }
     }
-
-    // Note: calculate_stats removed - using WorkerRegistry::stats() instead
-
-    // === Phase 2: Router Management ===
-    // Note: Dynamic router creation removed - routers are created and registered externally
 
     /// Get the appropriate router for a request based on headers and request content
     pub fn select_router_for_request(
@@ -406,14 +408,10 @@ impl RouterManager {
             })
             .unwrap_or(false);
 
-        // If model specified, find routers serving that model
+        // If model specified, use get_router_for_model
         let candidate_routers = if let Some(model) = model_id {
-            // Get routers for specific model
-            if let Some(router_ids) = self.model_routers.get(model) {
-                router_ids
-                    .iter()
-                    .filter_map(|id| self.routers.get(id).map(|r| r.clone()))
-                    .collect::<Vec<_>>()
+            if let Some(router) = self.get_router_for_model(model) {
+                vec![router]
             } else {
                 Vec::new()
             }
@@ -463,11 +461,6 @@ impl RouterManager {
         best_router
     }
 }
-
-// Note: Default implementation removed as RouterManager now requires AppContext
-// which cannot be defaulted. RouterManager must be created with explicit context.
-
-// === Phase 2: RouterManager as RouterTrait ===
 
 /// RouterManager implements RouterTrait to act as a meta-router
 /// that delegates requests to the appropriate underlying router
@@ -547,14 +540,10 @@ impl RouterTrait for RouterManager {
             .into_response()
     }
 
-    /// Get available models - aggregate from all routers
+    /// Get available models - query from worker registry
     async fn get_models(&self, _req: Request<Body>) -> Response {
-        // Return models that have registered routers
-        let models = self
-            .model_routers
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect::<Vec<_>>();
+        // Get models from worker registry
+        let models = self.worker_registry.get_models();
 
         if models.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
