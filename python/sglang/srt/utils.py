@@ -2417,7 +2417,11 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif server_args.moe_a2a_backend != "deepep":
+        elif server_args.moe_a2a_backend in [
+            "none",
+            "fp4_allgather",
+            "flashinfer_alltoallv",
+        ]:
             return True
         else:
             return (
