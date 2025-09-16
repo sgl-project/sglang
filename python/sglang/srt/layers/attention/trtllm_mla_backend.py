@@ -583,6 +583,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=forward_batch.mha_return_lse,
             )
         else:
+            # # replace with trtllm ragged attention once accuracy is resolved.
+            # output = super().forward_extend(
+            #     q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            # )
             if  not (forward_batch.attn_attend_prefix_cache is not None
                  and forward_batch.mha_return_lse):
                 output = super().forward_extend(
@@ -627,7 +631,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     bmm1_scale=layer.scaling,
                     bmm2_scale=1.0,
                     o_sf_scale=-1.0,
-                    batch_size=qo_indptr[-1].item(),
+                    batch_size=len(actual_seq_lens_qo), #qo_indptr[-1].item(),
                     window_left=-1,
                     cum_seq_lens_q=qo_indptr,
                     cum_seq_lens_kv=kv_indptr,
@@ -635,11 +639,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     is_causal=False,
                     return_lse=True,
                 )
-                # TODO(shuw@nvidia.com): Depends on resolution of https://github.com/flashinfer-ai/flashinfer/issues/1663.
-                # The out-of-bounds writes in flashinfer's trtllm_ragged_attention_deepseek.
-                if actual_seq_lens_kv[-1].item() == 0:
-                    s1[qo_indptr[-2].item():] = torch.tensor(float('-inf'), dtype=s1.dtype, device=s1.device)
-                    o1[qo_indptr[-2].item():] = 0
+            #     # TODO(shuw@nvidia.com): Depends on resolution of https://github.com/flashinfer-ai/flashinfer/issues/1663.
+            #     # The out-of-bounds writes in flashinfer's trtllm_ragged_attention_deepseek.
+            #     if actual_seq_lens_kv[-1].item() == 0:
+            #         s1[qo_indptr[-2].item():] = torch.tensor(float('-inf'), dtype=s1.dtype, device=s1.device)
+            #         o1[qo_indptr[-2].item():] = 0
                 output = (o1, s1)
         return output
 
