@@ -77,9 +77,12 @@ class HiRadixCache(RadixCache):
         self.enable_storage = hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and enable_metrics
 
-        # todo: customizable storage prefetch threshold and timeout
         self.prefetch_threshold = 256
-        self.prefetch_timeout = 3  # seconds
+        self.prefetch_timeout_base = 1  # seconds
+        self.prefetch_timeout_per_ki_token = 1  # seconds
+        self.prefetch_timeout_per_page = (
+            page_size / 1024 * self.prefetch_timeout_per_ki_token
+        )
         self.prefetch_stop_policy = hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
@@ -484,16 +487,30 @@ class HiRadixCache(RadixCache):
 
         if len(operation.hash_value) == 0:
             completed = False
+            print(
+                f"operation {operation.request_id} completed: {completed} since hash_value is empty"
+            )
         else:
             completed = (
                 operation.completed_tokens == len(operation.hash_value) * self.page_size
+            )
+            print(
+                f"operation {operation.request_id} completed: {completed}, completed_tokens: {operation.completed_tokens}, hash_value_len: {len(operation.hash_value) * self.page_size}"
             )
 
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
             can_terminate = completed or (
-                time.monotonic() - operation.start_time > self.prefetch_timeout
+                # If hash_value has not been computed in timeout_base seconds, terminate it.
+                time.monotonic() - operation.start_time
+                > self.prefetch_timeout_base
+                + len(operation.hash_value) * self.prefetch_timeout_per_page
+            )
+            print(
+                f"operation {operation.request_id} can_terminate: {can_terminate}, duration: {time.monotonic() - operation.start_time}, "
+                f"hash_value_len: {len(operation.hash_value) * self.page_size}, "
+                f"timeout: {self.prefetch_timeout_base + len(operation.hash_value) * self.prefetch_timeout_per_page}"
             )
         else:
             # unknown prefetch stop policy, just return True
