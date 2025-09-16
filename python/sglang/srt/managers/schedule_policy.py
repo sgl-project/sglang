@@ -554,6 +554,15 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
+                # Split-kv size for prefill is hard-coded to 4096 here
+                # Also we want to assert that chunked prefill size is multiple of split-kv-size
+                # Cut trunc_len to the nearest multiple of split_kv_size
+                split_kv_size = 4096
+                if trunc_len < split_kv_size:
+                    return AddReqResult.OTHER
+                else:
+                    trunc_len = split_kv_size * (trunc_len // split_kv_size)
+
                 # Chunked prefill
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
