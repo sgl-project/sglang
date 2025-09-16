@@ -179,36 +179,14 @@ class MooncakeStore(HiCacheStorage):
 
     def check_server(self):
         master_server_ip = self.config.master_server_address.split(':')[0]
-        health_url = f"http://{master_server_ip}:9003/health"
         segments_url = f"http://{master_server_ip}:9003/get_all_segments"
         start_time = time.perf_counter()
 
-        health_result = False
-        segments_result = False
+        check_result = False
         while time.perf_counter() - start_time < SETUP_TIMEOUT:
             try:
-                check_health_resp = requests.get(health_url, timeout=3)
-            except Exception:
-                logger.info(
-                    "waiting Mooncake store master started, cost_time: %.2f seconds.",
-                    time.perf_counter() - start_time
-                )
-                time.sleep(3)
-                continue
-
-            if check_health_resp.text != "OK":
-                logger.info(
-                    "waiting Mooncake store master started, cost_time: %.2f seconds.",
-                    time.perf_counter() - start_time
-                )
-                time.sleep(3)
-                continue
-
-            health_result = True
-
-            try:
                 check_segments_resp = requests.get(segments_url, timeout=3)
-            except Exception as e:
+            except Exception:
                 logger.info(
                     "waiting real client started, cost_time: %.2f seconds.",
                     time.perf_counter() - start_time
@@ -224,12 +202,11 @@ class MooncakeStore(HiCacheStorage):
                 time.sleep(3)
                 continue
 
-            segments_result = True
+            logger.info("Mooncake store master and real client started successfully.")
+            check_result = True
             break
 
-        if health_result and segments_result:
-            logger.info("Mooncake store master and real client started successfully.")
-        else:
+        if not check_result:
             logger.error("Mooncake store master and real client start timeout")
             raise ValueError(
                 "Mooncake store master and real client start timeout"
