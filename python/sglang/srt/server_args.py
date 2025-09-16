@@ -2664,6 +2664,16 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif model_arch in ["Exaone4ForCausalLM"]:
+            if hf_config.sliding_window_pattern is not None:
+                # https://docs.sglang.ai/advanced_features/attention_backend.html
+                assert self.attention_backend in {
+                    "flashinfer",
+                    "fa3",
+                    "triton",
+                    "trtllm_mha",
+                }, "flashinfer, fa3, triton, or trtllm_mla is required for Exaone4ForCausalLM-32B"
+
 
     def adjust_mem_fraction_for_vlm(self, model_config):
         vision_config = getattr(model_config.hf_config, "vision_config", None)
