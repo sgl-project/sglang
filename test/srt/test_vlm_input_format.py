@@ -128,7 +128,7 @@ class VLMInputTestBase:
         processor_output, prompt = self.get_processor_output(req=req)
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
-            image_data=[self._pixel_values_image_data(processor_output)],
+            image_data=[self._processor_output_image_data(processor_output)],
             sampling_params=dict(temperature=0.0),
         )
         self.verify_response(output)
@@ -141,7 +141,7 @@ class VLMInputTestBase:
             feature=precomputed_embeddings,
         )
 
-    def _pixel_values_image_data(self, processor_output):
+    def _processor_output_image_data(self, processor_output):
         """Override in subclass to pass the correct set of arguments."""
         raise NotImplementedError
 
@@ -163,7 +163,7 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
             processor_output["pixel_values"], processor_output["image_grid_thw"]
         )
 
-    def _pixel_values_image_data(self, processor_output):
+    def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
 
 
@@ -184,7 +184,7 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
             ).last_hidden_state
         )
 
-    def _pixel_values_image_data(self, processor_output):
+    def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
 
 
@@ -207,7 +207,7 @@ class TestKimiVLImageUnderstandsImage(
             )
         )
 
-    def _pixel_values_image_data(self, processor_output):
+    def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
 
 

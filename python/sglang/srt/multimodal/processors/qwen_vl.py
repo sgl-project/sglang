@@ -254,6 +254,14 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
         input_ids = input_ids.flatten()
 
+        image_grid_thw = getattr(ret, "image_grid_thw", None)
+        if image_grid_thw is None and image_data is not None:
+            image_grid_thw = image_data[0].get("image_grid_thw", None)
+
+        video_grid_thw = getattr(ret, "video_grid_thw", None)
+        if video_grid_thw is None and request_obj.video_data is not None:
+            video_grid_thw = request_obj.video_data[0].get("video_grid_thw", None)
+
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
@@ -265,14 +273,11 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             ),
             # use the expanded token ids
             input_ids=input_ids.unsqueeze(0),
-            image_grid_thw=getattr(ret, "image_grid_thw", None)
-            or image_data[0].get("image_grid_thw", None),
-            video_grid_thw=getattr(ret, "video_grid_thw", None)
-            or request_obj.video_data[0].get("video_grid_thw", None),
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
             second_per_grid_ts=getattr(ret, "second_per_grid_ts", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
-        print(f"{mrope_positions=}")
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
