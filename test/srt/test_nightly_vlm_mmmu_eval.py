@@ -11,10 +11,8 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     check_model_scores,
-    is_in_ci,
     parse_models,
     popen_launch_server,
-    write_github_step_summary,
 )
 
 MODEL_SCORE_THRESHOLDS = {
@@ -28,9 +26,9 @@ MODEL_SCORE_THRESHOLDS = {
 DEFAULT_VLM_MODELS = ",".join(
     [
         "Qwen/Qwen2-VL-7B-Instruct",
-        # "Qwen/Qwen2.5-VL-7B-Instruct",
-        # "OpenGVLab/InternVL2_5-2B",
-        # "google/gemma-3-4b-it",
+        "Qwen/Qwen2.5-VL-7B-Instruct",
+        "OpenGVLab/InternVL2_5-2B",
+        "google/gemma-3-4b-it",
     ]
 )
 

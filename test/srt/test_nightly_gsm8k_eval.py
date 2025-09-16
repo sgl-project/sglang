@@ -12,7 +12,8 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     check_model_scores,
     parse_models,
-    popen_launch_server,
+    popen_launch_server, DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1, DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1, DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
 )
 
 MODEL_SCORE_THRESHOLDS = {
@@ -81,11 +82,10 @@ class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
-            (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
 
@@ -95,7 +95,6 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         )
         is_first = True
         all_results = []
-        print(f"{self.model_groups=}")
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
