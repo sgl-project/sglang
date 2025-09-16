@@ -63,8 +63,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
 
                     metrics = run_eval(args)
 
-                    print(f"{metrics=}")
-                    metrics["score"] = round(metrics["score"], 3)
+                    metrics["score"] = round(metrics["score"], 4)
                     print(
                         f"{'=' * 42}\n{model} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
                     )

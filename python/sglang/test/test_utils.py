@@ -1538,8 +1538,8 @@ def parse_models(model_string: str):
 
 def check_model_scores(results, model_score_thresholds, test_name):
     failed_models = []
-    summary = " | model | score | threshold | status |\n"
-    summary += "| ----- | ----- | --------- | ------ |\n"
+    summary = " | model | status | score | threshold  |\n"
+    summary += "| ----- | ------ | ----- | ---------- | \n"
 
     for model, score in results:
         threshold = model_score_thresholds.get(model)
@@ -1556,7 +1556,7 @@ def check_model_scores(results, model_score_thresholds, test_name):
                 f"Model {model} score ({score:.4f}) is below threshold ({threshold:.4f})"
             )
 
-        line = f"| {model} | {score} | {threshold} | {status_emoji} |\n"
+        line = f"| {status_emoji} | {model} | {score} | {threshold} |\n"
         summary += line
 
     print(summary)
