@@ -38,11 +38,15 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.quantization.int8_kernel import (
+    per_token_quant_int8,
+    w8a8_per_channel_per_token_matmul,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     apply_module_patch,
     cpu_has_amx_support,
+    get_device_capability,
     is_cpu,
     is_cuda,
     is_npu,
@@ -344,7 +348,13 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["weight"])
         else:
-            layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+            use_triton_impl = _is_cuda and get_device_capability() == (8, 9)
+            if use_triton_impl:
+                layer.weight = Parameter(layer.weight.data, requires_grad=False)
+                self.gemm_func = w8a8_per_channel_per_token_matmul
+            else:
+                layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+                self.gemm_func = int8_scaled_mm
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
     def create_weights(
@@ -396,7 +406,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
         x_q, x_scale = per_token_quant_int8(x)
 
-        return int8_scaled_mm(
+        return self.gemm_func(
             x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
         )
 

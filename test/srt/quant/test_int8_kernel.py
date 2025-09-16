@@ -6,8 +6,15 @@ import torch
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.quantization.int8_kernel import (
+    per_token_quant_int8,
+    w8a8_per_channel_per_token_matmul,
+)
 from sglang.test.test_utils import CustomTestCase
+
+
+def to_int8(tensor: torch.Tensor) -> torch.Tensor:
+    return torch.round(tensor.clamp(min=-128, max=127)).to(dtype=torch.int8)
 
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
@@ -163,6 +170,84 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
                 seed=params[7],
             ):
                 self._w8a8_int8_fused_moe(*params)
+
+
+def torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias):
+    o = torch.matmul(a.to(torch.float32), b.to(torch.float32))
+    if bias is not None:
+        o = o.to(torch.float32) * scale_a.view(-1, 1) * scale_b.view(1, -1) + bias
+    else:
+        o = o.to(torch.float32) * scale_a.view(-1, 1) * scale_b.view(1, -1)
+    return o.to(out_dtype)
+
+
+class TestW8A8Int8Gemm(CustomTestCase):
+    DTYPES = [torch.half, torch.bfloat16]
+    M = [1, 256, 1023, 2048, 4096, 8192]
+    N = [128, 1024]
+    K = [256, 512, 1024, 4096]
+
+    SEEDS = [0]
+    WITH_BIAS = [True, False]
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        torch.set_default_device("cuda")
+
+    def _w8a8_int8_gemm(self, M, N, K, dtype, seed, with_bias):
+        torch.manual_seed(seed)
+        a = to_int8(
+            torch.randn(
+                (M, K),
+            )
+            * 5
+        )
+        b = to_int8(
+            torch.randn(
+                (N, K),
+            )
+            * 5
+        )
+        scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
+        scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
+        if with_bias:
+            bias = torch.randn((N,), device="cuda", dtype=dtype) * 10
+        else:
+            bias = None
+
+        with torch.inference_mode():
+            ref_out = torch_scaled_mm(a, b.T, scale_a, scale_b, dtype, bias)
+            out = w8a8_per_channel_per_token_matmul(
+                a, b, scale_a, scale_b, out_dtype=dtype, bias=bias
+            )
+
+        # Check results
+        self.assertTrue(
+            torch.mean(torch.abs(out.to(torch.float32) - ref_out.to(torch.float32)))
+            / torch.mean(torch.abs(ref_out.to(torch.float32)))
+            < 0.05
+        )
+
+    def test_w8a8_int8_gemm(self):
+        for params in itertools.product(
+            self.M,
+            self.N,
+            self.K,
+            self.DTYPES,
+            self.SEEDS,
+            self.WITH_BIAS,
+        ):
+            with self.subTest(
+                M=params[0],
+                N=params[1],
+                K=params[2],
+                dtype=params[3],
+                seed=params[4],
+                with_bias=params[5],
+            ):
+                self._w8a8_int8_gemm(*params)
 
 
 if __name__ == "__main__":
