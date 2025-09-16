@@ -640,9 +640,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 # TODO(shuw@nvidia.com): Depends on resolution of https://github.com/flashinfer-ai/flashinfer/issues/1663.
                 # The out-of-bounds writes in flashinfer's trtllm_ragged_attention_deepseek.
                 if actual_seq_lens_kv[-1].item() == 0:
-                    s1[qo_indptr[-2].item() :] = torch.tensor(
-                        float("-inf"), dtype=s1.dtype, device=s1.device
-                    )
                     o1[qo_indptr[-2].item() :] = 0
                 output = (o1, s1)
         return output
