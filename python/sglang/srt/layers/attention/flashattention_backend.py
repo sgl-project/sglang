@@ -307,6 +307,7 @@ class FlashAttentionBackend(AttentionBackend):
         speculative_num_steps=0,
     ):
         super().__init__()
+
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -646,15 +647,19 @@ class FlashAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-        layer_id: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                cache_loc = forward_batch.out_cache_loc
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, None, None, layer_id_override=layer_id
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -670,28 +675,30 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        window_size = (-1, -1)
+        is_swa = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
+        window_size = (layer.sliding_window_size, 0) if is_swa else (-1, -1)
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        # if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
-        #     if layer.k_scale is not None:
-        #         descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-        #         k_descale = layer.k_scale.expand(descale_shape)
-        #         v_descale = layer.v_scale.expand(descale_shape)
-        #     q = q.to(self.kv_cache_dtype)
-        #     q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-        #     k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
-        causal = True
+        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+            if layer.k_scale is not None:
+                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
+            q = q.to(self.kv_cache_dtype)
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+        causal = not layer.is_cross_attention
 
         # Check if we should use local attention
-        # use_local_attn = (
-        #     self.attention_chunk_size is not None
-        #     and metadata.local_attn_metadata is not None
-        #     and (hasattr(layer, "use_irope") and layer.use_irope)
-        # )
-        use_local_attn = False
+        use_local_attn = (
+            self.attention_chunk_size is not None
+            and metadata.local_attn_metadata is not None
+            and (hasattr(layer, "use_irope") and layer.use_irope)
+        )
 
         # We do cascade attention for Target Verify with topk > 1
         # We don't use cascade attention for Sliding Window Attention:
@@ -733,26 +740,22 @@ class FlashAttentionBackend(AttentionBackend):
         if not self.use_mla:
             # Do multi-head attention
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id if layer_id is None else layer_id
+                layer.layer_id
             )
-            key_cache = key_cache.view(-1, self.page_size, 8, 64)
-            value_cache = value_cache.view(-1, self.page_size, 8, 64)
-            # if layer.is_cross_attention:
-            #     page_table = metadata.encoder_page_table
-            #     cache_seqlens = metadata.encoder_lens_int32
-            #     cu_seqlens_k = metadata.encoder_cu_seqlens_k
-            #     window_size = (-1, -1)
-
-            # print("q shape", q.contiguous().view(-1, 32, 64).shape)
-            # print("key_cache shape", key_cache.shape)
-            # print("value_cache shape", value_cache.shape)
-            # print("cache_seqlens shape", cache_seqlens.shape)
-            # print("cu_seqlens_q shape", cu_seqlens_q.shape)
-            # print("cu_seqlens_k shape", cu_seqlens_k.shape)
-            # print("max_seqlen_q shape", max_seqlen_q)
+            key_cache = key_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            value_cache = value_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
+            if layer.is_cross_attention:
+                page_table = metadata.encoder_page_table
+                cache_seqlens = metadata.encoder_lens_int32
+                cu_seqlens_k = metadata.encoder_cu_seqlens_k
+                window_size = (-1, -1)
 
             result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, 32, 64),
+                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
                 page_table=page_table,
@@ -760,17 +763,15 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                 max_seqlen_q=max_seqlen_q,
-                softmax_scale=0.08838834764831845,
+                softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
                 window_size=window_size,
-                softcap=0.0,
+                softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
                 **kwargs,
             )
-
-            return result.view(-1, 32 * 64)
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result

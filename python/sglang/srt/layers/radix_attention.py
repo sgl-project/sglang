@@ -24,8 +24,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-from sglang.srt.context_manager import get_forward_context
 from sglang.srt.utils import direct_register_custom_op
+from sglang.srt.context_manager import get_forward_context, set_forward_attention_layer
 
 
 class AttentionType(Enum):
@@ -86,7 +86,6 @@ class RadixAttention(nn.Module):
         if self.quant_method is not None:
             self.quant_method.create_weights(self)
         self.attn_type = attn_type
-        self.layer_name = str(layer_id)
 
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
@@ -137,9 +136,10 @@ class RadixAttention(nn.Module):
         #         save_kv_cache,
         #         **kwargs,
         #     )
-        return torch.ops.sglang.unified_attention_with_output(
-            q, k, v, save_kv_cache, self.layer_id
-        )
+        with set_forward_attention_layer(self):
+            return torch.ops.sglang.unified_attention_with_output(
+                    q, k, v, save_kv_cache
+            )
 
 
 def unified_attention_with_output(
@@ -147,12 +147,12 @@ def unified_attention_with_output(
     key: torch.Tensor,
     value: torch.Tensor,
     save_kv_cache: bool,
-    layer_id: int,
 ) -> torch.Tensor:
     context = get_forward_context()
     forward_batch = context.forward_batch
+    attention_layer = context.attention_layer
     return forward_batch.attn_backend.forward(
-        query, key, value, None, forward_batch, save_kv_cache, layer_id=layer_id
+        query, key, value, attention_layer, forward_batch, save_kv_cache
     )
 
 
@@ -161,7 +161,6 @@ def unified_attention_with_output_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     save_kv_cache: bool,
-    layer_id: int,
 ) -> torch.Tensor:
     return torch.empty_like(query)
 

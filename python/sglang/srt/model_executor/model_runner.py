@@ -723,7 +723,8 @@ class ModelRunner:
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
-            self.init_device_graphs()
+            # self.init_device_graphs()
+            self.graph_runner = None
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
