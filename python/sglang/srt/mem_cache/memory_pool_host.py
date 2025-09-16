@@ -140,7 +140,7 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_flat_data_page(self, index) -> torch.Tensor:
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         """
         Get a flat data page from the host memory pool.
         """
@@ -461,13 +461,16 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def get_flat_data_page(self, index) -> torch.Tensor:
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":
-            return self.kv_buffer[:, :, index : index + self.page_size, :, :].flatten()
+            data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
-            return self.kv_buffer[:, index : index + self.page_size, :, :, :].flatten()
+            data_page = self.kv_buffer[:, index : index + self.page_size, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
+        if flat:
+            data_page = data_page.flatten()
+        return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(
@@ -497,27 +500,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_page_buffer_list(self, indices):
-        assert len(indices) % self.page_size == 0
-        page_buffer_list = []
-        if self.layout == "layer_first":
-            for i in range(0, len(indices), self.page_size):
-                index = indices[i]
-                page_buffer_list.append(
-                    self.kv_buffer[:, :, index : index + self.page_size, :, :]
-                )
-        elif self.layout == "page_first":
-            for i in range(0, len(indices), self.page_size):
-                index = indices[i]
-                page_buffer_list.append(
-                    self.kv_buffer[:, index : index + self.page_size, :, :, :]
-                )
-        else:
-            raise ValueError(f"Unsupported layout: {self.layout}")
-        return page_buffer_list
-
     def get_page_buffer_meta(self, indices):
-        """"
+        """ "
         meta data for zero copy
         """
         assert len(indices) % self.page_size == 0
@@ -550,10 +534,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     ptr_list.append(k_ptr)
                     ptr_list.append(v_ptr)
             element_size = (
-                self.dtype.itemsize
-                * self.page_size
-                * self.head_num
-                * self.head_dim
+                self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
             )
             element_size_list = [element_size] * len(ptr_list)
         elif self.layout == "page_first":
@@ -755,13 +736,16 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def get_flat_data_page(self, index) -> torch.Tensor:
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":
-            return self.kv_buffer[:, index : index + self.page_size, :, :].flatten()
+            data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
-            return self.kv_buffer[index : index + self.page_size, :, :, :].flatten()
+            data_page = self.kv_buffer[index : index + self.page_size, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
+        if flat:
+            data_page = data_page.flatten()
+        return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(
@@ -794,27 +778,8 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_page_buffer_list(self, indices):
-        assert len(indices) % self.page_size == 0
-        page_buffer_list = []
-        if self.layout == "layer_first":
-            for i in range(0, len(indices), self.page_size):
-                index = indices[i]
-                page_buffer_list.append(
-                    self.kv_buffer[:, index : index + self.page_size, :, :]
-                )
-        elif self.layout == "page_first":
-            for i in range(0, len(indices), self.page_size):
-                index = indices[i]
-                page_buffer_list.append(
-                    self.kv_buffer[index : index + self.page_size, :, :, :]
-                )
-        else:
-            raise ValueError(f"Unsupported layout: {self.layout}")
-        return page_buffer_list
-
     def get_page_buffer_meta(self, indices):
-        """"
+        """ "
         meta data for zero copy
         """
         assert len(indices) % self.page_size == 0

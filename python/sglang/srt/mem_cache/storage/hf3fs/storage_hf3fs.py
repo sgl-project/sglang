@@ -521,8 +521,12 @@ class HiCacheHF3FS(HiCacheStorage):
     def _batch_get_preprocess(self, keys, host_indices):
         page_num = len(host_indices) // self.mem_pool_host.page_size
         # host_indices to kv_buffer
+        flat = not self.is_zero_copy
         values = (
-            self.mem_pool_host.get_page_buffer_list(host_indices)
+            [
+                self.mem_pool_host.get_data_page(host_indices[i * page_num], flat=flat)
+                for i in range(page_num)
+            ]
             if self.is_zero_copy
             else [
                 self.mem_pool_host.get_dummy_flat_data_page() for _ in range(page_num)
@@ -568,16 +572,11 @@ class HiCacheHF3FS(HiCacheStorage):
     def _batch_set_preprocess(self, keys, host_indices):
         page_num = len(host_indices) // self.mem_pool_host.page_size
         # host_indices to kv_buffer
-        values = (
-            self.mem_pool_host.get_page_buffer_list(host_indices)
-            if self.is_zero_copy
-            else [
-                self.mem_pool_host.get_flat_data_page(
-                    host_indices[i * self.mem_pool_host.page_size]
-                )
-                for i in range(page_num)
-            ]
-        )
+        flat = not self.is_zero_copy
+        values = [
+            self.mem_pool_host.get_data_page(host_indices[i * page_num], flat=flat)
+            for i in range(page_num)
+        ]
 
         if self.is_zero_copy and not self.is_mla_model:
             keys = self._get_mha_zero_copy_keys(keys)

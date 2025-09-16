@@ -624,14 +624,15 @@ class HiCacheController:
 
     def _generic_page_get_v1(self, operation, hash_values, host_indices):
         results = self.storage_backend.batch_get_v1(hash_values, host_indices)
+        inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
                 logger.warning(
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
                 break
-            if not operation.increment(self.page_size):
-                break  # Operation terminated by controller
+            inc += self.page_size
+        operation.increment(inc)
 
     def _generic_page_get(self, operation, hash_values, host_indices):
         dummy_page_dst = [
@@ -794,7 +795,7 @@ class HiCacheController:
     # non-zero copy
     def _generic_page_set(self, hash_values, host_indices) -> bool:
         data = [
-            self.mem_pool_host.get_flat_data_page(host_indices[i * self.page_size])
+            self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)
