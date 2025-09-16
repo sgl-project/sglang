@@ -96,7 +96,7 @@ class VLMInputTestBase:
             return_tensors="pt",
         ).to(self.device)
 
-        return inputs
+        return inputs, text
 
     async def test_accepts_image(self):
         req = self.get_completion_request()
@@ -111,7 +111,7 @@ class VLMInputTestBase:
 
     async def test_accepts_precomputed_embeddings(self):
         req = self.get_completion_request()
-        processor_output = self.get_processor_output(req=req)
+        processor_output, _ = self.get_processor_output(req=req)
         with torch.inference_mode():
             precomputed_embeddings = self.__class__.visual(processor_output)
         output = await self.engine.async_generate(
@@ -125,7 +125,7 @@ class VLMInputTestBase:
 
     async def test_accepts_processor_output(self):
         req = self.get_completion_request()
-        processor_output = self.get_processor_output(req=req)
+        processor_output, prompt = self.get_processor_output(req=req)
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
             image_data=[self._pixel_values_image_data(processor_output)],
@@ -133,9 +133,13 @@ class VLMInputTestBase:
         )
         self.verify_response(output)
 
-    def _precomputed_image_data(self, _processor_output, precomputed_embeddings):
+    def _precomputed_image_data(self, processor_output, precomputed_embeddings):
         """This should not be overridden."""
-        return dict(format="precomputed_embedding", feature=precomputed_embeddings)
+        return dict(
+            processor_output,
+            format="precomputed_embedding",
+            feature=precomputed_embeddings,
+        )
 
     def _pixel_values_image_data(self, processor_output):
         """Override in subclass to pass the correct set of arguments."""

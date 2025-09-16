@@ -518,7 +518,6 @@ def embed_mm_inputs(
     Returns:
         Combined embedding tensor with multimodal content integrated
     """
-    print(f"{mm_inputs_list=}")
     if mm_inputs_list is None:
         return None
 

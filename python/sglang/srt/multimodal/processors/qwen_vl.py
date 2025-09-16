@@ -253,6 +253,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         )
 
         input_ids = input_ids.flatten()
+
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
@@ -262,13 +263,16 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
+            # use the expanded token ids
             input_ids=input_ids.unsqueeze(0),
-            image_grid_thw=getattr(ret, "image_grid_thw", None),
-            video_grid_thw=getattr(ret, "video_grid_thw", None),
+            image_grid_thw=getattr(ret, "image_grid_thw", None)
+            or image_data[0].get("image_grid_thw", None),
+            video_grid_thw=getattr(ret, "video_grid_thw", None)
+            or request_obj.video_data[0].get("video_grid_thw", None),
             second_per_grid_ts=getattr(ret, "second_per_grid_ts", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
-
+        print(f"{mrope_positions=}")
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
