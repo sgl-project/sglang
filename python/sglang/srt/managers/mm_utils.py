@@ -66,7 +66,7 @@ class FIFOTensorCache:
     def get_current_cache_size(self):
         total_bytes = 0
         for value in self.hash_map:
-            tensor_bytes = value.element_size() * value.numel()
+            tensor_bytes = self.hash_map[value].element_size() * self.hash_map[value].numel()
             total_bytes += tensor_bytes
     
         return total_bytes / (1024 * 1024)

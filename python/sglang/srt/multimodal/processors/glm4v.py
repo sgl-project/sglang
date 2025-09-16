@@ -108,7 +108,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
 
-        self.image_cache_table = FIFOTensorCache(CACHED_IMAGE_MAX_NUM)
+        self.image_cache_table = FIFOTensorCache()
 
     # adapted from https://github.com/huggingface/transformers/blob/369c99d0cea403b77bd0aef818527106453fd9fc/src/transformers/video_utils.py#L312
     async def preprocess_video(self, vr: VideoReader):
