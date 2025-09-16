@@ -39,7 +39,7 @@ else
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
-    $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
+    $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm cuda_pathfinder || true
 fi
 
 # Install the main package
