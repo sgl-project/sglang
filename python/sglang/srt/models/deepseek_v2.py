@@ -26,7 +26,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm, trange
-
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -70,9 +69,8 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.quantization import deep_gemm_wrapper, Fp8Config
+from sglang.srt.layers.quantization import Fp8Config, deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -84,9 +82,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
-    transform_scale_ue8m0,
     quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
+    transform_scale_ue8m0,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -2813,9 +2811,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 module_list.append(layer.self_attn.q_proj)
 
             for module in module_list:
-                out_s = transform_scale_ue8m0(module.weight_scale_inv.data, mn=module.weight.shape[-2])
+                out_s = transform_scale_ue8m0(
+                    module.weight_scale_inv.data, mn=module.weight.shape[-2]
+                )
                 module.weight_scale_inv.data = out_s
-
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
@@ -3070,7 +3069,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         # temporarily only support DeepSeek V3/R1
         weight_block_size = [128, 128]
 
-        for layer_id in trange(self.config.num_hidden_layers, desc="quant attn to fp8 ue8m0"):
+        for layer_id in trange(
+            self.config.num_hidden_layers, desc="quant attn to fp8 ue8m0"
+        ):
             for stem in [
                 "kv_a_proj_with_mqa",
                 "kv_b_proj",
@@ -3080,7 +3081,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ]:
                 partial_name = f"model.layers.{layer_id}.self_attn.{stem}"
                 original_weight = weights_dict[f"{partial_name}.weight"]
-                out_w, out_s = quant_weight_ue8m0(original_weight, weight_block_size=weight_block_size)
+                out_w, out_s = quant_weight_ue8m0(
+                    original_weight, weight_block_size=weight_block_size
+                )
                 weights_dict[f"{partial_name}.weight"] = out_w
                 weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
 

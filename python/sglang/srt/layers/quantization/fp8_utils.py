@@ -452,12 +452,15 @@ def _requant_weight_ue8m0(
 
     return out_w, out_s
 
+
 def quant_weight_ue8m0(
     weight_dequant: torch.Tensor,
     weight_block_size: List[int],
 ):
     assert weight_block_size == [128, 128]
-    assert weight_dequant.dtype == torch.bfloat16, f"{weight_dequant.dtype=} {weight_dequant.shape=}"
+    assert (
+        weight_dequant.dtype == torch.bfloat16
+    ), f"{weight_dequant.dtype=} {weight_dequant.shape=}"
 
     *batch_dims, n, k = weight_dequant.shape
 
@@ -465,11 +468,20 @@ def quant_weight_ue8m0(
     out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
 
     out_w = out_w_flat.view((*batch_dims, n, k))
-    out_s = out_s_flat.view((*batch_dims, ceil_div(n, weight_block_size[0]), ceil_div(k, weight_block_size[1])))
+    out_s = out_s_flat.view(
+        (
+            *batch_dims,
+            ceil_div(n, weight_block_size[0]),
+            ceil_div(k, weight_block_size[1]),
+        )
+    )
 
-    print(f"hi quant_weight_ue8m0 {weight_dequant.shape=} {out_w.shape=} {out_s.shape=} {out_w.dtype=} {out_s.dtype=}")
+    print(
+        f"hi quant_weight_ue8m0 {weight_dequant.shape=} {out_w.shape=} {out_s.shape=} {out_w.dtype=} {out_s.dtype=}"
+    )
 
     return out_w, out_s
+
 
 # NOTE copy and modified from DeepGEMM
 def transform_scale_ue8m0(sf, mn):
@@ -478,6 +490,7 @@ def transform_scale_ue8m0(sf, mn):
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
     sf = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
     return sf
+
 
 # COPIED FROM DeepGEMM
 def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
