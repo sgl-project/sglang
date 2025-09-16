@@ -451,9 +451,9 @@ mod tests {
 
         let worker = WorkerFactory::create_regular_with_labels(
             "http://worker1:8080".to_string(),
-            Some("test_api_key".to_string()),
             labels,
             CircuitBreakerConfig::default(),
+            Some("test_api_key".to_string()),
         );
 
         // Register worker (WorkerFactory returns Box<dyn Worker>, convert to Arc)
@@ -485,27 +485,27 @@ mod tests {
         labels1.insert("model_id".to_string(), "llama-3".to_string());
         let worker1 = WorkerFactory::create_regular_with_labels(
             "http://worker1:8080".to_string(),
-            Some("test_api_key".to_string()),
             labels1,
             CircuitBreakerConfig::default(),
+            Some("test_api_key".to_string()),
         );
 
         let mut labels2 = HashMap::new();
         labels2.insert("model_id".to_string(), "llama-3".to_string());
         let worker2 = WorkerFactory::create_regular_with_labels(
             "http://worker2:8080".to_string(),
-            Some("test_api_key".to_string()),
             labels2,
             CircuitBreakerConfig::default(),
+            Some("test_api_key".to_string()),
         );
 
         let mut labels3 = HashMap::new();
         labels3.insert("model_id".to_string(), "gpt-4".to_string());
         let worker3 = WorkerFactory::create_regular_with_labels(
             "http://worker3:8080".to_string(),
-            Some("test_api_key".to_string()),
             labels3,
             CircuitBreakerConfig::default(),
+            Some("test_api_key".to_string()),
         );
 
         // Register workers

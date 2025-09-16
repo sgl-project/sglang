@@ -830,11 +830,45 @@ impl WorkerFactory {
     /// Create a regular worker with custom labels (for multi-router support)
     pub fn create_regular_with_labels(
         url: String,
-        api_key: Option<String>,
         labels: std::collections::HashMap<String, String>,
         circuit_breaker_config: CircuitBreakerConfig,
+        api_key: Option<String>,
     ) -> Box<dyn Worker> {
         let mut worker = BasicWorker::new(url.clone(), WorkerType::Regular, api_key.clone())
+            .with_circuit_breaker_config(circuit_breaker_config);
+
+        // Add labels to metadata
+        worker.metadata.labels = labels;
+
+        Box::new(worker)
+    }
+
+    /// Create a prefill worker with labels
+    pub fn create_prefill_with_labels(
+        url: String,
+        bootstrap_port: Option<u16>,
+        labels: std::collections::HashMap<String, String>,
+        circuit_breaker_config: CircuitBreakerConfig,
+        api_key: Option<String>,
+    ) -> Box<dyn Worker> {
+        let mut worker =
+            BasicWorker::new(url.clone(), WorkerType::Prefill { bootstrap_port }, api_key)
+                .with_circuit_breaker_config(circuit_breaker_config);
+
+        // Add labels to metadata
+        worker.metadata.labels = labels;
+
+        Box::new(worker)
+    }
+
+    /// Create a decode worker with labels
+    pub fn create_decode_with_labels(
+        url: String,
+        labels: std::collections::HashMap<String, String>,
+        circuit_breaker_config: CircuitBreakerConfig,
+        api_key: Option<String>,
+    ) -> Box<dyn Worker> {
+        let mut worker = BasicWorker::new(url.clone(), WorkerType::Decode, api_key)
             .with_circuit_breaker_config(circuit_breaker_config);
 
         // Add labels to metadata
