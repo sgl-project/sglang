@@ -122,6 +122,7 @@ pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
+    pub router_manager: Option<Arc<RouterManager>>,
 }
 
 // Fallback handler for unmatched routes
@@ -326,8 +327,8 @@ async fn create_worker(
     State(state): State<Arc<AppState>>,
     Json(config): Json<WorkerConfigRequest>,
 ) -> Response {
-    // Check if the router is actually a RouterManager (enable_igw=true)
-    if let Some(router_manager) = state.router.as_any().downcast_ref::<RouterManager>() {
+    // Check if we have a RouterManager (enable_igw=true)
+    if let Some(router_manager) = &state.router_manager {
         // Call RouterManager's add_worker method directly with the full config
         match router_manager.add_worker(config).await {
             Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -357,7 +358,7 @@ async fn create_worker(
 
 /// GET /workers - List all workers with details
 async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
-    if let Some(router_manager) = state.router.as_any().downcast_ref::<RouterManager>() {
+    if let Some(router_manager) = &state.router_manager {
         let response = router_manager.list_workers();
         Json(response).into_response()
     } else {
@@ -400,7 +401,7 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
 
 /// GET /workers/{url} - Get specific worker info
 async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
-    if let Some(router_manager) = state.router.as_any().downcast_ref::<RouterManager>() {
+    if let Some(router_manager) = &state.router_manager {
         if let Some(worker) = router_manager.get_worker(&url) {
             Json(worker).into_response()
         } else {
@@ -431,7 +432,7 @@ async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>)
 
 /// DELETE /workers/{url} - Remove a worker
 async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
-    if let Some(router_manager) = state.router.as_any().downcast_ref::<RouterManager>() {
+    if let Some(router_manager) = &state.router_manager {
         match router_manager.remove_worker_from_registry(&url) {
             Ok(response) => (StatusCode::OK, Json(response)).into_response(),
             Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
@@ -594,69 +595,76 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let app_context = Arc::new(app_context);
 
     // Create the appropriate router based on enable_igw flag
-    let router: Box<dyn RouterTrait> = if config.router_config.enable_igw {
-        info!("Multi-router mode enabled (enable_igw=true)");
+    let (router, router_manager): (Arc<dyn RouterTrait>, Option<Arc<RouterManager>>) =
+        if config.router_config.enable_igw {
+            info!("Multi-router mode enabled (enable_igw=true)");
 
-        // Create RouterManager with shared registries from AppContext
-        let mut router_manager = RouterManager::new(
-            config.router_config.clone(),
-            client.clone(),
-            app_context.worker_registry.clone(),
-            app_context.policy_registry.clone(),
-        );
+            // Create RouterManager with shared registries from AppContext
+            let router_manager = Arc::new(RouterManager::new(
+                config.router_config.clone(),
+                client.clone(),
+                app_context.worker_registry.clone(),
+                app_context.policy_registry.clone(),
+            ));
 
-        // 1. HTTP Regular Router
-        match RouterFactory::create_regular_router(
-            &[], // Empty worker list - workers added later
-            &app_context,
-        )
-        .await
-        {
-            Ok(http_regular) => {
-                info!("Created HTTP Regular router");
-                router_manager.register_router(
-                    RouterId::new("http-regular".to_string()),
-                    Arc::from(http_regular),
-                );
+            // 1. HTTP Regular Router
+            match RouterFactory::create_regular_router(
+                &[], // Empty worker list - workers added later
+                &app_context,
+            )
+            .await
+            {
+                Ok(http_regular) => {
+                    info!("Created HTTP Regular router");
+                    router_manager.register_router(
+                        RouterId::new("http-regular".to_string()),
+                        Arc::from(http_regular),
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to create HTTP Regular router: {e}");
+                }
             }
-            Err(e) => {
-                warn!("Failed to create HTTP Regular router: {e}");
-            }
-        }
 
-        // 2. HTTP PD Router
-        match RouterFactory::create_pd_router(
-            &[],
-            &[],
-            None,
-            None,
-            &config.router_config.policy,
-            &app_context,
-        )
-        .await
-        {
-            Ok(http_pd) => {
-                info!("Created HTTP PD router");
-                router_manager
-                    .register_router(RouterId::new("http-pd".to_string()), Arc::from(http_pd));
+            // 2. HTTP PD Router
+            match RouterFactory::create_pd_router(
+                &[],
+                &[],
+                None,
+                None,
+                &config.router_config.policy,
+                &app_context,
+            )
+            .await
+            {
+                Ok(http_pd) => {
+                    info!("Created HTTP PD router");
+                    router_manager
+                        .register_router(RouterId::new("http-pd".to_string()), Arc::from(http_pd));
+                }
+                Err(e) => {
+                    warn!("Failed to create HTTP PD router: {e}");
+                }
             }
-            Err(e) => {
-                warn!("Failed to create HTTP PD router: {e}");
-            }
-        }
 
-        // TODO: Add gRPC routers once we have dynamic tokenizer loading
+            // TODO: Add gRPC routers once we have dynamic tokenizer loading
 
-        info!(
-            "RouterManager initialized with {} routers",
-            router_manager.router_count()
-        );
-        Box::new(router_manager)
-    } else {
-        info!("Single router mode (enable_igw=false)");
-        // Create single router with the context
-        RouterFactory::create_router(&app_context).await?
-    };
+            info!(
+                "RouterManager initialized with {} routers",
+                router_manager.router_count()
+            );
+            (
+                router_manager.clone() as Arc<dyn RouterTrait>,
+                Some(router_manager),
+            )
+        } else {
+            info!("Single router mode (enable_igw=false)");
+            // Create single router with the context
+            (
+                Arc::from(RouterFactory::create_router(&app_context).await?),
+                None,
+            )
+        };
 
     // Start health checker for all workers in the registry
     let _health_checker = app_context
@@ -685,9 +693,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Create app state with router and context
     let app_state = Arc::new(AppState {
-        router: Arc::from(router),
+        router,
         context: app_context.clone(),
         concurrency_queue_tx: limiter.queue_tx.clone(),
+        router_manager,
     });
     let router_arc = Arc::clone(&app_state.router);
 
