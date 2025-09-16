@@ -126,6 +126,9 @@ class StructuralTagResponseFormat(BaseModel):
     structures: List[StructuresResponseFormat]
     triggers: List[str]
 
+class StructuralTagResponseFormatV1(BaseModel):
+    type: Literal["structural_tag"]
+    format: Dict[str, Any]
 
 class FileRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/files/create
@@ -219,7 +222,7 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
-    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat, StructuralTagResponseFormatV1]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -432,7 +435,7 @@ class ChatCompletionRequest(BaseModel):
     )
     n: int = 1
     presence_penalty: float = 0.0
-    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat, StructuralTagResponseFormatV1]] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False

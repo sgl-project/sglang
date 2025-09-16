@@ -238,17 +238,22 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             structural_tag = json.loads(key_string)
-            tags = [
-                StructuralTagItem(
-                    begin=structure["begin"],
-                    schema=json.dumps(structure["schema"]),
-                    end=structure["end"],
+            if "format" in structural_tag:
+                # V1 format
+                ctx = self.grammar_compiler.compile_structural_tag(structural_tag)
+            else:
+                # Deprecated format
+                tags = [
+                    StructuralTagItem(
+                        begin=structure["begin"],
+                        schema=json.dumps(structure["schema"]),
+                        end=structure["end"],
+                    )
+                    for structure in structural_tag["structures"]
+                ]
+                ctx = self.grammar_compiler.compile_structural_tag(
+                    tags, structural_tag["triggers"]
                 )
-                for structure in structural_tag["structures"]
-            ]
-            ctx = self.grammar_compiler.compile_structural_tag(
-                tags, structural_tag["triggers"]
-            )
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
