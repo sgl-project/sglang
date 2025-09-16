@@ -5,6 +5,9 @@ import unittest
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     _parse_int_list_env,
@@ -18,7 +21,6 @@ from sglang.test.test_utils import (
 )
 
 PROFILE_DIR = "performance_profiles_text_models"
-PROFILE_URL_PLACEHOLDER = "<<ARTIFACT_URL>>"
 REPORT_MD_FILENAME = "performance_report.md"
 
 
@@ -46,10 +48,10 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                 False,
                 False,
             ),
-            # (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
+            (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
