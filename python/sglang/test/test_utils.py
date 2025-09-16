@@ -1489,8 +1489,19 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
             parts = [part.strip() for part in m.group(0).split("|") if part.strip()]
             filename = result.get("trace_link")
             if base_url and filename:
-                link = f"{base_url}/{filename}"
-                row = f"| {' | '.join(parts)} | [trace]({link}) |\n"
+                # Build a Perfetto UI deep link that opens the remote trace directly
+                # Note: url parameter must be URL-encoded and the remote host must allow CORS
+                try:
+                    from urllib.parse import quote
+                except ImportError:
+                    quote = None
+                raw_link = f"{base_url}/{filename}"
+                perfetto_link = (
+                    f"https://ui.perfetto.dev/#!/?url={quote(raw_link, safe='')}"
+                    if quote
+                    else f"https://ui.perfetto.dev/#!/?url={raw_link}"
+                )
+                row = f"| {' | '.join(parts)} | [trace]({perfetto_link}) |\n"
             else:
                 row = f"| {' | '.join(parts)} | [trace](#) |\n"
             summary += row

@@ -42,7 +42,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
 
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "1024"))
-        cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "16"))
+        cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "32"))
         cls.full_report = f"## {cls.__name__}\n"
 
     def test_vlm_models_mmmu_performance(self):
@@ -58,8 +58,6 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                         profile_path_prefix = os.path.join(
                             PROFILE_DIR, profile_filename
                         )
-
-                        print(f"{profile_filename=}")
 
                         command = [
                             "python3",

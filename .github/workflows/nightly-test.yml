@@ -138,7 +138,7 @@ jobs:
           bash scripts/ci/ci_install_dependency.sh
           apt-get install rsync -y
 
-      - name: Run perf test for VLM models (MMMU-100)
+      - name: Run perf test for VLM models (MMMU)
         timeout-minutes: 240
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/mickqian/SGLang-test-nightly/main/traces/${{ github.run_id }}

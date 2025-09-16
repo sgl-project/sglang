@@ -47,7 +47,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                 with self.subTest(model=model):
 
                     process = popen_launch_server_wrapper(
-                        self.base_url, model, "", ["--tp=2"] if is_tp2 else []
+                        self.base_url, model, "", ["--tp", "2"] if is_tp2 else []
                     )
                     model_results = []
 
