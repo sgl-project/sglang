@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageC
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
-SETUP_TIMEOUT = 600 # 10min
+SETUP_TIMEOUT = 600  # 10min
 
 logger = logging.getLogger(__name__)
 
@@ -181,20 +181,26 @@ class MooncakeStore(HiCacheStorage):
         master_server_ip = self.config.master_server_address.split(':')[0]
         health_url = f"http://{master_server_ip}:9003/health"
         segments_url = f"http://{master_server_ip}:9003/get_all_segments"
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         health_result = False
         segments_result = False
-        while time.time() - start_time < SETUP_TIMEOUT:
+        while time.perf_counter() - start_time < SETUP_TIMEOUT:
             try:
-                check_health_resp = requests.get(health_url)
-            except Exception as e:
-                logger.info("waiting Mooncake store master started, cost_time: %s", time.time() - start_time)
+                check_health_resp = requests.get(health_url, timeout=3)
+            except Exception:
+                logger.info(
+                    "waiting Mooncake store master started, cost_time: %.2f seconds.",
+                    time.perf_counter() - start_time
+                )
                 time.sleep(3)
                 continue
 
             if check_health_resp.text != "OK":
-                logger.info("waiting Mooncake store master started, cost_time: %s", time.time() - start_time)
+                logger.info(
+                    "waiting Mooncake store master started, cost_time: %.2f seconds.",
+                    time.perf_counter() - start_time
+                )
                 time.sleep(3)
                 continue
 
@@ -203,12 +209,18 @@ class MooncakeStore(HiCacheStorage):
             try:
                 check_segments_resp = requests.get(segments_url)
             except Exception as e:
-                logger.info("waiting real client started, cost_time: %s", time.time() - start_time)
+                logger.info(
+                    "waiting real client started, cost_time: %.2f seconds.",
+                    time.perf_counter() - start_time
+                )
                 time.sleep(3)
                 continue
 
             if check_segments_resp.text == "":
-                logger.info("waiting real client started, cost_time: %s", time.time() - start_time)
+                logger.info(
+                    "waiting real client started, cost_time: %.2f seconds.",
+                    time.perf_counter() - start_time
+                )
                 time.sleep(3)
                 continue
 
