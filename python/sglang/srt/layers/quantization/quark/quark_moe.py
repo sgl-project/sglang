@@ -35,6 +35,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
+    from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
+
 OCP_MX_BLOCK_SIZE = 32
 
 if TYPE_CHECKING:
@@ -419,7 +421,11 @@ class QuarkW8A8FP8MoEMethod(QuarkMoEMethod):
                 f"Unsupported weight quantization strategy: {self.weight_qscheme}."
             )
 
-        if _use_aiter:
+        if (
+            _use_aiter
+            and self.is_weight_per_channel
+            and self.moe_runner_config.apply_router_weight_on_input
+        ):
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
