@@ -182,8 +182,6 @@ class MooncakeStore(HiCacheStorage):
         assert self.store.put(warmup_key, warmup_value) == 0
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
-        # delete warmup key
-        self.store.remove(warmup_key)
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
