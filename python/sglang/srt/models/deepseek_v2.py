@@ -884,7 +884,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
@@ -1988,7 +1988,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         return output
 
 
-def get_self_attn_quant_config(quant_config):
+def get_q_b_proj_quant_config(quant_config):
     if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
         # refer to real DeepSeek V3 quant config
         return Fp8Config(
@@ -2034,7 +2034,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
-            quant_config=get_self_attn_quant_config(quant_config),
+            quant_config=quant_config,
             layer_id=layer_id,
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
@@ -2600,7 +2600,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                self_attn_quant_config = get_self_attn_quant_config(self.quant_config)
+                # TODO
+                # self_attn_quant_config = get_self_attn_quant_config(self.quant_config)
+                self_attn_quant_config = self.quant_config
                 if (
                     hasattr(self_attn_quant_config, "weight_block_size")
                     and self_attn_quant_config.weight_block_size is not None
@@ -2817,16 +2819,16 @@ class DeepseekV2ForCausalLM(nn.Module):
             layer = self.model.layers[layer_id]
 
             module_list = [
-                layer.self_attn.kv_b_proj,
-                layer.self_attn.o_proj,
+                # layer.self_attn.kv_b_proj,
+                # layer.self_attn.o_proj,
             ]
 
-            if self.config.q_lora_rank is not None:
-                module_list.append(layer.self_attn.fused_qkv_a_proj_with_mqa)
-                module_list.append(layer.self_attn.q_b_proj)
-            else:
-                module_list.append(layer.self_attn.kv_a_proj_with_mqa)
-                module_list.append(layer.self_attn.q_proj)
+            # if self.config.q_lora_rank is not None:
+            #     module_list.append(layer.self_attn.fused_qkv_a_proj_with_mqa)
+            module_list.append(layer.self_attn.q_b_proj)
+            # else:
+            #     module_list.append(layer.self_attn.kv_a_proj_with_mqa)
+            #     module_list.append(layer.self_attn.q_proj)
 
             for module in module_list:
                 out_s = transform_scale_ue8m0(
@@ -3091,10 +3093,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.config.num_hidden_layers, desc="quant attn to fp8 ue8m0"
         ):
             for stem in [
-                "kv_a_proj_with_mqa",
-                "kv_b_proj",
-                "o_proj",
-                "q_a_proj",
+                # "kv_a_proj_with_mqa",
+                # "kv_b_proj",
+                # "o_proj",
+                # "q_a_proj",
                 "q_b_proj",
             ]:
                 partial_name = f"model.layers.{layer_id}.self_attn.{stem}"
