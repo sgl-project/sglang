@@ -432,6 +432,10 @@ class LoRAManager:
             ) and not self.base_model.should_apply_lora(module_name):
                 continue
 
+            # Skip vision model
+            if module_name.find("vision_model.model") != -1:
+                continue
+
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:
                 layer_id = get_layer_id(module_name)
