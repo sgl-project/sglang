@@ -50,8 +50,7 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
-CACHED_IMAGE_MAX_NUM = 1024
-
+CACHED_IMAGE_MAX_MB_SIZE = 4096
 
 def smart_resize(
     height: int,
@@ -349,7 +348,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             start_height = 0
             end_height = 0
             tensor_lists = []
-
+            used_hash_keys = set()
             for img_idx in range(len(images)):
                 # cache Tensor
                 if img_idx in new_processed_img_idxes:
@@ -359,7 +358,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                     start_height = end_height
                     end_height = start_height + img_height
                     to_cache_tensor = result["pixel_values"][start_height:end_height]
-                    delete_key = self.image_cache_table.add(
+                    self.image_cache_table.add(
                         img_hash_keys[img_idx], to_cache_tensor
                     )
 
@@ -367,6 +366,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                 # add input ids and insert tensor
                 else:
                     cached_tensor = self.image_cache_table.get(img_hash_keys[img_idx])
+                    used_hash_keys.add(img_hash_keys[img_idx])
                     assert isinstance(
                         cached_tensor, torch.Tensor
                     ), "invalid cached_tensor"
@@ -384,10 +384,44 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                         insert_cached_ids,
                     )
 
-            proxy_pixel_values = generate_reconstruct_cudatensor_infos(tensor_lists)
-            proxy_pixel_values["hash_keys"] = img_hash_keys
-            proxy_pixel_values["cat_feature"] = True
-            # proxy_pixel_values = torch.cat(tensor_lists).to("cpu")
+            total_bytes = 0
+            for ts in tensor_lists:
+                total_bytes+= (ts.element_size() * ts.numel())
+            
+            total_MB = total_bytes // (1024 * 1024) + 1
+            device_id = torch.cuda.current_device()
+            device = torch.device(f"cuda:{device_id}")
+            
+            allocated = torch.cuda.memory_allocated(device)
+            reserved = torch.cuda.memory_reserved(device)
+            total = torch.cuda.get_device_properties(device).total_memory
+            
+            #[NOTE]actually, torch reserved memory can also be used, here excluding torch reserved memory
+            available_size_mb = (total - allocated - reserved) // (1024 * 1024)
+            
+            max_cache_image_size = CACHED_IMAGE_MAX_MB_SIZE
+            if get_bool_env_var("SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB"):
+                max_cache_image_size = get_int_env_var("SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB")
+            else:
+                logger.info("not set SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB, use default value = {}".format(max_cache_image_size))
+            
+            if max_cache_image_size > available_size_mb:
+                logger.info("max_cache_image_size {} mb over available size {} mb, set max cache size as {} mb".format(max_cache_image_size, available_size_mb, available_size_mb))
+                max_cache_image_size = available_size_mb
+            
+            send_cudaipc_handle = True
+            if max_cache_image_size < total_MB:
+                logger.info("images data total size over max cache size, can not cache image datas for this request, send raw image instead of cudaipc-handle")
+                send_cudaipc_handle = False
+            
+            if send_cudaipc_handle:
+                proxy_pixel_values = generate_reconstruct_cudatensor_infos(tensor_lists)
+                proxy_pixel_values["hash_keys"] = img_hash_keys
+                proxy_pixel_values["cat_feature"] = True
+                
+                self.image_cache_table.pop_until(max_cache_image_size, used_hash_keys)
+            else:
+                proxy_pixel_values = torch.cat(tensor_lists).to("cpu")
             result["image_grid_thw"] = torch.Tensor(image_grid_thw_lists).to(
                 torch.int64
             )
@@ -429,17 +463,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         cache_mm_image_items = get_bool_env_var("SGL_CACHE_MM_IMAGE")
         if cache_mm_image_items:
             images = base_output.images
-
-            max_image_num = CACHED_IMAGE_MAX_NUM
-            if get_int_env_var("SGL_IMAGE_CACHE_NUM"):
-                max_image_num = get_int_env_var("SGL_IMAGE_CACHE_NUM")
-
-            if len(images) > max_image_num:
-                raise RuntimeError(
-                    "input image num exceed max size, try to use no cache mode(unset SGL_CACHE_MM_IMAGE) or increase image cache num by set SGL_IMAGE_CACHE_NUM"
-                )
-
-            self.image_cache_table.pop_until(max_image_num - len(images))
 
             img_hash_keys = []
             img_heights = []

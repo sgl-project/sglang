@@ -36,8 +36,7 @@ TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
 
 class FIFOTensorCache:
-    def __init__(self, max_size: int):
-        self.max_size = max_size
+    def __init__(self):
         self.hash_map = {}
         self.order = []
 
@@ -46,10 +45,6 @@ class FIFOTensorCache:
             self.order.remove(key)
         self.hash_map[key] = value
         self.order.append(key)
-        if len(self.hash_map) > self.max_size:
-            oldest_key = self.order.pop(0)
-            self.hash_map.pop(oldest_key)
-        return None
 
     def get(self, key: int):
         return self.hash_map.get(key)
@@ -59,20 +54,30 @@ class FIFOTensorCache:
 
     def erase(self, key: int):
         self.hash_map.pop(key)
-
-    def pop_until(self, limit_size):
-        while len(self.hash_map) > limit_size:
+    
+    def pop_until(self, limit_mb_size, used_hashkeys):
+        while self.get_current_cache_size() > limit_mb_size:
             oldest_key = self.order.pop(0)
-            self.erase(oldest_key)
-
+            ret = self.hash_map.pop(oldest_key)
+            # add to map again
+            if oldest_key in used_hashkeys:
+                self.add(oldest_key, ret)
+            
+    def get_current_cache_size(self):
+        total_bytes = 0
+        for value in self.hash_map:
+            tensor_bytes = value.element_size() * value.numel()
+            total_bytes += tensor_bytes
+    
+        return total_bytes / (1024 * 1024)
+        
     def print_infos(self):
         for key in self.hash_map:
             print(
                 "check key {} pixel_values_shape {}".format(
-                    key, self.hash_map[key]["pixel_values"].shape
+                    key, self.hash_map[key].shape
                 )
             )
-
 
 class TransportProxyTensor(torch.Tensor):
     """

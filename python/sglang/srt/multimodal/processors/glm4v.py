@@ -26,9 +26,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, logger
 
-CACHED_IMAGE_MAX_NUM = 1024
+CACHED_IMAGE_MAX_MB_SIZE = 4096
 
 
 # code from transformers
@@ -210,27 +210,23 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # start_height = 0
             # end_height = 0
             tensor_lists = []
-
+            used_hash_keys = set()
             for img_idx in range(len(images)):
                 # cache Tensor
                 if img_idx in new_processed_img_idxes:
                     idx_in_new_processed = new_processed_img_idxes.index(img_idx)
 
-                    to_cache_tensor = result["pixel_values"][idx_in_new_processed]
-                    delete_key = self.image_cache_table.add(
+                    to_cache_tensor = result["pixel_values"][idx_in_new_processed].contiguous()
+                    self.image_cache_table.add(
                         img_hash_keys[img_idx],
-                        {
-                            "pixel_values": to_cache_tensor,
-                            "target_shape": (target_height, target_width),
-                        },
+                        to_cache_tensor
                     )
-
-                    tensor_lists.append(to_cache_tensor.contiguous())
+                    
+                    tensor_lists.append(to_cache_tensor)
                 # add input ids and insert tensor
                 else:
-                    cached_tensor = self.image_cache_table.get(img_hash_keys[img_idx])[
-                        "pixel_values"
-                    ]
+                    cached_tensor = self.image_cache_table.get(img_hash_keys[img_idx])
+                    used_hash_keys.add(img_hash_keys[img_idx])
                     assert isinstance(
                         cached_tensor, torch.Tensor
                     ), "invalid cached_tensor"
@@ -247,14 +243,58 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                         img_pad_token,
                         insert_cached_ids,
                     )
-
-            proxy_pixel_values = generate_reconstruct_cudatensor_infos(tensor_lists)
-            proxy_pixel_values["cat_feature"] = False
-            proxy_pixel_values["hash_keys"] = img_hash_keys
-            # proxy_pixel_values = torch.stack(tensor_lists).to("cpu")
+            
+            total_bytes = 0
+            for ts in tensor_lists:
+                total_bytes+= (ts.element_size() * ts.numel())
+            
+            total_MB = total_bytes // (1024 * 1024) + 1
+            device_id = torch.cuda.current_device()
+            device = torch.device(f"cuda:{device_id}")
+            
+            allocated = torch.cuda.memory_allocated(device)
+            reserved = torch.cuda.memory_reserved(device)
+            total = torch.cuda.get_device_properties(device).total_memory
+            
+            #[NOTE]actually, torch reserved memory can also be used, here excluding torch reserved memory
+            available_size_mb = (total - allocated - reserved) // (1024 * 1024)
+            
+            max_cache_image_size = CACHED_IMAGE_MAX_MB_SIZE
+            if get_bool_env_var("SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB"):
+                max_cache_image_size = get_int_env_var("SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB")
+            else:
+                logger.info("not set SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB, use default value = {}".format(max_cache_image_size))
+            
+            if max_cache_image_size > available_size_mb:
+                logger.info("max_cache_image_size {} mb over available size {} mb, set max cache size as {} mb".format(max_cache_image_size, available_size_mb, available_size_mb))
+                max_cache_image_size = available_size_mb
+            
+            send_cudaipc_handle = True
+            if max_cache_image_size < total_MB:
+                logger.info("images data total size over max cache size, can not cache image datas for this request, send raw image instead of cudaipc-handle")
+                send_cudaipc_handle = False
+            
+            
+            
+            # send_cudaipc_handle
+            # 1. generate cuda-ipc infos
+            # 2. set cat/stack mark for tensort list
+            # 3. add hash_keys(to generate new hash)
+            # 4. update cache
+            if send_cudaipc_handle:
+                proxy_pixel_values = generate_reconstruct_cudatensor_infos(tensor_lists)
+                proxy_pixel_values["cat_feature"] = False
+                proxy_pixel_values["hash_keys"] = img_hash_keys
+                
+                self.image_cache_table.pop_until(max_cache_image_size, used_hash_keys)
+            # send raw data , move to cpu    
+            else:
+                proxy_pixel_values = torch.stack(tensor_lists).to("cpu")
+            
+            
             result["image_grid_thw"] = torch.Tensor(image_grid_thw_lists).to(
-                torch.int64
-            )
+                    torch.int64
+                )
 
             result["attention_mask"] = torch.ones_like(result["input_ids"])
             result["token_type_ids"] = torch.zeros_like(result["input_ids"])
@@ -307,17 +347,6 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
         if cache_mm_image_items and is_glm4_5_v_processor:
             images = base_output.images
-
-            max_image_num = CACHED_IMAGE_MAX_NUM
-            if get_int_env_var("SGL_IMAGE_CACHE_NUM"):
-                max_image_num = get_int_env_var("SGL_IMAGE_CACHE_NUM")
-
-            if len(images) > max_image_num:
-                raise RuntimeError(
-                    "input image num exceed max size, try to use no cache mode(unset SGL_CACHE_MM_IMAGE) or increase image cache num by set SGL_IMAGE_CACHE_NUM"
-                )
-
-            self.image_cache_table.pop_until(max_image_num - len(images))
 
             img_hash_keys = []
             img_heights = []
