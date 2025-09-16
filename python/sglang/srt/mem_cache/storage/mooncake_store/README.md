@@ -54,7 +54,10 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 
 ### Single Server Deployment
 
-**Launch Mooncake `metadata service`:**
+There are four components for deploying Mooncake: metadata service, master service, store service and sglang instance.
+Note: *Only **master service** is mandatory for single server deployment.*
+
+**Launch Mooncake `metadata service`(Optional):**
 
 ```bash
 python -m mooncake.http_metadata_server
@@ -64,6 +67,11 @@ python -m mooncake.http_metadata_server
 
 ```bash
 mooncake_master
+```
+
+To start both the metadata and master services together:
+```bash
+mooncake_master --enable_http_metadata_server=true
 ```
 
 **Launch Mooncake `store service`:**

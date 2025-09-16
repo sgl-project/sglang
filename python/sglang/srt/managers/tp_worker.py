@@ -30,8 +30,10 @@ from sglang.srt.hf_transformers_utils import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -88,6 +90,7 @@ class TpModelWorker:
                 else server_args.speculative_draft_model_revision
             ),
             is_draft_model=is_draft_worker,
+            tp_rank=tp_rank,
         )
 
         self.model_runner = ModelRunner(
@@ -256,6 +259,15 @@ class TpModelWorker:
 
             if skip_sample:
                 next_token_ids = None
+                # For prefill-only requests, we still need to compute logprobs even when sampling is skipped
+                if (
+                    model_worker_batch.is_prefill_only
+                    and model_worker_batch.return_logprob
+                ):
+                    # Compute logprobs without full sampling
+                    self.model_runner.compute_logprobs_only(
+                        logits_output, model_worker_batch
+                    )
             else:
                 next_token_ids = self.model_runner.sample(
                     logits_output, model_worker_batch
@@ -289,6 +301,31 @@ class TpModelWorker:
             recv_req.world_size,
             recv_req.group_name,
             recv_req.backend,
+        )
+        return success, message
+
+    def init_weights_send_group_for_remote_instance(
+        self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        success, message = (
+            self.model_runner.init_weights_send_group_for_remote_instance(
+                recv_req.master_address,
+                recv_req.ports,
+                recv_req.group_rank,
+                recv_req.world_size,
+                recv_req.group_name,
+                recv_req.backend,
+            )
+        )
+        return success, message
+
+    def send_weights_to_remote_instance(
+        self, recv_req: SendWeightsToRemoteInstanceReqInput
+    ):
+        success, message = self.model_runner.send_weights_to_remote_instance(
+            recv_req.master_address,
+            recv_req.ports,
+            recv_req.group_name,
         )
         return success, message
 
