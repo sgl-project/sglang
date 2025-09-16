@@ -8,12 +8,16 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     check_model_scores,
     parse_models,
-    popen_launch_server, DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1, DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1, DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
+    popen_launch_server,
+    popen_launch_server_wrapper,
 )
 
 MODEL_SCORE_THRESHOLDS = {
@@ -36,20 +40,6 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
 }
-
-
-def popen_launch_server_wrapper(base_url, model, is_tp2):
-    other_args = ["--log-level-http", "warning", "--trust-remote-code"]
-    if is_tp2:
-        other_args.extend(["--tp", "2"])
-
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-    )
-    return process
 
 
 def write_results_to_json(model, metrics, mode="a"):
@@ -98,7 +88,9 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
-                    process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
+                    process = popen_launch_server_wrapper(
+                        self.base_url, model, "", ["tp==2"] if is_tp2 else []
+                    )
 
                     args = SimpleNamespace(
                         base_url=self.base_url,

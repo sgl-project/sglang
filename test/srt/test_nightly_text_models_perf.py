@@ -7,8 +7,8 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     _parse_int_list_env,
     extract_trace_link_from_bench_one_batch_server_output,
@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     generate_markdown_report_nightly,
     is_in_ci,
     parse_models,
-    popen_launch_server,
+    popen_launch_server_wrapper,
     write_github_step_summary,
 )
 
@@ -24,38 +24,17 @@ PROFILE_DIR = "performance_profiles_text_models"
 REPORT_MD_FILENAME = "performance_report.md"
 
 
-def popen_launch_server_wrapper(base_url, model, is_tp2):
-    other_args = ["--log-level-http", "warning", "--trust-remote-code"]
-    if is_tp2:
-        other_args.extend(["--tp", "2"])
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-    )
-    return process
-
-
 class TestNightlyTextModelsPerformance(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
-            (
-                parse_models(
-                    "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3"
-                ),
-                False,
-                False,
-            ),
-            (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
-        cls.batch_sizes = [1, 1, 8, 32]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "1024"))
         os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -67,7 +46,9 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
             for model in model_group:
                 with self.subTest(model=model):
 
-                    process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
+                    process = popen_launch_server_wrapper(
+                        self.base_url, model, "", ["--tp=2"] if is_tp2 else []
+                    )
                     model_results = []
 
                     for batch_size in batch_sizes or self.batch_sizes:

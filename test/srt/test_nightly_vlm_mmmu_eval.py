@@ -8,16 +8,14 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     check_model_scores,
     parse_models,
-    popen_launch_server,
+    popen_launch_server_wrapper,
 )
 
 MODEL_SCORE_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples
-    "Qwen/Qwen2-VL-7B-Instruct": 0.30,
     "Qwen/Qwen2.5-VL-7B-Instruct": 0.32,
     "OpenGVLab/InternVL2_5-2B": 0.22,
     "google/gemma-3-4b-it": 0.18,
@@ -31,24 +29,6 @@ DEFAULT_VLM_MODELS = ",".join(
         "google/gemma-3-4b-it",
     ]
 )
-
-
-def _extra_args_for_model(model: str):
-    args = ["--trust-remote-code", "--cuda-graph-max-bs", "4"]
-    if model.startswith("google/gemma-3"):
-        args += ["--enable-multimodal"]
-    return args
-
-
-def popen_launch_server_wrapper(base_url, model):
-    other_args = _extra_args_for_model(model)
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-    )
-    return process
 
 
 def write_results_to_json(model, metrics, mode="a"):

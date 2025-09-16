@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     parse_models,
     popen_launch_server,
+    popen_launch_server_wrapper,
     write_github_step_summary,
 )
 
@@ -23,32 +24,10 @@ PROFILE_DIR = "performance_profiles_vlms"
 
 MODEL_DEFAULTS = [
     # Keep conservative defaults. Can be overridden by env NIGHTLY_VLM_MODELS
-    "Qwen/Qwen2-5-VL-7B-Instruct",
+    "Qwen/Qwen2.5-VL-7B-Instruct",
     "google/gemma-3-27b-it",
     "openbmb/MiniCPM-V-2_6",
 ]
-
-
-def _extra_args_for_model(model: str):
-    # Align with TestNightlyVLMMmmuEval defaults
-    args = ["--trust-remote-code", "--cuda-graph-max-bs", "4"]
-    if model.startswith("google/gemma-3"):
-        args += ["--enable-multimodal"]
-    return args
-
-
-def popen_launch_server_wrapper(base_url: str, model: str):
-    other_args = _extra_args_for_model(model)
-    env = os.environ.copy()
-    env["SGLANG_TORCH_PROFILER_DIR"] = os.path.abspath(PROFILE_DIR)
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-        env=env,
-    )
-    return process
 
 
 class TestNightlyVLMModelsPerformance(unittest.TestCase):
@@ -71,7 +50,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         for model in self.models:
             model_results = []
             with self.subTest(model=model):
-                process = popen_launch_server_wrapper(self.base_url, model)
+                process = popen_launch_server_wrapper(self.base_url, model, PROFILE_DIR)
                 try:
                     # Run bench_one_batch_server against the launched server
                     os.makedirs(PROFILE_DIR, exist_ok=True)

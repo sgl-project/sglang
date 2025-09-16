@@ -1557,3 +1557,26 @@ def find_traces_under_path(path: str) -> List[str]:
             if file.endswith(".trace.json.gz"):
                 results.append(f"{file}")
     return results
+
+
+def _extra_args_for_model(extra_args=[]):
+    args = ["--trust-remote-code", "--cuda-graph-max-bs", "4", "--enable-multimodal"]
+    if extra_args:
+        args.extend(extra_args)
+    return args
+
+
+def popen_launch_server_wrapper(
+    base_url: str, model: str, profile_dir: str = "", extra_args=[]
+):
+    other_args = _extra_args_for_model(extra_args)
+    env = os.environ.copy()
+    env["SGLANG_TORCH_PROFILER_DIR"] = os.path.abspath(profile_dir)
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+        env=env,
+    )
+    return process
