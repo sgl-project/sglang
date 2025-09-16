@@ -468,7 +468,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             return self.kv_buffer[:, index : index + self.page_size, :, :, :].flatten()
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
-            return self.kv_buffer[:, real_index: real_index + 1, :, :, :, :].flatten()
+            return self.kv_buffer[:, real_index : real_index + 1, :, :, :, :].flatten()
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
