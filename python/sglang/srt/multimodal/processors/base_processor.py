@@ -347,9 +347,10 @@ class BaseMultimodalProcessor(ABC):
                 try:
                     data = next(data_iterator)
                 except StopIteration:
-                    raise ValueError(
-                        f"Mismatch: More '{text_part}' tokens found than corresponding data items provided."
+                    logger.warning(
+                        f"Mismatch: More '{modality}' tokens found than corresponding data provided."
                     )
+                    return futures, task_info
 
                 frame_count_limit = None
                 if modality == Modality.IMAGE and image_estimated_frames_iter:
@@ -422,7 +423,7 @@ class BaseMultimodalProcessor(ABC):
         assert isinstance(prompt, str)
         # split text into list of normal text and special tokens
         text_parts = re.split(multimodal_tokens_pattern, prompt)
-
+        print(f"{image_data=}")
         # collect all data
         data_iterators = {}
         if multimodal_tokens.image_token and image_data:
@@ -447,6 +448,7 @@ class BaseMultimodalProcessor(ABC):
         # Process results
         images, videos, audios = [], [], []
         new_text_parts = []
+        has_precomputed_input = False
         for text_part in text_parts:
             try:
                 if multimodal_tokens_pattern.match(text_part):
@@ -455,6 +457,7 @@ class BaseMultimodalProcessor(ABC):
                         raw_data.get("format") == "processor_output"
                         or raw_data.get("format") == "precomputed_embedding"
                     )
+                    has_precomputed_input = has_precomputed_input | is_precomputed
                     result = next(futures_iter).result()
                     print(f"{result=}")
                     if modality == Modality.IMAGE:
@@ -496,6 +499,8 @@ class BaseMultimodalProcessor(ABC):
                     new_text_parts += [text_part]
 
             except Exception as e:
+                if has_precomputed_input:
+                    continue
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
@@ -520,7 +525,6 @@ class BaseMultimodalProcessor(ABC):
         mask = input_ids == mm_token_id
         start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
         end_positions = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
-
         return list(zip(start_positions.tolist(), end_positions.tolist()))
 
     @staticmethod
@@ -675,5 +679,8 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
+
+            print(f"{input_ids.tolist()=}")
+            print(f"{mm_item.offsets=}")
 
         return all_collected_items, input_ids, ret

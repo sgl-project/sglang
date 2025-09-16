@@ -17,7 +17,8 @@ from sglang import Engine
 from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
+IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
 
 
 class VLMInputTestBase:
@@ -30,10 +31,12 @@ class VLMInputTestBase:
     def setUpClass(cls):
         assert cls.model_path is not None, "Set model_path in subclass"
         assert cls.chat_template is not None, "Set chat_template in subclass"
-        cls.image_url = TEST_IMAGE_URL
+        cls.image_urls = [IMAGE_MAN_IRONING_URL, IMAGE_SGL_LOGO_URL]
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        response = requests.get(cls.image_url)
-        cls.main_image = Image.open(BytesIO(response.content))
+        cls.main_image = []
+        for image_url in cls.image_urls:
+            response = requests.get(image_url)
+            cls.main_image.append(Image.open(BytesIO(response.content)))
         cls.processor = AutoProcessor.from_pretrained(
             cls.model_path, trust_remote_code=True, use_fast=True
         )
@@ -61,19 +64,18 @@ class VLMInputTestBase:
     def verify_response(self, output):
         out_text = output["text"].lower()
         assert "taxi" in out_text or "cab" in out_text or "car" in out_text, out_text
+        assert "sg" in out_text.lower() and "text" in out_text, out_text
 
-    def get_completion_request(self, image_count=1) -> ChatCompletionRequest:
+    def get_completion_request(self) -> ChatCompletionRequest:
         json_structure = {
             "model": self.model_path,
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": self.image_url}}
-                    ]
-                    * image_count
-                    + [
-                        {"type": "text", "text": "What's in this picture?"},
+                        {"type": "image_url", "image_url": {"url": self.image_urls[0]}},
+                        {"type": "image_url", "image_url": {"url": self.image_urls[1]}},
+                        {"type": "text", "text": "What are in these pictures?"},
                     ],
                 }
             ],
@@ -81,9 +83,7 @@ class VLMInputTestBase:
         json_str = json.dumps(json_structure)
         return ChatCompletionRequest.model_validate_json(json_str)
 
-    def get_processor_output(
-        self, req: Optional[ChatCompletionRequest] = None, image_count=1
-    ):
+    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None):
         if req is None:
             req = self.get_completion_request()
         conv = generate_chat_conv(req, template_name=self.chat_template)
@@ -92,7 +92,7 @@ class VLMInputTestBase:
         # Process inputs using processor
         inputs = self.processor(
             text=[text],
-            images=[self.main_image] * image_count,
+            images=self.main_image,
             return_tensors="pt",
         ).to(self.device)
 
@@ -104,7 +104,7 @@ class VLMInputTestBase:
         text = conv.get_prompt()
         output = await self.engine.async_generate(
             prompt=text,
-            image_data=[self.main_image],
+            image_data=self.main_image,
             sampling_params=dict(temperature=0.0),
         )
         self.verify_response(output)
@@ -124,9 +124,8 @@ class VLMInputTestBase:
         self.verify_response(output)
 
     async def test_accepts_processor_output(self):
-        image_count = 2
-        req = self.get_completion_request(image_count=image_count)
-        processor_output = self.get_processor_output(req=req, image_count=image_count)
+        req = self.get_completion_request()
+        processor_output = self.get_processor_output(req=req)
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
             image_data=[self._pixel_values_image_data(processor_output)],
