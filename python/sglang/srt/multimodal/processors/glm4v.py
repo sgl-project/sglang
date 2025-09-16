@@ -177,13 +177,11 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             )
 
             img_hash_keys = kwargs.pop("img_hash_keys")
-            target_height, target_width = kwargs.pop("target_shape")
             new_processed_imgs = kwargs.pop("new_processed_imgs")
             new_processed_img_idxes = kwargs.pop("new_processed_img_idxes")
             img_token_nums = kwargs.pop("img_token_nums")
             remove_image_idx = kwargs.pop("remove_image_idx")
             image_grid_thw_lists = kwargs.pop("image_grid_thw_lists")
-            processed_img_heights = []
 
             processed_text = operate_substrings(
                 input_text, to_replace_str, remove_image_idx, repalce_str
@@ -349,7 +347,6 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             images = base_output.images
 
             img_hash_keys = []
-            img_heights = []
             new_processed_imgs = []
             new_processed_img_idxes = []
             img_token_nums = []
@@ -397,13 +394,11 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 else:
                     remove_image_idx.append(img_idx)
 
-                img_heights.append(image_height)
                 img_token_nums.append(img_token_num)
 
             #
             args_dict = {
                 "img_hash_keys": img_hash_keys,
-                "target_shape": (target_height, target_width),
                 "new_processed_imgs": new_processed_imgs,
                 "new_processed_img_idxes": new_processed_img_idxes,
                 "img_token_nums": img_token_nums,
