@@ -416,6 +416,7 @@ class LoRAManager:
         return lora_module
 
     def should_skip_lora_for_vision_model(self, module_name):
+        # TODO: support different vision models
         return module_name.find("vision_model.model") != -1
 
     def init_lora_modules(self):
