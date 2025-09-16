@@ -5,13 +5,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled
-from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
+from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
+    CombineInput,
+    CombineInputFormat,
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -40,11 +42,6 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
-from sglang.srt.layers.moe.ep_moe.kernels import (
-    deepep_permute_triton_kernel,
-    deepep_post_reorder_triton_kernel,
-    deepep_run_moe_deep_preprocess,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -56,6 +53,7 @@ class DeepEPNormalOutput(NamedTuple):
     """DeepEP normal dispatch output."""
 
     hidden_states: torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
+    # hidden_states_scale
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
@@ -79,24 +77,32 @@ class DeepEPLLOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_LL
 
 
-class AscendDeepEPLLOutput(NamedTuple):
-    """AscendDeepEP low latency dispatch output."""
-
-    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
-    topk_idx: torch.Tensor
-    topk_weights: torch.Tensor
-    masked_m: torch.Tensor
-    seg_indptr: torch.Tensor
-    expected_m: int
-
-    @property
-    def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.ASCENT_LL
-
-
 assert isinstance(DeepEPNormalOutput, DispatchOutput)
 assert isinstance(DeepEPLLOutput, DispatchOutput)
-assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
+
+
+class DeepEPNormalCombineInput(NamedTuple):
+    """DeepEP normal combine input."""
+
+    pass
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_NORMAL
+
+
+class DeepEPLLCombineInput(NamedTuple):
+    """DeepEP low latency combine input."""
+
+    pass
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_LL
+
+
+assert isinstance(DeepEPNormalCombineInput, CombineInput)
+assert isinstance(DeepEPLLCombineInput, CombineInput)
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -272,6 +278,9 @@ class _DeepEPDispatcherImplBase:
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
         )
+        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
+        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
+        assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.handle = None
 
@@ -409,7 +418,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            deepep_post_reorder_triton_kernel,
+        )
+
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
@@ -495,7 +508,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=True,
+            # TODO(shuw): pending https://github.com/deepseek-ai/DeepEP/pull/341
+            use_fp8=not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"),
         )
         return (
             hidden_states,
@@ -523,23 +537,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             masked_m
         )
 
-        if _is_npu:
-            deepep_output = AscendDeepEPLLOutput(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                masked_m,
-                self.handle[1],
-                expected_m,
-            )
-        else:
-            deepep_output = DeepEPLLOutput(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                masked_m,
-                expected_m,
-            )
+        deepep_output = DeepEPLLOutput(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            masked_m,
+            expected_m,
+        )
         return deepep_output
 
     def _dispatch_core(

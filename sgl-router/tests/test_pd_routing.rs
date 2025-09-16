@@ -191,11 +191,13 @@ mod test_pd_routing {
                 connection_mode: ConnectionMode::Http,
                 model_path: None,
                 tokenizer_path: None,
+                history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             };
 
             // Router creation will fail due to health checks, but config should be valid
             let app_context =
-                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64, None);
+                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64, None)
+                    .expect("Failed to create AppContext");
             let app_context = std::sync::Arc::new(app_context);
             let result = RouterFactory::create_router(&app_context).await;
             assert!(result.is_err());
