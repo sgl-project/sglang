@@ -55,7 +55,8 @@ from auto_round import AutoRound
 model_id = "meta-llama/Llama-3.2-1B-Instruct"
 quant_path = "Llama-3.2-1B-Instruct-autoround-4bit"
 # Scheme examples: "W2A16", "W3A16", "W4A16", "W8A16", "NVFP4", "MXFP4" (no real kernels), "GGUF:Q4_K_M", etc.
-scheme, format = "W4A16", "auto_round"
+scheme = "W4A16"
+format = "auto_round"
 autoround = AutoRound(model_id, scheme=scheme)
 autoround.quantize_and_save(quant_path, format=format) # quantize and save
 
@@ -67,7 +68,8 @@ autoround.quantize_and_save(quant_path, format=format) # quantize and save
 from auto_round import AutoRoundMLLM
 model_name = "Qwen/Qwen2-VL-2B-Instruct"
 quant_path = "Qwen2-VL-2B-Instruct-autoround-4bit"
-scheme, format = "W4A16", "auto_round"
+scheme = "W4A16"
+format = "auto_round"
 autoround = AutoRoundMLLM(model_name, scheme)
 autoround.quantize_and_save(quant_path, format=format) # quantize and save
 
