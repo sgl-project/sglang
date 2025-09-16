@@ -150,11 +150,13 @@ from sglang.srt.weight_sync.tensor_bucket import (
 # Import ParameterServer and related functions for checkpoint engine
 try:
     from checkpoint_engine.ps import ParameterServer
+
     from sglang.srt.model_executor.update import (
         split_checkpoint_files,
         split_tensors,
         update_weights,
     )
+
     CHECKPOINT_ENGINE_AVAILABLE = True
 except ImportError:
     CHECKPOINT_ENGINE_AVAILABLE = False
@@ -303,16 +305,6 @@ class ModelRunner:
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
-
-        # Initialize ParameterServer for checkpoint engine
-        self.ps = None
-        if CHECKPOINT_ENGINE_AVAILABLE and ParameterServer is not None:
-            try:
-                self.ps = ParameterServer(auto_pg=True)
-                logger.info("ParameterServer initialized for checkpoint engine")
-            except Exception as e:
-                logger.warning(f"Failed to initialize ParameterServer: {e}")
-                self.ps = None
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -782,17 +774,13 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        if self.server_args.load_format == LoadFormat.CKPT_ENGINE:
-            # Use checkpoint engine for loading
-            self.model = self.load_model_from_ckpt_engine()
-        else:
-            # Use standard model loading
-            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
-                self.model = get_model(
-                    model_config=self.model_config,
-                    load_config=self.load_config,
-                    device_config=DeviceConfig(self.device, self.gpu_id),
-                )
+        # Use standard model loading
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
+            self.model = get_model(
+                model_config=self.model_config,
+                load_config=self.load_config,
+                device_config=DeviceConfig(self.device, self.gpu_id),
+            )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
@@ -2140,75 +2128,6 @@ class ModelRunner:
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
-
-    def load_model_from_ckpt_engine(self):
-        """Load model using checkpoint engine format."""
-        logger.info("Loading model from checkpoint engine format...")
-        
-        if not CHECKPOINT_ENGINE_AVAILABLE or self.ps is None:
-            raise RuntimeError(
-                "Checkpoint engine is not available. Please ensure checkpoint_engine.ps is installed."
-            )
-        
-        # Check if the required functions are available
-        if split_checkpoint_files is None or split_tensors is None or update_weights is None:
-            raise RuntimeError(
-                "Checkpoint engine functions are not available. Please ensure all dependencies are installed."
-            )
-        
-        # Initialize model structure first
-        from sglang.srt.model_loader.utils import set_default_torch_dtype
-        from sglang.srt.model_loader.loader import _initialize_model
-        
-        target_device = torch.device(self.device)
-        with set_default_torch_dtype(self.model_config.dtype):
-            with target_device:
-                model = _initialize_model(self.model_config, self.load_config)
-        
-        # Prepare checkpoint loading parameters
-        checkpoint_path = self.model_config.model_path
-        checkpoint_name = f"ckpt-{self.tp_rank}"  # Unique checkpoint name per rank
-        world_size = self.tp_size * self.pp_size
-        rank = self.tp_rank + self.pp_rank * self.tp_size
-        
-        # Check if index file exists to determine loading strategy
-        index_fn = os.path.join(checkpoint_path, "model.safetensors.index.json")
-        if os.path.exists(index_fn):
-            # Use tensor splitting approach
-            named_tensors = split_tensors(checkpoint_path, rank, world_size)
-            checkpoint_files = []
-        else:
-            # Use file splitting approach
-            checkpoint_files = split_checkpoint_files(checkpoint_path, rank, world_size)
-            named_tensors = {}
-        
-        # Create request function for inference
-        def req_func(socket_paths):
-            # This is a placeholder - actual implementation would depend on
-            # how the checkpoint engine communicates with inference servers
-            logger.info(f"Requesting inference update for rank {rank}")
-        
-        # Use update_weights to load the model
-        try:
-            # Use the configured checkpoint engine endpoint or default
-            endpoint = self.server_args.ckpt_engine_endpoint or "http://localhost:19730"
-            update_weights(
-                ps=self.ps,
-                checkpoint_name=checkpoint_name,
-                checkpoint_files=checkpoint_files,
-                named_tensors=named_tensors,
-                req_func=req_func,
-                inference_parallel_size=self.tp_size,  # Use TP size for parallel loading
-                endpoint=endpoint,
-                update_method="broadcast"
-            )
-            
-            logger.info(f"Successfully loaded model from checkpoint engine for rank {rank}")
-            return model
-            
-        except Exception as e:
-            logger.error(f"Failed to load model from checkpoint engine: {e}")
-            raise RuntimeError(f"Checkpoint engine loading failed: {e}")
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

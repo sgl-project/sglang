@@ -16,6 +16,7 @@ import re
 import socket
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -1487,6 +1488,89 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         torch.cuda.empty_cache()
 
 
+class CkptEngineModelLoader(BaseModelLoader):
+    """Model loader for checkpoint engine format."""
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        if load_config.model_loader_extra_config:
+            raise ValueError(
+                f"Model loader extra config is not supported for "
+                f"load format {load_config.load_format}"
+            )
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        """Load model using checkpoint engine format."""
+        logger.info("Loading weights from checkpoint engine format ...")
+
+        model_weights = f"ckptengine://"
+
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config)
+
+            with create_remote_connector(model_weights, device_config.device) as client:
+                connector_type = get_connector_type(client)
+                if connector_type == ConnectorType.CKPTENGINE:
+                    self.load_model_from_ckpt_engine(
+                        model, client, model_config, device_config
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported connector type {connector_type} for "
+                        f"remote tensor model loading."
+                    )
+
+        return model.eval()
+
+    def _get_weights_iterator(
+        self,
+        client,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Get an iterator for the model weights from CKPT Engine."""
+        assert get_connector_type(client) == ConnectorType.CKPTENGINE
+        tp_rank = get_tensor_model_parallel_rank()
+        return client.weight_iterator(tp_rank)
+
+    def load_model_from_ckpt_engine(
+        self, model, client, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        socket = client.get_socket_handle(device_config.gpu_id)
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(module)
+        weights_iterator = self._get_weights_iterator(client)
+        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        for key, tensor in weights_iterator:
+            # If loading with LoRA enabled, additional padding may
+            # be added to certain parameters. We only load into a
+            # narrowed view of the parameter data.
+            param_data = state_dict[key].data
+            param_shape = state_dict[key].shape
+            for dim, size in enumerate(tensor.shape):
+                if size < param_shape[dim]:
+                    param_data = param_data.narrow(dim, 0, size)
+            if tensor.shape != param_shape:
+                logger.warning(
+                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                    tensor.shape,
+                    key,
+                    param_shape,
+                )
+            param_data.copy_(tensor)
+            state_dict.pop(key)
+        if state_dict:
+            raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+        post_load_weights(model, model_config)
+
+
 class RemoteModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote database."""
 
@@ -1629,56 +1713,6 @@ class RemoteModelLoader(BaseModelLoader):
 
         end = time.perf_counter()
         logger.info("Loaded weights from remote storage in %.2f seconds.", end - start)
-        return model.eval()
-
-
-class CkptEngineModelLoader(BaseModelLoader):
-    """Model loader for checkpoint engine format."""
-
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-        if load_config.model_loader_extra_config:
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
-            )
-
-    def download_model(self, model_config: ModelConfig) -> None:
-        """Download model for checkpoint engine format."""
-        # TODO: Implement download logic for checkpoint engine format
-        pass
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-    ) -> nn.Module:
-        """Load model using checkpoint engine format."""
-        logger.info("Loading weights from checkpoint engine format ...")
-        
-        target_device = torch.device(device_config.device)
-        with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = _initialize_model(model_config, self.load_config)
-
-            # TODO: Implement checkpoint engine specific weight loading logic
-            # For now, use default weight loading as placeholder
-            # This is a placeholder implementation - actual logic will be implemented later
-            weights = []  # Placeholder for weights iterator
-            model.load_weights(weights)
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    # When quant methods need to process weights after loading
-                    # (for repacking, quantizing, etc), they expect parameters
-                    # to be on the global target device. This scope is for the
-                    # case where cpu offloading is used, where we will move the
-                    # parameters onto device for processing and back off after.
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
-
         return model.eval()
 
 

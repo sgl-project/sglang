@@ -431,7 +431,9 @@ class ServerArgs:
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
 
     # Checkpoint engine configuration
+    enable_ckpt_engine: bool = False
     ckpt_engine_endpoint: Optional[str] = None
+    ckpt_engine_name: str = "ckpt-engine-iter-0"
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -1011,6 +1013,18 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.remote_instance_weight_loader_send_weights_group_ports,
             help="The communication group ports for loading weights from remote instance.",
+        )
+        parser.add_argument(
+            "--enable-ckpt-engine",
+            type=str,
+            default=ServerArgs.enable_ckpt_engine,
+            help="Using Mooncake Checkpoint Engine",
+        )
+        parser.add_argument(
+            "--checkpoint-name",
+            type=str,
+            default=ServerArgs.ckpt_engine_name,
+            help="Name of checkpoint",
         )
         parser.add_argument(
             "--ckpt-engine-endpoint",
