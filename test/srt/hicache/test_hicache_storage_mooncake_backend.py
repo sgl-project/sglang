@@ -15,7 +15,11 @@ import requests
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_utils import CustomTestCase, find_available_port
+from sglang.test.test_utils import (
+    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+    CustomTestCase,
+    find_available_port,
+)
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
@@ -225,7 +229,6 @@ class TestMooncakeBackendLayerFirstLayout(
 '''
 
 
-# Same as #10131, page first layout test
 class TestMooncakeBackendPageFirstLayout(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
@@ -239,7 +242,25 @@ class TestMooncakeBackendPageFirstLayout(
         return server_args, env_vars
 
 
-# Same as #10131, accuracy test
+class TestMooncakeBackendMLAModel(
+    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
+):
+    """MLA Model tests for HiCache-Mooncake backend"""
+
+    @classmethod
+    def _get_model_name(cls):
+        """Use MLA model for testing"""
+        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args["--hicache-mem-layout"] = "page_first"
+        server_args["--tp-size"] = 2
+        return server_args, env_vars
+
+
 class TestMooncakeBackendAccuracy(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
