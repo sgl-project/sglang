@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import sglang as sgl
 from fastapi import FastAPI, HTTPException, Request
@@ -273,9 +273,32 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     max_tokens: int = 50
-    temperature: float = 0.8
-    top_p: float = 0.95
+    temperature: float = 1.0
+    top_p: float = 1.0
     stream: bool = False
+
+    top_k: Optional[int] = None
+    min_p: Optional[float] = 0.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    stop: Optional[Union[str, List[str]]] = None
+    stop_token_ids: Optional[List[int]] = None
+    logit_bias: Optional[Dict[str, float]] = None
+    response_format: Optional[Dict] = None
+    n: Optional[int] = 1
+    no_stop_trim: Optional[bool] = False
+    ignore_eos: Optional[bool] = False
+    skip_special_tokens: Optional[bool] = True
+
+    seed: Optional[int] = None
+    top_a: Optional[float] = None
+    logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = None
+    tools: Optional[List[Dict]] = None
+    tool_choice: Optional[Union[str, Dict]] = None
+    parallel_tool_calls: Optional[bool] = None
+    verbosity: Optional[str] = None
 
 
 class ChatCompletionChoice(BaseModel):
@@ -359,11 +382,48 @@ async def generate_response_sglang(
     inference_start_time = time.time()
     
     try:
-        sampling_params = {
+        if request.seed is not None:
+            raise HTTPException(status_code=400, detail="Parameter 'seed' is not supported per request")
+        if request.top_a is not None:
+            raise HTTPException(status_code=400, detail="Parameter 'top_a' is not supported")
+        if request.logprobs or (request.top_logprobs is not None):
+            raise HTTPException(status_code=400, detail="Parameter 'logprobs/top_logprobs' not supported in this endpoint")
+        if request.tools or request.tool_choice is not None or request.parallel_tool_calls is not None:
+            raise HTTPException(status_code=400, detail="Tool calling is not supported in this endpoint")
+
+        sampling_params: Dict[str, Union[int, float, bool, str, List[str], List[int], Dict[str, float]]] = {
             "max_new_tokens": request.max_tokens,
             "temperature": request.temperature,
             "top_p": request.top_p,
+            "frequency_penalty": request.frequency_penalty,
+            "presence_penalty": request.presence_penalty,
+            "repetition_penalty": request.repetition_penalty,
+            "min_p": request.min_p if request.min_p is not None else 0.0,
+            "n": request.n or 1,
+            "no_stop_trim": request.no_stop_trim,
+            "ignore_eos": request.ignore_eos,
+            "skip_special_tokens": request.skip_special_tokens,
         }
+        if request.top_k is not None:
+            sampling_params["top_k"] = request.top_k if request.top_k > 0 else -1
+        if request.stop is not None:
+            sampling_params["stop"] = request.stop
+        if request.stop_token_ids is not None:
+            sampling_params["stop_token_ids"] = request.stop_token_ids
+        if request.logit_bias is not None:
+            sampling_params["logit_bias"] = request.logit_bias
+
+        if request.response_format and isinstance(request.response_format, dict):
+            rf_type = request.response_format.get("type")
+            if rf_type == "json_schema":
+                schema = request.response_format.get("json_schema")
+                try:
+                    schema_str = json.dumps(schema) if not isinstance(schema, str) else schema
+                    sampling_params["json_schema"] = schema_str
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Invalid json_schema: {str(e)}")
+            elif rf_type == "json_object":
+                sampling_params["json_schema"] = "{\"type\": \"object\"}"
         
         logger.debug(f"[{request_id}] Sampling params: {sampling_params}")
         
@@ -376,19 +436,39 @@ async def generate_response_sglang(
         inference_end_time = time.time()
         total_inference_latency_ms = (inference_end_time - inference_start_time) * 1000
         
-        generated_text = result["text"]
-        # Remove the original prompt from the response
-        response_text = generated_text[len(prompt):].strip()
+        generated_text = result.get("text", "") if isinstance(result, dict) else str(result)
+
+        if isinstance(result, dict) and isinstance(result.get("meta_info"), dict):
+            response_text = generated_text.strip()
+        else:
+            response_text = generated_text[len(prompt):].strip()
         
         logger.info(f"[{request_id}] Generation completed in {total_inference_latency_ms:.2f}ms")
         logger.debug(f"[{request_id}] Response: {response_text[:100]}...")
         
-        # Create usage info (approximation for now)
-        usage_info = {
-            "prompt_tokens": len(prompt.split()),  # Rough approximation
-            "completion_tokens": len(response_text.split()),  # Rough approximation
-            "total_tokens": len(prompt.split()) + len(response_text.split())
-        }
+        if isinstance(result, dict) and isinstance(result.get("meta_info"), dict):
+            meta = result["meta_info"]
+            prompt_tokens = int(meta.get("prompt_tokens", 0) or 0)
+            completion_tokens = int(meta.get("completion_tokens", 0) or 0)
+            usage_info = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+        else:
+            tokenizer = getattr(getattr(engine, "tokenizer_manager", None), "tokenizer", None)
+            if tokenizer is None:
+                raise HTTPException(status_code=500, detail="Tokenizer not initialized")
+            try:
+                prompt_tokens = len(tokenizer.encode(prompt))
+                completion_tokens = len(tokenizer.encode(response_text))
+                usage_info = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Tokenizer error: {str(e)}")
         
         return response_text, total_inference_latency_ms, usage_info
         
@@ -429,11 +509,48 @@ async def stream_response_sglang(
     logger.info(f"[{request_id}] Starting streaming generation for prompt length: {len(prompt)}")
     
     try:
-        sampling_params = {
+        # Validate unsupported params
+        if request.seed is not None:
+            raise HTTPException(status_code=400, detail="Parameter 'seed' is not supported per request")
+        if request.top_a is not None:
+            raise HTTPException(status_code=400, detail="Parameter 'top_a' is not supported")
+        if request.logprobs or (request.top_logprobs is not None):
+            raise HTTPException(status_code=400, detail="Parameter 'logprobs/top_logprobs' not supported in this endpoint")
+        if request.tools or request.tool_choice is not None or request.parallel_tool_calls is not None:
+            raise HTTPException(status_code=400, detail="Tool calling is not supported in this endpoint")
+
+        sampling_params: Dict[str, Union[int, float, bool, str, List[str], List[int], Dict[str, float]]] = {
             "max_new_tokens": request.max_tokens,
             "temperature": request.temperature,
             "top_p": request.top_p,
+            "frequency_penalty": request.frequency_penalty,
+            "presence_penalty": request.presence_penalty,
+            "repetition_penalty": request.repetition_penalty,
+            "min_p": request.min_p if request.min_p is not None else 0.0,
+            "n": request.n or 1,
+            "no_stop_trim": request.no_stop_trim,
+            "ignore_eos": request.ignore_eos,
+            "skip_special_tokens": request.skip_special_tokens,
         }
+        if request.top_k is not None:
+            sampling_params["top_k"] = request.top_k if request.top_k > 0 else -1
+        if request.stop is not None:
+            sampling_params["stop"] = request.stop
+        if request.stop_token_ids is not None:
+            sampling_params["stop_token_ids"] = request.stop_token_ids
+        if request.logit_bias is not None:
+            sampling_params["logit_bias"] = request.logit_bias
+        if request.response_format and isinstance(request.response_format, dict):
+            rf_type = request.response_format.get("type")
+            if rf_type == "json_schema":
+                schema = request.response_format.get("json_schema")
+                try:
+                    schema_str = json.dumps(schema) if not isinstance(schema, str) else schema
+                    sampling_params["json_schema"] = schema_str
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Invalid json_schema: {str(e)}")
+            elif rf_type == "json_object":
+                sampling_params["json_schema"] = "{\"type\": \"object\"}"
         
         logger.debug(f"[{request_id}] Streaming sampling params: {sampling_params}")
         
@@ -518,6 +635,27 @@ async def stream_response_sglang(
         
         yield f"data: {error_response.model_dump_json()}\n\n"
         yield "data: [DONE]\n\n"
+
+
+# --- Token Counting Utilities and Endpoint ---
+
+def _count_tokens_from_messages(messages: List[ChatMessage]) -> int:
+    """Count prompt tokens by applying the same simple chat template used for generation.
+
+    Strict: requires tokenizer; no approximations or fallbacks.
+    """
+    tokenizer = getattr(getattr(engine, "tokenizer_manager", None), "tokenizer", None)
+    if tokenizer is None:
+        raise HTTPException(status_code=500, detail="Tokenizer not initialized")
+    prompt_text = extract_prompt_from_messages(messages)
+    try:
+        return len(tokenizer.encode(prompt_text))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Tokenizer error: {str(e)}")
+
+
+class TokenCountResponse(BaseModel):
+    prompt_tokens: int
 
 # --- FastAPI App and Endpoints ---
 app = FastAPI(lifespan=lifespan, title="SGLang Hathora Serve", version="1.0.0")
@@ -615,6 +753,15 @@ async def create_chat_completion(request: ChatCompletionRequest):
     except Exception as e:
         logger.error(f"Unexpected error in chat completion: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/v1/tokens", response_model=TokenCountResponse)
+async def count_tokens_endpoint(request: ChatCompletionRequest) -> TokenCountResponse:
+    """Return the number of prompt tokens for the given messages using the model tokenizer."""
+    if not engine:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    tokens = _count_tokens_from_messages(request.messages)
+    return TokenCountResponse(prompt_tokens=tokens)
 
 
 @app.get("/health")
