@@ -72,7 +72,10 @@ class LogitsProcessorOutput:
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
-    next_token_token_ids_logprobs_val: Optional[List] = None
+    # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
+    next_token_token_ids_logprobs_val: Optional[
+        List[Union[List[float], torch.Tensor]]
+    ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -185,10 +188,9 @@ class LogitsMetadata:
             )
         else:
             dp_local_start_pos = cumtokens[dp_rank - 1]
-        dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = dp_local_num_tokens
+        self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         hidden_size = get_dp_hidden_size()
         dtype = get_dp_dtype()

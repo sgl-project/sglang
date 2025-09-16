@@ -127,6 +127,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_blackwell,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
@@ -134,6 +135,7 @@ from sglang.srt.utils import (
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_sm100_supported,
+    log_info_on_rank0,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     parse_connector_type,
@@ -514,6 +516,7 @@ class ModelRunner:
                     "aiter",
                     "flashinfer",
                     "fa3",
+                    "fa4",
                     "triton",
                     "flashmla",
                     "cutlass_mla",
@@ -1351,7 +1354,18 @@ class ModelRunner:
     ):
         # Determine the kv cache dtype
         if self.server_args.kv_cache_dtype == "auto":
-            self.kv_cache_dtype = self.dtype
+            quant_config = getattr(self.model, "quant_config", None)
+            kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+            if (
+                isinstance(kv_cache_quant_algo, str)
+                and kv_cache_quant_algo.upper() == "FP8"
+            ):
+                if _is_hip:
+                    self.kv_cache_dtype = torch.float8_e4m3fnuz
+                else:
+                    self.kv_cache_dtype = torch.float8_e4m3fn
+            else:
+                self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
             if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = torch.float8_e5m2fnuz
@@ -1366,6 +1380,8 @@ class ModelRunner:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
+
+        log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if SGLANG_CI_SMALL_KV_SIZE:
@@ -1567,6 +1583,7 @@ class ModelRunner:
                 )
             elif self.is_hybrid_gdn:
                 self.token_to_kv_pool = HybridLinearKVPool(
+                    page_size=self.page_size if _is_npu else 1,
                     size=self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
@@ -1601,7 +1618,10 @@ class ModelRunner:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if self.server_args.attention_backend == "ascend":
+            if _is_npu and self.server_args.attention_backend in [
+                "ascend",
+                "hybrid_linear_attn",
+            ]:
                 self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1781,6 +1801,15 @@ class ModelRunner:
             )
 
             return FlashAttentionBackend(self)
+        elif backend_str == "fa4":
+            assert (
+                self.use_mla_backend
+            ), "FlashAttention v4 Support is at an early stage, only MLA model supported now"
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            return FlashAttentionBackend(self, fa_impl_ver=4)
         elif backend_str == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
@@ -1819,15 +1848,26 @@ class ModelRunner:
             assert (
                 self.is_hybrid_gdn
             ), "hybrid_linear_attn backend can only be used with hybrid GDN models."
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
                 HybridLinearAttnBackend,
                 MambaAttnBackend,
             )
 
-            full_attn_backend = FlashAttentionBackend(self)
+            if _is_npu:
+                from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+
+                full_attn_backend = AscendAttnBackend(self)
+            elif is_blackwell():
+                from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+                full_attn_backend = TritonAttnBackend(self)
+            else:
+                from sglang.srt.layers.attention.flashattention_backend import (
+                    FlashAttentionBackend,
+                )
+
+                full_attn_backend = FlashAttentionBackend(self)
+
             linear_attn_backend = MambaAttnBackend(self)
             full_attn_layers = self.model_config.hf_config.full_attention_layer_ids
             return HybridLinearAttnBackend(
@@ -2141,6 +2181,38 @@ class ModelRunner:
             forward_batch.token_ids_logprobs,
         )
         return next_token_ids
+
+    def compute_logprobs_only(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """
+        Compute token_ids_logprobs without performing sampling.
+
+        Optimized path for prefill-only requests that need token_ids_logprobs but don't
+        require next token generation. Skips expensive sampling operations
+        while still providing requested probability information.
+
+        Args:
+            logits_output: The logits output from the model forward
+            forward_batch: The forward batch that generates logits_output
+        """
+        if not forward_batch.token_ids_logprobs:
+            return
+
+        # Preprocess logits (same as in sample method)
+        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+
+        # Delegate to sampler for logprob-only computation
+        # This populates logits_output with requested token probabilities
+        self.sampler.compute_logprobs_only(
+            logits_output,
+            forward_batch.sampling_info,
+            forward_batch.return_logprob,
+            forward_batch.top_logprobs_nums,
+            forward_batch.token_ids_logprobs,
+        )
 
     @property
     def model_is_mrope(self) -> bool:
