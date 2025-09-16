@@ -14,7 +14,6 @@ from sglang.test.test_utils import (
     generate_markdown_report_nightly,
     is_in_ci,
     parse_models,
-    popen_launch_server,
     popen_launch_server_wrapper,
     write_github_step_summary,
 )
@@ -71,6 +70,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                             self.base_url,
                             "--batch-size",
                             str(batch_size),
+                            "--trust-remote-code",
                             "--input-len",
                             *[str(x) for x in self.input_lens],
                             "--output-len",

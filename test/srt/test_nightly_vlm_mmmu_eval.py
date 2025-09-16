@@ -16,14 +16,13 @@ from sglang.test.test_utils import (
 
 MODEL_SCORE_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples
-    "Qwen/Qwen2.5-VL-7B-Instruct": 0.32,
-    "OpenGVLab/InternVL2_5-2B": 0.22,
-    "google/gemma-3-4b-it": 0.18,
+    "Qwen/Qwen2.5-VL-7B-Instruct": 0.37,
+    "OpenGVLab/InternVL2_5-2B": 0.30,
+    "google/gemma-3-4b-it": 0.35,
 }
 
 DEFAULT_VLM_MODELS = ",".join(
     [
-        "Qwen/Qwen2-VL-7B-Instruct",
         "Qwen/Qwen2.5-VL-7B-Instruct",
         "OpenGVLab/InternVL2_5-2B",
         "google/gemma-3-4b-it",
@@ -87,7 +86,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                     )
 
                     metrics = run_eval(args)
-                    metrics["score"] = round(metrics["score"], 2)
+                    metrics["score"] = round(metrics["score"], 3)
                     print(
                         f"{'=' * 42}\n{model} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
                     )
