@@ -2648,7 +2648,7 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
 
-        elif "Llama4" in model_arch:
+        elif "Llama4" in model_arch and self.device != "cpu":
             assert self.attention_backend in {
                 "fa3",
                 "aiter",
