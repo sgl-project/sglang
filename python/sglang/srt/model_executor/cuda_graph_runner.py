@@ -60,6 +60,9 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +139,7 @@ def patch_model(
                 mode=os.environ.get(
                     "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
                 ),
-                dynamic=False,
+                dynamic=True if _is_hip and get_bool_env_var("SGLANG_USE_DYNAMIC") else False,
             )
         else:
             yield model.forward
