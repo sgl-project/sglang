@@ -12,6 +12,7 @@ from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device,
     is_cpu,
     is_cuda,
     is_hip,
@@ -688,14 +689,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
         if device is not None:
             self.device = device
-        elif _is_xpu:
-            self.device = "xpu"
-        elif _is_npu:
-            self.device = "npu"
-        elif _is_cuda:
-            self.device = "cuda"
         else:
-            self.device = "cpu"
+            self.device = get_device()
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
