@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_flashinfer_available, is_cuda
+from sglang.srt.utils import is_cuda, is_flashinfer_available
 
 if is_flashinfer_available():
     import flashinfer
