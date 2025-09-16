@@ -5,8 +5,8 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, List, Optional
-import requests
 
+import requests
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
@@ -178,7 +178,7 @@ class MooncakeStore(HiCacheStorage):
             raise
 
     def check_server(self):
-        master_server_ip = self.config.master_server_address.split(':')[0]
+        master_server_ip = self.config.master_server_address.split(":")[0]
         segments_url = f"http://{master_server_ip}:9003/get_all_segments"
         start_time = time.perf_counter()
 
@@ -188,29 +188,27 @@ class MooncakeStore(HiCacheStorage):
                 check_segments_resp = requests.get(segments_url, timeout=3)
             except Exception:
                 logger.info(
-                    "waiting real client started, cost_time: %.2f seconds.",
-                    time.perf_counter() - start_time
+                    "waiting mooncake store server started, cost_time: %.2f seconds.",
+                    time.perf_counter() - start_time,
                 )
                 time.sleep(3)
                 continue
 
             if check_segments_resp.text == "":
                 logger.info(
-                    "waiting real client started, cost_time: %.2f seconds.",
-                    time.perf_counter() - start_time
+                    "waiting mooncake store server started, cost_time: %.2f seconds.",
+                    time.perf_counter() - start_time,
                 )
                 time.sleep(3)
                 continue
 
-            logger.info("Mooncake store master and real client started successfully.")
+            logger.info("Mooncake store server started successfully.")
             check_result = True
             break
 
         if not check_result:
-            logger.error("Mooncake store master and real client start timeout")
-            raise ValueError(
-                "Mooncake store master and real client start timeout"
-            )
+            logger.error("Launch mooncake store server timeout")
+            raise ValueError("Launch mooncake store server timeout")
 
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
