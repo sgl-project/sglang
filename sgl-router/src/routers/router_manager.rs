@@ -41,7 +41,6 @@ impl RouterId {
 }
 
 /// Router Manager - Central coordinator for routers and workers
-/// Only created when enable_igw=true
 pub struct RouterManager {
     /// Worker registry (single source of truth in multi-router mode)
     worker_registry: Arc<WorkerRegistry>,
@@ -49,7 +48,7 @@ pub struct RouterManager {
     /// Policy registry for managing model-to-policy mappings
     policy_registry: Arc<crate::policies::PolicyRegistry>,
 
-    /// All routers managed by this manager (max 4 routers in Phase 2)
+    /// All routers managed by this manager
     /// RouterId examples: "http-regular", "http-pd", "grpc-regular", "grpc-pd"
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
 
@@ -83,12 +82,7 @@ impl RouterManager {
     }
 
     /// Register a router with the manager
-    pub fn register_router(
-        &mut self,
-        id: RouterId,
-        router: Arc<dyn RouterTrait>,
-        _models: Vec<String>, // Keep parameter for backward compatibility but ignore it
-    ) {
+    pub fn register_router(&mut self, id: RouterId, router: Arc<dyn RouterTrait>) {
         // Store router
         self.routers.insert(id.clone(), router);
 
@@ -210,32 +204,28 @@ impl RouterManager {
             labels.insert("chat_template".to_string(), chat_template);
         }
 
-        // Create worker based on type
-        // Note: For prefill and decode workers, we can't easily add labels after creation
-        // since they return Box<dyn Worker>. We'll need to enhance WorkerFactory in the future.
         let worker = match config.worker_type.as_deref() {
-            Some("prefill") => {
-                // For now, prefill workers won't have custom labels
-                // TODO: Enhance WorkerFactory to accept labels for prefill workers
-                WorkerFactory::create_prefill(config.url.clone(), config.bootstrap_port)
-            }
-            Some("decode") => {
-                // For now, decode workers won't have custom labels
-                // TODO: Enhance WorkerFactory to accept labels for decode workers
-                WorkerFactory::create_decode(config.url.clone())
-            }
-            _ => {
-                // Regular workers can have labels
-                WorkerFactory::create_regular_with_labels(
-                    config.url.clone(),
-                    labels.clone(),
-                    CircuitBreakerConfig::default(),
-                )
-            }
+            Some("prefill") => WorkerFactory::create_prefill_with_labels(
+                config.url.clone(),
+                config.bootstrap_port,
+                labels.clone(),
+                CircuitBreakerConfig::default(),
+            ),
+            Some("decode") => WorkerFactory::create_decode_with_labels(
+                config.url.clone(),
+                labels.clone(),
+                CircuitBreakerConfig::default(),
+            ),
+            _ => WorkerFactory::create_regular_with_labels(
+                config.url.clone(),
+                labels.clone(),
+                CircuitBreakerConfig::default(),
+            ),
         };
 
         // Register worker
-        let worker_id = self.worker_registry.register(Arc::from(worker));
+        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker_id = self.worker_registry.register(worker_arc.clone());
 
         // Notify PolicyRegistry about the new worker
         // Extract policy hint from labels if provided
@@ -262,7 +252,6 @@ impl RouterManager {
         );
 
         // Return worker info
-        let worker_arc = self.worker_registry.get(&worker_id).unwrap();
         let worker_info = self.worker_to_info(worker_id.as_str(), &worker_arc);
 
         Ok(WorkerApiResponse {
@@ -375,7 +364,11 @@ impl RouterManager {
             model_id: worker.model_id().to_string(),
             priority: worker.priority(),
             cost: worker.cost(),
-            worker_type: format!("{:?}", worker.worker_type()),
+            worker_type: match worker.worker_type() {
+                WorkerType::Regular => "regular".to_string(),
+                WorkerType::Prefill { .. } => "prefill".to_string(),
+                WorkerType::Decode => "decode".to_string(),
+            },
             is_healthy: worker.is_healthy(),
             load: worker.load(),
             connection_mode: format!("{:?}", worker.connection_mode()),
@@ -386,11 +379,6 @@ impl RouterManager {
             metadata: metadata.labels.clone(),
         }
     }
-
-    // Note: calculate_stats removed - using WorkerRegistry::stats() instead
-
-    // === Phase 2: Router Management ===
-    // Note: Dynamic router creation removed - routers are created and registered externally
 
     /// Get the appropriate router for a request based on headers and request content
     pub fn select_router_for_request(
@@ -473,11 +461,6 @@ impl RouterManager {
         best_router
     }
 }
-
-// Note: Default implementation removed as RouterManager now requires AppContext
-// which cannot be defaulted. RouterManager must be created with explicit context.
-
-// === Phase 2: RouterManager as RouterTrait ===
 
 /// RouterManager implements RouterTrait to act as a meta-router
 /// that delegates requests to the appropriate underlying router
