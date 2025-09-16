@@ -23,7 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-from functools import lru_cache, partial
+from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
 import torch
@@ -61,7 +61,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import permute_inv
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +116,6 @@ class Qwen2_5_VisionBlock(nn.Module):
         rms_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
         self.norm2 = RMSNorm(dim, eps=rms_norm_eps)
 
@@ -458,9 +455,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         return x
 
 
-cached_get_processor = lru_cache(get_processor)
-
-
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
@@ -531,7 +525,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             self.visual.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
