@@ -54,7 +54,7 @@ class FIFOTensorCache:
 
     def erase(self, key: int):
         self.hash_map.pop(key)
-    
+
     def pop_until(self, limit_mb_size, used_hashkeys):
         while self.get_current_cache_size() > limit_mb_size:
             oldest_key = self.order.pop(0)
@@ -62,15 +62,17 @@ class FIFOTensorCache:
             # add to map again
             if oldest_key in used_hashkeys:
                 self.add(oldest_key, ret)
-            
+
     def get_current_cache_size(self):
         total_bytes = 0
         for value in self.hash_map:
-            tensor_bytes = self.hash_map[value].element_size() * self.hash_map[value].numel()
+            tensor_bytes = (
+                self.hash_map[value].element_size() * self.hash_map[value].numel()
+            )
             total_bytes += tensor_bytes
-    
+
         return total_bytes / (1024 * 1024)
-        
+
     def print_infos(self):
         for key in self.hash_map:
             print(
@@ -78,6 +80,7 @@ class FIFOTensorCache:
                     key, self.hash_map[key].shape
                 )
             )
+
 
 class TransportProxyTensor(torch.Tensor):
     """
