@@ -63,7 +63,12 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
 # Fix DeepEP IBGDA symlink
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
-# Clone and install SGLang
+FROM scratch AS local_src
+COPY . /src
+
+FROM base AS build-image
+# Install SGLang
+WORKDIR /sgl-workspace
 ARG BRANCH_TYPE
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
