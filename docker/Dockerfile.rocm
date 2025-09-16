@@ -1,7 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.2 --build-arg GPU_ARCH=gfx942 -t v0.5.2-rocm630-mi30x -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.5.2 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.2-rocm700-mi30x -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.5.2 --build-arg GPU_ARCH=gfx950 -t v0.5.2-rocm700-mi35x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.3rc0 --build-arg GPU_ARCH=gfx942 -t v0.5.3rc0-rocm630-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.3rc0 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.3rc0-rocm700-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.3rc0 --build-arg GPU_ARCH=gfx950 -t v0.5.3rc0-rocm700-mi35x -f Dockerfile.rocm .
 
 
 # Default base images
@@ -181,6 +181,7 @@ RUN git clone ${SGL_REPO} \
     && mv pyproject_rocm.toml pyproject.toml \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
     && cd .. \
+    && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          python -m pip --no-cache-dir install -e "python[srt_hip]" ${NO_DEPS_FLAG}; \
        else \
