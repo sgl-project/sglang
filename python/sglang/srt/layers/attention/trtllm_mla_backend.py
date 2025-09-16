@@ -631,7 +631,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     bmm1_scale=layer.scaling,
                     bmm2_scale=1.0,
                     o_sf_scale=-1.0,
-                    batch_size=len(actual_seq_lens_qo), #qo_indptr[-1].item(),
+                    batch_size=len(actual_seq_lens_qo),
                     window_left=-1,
                     cum_seq_lens_q=qo_indptr,
                     cum_seq_lens_kv=kv_indptr,
@@ -639,11 +639,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     is_causal=False,
                     return_lse=True,
                 )
-            #     # TODO(shuw@nvidia.com): Depends on resolution of https://github.com/flashinfer-ai/flashinfer/issues/1663.
-            #     # The out-of-bounds writes in flashinfer's trtllm_ragged_attention_deepseek.
-            #     if actual_seq_lens_kv[-1].item() == 0:
-            #         s1[qo_indptr[-2].item():] = torch.tensor(float('-inf'), dtype=s1.dtype, device=s1.device)
-            #         o1[qo_indptr[-2].item():] = 0
+                # TODO(shuw@nvidia.com): Depends on resolution of https://github.com/flashinfer-ai/flashinfer/issues/1663.
+                # The out-of-bounds writes in flashinfer's trtllm_ragged_attention_deepseek.
+                if actual_seq_lens_kv[-1].item() == 0:
+                    s1[qo_indptr[-2].item():] = torch.tensor(float('-inf'), dtype=s1.dtype, device=s1.device)
+                    o1[qo_indptr[-2].item():] = 0
                 output = (o1, s1)
         return output
 
