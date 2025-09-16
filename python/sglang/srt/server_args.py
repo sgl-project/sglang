@@ -856,7 +856,9 @@ class ServerArgs:
             self.speculative_eagle_topk = self.speculative_lookahead_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
                 # TODO: Do better auto choose in the future
-                self.speculative_num_draft_tokens = 16
+                self.speculative_num_draft_tokens = (
+                    self.speculative_lookahead_max_match_window_size
+                )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
                 "using lookahead speculative decoding."
