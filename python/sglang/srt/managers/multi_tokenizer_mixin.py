@@ -378,7 +378,7 @@ class MultiHttpWorkerDetokenizerMixin:
         if hasattr(self, "socket_mapping"):
             self.socket_mapping.clear_all_sockets()
 
-    def multi_http_worker_event_loop(self):
+    def multi_http_worker_event_loop(self,detokenizer_worker_num):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
