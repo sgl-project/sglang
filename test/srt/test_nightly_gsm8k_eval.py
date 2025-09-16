@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
     parse_models,
     popen_launch_server,
     popen_launch_server_wrapper,
+    write_results_to_json,
 )
 
 MODEL_SCORE_THRESHOLDS = {
@@ -40,31 +41,6 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
 }
-
-
-def write_results_to_json(model, metrics, mode="a"):
-    result = {
-        "timestamp": datetime.now().isoformat(),
-        "model": model,
-        "metrics": metrics,
-        "score": metrics["score"],
-    }
-
-    existing_results = []
-    if mode == "a" and os.path.exists("results.json"):
-        try:
-            with open("results.json", "r") as f:
-                existing_results = json.load(f)
-        except json.JSONDecodeError:
-            existing_results = []
-
-    if isinstance(existing_results, list):
-        existing_results.append(result)
-    else:
-        existing_results = [result]
-
-    with open("results.json", "w") as f:
-        json.dump(existing_results, f, indent=2)
 
 
 # Do not use `CustomTestCase` since `test_mgsm_en_all_models` does not want retry

@@ -12,6 +12,7 @@ from sglang.test.test_utils import (
     check_model_scores,
     parse_models,
     popen_launch_server_wrapper,
+    write_results_to_json,
 )
 
 MODEL_SCORE_THRESHOLDS = {
@@ -28,31 +29,6 @@ DEFAULT_VLM_MODELS = ",".join(
         "google/gemma-3-4b-it",
     ]
 )
-
-
-def write_results_to_json(model, metrics, mode="a"):
-    result = {
-        "timestamp": datetime.now().isoformat(),
-        "model": model,
-        "metrics": metrics,
-        "score": metrics["score"],
-    }
-
-    existing_results = []
-    if mode == "a" and os.path.exists("results_vlm_mmmu.json"):
-        try:
-            with open("results_vlm_mmmu.json", "r") as f:
-                existing_results = json.load(f)
-        except json.JSONDecodeError:
-            existing_results = []
-
-    if isinstance(existing_results, list):
-        existing_results.append(result)
-    else:
-        existing_results = [result]
-
-    with open("results_vlm_mmmu.json", "w") as f:
-        json.dump(existing_results, f, indent=2)
 
 
 class TestNightlyVLMMmmuEval(unittest.TestCase):
@@ -86,6 +62,8 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                     )
 
                     metrics = run_eval(args)
+
+                    print(f"{metrics=}")
                     metrics["score"] = round(metrics["score"], 3)
                     print(
                         f"{'=' * 42}\n{model} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
@@ -99,11 +77,11 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                     kill_process_tree(process.pid)
 
         try:
-            with open("results_vlm_mmmu.json", "r") as f:
-                print("\nFinal Results from results_vlm_mmmu.json:")
+            with open("results.json", "r") as f:
+                print("\nFinal Results from results.json:")
                 print(json.dumps(json.load(f), indent=2))
         except Exception as e:
-            print(f"Error reading results_vlm_mmmu.json: {e}")
+            print(f"Error reading results: {e}")
 
         check_model_scores(all_results, MODEL_SCORE_THRESHOLDS, self.__class__.__name__)
 

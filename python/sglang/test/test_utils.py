@@ -14,6 +14,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -1591,3 +1592,28 @@ def popen_launch_server_wrapper(
         env=env,
     )
     return process
+
+
+def write_results_to_json(model, metrics, mode="a"):
+    result = {
+        "timestamp": datetime.now().isoformat(),
+        "model": model,
+        "metrics": metrics,
+        "score": metrics["score"],
+    }
+
+    existing_results = []
+    if mode == "a" and os.path.exists("results.json"):
+        try:
+            with open("results.json", "r") as f:
+                existing_results = json.load(f)
+        except json.JSONDecodeError:
+            existing_results = []
+
+    if isinstance(existing_results, list):
+        existing_results.append(result)
+    else:
+        existing_results = [result]
+
+    with open("results.json", "w") as f:
+        json.dump(existing_results, f, indent=2)
