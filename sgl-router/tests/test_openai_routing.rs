@@ -186,7 +186,9 @@ async fn test_unsupported_endpoints() {
     // Test generate endpoint (SGLang-specific, should not be supported)
     let generate_request = GenerateRequest {
         prompt: None,
-        text: Some("Hello world".to_string()),
+        text: Some(sglang_router_rs::protocols::spec::StringOrArray::String(
+            "Hello world".to_string(),
+        )),
         input_ids: None,
         parameters: None,
         sampling_params: None,

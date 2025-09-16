@@ -600,10 +600,9 @@ impl PDRouter {
             }
         }
         // Check text array
-        if let Some(text) = &req.text {
-            if text.contains("[") && text.contains("]") {
-                // This is a simplified check - in reality we'd need to parse JSON
-                return None; // For now, fall back to non-batch
+        if let Some(StringOrArray::Array(arr)) = &req.text {
+            if !arr.is_empty() {
+                return Some(arr.len());
             }
         }
         None
@@ -908,8 +907,14 @@ impl PDRouter {
             context_clone.parallel_batch = false; // Prevent recursion
 
             // Create future for this sub-batch
+            let batch_start_idx = current_idx - sub_batch.len(); // Starting index for this batch
             let fut = async move {
-                debug!("Worker {} processing {} items", worker_idx, sub_batch.len());
+                debug!(
+                    "Worker {} processing {} items starting at index {}",
+                    worker_idx,
+                    sub_batch.len(),
+                    batch_start_idx
+                );
                 let response = self
                     .execute_dual_dispatch_internal_wrapper(
                         headers_clone.as_ref(),
@@ -917,7 +922,7 @@ impl PDRouter {
                         context_clone,
                     )
                     .await;
-                (worker_idx, response)
+                (batch_start_idx, response) // Return start index instead of worker index
             };
 
             futures.push(fut);
@@ -1030,7 +1035,7 @@ impl PDRouter {
         let active_streams = Arc::new(std::sync::atomic::AtomicUsize::new(results.len()));
 
         // Spawn tasks to merge all streams
-        for (worker_idx, response) in results.drain(..) {
+        for (start_idx, response) in results.drain(..) {
             let tx = tx.clone();
             let active_streams = active_streams.clone();
 
@@ -1039,7 +1044,6 @@ impl PDRouter {
                 let body = response.into_body();
                 let mut stream = body.into_data_stream();
 
-                let mut batch_idx = 0;
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
                         Ok(chunk) => {
@@ -1054,19 +1058,34 @@ impl PDRouter {
                                     if let Ok(mut data) =
                                         serde_json::from_str::<Value>(data_content)
                                     {
-                                        // Add metadata about which worker and item this is from
+                                        // For streaming responses, we need to maintain the correct choice index
+                                        // Each worker processes multiple items, so we need to adjust the index
                                         if let Some(obj) = data.as_object_mut() {
-                                            obj.insert(
-                                                "_worker_idx".to_string(),
-                                                json!(worker_idx),
-                                            );
-                                            obj.insert(
-                                                "_batch_item_idx".to_string(),
-                                                json!(batch_idx),
-                                            );
+                                            if let Some(choices) = obj
+                                                .get_mut("choices")
+                                                .and_then(|c| c.as_array_mut())
+                                            {
+                                                for choice in choices {
+                                                    if let Some(choice_obj) = choice.as_object_mut()
+                                                    {
+                                                        if let Some(idx) = choice_obj
+                                                            .get("index")
+                                                            .and_then(|i| i.as_i64())
+                                                        {
+                                                            // Calculate global index based on start position
+                                                            let global_index =
+                                                                start_idx + idx as usize;
+                                                            choice_obj.insert(
+                                                                "index".to_string(),
+                                                                json!(global_index),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
 
-                                        // Re-serialize and send
+                                        // Re-serialize and send (without extra metadata)
                                         let modified_line = format!(
                                             "data: {}\n\n",
                                             serde_json::to_string(&data).unwrap_or_default()
@@ -1074,8 +1093,6 @@ impl PDRouter {
                                         if tx.send(Ok(bytes::Bytes::from(modified_line))).is_err() {
                                             break;
                                         }
-
-                                        batch_idx += 1;
                                     } else if data_content == "[DONE]" {
                                         // Don't forward individual DONE markers
                                         continue;
@@ -1099,7 +1116,10 @@ impl PDRouter {
                             }
                         }
                         Err(e) => {
-                            warn!("Error reading stream from worker {}: {}", worker_idx, e);
+                            warn!(
+                                "Error reading stream from batch starting at {}: {}",
+                                start_idx, e
+                            );
                             break;
                         }
                     }
@@ -1109,8 +1129,8 @@ impl PDRouter {
                 let remaining =
                     active_streams.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
                 debug!(
-                    "Worker {} stream completed, {} streams remaining",
-                    worker_idx, remaining
+                    "Batch starting at {} stream completed, {} streams remaining",
+                    start_idx, remaining
                 );
 
                 // If this was the last stream, send DONE marker
@@ -1142,68 +1162,96 @@ impl PDRouter {
 
     // Aggregate multiple JSON responses into a single batch response
     async fn aggregate_json_responses(results: Vec<(usize, Response)>) -> Response {
-        let mut all_responses = Vec::new();
-        let worker_count = results.len();
+        let mut all_choices = Vec::new();
+        let mut first_response_metadata: Option<Value> = None;
+        let mut total_prompt_tokens = 0i64;
+        let mut total_completion_tokens = 0i64;
 
         // Collect all response bodies
-        for (worker_idx, response) in results {
+        for (start_idx, response) in results {
             let body = response.into_body();
             let bytes = match axum::body::to_bytes(body, usize::MAX).await {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(
-                        "Failed to read response body from worker {}: {}",
-                        worker_idx, e
+                        "Failed to read response body from batch starting at {}: {}",
+                        start_idx, e
                     );
                     continue;
                 }
             };
 
             match serde_json::from_slice::<Value>(&bytes) {
-                Ok(mut json_value) => {
-                    // Handle different response formats
-                    if let Some(obj) = json_value.as_object_mut() {
-                        // Add metadata about which worker processed this
-                        obj.insert("_worker_idx".to_string(), json!(worker_idx));
+                Ok(json_value) => {
+                    if let Some(obj) = json_value.as_object() {
+                        // Save metadata from first response
+                        if first_response_metadata.is_none() {
+                            let mut metadata = obj.clone();
+                            metadata.remove("choices");
+                            metadata.remove("usage");
+                            first_response_metadata = Some(Value::Object(metadata));
+                        }
 
-                        // If it's an array response (batch), extract items
-                        if let Some(items) = obj.get("text").and_then(|t| t.as_array()) {
-                            for item in items {
-                                all_responses.push(item.clone());
+                        // Extract choices array
+                        if let Some(choices) = obj.get("choices").and_then(|c| c.as_array()) {
+                            for (idx, mut choice) in choices.iter().cloned().enumerate() {
+                                // Fix the index to be globally unique based on start_idx
+                                if let Some(choice_obj) = choice.as_object_mut() {
+                                    let global_index = start_idx + idx;
+                                    choice_obj.insert("index".to_string(), json!(global_index));
+                                }
+                                all_choices.push(choice);
                             }
-                        } else if let Some(items) = obj.get("choices").and_then(|c| c.as_array()) {
-                            for item in items {
-                                all_responses.push(item.clone());
+                        }
+
+                        // Accumulate usage stats
+                        if let Some(usage) = obj.get("usage").and_then(|u| u.as_object()) {
+                            if let Some(prompt) =
+                                usage.get("prompt_tokens").and_then(|p| p.as_i64())
+                            {
+                                total_prompt_tokens += prompt;
                             }
-                        } else {
-                            // Single response, add as-is
-                            all_responses.push(json_value);
+                            if let Some(completion) =
+                                usage.get("completion_tokens").and_then(|c| c.as_i64())
+                            {
+                                total_completion_tokens += completion;
+                            }
                         }
-                    } else if let Some(array) = json_value.as_array() {
-                        // Direct array response
-                        for item in array {
-                            all_responses.push(item.clone());
-                        }
-                    } else {
-                        all_responses.push(json_value);
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to parse JSON from worker {}: {}", worker_idx, e);
+                    warn!(
+                        "Failed to parse JSON from batch starting at {}: {}",
+                        start_idx, e
+                    );
                 }
             }
         }
 
-        // Return aggregated response
-        (
-            StatusCode::OK,
-            Json(json!({
-                "text": all_responses,
-                "_parallel_batch": true,
-                "_worker_count": worker_count
-            })),
-        )
-            .into_response()
+        // Build the final response maintaining OpenAI format
+        let mut response = if let Some(metadata) = first_response_metadata {
+            metadata.as_object().unwrap().clone()
+        } else {
+            // Fallback if no valid response was found
+            serde_json::Map::new()
+        };
+
+        // Add aggregated choices
+        response.insert("choices".to_string(), Value::Array(all_choices));
+
+        // Add aggregated usage stats
+        response.insert(
+            "usage".to_string(),
+            json!({
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+                "prompt_tokens_details": null,
+                "reasoning_tokens": 0
+            }),
+        );
+
+        (StatusCode::OK, Json(Value::Object(response))).into_response()
     }
 
     async fn handle_decode_error_response(
@@ -2224,7 +2272,11 @@ impl RouterTrait for PDRouter {
         // Extract text for cache-aware routing
         let request_text = if self.policies_need_request_text() {
             body.text
-                .as_deref()
+                .as_ref()
+                .and_then(|t| match t {
+                    StringOrArray::String(s) => Some(s.as_str()),
+                    StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
+                })
                 .or_else(|| {
                     body.prompt.as_ref().and_then(|p| match p {
                         StringOrArray::String(s) => Some(s.as_str()),

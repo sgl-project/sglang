@@ -1742,7 +1742,7 @@ pub struct GenerateRequest {
 
     /// Text input - SGLang native format
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
+    pub text: Option<StringOrArray>,
 
     /// Input IDs for tokenized input
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1800,7 +1800,10 @@ impl GenerationRequest for GenerateRequest {
     fn extract_text_for_routing(&self) -> String {
         // Check fields in priority order: text, prompt, inputs
         if let Some(ref text) = self.text {
-            return text.clone();
+            return match text {
+                StringOrArray::String(s) => s.clone(),
+                StringOrArray::Array(v) => v.join(" "),
+            };
         }
 
         if let Some(ref prompt) = self.prompt {
