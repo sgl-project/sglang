@@ -545,7 +545,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-    ):# -> torch.Tensor:
+    ):
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
@@ -554,13 +554,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
         # chunked prefix cache is not enabled, use Flashinfer MLA prefill kernel
-        # print('ttt'*100)
-        # print(f"attn_attend_prefix_cache: {forward_batch.attn_attend_prefix_cache}")
         if forward_batch.attn_attend_prefix_cache is None:
-            # print('xx'*100)
-            # print(q.shape)
-            # if q_rope:
-            #     print(q_rope.shape)
             return super().forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
@@ -569,7 +563,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
             v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
-            # print('calling trtllm_ragged_attention_deepseek')
             output = flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
@@ -590,11 +583,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=forward_batch.mha_return_lse,
             )
         else:
-            # replace with trtllm ragged attention once accuracy is resolved.
-            # print('yyy'*100)
-            # print(q.shape)
-            # if q_rope:
-            #     print(q_rope.shape)
             if  not (forward_batch.attn_attend_prefix_cache is not None
                  and forward_batch.mha_return_lse):
                 output = super().forward_extend(
@@ -633,16 +621,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     key=k,
                     value=v,
                     workspace_buffer=self.workspace_buffer,
-                    seq_lens=actual_seq_lens_kv,#self.forward_prefill_metadata.seq_lens,
-                    max_q_len=max_qo,#self.forward_prefill_metadata.max_seq_len,
-                    max_kv_len=max_kv,#self.forward_prefill_metadata.max_seq_len,
+                    seq_lens=actual_seq_lens_kv,
+                    max_q_len=max_qo,
+                    max_kv_len=max_kv,
                     bmm1_scale=layer.scaling,
                     bmm2_scale=1.0,
-                    o_sf_scale=-1.0,#1.0,
-                    batch_size=qo_indptr[-1].item(),#forward_batch.batch_size,
+                    o_sf_scale=-1.0,
+                    batch_size=qo_indptr[-1].item(),
                     window_left=-1,
-                    cum_seq_lens_q=qo_indptr,#self.forward_prefill_metadata.cum_seq_lens,
-                    cum_seq_lens_kv=kv_indptr,#self.forward_prefill_metadata.cum_seq_lens,
+                    cum_seq_lens_q=qo_indptr,
+                    cum_seq_lens_kv=kv_indptr,
                     enable_pdl=False,
                     is_causal=False,
                     return_lse=True,
