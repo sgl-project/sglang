@@ -81,6 +81,8 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang
 git checkout <YOUR-DESIRED-VERSION>
 
+# Use dedicated toml file
+cp python/pyproject_other.toml python/pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
