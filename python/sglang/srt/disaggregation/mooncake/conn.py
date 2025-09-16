@@ -459,7 +459,9 @@ class MooncakeKVManager(BaseKVManager):
             dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
         else:
             # Send KVCache from 1 prefill instance to multiple decode instances
-            src_head_start_offset = dst_tp_rank_in_group * dst_heads_per_rank
+            src_head_start_offset = (
+                dst_tp_rank_in_group * dst_heads_per_rank
+            ) % src_heads_per_rank
             num_heads_to_send = dst_heads_per_rank
             dst_head_start_offset = 0
 

@@ -13,8 +13,8 @@ from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
 
 from sglang.srt.layers.moe.fused_moe_triton import override_config
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-    fused_moe,
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
     get_config_dtype_str,
     get_config_file_name,
     get_default_config,
@@ -438,6 +438,15 @@ def main(args: argparse.Namespace):
         "Grok1AForCausalLM",
     ]:
         E = config.num_local_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] in [
+        "BailingMoEForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
+    ]:
+        E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size

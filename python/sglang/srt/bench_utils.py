@@ -1,5 +1,4 @@
 import os
-import re
 import sys
 from contextlib import nullcontext
 
@@ -109,8 +108,7 @@ def bench_kineto(
     if not with_multiple_kernels:
         for name in kernel_names:
             assert (
-                sum([int(re.search(name, line) is not None) for line in prof_lines])
-                == 1
+                sum([name in line for line in prof_lines]) == 1
             ), f"Errors of the kernel {name} in the profiling table (table: {prof_lines})"
 
     # Save chrome traces
@@ -124,7 +122,7 @@ def bench_kineto(
         total_time = 0
         total_num = 0
         for line in prof_lines:
-            if re.search(name, line) is not None:
+            if name in line:
                 time_str = line.split()[-2]
                 num_str = line.split()[-1]
                 for unit, scale in units.items():

@@ -332,7 +332,7 @@ class ServingChatTestCase(unittest.TestCase):
         """Ensure non-streaming tool_call.id matches functions.{name}:{index} for kimi_k2 parser."""
 
         # Force kimi_k2 parser
-        self.tm.server_args.tool_call_parser = "kimi_k2"
+        self.chat.tool_call_parser = "kimi_k2"
 
         # Mock FunctionCallParser.parse_non_stream to return one tool call
         with patch(
@@ -357,7 +357,6 @@ class ServingChatTestCase(unittest.TestCase):
             tool_calls, remaining_text, _ = self.chat._process_tool_calls(
                 text="<|tool_calls_section_begin|>...",
                 tools=tools,
-                tool_call_parser="kimi_k2",
                 finish_reason=finish_reason,
             )
 
@@ -370,7 +369,7 @@ class ServingChatTestCase(unittest.TestCase):
         """Ensure streaming first chunk tool_call.id matches functions.{name}:{index} for kimi_k2 parser."""
 
         # Force kimi_k2 parser
-        self.tm.server_args.tool_call_parser = "kimi_k2"
+        self.chat.tool_call_parser = "kimi_k2"
 
         # Prepare request with tools
         req = ChatCompletionRequest(

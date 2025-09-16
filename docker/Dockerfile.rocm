@@ -1,7 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.2rc2 --build-arg GPU_ARCH=gfx942 -t v0.5.2rc2-rocm630-mi30x -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.5.2rc2 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.2rc2-rocm700-mi30x -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.5.2rc2 --build-arg GPU_ARCH=gfx950 -t v0.5.2rc2-rocm700-mi35x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.3rc0 --build-arg GPU_ARCH=gfx942 -t v0.5.3rc0-rocm630-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.3rc0 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.3rc0-rocm700-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.3rc0 --build-arg GPU_ARCH=gfx950 -t v0.5.3rc0-rocm700-mi35x -f Dockerfile.rocm .
 
 
 # Default base images
@@ -181,6 +181,7 @@ RUN git clone ${SGL_REPO} \
     && mv pyproject_rocm.toml pyproject.toml \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
     && cd .. \
+    && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          python -m pip --no-cache-dir install -e "python[srt_hip]" ${NO_DEPS_FLAG}; \
        else \
@@ -193,6 +194,18 @@ RUN python -m pip cache purge
 RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
          /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
+
+# Install Rust toolchain for sgl-router
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && rustc --version && cargo --version
+
+# Build and install sgl-router
+RUN python3 -m pip install --no-cache-dir setuptools-rust \
+    && cd /sgl-workspace/sglang/sgl-router \
+    && cargo build --release \
+    && python3 -m pip install --no-cache-dir . \
+    && rm -rf /root/.cache
 
 # Performance environment variable.
 ENV HIP_FORCE_DEV_KERNARG=1

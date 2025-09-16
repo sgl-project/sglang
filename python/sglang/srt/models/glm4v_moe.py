@@ -74,6 +74,9 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def determine_num_fused_shared_experts(
         self, architecture: str = "Glm4MoeForCausalLM"
     ):

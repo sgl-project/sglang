@@ -9,14 +9,20 @@ use axum::{
 };
 use std::fmt::Debug;
 
-use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
+use crate::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+    ResponsesRequest,
+};
 
 pub mod factory;
 pub mod grpc;
 pub mod header_utils;
 pub mod http;
+pub mod router_manager;
 
 pub use factory::RouterFactory;
+// Re-export HTTP routers for convenience (keeps routers::openai_router path working)
+pub use http::{openai_router, pd_router, pd_types, router};
 
 /// Worker management trait for administrative operations
 ///
@@ -59,14 +65,19 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     async fn get_model_info(&self, req: Request<Body>) -> Response;
 
     /// Route a generate request
-    async fn route_generate(&self, headers: Option<&HeaderMap>, body: &GenerateRequest)
-        -> Response;
+    async fn route_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+    ) -> Response;
 
     /// Route a chat completion request
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
+        model_id: Option<&str>,
     ) -> Response;
 
     /// Route a completion request
@@ -74,11 +85,59 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         &self,
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
+        model_id: Option<&str>,
     ) -> Response;
 
-    async fn route_embeddings(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
+    /// Route a responses request
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+    ) -> Response;
 
-    async fn route_rerank(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
+    /// Retrieve a stored/background response by id
+    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
+
+    /// Cancel a background response by id
+    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
+
+    /// Delete a response by id
+    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses delete endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// List input items of a response by id
+    async fn list_response_input_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses list input items endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Route embedding requests (OpenAI-compatible /v1/embeddings)
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response;
+
+    async fn route_rerank(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RerankRequest,
+        model_id: Option<&str>,
+    ) -> Response;
 
     /// Flush cache on all workers
     async fn flush_cache(&self) -> Response;

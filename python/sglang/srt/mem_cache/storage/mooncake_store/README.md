@@ -54,7 +54,10 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 
 ### Single Server Deployment
 
-**Launch Mooncake `metadata service`:**
+There are four components for deploying Mooncake: metadata service, master service, store service and sglang instance.
+Note: *Only **master service** is mandatory for single server deployment.*
+
+**Launch Mooncake `metadata service`(Optional):**
 
 ```bash
 python -m mooncake.http_metadata_server
@@ -63,10 +66,22 @@ python -m mooncake.http_metadata_server
 **Launch Mooncake `master service`:**
 
 ```bash
-mooncake_master
+mooncake_master --eviction_high_watermark_ratio=0.95
 ```
 
-**Launch Mooncake `store service`:**
+To start both the metadata and master services together:
+```bash
+mooncake_master --enable_http_metadata_server=true --eviction_high_watermark_ratio=0.95
+```
+
+**Understanding `eviction_high_watermark_ratio`:**
+
+When a `PutStart` request fails due to insufficient memory, or when the eviction thread detects that space usage has reached the configured high watermark ratio, an eviction task is triggered to free up space by evicting a portion of objects.
+
+Due to memory fragmentation, allocation failures may occur even when memory usage has not yet reached 100%. The actual threshold depends on the workload. This [benchmark document](https://kvcache-ai.github.io/Mooncake/performance/allocator_benchmark_result.html)
+ provides memory allocation efficiency results under different scenarios. if excessive allocation failures are observed, consider lowering this parameter accordingly.
+
+**Launch Mooncake `store service` (Optional):**
 
 First, create and save a configuration file in JSON format. For example:
 
@@ -98,10 +113,15 @@ Then start the `store service`:
 python -m mooncake.mooncake_store_service --config=[config_path]
 ```
 
-Note: To get started quickly, if `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting the `SGLang server`, launching the `store service` can be skipped. In this case, the `SGLang server` also fulfills the role of the `store service`.
+Note: If `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting the `SGLang server`, launching the `store service` can be skipped. In this case, the `SGLang server` also takes on the role of the `store service`, which simplifies deployment but couples the two components together. Users can choose the deployment approach that best fits their needs.
 
 **Start the `SGLang server` with Mooncake enabled:**
+
 Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` layout (which optimizes memory access patterns for KV cache operations).
+
+There are two ways to configure Mooncake: 1. Using environment variables; 2. Using extra-config of sglang arguments.
+
+**Using env variables to configure Mooncake**
 
 ```bash
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
@@ -122,6 +142,16 @@ Parameter Explanation:
 * `MOONCAKE_PROTOCOL`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
 * `MOONCAKE_DEVICE`: The RDMA devices used by Mooncake. This parameter is required only when the protocol is set to `"rdma"`. Available devices can be listed using the `ibv_devices` command.
 * `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory (in bytes) contributed to the global memory pool. If at least one `store service` is launched, then this value could be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
+
+**Using extra-config of sglang arguments to configure Mooncake**
+
+```bash
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path] \
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "local_hostname": "localhost", "metadata_server": "http://127.0.0.1:8080/metadata", "global_segment_size": 4294967296, "local_buffer_size": 16777216, "protocol": "rdma", "device_name": "mlx5_0,mlx5_1"}'
+```
 
 **Important: Understanding Global Segment Size**
 
