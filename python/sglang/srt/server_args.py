@@ -110,6 +110,8 @@ ATTENTION_BACKEND_CHOICES = [
     "ascend",
 ]
 
+LORA_BACKEND_CHOICES = ["triton", "csgmv"]
+
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
@@ -1601,7 +1603,8 @@ class ServerArgs:
         parser.add_argument(
             "--lora-backend",
             type=str,
-            default="triton",
+            choices=LORA_BACKEND_CHOICES,
+            default=ServerArgs.lora_backend,
             help="Choose the kernel backend for multi-LoRA serving.",
         )
 
@@ -2645,7 +2648,7 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
 
-        elif "Llama4" in model_arch:
+        elif "Llama4" in model_arch and self.device != "cpu":
             assert self.attention_backend in {
                 "fa3",
                 "aiter",
