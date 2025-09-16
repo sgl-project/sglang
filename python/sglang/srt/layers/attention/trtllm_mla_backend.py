@@ -554,11 +554,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
         # chunked prefix cache is not enabled, use Flashinfer MLA prefill kernel
+        # print('ttt'*100)
+        # print(f"attn_attend_prefix_cache: {forward_batch.attn_attend_prefix_cache}")
         if forward_batch.attn_attend_prefix_cache is None:
-            print('xx'*100)
-            print(q.shape)
-            if q_rope:
-                print(q_rope.shape)
+            # print('xx'*100)
+            # print(q.shape)
+            # if q_rope:
+            #     print(q_rope.shape)
             return super().forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
@@ -567,6 +569,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
             v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+            # print('calling trtllm_ragged_attention_deepseek')
             output = flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
@@ -592,71 +595,64 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # print(q.shape)
             # if q_rope:
             #     print(q_rope.shape)
-            output = super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
-            )
-            # shuw test
-            return output
-            assert q_rope is None
-            assert k_rope is None
-            assert forward_batch.num_prefix_chunks is not None
-            num_prefix_chunks = forward_batch.num_prefix_chunks
-            # self.update_prefix_chunks(num_prefix_chunks)
+            if  not (forward_batch.attn_attend_prefix_cache is not None
+                 and forward_batch.mha_return_lse):
+                output = super().forward_extend(
+                    q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+                )                 
+            else:
+                assert q_rope is None
+                assert k_rope is None
+                num_prefix_chunks = forward_batch.num_prefix_chunks
 
-            prefix_lens = forward_batch.extend_prefix_lens
-            seq_lens = forward_batch.seq_lens
+                prefix_lens = forward_batch.extend_prefix_lens
+                seq_lens = forward_batch.seq_lens
 
-            bs = len(seq_lens)
-            qo_indptr = self.qo_indptr
-            qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
-            qo_indptr = qo_indptr[: bs + 1]
-            max_qo = int((seq_lens - prefix_lens).max().item())
-            
-
-            for chunk_idx in range(num_prefix_chunks):
+                bs = len(seq_lens)
+                qo_indptr = self.qo_indptr
+                qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+                qo_indptr = qo_indptr[: bs + 1]
+                actual_seq_lens_qo = qo_indptr[1:] - qo_indptr[:-1]
+                max_qo = int(actual_seq_lens_qo.max().item())
+                
                 # MHA for chunked prefix kv cache when running model with MLA
                 assert forward_batch.prefix_chunk_idx is not None
                 assert forward_batch.prefix_chunk_cu_seq_lens is not None
                 assert forward_batch.prefix_chunk_max_seq_lens is not None
+                chunk_idx = forward_batch.prefix_chunk_idx
 
                 kv_indptr = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
-                max_kv = int((kv_indptr[1:] - kv_indptr[:-1]).max().item())
-                # wrapper = self.chunk_ragged_wrappers[chunk_idx]
-                # wrapper.begin_forward(
-                #     qo_indptr=qo_indptr,
-                #     kv_indptr=kv_indptr,
-                #     num_qo_heads=self.num_local_heads,
-                #     num_kv_heads=self.num_local_heads,
-                #     head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
-                #     head_dim_vo=self.v_head_dim,
-                #     q_data_type=self.q_data_type,
-                #     causal=False,
-                # )
-
+                actual_seq_lens_kv = kv_indptr[1:] - kv_indptr[:-1]
+                max_kv = int((actual_seq_lens_kv).max().item())
 
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-                k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-                v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
-                output, s1 = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                k = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype)
+                v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype)
+                o1, s1 = flashinfer.prefill.trtllm_ragged_attention_deepseek(
                     query=qall,
                     key=k,
                     value=v,
                     workspace_buffer=self.workspace_buffer,
-                    seq_lens=kv_indptr[1:] - kv_indptr[:-1],#self.forward_prefill_metadata.seq_lens,
+                    seq_lens=actual_seq_lens_kv,#self.forward_prefill_metadata.seq_lens,
                     max_q_len=max_qo,#self.forward_prefill_metadata.max_seq_len,
                     max_kv_len=max_kv,#self.forward_prefill_metadata.max_seq_len,
                     bmm1_scale=layer.scaling,
                     bmm2_scale=1.0,
                     o_sf_scale=-1.0,#1.0,
-                    batch_size=bs,#forward_batch.batch_size,
+                    batch_size=qo_indptr[-1].item(),#forward_batch.batch_size,
                     window_left=-1,
                     cum_seq_lens_q=qo_indptr,#self.forward_prefill_metadata.cum_seq_lens,
                     cum_seq_lens_kv=kv_indptr,#self.forward_prefill_metadata.cum_seq_lens,
                     enable_pdl=False,
                     is_causal=False,
-                    return_lse=forward_batch.mha_return_lse,
+                    return_lse=True,
                 )
-            return output, s1
+                # TODO(shuw@nvidia.com): Depends on resolution of https://github.com/flashinfer-ai/flashinfer/issues/1663.
+                # The out-of-bounds writes in flashinfer's trtllm_ragged_attention_deepseek.
+                if actual_seq_lens_kv[-1].item() == 0:
+                    s1[qo_indptr[-2].item():] = torch.tensor(float('-inf'), dtype=s1.dtype, device=s1.device)
+                    o1[qo_indptr[-2].item():] = 0
+                output = (o1, s1)
         return output
 
 
