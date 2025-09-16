@@ -780,12 +780,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _use_aiter:
                 # Pre-shuffle weights
-                layer.w13_weight.data.copy_(shuffle_weight(
-                    layer.w13_weight.contiguous(), (16, 16)
-                ))
-                layer.w2_weight.data.copy_(shuffle_weight(
-                    layer.w2_weight.contiguous(), (16, 16)
-                ))
+                layer.w13_weight.data.copy_(
+                    shuffle_weight(layer.w13_weight.contiguous(), (16, 16))
+                )
+                layer.w2_weight.data.copy_(
+                    shuffle_weight(layer.w2_weight.contiguous(), (16, 16))
+                )
 
             if _is_cpu:
                 assert (
