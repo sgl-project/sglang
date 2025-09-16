@@ -239,6 +239,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         self,
         config: Qwen3NextConfig,
         layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -278,6 +279,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             input_size=self.hidden_size,
             output_size=projection_size_qkvz,
             bias=False,
+            quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
@@ -285,6 +287,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             input_size=self.hidden_size,
             output_size=projection_size_ba,
             bias=False,
+            quant_config=None,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
@@ -336,6 +339,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             self.value_dim,
             self.hidden_size,
             bias=False,
+            quant_config=quant_config,
             input_is_parallel=True,
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
@@ -493,7 +497,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.linear_attn = Qwen3GatedDeltaNet(config, layer_id, alt_stream)
+        self.linear_attn = Qwen3GatedDeltaNet(config, layer_id, quant_config, alt_stream)
 
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
