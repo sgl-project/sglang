@@ -66,15 +66,22 @@ python -m mooncake.http_metadata_server
 **Launch Mooncake `master service`:**
 
 ```bash
-mooncake_master
+mooncake_master --eviction_high_watermark_ratio=0.95
 ```
 
 To start both the metadata and master services together:
 ```bash
-mooncake_master --enable_http_metadata_server=true
+mooncake_master --enable_http_metadata_server=true --eviction_high_watermark_ratio=0.95
 ```
 
-**Launch Mooncake `store service`:**
+**Understanding `eviction_high_watermark_ratio`:**
+
+When a `PutStart` request fails due to insufficient memory, or when the eviction thread detects that space usage has reached the configured high watermark ratio, an eviction task is triggered to free up space by evicting a portion of objects.
+
+Due to memory fragmentation, allocation failures may occur even when memory usage has not yet reached 100%. The actual threshold depends on the workload. This [benchmark document](https://kvcache-ai.github.io/Mooncake/performance/allocator_benchmark_result.html)
+ provides memory allocation efficiency results under different scenarios. if excessive allocation failures are observed, consider lowering this parameter accordingly.
+
+**Launch Mooncake `store service` (Optional):**
 
 First, create and save a configuration file in JSON format. For example:
 
@@ -106,9 +113,10 @@ Then start the `store service`:
 python -m mooncake.mooncake_store_service --config=[config_path]
 ```
 
-Note: To get started quickly, if `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting the `SGLang server`, launching the `store service` can be skipped. In this case, the `SGLang server` also fulfills the role of the `store service`.
+Note: If `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting the `SGLang server`, launching the `store service` can be skipped. In this case, the `SGLang server` also takes on the role of the `store service`, which simplifies deployment but couples the two components together. Users can choose the deployment approach that best fits their needs.
 
 **Start the `SGLang server` with Mooncake enabled:**
+
 Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` layout (which optimizes memory access patterns for KV cache operations).
 
 There are two ways to configure Mooncake: 1. Using environment variables; 2. Using extra-config of sglang arguments.
