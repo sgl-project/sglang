@@ -415,7 +415,7 @@ class LoRAManager:
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
-    def should_skip_lora(self, module_name):
+    def should_skip_lora_for_vision_model(self, module_name):
         return module_name.find("vision_model.model") != -1
 
     def init_lora_modules(self):
