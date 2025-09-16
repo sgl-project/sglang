@@ -207,7 +207,9 @@ class ForwardBatch:
 
     # For extend
     extend_num_tokens: Optional[int] = None
-    extend_seq_lens: Optional[torch.Tensor] = None
+    extend_seq_lens: Optional[torch.Tensor] = (
+        None  # number of new query tokens to generate
+    )
     extend_prefix_lens: Optional[torch.Tensor] = None
     extend_start_loc: Optional[torch.Tensor] = None
     extend_prefix_lens_cpu: Optional[List[int]] = None

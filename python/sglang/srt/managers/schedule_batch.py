@@ -1422,7 +1422,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
-
         self.merge_batch(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
@@ -1932,7 +1931,7 @@ class ModelWorkerBatch:
     tbo_split_seq_index: Optional[int]
     global_forward_mode: Optional[ForwardMode]
 
-    # For extend
+    # For extend and chunked prefill
     extend_num_tokens: Optional[int]
     extend_seq_lens: Optional[List[int]]
     extend_prefix_lens: Optional[List[int]]

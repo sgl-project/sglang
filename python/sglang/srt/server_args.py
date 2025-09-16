@@ -2272,6 +2272,7 @@ class ServerArgs:
             default=ServerArgs.disaggregation_bootstrap_port,
             help="Bootstrap server port on the prefill server. Default is 8998.",
         )
+
         parser.add_argument(
             "--disaggregation-decode-tp",
             type=int,
