@@ -62,12 +62,12 @@ class MooncakeCombineInput(NamedTuple):
 assert isinstance(MooncakeCombineInput, CombineInput)
 
 
-_BROKEN_RANKS: Optional[torch.Tensor] = None
+_ACTIVE_RANKS: Optional[torch.Tensor] = None
 
 
-def get_ep_broken_ranks() -> torch.Tensor:
-    assert _BROKEN_RANKS is not None, "_BROKEN_RANKS is not initialized"
-    return _BROKEN_RANKS
+def get_ep_active_ranks() -> torch.Tensor:
+    assert _ACTIVE_RANKS is not None, "_ACTIVE_RANKS is not initialized"
+    return _ACTIVE_RANKS
 
 
 class EPBuffer:
@@ -152,12 +152,12 @@ class _MooncakeEPDispatcherImpl:
         self.first_execution = True
         self.timeout_us = 10000000
 
-        global _BROKEN_RANKS
-        if _BROKEN_RANKS is None:
-            _BROKEN_RANKS = torch.zeros(
+        global _ACTIVE_RANKS
+        if _ACTIVE_RANKS is None:
+            _ACTIVE_RANKS = torch.ones(
                 (self.num_experts,), dtype=torch.int32, device="cuda"
             )
-        self.broken_ranks = _BROKEN_RANKS
+        self.active_ranks = _ACTIVE_RANKS
 
         self.handle = None
 
@@ -223,7 +223,7 @@ class _MooncakeEPDispatcherImpl:
             buffer.dispatch(
                 hidden_states,
                 topk_idx,
-                self.broken_ranks,
+                self.active_ranks,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 -1 if self.first_execution else self.timeout_us,
@@ -262,7 +262,7 @@ class _MooncakeEPDispatcherImpl:
             hidden_states,
             topk_idx,
             topk_weights,
-            self.broken_ranks,
+            self.active_ranks,
             -1 if self.first_execution else self.timeout_us,
             self.handle,
             async_finish=not self.return_recv_hook,
