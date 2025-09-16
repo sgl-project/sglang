@@ -1474,13 +1474,12 @@ def _ensure_remove_suffix(text: str, suffix: str):
 def generate_markdown_report_nightly(model, results, input_len, output_len):
     summary = f"### {model}\n"
     summary += f"Input lens: {input_len}. Output lens: {output_len}.\n"
-    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | trace |\n"
+    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile |\n"
     summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
 
     base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
     # Optional: a relay page that fetches the trace and postMessages it to Perfetto UI.
     # See: https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui
-    relay_base = os.getenv("PERFETTO_DEEPLINK_RELAY", "").rstrip("/")
     relay_base = (
         "https://mickqian.github.io/sglang-ci-perfetto-relay-page/perfetto_relay.html"
     )
@@ -1494,32 +1493,21 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
             # Reconstruct the row and append a placeholder artifact link for profile
             parts = [part.strip() for part in m.group(0).split("|") if part.strip()]
             filename = result.get("trace_link")
-            if base_url and filename:
-                try:
-                    from urllib.parse import quote
-                except ImportError:
-                    quote = None
+            try:
+                from urllib.parse import quote
+            except ImportError:
+                quote = None
 
-                raw_link = f"{base_url}/{filename}"
+            raw_link = f"{base_url}/{filename}"
 
-                if relay_base:
-                    # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
-                    relay_link = (
-                        f"{relay_base}?src={quote(raw_link, safe='')}"
-                        if quote
-                        else f"{relay_base}?src={raw_link}"
-                    )
-                    row = f"| {' | '.join(parts)} | [trace]({relay_link}) |\n"
-                else:
-                    # Fallback: attempt direct URL param (may fail due to CSP/CORS; use only if your hosting allows it)
-                    perfetto_link = (
-                        f"https://ui.perfetto.dev/#!/?url={quote(raw_link, safe='')}"
-                        if quote
-                        else f"https://ui.perfetto.dev/#!/?url={raw_link}"
-                    )
-                    row = f"| {' | '.join(parts)} | [trace]({perfetto_link}) |\n"
-            else:
-                row = f"| {' | '.join(parts)} | [trace](#) |\n"
+            # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
+            relay_link = (
+                f"{relay_base}?src={quote(raw_link, safe='')}"
+                if quote
+                else f"{relay_base}?src={raw_link}"
+            )
+            row = f"| {' | '.join(parts)} | [trace]({relay_link}) |\n"
+
             summary += row
     return summary
 

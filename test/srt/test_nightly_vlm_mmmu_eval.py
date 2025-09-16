@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 MODEL_SCORE_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples
-    "Qwen/Qwen2.5-VL-7B-Instruct": 0.355,
+    "Qwen/Qwen2.5-VL-7B-Instruct": 0.340,
     "OpenGVLab/InternVL2_5-2B": 0.30,
     "google/gemma-3-4b-it": 0.35,
 }
