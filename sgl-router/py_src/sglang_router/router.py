@@ -46,6 +46,9 @@ class Router:
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         dp_aware: Enable data parallelism aware schedule. Default: False
+        enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When enabled,
+            the router can manage multiple models simultaneously with per-model load balancing
+            policies. Default: False
         api_key: The api key used for the authorization with the worker.
             Useful when the dp aware scheduling strategy is enabled.
             Default: None
@@ -116,7 +119,7 @@ class Router:
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
 
-        # remoge mini_lb parameter
+        # remove mini_lb parameter
         args_dict.pop("mini_lb")
 
         return Router(_Router(**args_dict))
