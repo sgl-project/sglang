@@ -167,6 +167,7 @@ is_ampere_with_cuda_12_3 = lambda: _check(8)
 is_hopper_with_cuda_12_3 = lambda: _check(9)
 
 
+@lru_cache(maxsize=1)
 def is_blackwell():
     if not is_cuda():
         return False
