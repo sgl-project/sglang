@@ -436,7 +436,7 @@ class LoRAManager:
                 continue
 
             # Skip vision model
-            if self.should_skip_lora(module_name):
+            if self.should_skip_lora_for_vision_model(module_name):
                 continue
 
             # The module should be converted if it is included in target_names
