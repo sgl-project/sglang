@@ -479,6 +479,10 @@ class WorkloadGenerator:
             "summary": {
                 "total_requests": len(self.performance_metrics["ttft"]),
                 "request_rate": self.request_rate,
+                "average_prompt_len": sum(self.performance_metrics["prompt_len"])
+                / len(self.performance_metrics["prompt_len"]),
+                "average_output_len": sum(self.performance_metrics["generated_len"])
+                / len(self.performance_metrics["generated_len"]),
                 "average_ttft": sum(self.performance_metrics["ttft"])
                 / len(self.performance_metrics["ttft"]),
                 "p90_ttft": sorted(self.performance_metrics["ttft"])[
@@ -533,6 +537,12 @@ class WorkloadGenerator:
         print("Performance metrics summary:")
         print(
             f"  Total requests: {performance_data['summary']['total_requests']} at {performance_data['summary']['request_rate']} requests per second"
+        )
+        print(
+            f"  Average Prompt Length: {performance_data['summary']['average_prompt_len']:.2f} tokens"
+        )
+        print(
+            f"  Average Output Length: {performance_data['summary']['average_output_len']:.2f} tokens"
         )
         print(f"  Average TTFT: {performance_data['summary']['average_ttft']:.2f}")
         print(f"  P90 TTFT: {performance_data['summary']['p90_ttft']:.2f}")
