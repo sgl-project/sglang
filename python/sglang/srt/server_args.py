@@ -179,7 +179,7 @@ class ServerArgs:
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
-    eviction_policy: str = "lru"
+    radix_eviction_policy: str = "lru"
 
     # Runtime options
     device: Optional[str] = None
@@ -1836,12 +1836,11 @@ class ServerArgs:
             help="The write policy of hierarchical cache.",
         )
         parser.add_argument(
-            "--eviction-policy",
+            "--radix-eviction-policy",
             type=str,
             choices=["lru", "lfu"],
-            default=ServerArgs.eviction_policy,
-            help="The eviction policy of hierarchical cache. 'lru' stands for "
-            "Least Recently Used, 'lfu' stands for Least Frequently Used.",
+            default=ServerArgs.radix_eviction_policy,
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
         )
         parser.add_argument(
             "--hicache-io-backend",
