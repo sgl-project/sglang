@@ -283,9 +283,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal[
-        "none", "deepep", "fp4_allgather", "flashinfer_alltoallv"
-    ] = "none"
+    moe_a2a_backend: Literal["none", "deepep"] = "none"
     moe_runner_backend: Literal[
         "auto",
         "triton",
@@ -351,7 +349,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
-    disable_flashinfer_cutlass_moe_comm_opt: bool = False
+    disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
@@ -696,23 +694,6 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-            if (
-                self.moe_a2a_backend == "none"
-                and not self.disable_flashinfer_cutlass_moe_comm_opt
-                and self.enable_dp_attention
-                and self.dp_size == self.tp_size
-            ):
-                from sglang.srt.layers.flashinfer_alltoall import (
-                    is_flashinfer_alltoallv_supported,
-                )
-
-                if is_flashinfer_alltoallv_supported():
-                    self.moe_a2a_backend = "flashinfer_alltoallv"
-                else:
-                    self.moe_a2a_backend = "fp4_allgather"
-                logger.warning(
-                    f"--moe-a2a-backend={self.moe_a2a_backend} is automatically enabled for Flashinfer Cutlass MOE. Use --disable-flashinfer-cutlass-moe-comm-opt to disable the automatic communication optimization."
-                )
 
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert (
@@ -1749,7 +1730,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep", "fp4_allgather", "flashinfer_alltoallv"],
+            choices=["none", "deepep"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
@@ -2063,9 +2044,9 @@ class ServerArgs:
             help="Enable NCCL symmetric memory for fast collectives.",
         )
         parser.add_argument(
-            "--disable-flashinfer-cutlass-moe-comm-opt",
+            "--disable-flashinfer-cutlass-moe-fp4-allgather",
             action="store_true",
-            help="When enabling flashinfer cutlass moe, disable the automatic communication optimization.",
+            help="Disables quantize before all-gather for flashinfer cutlass moe.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",
