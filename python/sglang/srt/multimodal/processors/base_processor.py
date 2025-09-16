@@ -12,7 +12,11 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputFormat,
+)
 from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
 
 _is_npu = is_npu()
