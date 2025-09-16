@@ -37,30 +37,34 @@ class TorchFlexAttnBackend(AttentionBackend):
             for seq_idx in range(forward_batch.seq_lens.shape[0]):
                 seq_len_kv = forward_batch.seq_lens[seq_idx]
                 seq_len_q = seq_len_kv
-                self.extend_block_masks.append(create_block_mask(
-                    self._causal_mask,
-                    None,
-                    None,
-                    seq_len_q,
-                    seq_len_kv,
-                    device=self.device,
-                    _compile=False,
-                ))
+                self.extend_block_masks.append(
+                    create_block_mask(
+                        self._causal_mask,
+                        None,
+                        None,
+                        seq_len_q,
+                        seq_len_kv,
+                        device=self.device,
+                        _compile=False,
+                    )
+                )
 
         elif forward_batch.forward_mode.is_decode():
             for seq_idx in range(forward_batch.seq_lens.shape[0]):
                 seq_len_q = 1
                 seq_len_kv = forward_batch.seq_lens[seq_idx]
 
-                self.decode_block_masks.append(create_block_mask(
-                    self._decode_mask,
-                    None,
-                    None,
-                    seq_len_q,
-                    seq_len_kv,
-                    device=self.device,
-                    _compile=False,
-                ))
+                self.decode_block_masks.append(
+                    create_block_mask(
+                        self._decode_mask,
+                        None,
+                        None,
+                        seq_len_q,
+                        seq_len_kv,
+                        device=self.device,
+                        _compile=False,
+                    )
+                )
 
     def _causal_mask(self, b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
@@ -139,7 +143,7 @@ class TorchFlexAttnBackend(AttentionBackend):
 
             if not causal:
                 raise NotImplementedError("Non-causal mode is not yet implemented.")
-            
+
             per_req_out_redundant = (
                 self.flex_attention(
                     per_req_query_redundant.unsqueeze(0),
@@ -152,7 +156,9 @@ class TorchFlexAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redundant[prefill_seq_len_q:, :, :]
+            output[start_q:end_q, :, :] = per_req_out_redundant[
+                prefill_seq_len_q:, :, :
+            ]
             start_q, start_kv = end_q, end_kv
         return output
 
