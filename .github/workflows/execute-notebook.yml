@@ -6,6 +6,7 @@ on:
     paths:
       - "python/sglang/**"
       - "docs/**"
+    types: [synchronize, labeled]
   workflow_dispatch:
 
 
@@ -17,19 +18,16 @@ concurrency:
 jobs:
   run-all-notebooks:
     runs-on: 1-gpu-runner
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
           pip install -r docs/requirements.txt
-          apt-get update
-          apt-get install -y pandoc
-          apt-get update && apt-get install -y parallel retry
-
+          apt-get update && apt-get install -y pandoc parallel retry
           ln -sf "$(which python3)" /usr/bin/python
 
       - name: Setup Jupyter Kernel
@@ -44,7 +42,7 @@ jobs:
           make compile
 
 
-  finish:
+  notebook-finish:
     needs: [
       run-all-notebooks
     ]

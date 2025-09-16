@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import re
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.multimodal_processor import (
@@ -38,14 +37,8 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<image_soft_token>",
             image_token_id=hf_config.image_token_id,
-            image_token_regex=re.compile(
-                r"<start_of_image>(?:(?:<image_soft_token>)*<end_of_image>)?"
-            ),
             audio_token="<audio_soft_token>",
             audio_token_id=hf_config.audio_token_id,
-            audio_token_regex=re.compile(
-                r"<start_of_audio>(?:(?:<audio_soft_token>)*<end_of_audio>)?"
-            ),
         ).build(_processor)
 
     async def process_mm_data_async(

@@ -1,11 +1,12 @@
+from __future__ import annotations
+
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.code_completion_parser import generate_completion_prompt_from_request
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -21,8 +22,14 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.template_manager import TemplateManager
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.parser.code_completion_parser import (
+    generate_completion_prompt_from_request,
+)
+from sglang.utils import convert_json_schema_to_str
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.template_manager import TemplateManager
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +48,18 @@ class OpenAIServingCompletion(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "cmpl-"
 
+    def _validate_request(self, request: CompletionRequest) -> Optional[str]:
+        """Validate that the input is valid."""
+        prompt = request.prompt
+        if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
+            return "Prompt cannot be empty"
+
+        return None
+
     def _convert_to_internal_request(
         self,
         request: CompletionRequest,
+        raw_request: Request = None,
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
         # NOTE: with openai API, the prompt's logprobs are always not computed
@@ -74,6 +90,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
         else:
             prompt_kwargs = {"input_ids": prompt}
 
+        # Extract customer labels from raw request headers
+        customer_labels = self.extract_customer_labels(raw_request)
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             sampling_params=sampling_params,
@@ -88,6 +107,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
+            customer_labels=customer_labels,
         )
 
         return adapted_request, request
@@ -116,6 +136,20 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
         }
+
+        # Handle response_format constraints
+        if request.response_format and request.response_format.type == "json_schema":
+            sampling_params["json_schema"] = convert_json_schema_to_str(
+                request.response_format.json_schema.schema_
+            )
+        elif request.response_format and request.response_format.type == "json_object":
+            sampling_params["json_schema"] = '{"type": "object"}'
+        elif (
+            request.response_format and request.response_format.type == "structural_tag"
+        ):
+            sampling_params["structural_tag"] = convert_json_schema_to_str(
+                request.response_format.model_dump(by_alias=True)
+            )
 
         return sampling_params
 
@@ -373,6 +407,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             created=created,
             choices=choices,
             usage=usage,
+            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

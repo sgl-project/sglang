@@ -10,13 +10,16 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.srt.function_call.step3_detector import Step3Detector
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +38,13 @@ class FunctionCallParser:
         "qwen25": Qwen25Detector,
         "mistral": MistralDetector,
         "deepseekv3": DeepSeekV3Detector,
+        "deepseekv31": DeepSeekV31Detector,
         "pythonic": PythonicDetector,
         "kimi_k2": KimiK2Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "glm45": Glm4MoeDetector,
+        "step3": Step3Detector,
+        "gpt-oss": GptOssDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
@@ -63,6 +69,8 @@ class FunctionCallParser:
         Returns:
             True if the text contains a tool call, False otherwise
         """
+        if not self.tools:
+            return False
         return self.detector.has_tool_call(text)
 
     def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
@@ -77,6 +85,8 @@ class FunctionCallParser:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
+        if not self.tools:
+            return full_text, []
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
         if tool_call_list:
@@ -96,6 +106,8 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
+        if not self.tools:
+            return chunk_text, []
         final_normal_text = ""
         final_calls = []
 
