@@ -91,9 +91,6 @@ class HiRadixCache(RadixCache):
             page_size / 1024 * prefetch_timeout_per_ki_token
         )
         self.prefetch_stop_policy = hicache_storage_prefetch_policy
-        print(
-            f"============prefetch_threshold: {self.prefetch_threshold}, prefetch_timeout_base: {self.prefetch_timeout_base}, prefetch_timeout_per_ki_token: {prefetch_timeout_per_ki_token}"
-        )
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -564,15 +561,9 @@ class HiRadixCache(RadixCache):
 
         if len(operation.hash_value) == 0:
             completed = False
-            print(
-                f"operation {operation.request_id} completed: {completed} since hash_value is empty"
-            )
         else:
             completed = (
                 operation.completed_tokens == len(operation.hash_value) * self.page_size
-            )
-            print(
-                f"operation {operation.request_id} completed: {completed}, completed_tokens: {operation.completed_tokens}, hash_value_len: {len(operation.hash_value) * self.page_size}"
             )
 
         if self.prefetch_stop_policy == "wait_complete":
@@ -583,11 +574,6 @@ class HiRadixCache(RadixCache):
                 time.monotonic() - operation.start_time
                 > self.prefetch_timeout_base
                 + len(operation.hash_value) * self.prefetch_timeout_per_page
-            )
-            print(
-                f"operation {operation.request_id} can_terminate: {can_terminate}, duration: {time.monotonic() - operation.start_time}, "
-                f"hash_value_len: {len(operation.hash_value) * self.page_size}, "
-                f"timeout: {self.prefetch_timeout_base + len(operation.hash_value) * self.prefetch_timeout_per_page}"
             )
         else:
             # unknown prefetch stop policy, just return True
