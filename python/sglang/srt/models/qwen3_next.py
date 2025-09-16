@@ -497,7 +497,9 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.linear_attn = Qwen3GatedDeltaNet(config, layer_id, quant_config, alt_stream)
+        self.linear_attn = Qwen3GatedDeltaNet(
+            config, layer_id, quant_config, alt_stream
+        )
 
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
