@@ -1478,7 +1478,12 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
     summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
 
     base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
-
+    # Optional: a relay page that fetches the trace and postMessages it to Perfetto UI.
+    # See: https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui
+    relay_base = os.getenv("PERFETTO_DEEPLINK_RELAY", "").rstrip("/")
+    relay_base = (
+        "https://mickqian.github.io/sglang-ci-perfetto-relay-page/perfetto_relay.html"
+    )
     for result in results:
         # Extract the metrics row that bench_one_batch_server prints (without the profile column)
         m = re.search(
@@ -1490,19 +1495,29 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
             parts = [part.strip() for part in m.group(0).split("|") if part.strip()]
             filename = result.get("trace_link")
             if base_url and filename:
-                # Build a Perfetto UI deep link that opens the remote trace directly
-                # Note: url parameter must be URL-encoded and the remote host must allow CORS
                 try:
                     from urllib.parse import quote
                 except ImportError:
                     quote = None
+
                 raw_link = f"{base_url}/{filename}"
-                perfetto_link = (
-                    f"https://ui.perfetto.dev/#!/?url={quote(raw_link, safe='')}"
-                    if quote
-                    else f"https://ui.perfetto.dev/#!/?url={raw_link}"
-                )
-                row = f"| {' | '.join(parts)} | [trace]({perfetto_link}) |\n"
+
+                if relay_base:
+                    # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
+                    relay_link = (
+                        f"{relay_base}?src={quote(raw_link, safe='')}"
+                        if quote
+                        else f"{relay_base}?src={raw_link}"
+                    )
+                    row = f"| {' | '.join(parts)} | [trace]({relay_link}) |\n"
+                else:
+                    # Fallback: attempt direct URL param (may fail due to CSP/CORS; use only if your hosting allows it)
+                    perfetto_link = (
+                        f"https://ui.perfetto.dev/#!/?url={quote(raw_link, safe='')}"
+                        if quote
+                        else f"https://ui.perfetto.dev/#!/?url={raw_link}"
+                    )
+                    row = f"| {' | '.join(parts)} | [trace]({perfetto_link}) |\n"
             else:
                 row = f"| {' | '.join(parts)} | [trace](#) |\n"
             summary += row
