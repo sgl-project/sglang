@@ -49,7 +49,6 @@ class JsonArrayDetector(BaseFormatDetector):
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         # If we previously withheld a valid tool-call separator, prepend it
         # when we see the next JSON object start (typically '{' inside array).
-        # Keep any user-provided leading whitespace by inserting before it.
         if self._pending_separator:
             # Find first non-space to decide if an object starts now.
             i = 0
@@ -77,28 +76,15 @@ class JsonArrayDetector(BaseFormatDetector):
 
             try:
                 json.loads(full_json)
-                # It's a valid object followed by a separator. Two cases:
-                # 1) There is remainder in the same chunk → process object now,
-                #    then immediately process remainder prefixed with separator.
-                # 2) No remainder → withhold the separator and insert it when
-                #    the next object starts in a future chunk.
+                # It's a valid object followed by a separator.
                 remainder = new_text[sep_index + len(sep):]
                 if remainder:
-                    # Process the object portion (without the separator)
-                    first_result = super().parse_streaming_increment(
-                        json_part_original, tools
+                    # Strip leading whitespace from remainder before prepending separator
+                    remainder_stripped = remainder.lstrip()
+                    # Process the complete chunk with separator reinserted
+                    return super().parse_streaming_increment(
+                        json_part_original + sep + remainder_stripped, tools
                     )
-                    # Immediately pass the remainder with the separator reinserted
-                    second_result = super().parse_streaming_increment(
-                        sep + remainder, tools
-                    )
-                    # Merge results
-                    merged = StreamingParseResult(
-                        normal_text=(first_result.normal_text or "")
-                        + (second_result.normal_text or ""),
-                        calls=(first_result.calls or []) + (second_result.calls or []),
-                    )
-                    return merged
                 else:
                     # No remainder. Withhold the separator for the next chunk.
                     self._pending_separator = True
