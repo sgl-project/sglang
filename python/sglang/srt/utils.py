@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import builtins
 import ctypes
@@ -166,16 +167,32 @@ is_ampere_with_cuda_12_3 = lambda: _check(8)
 is_hopper_with_cuda_12_3 = lambda: _check(9)
 
 
+@lru_cache(maxsize=1)
 def is_blackwell():
     if not is_cuda():
         return False
     return torch.cuda.get_device_capability()[0] == 10
 
 
+@lru_cache(maxsize=1)
+def is_sm100_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 10) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
+@lru_cache(maxsize=1)
+def is_sm90_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 9) and (
+        torch.version.cuda >= "12.3"
+    )
+
+
 _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
+    # FIXME: move your environment variable to sglang.environ
     value = os.getenv(name, default)
     value = value.lower()
 
@@ -193,6 +210,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
 
 
 def get_int_env_var(name: str, default: int = 0) -> int:
+    # FIXME: move your environment variable to sglang.environ
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
@@ -216,8 +234,16 @@ except:
     is_intel_amx_backend_available = False
 
 
+try:
+    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # to support torch compile
+    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+except:
+    is_amx_tile_supported = False
+
+
 def cpu_has_amx_support():
-    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+    return is_amx_tile_supported and is_intel_amx_backend_available
 
 
 def use_intel_amx_backend(layer):
@@ -412,7 +438,9 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        free_gpu_memory = psutil.virtual_memory().available
+        total_free_memory = psutil.virtual_memory().available
+        n_numa_node: int = len(get_cpu_ids_by_node())
+        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -1135,7 +1163,7 @@ def pytorch_profile(name, func, *args, data_size=-1):
 
 def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-):
+) -> zmq.Socket:
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -1407,6 +1435,7 @@ def init_custom_process_group(
     store=None,
     group_name=None,
     pg_options=None,
+    device_id=None,
 ):
     from torch.distributed.distributed_c10d import (
         Backend,
@@ -1460,6 +1489,7 @@ def init_custom_process_group(
         group_name=group_name,
         **{pg_options_param_name: pg_options},
         timeout=timeout,
+        device_id=device_id,
     )
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
@@ -1665,8 +1695,28 @@ def direct_register_custom_op(
     IMPORTANT: the lifetime of the operator is tied to the lifetime of the
     library object. If you want to bind the operator to a different library,
     make sure the library object is alive when the operator is used.
+
+    Note: This function will silently skip registration if the operator
+    with the same name is already registered to avoid RuntimeError in
+    multi-engine scenarios (e.g., VERL framework).
     """
     import torch.library
+
+    my_lib = target_lib or sglang_lib
+
+    # Check if operator is already registered to avoid duplicate registration
+    # This is important for scenarios where multiple SGLang engines run in the same process
+    try:
+        # Try to access the operator to see if it's already registered
+        lib_name = my_lib.m.name if hasattr(my_lib.m, "name") else "sglang"
+        if hasattr(torch.ops, lib_name) and hasattr(
+            getattr(torch.ops, lib_name), op_name
+        ):
+            # Operator already exists, skip registration
+            return
+    except (AttributeError, RuntimeError):
+        # Operator doesn't exist, proceed with registration
+        pass
 
     if hasattr(torch.library, "infer_schema"):
         schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
@@ -1676,11 +1726,22 @@ def direct_register_custom_op(
 
         schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
 
-    my_lib = target_lib or sglang_lib
-    my_lib.define(op_name + schema_str)
-    my_lib.impl(op_name, op_func, "CUDA")
-    if fake_impl is not None:
-        my_lib._register_fake(op_name, fake_impl)
+    try:
+        my_lib.define(op_name + schema_str)
+        my_lib.impl(op_name, op_func, "CUDA")
+        if fake_impl is not None:
+            my_lib._register_fake(op_name, fake_impl)
+    except RuntimeError as error:
+        if "Tried to register an operator" in str(e) and "multiple times" in str(e):
+            # Silently ignore duplicate registration errors
+            # This can happen in multi-engine scenarios
+            pass
+        else:
+            # Re-raise other RuntimeErrors
+            raise error
+    except AttributeError as error:
+        # Always re-raise AttributeError as it indicates missing dependencies
+        raise error
 
 
 def set_gpu_proc_affinity(
@@ -1916,6 +1977,15 @@ def get_ip() -> str:
         # https://developers.google.com/speed/public-dns/docs/using#addresses
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try  using hostname
+    hostname = socket.gethostname()
+    try:
+        ip_addr = socket.gethostbyname(hostname)
+        warnings.warn("using local ip address: {}".format(ip_addr))
+        return ip_addr
     except Exception:
         pass
 
@@ -2733,6 +2803,10 @@ def lru_cache_frozenset(maxsize=128):
     return decorator
 
 
+def get_origin_rid(rid):
+    return rid.split("_", 1)[1] if "_" in rid else rid
+
+
 def apply_module_patch(target_module, target_function, wrappers):
     original_module, original_function = parse_module_path(
         target_module, target_function, False
@@ -2832,6 +2906,18 @@ def parse_module_path(module_path, function_name, create_dummy):
 
 
 def mxfp_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx95_supported():
     """
     Returns whether the current platform supports MX types.
     """
@@ -2957,3 +3043,21 @@ def check_cuda_result(raw_output):
         raise Exception(f"CUDA error: {err}")
 
     return results
+
+
+def numa_bind_to_node(node: int):
+    libnuma = ctypes.CDLL("libnuma.so")
+    if libnuma.numa_available() < 0:
+        raise SystemError("numa not available on this system")
+
+    libnuma.numa_run_on_node(ctypes.c_int(node))
+    libnuma.numa_set_localalloc()
+
+
+def json_list_type(value):
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid JSON list: {value}. Please provide a valid JSON list."
+        )

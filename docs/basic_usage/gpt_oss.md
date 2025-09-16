@@ -6,7 +6,7 @@ Please refer to [https://github.com/sgl-project/sglang/issues/8833](https://gith
 
 ### Responses API
 
-GPT‑OSS is compatible with the OpenAI Responses API. Use `client.responses.create(...)` with `model`, `instructions`, `input`, and optional `tools` to enable built‑in tool use.
+GPT‑OSS is compatible with the OpenAI Responses API. Use `client.responses.create(...)` with `model`, `instructions`, `input`, and optional `tools` to enable built‑in tool use. You can set reasoning level via `instructions`, e.g., "Reasoning: high" (also supports "medium" and "low") — levels: low (fast), medium (balanced), high (deep).
 
 ### Built-in Tools
 
@@ -22,6 +22,11 @@ GPT‑OSS can call built‑in tools for web search and Python execution. You can
 
 - Uses the Exa backend for web search.
 - Requires an Exa API key; set `EXA_API_KEY` in your environment. Create a key at `https://exa.ai`.
+
+### Tool & Reasoning Parser
+
+- We support OpenAI Reasoning and Tool Call parser, as well as our SGLang native api for tool call and reasoning. Refer to [reasoning parser](../advanced_features/separate_reasoning.ipynb) and [tool call parser](../advanced_features/function_calling.ipynb) for more details.
+
 
 ## Notes
 
@@ -63,6 +68,16 @@ tools = [
     {"type": "code_interpreter"},
     {"type": "web_search_preview"},
 ]
+
+# Reasoning level example
+response = client.responses.create(
+    model="openai/gpt-oss-120b",
+    instructions="You are a helpful assistant."
+    reasoning_effort="high" # Supports high, medium, or low
+    input="In one sentence, explain the transformer architecture.",
+)
+print("====== reasoning: high ======")
+print(response.output_text)
 
 # Test python tool
 response = client.responses.create(

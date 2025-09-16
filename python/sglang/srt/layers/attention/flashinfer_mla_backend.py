@@ -28,11 +28,14 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import is_flashinfer_available, next_power_of_2
+from sglang.srt.utils import (
+    is_flashinfer_available,
+    is_sm100_supported,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -93,6 +96,7 @@ class FlashInferMhaChunkKVRunner:
     def update_wrapper(
         self,
         forward_batch: ForwardBatch,
+        disable_flashinfer_ragged: bool = False,
     ):
         assert forward_batch.num_prefix_chunks is not None
         num_prefix_chunks = forward_batch.num_prefix_chunks
@@ -125,16 +129,17 @@ class FlashInferMhaChunkKVRunner:
                 causal=False,
             )
         # ragged prefill
-        self.ragged_wrapper.begin_forward(
-            qo_indptr=qo_indptr,
-            kv_indptr=qo_indptr,
-            num_qo_heads=self.num_local_heads,
-            num_kv_heads=self.num_local_heads,
-            head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
-            head_dim_vo=self.v_head_dim,
-            q_data_type=self.q_data_type,
-            causal=True,
-        )
+        if not disable_flashinfer_ragged:
+            self.ragged_wrapper.begin_forward(
+                qo_indptr=qo_indptr,
+                kv_indptr=qo_indptr,
+                num_qo_heads=self.num_local_heads,
+                num_kv_heads=self.num_local_heads,
+                head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                head_dim_vo=self.v_head_dim,
+                q_data_type=self.q_data_type,
+                causal=True,
+            )
 
     def forward(
         self,
@@ -488,9 +493,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ):
         """Init the metadata for a forward pass."""
-        self.mha_chunk_kv_cache.update_wrapper(forward_batch)
+        self.mha_chunk_kv_cache.update_wrapper(forward_batch, disable_flashinfer_ragged)
 
     def forward_extend(
         self,

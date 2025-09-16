@@ -53,8 +53,6 @@ class TreeNode:
         self.last_access_time = time.monotonic()
 
         self.hit_count = 0
-        # indicating the node is loading KV cache from host
-        self.loading = False
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0
@@ -62,7 +60,6 @@ class TreeNode:
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
-        self.backuped_storage = False
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -152,6 +149,7 @@ class RadixCache(BasePrefixCache):
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
+        self.root_node.host_value = []
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
@@ -194,7 +192,7 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: List, value=None):
+    def insert(self, key: List, value=None, chunked=False):
         if self.disable:
             return 0
 
@@ -239,7 +237,7 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req):
+    def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
@@ -260,7 +258,9 @@ class RadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
+        new_prefix_len = self.insert(
+            page_aligned_token_ids, page_aligned_kv_indices, chunked=chunked
+        )
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
