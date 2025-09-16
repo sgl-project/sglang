@@ -53,7 +53,7 @@ class SchedulerMetricsMixin:
             # Map disaggregation_mode to engine_type (null -> unified, others as-is)
             engine_type = (
                 "unified"
-                if self.server_args.disaggregation_mode == "null"
+                if self.server_args.disaggregation_mode == DisaggregationMode.NULL.value
                 else self.server_args.disaggregation_mode
             )
 
