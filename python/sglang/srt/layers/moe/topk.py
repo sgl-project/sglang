@@ -213,14 +213,6 @@ class TopK(CustomOp):
         if use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
 
-        if (
-            quant_config is not None
-            and quant_config.get_name() == "modelopt_fp4"
-            and should_use_flashinfer_trtllm_moe()
-        ):
-            # https://github.com/sgl-project/sglang/pull/9834#discussion_r2324480643
-            correction_bias = correction_bias.to(torch.bfloat16)
-
         self.topk_config = TopKConfig(
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,

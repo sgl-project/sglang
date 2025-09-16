@@ -143,10 +143,10 @@ def get_backend_from_name(name: str) -> BaseLoRABackend:
         from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 
         return TritonLoRABackend
-    # elif name == "csgmv":
-    #     from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
+    elif name == "csgmv":
+        from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 
-    #     return ChunkedSgmvLoRABackend
+        return ChunkedSgmvLoRABackend
     elif name == "flashinfer":
         raise ValueError(
             "FlashInfer LoRA backend has been deprecated, please use `triton` instead."
