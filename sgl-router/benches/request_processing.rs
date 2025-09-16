@@ -45,6 +45,7 @@ fn default_generate_request() -> GenerateRequest {
         session_params: None,
         return_hidden_states: false,
         rid: None,
+        parallel_batch: None,
     }
 }
 
@@ -93,6 +94,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         stream_reasoning: true,
         chat_template_kwargs: None,
         return_hidden_states: false,
+        parallel_batch: None,
     }
 }
 
@@ -133,6 +135,7 @@ fn default_completion_request() -> CompletionRequest {
         lora_path: None,
         session_params: None,
         return_hidden_states: false,
+        parallel_batch: None,
         other: serde_json::Map::new(),
     }
 }
