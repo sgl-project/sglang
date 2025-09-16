@@ -10,6 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 def execute():
+    if dist.get_rank() == 0:
+        logger.info(f"[slow_rank_detector] Start benchmarking...")
+
     local_metrics = {bench_name: _compute_local_metric(bench_name) for bench_name in _BENCH_NAMES}
 
     all_metrics = [None for _ in range(dist.get_world_size())]
@@ -21,8 +24,8 @@ def execute():
 
 class _GemmExecutor:
     def __init__(self):
-        self.lhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
-        self.rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
+        self.lhs = torch.randn((8192, 8192), dtype=torch.bfloat16, device='cuda')
+        self.rhs = torch.randn((8192, 8192), dtype=torch.bfloat16, device='cuda')
 
     def __call__(self):
         self.lhs @ self.rhs
@@ -30,7 +33,7 @@ class _GemmExecutor:
 
 class _ElementwiseExecutor:
     def __init__(self):
-        self.value = torch.randn(128 * 1024 ** 2, dtype=torch.int32, device='cuda')
+        self.value = torch.randint(0, 10000, (128 * 1024 ** 2,), dtype=torch.int32, device='cuda')
 
     def __call__(self):
         self.value += 1
@@ -46,7 +49,7 @@ _BENCH_NAMES = list(_EXECUTOR_CLS_OF_BENCH.keys())
 
 def _compute_local_metric(bench_name):
     executor = _EXECUTOR_CLS_OF_BENCH[bench_name]()
-    ms, _, _ = triton.testing.do_bench_cudagraph(executor, return_mode="mean")
+    ms = triton.testing.do_bench_cudagraph(executor, return_mode="mean", rep=20)
     return ms
 
 
