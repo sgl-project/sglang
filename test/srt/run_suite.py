@@ -81,6 +81,7 @@ suites = {
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
+        TestFile("test_logprobs.py", 55),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
