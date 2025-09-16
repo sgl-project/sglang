@@ -191,6 +191,7 @@ mod test_pd_routing {
                 connection_mode: ConnectionMode::Http,
                 model_path: None,
                 tokenizer_path: None,
+                history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             };
 
             // Router creation will fail due to health checks, but config should be valid
