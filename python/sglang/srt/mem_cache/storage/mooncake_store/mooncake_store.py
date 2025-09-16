@@ -200,68 +200,20 @@ class MooncakeStore(HiCacheStorage):
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
     def _get_mha_buffer_meta(self, keys, indices):
-        ptr_list = []
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
-        kv_buffer_data_ptr = self.mem_pool_host.kv_buffer.data_ptr()
-        indices = indices.tolist()
-        v_offset = (
-            self.mem_pool_host.layer_num
-            * self.mem_pool_host.size
-            * self.mem_pool_host.head_num
-            * self.mem_pool_host.head_dim
-            * self.mem_pool_host.dtype.itemsize
-        )
-        for index in range(0, len(indices), self.mem_pool_host.page_size):
-            k_ptr = (
-                kv_buffer_data_ptr
-                + indices[index]
-                * self.mem_pool_host.layer_num
-                * self.mem_pool_host.head_num
-                * self.mem_pool_host.head_dim
-                * self.mem_pool_host.dtype.itemsize
-            )
-            v_ptr = k_ptr + v_offset
-            ptr_list.append(k_ptr)
-            ptr_list.append(v_ptr)
-            key_ = keys[index // self.mem_pool_host.page_size]
+        for key_ in keys:
             key_list.append(f"{key_}_{self.local_rank}_k")
             key_list.append(f"{key_}_{self.local_rank}_v")
-        element_size = (
-            self.mem_pool_host.layer_num
-            * self.mem_pool_host.dtype.itemsize
-            * self.mem_pool_host.page_size
-            * self.mem_pool_host.head_num
-            * self.mem_pool_host.head_dim
-        )
-        element_size_list = [element_size] * len(key_list)
+        assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
     def _get_mla_buffer_meta(self, keys, indices):
-        ptr_list = []
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
-        kv_buffer_data_ptr = self.mem_pool_host.kv_buffer.data_ptr()
-        indices = indices.tolist()
-        for index in range(0, len(indices), self.mem_pool_host.page_size):
-            k_ptr = (
-                kv_buffer_data_ptr
-                + indices[index]
-                * self.mem_pool_host.layer_num
-                * (
-                    self.mem_pool_host.kv_lora_rank
-                    + self.mem_pool_host.qk_rope_head_dim
-                )
-                * self.mem_pool_host.dtype.itemsize
-            )
-            ptr_list.append(k_ptr)
-            key_ = keys[index // self.mem_pool_host.page_size]
+        for key_ in keys:
             key_list.append(f"{key_}_k")
-        element_size = (
-            self.mem_pool_host.layer_num
-            * self.mem_pool_host.dtype.itemsize
-            * self.mem_pool_host.page_size
-            * (self.mem_pool_host.kv_lora_rank + self.mem_pool_host.qk_rope_head_dim)
-        )
-        element_size_list = [element_size] * len(key_list)
+        assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
     def _batch_preprocess(self, keys, host_indices):
