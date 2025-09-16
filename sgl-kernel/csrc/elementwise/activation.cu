@@ -190,3 +190,23 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     return true;
   });
 }
+
+#if USE_ROCM
+void gelu_quick(at::Tensor& out, const at::Tensor& input) {
+  int d = input.size(-1);
+  int64_t num_tokens = input.numel() / input.size(-1);
+  dim3 grid(num_tokens);
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
+    uint32_t vec_size = 16 / sizeof(c_type);
+    dim3 block(std::min(d / vec_size, 1024U));
+    sgl_hip::activation::act_only_kernel<c_type, gelu_quick_act>
+        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+
+    return true;
+  });
+}
+#endif
