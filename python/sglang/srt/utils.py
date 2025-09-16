@@ -3157,11 +3157,11 @@ def json_list_type(value):
 def temp_set_cuda_visible_devices(gpu_id: int):
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if original_cuda_visible_devices:
-        cuda_visisble_devices = original_cuda_visible_devices.split(",")
+        cuda_visible_devices = original_cuda_visible_devices.split(",")
     else:
-        cuda_visisble_devices = []
+        cuda_visible_devices = []
 
-    str_gpu_id = cuda_visisble_devices[gpu_id] if cuda_visisble_devices else str(gpu_id)
+    str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
     os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
     yield
     if original_cuda_visible_devices:
