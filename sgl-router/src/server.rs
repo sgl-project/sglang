@@ -1,6 +1,7 @@
 use crate::{
-    config::{ConnectionMode, RouterConfig},
+    config::{ConnectionMode, HistoryBackend, RouterConfig},
     core::{WorkerRegistry, WorkerType},
+    data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
     middleware::{self, QueuedRequest, TokenBucket},
@@ -50,6 +51,7 @@ pub struct AppContext {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
+    pub response_storage: SharedResponseStorage,
 }
 
 impl AppContext {
@@ -94,6 +96,12 @@ impl AppContext {
 
         let router_manager = None;
 
+        // Initialize response storage based on configuration
+        let response_storage: SharedResponseStorage = match router_config.history_backend {
+            HistoryBackend::Memory => Arc::new(MemoryResponseStorage::new()),
+            HistoryBackend::None => Arc::new(NoOpResponseStorage::new()),
+        };
+
         Ok(Self {
             client,
             router_config,
@@ -104,6 +112,7 @@ impl AppContext {
             worker_registry,
             policy_registry,
             router_manager,
+            response_storage,
         })
     }
 }
