@@ -58,6 +58,7 @@ jobs:
           docker exec ci_sglang_xeon bash -c "python3 -m pip install --upgrade pip"
           docker exec ci_sglang_xeon pip uninstall sgl-kernel -y || true
           docker exec -w /sglang-checkout/sgl-kernel ci_sglang_xeon bash -c "cp pyproject_cpu.toml pyproject.toml && pip install -v ."
+          docker exec -w /sglang-checkout/ ci_sglang_xeon bash -c "rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml"
           docker exec -w /sglang-checkout/ ci_sglang_xeon bash -c "pip install -e "python[dev_cpu]""
 
       - name: Check AMX support

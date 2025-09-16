@@ -111,6 +111,8 @@ ATTENTION_BACKEND_CHOICES = [
     "ascend",
 ]
 
+LORA_BACKEND_CHOICES = ["triton", "csgmv"]
+
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
@@ -1611,7 +1613,8 @@ class ServerArgs:
         parser.add_argument(
             "--lora-backend",
             type=str,
-            default="triton",
+            choices=LORA_BACKEND_CHOICES,
+            default=ServerArgs.lora_backend,
             help="Choose the kernel backend for multi-LoRA serving.",
         )
 
