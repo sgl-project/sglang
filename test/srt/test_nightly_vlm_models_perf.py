@@ -6,7 +6,6 @@ import warnings
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     _parse_int_list_env,
     extract_trace_link_from_bench_one_batch_server_output,
@@ -18,7 +17,6 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-REPORT_MD_FILENAME = "vlm_performance_report.md"
 PROFILE_DIR = "performance_profiles_vlms"
 
 MODEL_DEFAULTS = [
@@ -131,10 +129,6 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                     self.output_lens,
                 )
                 self.full_report += report_part + "\n"
-
-        with open(REPORT_MD_FILENAME, "w") as f:
-            print(f"results written to {REPORT_MD_FILENAME=}")
-            f.write(self.full_report)
 
         if is_in_ci():
             write_github_step_summary(self.full_report)

@@ -21,7 +21,6 @@ from sglang.test.test_utils import (
 )
 
 PROFILE_DIR = "performance_profiles_text_models"
-REPORT_MD_FILENAME = "performance_report.md"
 
 
 class TestNightlyTextModelsPerformance(unittest.TestCase):
@@ -122,11 +121,6 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                             model, model_results, self.input_lens, self.output_lens
                         )
                         self.full_report += report_part + "\n"
-
-        # Persist the report for later substitution of artifact URL in the workflow
-        with open(REPORT_MD_FILENAME, "w") as f:
-            print(f"results written to {REPORT_MD_FILENAME=}")
-            f.write(self.full_report)
 
         if is_in_ci():
             write_github_step_summary(self.full_report)

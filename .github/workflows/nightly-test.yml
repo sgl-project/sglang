@@ -77,23 +77,6 @@ jobs:
             echo "No changes to commit"
           fi
 
-      - name: Print text models performance table if exists
-        run: |
-          python3 - <<'PY'
-          import os
-          p = 'test/srt/vlm_performance_report.md'
-          if not os.path.exists(p):
-              print('VLM Report not found, skip printing')
-              raise SystemExit(0)
-          s = open(p, 'r').read()
-          # append to GitHub summary
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-              f.write('\n')
-              f.write(s)
-          PY
-
-
-
   nightly-test-eval-vlm-models:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
@@ -111,20 +94,6 @@ jobs:
           cd test/srt
           python3 test_nightly_vlm_mmmu_eval.py
 
-      - name: Print performance table if exists
-        run: |
-          python3 - <<'PY'
-          import os
-          p = 'test/srt/performance_report.md'
-          if not os.path.exists(p):
-              print('Report not found, skip printing')
-              raise SystemExit(0)
-          s = open(p, 'r').read()
-          # append to GitHub summary
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-              f.write('\n')
-              f.write(s)
-          PY
 
   nightly-test-perf-vlm-models:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
@@ -170,18 +139,3 @@ jobs:
           else
             echo "No changes to commit"
           fi
-
-      - name: Print VLM performance table if exists
-        run: |
-          python3 - <<'PY'
-          import os
-          p = 'test/srt/vlm_performance_report.md'
-          if not os.path.exists(p):
-              print('VLM Report not found, skip printing')
-              raise SystemExit(0)
-          s = open(p, 'r').read()
-          # append to GitHub summary
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-              f.write('\n')
-              f.write(s)
-          PY
