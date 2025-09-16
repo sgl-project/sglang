@@ -524,7 +524,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
+        print(f"{pixel_values=}")
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+        print(f"{image_grid_thw.tolist()=}")
+
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         if self.use_data_parallel:

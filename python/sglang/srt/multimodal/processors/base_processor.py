@@ -35,7 +35,7 @@ SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
-    # input_text, with each frame of video/image represented with a image_token
+    # input_text with all multimodality placeholder token expanded
     input_text: str
 
     # frames loaded from image, in given order
@@ -450,7 +450,6 @@ class BaseMultimodalProcessor(ABC):
 
         """
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
-
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
             prompt = self._processor.tokenizer.decode(prompt)
@@ -460,7 +459,6 @@ class BaseMultimodalProcessor(ABC):
         assert isinstance(prompt, str)
         # split text into list of normal text and special tokens
         text_parts = re.split(multimodal_tokens_pattern, prompt)
-        print(f"{image_data=}")
         # collect all data
         data_iterators = {}
         if multimodal_tokens.image_token and image_data:
@@ -496,7 +494,6 @@ class BaseMultimodalProcessor(ABC):
                     )
                     has_precomputed_input = has_precomputed_input | is_precomputed
                     result = next(futures_iter).result()
-                    print(f"{result=}")
                     if modality == Modality.IMAGE:
                         # If data is already processed or embedded, it will be a
                         # dictionary(processed, or precomputed). In this case we want to keep the
@@ -535,9 +532,15 @@ class BaseMultimodalProcessor(ABC):
                     # normal text
                     new_text_parts += [text_part]
 
-            except Exception as e:
+            except StopIteration as e:
+                # when precomputed_input is presented with multi-images, StopIteration is expected
                 if has_precomputed_input:
+                    new_text_parts += [text_part]
                     continue
+                raise RuntimeError(
+                    f"An exception occurred while loading multimodal data: {e}"
+                )
+            except Exception as e:
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
@@ -582,7 +585,6 @@ class BaseMultimodalProcessor(ABC):
         Note that the data_dict can be passed via offline engine api
         """
 
-        print(f"collect_mm_items_from_processor_output")
         items: dict[Modality, MultimodalDataItem] = {}
         for attr_name, value in data_dict.items():
             if attr_name == "input_ids":
@@ -686,9 +688,10 @@ class BaseMultimodalProcessor(ABC):
         # Handle dict items (processed or precomputed)
         for modality, dict_item in dict_items:
             if dict_item.get("format", None) == "processor_output":
-                all_collected_items.extend(
-                    self.collect_mm_items_from_processor_output(dict_item)
-                )
+                items = self.collect_mm_items_from_processor_output(dict_item)
+                for item in items:
+                    item.format = MultimodalInputFormat.PROCESSOR_OUTPUT
+                all_collected_items.extend(items)
             elif dict_item.get("format", None) == "precomputed_embedding":
                 all_collected_items.append(
                     MultimodalDataItem(
@@ -698,7 +701,6 @@ class BaseMultimodalProcessor(ABC):
                         model_specific_data=dict_item,
                     )
                 )
-
         # Fallback tokenization if no raw items were processed
         if input_ids is None:
             input_ids = self._processor.tokenizer(
