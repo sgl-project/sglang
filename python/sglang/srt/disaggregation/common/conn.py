@@ -73,6 +73,7 @@ class CommonKVManager(BaseKVManager):
         self.server_socket = zmq.Context().socket(zmq.PULL)
         if is_valid_ipv6_address(self.local_ip):
             self.server_socket.setsockopt(zmq.IPV6, 1)
+        self.request_status: Dict[int, KVPoll] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._register_to_bootstrap()
