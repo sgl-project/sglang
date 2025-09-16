@@ -4,7 +4,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 ARG BUILD_TYPE=blackwell
 ARG DEEPEP_COMMIT=1b14ad661c7640137fcfe93cccb2694ede1220b0
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
-ARG SGL_KERNEL_VERSION=0.3.9.post2
+ARG SGL_KERNEL_VERSION=0.3.10
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \

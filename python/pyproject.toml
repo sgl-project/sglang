@@ -57,7 +57,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.24",
-  "sgl-kernel==0.3.9.post2",
+  "sgl-kernel==0.3.10",
   "torch==2.8.0",
   "torchaudio==2.8.0",
   "torchvision",
@@ -67,10 +67,10 @@ dependencies = [
   "tiktoken",
   "anthropic>=0.20.0",
   "torch_memory_saver==0.0.8",
-  "decord",
 ]
 
 [project.optional-dependencies]
+decord = ["decord"]
 test = [
   "accelerate",
   "expecttest",
@@ -88,8 +88,8 @@ tracing = [
     "opentelemetry-exporter-otlp",
     "opentelemetry-exporter-otlp-proto-grpc",
 ]
-all = ["sglang[test]"]
-blackwell = ["nvidia-cutlass-dsl==4.1.0", "sglang[test]"]
+all = ["sglang[test]", "sglang[decord]"]
+blackwell = ["nvidia-cutlass-dsl==4.2.0", "sglang[test]"]
 dev = ["sglang[test]"]
 
 [project.urls]
