@@ -70,8 +70,8 @@ class JsonArrayDetector(BaseFormatDetector):
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         """
-        Wrapper for base format detector to handle JSON array specifics. To prevent partial json loader crash,
-        we withhold the tool call separator until we see the next JSON object start.
+        Parse JSON array tool calls with improved separator detection.
+        Uses brace counting to find valid separators that are outside JSON objects.
         """
         # If we previously withheld a valid tool-call separator, prepend it
         # when we see the next JSON object start
@@ -81,10 +81,18 @@ class JsonArrayDetector(BaseFormatDetector):
                 # Re-insert the withheld separator before the new object.
                 new_text = self.tool_call_separator + new_text
                 self._pending_separator = False
-
-        # Detect the configured tool call separator within this chunk.
-        sep_index = self._find_valid_separator(new_text)
-        if sep_index != -1 and sep_index > 0:  # Ensure separator is not at position 0
+                # Process the original text (without the prepended separator) for separator detection
+                sep_index = self._find_valid_separator(new_text[1:])
+                if sep_index != -1:
+                    sep_index += 1  # Adjust for the prepended separator
+            else:
+                # No new object starting, just process normally
+                sep_index = self._find_valid_separator(new_text)
+        else:
+            # Detect the configured tool call separator within this chunk.
+            sep_index = self._find_valid_separator(new_text)
+            
+        if sep_index > 0:  # Ensure separator is not at position 0
             # Candidate separator found. Validate that the content before it
             # closes a complete JSON object, using the accumulated buffer.
             json_part = new_text[:sep_index]
@@ -93,6 +101,8 @@ class JsonArrayDetector(BaseFormatDetector):
             full_json = self._buffer + json_part
             if full_json.startswith(self.bot_token):
                 full_json = full_json[len(self.bot_token):]
+            elif full_json.startswith(self.tool_call_separator):
+                full_json = full_json[len(self.tool_call_separator):]
             if full_json.endswith(self.eot_token):
                 full_json = full_json[:-len(self.eot_token)]
 
@@ -101,14 +111,11 @@ class JsonArrayDetector(BaseFormatDetector):
                 # It's a valid object followed by a separator.
                 remainder = new_text[sep_index + len(self.tool_call_separator):]
                 if remainder:
-                    # Strip leading whitespace from remainder before prepending separator
-                    remainder_stripped = remainder.lstrip()
-                    # Process the complete chunk with separator reinserted
-                    return super().parse_streaming_increment(
-                        json_part + self.tool_call_separator + remainder_stripped, tools
-                    )
+                    # There's more text after the separator - process normally
+                    return super().parse_streaming_increment(new_text, tools)
                 else:
-                    # No remainder. Withhold the separator for the next chunk.
+                    # No remainder - separator was at end of chunk
+                    # Withhold the separator for the next chunk
                     self._pending_separator = True
                     return super().parse_streaming_increment(json_part, tools)
             except json.JSONDecodeError:
