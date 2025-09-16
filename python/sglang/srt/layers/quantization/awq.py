@@ -1002,7 +1002,7 @@ class AWQMoEAscendMethod(AWQMoEMethod):
         dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        
+
         assert (
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
