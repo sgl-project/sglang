@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_npu,
     is_port_available,
     is_remote_url,
     is_sm90_supported,
@@ -109,6 +110,8 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
 ]
+
+LORA_BACKEND_CHOICES = ["triton", "csgmv"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
@@ -205,6 +208,8 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
+    tokenizer_metrics_custom_labels_header: str = "x-customer-labels"
+    tokenizer_metrics_allowed_customer_labels: Optional[List[str]] = None
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
@@ -215,6 +220,8 @@ class ServerArgs:
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
     gc_warning_threshold_secs: float = 0.0
+    enable_trace: bool = False
+    oltp_traces_endpoint: str = "localhost:4317"
 
     # API related
     api_key: Optional[str] = None
@@ -231,6 +238,7 @@ class ServerArgs:
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+    load_watch_interval: float = 0.1
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -360,6 +368,7 @@ class ServerArgs:
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
     triton_attention_num_kv_splits: int = 8
+    triton_attention_split_tile_size: Optional[int] = None
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
@@ -373,6 +382,11 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
 
+    # Dynamic batch tokenizer
+    enable_dynamic_batch_tokenizer: bool = False
+    dynamic_batch_tokenizer_batch_size: int = 32
+    dynamic_batch_tokenizer_batch_timeout: float = 0.002
+
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
     debug_tensor_dump_input_file: Optional[str] = None
@@ -380,7 +394,7 @@ class ServerArgs:
     debug_tensor_dump_prefill_only: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
-    disaggregation_mode: str = "null"
+    disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_decode_tp: Optional[int] = None
@@ -388,6 +402,9 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
+
+    # FIXME: hack to reduce ITL when decode bs is small
+    disaggregation_decode_polling_interval: int = 1
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -570,7 +587,7 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
-        if self.attention_backend == "ascend":
+        if is_npu() and self.attention_backend in ["ascend", "hybrid_linear_attn"]:
             logger.warning(
                 "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
             )
@@ -652,6 +669,7 @@ class ServerArgs:
 
         if self.dp_size == 1:
             self.enable_dp_attention = False
+            self.enable_dp_lm_head = False
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -874,6 +892,13 @@ class ServerArgs:
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
 
+        # Validation: prevent both tokenizer batching features from being enabled
+        if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
+            raise ValueError(
+                "Cannot enable both --enable-tokenizer-batch-encode and --enable-dynamic-batch-tokenizer. "
+                "Please choose one tokenizer batching approach."
+            )
+
         # Propagate env vars
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
@@ -889,6 +914,14 @@ class ServerArgs:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
+            )
+
+        if (
+            not self.tokenizer_metrics_custom_labels_header
+            and self.tokenizer_metrics_allowed_customer_labels
+        ):
+            raise ValueError(
+                "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-customer-labels."
             )
 
     @staticmethod
@@ -1305,6 +1338,21 @@ class ServerArgs:
             "otherwise all metrics appear to come from TP 0.",
         )
         parser.add_argument(
+            "--tokenizer-metrics-custom-labels-header",
+            type=str,
+            default=ServerArgs.tokenizer_metrics_custom_labels_header,
+            help="Specify the HTTP header for passing customer labels for tokenizer metrics.",
+        )
+        parser.add_argument(
+            "--tokenizer-metrics-allowed-customer-labels",
+            type=str,
+            nargs="+",
+            default=ServerArgs.tokenizer_metrics_allowed_customer_labels,
+            help="The customer labels allowed for tokenizer metrics. The labels are specified via a dict in "
+            "'--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': "
+            "'value2'} is allowed if '--tokenizer-metrics-allowed-labels label1 label2' is set.",
+        )
+        parser.add_argument(
             "--bucket-time-to-first-token",
             type=float,
             nargs="+",
@@ -1374,6 +1422,17 @@ class ServerArgs:
             type=str,
             default=None,
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        )
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            "--oltp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
 
         # API related
@@ -1460,6 +1519,12 @@ class ServerArgs:
             ],
         )
         parser.add_argument(
+            "--load-watch-interval",
+            type=float,
+            default=ServerArgs.load_watch_interval,
+            help="The interval of load watching in seconds.",
+        )
+        parser.add_argument(
             "--prefill-round-robin-balance",
             default=ServerArgs.prefill_round_robin_balance,
             action="store_true",
@@ -1539,7 +1604,8 @@ class ServerArgs:
         parser.add_argument(
             "--lora-backend",
             type=str,
-            default="triton",
+            choices=LORA_BACKEND_CHOICES,
+            default=ServerArgs.lora_backend,
             help="Choose the kernel backend for multi-LoRA serving.",
         )
 
@@ -2073,6 +2139,12 @@ class ServerArgs:
             help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
         )
         parser.add_argument(
+            "--triton-attention-split-tile-size",
+            type=int,
+            default=ServerArgs.triton_attention_split_tile_size,
+            help="The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference.",
+        )
+        parser.add_argument(
             "--num-continuous-decode-steps",
             type=int,
             default=ServerArgs.num_continuous_decode_steps,
@@ -2162,12 +2234,29 @@ class ServerArgs:
             action="store_true",
             help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
         )
+        parser.add_argument(
+            "--enable-dynamic-batch-tokenizer",
+            action="store_true",
+            help="Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-tokenizer-batch-size",
+            type=int,
+            default=ServerArgs.dynamic_batch_tokenizer_batch_size,
+            help="[Only used if --enable-dynamic-batch-tokenizer is set] Maximum batch size for dynamic batch tokenizer.",
+        )
+        parser.add_argument(
+            "--dynamic-batch-tokenizer-batch-timeout",
+            type=float,
+            default=ServerArgs.dynamic_batch_tokenizer_batch_timeout,
+            help="[Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests.",
+        )
 
         # PD disaggregation
         parser.add_argument(
             "--disaggregation-mode",
             type=str,
-            default="null",
+            default=ServerArgs.disaggregation_mode,
             choices=["null", "prefill", "decode"],
             help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
         )
@@ -2215,6 +2304,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.num_reserved_decode_tokens,
             help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-polling-interval",
+            type=int,
+            default=ServerArgs.disaggregation_decode_polling_interval,
+            help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
         )
 
         # Custom weight loader
@@ -2345,7 +2440,8 @@ class ServerArgs:
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
-        if self.chunked_prefill_size > 0:
+        # Skip validation if disaggregation mode is decode.
+        if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"

@@ -24,6 +24,7 @@ suites = {
         TestFile("lora/test_lora_update.py", 400),
         TestFile("lora/test_lora_qwen3.py", 97),
         TestFile("lora/test_lora_radix_cache.py", 100),
+        TestFile("lora/test_chunked_sgmv_backend.py", 30),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -146,8 +147,8 @@ suites = {
         TestFile("test_full_deepseek_v3.py", 333),
     ],
     "per-commit-8-gpu-b200": [
-        # add more here
         TestFile("test_gpt_oss_4gpu.py", 600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 600),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),

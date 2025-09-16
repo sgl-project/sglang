@@ -191,6 +191,7 @@ _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
+    # FIXME: move your environment variable to sglang.environ
     value = os.getenv(name, default)
     value = value.lower()
 
@@ -208,6 +209,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
 
 
 def get_int_env_var(name: str, default: int = 0) -> int:
+    # FIXME: move your environment variable to sglang.environ
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
@@ -1160,7 +1162,7 @@ def pytorch_profile(name, func, *args, data_size=-1):
 
 def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-):
+) -> zmq.Socket:
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3

@@ -65,13 +65,11 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import (
-    FusedMoE,
-    _is_fp4_quantization_enabled,
-)
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -154,6 +152,7 @@ if _is_cuda:
     from sgl_kernel import (
         awq_dequantize,
         bmm_fp8,
+        concat_mla_k,
         dsv3_fused_a_gemm,
         dsv3_router_gemm,
         merge_state_v2,
@@ -271,6 +270,7 @@ class MoEGate(nn.Module):
     def __init__(
         self,
         config,
+        quant_config,
         prefix: str = "",
         is_nextn: bool = False,
     ):
@@ -280,8 +280,15 @@ class MoEGate(nn.Module):
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
         if config.topk_method == "noaux_tc":
+            correction_bias_dtype = (
+                torch.bfloat16
+                if quant_config is not None
+                and quant_config.get_name() == "modelopt_fp4"
+                and should_use_flashinfer_trtllm_moe()
+                else torch.float32
+            )
             self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=torch.float32)
+                torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
             )
         else:
             self.e_score_correction_bias = None
@@ -356,7 +363,10 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self.gate = MoEGate(
-            config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("gate", prefix),
+            is_nextn=is_nextn,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -373,9 +383,6 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        correction_bias = self.gate.e_score_correction_bias
-        if _is_fp4_quantization_enabled():
-            correction_bias = correction_bias.to(torch.bfloat16)
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             renormalize=config.norm_topk_prob,
@@ -383,10 +390,13 @@ class DeepseekV2MoE(nn.Module):
             num_expert_group=config.n_group,
             num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=config.topk_group,
-            correction_bias=correction_bias,
+            correction_bias=self.gate.e_score_correction_bias,
+            quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk(),
-            force_topk=quant_config is None,
+            # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
+            # and requires the output format to be standard. We use quant_config to determine the output format.
+            output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
 
         self.shared_experts_is_int8 = False
@@ -1298,8 +1308,18 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
-        k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+
+        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
+        if (
+            _is_cuda
+            and (self.num_local_heads == 128)
+            and (self.qk_nope_head_dim == 128)
+            and (self.qk_rope_head_dim == 64)
+        ):
+            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
+        else:
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_pe
 
         if not _is_npu:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
@@ -2236,8 +2256,15 @@ class DeepseekV2Model(nn.Module):
                     [
                         "w13_weight",
                         "w2_weight",
-                        "w13_blockscale_swizzled",
-                        "w2_blockscale_swizzled",
+                        # only for nvfp4
+                        *(
+                            [
+                                "w13_blockscale_swizzled",
+                                "w2_blockscale_swizzled",
+                            ]
+                            if hasattr(module, "w13_blockscale_swizzled")
+                            else []
+                        ),
                     ]
                     if isinstance(module, FusedMoE)
                     else []

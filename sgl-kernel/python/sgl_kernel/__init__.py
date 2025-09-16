@@ -23,6 +23,7 @@ from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_
 from sgl_kernel.elementwise import (
     FusedSetKVBufferArg,
     apply_rope_with_cos_sin_cache_inplace,
+    concat_mla_absorb_q,
     concat_mla_k,
     copy_to_gpu_no_ce,
     downcast_fp8,
@@ -34,11 +35,6 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
-from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
-
-if torch.version.hip is not None:
-    from sgl_kernel.elementwise import gelu_quick
-
 from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.gemm import (
     awq_dequantize,
@@ -71,6 +67,7 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
+from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
 from sgl_kernel.marlin import (
     awq_marlin_moe_repack,
     awq_marlin_repack,
@@ -103,6 +100,9 @@ from sgl_kernel.speculative import (
 )
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__
+
+if torch.version.hip is not None:
+    from sgl_kernel.elementwise import gelu_quick
 
 
 def create_greenctx_stream_by_value(*args, **kwargs):
