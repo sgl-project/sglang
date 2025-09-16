@@ -58,6 +58,7 @@ impl TestContext {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1090,10 +1091,14 @@ mod responses_endpoint_tests {
         let app = ctx.create_app().await;
 
         // First create a response to obtain an id
+        let resp_id = "test-get-resp-id-123";
         let payload = json!({
             "input": "Hello Responses API",
             "model": "mock-model",
-            "stream": false
+            "stream": false,
+            "store": true,
+            "background": true,
+            "request_id": resp_id
         });
         let req = Request::builder()
             .method("POST")
@@ -1103,11 +1108,6 @@ mod responses_endpoint_tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let resp_id = body_json["id"].as_str().unwrap().to_string();
 
         // Retrieve the response
         let req = Request::builder()
@@ -1140,10 +1140,14 @@ mod responses_endpoint_tests {
         let app = ctx.create_app().await;
 
         // First create a response to obtain an id
+        let resp_id = "test-cancel-resp-id-456";
         let payload = json!({
             "input": "Hello Responses API",
             "model": "mock-model",
-            "stream": false
+            "stream": false,
+            "store": true,
+            "background": true,
+            "request_id": resp_id
         });
         let req = Request::builder()
             .method("POST")
@@ -1153,11 +1157,6 @@ mod responses_endpoint_tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let resp_id = body_json["id"].as_str().unwrap().to_string();
 
         // Cancel the response
         let req = Request::builder()
@@ -1394,6 +1393,7 @@ mod error_tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1752,6 +1752,7 @@ mod pd_mode_tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         };
 
         // Create app context
@@ -1914,6 +1915,7 @@ mod request_id_tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         };
 
         let ctx = TestContext::new_with_config(
