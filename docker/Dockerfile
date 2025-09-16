@@ -1,4 +1,4 @@
-ARG CUDA_VERSION=12.6.1
+ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
 
 ARG BUILD_TYPE=all

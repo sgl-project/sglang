@@ -4,6 +4,7 @@ use super::{get_healthy_worker_indices, LoadBalancingPolicy};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use rand::Rng;
+use std::sync::Arc;
 
 /// Random selection policy
 ///
@@ -20,7 +21,7 @@ impl RandomPolicy {
 impl LoadBalancingPolicy for RandomPolicy {
     fn select_worker(
         &self,
-        workers: &[Box<dyn Worker>],
+        workers: &[Arc<dyn Worker>],
         _request_text: Option<&str>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
@@ -56,16 +57,16 @@ mod tests {
     #[test]
     fn test_random_selection() {
         let policy = RandomPolicy::new();
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(BasicWorker::new(
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
                 "http://w1:8000".to_string(),
                 WorkerType::Regular,
             )),
-            Box::new(BasicWorker::new(
+            Arc::new(BasicWorker::new(
                 "http://w2:8000".to_string(),
                 WorkerType::Regular,
             )),
-            Box::new(BasicWorker::new(
+            Arc::new(BasicWorker::new(
                 "http://w3:8000".to_string(),
                 WorkerType::Regular,
             )),
@@ -87,12 +88,12 @@ mod tests {
     #[test]
     fn test_random_with_unhealthy_workers() {
         let policy = RandomPolicy::new();
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(BasicWorker::new(
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
                 "http://w1:8000".to_string(),
                 WorkerType::Regular,
             )),
-            Box::new(BasicWorker::new(
+            Arc::new(BasicWorker::new(
                 "http://w2:8000".to_string(),
                 WorkerType::Regular,
             )),
@@ -110,7 +111,7 @@ mod tests {
     #[test]
     fn test_random_no_healthy_workers() {
         let policy = RandomPolicy::new();
-        let workers: Vec<Box<dyn Worker>> = vec![Box::new(BasicWorker::new(
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
             "http://w1:8000".to_string(),
             WorkerType::Regular,
         ))];

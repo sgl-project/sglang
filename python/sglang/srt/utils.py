@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import builtins
 import ctypes
@@ -190,6 +191,7 @@ _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
+    # FIXME: move your environment variable to sglang.environ
     value = os.getenv(name, default)
     value = value.lower()
 
@@ -207,6 +209,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
 
 
 def get_int_env_var(name: str, default: int = 0) -> int:
+    # FIXME: move your environment variable to sglang.environ
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
@@ -1159,7 +1162,7 @@ def pytorch_profile(name, func, *args, data_size=-1):
 
 def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-):
+) -> zmq.Socket:
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -1431,6 +1434,7 @@ def init_custom_process_group(
     store=None,
     group_name=None,
     pg_options=None,
+    device_id=None,
 ):
     from torch.distributed.distributed_c10d import (
         Backend,
@@ -1484,6 +1488,7 @@ def init_custom_process_group(
         group_name=group_name,
         **{pg_options_param_name: pg_options},
         timeout=timeout,
+        device_id=device_id,
     )
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
@@ -3046,3 +3051,12 @@ def numa_bind_to_node(node: int):
 
     libnuma.numa_run_on_node(ctypes.c_int(node))
     libnuma.numa_set_localalloc()
+
+
+def json_list_type(value):
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid JSON list: {value}. Please provide a valid JSON list."
+        )

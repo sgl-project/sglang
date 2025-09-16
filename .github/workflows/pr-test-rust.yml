@@ -9,15 +9,20 @@ on:
     branches: [ main ]
     paths:
       - "sgl-router/**"
+    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
   group: pr-test-rust-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   unit-test-rust:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -27,10 +32,17 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sgl-router
+          cache-all-crates: true
+          cache-on-failure: true
 
       - name: Run lint
         run: |
@@ -65,10 +77,14 @@ jobs:
           # Run quick benchmarks to ensure they work using Python script
           python3 scripts/run_benchmarks.py --quick
 
-  e2e-python:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  pytest-rust:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: BM.A10.4
-    timeout-minutes: 35
+    timeout-minutes: 25
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -77,6 +93,18 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-router
+          cache-all-crates: true
+          cache-on-failure: true
+
       - name: Install SGLang dependencies
         run: |
           sudo bash scripts/ci/ci_install_dependency.sh
@@ -84,6 +112,7 @@ jobs:
       - name: Build python binding
         run: |
           source "$HOME/.cargo/env"
+          export RUSTC_WRAPPER=sccache
           cd sgl-router
           pip install setuptools-rust wheel build
           python3 -m build
@@ -109,11 +138,110 @@ jobs:
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
+          python3 -m pip --no-cache-dir install --upgrade --ignore-installed blinker
+          python3 -m pip --no-cache-dir install --upgrade --break-system-packages genai-bench==0.0.2
           pytest -m e2e -s  -vv -o log_cli=true --log-cli-level=INFO
 
+      - name: Upload benchmark results
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genai-bench-results-all-policies
+          path: sgl-router/benchmark_**/
+
   finish:
-    needs: [unit-test-rust, e2e-python]
+    needs: [unit-test-rust, pytest-rust]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
         run: echo "This is an empty step to ensure that all jobs are completed."
+
+  summarize-benchmarks:
+    needs: pytest-rust
+    runs-on: ubuntu-latest
+    if: success()
+
+    steps:
+    - name: Install jq
+      run: sudo apt-get update && sudo apt-get install -y jq bc
+
+    - name: Download benchmark results
+      uses: actions/download-artifact@v4
+      with:
+        name: genai-bench-results-all-policies
+
+    - name: List downloaded contents
+      run: |
+        echo "Contents after download:"
+        ls -la
+        find . -name "benchmark_*" -type d
+        echo "JSON files found:"
+        find . -name "*.json" | head -10
+
+    - name: Create benchmark summary
+      run: |
+        echo "=== DEBUG: Creating benchmark summary ==="
+        echo "Available benchmark directories:"
+        find . -name "benchmark_*" -type d || true
+        echo "=========================================="
+
+        echo "## Router E2E Genai-Bench Results Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Results captured from E2E tests for two scenarios: regular router (2 workers, dp=2) and PD router (2 prefill + 2 decode)." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Scenario | Status | TTFT (s) | E2E Latency (s) | Input Throughput (tok/s) | Output Throughput (tok/s) |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|--------|----------|-----------------|--------------------------|---------------------------|" >> $GITHUB_STEP_SUMMARY
+
+        scenarios=$'Regular (dp=2, round_robin)|benchmark_round_robin_regular\nPD (2 prefill + 2 decode, round_robin)|benchmark_round_robin_pd'
+
+        echo "$scenarios" | sed 's/^\s*//' | while IFS='|' read -r label pattern; do
+          [ -z "$label" ] && continue
+          # Find the result folder (handle different extraction layouts)
+          result_folder=$(find . -maxdepth 3 \( -name "$pattern" -o -path "*${pattern}*" \) -type d | head -1)
+
+          if [ -n "$result_folder" ] && [ -d "$result_folder" ]; then
+            json_file=$(find "$result_folder" -name "*.json" -not -name "experiment_metadata.json" | head -1)
+
+            if [ -n "$json_file" ] && [ -f "$json_file" ]; then
+              ttft_mean=$(jq -r '.aggregated_metrics.stats.ttft.mean' "$json_file")
+              e2e_latency_mean=$(jq -r '.aggregated_metrics.stats.e2e_latency.mean' "$json_file")
+              input_throughput_mean=$(jq -r '.aggregated_metrics.stats.input_throughput.mean' "$json_file")
+              output_throughput_mean=$(jq -r '.aggregated_metrics.stats.output_throughput.mean' "$json_file")
+
+              ttft_display=$(printf "%.2f" "$ttft_mean" 2>/dev/null || echo "$ttft_mean")
+              e2e_display=$(printf "%.2f" "$e2e_latency_mean" 2>/dev/null || echo "$e2e_latency_mean")
+              input_display=$(printf "%.0f" "$input_throughput_mean" 2>/dev/null || echo "$input_throughput_mean")
+              output_display=$(printf "%.0f" "$output_throughput_mean" 2>/dev/null || echo "$output_throughput_mean")
+
+              echo "| ${label} | ✅ Success | $ttft_display | $e2e_display | $input_display | $output_display |" >> $GITHUB_STEP_SUMMARY
+
+              # Optional GPU utilization table if monitor output exists
+              gpu_json="$result_folder/gpu_utilization.json"
+              if [ -f "$gpu_json" ]; then
+                overall_mean=$(jq -r '.overall.mean // 0' "$gpu_json")
+                printf "\n#### GPU Utilization — %s\n\n" "$label" >> $GITHUB_STEP_SUMMARY
+                printf "Overall mean: %.2f%%\n\n" "$overall_mean" >> $GITHUB_STEP_SUMMARY
+                echo "| GPU | Mean (%) | p5 | p10 | p25 | p50 | p75 | p90 | p95 |" >> $GITHUB_STEP_SUMMARY
+                echo "|-----|----------|----|-----|-----|-----|-----|-----|-----|" >> $GITHUB_STEP_SUMMARY
+                jq -r '
+                  .per_gpu
+                  | to_entries[]
+                  | [ .key,
+                      (.value.mean // 0),
+                      (.value.p5 // 0),
+                      (.value.p10 // 0),
+                      (.value.p25 // 0),
+                      (.value.p50 // 0),
+                      (.value.p75 // 0),
+                      (.value.p90 // 0),
+                      (.value.p95 // 0)
+                    ]
+                  | @tsv' "$gpu_json" \
+                  | while IFS=$'\t' read -r gpu m p5 p10 p25 p50 p75 p90 p95; do
+                      printf "| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f |\n" "$gpu" "$m" "$p5" "$p10" "$p25" "$p50" "$p75" "$p90" "$p95" >> $GITHUB_STEP_SUMMARY
+                    done
+                echo "" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          fi
+        done

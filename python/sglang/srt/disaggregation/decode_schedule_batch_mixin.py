@@ -110,7 +110,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    req.grammar.accept_token(req.output_ids[-1])
+                    # if it is not None, then the grammar is from a retracted request, and we should not
+                    # accept the token as it's already accepted
+                    if req.grammar.current_token is None:
+                        req.grammar.accept_token(req.output_ids[-1])
                 except ValueError as e:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
