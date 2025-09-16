@@ -1110,6 +1110,7 @@ def sample_sharegpt_requests(
                 add_generation_prompt=True,
                 tokenize=False,
             )
+        if tokenizer.bos_token:
             prompt = prompt.replace(tokenizer.bos_token, "")
 
         prompt_token_ids = tokenizer.encode(prompt)
