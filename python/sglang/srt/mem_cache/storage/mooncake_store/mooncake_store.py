@@ -207,7 +207,7 @@ class MooncakeStore(HiCacheStorage):
             health_result = True
 
             try:
-                check_segments_resp = requests.get(segments_url)
+                check_segments_resp = requests.get(segments_url, timeout=3)
             except Exception as e:
                 logger.info(
                     "waiting real client started, cost_time: %.2f seconds.",
