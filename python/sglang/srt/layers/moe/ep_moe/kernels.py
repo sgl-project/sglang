@@ -1087,3 +1087,237 @@ def deepep_ll_get_cutlass_w4a8_moe_mm_data(
         problem_sizes1.to(torch.int32),
         problem_sizes2.to(torch.int32),
     )
+
+
+@triton.jit
+def _silu_mul_and_static_tensor_quant_kernel(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    stride_input_2,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    stride_output_2,
+    masked_m_ptr,
+    scale_ptr,
+    size_n,
+    BLOCK_N: tl.constexpr,
+    UNROLL_FACTOR: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    token_id = tl.program_id(1)
+    hidden_dim_block_index = tl.program_id(0)
+
+    block_num_per_expert = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+    scale_inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
+
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
+    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+
+    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
+    input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
+
+    for token_index in tl.range(
+        token_id,
+        token_num_cur_expert,
+        block_num_per_expert,
+        loop_unroll_factor=UNROLL_FACTOR,
+    ):
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_1,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_1 + size_n,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        gate = gate / (1 + tl.exp(-gate))
+        gate_up = up * gate * scale_inv
+        tl.store(
+            output_ptr_offs + token_index * stride_output_1,
+            gate_up.to(output_ptr.dtype.element_ty),
+            mask=offs_in_d < size_n,
+        )
+
+
+def silu_mul_and_per_tensor_static_quant_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+    output_scale: torch.Tensor,
+):
+    """
+    input shape [expert_num, token_num_padded, hidden_dim]
+    output shape [expert_num, token_num_padded, hidden_dim // 2], dtype fp8
+    masked_m shape [expert_num],
+    scale: # [1,] single float
+    """
+
+    assert input.is_contiguous()
+    assert output.dtype == torch.float8_e4m3fn
+    assert output.is_contiguous()
+    assert len(input.shape) == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+
+    size_n = input.shape[-1] // 2
+
+    expert_num = len(masked_m)
+
+    if expert_num < 4:
+        BLOCK_NUM_PER_EXPERT = 64
+    else:
+        BLOCK_NUM_PER_EXPERT = 32
+
+    UNROLL_FACTOR = 8
+    BLOCK_N = 1024
+
+    grid = (
+        triton.cdiv(size_n, BLOCK_N),
+        BLOCK_NUM_PER_EXPERT,
+        expert_num,
+    )
+
+    _silu_mul_and_static_tensor_quant_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        masked_m,
+        output_scale,
+        size_n,
+        BLOCK_N=BLOCK_N,
+        UNROLL_FACTOR=UNROLL_FACTOR,
+        num_warps=1,
+    )
+    return
+
+
+@triton.jit
+def _silu_and_mul_post_per_tensor_quant_kernel(
+    input_ptr,
+    stride_input_expert,
+    stride_input_token,
+    stride_input_dim,
+    output_ptr,
+    stride_output_expert,
+    stride_output_token,
+    stride_output_dim,
+    scale_ptr,
+    masked_m_ptr,
+    inner_dim,
+    fp8_max,
+    fp8_min,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    """
+    Triton kernel: fused SiLU(gate) * up + per-tensor FP8 quantization.
+
+    Shape:
+        input:  [E, T_padded, 2*D]  -> gate: [:,:,D], up: [:,:,D]
+        output: [E, T_padded, D], dtype=float8_e4m3fn
+    """
+    expert_id = tl.program_id(2)
+    block_id_token = tl.program_id(1)
+    block_id_dim = tl.program_id(0)
+
+    num_token_blocks = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    scale = 1.0 / tl.load(scale_ptr).to(tl.float32)
+
+    stride_input_expert = tl.cast(stride_input_expert, tl.int32)
+    stride_output_expert = tl.cast(stride_output_expert, tl.int32)
+    stride_input_token = tl.cast(stride_input_token, tl.int32)
+    stride_output_token = tl.cast(stride_output_token, tl.int32)
+
+    offset_d = block_id_dim * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_d = offset_d < inner_dim
+
+    # 计算 base pointers for current expert and dim block
+    input_base_offs = input_ptr + expert_id * stride_input_expert + offset_d
+    output_base_offs = output_ptr + expert_id * stride_output_expert + offset_d
+
+    for token_idx in tl.range(
+        block_id_token, token_num_cur_expert, num_token_blocks, num_stages=NUM_STAGE
+    ):
+        gate_ptr = input_base_offs + token_idx * stride_input_token
+        up_ptr = gate_ptr + inner_dim
+        gate = tl.load(gate_ptr, mask=mask_d, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr, mask=mask_d, other=0.0).to(tl.float32)
+
+        # SiLU: x * sigmoid(x)
+        gate = gate / (1 + tl.exp(-gate))
+        gate = gate.to(input_ptr.dtype.element_ty)
+        gate_up = up * gate
+
+        scaled = gate_up * scale
+        output_q = tl.clamp(scaled, fp8_min, fp8_max).to(output_ptr.dtype.element_ty)
+        out_ptr = output_base_offs + token_idx * stride_output_token
+        tl.store(out_ptr, output_q, mask=mask_d)
+
+
+def silu_and_mul_masked_post_per_tensor_quant_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Fused SiLU + Mul + Per-Tensor Quantization to FP8.
+
+    Args:
+        input: [expert_num, token_num_padded, 2 * inner_dim]
+        output: [expert_num, token_num_padded, inner_dim], dtype=torch.float8_e4m3fn
+        masked_m: [expert_num], actual token count for each expert
+        scale: [1] or [expert_num], quantization scale (per-tensor or per-expert)
+
+    Returns:
+        output tensor
+    """
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+    assert output.dtype == torch.float8_e4m3fn
+    assert input.ndim == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+    assert scale.numel() == 1 or scale.shape[0] == input.shape[0]
+
+    expert_num = input.shape[0]
+    #  3584
+    inner_dim = input.shape[-1] // 2
+
+    BLOCK_N = 256
+    BLOCK_M = 64 if expert_num < 4 else 32
+    NUM_STAGES = 3
+    hidden_dim_split_block_num = triton.cdiv(inner_dim, BLOCK_N)
+
+    grid = (hidden_dim_split_block_num, BLOCK_M, expert_num)
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+    fp8_min = -fp8_max
+
+    _silu_and_mul_post_per_tensor_quant_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        scale,
+        masked_m,
+        inner_dim,
+        fp8_max,
+        fp8_min,
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+    )
+    return output
