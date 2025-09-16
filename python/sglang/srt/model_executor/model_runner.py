@@ -516,6 +516,7 @@ class ModelRunner:
                     "aiter",
                     "flashinfer",
                     "fa3",
+                    "fa4",
                     "triton",
                     "flashmla",
                     "cutlass_mla",
@@ -1800,6 +1801,15 @@ class ModelRunner:
             )
 
             return FlashAttentionBackend(self)
+        elif backend_str == "fa4":
+            assert (
+                self.use_mla_backend
+            ), "FlashAttention v4 Support is at an early stage, only MLA model supported now"
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            return FlashAttentionBackend(self, fa_impl_ver=4)
         elif backend_str == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
