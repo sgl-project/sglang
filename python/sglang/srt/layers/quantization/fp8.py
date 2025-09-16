@@ -352,11 +352,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     _is_cpu_amx_available
                 ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
                 _amx_process_weight_after_loading(layer, ["weight"])
+                layer.weight_scale_inv = torch.nn.Parameter(
+                    layer.weight_scale_inv.data, requires_grad=False
+                )
                 return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
-            layer.weight = Parameter(weight, requires_grad=False)
-            layer.weight_scale_inv = Parameter(weight_scale, requires_grad=False)
+            layer.weight.data = weight.data
+            layer.weight_scale_inv.data = weight_scale.data
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -1132,10 +1135,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and topk_config.topk_group is not None
         ), "Current trtllm_fp8_block_scale_moe kernel does not support these two arguments as None"
 
-        if topk_config.correction_bias is None:
-            correction_bias = topk_config.correction_bias.to(x.dtype)
-        else:
-            correction_bias = None
+        correction_bias = (
+            None
+            if topk_config.correction_bias is None
+            else topk_config.correction_bias.to(x.dtype)
+        )
+
         return trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
             routing_bias=correction_bias,

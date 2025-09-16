@@ -81,7 +81,7 @@ FetchContent_Populate(repo-triton)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        1a85c439a064c1609568675aa580a409a53fb183
+    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -94,6 +94,15 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
+
+# flash-attention origin
+FetchContent_Declare(
+    repo-flash-attention-origin
+    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
+    GIT_TAG        203b9b3dba39d5d08dffb49c09aa622984dff07d
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-flash-attention-origin)
 
 # mscclpp
 FetchContent_Declare(
@@ -148,7 +157,11 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
-    "--threads=32"
+
+    # The following flag leads to the CMAKE_BUILD_PARALLEL_LEVEL breaking,
+    # it triggers OOM with low memory host. Extract the threads number to
+    # option named SGL_KERNEL_COMPILE_THREADS, default value 32.
+    # "--threads=32"
 
     # Supress warnings
     "-Xcompiler=-Wno-clang-format-violations"
@@ -157,11 +170,26 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-Xcompiler=-Wno-terminate"
     "-Xcompiler=-Wfatal-errors"
     "-Xcompiler=-ftemplate-backtrace-limit=1"
-    "-Xcudafe=--diag_suppress=177"  # variable was declared but never referenced
+    "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
+    "-Xcudafe=--diag_suppress=2361"  # invalid narrowing conversion from "char" to "signed char"
 
     # uncomment to debug
     # "--ptxas-options=-v"
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
+)
+
+set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default 32")
+
+# When SGL_KERNEL_COMPILE_THREADS value is less than 1, set it to 1
+if (NOT SGL_KERNEL_COMPILE_THREADS MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "SGL_KERNEL_COMPILE_THREADS must be an integer, but was set to '${SGL_KERNEL_COMPILE_THREADS}'.")
+elseif (SGL_KERNEL_COMPILE_THREADS LESS 1)
+    message(STATUS "SGL_KERNEL_COMPILE_THREADS was set to a value less than 1. Using 1 instead.")
+    set(SGL_KERNEL_COMPILE_THREADS 1)
+endif()
+
+list(APPEND SGL_KERNEL_CUDA_FLAGS
+    "--threads=${SGL_KERNEL_COMPILE_THREADS}"
 )
 
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
@@ -242,6 +270,7 @@ set(SOURCES
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/cast.cu"
     "csrc/elementwise/copy.cu"
+    "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/common_extension.cc"
@@ -271,6 +300,8 @@ set(SOURCES
     "csrc/gemm/gptq/gptq_kernel.cu"
 
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
+
+    "csrc/mamba/causal_conv1d.cu"
 
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
@@ -494,3 +525,13 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
         DESTINATION "triton_kernels"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
+
+# flash attention 4
+# TODO: find a better install condition.
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+    # flash_attn/cute
+    install(DIRECTORY "${repo-flash-attention-origin_SOURCE_DIR}/flash_attn/cute/"
+            DESTINATION "flash_attn/cute"
+            PATTERN ".git*" EXCLUDE
+            PATTERN "__pycache__" EXCLUDE)
+    endif()

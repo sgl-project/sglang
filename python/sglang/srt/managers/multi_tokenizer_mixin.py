@@ -19,6 +19,7 @@ import os
 import pickle
 import sys
 import threading
+from functools import partialmethod
 from multiprocessing import shared_memory
 from typing import Any, Dict
 
@@ -36,7 +37,8 @@ from sglang.srt.managers.io_struct import (
     MultiTokenizerRegisterReq,
     MultiTokenizerWrapper,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager, _Communicator
+from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
@@ -193,6 +195,8 @@ def _handle_output_by_index(output, i):
                 if output.output_hidden_states
                 else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchEmbeddingOut):
         new_output = BatchEmbeddingOut(
@@ -209,6 +213,8 @@ def _handle_output_by_index(output, i):
             cached_tokens=(
                 [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchStrOut):
         new_output = BatchStrOut(
@@ -305,6 +311,8 @@ def _handle_output_by_index(output, i):
                 if output.output_hidden_states
                 else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchMultimodalOut):
         new_output = BatchMultimodalOut(
@@ -326,6 +334,8 @@ def _handle_output_by_index(output, i):
             cached_tokens=(
                 [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
             ),
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
         )
     else:
         new_output = output
@@ -343,6 +353,10 @@ class MultiHttpWorkerDetokenizerMixin:
         else:
             worker_ids = []
         return worker_ids
+
+    def maybe_clear_socket_mapping(self):
+        if hasattr(self, "socket_mapping"):
+            self.socket_mapping.clear_all_sockets()
 
     def multi_http_worker_event_loop(self):
         """The event loop that handles requests, for multi multi-http-worker mode"""
@@ -448,9 +462,7 @@ class MultiTokenizerManager(TokenizerManager):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        setproctitle.setproctitle(
-            f"sglang::http_server/multi_tokenizer_manager:{os.getpid()}"
-        )
+        setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
         server_args.disaggregation_mode = "null"
@@ -555,3 +567,17 @@ def write_data_for_multi_tokenizer(
     args_shm.close()
 
     return args_shm
+
+
+def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
+    """Monkey patch uvicorn multiprocessing is_alive timeout"""
+    # from default 5s -> 10s
+    try:
+        from uvicorn.supervisors.multiprocess import Process
+
+        Process.is_alive = partialmethod(Process.is_alive, timeout=timeout)
+
+    except ImportError:
+        logger.warning(
+            "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
+        )
