@@ -94,7 +94,7 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     sgl_hip::activation::act_and_mul_kernel<c_type, silu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #else
-    const c10::cuda::OptionalCUDAGuard device_guard(out.device());
+    const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
     config.blockDim = std::min(d / vec_size, 1024U);
@@ -129,7 +129,7 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     sgl_hip::activation::act_and_mul_kernel<c_type, gelu_tanh>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #else
-    const c10::cuda::OptionalCUDAGuard device_guard(out.device());
+    const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
     config.blockDim = std::min(d / vec_size, 1024U);
@@ -166,7 +166,7 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     sgl_hip::activation::act_and_mul_kernel<c_type, gelu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #else
-    const c10::cuda::OptionalCUDAGuard device_guard(out.device());
+    const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
     config.blockDim = std::min(d / vec_size, 1024U);
