@@ -583,15 +583,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=forward_batch.mha_return_lse,
             )
         else:
-            # # replace with trtllm ragged attention once accuracy is resolved.
-            # output = super().forward_extend(
-            #     q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
-            # )
-            if  not (forward_batch.attn_attend_prefix_cache is not None
-                 and forward_batch.mha_return_lse):
+            if not (
+                forward_batch.attn_attend_prefix_cache is not None
+                and forward_batch.mha_return_lse
+            ):
                 output = super().forward_extend(
                     q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
-                )                 
+                )
             else:
                 assert q_rope is None
                 assert k_rope is None
@@ -606,7 +604,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 qo_indptr = qo_indptr[: bs + 1]
                 actual_seq_lens_qo = qo_indptr[1:] - qo_indptr[:-1]
                 max_qo = int(actual_seq_lens_qo.max().item())
-                
+
                 # MHA for chunked prefix kv cache when running model with MLA
                 assert forward_batch.prefix_chunk_idx is not None
                 assert forward_batch.prefix_chunk_cu_seq_lens is not None
@@ -642,8 +640,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 # TODO(shuw@nvidia.com): Depends on resolution of https://github.com/flashinfer-ai/flashinfer/issues/1663.
                 # The out-of-bounds writes in flashinfer's trtllm_ragged_attention_deepseek.
                 if actual_seq_lens_kv[-1].item() == 0:
-                    s1[qo_indptr[-2].item():] = torch.tensor(float('-inf'), dtype=s1.dtype, device=s1.device)
-                    o1[qo_indptr[-2].item():] = 0
+                    s1[qo_indptr[-2].item() :] = torch.tensor(
+                        float("-inf"), dtype=s1.dtype, device=s1.device
+                    )
+                    o1[qo_indptr[-2].item() :] = 0
                 output = (o1, s1)
         return output
 
