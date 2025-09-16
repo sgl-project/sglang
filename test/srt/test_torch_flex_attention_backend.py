@@ -30,13 +30,13 @@ class TestTorchFlexAttnBackend(CustomTestCase):
 
         try:
             args = SimpleNamespace(
-            num_shots=8,
-            data_path=None,
-            num_questions=100,
-            parallel=10,
-            max_new_tokens=512,
-            host="http://127.0.0.1",
-            port=int(base_url.split(":")[-1]),
+                num_shots=8,
+                data_path=None,
+                num_questions=100,
+                parallel=10,
+                max_new_tokens=512,
+                host="http://127.0.0.1",
+                port=int(base_url.split(":")[-1]),
             )
             metrics = run_eval_few_shot_gsm8k(args)
             print(f"{metrics=}")
