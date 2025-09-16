@@ -708,10 +708,10 @@ impl PDRouter {
 
         // Only check workers if parallel batch is requested with multiple items
         if context.parallel_batch && batch_size > 1 {
-            let available_prefill = match self.prefill_workers.read() {
-                Ok(w) => w.iter().filter(|w| w.is_available()).count(),
-                Err(_) => 0,
-            };
+            let prefill_workers = self.worker_registry.get_by_type(&WorkerType::Prefill {
+                bootstrap_port: None,
+            });
+            let available_prefill = prefill_workers.iter().filter(|w| w.is_available()).count();
 
             if available_prefill >= 2 {
                 info!(
@@ -735,11 +735,11 @@ impl PDRouter {
     }
 
     // Wrapper for the original execute_dual_dispatch logic
-    async fn execute_dual_dispatch_internal_wrapper<T: Serialize + Clone>(
+    async fn execute_dual_dispatch_internal_wrapper<'a, T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
-        context: PDRequestContext,
+        context: PDRequestContext<'a>,
     ) -> Response {
         let start_time = Instant::now();
 
@@ -824,11 +824,11 @@ impl PDRouter {
     }
 
     // Execute batch request in parallel across multiple prefill workers
-    async fn execute_parallel_batch<T: Serialize + Clone>(
+    async fn execute_parallel_batch<'a, T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
-        context: PDRequestContext,
+        context: PDRequestContext<'a>,
     ) -> Response {
         let batch_size = context.batch_size.unwrap_or(0);
 
@@ -856,10 +856,10 @@ impl PDRouter {
         };
 
         // Get available prefill workers count
-        let available_workers = {
-            let workers = self.prefill_workers.read().unwrap();
-            workers.iter().filter(|w| w.is_available()).count()
-        };
+        let prefill_workers = self.worker_registry.get_by_type(&WorkerType::Prefill {
+            bootstrap_port: None,
+        });
+        let available_workers = prefill_workers.iter().filter(|w| w.is_available()).count();
 
         // Calculate distribution
         let workers_to_use = available_workers.min(batch_size).max(1);

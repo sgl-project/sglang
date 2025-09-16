@@ -62,6 +62,7 @@ fn create_minimal_completion_request() -> CompletionRequest {
         ebnf: None,
         json_schema: None,
         stop_token_ids: None,
+        parallel_batch: None,
         no_stop_trim: false,
         ignore_eos: false,
         skip_special_tokens: true,
@@ -195,6 +196,7 @@ async fn test_unsupported_endpoints() {
         session_params: None,
         return_hidden_states: false,
         rid: None,
+        parallel_batch: None,
     };
 
     let response = router.route_generate(None, &generate_request, None).await;
