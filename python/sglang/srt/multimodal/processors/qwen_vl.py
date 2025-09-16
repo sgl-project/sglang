@@ -277,7 +277,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             video_token_id=hf_config.video_token_id,
         ).build(_processor)
 
-        self.image_cache_table = FIFOTensorCache(CACHED_IMAGE_MAX_NUM)
+        self.image_cache_table = FIFOTensorCache()
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
