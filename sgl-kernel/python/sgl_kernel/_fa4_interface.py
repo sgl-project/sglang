@@ -4,6 +4,8 @@
 # [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.1.0.
 
 
+import copy
+import gc
 import logging
 import math
 from typing import Optional, Tuple
@@ -382,6 +384,61 @@ _flash_attn_fwd.compile_key_map = [
 ]
 
 
+def warmup_flash_attn(f):
+    """
+    Decorator for flash_attn_varlen_func:
+    - On the first call, run several warmup passes with different flag combinations
+    - Warmups are executed sequentially to minimize peak GPU memory usage
+    - Does not modify user-provided tensors (clones data)
+    - Easy to extend with more compile-key dimensions
+    """
+    done = False
+
+    def _clone_args(args, kwargs):
+        """Clone tensor arguments to avoid sharing storage; deepcopy for others."""
+
+        def maybe_clone(x):
+            if isinstance(x, torch.Tensor):
+                return x.clone()
+            return copy.deepcopy(x)
+
+        return tuple(maybe_clone(a) for a in args), {
+            k: maybe_clone(v) for k, v in kwargs.items()
+        }
+
+    def _run_warmups(args, kwargs):
+        """Run warmup calls sequentially and release memory after each."""
+        base_args, base_kwargs = _clone_args(args, kwargs)
+
+        # Warmup combinations for return_softmax_lse and causal
+        combos = [
+            dict(return_softmax_lse=False, causal=False),
+            dict(return_softmax_lse=False, causal=True),
+            dict(return_softmax_lse=True, causal=False),
+            dict(return_softmax_lse=True, causal=True),
+        ]
+
+        for combo in combos:
+            wa, wk = _clone_args(base_args, base_kwargs)
+            wk.update(combo)
+            with torch.cuda.stream(torch.cuda.current_stream()):
+                f(*wa, **wk)
+            del wa, wk
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    def wrapper(*args, **kwargs):
+        nonlocal done
+        if not done:
+            logger.info("Running flash_attn_varlen_func warmup passes...")
+            _run_warmups(args, kwargs)
+            done = True
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
+@warmup_flash_attn
 def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
