@@ -39,6 +39,8 @@ else
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
+    rm -rf /usr/local/lib/python3.10/dist-packages/cuda_pathfinder-1.2.2.dist-info
+    rm -rf /usr/local/lib/python3.10/dist-packages/cuda_pathfinder
     $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm cuda_pathfinder || true
 fi
 
