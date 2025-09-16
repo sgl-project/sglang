@@ -22,8 +22,8 @@ PROFILE_DIR = "performance_profiles_vlms"
 MODEL_DEFAULTS = [
     # Keep conservative defaults. Can be overridden by env NIGHTLY_VLM_MODELS
     "Qwen/Qwen2.5-VL-7B-Instruct",
-    # "google/gemma-3-27b-it",
-    # "openbmb/MiniCPM-V-2_6",
+    "google/gemma-3-27b-it",
+    "openbmb/MiniCPM-V-2_6",
 ]
 
 

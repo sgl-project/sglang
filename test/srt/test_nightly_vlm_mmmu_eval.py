@@ -25,8 +25,8 @@ MODEL_SCORE_THRESHOLDS = {
 DEFAULT_VLM_MODELS = ",".join(
     [
         "Qwen/Qwen2.5-VL-7B-Instruct",
-        # "OpenGVLab/InternVL2_5-2B",
-        # "google/gemma-3-4b-it",
+        "OpenGVLab/InternVL2_5-2B",
+        "google/gemma-3-4b-it",
     ]
 )
 
