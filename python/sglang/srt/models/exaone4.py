@@ -1,4 +1,3 @@
-import logging
 from collections.abc import Iterable
 from typing import Any, List, Optional, Tuple, Union
 
@@ -36,9 +35,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, make_layers
-from sglang.utils import get_exception_traceback
-
-logger = logging.getLogger(__name__)
+from sglang.utils import get_exception_traceback, logger
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
