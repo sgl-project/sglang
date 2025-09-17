@@ -84,9 +84,7 @@ class MooncakeStoreConfig:
             master_metrics_port=int(
                 os.getenv("MOONCAKE_MASTER_METRICS_PORT", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            check_server=bool(
-                os.getenv("MOONCAKE_CHECK_SERVER", DEFAULT_CHECK_SERVER)
-            )
+            check_server=bool(os.getenv("MOONCAKE_CHECK_SERVER", DEFAULT_CHECK_SERVER))
         )
 
     @staticmethod
