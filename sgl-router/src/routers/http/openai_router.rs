@@ -15,15 +15,18 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{
+        sse::{Event, Sse},
         IntoResponse, Response,
     },
 };
 use futures_util::StreamExt;
-use serde_json::{json, to_string, to_value, Value};
+use serde_json::{json, to_value, Value};
 use std::{
     any::Any,
+    convert::Infallible,
     sync::atomic::{AtomicBool, Ordering},
 };
+use tokio_stream::iter;
 use tracing::{info, warn};
 
 /// Router for OpenAI backend
@@ -586,19 +589,30 @@ impl super::super::RouterTrait for OpenAIRouter {
         &self,
         _headers: Option<&HeaderMap>,
         response_id: &str,
-        _params: &ResponsesGetParams,
+        params: &ResponsesGetParams,
     ) -> Response {
-        // First check local storage
         let stored_id = ResponseId::from_string(response_id.to_string());
         if let Ok(Some(stored_response)) = self.response_storage.get_response(&stored_id).await {
-            if !stored_response.raw_response.is_null() {
-                let response = (
+            let stream_requested = params.stream.unwrap_or(false);
+            let raw_value = stored_response.raw_response.clone();
+
+            if !raw_value.is_null() {
+                if stream_requested {
+                    let event = Event::default().data(raw_value.to_string());
+                    let done_event = Event::default().data("[DONE]");
+                    let stream = iter(vec![
+                        Ok::<Event, Infallible>(event),
+                        Ok::<Event, Infallible>(done_event),
+                    ]);
+                    return Sse::new(stream).into_response();
+                }
+
+                return (
                     StatusCode::OK,
                     [("content-type", "application/json")],
-                    stored_response.raw_response.to_string(),
+                    raw_value.to_string(),
                 )
                     .into_response();
-                return response;
             }
 
             let openai_response = ResponsesResponse {
@@ -625,16 +639,28 @@ impl super::super::RouterTrait for OpenAIRouter {
                 tools: vec![],
             };
 
+            if stream_requested {
+                if let Ok(value) = serde_json::to_value(&openai_response) {
+                    let event = Event::default().data(value.to_string());
+                    let done_event = Event::default().data("[DONE]");
+                    let stream = iter(vec![
+                        Ok::<Event, Infallible>(event),
+                        Ok::<Event, Infallible>(done_event),
+                    ]);
+                    return Sse::new(stream).into_response();
+                }
+            }
+
             return (
                 StatusCode::OK,
                 [("content-type", "application/json")],
-                to_string(&openai_response).unwrap_or_else(|e| {
+                serde_json::to_string(&openai_response).unwrap_or_else(|e| {
                     format!("{{\"error\": \"Failed to serialize response: {}\"}}", e)
                 }),
             )
                 .into_response();
         }
-        // If not in local storage, surface a not-found error
+
         (
             StatusCode::NOT_FOUND,
             format!(

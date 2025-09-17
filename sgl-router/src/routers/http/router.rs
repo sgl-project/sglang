@@ -7,8 +7,7 @@ use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesGetParams,
-    ResponsesRequest,
+    RerankRequest, RerankResponse, RerankResult, ResponsesGetParams, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
