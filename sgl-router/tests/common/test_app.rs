@@ -29,7 +29,8 @@ pub fn create_test_app(
     let app_state = Arc::new(AppState {
         router,
         context: app_context,
-        concurrency_queue_tx: None, // No queue for tests
+        concurrency_queue_tx: None,
+        router_manager: None,
     });
 
     // Configure request ID headers (use defaults if not specified)

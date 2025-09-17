@@ -172,6 +172,7 @@ void downcast_fp8(
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
+void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);

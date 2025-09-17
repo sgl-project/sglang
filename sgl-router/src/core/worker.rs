@@ -804,6 +804,37 @@ impl WorkerFactory {
         Box::new(worker)
     }
 
+    /// Create a prefill worker with labels
+    pub fn create_prefill_with_labels(
+        url: String,
+        bootstrap_port: Option<u16>,
+        labels: std::collections::HashMap<String, String>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        let mut worker = BasicWorker::new(url.clone(), WorkerType::Prefill { bootstrap_port })
+            .with_circuit_breaker_config(circuit_breaker_config);
+
+        // Add labels to metadata
+        worker.metadata.labels = labels;
+
+        Box::new(worker)
+    }
+
+    /// Create a decode worker with labels
+    pub fn create_decode_with_labels(
+        url: String,
+        labels: std::collections::HashMap<String, String>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        let mut worker = BasicWorker::new(url.clone(), WorkerType::Decode)
+            .with_circuit_breaker_config(circuit_breaker_config);
+
+        // Add labels to metadata
+        worker.metadata.labels = labels;
+
+        Box::new(worker)
+    }
+
     /// Create a DP-aware worker of specified type
     pub fn create_dp_aware(
         base_url: String,

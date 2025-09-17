@@ -45,6 +45,8 @@ k8s-openapi = { version = "0.25.0", features = ["v1_33"] }
 metrics = "0.24.2"
 metrics-exporter-prometheus = "0.17.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
+ulid = "1.2.1"
+parking_lot = "0.12.4"
 thiserror = "2.0.12"
 regex = "1.10"
 url = "2.5.4"

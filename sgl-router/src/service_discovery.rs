@@ -603,6 +603,7 @@ mod tests {
             reasoning_parser_factory: None, // HTTP mode doesn't need reasoning parser
             tool_parser_registry: None,     // HTTP mode doesn't need tool parser
             router_manager: None,           // Test doesn't need router manager
+            response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
         });
 
         let router = Router::new(vec![], &app_context).await.unwrap();

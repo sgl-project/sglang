@@ -65,7 +65,7 @@ tracing = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.9.post2",
+    "sgl-kernel==0.3.10",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
@@ -75,13 +75,13 @@ srt = [
 
 blackwell = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.9.post2",
+    "sgl-kernel==0.3.10",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
     "flashinfer_python==0.3.1",
-    "nvidia-cutlass-dsl==4.1.0",
+    "nvidia-cutlass-dsl==4.2.0",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD

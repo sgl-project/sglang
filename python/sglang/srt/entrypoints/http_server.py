@@ -29,8 +29,6 @@ import time
 from http import HTTPStatus
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
-import setproctitle
-
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 
 # Fix a bug of Python threading

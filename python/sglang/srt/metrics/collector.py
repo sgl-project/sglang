@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
-from sglang.srt.metrics.utils import generate_buckets
+from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
@@ -513,6 +513,14 @@ class SchedulerMetricsCollector:
             buckets=tree_traversal_time_buckets,
         )
 
+        self.request_latency_seconds = Histogram(
+            name="sglang:request_latency_seconds",
+            documentation="The latency of each stage of requests.",
+            # captures latency in range [1ms - ~1191s]
+            buckets=exponential_buckets(start=0.001, width=1.62, length=30),
+            labelnames=list(labels.keys()) + ["stage"],
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -525,6 +533,10 @@ class SchedulerMetricsCollector:
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def observe_request_latency_seconds(self, stage: str, latency: float) -> None:
+        labels_with_stage = {**self.labels, "stage": stage}
+        self.request_latency_seconds.labels(**labels_with_stage).observe(latency)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)

@@ -570,6 +570,7 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: List[int]
     # Whether to stream output
     stream: bool
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -656,6 +657,8 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -763,6 +766,8 @@ class TokenizedEmbeddingReqInput:
     data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
+    # Priority for the request
+    priority: Optional[int] = None
 
 
 @dataclass
