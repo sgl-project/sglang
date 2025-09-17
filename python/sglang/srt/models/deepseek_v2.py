@@ -43,7 +43,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.ascend_ops.mla_preprocess import (
+from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
     AscendFusedMLAPreprocess,
     is_mla_preprocess_enabled,
 )

@@ -8,7 +8,7 @@ import torch_npu
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.ascend_ops.mla_preprocess import (
+from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
