@@ -949,5 +949,6 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
+            use_wna16=True,
         )
         return StandardCombineInput(hidden_states=output)
