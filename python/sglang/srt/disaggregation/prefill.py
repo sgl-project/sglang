@@ -421,9 +421,20 @@ class SchedulerDisaggregationPrefillMixin:
                     last_hidden_index = (
                         hidden_state_offset + extend_input_len_per_req[i] - 1
                     )
-                    req.hidden_states_tensor = (
-                        logits_output.hidden_states[last_hidden_index].cpu().clone()
-                    )
+                    if self.spec_algorithm.is_eagle3():
+                        hidden_size = self.model_config.hf_text_config.hidden_size
+                        hidden_states_for_transfer = (
+                            logits_output.hidden_states[last_hidden_index][
+                                -hidden_size:
+                            ]
+                            .cpu()
+                            .clone()
+                        )
+                    else:
+                        hidden_states_for_transfer = (
+                            logits_output.hidden_states[last_hidden_index].cpu().clone()
+                        )
+                    req.hidden_states_tensor = hidden_states_for_transfer
                     hidden_state_offset += extend_input_len_per_req[i]
                 else:
                     req.hidden_states_tensor = None
