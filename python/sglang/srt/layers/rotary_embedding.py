@@ -790,8 +790,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             torch.add(positions, offsets) if offsets is not None else positions
         ]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.repeat(1, 2)
-        sin = sin.repeat(1, 2)
+        # Reshape to [batchsize, head_dim, seq, rotary_dim]
+        cos = cos.repeat(1, 2).unsqueeze(-2).unsqueeze(-2)
+        sin = sin.repeat(1, 2).unsqueeze(-2).unsqueeze(-2)
 
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
