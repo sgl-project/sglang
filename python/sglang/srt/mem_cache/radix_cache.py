@@ -227,7 +227,6 @@ class RadixCache(BasePrefixCache):
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
-            print(value)
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -472,7 +471,6 @@ class RadixCache(BasePrefixCache):
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
-            print(f"prefix_len: {prefix_len}, key: {key}, value: {value}")
             value = value[prefix_len:]
 
             if prefix_len < len(node.key):
