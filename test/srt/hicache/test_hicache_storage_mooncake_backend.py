@@ -67,12 +67,20 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         try:
             # Start metadata server with port configuration
             cls.metadata_service_process = subprocess.Popen(
-                ["python3", "-m", "mooncake.http_metadata_server", "--port", str(cls.mooncake_metadata_port)],
+                [
+                    "python3",
+                    "-m",
+                    "mooncake.http_metadata_server",
+                    "--port",
+                    str(cls.mooncake_metadata_port),
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 preexec_fn=os.setsid,  # Create new process group
             )
-            print(f"Mooncake metadata service started on port {cls.mooncake_metadata_port}")
+            print(
+                f"Mooncake metadata service started on port {cls.mooncake_metadata_port}"
+            )
         except (FileNotFoundError, subprocess.SubprocessError) as e:
             print(f"Warning: Could not start Mooncake metadata service: {e}")
             cls.metadata_service_process = None
