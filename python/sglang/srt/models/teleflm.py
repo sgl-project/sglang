@@ -108,11 +108,6 @@ class TeleFLMModel(LlamaModel):
 
 
 class TeleFLMForCausalLM(LlamaForCausalLM):
-    """
-    This class is the causal language model for TeleFLM, inheriting from LlamaForCausalLM.
-    It adjusts the logits processor based on µ-scaling parameters.
-    """
-
     def __init__(
         self,
         config: LlamaConfig,
