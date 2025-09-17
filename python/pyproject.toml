@@ -90,7 +90,7 @@ tracing = [
 ]
 all = ["sglang[test]", "sglang[decord]"]
 blackwell = ["nvidia-cutlass-dsl==4.2.0", "sglang[test]", "sglang[decord]"]
-blackwell_aarch64 = ["nvidia-cutlass-dsl==4.1.0", "sglang[test]"]
+blackwell_aarch64 = ["nvidia-cutlass-dsl==4.2.0", "sglang[test]"]
 dev = ["sglang[test]"]
 
 [project.urls]
