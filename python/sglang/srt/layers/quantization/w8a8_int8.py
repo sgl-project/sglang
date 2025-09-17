@@ -122,10 +122,7 @@ def npu_fused_experts(
 ):
     w13_offset = kwargs.get("w13_offset", None)
     w2_offset = kwargs.get("w2_offset", None)
-    if w13_offset is not None or w2_offset is not None:
-        use_awq = True
-    else:
-        use_awq = False
+    use_wna16 = kwargs.get("use_wna16", False)
 
     original_shape = hidden_states.shape
     original_dtype = hidden_states.dtype
@@ -151,7 +148,7 @@ def npu_fused_experts(
     )
     expert_tokens = expert_tokens.to(torch.int64)
     # gmm1: gate_up_proj
-    if not use_awq:
+    if not use_wna16:
         hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
         scale_args13 = {
             "scale": [w13_scale.to(scale_dtype)],
