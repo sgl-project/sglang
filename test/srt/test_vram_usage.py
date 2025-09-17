@@ -33,7 +33,7 @@ class TestVRAMUsageBenchServing(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_vram_usage_increase_under_10_percent(self):
+    def test_vram_usage_increase_under_5gb(self):
         # Step 0: skip if no GPU
         if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
             self.skipTest("No CUDA device available; skip VRAM OOM test")
