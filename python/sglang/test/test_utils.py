@@ -185,9 +185,9 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
+        pred = res.json()["text"][0][len(prompt):]
     else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
+        pred = [x[len(prompt):] for x in res.json()["text"]]
     return pred
 
 
@@ -207,9 +207,9 @@ def call_generate_outlines(
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
+        pred = res.json()["text"][0][len(prompt):]
     else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
+        pred = [x[len(prompt):] for x in res.json()["text"]]
     return pred
 
 
@@ -243,12 +243,12 @@ def call_generate_guidance(
             model
             + prompt
             + gen(
-                name="answer",
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-                regex=regex,
-            )
+            name="answer",
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+            regex=regex,
+        )
         )
         rets.append(out["answer"])
     return rets if n > 1 else rets[0]
@@ -1332,8 +1332,8 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                             if (
                                 res["meta_info"]["output_top_logprobs"][i][rank][0]
                                 == res["meta_info"]["output_top_logprobs"][i][rank + 1][
-                                    0
-                                ]
+                                0
+                            ]
                             ):
                                 rank += 1
                             else:
@@ -1539,7 +1539,7 @@ def parse_models(model_string: str):
 
 
 def check_model_scores(
-    results, test_name, model_accuracy_thresholds, model_latency_thresholds={}
+    results, test_name, model_accuracy_thresholds, model_latency_thresholds=None
 ):
     """
     results: list of tuple of (model_path, accuracy, latency)
@@ -1558,7 +1558,7 @@ def check_model_scores(
             print(f"Warning: No threshold defined for model {model}")
             continue
 
-        latency_threshold = model_latency_thresholds.get(model, None) or 1e9
+        latency_threshold = model_latency_thresholds.get(model, None) if model_latency_thresholds else 1e9
 
         is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
         status_emoji = "✅" if is_success else "❌"
@@ -1595,8 +1595,6 @@ def _parse_int_list_env(name: str, default_val: str):
 def find_traces_under_path(path: str) -> List[str]:
     results = []
     for _, dirs, files in os.walk(path):
-        print(f"{dirs=}")
-        print(f"{files=}")
         for file in files:
             if file.endswith(".trace.json.gz"):
                 results.append(f"{file}")

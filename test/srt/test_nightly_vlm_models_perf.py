@@ -51,72 +51,65 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                 try:
                     # Run bench_one_batch_server against the launched server
                     os.makedirs(PROFILE_DIR, exist_ok=True)
-                    for batch_size in self.batch_sizes:
-                        profile_filename = f"{model.replace('/', '_')}_bs{batch_size}_{int(time.time())}"
-                        profile_path_prefix = os.path.join(
-                            PROFILE_DIR, profile_filename
-                        )
+                    profile_filename = f"{model.replace('/', '_')}_{int(time.time())}"
+                    profile_path_prefix = os.path.join(PROFILE_DIR, profile_filename)
 
-                        command = [
-                            "python3",
-                            "-m",
-                            "sglang.bench_one_batch_server",
-                            f"--model={model}",
-                            "--base-url",
-                            self.base_url,
-                            "--batch-size",
-                            str(batch_size),
-                            "--trust-remote-code",
-                            "--input-len",
-                            *[str(x) for x in self.input_lens],
-                            "--output-len",
-                            *[str(x) for x in self.output_lens],
-                            "--dataset-name=mmmu",
-                            "--show-report",
-                            "--profile",
-                            "--profile-by-stage",
-                            "--profile-filename-prefix",
-                            profile_path_prefix,
-                        ]
+                    command = [
+                        "python3",
+                        "-m",
+                        "sglang.bench_one_batch_server",
+                        f"--model={model}",
+                        "--base-url",
+                        self.base_url,
+                        "--batch-size",
+                        *[str(x) for x in self.batch_sizes],
+                        "--input-len",
+                        *[str(x) for x in self.input_lens],
+                        "--output-len",
+                        *[str(x) for x in self.output_lens],
+                        "--trust-remote-code",
+                        "--dataset-name=mmmu",
+                        "--show-report",
+                        "--profile",
+                        "--profile-by-stage",
+                        "--profile-filename-prefix",
+                        profile_path_prefix,
+                    ]
 
-                        print(f"Running command: {' '.join(command)}")
-                        result = subprocess.run(command, capture_output=True, text=True)
+                    print(f"Running command: {' '.join(command)}")
+                    result = subprocess.run(command, capture_output=True, text=True)
 
-                        if result.returncode != 0:
-                            print(
-                                f"Error running benchmark for {model} with batch size {batch_size}:"
-                            )
-                            print(result.stderr)
-                            # Continue to next batch size even if one fails
-                            continue
+                    if result.returncode != 0:
+                        print(f"Error running benchmark for {model} with batch size:")
+                        print(result.stderr)
+                        # Continue to next batch size even if one fails
+                        continue
 
-                        print(f"Output for {model} with batch size {batch_size}:")
-                        print(result.stdout)
+                    print(f"Output for {model} with batch size:")
+                    print(result.stdout)
 
-                        trace_dir = (
-                            extract_trace_link_from_bench_one_batch_server_output(
-                                result.stdout
-                            )
-                        )
+                    trace_dir = extract_trace_link_from_bench_one_batch_server_output(
+                        result.stdout
+                    )
 
-                        trace_files = find_traces_under_path(trace_dir)
-                        extend_trace_filename = [
-                            trace_file
-                            for trace_file in trace_files
-                            if trace_file.endswith(".EXTEND.trace.json.gz")
-                        ][0]
+                    trace_files = find_traces_under_path(trace_dir)
+                    extend_trace_filename = [
+                        trace_file
+                        for trace_file in trace_files
+                        if trace_file.endswith(".EXTEND.trace.json.gz")
+                    ][0]
 
-                        # because the profile_id dir under PROFILE_DIR
-                        extend_trace_file_relative_path_from_profile_dir = trace_dir[
-                            trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1 :
-                        ]
+                    # because the profile_id dir under PROFILE_DIR
+                    extend_trace_file_relative_path_from_profile_dir = trace_dir[
+                        trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1 :
+                    ]
 
-                        model_results.append(
-                            {
-                                "output": result.stdout,
-                                "trace_link": f"{extend_trace_file_relative_path_from_profile_dir}/{extend_trace_filename}",
-                            }
-                        )
+                    model_results.append(
+                        {
+                            "output": result.stdout,
+                            "trace_link": f"{extend_trace_file_relative_path_from_profile_dir}/{extend_trace_filename}",
+                        }
+                    )
 
                 finally:
                     kill_process_tree(process.pid)

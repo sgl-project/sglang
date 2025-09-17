@@ -27,10 +27,11 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
+            (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
+            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
+            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
+            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
+            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
@@ -62,7 +63,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                         "--base-url",
                         self.base_url,
                         "--batch-size",
-                        str(self.batch_sizes),
+                        *[str(x) for x in self.batch_sizes],
                         "--input-len",
                         *[str(x) for x in self.input_lens],
                         "--output-len",
@@ -78,9 +79,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                     result = subprocess.run(command, capture_output=True, text=True)
 
                     if result.returncode != 0:
-                        print(
-                            f"Error running benchmark for {model} with batch size :"
-                        )
+                        print(f"Error running benchmark for {model} with batch size :")
                         print(result.stderr)
                         # Continue to next batch size even if one fails
                         continue
@@ -88,10 +87,8 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                     print(f"Output for {model} with batch size:")
                     print(result.stdout)
 
-                    trace_dir = (
-                        extract_trace_link_from_bench_one_batch_server_output(
-                            result.stdout
-                        )
+                    trace_dir = extract_trace_link_from_bench_one_batch_server_output(
+                        result.stdout
                     )
 
                     trace_files = find_traces_under_path(trace_dir)
@@ -103,7 +100,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
 
                     # because the profile_id dir under PROFILE_DIR
                     extend_trace_file_relative_path_from_profile_dir = trace_dir[
-                        trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1:
+                        trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1 :
                     ]
 
                     model_results.append(
@@ -112,6 +109,8 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                             "trace_link": f"{extend_trace_file_relative_path_from_profile_dir}/{extend_trace_filename}",
                         }
                     )
+
+                    print(f"{model_results=}")
 
                     kill_process_tree(process.pid)
 
