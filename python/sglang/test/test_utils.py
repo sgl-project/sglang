@@ -185,9 +185,9 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt):]
+        pred = res.json()["text"][0][len(prompt) :]
     else:
-        pred = [x[len(prompt):] for x in res.json()["text"]]
+        pred = [x[len(prompt) :] for x in res.json()["text"]]
     return pred
 
 
@@ -207,9 +207,9 @@ def call_generate_outlines(
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt):]
+        pred = res.json()["text"][0][len(prompt) :]
     else:
-        pred = [x[len(prompt):] for x in res.json()["text"]]
+        pred = [x[len(prompt) :] for x in res.json()["text"]]
     return pred
 
 
@@ -243,12 +243,12 @@ def call_generate_guidance(
             model
             + prompt
             + gen(
-            name="answer",
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=stop,
-            regex=regex,
-        )
+                name="answer",
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop=stop,
+                regex=regex,
+            )
         )
         rets.append(out["answer"])
     return rets if n > 1 else rets[0]
@@ -1332,8 +1332,8 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                             if (
                                 res["meta_info"]["output_top_logprobs"][i][rank][0]
                                 == res["meta_info"]["output_top_logprobs"][i][rank + 1][
-                                0
-                            ]
+                                    0
+                                ]
                             ):
                                 rank += 1
                             else:
@@ -1498,31 +1498,45 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
         "https://mickqian.github.io/sglang-ci-perfetto-relay-page/perfetto_relay.html"
     )
     for result in results:
+        print(f"{result=}")
         # Extract the metrics row that bench_one_batch_server prints (without the profile column)
-        m = re.search(
+        metrics = re.search(
             r"\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*(?:n/a|[\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|",
             result["output"],
         )
-        if m:
-            # Reconstruct the row and append a placeholder artifact link for profile
-            parts = [part.strip() for part in m.group(0).split("|") if part.strip()]
-            filename = result.get("trace_link")
-            try:
-                from urllib.parse import quote
-            except ImportError:
-                quote = None
 
-            raw_link = f"{base_url}/{filename}"
+        filenames = result.get("trace_links")
+        filenames_iter = iter(filenames)
+        if metrics:
+            for line in result["output"].splitlines():
+                # for line in metrics.group(0).splitlines():
+                print(f"{line=}")
+                if (
+                    line.startswith("|")
+                    and "batch size" not in line
+                    and "--" not in line
+                ):
+                    # find the data lines
+                    # Reconstruct the row and append a placeholder artifact link for profile
+                    print(f"data line: {line=}")
 
-            # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
-            relay_link = (
-                f"{relay_base}?src={quote(raw_link, safe='')}"
-                if quote
-                else f"{relay_base}?src={raw_link}"
-            )
-            row = f"| {' | '.join(parts)} | [trace]({relay_link}) |\n"
+                    parts = [part.strip() for part in line.split("|") if part.strip()]
+                    try:
+                        from urllib.parse import quote
+                    except ImportError:
+                        quote = None
 
-            summary += row
+                    raw_link = f"{base_url}/{next(filenames_iter)}"
+                    print(f"{raw_link=}")
+                    # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
+                    relay_link = (
+                        f"{relay_base}?src={quote(raw_link, safe='')}"
+                        if quote
+                        else f"{relay_base}?src={raw_link}"
+                    )
+                    row = f"| {' | '.join(parts[:-1])} | [trace]({relay_link}) |\n"
+
+                    summary += row
     return summary
 
 
@@ -1558,7 +1572,11 @@ def check_model_scores(
             print(f"Warning: No threshold defined for model {model}")
             continue
 
-        latency_threshold = model_latency_thresholds.get(model, None) if model_latency_thresholds else 1e9
+        latency_threshold = (
+            model_latency_thresholds.get(model, None)
+            if model_latency_thresholds
+            else 1e9
+        )
 
         is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
         status_emoji = "✅" if is_success else "❌"
@@ -1613,7 +1631,6 @@ def popen_launch_server_wrapper(
 ):
     other_args = _extra_args_for_model(extra_args)
     env = os.environ.copy()
-    env["SGLANG_TORCH_PROFILER_DIR"] = os.path.abspath(profile_dir)
     process = popen_launch_server(
         model,
         base_url,

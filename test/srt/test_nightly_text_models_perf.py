@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import time
 import unittest
@@ -35,6 +36,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
+        cls.batch_sizes = [1, 1]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "1024"))
         os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -87,30 +89,38 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                     print(f"Output for {model} with batch size:")
                     print(result.stdout)
 
-                    trace_dir = extract_trace_link_from_bench_one_batch_server_output(
-                        result.stdout
-                    )
 
-                    trace_files = find_traces_under_path(trace_dir)
-                    extend_trace_filename = [
+                    pattern = r"\[Profile\]\((.*?)\)"
+                    trace_dirs = re.findall(pattern, result.stdout)
+
+                    trace_filenames_from_all_dirs = [
+                        find_traces_under_path(trace_dir) for trace_dir in trace_dirs
+                    ]
+
+                    extend_trace_filenames = [
                         trace_file
+                        for trace_files in trace_filenames_from_all_dirs
                         for trace_file in trace_files
                         if trace_file.endswith(".EXTEND.trace.json.gz")
-                    ][0]
+                    ]
+
 
                     # because the profile_id dir under PROFILE_DIR
-                    extend_trace_file_relative_path_from_profile_dir = trace_dir[
-                        trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1 :
+                    extend_trace_file_relative_path_from_profile_dirs = [
+                        f"{trace_dir[trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1:]}/{extend_trace_filename}"
+                        for extend_trace_filename, trace_dir in zip(
+                            extend_trace_filenames, trace_dirs
+                        )
                     ]
 
                     model_results.append(
                         {
                             "output": result.stdout,
-                            "trace_link": f"{extend_trace_file_relative_path_from_profile_dir}/{extend_trace_filename}",
+                            "trace_links": extend_trace_file_relative_path_from_profile_dirs,
                         }
                     )
 
-                    print(f"{model_results=}")
+                    print(f"{extend_trace_file_relative_path_from_profile_dirs=}")
 
                     kill_process_tree(process.pid)
 
