@@ -46,3 +46,10 @@ def generate_buckets(
         return sorted(set(default_buckets))
     assert rule == "customer"
     return sorted(set([float(x) for x in buckets_rule[1:]]))
+
+
+def exponential_buckets(start: float, width: float, length: int) -> List[float]:
+    buckets = []
+    for i in range(length):
+        buckets.append(start * (width**i))
+    return buckets
