@@ -657,7 +657,7 @@ def general_mm_embed_routine(
             )
         except Exception as e:
             inputs_embeds = None
-            print(f"Error when embedding multimodal: {e}")
+            logger.error("Error when embedding multimodal inputs", exc_info=True)
         # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
         # just being defensive here
         forward_batch.mm_inputs = None
