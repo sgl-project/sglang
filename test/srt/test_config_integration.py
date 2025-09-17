@@ -59,11 +59,11 @@ def test_config_parser(merger):
         assert "2" in merged_args
         assert "--max-running-requests" in merged_args
         assert "128" in merged_args
-        
+
         # Test boolean arguments
         assert "--enable-metrics" in merged_args  # True boolean
-        assert "--stream-output" in merged_args   # True boolean
-        assert "--log-requests" in merged_args    # True boolean
+        assert "--stream-output" in merged_args  # True boolean
+        assert "--log-requests" in merged_args  # True boolean
         assert "--show-time-cost" in merged_args  # True boolean
         # False booleans should not be present (only add flag if True)
         assert "--trust-remote-code" not in merged_args  # False boolean
