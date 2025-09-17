@@ -1,4 +1,3 @@
-import json
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -76,7 +75,8 @@ class JsonArrayParser(BaseFormatDetector):
     ) -> StreamingParseResult:
         """
         Parse JSON array tool calls with improved separator detection.
-        Uses brace counting to find valid separators that are outside JSON objects.
+        Wrapper for base parse_streaming_increment that moves tool call separators from the end
+        of a tool call chunk to the beginning of the next tool call to avoid crashes in the base class.
         """
         # If we previously withheld a valid tool-call separator, prepend it
         # when we see the next JSON object start
@@ -98,34 +98,18 @@ class JsonArrayParser(BaseFormatDetector):
             sep_index = self._find_valid_separator(new_text)
 
         if sep_index > 0:  # Ensure separator is not at position 0
-            # Candidate separator found. Validate that the content before it
-            # closes a complete JSON object, using the accumulated buffer.
-            json_part = new_text[:sep_index]
-
-            # Build full JSON so far and exclude outer tokens the base strips.
-            full_json = self._buffer + json_part
-            if full_json.startswith(self.bot_token):
-                full_json = full_json[len(self.bot_token) :]
-            elif full_json.startswith(self.tool_call_separator):
-                full_json = full_json[len(self.tool_call_separator) :]
-            if full_json.endswith(self.eot_token):
-                full_json = full_json[: -len(self.eot_token)]
-
-            try:
-                json.loads(full_json)
-                # It's a valid object followed by a separator.
-                remainder = new_text[sep_index + len(self.tool_call_separator) :]
-                if remainder:
-                    # There's more text after the separator - process normally
-                    return super().parse_streaming_increment(new_text, tools)
-                else:
-                    # No remainder - separator was at end of chunk
-                    # Withhold the separator for the next chunk
-                    self._pending_separator = True
-                    return super().parse_streaming_increment(json_part, tools)
-            except json.JSONDecodeError:
-                # Not a complete object yet; fall through to base handling.
-                pass
+            # Valid separator found (brace_count == 0 means complete JSON object)
+            prev_tool_call = new_text[:sep_index]
+            remainder = new_text[sep_index + len(self.tool_call_separator) :]
+            
+            if remainder:
+                # There's more text after the separator - the base class can handle it
+                return super().parse_streaming_increment(new_text, tools)
+            else:
+                # No remainder - separator was at end of chunk
+                # Withhold the separator for the next chunk, to avoid a crash in base class
+                self._pending_separator = True
+                return super().parse_streaming_increment(prev_tool_call, tools)
 
         # Default: delegate to base implementation with unmodified text.
         return super().parse_streaming_increment(new_text, tools)
