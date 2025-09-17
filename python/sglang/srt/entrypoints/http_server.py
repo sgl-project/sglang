@@ -47,6 +47,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.srt.afd.afd_type import AFDRole
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.entrypoints.openai.protocol import (
@@ -1437,14 +1438,14 @@ def _wait_and_warmup(
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
     launch_callback: Optional[Callable[[], None]] = None,
 ):
-    if not server_args.skip_server_warmup:
+    if server_args.skip_server_warmup or server_args.afd_role == AFDRole.AFD_ROLE_FFN:
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+    else:
         if not _execute_server_warmup(
             server_args,
             pipe_finish_writer,
         ):
             return
-    else:
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     logger.info("The server is fired up and ready to roll!")
 

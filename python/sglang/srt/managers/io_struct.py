@@ -1416,3 +1416,8 @@ class GetLoadReqOutput:
 @dataclass
 class WatchLoadUpdateReq:
     loads: List[GetLoadReqOutput]
+
+
+@dataclass
+class AFSyncReq:
+    pass

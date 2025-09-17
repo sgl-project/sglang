@@ -34,6 +34,7 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
+from sglang.srt.afd.afd_type import AFDRole
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
@@ -67,6 +68,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    AFSyncReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     ClearHiCacheReqInput,
@@ -281,9 +283,14 @@ class Scheduler(
         # Init model config
         self.model_config = ModelConfig.from_server_args(server_args)
 
+        # Init afd config
+        self.afd_role = None
+        self.init_afd_config()
+
         # Init inter-process communication
         context = zmq.Context(2)
         self.idle_sleeper = None
+        self.afd_send_to_ffn, self.afd_recv_from_attn = None, None
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -306,13 +313,24 @@ class Scheduler(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
 
+            recv_sockets = [
+                self.recv_from_tokenizer,
+                self.recv_from_rpc,
+            ]
+
+            if self.tp_rank == 0:
+                if self.afd_role == AFDRole.AFD_ROLE_ATTN:
+                    self.afd_send_to_ffn = get_zmq_socket(
+                        context, zmq.PUSH, port_args.afd_ipc_name, False
+                    )
+                elif self.afd_role == AFDRole.AFD_ROLE_FFN:
+                    self.afd_recv_from_attn = get_zmq_socket(
+                        context, zmq.PULL, port_args.afd_ipc_name, True
+                    )
+                    recv_sockets.append(self.afd_recv_from_attn)
+
             if self.server_args.sleep_on_idle:
-                self.idle_sleeper = IdleSleeper(
-                    [
-                        self.recv_from_tokenizer,
-                        self.recv_from_rpc,
-                    ]
-                )
+                self.idle_sleeper = IdleSleeper(recv_sockets)
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
@@ -564,6 +582,8 @@ class Scheduler(
         )
         self.init_disaggregation()
 
+        self.afd_ffn_running = False
+
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
 
@@ -612,6 +632,7 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
                 (GetLoadReqInput, self.get_load),
+                (AFSyncReq, self.handle_afd_sync),
             ]
         )
 
@@ -867,6 +888,16 @@ class Scheduler(
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
 
+    def init_afd_config(self):
+        if self.server_args.afd_role is None:
+            return
+
+        if self.model_config.hf_config.architectures[0] not in ["Qwen3MoeForCausalLM"]:
+            logging.warning("AFD is not supported for the target model, disabled.")
+            return
+
+        self.afd_role = self.server_args.afd_role
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -882,6 +913,8 @@ class Scheduler(
                     trace_event("schedule", req.rid)
 
             if batch:
+                self._afd_send_req_to_ffn(AFSyncReq())
+
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -889,6 +922,27 @@ class Scheduler(
                 self.self_check_during_idle()
 
             self.last_batch = batch
+
+    def _afd_send_req_to_ffn(self, req):
+        if (
+            self.afd_role == AFDRole.AFD_ROLE_ATTN
+            and self.pp_rank == 0
+            and self.tp_rank == 0
+        ):
+            self.afd_send_to_ffn.send_pyobj(req)
+
+    @DynamicGradMode()
+    def event_loop_afd_ffn_normal(self):
+        """A normal scheduler loop for afd ffn."""
+        while True:
+            self.afd_ffn_running = False
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            if self.afd_ffn_running:
+                self.tp_worker.model_runner.afd_forward_ffn()
+            else:
+                self.maybe_sleep_on_idle()
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -1099,6 +1153,29 @@ class Scheduler(
                     recv_reqs.append(recv_rpc)
             else:
                 recv_reqs = None
+
+            if self.tp_rank == 0:
+                if self.afd_role == AFDRole.AFD_ROLE_ATTN:
+                    # send control reqs to ffn
+                    for req in recv_reqs:
+                        if not isinstance(
+                            req,
+                            (
+                                TokenizedGenerateReqInput,
+                                TokenizedEmbeddingReqInput,
+                                BatchTokenizedGenerateReqInput,
+                                BatchTokenizedEmbeddingReqInput,
+                            ),
+                        ):
+                            self.afd_send_to_ffn.send_pyobj(req)
+
+                elif self.afd_role == AFDRole.AFD_ROLE_FFN:
+                    while True:
+                        try:
+                            recv_afd = self.afd_recv_from_attn.recv_pyobj(zmq.NOBLOCK)
+                        except zmq.ZMQError:
+                            break
+                        recv_reqs.append(recv_afd)
         else:
             if self.attn_tp_rank == 0:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
@@ -2716,6 +2793,10 @@ class Scheduler(
         self.send_to_detokenizer.send_pyobj(recv_req)
         return None
 
+    def handle_afd_sync(self, recv_req: AFSyncReq):
+        self.afd_ffn_running = True
+        return None
+
 
 class IdleSleeper:
     """
@@ -2832,7 +2913,12 @@ def run_scheduler_process(
         )
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
-        if disaggregation_mode == DisaggregationMode.NULL:
+        if scheduler.afd_role is not None:
+            if scheduler.afd_role == AFDRole.AFD_ROLE_FFN:
+                scheduler.event_loop_afd_ffn_normal()
+            else:
+                scheduler.event_loop_normal()
+        elif disaggregation_mode == DisaggregationMode.NULL:
             if server_args.pp_size > 1:
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:

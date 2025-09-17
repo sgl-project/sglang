@@ -31,6 +31,7 @@ import requests
 import torch
 import torch.distributed as dist
 
+from sglang.srt.afd.afd_type import AFDRole
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -2019,6 +2020,23 @@ class ModelRunner:
             forward_batch.post_forward_mlp_sync_batch(ret)
 
         return ret, can_run_graph
+
+    def afd_forward_ffn(self):
+        assert self.server_args.afd_role == AFDRole.AFD_ROLE_FFN
+
+        # forward_batch fields like input_ids are needed in forwarding
+        placeholder = torch.zeros(0).to(self.device, non_blocking=True)
+        forward_batch = ForwardBatch(
+            forward_mode=0,
+            batch_size=0,
+            input_ids=placeholder,
+            req_pool_indices=placeholder,
+            seq_lens=placeholder,
+            out_cache_loc=placeholder,
+            seq_lens_sum=0,
+        )
+
+        self.model.forward(forward_batch.input_ids, None, forward_batch, None)
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
