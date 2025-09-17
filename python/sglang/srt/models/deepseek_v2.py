@@ -569,10 +569,13 @@ class DeepseekV2MoE(nn.Module):
         ):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
+        HACK_SBO_SHARED_AND_RS = True
+
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
-            )
+            if not HACK_SBO_SHARED_AND_RS:
+                shared_output = self._forward_shared_experts(
+                    hidden_states, gemm_output_zero_allocator
+                )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
@@ -580,7 +583,17 @@ class DeepseekV2MoE(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        shared_output = None
+        def _forward_shared_experts_and_put_results():
+            nonlocal shared_output
+            shared_output = self._forward_shared_experts(hidden_states, gemm_output_zero_allocator)
+
+        final_hidden_states = self.experts(
+            hidden_states,
+            topk_output,
+            forward_shared_experts=_forward_shared_experts_and_put_results,
+            alt_stream=self.alt_stream,
+        )
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
