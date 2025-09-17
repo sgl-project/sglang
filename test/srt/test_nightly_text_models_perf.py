@@ -36,7 +36,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
-        cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "1024"))
+        cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "512"))
         os.makedirs(PROFILE_DIR, exist_ok=True)
         cls.full_report = f"## {cls.__name__}\n"
 
