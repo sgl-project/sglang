@@ -508,7 +508,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=True,
+            # TODO(shuw): pending https://github.com/deepseek-ai/DeepEP/pull/341
+            use_fp8=not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"),
         )
         return (
             hidden_states,
