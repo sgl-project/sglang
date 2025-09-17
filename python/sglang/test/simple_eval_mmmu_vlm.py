@@ -1,9 +1,6 @@
 """
 MMMU evaluation for VLMs using the run_eval simple-evals interface.
 
-参考 bench_serving 的数据加载方式，直接从 HuggingFace 加载 MMMU 的 Math 测试集，
-确定性地选择 100 个样本，构造图文消息调用 OpenAI Chat Completions，
-并实现最小的答案解析与打分。
 """
 
 from __future__ import annotations
@@ -27,12 +24,41 @@ from sglang.test.simple_eval_common import (
 
 
 class MMMUVLMEval(Eval):
-    def __init__(self, num_examples: Optional[int], num_threads: int, seed: int = 42):
+    DOMAIN_CAT2SUB_CAT = {
+        "Art and Design": ["Art", "Art_Theory", "Design", "Music"],
+        "Business": ["Accounting", "Economics", "Finance", "Manage", "Marketing"],
+        "Science": ["Biology", "Chemistry", "Geography", "Math", "Physics"],
+        "Health and Medicine": [
+            "Basic_Medical_Science",
+            "Clinical_Medicine",
+            "Diagnostics_and_Laboratory_Medicine",
+            "Pharmacy",
+            "Public_Health",
+        ],
+        "Humanities and Social Science": [
+            "History",
+            "Literature",
+            "Sociology",
+            "Psychology",
+        ],
+        "Tech and Engineering": [
+            "Agriculture",
+            "Architecture_and_Engineering",
+            "Computer_Science",
+            "Electronics",
+            "Energy_and_Power",
+            "Materials",
+            "Mechanical_Engineering",
+        ],
+    }
+
+    def __init__(
+        self, num_examples: Optional[int] = 100, num_threads: int = 32, seed: int = 42
+    ):
         """Create MMMU VLM eval (Math subset, 100 fixed samples by default)."""
-        self.num_examples = 100 if num_examples is None else int(num_examples)
+        self.num_examples = num_examples
         self.num_threads = num_threads
         self.seed = seed
-
         # Prepare samples deterministically across all MMMU subjects (validation split)
         self.samples = self._prepare_mmmu_samples(self.num_examples)
 
@@ -59,35 +85,8 @@ class MMMUVLMEval(Eval):
 
     def _prepare_mmmu_samples(self, k: int) -> List[dict]:
         # Subjects and domains copied from MMMU data_utils to categorize results
-        DOMAIN_CAT2SUB_CAT = {
-            "Art and Design": ["Art", "Art_Theory", "Design", "Music"],
-            "Business": ["Accounting", "Economics", "Finance", "Manage", "Marketing"],
-            "Science": ["Biology", "Chemistry", "Geography", "Math", "Physics"],
-            "Health and Medicine": [
-                "Basic_Medical_Science",
-                "Clinical_Medicine",
-                "Diagnostics_and_Laboratory_Medicine",
-                "Pharmacy",
-                "Public_Health",
-            ],
-            "Humanities and Social Science": [
-                "History",
-                "Literature",
-                "Sociology",
-                "Psychology",
-            ],
-            "Tech and Engineering": [
-                "Agriculture",
-                "Architecture_and_Engineering",
-                "Computer_Science",
-                "Electronics",
-                "Energy_and_Power",
-                "Materials",
-                "Mechanical_Engineering",
-            ],
-        }
         subjects: List[str] = []
-        for subs in DOMAIN_CAT2SUB_CAT.values():
+        for subs in self.DOMAIN_CAT2SUB_CAT.values():
             subjects.extend(subs)
 
         # Load validation split of each subject
@@ -161,6 +160,7 @@ class MMMUVLMEval(Eval):
                     "category": subject,
                 }
             )
+
         return samples
 
     @staticmethod
@@ -268,38 +268,10 @@ class MMMUVLMEval(Eval):
             acc = (corr / tot) if tot > 0 else 0.0
             evaluation_result[cat] = {"acc": round(acc, 3), "num_example": tot}
         print(f"{evaluation_result=}")
-        # Domain table
-        DOMAIN_CAT2SUB_CAT = {
-            "Art and Design": ["Art", "Art_Theory", "Design", "Music"],
-            "Business": ["Accounting", "Economics", "Finance", "Manage", "Marketing"],
-            "Science": ["Biology", "Chemistry", "Geography", "Math", "Physics"],
-            "Health and Medicine": [
-                "Basic_Medical_Science",
-                "Clinical_Medicine",
-                "Diagnostics_and_Laboratory_Medicine",
-                "Pharmacy",
-                "Public_Health",
-            ],
-            "Humanities and Social Science": [
-                "History",
-                "Literature",
-                "Sociology",
-                "Psychology",
-            ],
-            "Tech and Engineering": [
-                "Agriculture",
-                "Architecture_and_Engineering",
-                "Computer_Science",
-                "Electronics",
-                "Energy_and_Power",
-                "Materials",
-                "Mechanical_Engineering",
-            ],
-        }
 
         printable_results = {}
         # Domains first
-        for domain, cats in DOMAIN_CAT2SUB_CAT.items():
+        for domain, cats in self.DOMAIN_CAT2SUB_CAT.items():
             acc_sum = 0.0
             num_sum = 0
             for cat in cats:

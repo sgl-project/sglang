@@ -89,7 +89,7 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run eval test for VLM models (MMMU-100)
+      - name: Run eval test for VLM models (fixed MMMU-100)
         timeout-minutes: 240
         run: |
           cd test/srt
