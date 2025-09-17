@@ -2,7 +2,7 @@
 Batch the same prompt in random batch sizes, and test if the results are consistent across different trials.
 
 Usage:
-python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials> --test-mode <single|mixed>
+python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials> --test-mode <single|mixed> --profile
 """
 
 import argparse
@@ -13,6 +13,8 @@ import random
 from typing import List
 
 import requests
+
+from sglang.profiler import run_profile
 
 PROMPT_1 = "Tell me about Richard Feynman: "
 PROMPT_2 = "Generate 1000 random numbers. Go directly into it, don't say Sure and don't say here are numbers. Just start with a number."
@@ -32,6 +34,9 @@ class BenchArgs:
     presence_penalty: float = 0.0
     return_logprob: bool = False
     stream: bool = False
+    profile: bool = False
+    profile_steps: int = 3
+    profile_by_stage: bool = False
     test_mode: str = "single"
 
     @staticmethod
@@ -57,6 +62,11 @@ class BenchArgs:
             default=BenchArgs.test_mode,
             choices=["single", "mixed", "prefix"],
         )
+        parser.add_argument("--profile", action="store_true")
+        parser.add_argument(
+            "--profile-steps", type=int, default=BenchArgs.profile_steps
+        )
+        parser.add_argument("--profile-by-stage", action="store_true")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -64,8 +74,15 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def send_single(args, batch_size: int):
+def send_single(
+    args,
+    batch_size: int,
+    profile: bool = False,
+    profile_steps: int = 3,
+    profile_by_stage: bool = False,
+):
 
+    base_url = f"http://{args.host}:{args.port}"
     prompt = [PROMPT_1] * batch_size
 
     json_data = {
@@ -80,8 +97,13 @@ def send_single(args, batch_size: int):
         "stream": args.stream,
     }
 
+    if profile:
+        run_profile(
+            base_url, profile_steps, ["CPU", "GPU"], None, None, profile_by_stage
+        )
+
     response = requests.post(
-        f"http://{args.host}:{args.port}/generate",
+        f"{base_url}/generate",
         json=json_data,
         stream=args.stream,
     )
@@ -189,14 +211,14 @@ def send_prefix(args, batch_size: int, prompts: List[str]):
 def test_deterministic(args):
     # First do some warmups
     for i in range(3):
-        send_single(args, 16)
+        send_single(args, 16, args.profile)
 
     if args.test_mode == "single":
         # In single mode, we test the deterministic behavior by sending the same prompt in batch sizes ranging from 1 to n_trials.
         texts = []
         for i in range(1, args.n_trials + 1):
             batch_size = i
-            text = send_single(args, batch_size)
+            text = send_single(args, batch_size, args.profile)
             text = text.replace("\n", " ")
             print(f"Trial {i} with batch size {batch_size}: {text}")
             texts.append(text)
