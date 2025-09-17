@@ -214,8 +214,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 tool_call_constraint = ("json_schema", json_schema)
 
-                
-
         # Use chat template
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
@@ -933,9 +931,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 for call_info in call_info_list:
                     tool_calls.append(
                         ToolCall(
-                            id=self._get_tool_id(
-                                call_info.name, call_info.tool_index
-                            ),
+                            id=self._get_tool_id(call_info.name, call_info.tool_index),
                             index=getattr(call_info, "tool_index", None),
                             function=FunctionResponse(
                                 name=call_info.name, arguments=call_info.parameters

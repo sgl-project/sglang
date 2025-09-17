@@ -2282,14 +2282,18 @@ class TestJsonArrayParser(unittest.TestCase):
     def test_parse_streaming_increment_with_separator_handling(self):
         """Test parsing with separator handling across chunks"""
         # First chunk ends with separator
-        self.detector.parse_streaming_increment('[{"name": "get_weather", "parameters": {"location": "Tokyo"}},', self.tools)
-        
+        self.detector.parse_streaming_increment(
+            '[{"name": "get_weather", "parameters": {"location": "Tokyo"}},', self.tools
+        )
+
         # Should have set pending separator
         self.assertTrue(self.detector._pending_separator)
 
         # Second chunk starts with new object
-        result2 = self.detector.parse_streaming_increment('{"name": "search", "parameters": {"query": "weather"}}]', self.tools)
-        
+        result2 = self.detector.parse_streaming_increment(
+            '{"name": "search", "parameters": {"query": "weather"}}]', self.tools
+        )
+
         # Should have processed the second object
         self.assertIsInstance(result2, StreamingParseResult)
 
@@ -2298,11 +2302,11 @@ class TestJsonArrayParser(unittest.TestCase):
         # Test with malformed JSON
         text = '[{"name": "get_weather", "parameters": {"location": "Tokyo"'
         result = self.detector.parse_streaming_increment(text, self.tools)
-        
+
         # Should not crash and return a valid result
         self.assertIsInstance(result, StreamingParseResult)
 
-        text = '[{}}}]'
+        text = "[{}}}]"
         result = self.detector.parse_streaming_increment(text, self.tools)
 
         self.assertIsInstance(result, StreamingParseResult)
@@ -2318,7 +2322,7 @@ class TestJsonArrayParser(unittest.TestCase):
         # Test with leading/trailing whitespace
         text = '  [{"name": "get_weather", "parameters": {"location": "Tokyo"}}]  '
         result = self.detector.parse_streaming_increment(text, self.tools)
-        
+
         # The base class should handle this
         self.assertIsInstance(result, StreamingParseResult)
 
@@ -2326,7 +2330,7 @@ class TestJsonArrayParser(unittest.TestCase):
         """Test parsing with nested JSON objects"""
         text = '[{"name": "get_weather", "parameters": {"location": "Tokyo", "nested": {"key": "value"}}}]'
         result = self.detector.parse_streaming_increment(text, self.tools)
-        
+
         # The base class should handle this
         self.assertIsInstance(result, StreamingParseResult)
 
@@ -2335,7 +2339,7 @@ class TestJsonArrayParser(unittest.TestCase):
         # Test array content without brackets (should be handled by base class)
         text = '{"name": "get_weather", "parameters": {"location": "Tokyo"}}'
         result = self.detector.parse_streaming_increment(text, self.tools)
-        
+
         # Should not parse as tool call since it doesn't start with [
         self.assertEqual(len(result.calls), 0)
 
@@ -2343,21 +2347,23 @@ class TestJsonArrayParser(unittest.TestCase):
         """Test that brace counting works correctly across multiple calls"""
         # Reset detector state
         self.detector.brace_count = 0
-        
+
         # First call with opening brace
         text1 = '{"name": "test"'
         sep_index1 = self.detector._find_valid_separator(text1)
         self.assertEqual(sep_index1, -1)  # No separator found
         self.assertEqual(self.detector.brace_count, 1)  # One opening brace
-        
+
         # Reset for second test
         self.detector.brace_count = 0
-        
+
         # Test with complete object and separator
         text2 = '{"name": "test"},{"name": "test2"}'
         sep_index2 = self.detector._find_valid_separator(text2)
         self.assertEqual(sep_index2, 16)  # Separator found at position 16
-        self.assertEqual(self.detector.brace_count, 0)  # Back to zero after complete object
+        self.assertEqual(
+            self.detector.brace_count, 0
+        )  # Back to zero after complete object
 
 
 if __name__ == "__main__":
