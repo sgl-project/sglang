@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Test script to verify SGLang config file integration.
 """
