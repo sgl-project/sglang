@@ -53,8 +53,8 @@ from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
-    get_device_memory_capacity,
     get_bool_env_var,
+    get_device_memory_capacity,
     is_hip,
     log_info_on_rank0,
     require_attn_tp_gather,
