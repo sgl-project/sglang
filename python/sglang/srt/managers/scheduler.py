@@ -58,7 +58,12 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tp_active_ranks,
+    get_tp_active_ranks_cpu,
+    get_world_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -147,6 +152,7 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -2221,9 +2227,12 @@ class Scheduler(
         if len(offload_tags) == 0 and disable_overlap_schedule:
             group = tp_group.device_group
             device = tp_group.device
+            torch.distributed.barrier(group=tp_group.cpu_group)
+            tp_active_ranks = get_tp_active_ranks()
         else:
             group = tp_group.cpu_group
             device = "cpu"
+            tp_active_ranks = get_tp_active_ranks_cpu()
 
         local_info = torch.tensor(
             [
@@ -2247,6 +2256,11 @@ class Scheduler(
             global_info.flatten(),
             local_info,
             group=group,
+        )
+        global_info.view(-1, 6)[tp_active_ranks == 0, :] = torch.tensor(
+            [0, 1, 0, 0, 1, ForwardMode.IDLE.value],
+            device=global_info.device,
+            dtype=global_info.dtype,
         )
         global_num_tokens = global_info[:, 0, 0].tolist()
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
