@@ -68,52 +68,8 @@ class ConfigArgumentMerger:
         before_config = cli_args[:config_index]
         after_config = cli_args[config_index + 2 :]  # Skip --config and file path
 
-        # Handle different command structures
-        if self._has_subcommand(before_config):
-            return self._merge_with_subcommand(before_config, config_args, after_config)
-        else:
-            return config_args + before_config + after_config
-
-    def _has_subcommand(self, args: List[str]) -> bool:
-        """Check if arguments start with a subcommand."""
-        return args and not args[0].startswith("-")
-
-    def _merge_with_subcommand(
-        self, before_config: List[str], config_args: List[str], after_config: List[str]
-    ) -> List[str]:
-        """Merge config args when subcommand is present."""
-        subcommand = before_config[0]
-        remaining_args = before_config[1:]
-
-        if subcommand == "serve":
-            return self._handle_serve_command(
-                subcommand, remaining_args, config_args, after_config
-            )
-        else:
-            return [subcommand] + config_args + remaining_args + after_config
-
-    def _handle_serve_command(
-        self,
-        subcommand: str,
-        remaining_args: List[str],
-        config_args: List[str],
-        after_config: List[str],
-    ) -> List[str]:
-        """Handle special logic for the 'serve' subcommand."""
-        has_model_in_cli = remaining_args and not remaining_args[0].startswith("-")
-        has_model_in_config = any(arg == "--model" for arg in config_args)
-
-        if not has_model_in_cli and not has_model_in_config:
-            raise ValueError(
-                "No model specified! Provide model as positional argument or in config file."
-            )
-
-        if has_model_in_cli:
-            model_arg = remaining_args[0]
-            other_args = remaining_args[1:]
-            return [subcommand, model_arg] + config_args + other_args + after_config
-        else:
-            return [subcommand] + config_args + remaining_args + after_config
+        # Simple merge: config args + CLI args
+        return config_args + before_config + after_config
 
     def _parse_yaml_config(self, file_path: str) -> List[str]:
         """

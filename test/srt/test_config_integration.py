@@ -28,6 +28,12 @@ def test_config_parser(merger):
         "port": 30000,
         "tensor-parallel-size": 2,
         "trust-remote-code": False,
+        "enable-metrics": True,
+        "stream-output": True,
+        "skip-server-warmup": False,
+        "log-requests": True,
+        "show-time-cost": True,
+        "is-embedding": False,
     }
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
@@ -53,6 +59,16 @@ def test_config_parser(merger):
         assert "2" in merged_args
         assert "--max-running-requests" in merged_args
         assert "128" in merged_args
+        
+        # Test boolean arguments
+        assert "--enable-metrics" in merged_args  # True boolean
+        assert "--stream-output" in merged_args   # True boolean
+        assert "--log-requests" in merged_args    # True boolean
+        assert "--show-time-cost" in merged_args  # True boolean
+        # False booleans should not be present (only add flag if True)
+        assert "--trust-remote-code" not in merged_args  # False boolean
+        assert "--skip-server-warmup" not in merged_args  # False boolean
+        assert "--is-embedding" not in merged_args  # False boolean
 
     finally:
         os.unlink(config_file)
