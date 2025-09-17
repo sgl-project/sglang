@@ -228,6 +228,11 @@ class CompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
+
+    # For customer metric labels
+    customer_labels: Optional[Dict[str, str]] = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -447,7 +452,7 @@ class ChatCompletionRequest(BaseModel):
         description="Constrains effort on reasoning for reasoning models. "
         "'low' is the least effort, 'high' is the most effort. Reducing reasoning effort can "
         "result in faster responses and fewer tokens used on reasoning in a response. "
-        "Currently only supported for OpenAI models.",
+        "Currently only supported for OpenAI models in the harmony path, i.e GPT-OSS models.",
     )
 
     @model_validator(mode="before")
@@ -540,11 +545,13 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For PD disaggregation
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
 
 
 class ChatMessage(BaseModel):
@@ -641,6 +648,8 @@ class EmbeddingRequest(BaseModel):
 
     # The request id.
     rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
 
 class EmbeddingObject(BaseModel):
