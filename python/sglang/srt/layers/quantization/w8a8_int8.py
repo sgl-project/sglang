@@ -154,16 +154,11 @@ def npu_fused_experts(
             "scale": [w13_scale.to(scale_dtype)],
             "per_token_scale": [pertoken_scale],
         }
-        scale_args2 = {
-            "scale": [w2_scale.to(scale_dtype)],
-            "per_token_scale": [pertoken_scale],
-        }
     else:
         scale_args13 = {
             "antiquant_scale": [w13_scale],
             "antiquant_offset": [w13_offset],
         }
-        scale_args2 = {"antiquant_scale": [w2_scale], "antiquant_offset": [w2_offset]}
 
     hidden_states = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -177,7 +172,15 @@ def npu_fused_experts(
     )[0]
     # act_fn: swiglu
     hidden_states = torch_npu.npu_swiglu(hidden_states)
-    hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+    if not use_wna16:
+        hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+
+        scale_args2 = {
+            "scale": [w2_scale.to(scale_dtype)],
+            "per_token_scale": [pertoken_scale],
+        }
+    else:
+        scale_args2 = {"antiquant_scale": [w2_scale], "antiquant_offset": [w2_offset]}
     # gmm2: down_proj
     hidden_states = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
