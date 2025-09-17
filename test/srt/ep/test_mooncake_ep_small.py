@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -70,7 +71,6 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-@unittest.skip("covered in TestMooncakeWithEPLB")
 class TestPureDP(TestTP):
     extra_args = [
         "--tp",
@@ -78,7 +78,28 @@ class TestPureDP(TestTP):
         "--enable-dp-attention",
         "--dp",
         "4",
+        "--moe-dense-tp-size",
+        "1",
+        "--enable-dp-lm-head",
+        "--disable-custom-all-reduce",
+        "--enable-eplb",
+        "--ep-num-redundant-experts",
+        "72",
     ]
+
+    def test_gsm8k_fault_1(self):
+        """
+        Kill one rank and the system should remain operational.
+        """
+        os.system("pkill -f sglang::scheduler_DP1_TP1_EP1")
+        super().test_gsm8k()
+
+    def test_gsm8k_fault_2(self):
+        """
+        Kill another rank and the system should remain operational.
+        """
+        os.system("pkill -f sglang::scheduler_DP3_TP3_EP3")
+        super().test_gsm8k()
 
 
 class TestHybridDPTP(TestTP):
@@ -88,7 +109,28 @@ class TestHybridDPTP(TestTP):
         "--enable-dp-attention",
         "--dp",
         "2",
+        "--moe-dense-tp-size",
+        "1",
+        "--enable-dp-lm-head",
+        "--disable-custom-all-reduce",
+        "--enable-eplb",
+        "--ep-num-redundant-experts",
+        "72",
     ]
+
+    def test_gsm8k_fault_1(self):
+        """
+        Kill one rank and the system should remain operational.
+        """
+        os.system("pkill -f sglang::scheduler_DP1_TP2_EP2")
+        super().test_gsm8k()
+
+    def test_gsm8k_fault_2(self):
+        """
+        Kill another rank and the system should remain operational.
+        """
+        os.system("pkill -f sglang::scheduler_DP1_TP3_EP3")
+        super().test_gsm8k()
 
 
 @unittest.skip("covered in TestMooncakeWithEPLB")
@@ -104,7 +146,6 @@ class TestNoGatherdBuffer(TestTP):
     ]
 
 
-@unittest.skip("covered in TestMooncakeWithEPLB")
 class TestTBO(TestTP):
     extra_args = [
         "--tp",
@@ -115,7 +156,26 @@ class TestTBO(TestTP):
         "--moe-dense-tp-size",
         "1",
         "--enable-two-batch-overlap",
+        "--enable-dp-lm-head",
+        "--disable-custom-all-reduce",
+        "--enable-eplb",
+        "--ep-num-redundant-experts",
+        "72",
     ]
+
+    def test_gsm8k_fault_1(self):
+        """
+        Kill one rank and the system should remain operational.
+        """
+        os.system("pkill -f sglang::scheduler_DP1_TP1_EP1")
+        super().test_gsm8k()
+
+    def test_gsm8k_fault_2(self):
+        """
+        Kill another rank and the system should remain operational.
+        """
+        os.system("pkill -f sglang::scheduler_DP3_TP3_EP3")
+        super().test_gsm8k()
 
 
 class TestMooncakeWithEPLB(TestTP):
