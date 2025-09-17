@@ -492,7 +492,7 @@ class BaseMultimodalProcessor(ABC):
                         raw_data.get("format") == "processor_output"
                         or raw_data.get("format") == "precomputed_embedding"
                     )
-                    has_precomputed_input = has_precomputed_input | is_precomputed
+                    has_precomputed_input |= is_precomputed
                     result = next(futures_iter).result()
                     if modality == Modality.IMAGE:
                         # If data is already processed or embedded, it will be a
