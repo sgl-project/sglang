@@ -1114,6 +1114,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return _dispatch_mla_subtype()
+        elif attention_backend == "fa4":
+            # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
+            return AttnForwardMethod.MHA_CHUNKED_KV
         elif attention_backend == "trtllm_mla":
             sum_extend_prefix_lens = (
                 sum(forward_batch.extend_prefix_lens_cpu)
