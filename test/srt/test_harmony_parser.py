@@ -204,6 +204,16 @@ class TestCanonicalStrategy(CustomTestCase):
         self.assertEqual(events[0].content, '{"location": "SF"}')
         self.assertEqual(remaining, "")
 
+    def test_parse_tool_call_ending_with_return(self):
+        """Test parsing tool call block ending with <|return|>."""
+        text = '<|channel|>commentary to=functions.get_weather<|message|>{"location": "SF"}<|return|>'
+        events, remaining = self.strategy.parse(text)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "tool_call")
+        self.assertEqual(events[0].content, '{"location": "SF"}')
+        self.assertEqual(remaining, "")
+
     def test_parse_tool_call_analysis(self):
         """Test parsing built-in tool call on analysis channel."""
         text = '<|channel|>analysis to=browser.search<|message|>{"query": "SGLang"}<|call|>'
