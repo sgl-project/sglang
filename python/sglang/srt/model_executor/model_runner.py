@@ -2169,8 +2169,29 @@ class ModelRunner:
                 split_forward_count,
             )
 
-        if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end()
+            if not torch.equal(
+                get_elastic_ep_state().active_ranks,
+                get_elastic_ep_state().last_active_ranks,
+            ):
+                get_elastic_ep_state().last_active_ranks = (
+                    get_elastic_ep_state().active_ranks.clone()
+                )
+                logging.info(f"recompute _forward_raw")
+                gen = self.eplb_manager.rebalance()
+                while True:
+                    try:
+                        next(gen)
+                    except StopIteration:
+                        break
+                output = self._forward_raw(
+                    forward_batch,
+                    skip_attn_backend_init,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
+            if self.eplb_manager is not None:
+                self.eplb_manager.on_forward_pass_end()
 
         return output
 

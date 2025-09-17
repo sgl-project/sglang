@@ -73,6 +73,9 @@ def compute_algorithm(
     if raw_algorithm != "auto":
         return EplbAlgorithm[raw_algorithm]
 
+    if get_elastic_ep_state().using_elastic_ep:
+        return EplbAlgorithm.elasticity_aware
+
     # TODO test on real scenarios and know which ones perform better
     if (num_groups is not None) and (num_groups % num_nodes == 0):
         return EplbAlgorithm.deepseek_hierarchical

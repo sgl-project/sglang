@@ -1,9 +1,11 @@
+import os
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_disaggregation_utils import get_rdma_devices_args
+from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -47,7 +49,13 @@ class _BaseTestMooncakeEp(CustomTestCase):
                 "512",
                 "--mem-fraction-static",
                 "0.5",
-                *cls.extra_args,
+                "--disable-custom-all-reduce",
+                "--enable-eplb",
+                "--ep-num-redundant-experts",
+                "24",
+                "--enable-dp-lm-head",
+                "--moe-dense-tp-size",
+                "1",
             ],
         )
 
@@ -69,6 +77,19 @@ class _BaseTestMooncakeEp(CustomTestCase):
         print(metrics)
 
         self.assertGreater(metrics["accuracy"], 0.60)
+
+    def test_bs_1_speed(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
+        print(f"{speed=:.2f}")
+
+    def test_bs_1_fault_tolerance(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
+        print(f"{speed=:.2f}")
+        os.system("pkill -f sglang::scheduler_DP2_TP2_EP2")
+        acc_length, speed = send_one_prompt(args)
+        print(f"{speed=:.2f}")
 
 
 class TestPureDP(_BaseTestMooncakeEp):
