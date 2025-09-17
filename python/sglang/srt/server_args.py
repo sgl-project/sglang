@@ -2659,6 +2659,116 @@ class ServerArgs:
             original_server_arg_mem_fraction * final_overall_factor
         )
 
+    def _configure_gpu_memory_settings(self, gpu_mem):
+        """
+        Configure GPU memory-dependent settings including mem_fraction_static,
+        chunked_prefill_size, cuda_graph_max_bs, and cuda_graph_bs.
+        """
+        # Set mem fraction static
+        if self.mem_fraction_static is None:
+            if gpu_mem is not None:
+                # GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
+                # mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
+
+                # We want mem_fraction_static to be as large as possible but still has enough room
+                # for activations and cuda graph buffers. We use the following heuristic to
+                # compute the needed size for activations and cuda graph buffers:
+                # - The size of the activation depends on the chunked_prefill_size and model size.
+                # - The size of cuda graph buffers depends on the cuda graph capture range and model size.
+                # For GPUs with more memory, we use a larger chunked_prefill_size and
+                # capture more cuda graphs, so they need to reserve more memory.
+                parallel_size = self.tp_size * self.pp_size
+
+                if gpu_mem < 20 * 1024:
+                    # T4, 4080. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
+                    reserved_mem = (2.8 + parallel_size / 10) * 1024
+                elif gpu_mem < 50 * 1024:
+                    # A10, L40, 4090, 5090. (chunked_prefill_size 2k, cuda_graph_max_bs 16)
+                    reserved_mem = (2.8 + parallel_size / 10) * 1024
+                elif gpu_mem < 90 * 1024:
+                    # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs -)
+                    # if tp >= 4, cuda_graph_max_bs 512, else 256
+                    reserved_mem = (9.5 + parallel_size / 2) * 1024
+                elif gpu_mem < 100 * 1024:
+                    # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
+                    reserved_mem = (12 + parallel_size / 2) * 1024
+                elif gpu_mem < 160 * 1024:
+                    # H200. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
+                    reserved_mem = (12 + parallel_size / 2) * 1024
+                else:
+                    # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
+                    reserved_mem = 32 * 1024
+
+                # draft model and larger cuda graph buffers
+                if self.speculative_draft_model_path is not None:
+                    reserved_mem *= 1.5
+
+                self.mem_fraction_static = max(
+                    0.3, min(0.95, (gpu_mem - reserved_mem) / gpu_mem)
+                )
+            else:
+                self.mem_fraction_static = 0.85
+
+        # Set chunked prefill size
+        if self.chunked_prefill_size is None:
+            if gpu_mem is not None:
+                if gpu_mem < 20 * 1024:
+                    # T4, 4080
+                    self.chunked_prefill_size = 2048
+                elif gpu_mem < 50 * 1024:
+                    # A10, L40, 4090, 5090
+                    self.chunked_prefill_size = 2048
+                elif gpu_mem < 90 * 1024:
+                    # H100, A100
+                    self.chunked_prefill_size = 8192
+                elif gpu_mem < 100 * 1024:
+                    # H20
+                    self.chunked_prefill_size = 8192
+                elif gpu_mem < 160 * 1024:
+                    # H200
+                    self.chunked_prefill_size = 8192
+                else:
+                    # B200, MI300
+                    self.chunked_prefill_size = 16384
+            else:
+                self.chunked_prefill_size = 8192
+
+        # Set cuda graph max batch size
+        if self.cuda_graph_max_bs is None:
+            if gpu_mem is not None:
+                if gpu_mem < 20 * 1024:
+                    # T4, 4080
+                    self.cuda_graph_max_bs = 8
+                elif gpu_mem < 50 * 1024:
+                    # A10, L40, 4090, 5090
+                    self.cuda_graph_max_bs = 16
+                elif gpu_mem < 90 * 1024:
+                    # H100, A100
+                    if self.tp_size >= 4:
+                        self.cuda_graph_max_bs = 512
+                    else:
+                        self.cuda_graph_max_bs = 256
+                elif gpu_mem < 100 * 1024:
+                    # H20
+                    self.cuda_graph_max_bs = 512
+                elif gpu_mem < 160 * 1024:
+                    # H200
+                    self.cuda_graph_max_bs = 512
+                else:
+                    # B200, MI300
+                    self.cuda_graph_max_bs = 512
+            else:
+                self.cuda_graph_max_bs = 256
+
+        # Set cuda graph batch sizes
+        if self.cuda_graph_bs is None:
+            if self.cuda_graph_max_bs <= 16:
+                self.cuda_graph_bs = [1, 2, 4, 8, 16][: self.cuda_graph_max_bs]
+            else:
+                self.cuda_graph_bs = [1, 2, 4] + [
+                    8 * i for i in range(1, self.cuda_graph_max_bs // 8 + 1)
+                ]
+
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
