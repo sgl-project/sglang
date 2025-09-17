@@ -34,7 +34,7 @@ class MooncakeStoreConfig:
                 config = json.load(fin)
         except Exception as e:
             raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
-        
+
         return MooncakeStoreConfig(
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
