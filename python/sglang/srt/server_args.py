@@ -2729,7 +2729,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     from sglang.srt.config_parser import ConfigArgumentMerger
 
     # Check for config file and merge arguments if present
-    if '--config' in argv:
+    if "--config" in argv:
         # Extract boolean actions from the parser to handle them correctly
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -2737,8 +2737,8 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         # Get boolean action destinations
         boolean_actions = []
         for action in parser._actions:
-            if hasattr(action, 'dest') and hasattr(action, 'action'):
-                if action.action in ['store_true', 'store_false']:
+            if hasattr(action, "dest") and hasattr(action, "action"):
+                if action.action in ["store_true", "store_false"]:
                     boolean_actions.append(action.dest)
 
         # Merge config file arguments with CLI arguments
