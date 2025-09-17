@@ -3,11 +3,16 @@ import threading
 import time
 from abc import ABC
 from contextlib import contextmanager, nullcontext
+from sglang.srt.utils import (
+    is_npu,
+)
 
 try:
     import torch_memory_saver
 
     _memory_saver = torch_memory_saver.torch_memory_saver
+    if is_npu():
+        _memory_saver.hook_mode = "torch"
     import_error = None
 except ImportError as e:
     import_error = e
