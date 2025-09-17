@@ -1498,7 +1498,6 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
         "https://mickqian.github.io/sglang-ci-perfetto-relay-page/perfetto_relay.html"
     )
     for result in results:
-        print(f"{result=}")
         # Extract the metrics row that bench_one_batch_server prints (without the profile column)
         metrics = re.search(
             r"\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*(?:n/a|[\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|",

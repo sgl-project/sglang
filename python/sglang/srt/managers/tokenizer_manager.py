@@ -568,8 +568,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         """Tokenize one request."""
         # Tokenize
-        # print(f"510 {obj=}")
-        # print(f"510 {obj.contains_mm_input()=}")
         input_embeds = None
         input_text = obj.text
         token_type_ids = None

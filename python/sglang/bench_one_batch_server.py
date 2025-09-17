@@ -33,7 +33,6 @@ from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
-from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 
@@ -273,18 +272,12 @@ def run_one_case(
             if "error" in data:
                 raise RuntimeError(f"Request has failed. {data}.")
 
-            if dataset_name == "mmmu1":
-                if data["choices"][0]["text"]:
-                    # First token
-                    if ttft == 0.0:
-                        ttft = time.perf_counter() - tic
-            else:
-                assert (
-                    data["meta_info"]["finish_reason"] is None
-                    or data["meta_info"]["finish_reason"]["type"] == "length"
-                )
-                if data["meta_info"]["completion_tokens"] == 1:
-                    ttft = time.perf_counter() - tic
+            assert (
+                data["meta_info"]["finish_reason"] is None
+                or data["meta_info"]["finish_reason"]["type"] == "length"
+            )
+            if data["meta_info"]["completion_tokens"] == 1:
+                ttft = time.perf_counter() - tic
 
     latency = time.perf_counter() - tic
     input_throughput = batch_size * input_len / ttft
@@ -356,15 +349,15 @@ def get_report_summary(
     rows = []
 
     for (
-        batch_size,
-        latency,
-        ttft,
-        input_throughput,
-        output_throughput,
-        _,
-        _,
-        acc_length,
-        trace_link,
+            batch_size,
+            latency,
+            ttft,
+            input_throughput,
+            output_throughput,
+            _,
+            _,
+            acc_length,
+            trace_link,
     ) in result:
         if is_blackwell():
             hourly_cost_per_gpu = 4  # $4/hour for one B200
