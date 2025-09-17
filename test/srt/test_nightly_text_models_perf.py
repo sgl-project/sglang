@@ -28,15 +28,13 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
-            (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
-        cls.batch_sizes = [1, 1]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "1024"))
         os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -89,7 +87,6 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                     print(f"Output for {model} with batch size:")
                     print(result.stdout)
 
-
                     pattern = r"\[Profile\]\((.*?)\)"
                     trace_dirs = re.findall(pattern, result.stdout)
 
@@ -103,7 +100,6 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                         for trace_file in trace_files
                         if trace_file.endswith(".EXTEND.trace.json.gz")
                     ]
-
 
                     # because the profile_id dir under PROFILE_DIR
                     extend_trace_file_relative_path_from_profile_dirs = [
@@ -119,8 +115,6 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                             "trace_links": extend_trace_file_relative_path_from_profile_dirs,
                         }
                     )
-
-                    print(f"{extend_trace_file_relative_path_from_profile_dirs=}")
 
                     kill_process_tree(process.pid)
 

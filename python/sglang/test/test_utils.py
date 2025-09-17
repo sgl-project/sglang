@@ -1510,7 +1510,6 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
         if metrics:
             for line in result["output"].splitlines():
                 # for line in metrics.group(0).splitlines():
-                print(f"{line=}")
                 if (
                     line.startswith("|")
                     and "batch size" not in line
@@ -1518,8 +1517,6 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
                 ):
                     # find the data lines
                     # Reconstruct the row and append a placeholder artifact link for profile
-                    print(f"data line: {line=}")
-
                     parts = [part.strip() for part in line.split("|") if part.strip()]
                     try:
                         from urllib.parse import quote
@@ -1527,7 +1524,6 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
                         quote = None
 
                     raw_link = f"{base_url}/{next(filenames_iter)}"
-                    print(f"{raw_link=}")
                     # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
                     relay_link = (
                         f"{relay_base}?src={quote(raw_link, safe='')}"

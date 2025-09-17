@@ -16,21 +16,25 @@ from sglang.test.test_utils import (
 
 MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples
-    # ModelDeploySetup("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(0.340, 39.6),
-    # ModelDeploySetup("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.295, 37.2),
-    # ModelDeploySetup("Efficient-Large-Model/NVILA-Lite-2B-hf-0626"): ModelEvalMetrics(0.32, 10.9),
-    # ModelDeploySetup("google/gemma-3-4b-it"): ModelEvalMetrics(0.360, 8.7),
-    # ModelDeploySetup("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.360, 11.0),
-    # ModelDeploySetup("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360),
-    # ModelDeploySetup("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(0.350),
-    # ModelDeploySetup("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.350, 19.8),
-    # ModelDeploySetup("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.350, 19,8),
-    # ModelDeploySetup("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 8.8),
-    # ModelDeploySetup("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.330, 20.5),
+    ModelDeploySetup("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(0.340, 39.6),
+    ModelDeploySetup("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.295, 37.2),
+    ModelDeploySetup("Efficient-Large-Model/NVILA-Lite-2B-hf-0626"): ModelEvalMetrics(
+        0.32, 10.9
+    ),
+    ModelDeploySetup("google/gemma-3-4b-it"): ModelEvalMetrics(0.360, 8.7),
+    ModelDeploySetup("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.360, 11.0),
+    ModelDeploySetup("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360),
+    ModelDeploySetup("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(0.350),
+    ModelDeploySetup("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.350, 19.8),
+    ModelDeploySetup("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.350, 19, 8),
+    ModelDeploySetup("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 8.8),
+    ModelDeploySetup("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.330, 20.5),
     ModelDeploySetup("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.340, 22.5),
-    # ModelDeploySetup("unsloth/Mistral-Small-3.1-24B-Instruct-2503"): ModelEvalMetrics(0.330, 13.8),
-    # ModelDeploySetup("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 18.0),
-    # ModelDeploySetup("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.310, 22.4),
+    ModelDeploySetup("unsloth/Mistral-Small-3.1-24B-Instruct-2503"): ModelEvalMetrics(
+        0.330, 13.8
+    ),
+    ModelDeploySetup("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 18.0),
+    ModelDeploySetup("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.310, 22.4),
 }
 
 

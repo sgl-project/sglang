@@ -22,8 +22,8 @@ PROFILE_DIR = "performance_profiles_vlms"
 MODEL_DEFAULTS = [
     # Keep conservative defaults. Can be overridden by env NIGHTLY_VLM_MODELS
     "Qwen/Qwen2.5-VL-7B-Instruct",
-    # "google/gemma-3-27b-it",
-    # "openbmb/MiniCPM-V-2_6",
+    "google/gemma-3-27b-it",
+    "openbmb/MiniCPM-V-2_6",
 ]
 
 
@@ -39,7 +39,6 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
-        cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,2")
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "1024"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "32"))
         cls.full_report = f"## {cls.__name__}\n"
@@ -103,7 +102,6 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                         if trace_file.endswith(".EXTEND.trace.json.gz")
                     ]
 
-
                     # because the profile_id dir under PROFILE_DIR
                     extend_trace_file_relative_path_from_profile_dirs = [
                         f"{trace_dir[trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1:]}/{extend_trace_filename}"
@@ -111,7 +109,6 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                             extend_trace_filenames, trace_dirs
                         )
                     ]
-
 
                     model_results.append(
                         {
@@ -132,7 +129,6 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                 )
                 self.full_report += report_part + "\n"
 
-        print(f"{self.full_report=}")
         if is_in_ci():
             write_github_step_summary(self.full_report)
 
