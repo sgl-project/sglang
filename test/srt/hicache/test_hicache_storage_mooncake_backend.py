@@ -33,14 +33,18 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     def setUpClass(cls):
         """Set up test environment and launch Mooncake services before server setup"""
         # Find available ports for Mooncake services to avoid conflicts
-        cls.mooncake_master_port = (
+        # cls.mooncake_master_port = (
+        #     HiCacheStorageMooncakeBackendBaseMixin.mooncake_master_port_base
+        # )
+        cls.mooncake_master_port = find_available_port(
             HiCacheStorageMooncakeBackendBaseMixin.mooncake_master_port_base
         )
-        # find_available_port(cls.mooncake_master_port_base)
-        cls.mooncake_metadata_port = (
+        # cls.mooncake_metadata_port = (
+        #     HiCacheStorageMooncakeBackendBaseMixin.mooncake_metadata_port_base
+        # )
+        cls.mooncake_metadata_port = find_available_port(
             HiCacheStorageMooncakeBackendBaseMixin.mooncake_metadata_port_base
         )
-        # find_available_port(cls.mooncake_metadata_port_base)
 
         # Start Mooncake services first
         cls._start_mooncake_services()
