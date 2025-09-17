@@ -479,10 +479,18 @@ class WorkloadGenerator:
             "summary": {
                 "total_requests": len(self.performance_metrics["ttft"]),
                 "request_rate": self.request_rate,
-                "average_prompt_len": sum(self.performance_metrics["prompt_len"])
-                / len(self.performance_metrics["prompt_len"]),
-                "average_output_len": sum(self.performance_metrics["generated_len"])
-                / len(self.performance_metrics["generated_len"]),
+                "average_prompt_len": (
+                    sum(self.performance_metrics["prompt_len"])
+                    / len(self.performance_metrics["prompt_len"])
+                    if self.performance_metrics["prompt_len"]
+                    else 0.0
+                ),
+                "average_output_len": (
+                    sum(self.performance_metrics["generated_len"])
+                    / len(self.performance_metrics["generated_len"])
+                    if self.performance_metrics["generated_len"]
+                    else 0.0
+                ),
                 "average_ttft": sum(self.performance_metrics["ttft"])
                 / len(self.performance_metrics["ttft"]),
                 "p90_ttft": sorted(self.performance_metrics["ttft"])[
