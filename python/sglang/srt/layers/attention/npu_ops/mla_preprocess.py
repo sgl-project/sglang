@@ -215,11 +215,6 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.num_local_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
         )
 
-        # rope
-        self.cos, self.sin = None, None
-        # reshape_and_cache
-        self.k_cache, self.v_cache, self.slot_mapping = None, None, None
-
     def get_sin_cos(self, positions):
         cos_sin = self.rotary_emb.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
@@ -239,18 +234,18 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.has_preprocess_weights = True
             self.dtype = hidden_states.dtype
 
-        self.cos, self.sin = self.get_sin_cos(positions)
-        self.k_cache, self.v_cache, self.slot_mapping = self.get_kv_cache_and_cache_idx(
+        cos, sin = self.get_sin_cos(positions)
+        k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(
             forward_batch
         )
 
         q_nope_out = torch.empty(
-            (hidden_states.shape[0], self.w_kc.shape[0], self.k_cache.shape[-1]),
+            (hidden_states.shape[0], self.w_kc.shape[0], k_cache.shape[-1]),
             dtype=input_dtype,
             device=hidden_states.device,
         )
         q_rope_out = torch.empty(
-            (hidden_states.shape[0], self.w_kc.shape[0], self.v_cache.shape[-1]),
+            (hidden_states.shape[0], self.w_kc.shape[0], v_cache.shape[-1]),
             dtype=input_dtype,
             device=hidden_states.device,
         )
@@ -268,12 +263,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.q_b_proj_weight_nz,
             self.q_b_proj_deq_scale,
             self.kv_a_layernorm.weight,
-            self.cos,
-            self.sin,
+            cos,
+            sin,
             self.w_kc,
-            self.k_cache,
-            self.v_cache,
-            self.slot_mapping,
+            k_cache,
+            v_cache,
+            slot_mapping,
             quant_scale0=self.qkv_a_proj.input_scale,
             quant_offset0=self.qkv_a_proj_input_offset,
             bias0=self.qkv_a_proj_quant_bias_kvq,
@@ -283,15 +278,15 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             cache_mode="krope_ctkv",
             quant_mode="per_tensor_quant_asymm",
             q_out0=q_nope_out,
-            kv_cache_out0=self.k_cache,
+            kv_cache_out0=k_cache,
             q_out1=q_rope_out,
-            kv_cache_out1=self.v_cache,
+            kv_cache_out1=v_cache,
         )
         return (
             q_rope_out,
-            self.v_cache,
+            v_cache,
             q_nope_out,
-            self.k_cache,
+            k_cache,
             forward_batch,
             zero_allocator,
             positions,
