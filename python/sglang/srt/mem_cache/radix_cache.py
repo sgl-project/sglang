@@ -54,10 +54,10 @@ class BaseKey:
     def __iter__(self) -> Iterator[int]:
         return iter(self.token_ids)
 
-    def __getitem__(self, idx: Union[int, slice]) -> Union[int, "BaseKey"]:
+    def __getitem__(self, idx: Union[int, slice]) -> "BaseKey":
         if isinstance(idx, slice):
             return BaseKey(self.token_ids[idx], self.extra_key)
-        return self.token_ids[idx]
+        return BaseKey([self.token_ids[idx]], self.extra_key)
 
     def __repr__(self) -> str:
         preview = self.token_ids[:10]
