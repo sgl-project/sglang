@@ -99,6 +99,8 @@ def run_eval(args):
     print(f"Total latency: {latency:.3f} s")
     print(f"Score: {metrics['score']:.3f}")
 
+    if getattr(args, "return_latency", False):
+        return metrics, latency
     return metrics
 
 

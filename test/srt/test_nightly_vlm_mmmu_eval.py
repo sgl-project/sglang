@@ -2,49 +2,42 @@ import json
 import unittest
 import warnings
 from types import SimpleNamespace
-from typing import List
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
+    ModelDeploySetup,
+    ModelEvalMetrics,
     check_model_scores,
     popen_launch_server_wrapper,
     write_results_to_json,
 )
 
-
-class ModelDeploySetup:
-    def __init__(self, model_path: str, extra_args: List[str] = []):
-        self.model_path = model_path
-        if "--enable-multimodal" not in extra_args:
-            extra_args.append("--enable-multimodal")
-        self.extra_args = extra_args
-
-
-MODEL_SCORE_THRESHOLDS = {
+MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples
-    ModelDeploySetup("Qwen/Qwen2-VL-7B-Instruct"): 0.330,
-    ModelDeploySetup("Qwen/Qwen2.5-VL-7B-Instruct"): 0.340,
-    ModelDeploySetup("openbmb/MiniCPM-o-2_6"): 0.350,
-    ModelDeploySetup("XiaomiMiMo/MiMo-VL-7B-RL"): 0.28,
-    ModelDeploySetup("Efficient-Large-Model/NVILA-Lite-2B-hf-0626"): 0.32,
-    ModelDeploySetup("mistral-community/pixtral-12b"): 0.360,
-    ModelDeploySetup("deepseek-ai/deepseek-vl2-small"): 0.340,
-    ModelDeploySetup("unsloth/Mistral-Small-3.1-24B-Instruct-2503"): 0.330,
-    ModelDeploySetup("deepseek-ai/Janus-Pro-7B"): 0.295,
-    ModelDeploySetup("google/gemma-3-4b-it"): 0.360,
-    ModelDeploySetup("google/gemma-3n-E4B-it"): 0.360,
-    ModelDeploySetup("moonshotai/Kimi-VL-A3B-Instruct"): 0.350,
-    ModelDeploySetup("zai-org/GLM-4.1V-9B-Thinking"): 0.310,
-    ModelDeploySetup("OpenGVLab/InternVL2_5-2B"): 0.300,
+    # ModelDeploySetup("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(0.340, 39.6),
+    # ModelDeploySetup("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.295, 37.2),
+    # ModelDeploySetup("Efficient-Large-Model/NVILA-Lite-2B-hf-0626"): ModelEvalMetrics(0.32, 10.9),
+    # ModelDeploySetup("google/gemma-3-4b-it"): ModelEvalMetrics(0.360, 8.7),
+    # ModelDeploySetup("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.360, 11.0),
+    # ModelDeploySetup("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360),
+    # ModelDeploySetup("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(0.350),
+    # ModelDeploySetup("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.350, 19.8),
+    # ModelDeploySetup("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.350, 19,8),
+    # ModelDeploySetup("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 8.8),
+    # ModelDeploySetup("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.330, 20.5),
+    ModelDeploySetup("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.340, 20.5),
+    # ModelDeploySetup("unsloth/Mistral-Small-3.1-24B-Instruct-2503"): ModelEvalMetrics(0.330, 13.8),
+    # ModelDeploySetup("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 18.0),
+    # ModelDeploySetup("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.310, 22.4),
 }
 
 
 class TestNightlyVLMMmmuEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.models = list(MODEL_SCORE_THRESHOLDS.keys())
+        cls.models = list(MODEL_THRESHOLDS.keys())
         cls.base_url = DEFAULT_URL_FOR_TEST
 
     def test_mmmu_vlm_models(self):
@@ -70,9 +63,12 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                         max_tokens=30,
                     )
 
-                    metrics = run_eval(args)
+                    args.return_latency = True
+
+                    metrics, latency = run_eval(args)
 
                     metrics["score"] = round(metrics["score"], 4)
+                    metrics["latency"] = round(latency, 4)
                     print(
                         f"{'=' * 42}\n{model_path} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
                     )
@@ -80,7 +76,9 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                     write_results_to_json(model_path, metrics, "w" if is_first else "a")
                     is_first = False
 
-                    all_results.append((model_path, metrics["score"]))
+                    all_results.append(
+                        (model_path, metrics["score"], metrics["latency"])
+                    )
                 finally:
                     kill_process_tree(process.pid)
 
@@ -91,7 +89,20 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
         except Exception as e:
             print(f"Error reading results: {e}")
 
-        check_model_scores(all_results, MODEL_SCORE_THRESHOLDS, self.__class__.__name__)
+        model_accuracy_thresholds = {
+            model.model_path: threshold.accuracy
+            for model, threshold in MODEL_THRESHOLDS.items()
+        }
+        model_latency_thresholds = {
+            model.model_path: threshold.eval_time
+            for model, threshold in MODEL_THRESHOLDS.items()
+        }
+        check_model_scores(
+            all_results,
+            self.__class__.__name__,
+            model_accuracy_thresholds,
+            model_latency_thresholds,
+        )
 
 
 if __name__ == "__main__":

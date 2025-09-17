@@ -247,12 +247,7 @@ def run_one_case(
     if dataset_name == "mmmu":
         # vlm
         input_ids = []
-        image_data = []
         for input_req in input_requests:
-            # messages = MMMUVLMEval.build_chat_messages_from_prompt(
-            #     input_req.prompt, input_req.image_data
-            # )
-            # input_ids += tokenizer。。。。.encode(input_req.prompt)
             input_ids += [tokenizer.encode(input_req.prompt)]
         payload["image_data"] = [req.image_data for req in input_requests]
 

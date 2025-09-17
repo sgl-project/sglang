@@ -267,7 +267,6 @@ class MMMUVLMEval(Eval):
             corr = per_cat_correct.get(cat, 0)
             acc = (corr / tot) if tot > 0 else 0.0
             evaluation_result[cat] = {"acc": round(acc, 3), "num_example": tot}
-        print(f"{evaluation_result=}")
 
         printable_results = {}
         # Domains first

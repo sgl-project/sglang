@@ -1470,6 +1470,20 @@ def _ensure_remove_suffix(text: str, suffix: str):
     return text.removesuffix(suffix)
 
 
+class ModelDeploySetup:
+    def __init__(self, model_path: str, extra_args: List[str] = []):
+        self.model_path = model_path
+        if "--enable-multimodal" not in extra_args:
+            extra_args.append("--enable-multimodal")
+        self.extra_args = extra_args
+
+
+class ModelEvalMetrics:
+    def __init__(self, accuracy: float, eval_time: float):
+        self.accuracy = accuracy
+        self.eval_time = eval_time
+
+
 # results are from `bench_one_batch_server.py`
 def generate_markdown_report_nightly(model, results, input_len, output_len):
     summary = f"### {model}\n"
@@ -1524,27 +1538,42 @@ def parse_models(model_string: str):
     return [model.strip() for model in model_string.split(",") if model.strip()]
 
 
-def check_model_scores(results, model_score_thresholds, test_name):
+def check_model_scores(
+    results, test_name, model_accuracy_thresholds, model_latency_thresholds={}
+):
+    """
+    results: list of tuple of (model_path, accuracy, latency)
+    """
     failed_models = []
-    summary = " | model | status | score | threshold  |\n"
-    summary += "| ----- | ------ | ----- | ---------- | \n"
+    if model_latency_thresholds is not None:
+        summary = " | model | status | score | score_threshold | latency | latency_threshold | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | \n"
+    else:
+        summary = " | model | status | score | score_threshold | \n"
+        summary += "| ----- | ------ | ----- | --------------- | \n"
 
-    for model, score in results:
-        threshold = model_score_thresholds.get(model)
-        if threshold is None:
+    for model, accuracy, latency in results:
+        accuracy_threshold = model_accuracy_thresholds.get(model)
+        if accuracy_threshold is None:
             print(f"Warning: No threshold defined for model {model}")
             continue
 
-        is_success = score >= threshold
+        latency_threshold = model_latency_thresholds.get(model, None) or 1e9
+
+        is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
         status_emoji = "✅" if is_success else "❌"
 
         if not is_success:
             failed_models.append(
                 f"\nScore Check Failed: {model}\n"
-                f"Model {model} score ({score:.4f}) is below threshold ({threshold:.4f})"
+                f"Model {model} score ({accuracy:.4f}) is below threshold ({accuracy_threshold:.4f})"
             )
 
-        line = f"| {model} | {status_emoji} | {score} | {threshold} |\n"
+        if model_latency_thresholds is not None:
+            line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold}\n"
+        else:
+            line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold}\n"
+
         summary += line
 
     print(summary)
@@ -1604,6 +1633,9 @@ def write_results_to_json(model, metrics, mode="a"):
         "metrics": metrics,
         "score": metrics["score"],
     }
+
+    if "latency" in metrics:
+        result["latency"] = (metrics.get("latency"),)
 
     existing_results = []
     if mode == "a" and os.path.exists("results.json"):

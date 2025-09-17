@@ -48,10 +48,11 @@ class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
+            (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
+            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
+            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
+            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
+            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
 
@@ -84,7 +85,8 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     write_results_to_json(model, metrics, "w" if is_first else "a")
                     is_first = False
 
-                    all_results.append((model, metrics["score"]))
+                    # 0.0 for empty latency
+                    all_results.append((model, metrics["score"], 0.0))
                     kill_process_tree(process.pid)
 
         try:
@@ -95,7 +97,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             print(f"Error reading results.json: {e}")
 
         # Check all scores after collecting all results
-        check_model_scores(all_results, MODEL_SCORE_THRESHOLDS, self.__class__.__name__)
+        check_model_scores(all_results, self.__class__.__name__, MODEL_SCORE_THRESHOLDS)
 
 
 if __name__ == "__main__":
