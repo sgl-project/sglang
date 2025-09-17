@@ -389,7 +389,7 @@ class SWARadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
-            key = BaseKey(key.token_ids[:page_aligned_len], key.extra_key)
+            key = key[:page_aligned_len]
 
         value, last_node = self._match_prefix_helper(key)
         if value:
@@ -407,7 +407,7 @@ class SWARadixCache(BasePrefixCache):
             return 0
 
         if value is None:
-            value = [x for x in key.token_ids]
+            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         return self._insert_helper(self.root_node, key, value, prev_prefix_len)
 
     def cache_finished_req(self, req: Req) -> None:
@@ -761,7 +761,7 @@ class SWARadixCache(BasePrefixCache):
                 if not child.swa_tombstone:
                     match_len_since_tombstone += len(child.value)
                 node = child
-                key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
+                key = key[prefix_len:]
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
@@ -788,16 +788,12 @@ class SWARadixCache(BasePrefixCache):
     def _split_node(self, key: BaseKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
         new_node = TreeNode()
-        new_node.children = {
-            self.get_child_key_fn(
-                BaseKey(key.token_ids[split_len:], key.extra_key)
-            ): child
-        }
+        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.swa_tombstone = child.swa_tombstone
         new_node.full_lock_ref = child.full_lock_ref
         new_node.swa_lock_ref = child.swa_lock_ref
-        new_node.key = BaseKey(child.key.token_ids[:split_len], child.key.extra_key)
+        new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
         # parent inherits the swa_uuid from child for swa lock ref
         new_node.swa_uuid = child.swa_uuid
@@ -810,7 +806,7 @@ class SWARadixCache(BasePrefixCache):
         if not new_node.swa_tombstone:
             self.swa_lru_list.remove_node(child)
         child.parent = new_node
-        child.key = BaseKey(child.key.token_ids[split_len:], child.key.extra_key)
+        child.key = child.key[split_len:]
         child.value = child.value[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
@@ -875,7 +871,7 @@ class SWARadixCache(BasePrefixCache):
                     )
 
             total_prefix_length += prefix_len
-            key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
+            key = key[prefix_len:]
             value = value[prefix_len:]
 
             if len(key):

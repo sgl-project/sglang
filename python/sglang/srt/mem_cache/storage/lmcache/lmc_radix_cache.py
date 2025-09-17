@@ -143,7 +143,7 @@ class LMCRadixCache(RadixCache):
 
         if self.page_size != 1:
             aligned_len = len(key) // self.page_size * self.page_size
-            key = BaseKey(key.token_ids[:aligned_len], key.extra_key)
+            key = key[:aligned_len]
 
         base_res = super().match_prefix(key, **kwargs)
         value: torch.Tensor = base_res.device_indices
@@ -195,7 +195,7 @@ class LMCRadixCache(RadixCache):
             new_node = TreeNode()
             start = value.numel()
             end = start + fetched
-            new_node.key = BaseKey(key.token_ids[start:end], key.extra_key)
+            new_node.key = key[start:end]
             new_node.value = token_slots[:fetched]
             new_node.parent = last_node
             last_node.children[self.get_child_key_fn(new_node.key)] = new_node

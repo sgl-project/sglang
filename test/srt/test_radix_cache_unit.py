@@ -545,6 +545,53 @@ class TestRadixCache(unittest.TestCase):
         values_set = set(all_values.tolist())
         self.assertEqual(values_set, {10, 20, 30, 40})
 
+    def test_advanced_prefix_match_with_node_splits(self):
+        """Advanced prefix matching: splits inside nodes and across pages."""
+        for page_size in [1, 2]:
+            with self.subTest(page_size=page_size):
+                cache = RadixCache(
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
+                    page_size=page_size,
+                )
+
+                # Insert a long sequence that will be split later.
+                seq1 = [1, 2, 3, 4, 5, 6, 7, 8]
+                val1 = torch.tensor([x * 10 for x in seq1], dtype=torch.int64)
+                cache.insert(BaseKey(seq1), val1)
+
+                # Insert a diverging branch to create an internal node on the path.
+                seq2 = [1, 2, 9, 10]
+                val2 = torch.tensor([x * 10 for x in seq2], dtype=torch.int64)
+                cache.insert(BaseKey(seq2), val2)
+                print(cache.pretty_print())
+
+                baseline_total = cache.total_size()
+                expected_total = 10  # 8 + 2
+                self.assertEqual(baseline_total, expected_total)
+
+                # Match that causes a split inside an existing node:
+                # take first 4 tokens of seq1, then diverge.
+                query1 = [1, 2, 3, 4, 999, 1000]
+                result1 = cache.match_prefix(BaseKey(query1))
+                torch.testing.assert_close(result1.device_indices, val1[:4])
+                # No data change after structural split during matching.
+                self.assertEqual(cache.total_size(), baseline_total)
+
+                # Full match of the long sequence still returns the full indices.
+                result_full = cache.match_prefix(BaseKey(seq1))
+                torch.testing.assert_close(result_full.device_indices, val1)
+
+                # Another split deeper on the path (after matching 6 tokens, then diverge).
+                query2 = [1, 2, 3, 4, 5, 6, 777, 888]
+                result2 = cache.match_prefix(BaseKey(query2))
+                torch.testing.assert_close(result2.device_indices, val1[:6])
+                self.assertEqual(cache.total_size(), baseline_total)
+
+                # Matching the short diverging branch should return exactly its indices.
+                result_branch = cache.match_prefix(BaseKey(seq2))
+                torch.testing.assert_close(result_branch.device_indices, val2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -592,7 +592,7 @@ class HiRadixCache(RadixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
-            key = BaseKey(key.token_ids[:page_aligned_len], key.extra_key)
+            key = key[:page_aligned_len]
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
@@ -666,7 +666,7 @@ class HiRadixCache(RadixCache):
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(node.key, key)
-            key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
+            key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
@@ -707,7 +707,7 @@ class HiRadixCache(RadixCache):
                 if not child.evicted:
                     value.append(child.value)
                 node = child
-                key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
+                key = key[prefix_len:]
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
@@ -717,14 +717,10 @@ class HiRadixCache(RadixCache):
     def _split_node(self, key: BaseKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
         new_node = TreeNode()
-        new_node.children = {
-            self.get_child_key_fn(
-                BaseKey(key.token_ids[split_len:], key.extra_key)
-            ): child
-        }
+        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
-        new_node.key = BaseKey(child.key.token_ids[:split_len], child.key.extra_key)
+        new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
 
         # split value and host value if exists
@@ -741,7 +737,7 @@ class HiRadixCache(RadixCache):
             new_node.hash_value = child.hash_value[: split_len // self.page_size]
             child.hash_value = child.hash_value[split_len // self.page_size :]
         child.parent = new_node
-        child.key = BaseKey(child.key.token_ids[split_len:], child.key.extra_key)
+        child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
@@ -754,7 +750,7 @@ class HiRadixCache(RadixCache):
         total_prefix_length = 0
 
         if value is None:
-            value = [x for x in key.token_ids]
+            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
 
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
@@ -783,7 +779,7 @@ class HiRadixCache(RadixCache):
                     total_prefix_length += prefix_len
                 node = new_node
 
-            key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
+            key = key[prefix_len:]
             value = value[prefix_len:]
 
             if len(key):

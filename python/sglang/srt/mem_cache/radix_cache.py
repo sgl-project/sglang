@@ -223,10 +223,11 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
-            key = BaseKey(key.token_ids[:page_aligned_len], key.extra_key)
+            key = key[:page_aligned_len]
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
+            print(value)
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -241,7 +242,7 @@ class RadixCache(BasePrefixCache):
             return 0
 
         if value is None:
-            value = [x for x in key.token_ids]
+            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         return self._insert_helper(self.root_node, key, value)
 
     def cache_finished_req(self, req: Req):
@@ -431,7 +432,7 @@ class RadixCache(BasePrefixCache):
             else:
                 value.append(child.value)
                 node = child
-                key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
+                key = key[prefix_len:]
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
@@ -442,16 +443,13 @@ class RadixCache(BasePrefixCache):
         # new_node -> child
         self._record_remove_event(child)
         new_node = TreeNode()
-        extra_key = key.extra_key
-        new_node.children = {
-            self.get_child_key_fn(BaseKey(key.token_ids[split_len:], extra_key)): child
-        }
+        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
-        new_node.key = BaseKey(child.key.token_ids[:split_len], extra_key)
+        new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
         child.parent = new_node
-        child.key = BaseKey(child.key.token_ids[split_len:], extra_key)
+        child.key = child.key[split_len:]
         child.value = child.value[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
@@ -473,7 +471,8 @@ class RadixCache(BasePrefixCache):
             node.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
-            key = BaseKey(key.token_ids[prefix_len:], key.extra_key)
+            key = key[prefix_len:]
+            print(f"prefix_len: {prefix_len}, key: {key}, value: {value}")
             value = value[prefix_len:]
 
             if prefix_len < len(node.key):
@@ -606,23 +605,12 @@ class RadixCache(BasePrefixCache):
 if __name__ == "__main__":
     tree = RadixCache(None, None, page_size=1, disable=False)
 
-    tree.insert(BaseKey(token_ids=["Hello"], extra_key=None))
-    tree.insert(BaseKey(token_ids=["Hello"], extra_key=None))
-    tree.insert("Hello_L.A.!")
-    tree.insert(
-        BaseKey(token_ids=["Hello_L.A.!", "Hello_world! Happy"], extra_key=None)
-    )
-    tree.insert(
-        BaseKey(token_ids=["Hello_world! Happy", "I love you!"], extra_key=None)
-    )
+    # Example token id sequences (as lists of ints)
+    tree.insert(BaseKey(token_ids=[1, 2, 3], extra_key=None))
+    tree.insert(BaseKey(token_ids=[1, 2, 3], extra_key=None))
+    tree.insert(BaseKey(token_ids=[1, 2, 4, 5], extra_key=None))
+    tree.insert(BaseKey(token_ids=[1, 2, 4, 5, 6, 7], extra_key=None))
+    tree.insert(BaseKey(token_ids=[8, 9, 10, 11, 12], extra_key=None))
     tree.pretty_print()
 
-    # print(tree.match_prefix("I love you! aha"))
-
-    # def evict_callback(x):
-    #    print("evict", x)
-    #    return len(x)
-
-    # tree.evict(5, evict_callback)
-    # tree.evict(10, evict_callback)
-    # tree.pretty_print()
+    print(tree.match_prefix(BaseKey(token_ids=[1, 2, 3, 13, 14], extra_key=None)))
