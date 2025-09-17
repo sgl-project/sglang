@@ -13,6 +13,7 @@ class TestFile:
 
 suites = {
     "per-commit": [
+        TestFile("debug_utils/test_tensor_dump_forward_hook.py", 1),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
