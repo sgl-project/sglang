@@ -10,7 +10,7 @@ use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest, StringOrArray, UserMessageContent,
+    ResponsesGetParams, ResponsesRequest, StringOrArray, UserMessageContent,
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1922,7 +1922,12 @@ impl RouterTrait for PDRouter {
             .into_response()
     }
 
-    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    async fn get_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+        _params: &ResponsesGetParams,
+    ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Responses retrieve endpoint not implemented for PD router",

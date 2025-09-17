@@ -1,4 +1,4 @@
-//! OpenAI router implementation (reqwest-based)
+//! OpenAI router implementation
 
 use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
@@ -6,7 +6,7 @@ use crate::data_connector::{ResponseId, SharedResponseStorage, StoredResponse};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-    ResponseStatus, ResponsesRequest, ResponsesResponse,
+    ResponseStatus, ResponsesGetParams, ResponsesRequest, ResponsesResponse,
 };
 use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
 use async_trait::async_trait;
@@ -14,10 +14,12 @@ use axum::{
     body::Body,
     extract::Request,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+    },
 };
 use futures_util::StreamExt;
-use serde_json::{from_str, from_value, json, to_string, to_value, Value};
+use serde_json::{json, to_string, to_value, Value};
 use std::{
     any::Any,
     sync::atomic::{AtomicBool, Ordering},
@@ -487,11 +489,12 @@ impl super::super::RouterTrait for OpenAIRouter {
                 // Get the response body
                 match response.text().await {
                     Ok(body_text) => {
-                        let raw_response_value = from_str::<Value>(&body_text).ok();
+                        let raw_response_value = serde_json::from_str::<Value>(&body_text).ok();
 
                         if body.store {
                             if let Some(raw_value) = raw_response_value.clone() {
-                                match from_value::<ResponsesResponse>(raw_value.clone()) {
+                                match serde_json::from_value::<ResponsesResponse>(raw_value.clone())
+                                {
                                     Ok(openai_response) => {
                                         let input_text = match &body.input {
                                             ResponseInput::Text(text) => text.clone(),
@@ -579,7 +582,12 @@ impl super::super::RouterTrait for OpenAIRouter {
         }
     }
 
-    async fn get_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn get_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        response_id: &str,
+        _params: &ResponsesGetParams,
+    ) -> Response {
         // First check local storage
         let stored_id = ResponseId::from_string(response_id.to_string());
         if let Ok(Some(stored_response)) = self.response_storage.get_response(&stored_id).await {

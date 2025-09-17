@@ -9,7 +9,7 @@ use crate::{
     protocols::{
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, ResponsesRequest, V1RerankReqInput,
+            RerankRequest, ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -236,10 +236,11 @@ async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
     headers: http::HeaderMap,
+    Query(params): Query<ResponsesGetParams>,
 ) -> Response {
     state
         .router
-        .get_response(Some(&headers), &response_id)
+        .get_response(Some(&headers), &response_id, &params)
         .await
 }
 

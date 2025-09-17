@@ -946,6 +946,18 @@ impl ResponseUsage {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ResponsesGetParams {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub include_obfuscation: Option<bool>,
+    #[serde(default)]
+    pub starting_after: Option<i64>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+}
+
 impl ResponsesUsage {
     pub fn to_response_usage(&self) -> ResponseUsage {
         match self {
