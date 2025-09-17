@@ -127,13 +127,15 @@ class TestJsonArrayParserIntegration(CustomTestCase):
         for tool_call in tool_calls:
             self.assertIsNotNone(tool_call.function.name)
             self.assertIsNotNone(tool_call.function.arguments)
-            
+
             # Verify arguments are valid JSON
             try:
                 args = json.loads(tool_call.function.arguments)
                 self.assertIsInstance(args, dict)
             except json.JSONDecodeError:
-                self.fail(f"Invalid JSON in tool call arguments: {tool_call.function.arguments}")
+                self.fail(
+                    f"Invalid JSON in tool call arguments: {tool_call.function.arguments}"
+                )
 
     def test_tool_choice_specific_function_with_json_array_parser(self):
         """Test that specific tool choice uses JsonArrayParser"""
@@ -160,13 +162,15 @@ class TestJsonArrayParserIntegration(CustomTestCase):
         # All tool calls should be for the specified function
         for tool_call in tool_calls:
             self.assertEqual(tool_call.function.name, "get_weather")
-            
+
             # Verify arguments are valid JSON
             try:
                 args = json.loads(tool_call.function.arguments)
                 self.assertIsInstance(args, dict)
             except json.JSONDecodeError:
-                self.fail(f"Invalid JSON in tool call arguments: {tool_call.function.arguments}")
+                self.fail(
+                    f"Invalid JSON in tool call arguments: {tool_call.function.arguments}"
+                )
 
     def test_tool_choice_required_streaming_with_json_array_parser(self):
         """Test that tool_choice='required' uses JsonArrayParser in streaming mode"""
@@ -273,13 +277,15 @@ class TestJsonArrayParserIntegration(CustomTestCase):
         for tool_call in tool_calls:
             self.assertIsNotNone(tool_call.function.name)
             self.assertIsNotNone(tool_call.function.arguments)
-            
+
             # Verify arguments are valid JSON
             try:
                 args = json.loads(tool_call.function.arguments)
                 self.assertIsInstance(args, dict)
             except json.JSONDecodeError:
-                self.fail(f"Invalid JSON in tool call arguments: {tool_call.function.arguments}")
+                self.fail(
+                    f"Invalid JSON in tool call arguments: {tool_call.function.arguments}"
+                )
 
     def test_json_array_parser_error_handling(self):
         """Test that JsonArrayParser handles malformed JSON gracefully"""
@@ -382,7 +388,9 @@ class TestJsonArrayParserIntegration(CustomTestCase):
                 self.assertIn("data", args)
                 self.assertIsInstance(args["data"], dict)
             except json.JSONDecodeError:
-                self.fail(f"Invalid JSON in complex tool call arguments: {tool_call.function.arguments}")
+                self.fail(
+                    f"Invalid JSON in complex tool call arguments: {tool_call.function.arguments}"
+                )
 
 
 if __name__ == "__main__":

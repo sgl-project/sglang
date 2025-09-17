@@ -216,8 +216,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 tool_call_constraint = ("json_schema", json_schema)
 
-                
-
         # Use chat template
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
