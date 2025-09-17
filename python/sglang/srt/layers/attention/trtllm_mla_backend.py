@@ -628,7 +628,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     enable_pdl=False,
                     is_causal=False,
                     return_lse=True,
-                    out=torch.zeros(*output_shape, dtype=q.dtype, device=q.device)
+                    out=torch.zeros(*output_shape, dtype=q.dtype, device=q.device),
                 )
         return output
 
