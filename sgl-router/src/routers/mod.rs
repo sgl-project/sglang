@@ -10,7 +10,8 @@ use axum::{
 use std::fmt::Debug;
 
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+    ResponsesRequest,
 };
 
 pub mod factory;
@@ -123,7 +124,13 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
             .into_response()
     }
 
-    async fn route_embeddings(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
+    /// Route embedding requests (OpenAI-compatible /v1/embeddings)
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response;
 
     async fn route_rerank(
         &self,
