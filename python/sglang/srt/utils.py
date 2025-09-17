@@ -82,11 +82,9 @@ from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
 from torch import nn
-from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-from triton.runtime.cache import FileCacheManager
 from typing_extensions import Literal
 
 from sglang.srt.metrics.func_timer import enable_func_timer
