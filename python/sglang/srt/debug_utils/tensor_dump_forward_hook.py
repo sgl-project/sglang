@@ -39,12 +39,8 @@ class TensorDumper:
         return str(self._process_dir)
 
     def add_tensor(self, name, tensor_item):
-        if isinstance(tensor_item, tuple) or isinstance(tensor_item, list):
-            tensors = []
-            for i in range(len(tensor_item)):
-                if tensor_item[i] is None:
-                    continue
-                tensors.append(tensor_item[i].cpu())
+        if isinstance(tensor_item, (tuple, list)):
+            tensors = [t.cpu() for t in tensor_item if t is not None]
             if len(tensors) == 1:
                 self._current_tensors[name] = tensors[0]
             else:
@@ -77,55 +73,46 @@ class TensorDumper:
         self._current_tensors = {}
         self._forward_pass_id += 1
 
+    def _add_hook_recursive(self, model, prefix, dump_module_name="model"):
+        has_dump_module = False
+        for name, module in model._modules.items():
+            do_dump = False
+            if len(prefix) == 0:
+                cur_name = name
+                if cur_name == dump_module_name:
+                    has_dump_module = True
+                    do_dump = True
+            else:
+                cur_name = prefix + "." + name
+            if module is not None:
+                temp, sub_count = self._add_hook_recursive(module, cur_name)
+                has_dump_module = has_dump_module or temp
+                if sub_count == 0 or do_dump:
+                    # Avoid duplicated output hooks, e.g. self_attn may contain:
+                    # self_attn.qkv_proj, self_attn.attn & self_attn.o_proj.
+                    # Therefore, we do not need to add output hooks for self_attn,
+                    # since the output of self_attn should be the same to self_attn.o_proj.
+                    module.register_forward_hook(self._dump_hook(cur_name, do_dump))
+        return has_dump_module, len(model._modules.items())
 
-tensor_dumper_singleton: Optional[TensorDumper] = None
+    def _dump_hook(self, tensor_name, do_dump):
+        def inner_dump_hook(module, input, output):
+            if do_dump:
+                # This is the top-level model, so we will record the input for it.
+                for item in input:
+                    if isinstance(item, ForwardBatch):
+                        self.add_tensor(tensor_name, item)
+                self.dump_current_tensors()
+            if output is not None:
+                self.add_tensor(tensor_name, output)
+
+        return inner_dump_hook
 
 
 def register_forward_hook_for_model(
     model, dump_dir: str, tp_size: int, tp_rank: int, pp_rank: int
 ):
-    global tensor_dumper_singleton
-    assert (
-        tensor_dumper_singleton is None
-    ), "Tensor dumper should be initialized only once"
-    tensor_dumper_singleton = TensorDumper(dump_dir, tp_size, tp_rank, pp_rank)
-    has_dump_module, _ = _add_hook_recursive(model, "")
+    tensor_dumper = TensorDumper(dump_dir, tp_size, tp_rank, pp_rank)
+    has_dump_module, _ = tensor_dumper._add_hook_recursive(model, "")
     assert has_dump_module, "model should have a module named 'model'"
-
-
-def _dump_hook(tensor_name, do_dump):
-    def inner_dump_hook(module, input, output):
-        global tensor_dumper_singleton
-        if do_dump:
-            # This is the top-level model, so we will record the input for it.
-            for item in input:
-                if isinstance(item, ForwardBatch):
-                    tensor_dumper_singleton.add_tensor(tensor_name, item)
-            tensor_dumper_singleton.dump_current_tensors()
-        if output is not None:
-            tensor_dumper_singleton.add_tensor(tensor_name, output)
-
-    return inner_dump_hook
-
-
-def _add_hook_recursive(model, prefix, dump_module_name="model"):
-    has_dump_module = False
-    for name, module in model._modules.items():
-        do_dump = False
-        if len(prefix) == 0:
-            cur_name = name
-            if cur_name == dump_module_name:
-                has_dump_module = True
-                do_dump = True
-        else:
-            cur_name = prefix + "." + name
-        if module is not None:
-            temp, sub_count = _add_hook_recursive(module, cur_name)
-            has_dump_module = has_dump_module or temp
-            if sub_count == 0 or do_dump:
-                # Avoid duplicated output hooks, e.g. self_attn may contain:
-                # self_attn.qkv_proj, self_attn.attn & self_attn.o_proj.
-                # Therefore, we do not need to add output hooks for self_attn,
-                # since the output of self_attn should be the same to self_attn.o_proj.
-                module.register_forward_hook(_dump_hook(cur_name, do_dump))
-    return has_dump_module, len(model._modules.items())
+    return tensor_dumper

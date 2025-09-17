@@ -60,7 +60,7 @@ def init_weights(module):
         torch.nn.init.ones_(module.weight)
 
 
-def test_model_forward_dump():
+def test_model_forward_dump(tmp_path):
     init_distributed_environment(
         backend="nccl",
         world_size=1,
@@ -72,10 +72,9 @@ def test_model_forward_dump():
     model = MockCausalLM()
     model.apply(init_weights)
     model = model.cuda().bfloat16()
-    register_forward_hook_for_model(model, "/tmp/sglang_dump/", 0, 0, 0)
-    from sglang.srt.debug_utils.tensor_dump_forward_hook import tensor_dumper_singleton
+    dumper = register_forward_hook_for_model(model, tmp_path / "sglang_dump", 0, 0, 0)
 
-    dir_path = tensor_dumper_singleton.get_dump_dir()
+    dir_path = dumper.get_dump_dir()
     inp = torch.randn(4, TEST_HIDDEN_SIZE, dtype=torch.bfloat16) * 0.01
     result = model(inp.cuda())
     data = torch.load(f"{dir_path}/Pass00000.pt")
