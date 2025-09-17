@@ -1499,6 +1499,9 @@ class CkptEngineModelLoader(BaseModelLoader):
                 f"load format {load_config.load_format}"
             )
 
+    def download_model(self, model_config: ModelConfig) -> None:
+        raise NotImplementedError
+
     def load_model(
         self,
         *,
