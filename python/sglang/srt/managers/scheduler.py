@@ -258,7 +258,7 @@ class Scheduler(
         self.enable_metrics_for_all_schedulers = (
             server_args.enable_metrics_for_all_schedulers
         )
-        self.enable_kv_cache_events = server_args.kv_events_config is not None
+        self.enable_kv_cache_events = server_args.kv_events_config and tp_rank == 0
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
