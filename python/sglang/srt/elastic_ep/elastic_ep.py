@@ -33,7 +33,7 @@ def _init_global_elastic_ep_metadata():
         return
 
     ep_size = torch.distributed.get_world_size()
-    active_ranks = torch.ones(ep_size, dtype=torch.int32)
+    active_ranks = torch.ones(ep_size, dtype=torch.int32, device="cuda")
     last_active_ranks = active_ranks.clone()
 
     _global_elastic_ep_metadata = ElasticEpMetadata(

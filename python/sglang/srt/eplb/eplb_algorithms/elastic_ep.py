@@ -42,8 +42,8 @@ def rebalance_experts(
             num_local_experts * num_active_ranks,
             1,
             1,
-            num_alive_gpus,
-            # weight, num_local_experts * num_alive_gpus, 1, 1, num_alive_gpus
+            num_active_ranks,
+            # weight, num_local_experts * num_active_ranks, 1, 1, num_active_ranks
         )
     elif enable_hierarchical:
         # use hierarchical load-balance policy
