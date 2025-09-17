@@ -479,6 +479,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool silu_activation,"
       "int pad_slot_id) -> ()");
   m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
+
+  /*
+   * From csrc/allreduce_rmsnorm_fusion
+   */
+  m.def(
+      "fused_rs_ln_ag_cta(Tensor! input, Tensor! residual, Tensor weight, "
+      "int mcptr, int signal_pads, int rank, int world_size, int MAX_CTAS, "
+      "float epsilon) -> ()");
+  m.impl("fused_rs_ln_ag_cta", torch::kCUDA,
+             &fused_rs_ln_ag_cta);
 }
 
 REGISTER_EXTENSION(common_ops)
