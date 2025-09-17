@@ -2788,9 +2788,14 @@ class PortArgs:
                 if nccl_port < 60000:
                     nccl_port += 42
                 else:
-                    nccl_port -= 43
+                    nccl_port = server_args.port + random.randint(100, 1000)
         else:
             nccl_port = server_args.nccl_port
+            # Check if the port is available
+            while True:
+                if is_port_available(nccl_port):
+                    break
+                nccl_port += 1
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
