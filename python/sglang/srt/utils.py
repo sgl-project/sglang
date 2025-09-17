@@ -564,16 +564,31 @@ def wait_port_available(
 
 def is_port_available(port):
     """Return whether a port is available."""
+    is_port_available_flag = False
+
+    # Ask the OS if the port is ready to be binded
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("", port))
             s.listen(1)
-            return True
+            is_port_available_flag = True
         except socket.error:
-            return False
+            is_port_available_flag = False
         except OverflowError:
-            return False
+            is_port_available_flag = False
+
+    # Ask the OS if the port is really accessible
+    host = "localhost"
+    timeout = 1.0
+    if is_port_available_flag is True:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                is_port_available_flag = True
+        except Exception as e:
+            is_port_available_flag = False
+
+    return is_port_available_flag
 
 
 def get_free_port():
