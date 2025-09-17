@@ -599,53 +599,32 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
                 )
             else:
-                assert q_rope is None
-                assert k_rope is None
-                # num_prefix_chunks = forward_batch.num_prefix_chunks
-
-                # prefix_lens = forward_batch.extend_prefix_lens
-                # seq_lens = self.forward_prefill_metadata.seq_lens
-
-                # bs = len(seq_lens)
-                # qo_indptr = self.qo_indptr
-                #qo_indptr[1 : bs + 1] = torch.cumsum(self.forward_prefill_metadata.seq_lens, dim=0)
-                
-                # qo_indptr = qo_indptr[: bs + 1]
-                qo_indptr = self.forward_prefill_metadata.cum_seq_lens
-                # actual_seq_lens_qo = qo_indptr[1:] - qo_indptr[:-1]
-                # max_qo = int(actual_seq_lens_qo.max().item())
-                max_qo = self.forward_prefill_metadata.max_seq_len #?
-
-
                 # MHA for chunked prefix kv cache when running model with MLA
                 assert forward_batch.prefix_chunk_idx is not None
                 assert forward_batch.prefix_chunk_cu_seq_lens is not None
-
+                assert q_rope is None
+                assert k_rope is None
                 chunk_idx = forward_batch.prefix_chunk_idx
-                kv_indptr = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
-                prefix_chunk_seq_lens_kv = forward_batch.prefix_chunk_seq_lens[chunk_idx]#kv_indptr[1:] - kv_indptr[:-1]
-                # max_kv = int((actual_seq_lens_kv).max().item())
-                max_kv = max(prefix_chunk_seq_lens_kv)
 
-                qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 k = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype)
                 v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype)
-                output_shape = (qall.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+                output_shape = (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
                 output = flashinfer.prefill.trtllm_ragged_attention_deepseek(
-                    query=qall,
+                    query=q,
                     key=k,
                     value=v,
                     workspace_buffer=self.workspace_buffer,
-                    seq_lens=prefix_chunk_seq_lens_kv,
-                    max_q_len=max_qo,
-                    max_kv_len=max_kv,
+                    seq_lens=forward_batch.prefix_chunk_seq_lens[chunk_idx],
+                    max_q_len=self.forward_prefill_metadata.max_seq_len,
+                    max_kv_len=max(forward_batch.prefix_chunk_seq_lens[chunk_idx]),
                     bmm1_scale=layer.scaling,
                     bmm2_scale=1.0,
                     o_sf_scale=-1.0,
                     batch_size=len(self.forward_prefill_metadata.seq_lens),
                     window_left=-1,
-                    cum_seq_lens_q=qo_indptr,
-                    cum_seq_lens_kv=kv_indptr,
+                    cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
+                    cum_seq_lens_kv=forward_batch.prefix_chunk_cu_seq_lens[chunk_idx],
                     enable_pdl=False,
                     is_causal=False,
                     return_lse=True,
