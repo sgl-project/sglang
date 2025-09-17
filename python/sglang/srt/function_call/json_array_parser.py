@@ -1,3 +1,4 @@
+import json
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -19,38 +20,13 @@ class JsonArrayParser(BaseFormatDetector):
         self.bot_token = "["
         self.eot_token = "]"
         self.tool_call_separator = ","
-        # Whether we detected a valid tool-call separator that was withheld
-        # from the previous chunk and should be re-inserted before the next
-        # tool call JSON object begins.
         self._pending_separator = False
-        # Track brace count across streaming chunks
-        self.brace_count = 0
-
-    def _find_valid_separator(self, text: str) -> int:
-        """
-        Find the first valid separator by tracking brace count character by character.
-        Updates self.brace_count as it processes the text.
-        Returns the index of the separator or -1 if not found.
-        """
-        if not self.tool_call_separator:
-            return -1
-
-        for i in range(len(text)):
-            if text[i] == "{":
-                self.brace_count += 1
-            elif text[i] == "}":
-                self.brace_count -= 1
-            elif text[i] == self.tool_call_separator and self.brace_count == 0:
-                return i
-
-        return -1
 
     def has_tool_call(self, text: str) -> bool:
         """
         Check if the given text contains a JSON tool call (array or single object).
         """
-        stripped = text.strip()
-        return stripped.startswith("[")
+        return "[" in text or "{" in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -74,44 +50,51 @@ class JsonArrayParser(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
-        Parse JSON array tool calls with improved separator detection.
-        Wrapper for base parse_streaming_increment that moves tool call separators from the end
-        of a tool call chunk to the beginning of the next tool call to avoid crashes in the base class.
+        Parse JSON array tool calls using json.loads() validation.
+        Checks the last comma to find valid JSON boundaries.
         """
-        # If we previously withheld a valid tool-call separator, prepend it
-        # when we see the next JSON object start
+        # If we receive the whole array at once, remove the array brackets.
+        # Otherwise the base class only removes '[' at the start and crashes because of the trailing ']'.
+        if new_text.strip().startswith(self.bot_token) and new_text.strip().endswith(self.eot_token):
+            new_text = new_text.lstrip(self.bot_token).rstrip(self.eot_token)
+            return super().parse_streaming_increment(new_text, tools)
+        # Handle pending separator from previous chunk
         if self._pending_separator:
-            # Check if the text (after removing leading whitespace) starts with '{'
-            if new_text.lstrip().startswith("{"):
-                # Re-insert the withheld separator before the new object.
+            if new_text.strip().startswith("{"):
                 new_text = self.tool_call_separator + new_text
                 self._pending_separator = False
-                # Process the original text (without the prepended separator) for separator detection
-                sep_index = self._find_valid_separator(new_text[1:])
-                if sep_index != -1:
-                    sep_index += 1  # Adjust for the prepended separator
-            else:
-                # No new object starting, just process normally
-                sep_index = self._find_valid_separator(new_text)
-        else:
-            # Detect the configured tool call separator within this chunk.
-            sep_index = self._find_valid_separator(new_text)
-
-        if sep_index > 0:  # Ensure separator is not at position 0
-            # Valid separator found (brace_count == 0 means complete JSON object)
-            prev_tool_call = new_text[:sep_index]
-            remainder = new_text[sep_index + len(self.tool_call_separator) :]
+        
+        last_comma_pos = new_text.rfind(self.tool_call_separator)
+        if last_comma_pos > 0:
+            # Found a potential separator, check if content before it is valid JSON
+            combined = self._buffer + new_text[:last_comma_pos]
+            start_pos = combined.find(self.bot_token) + 1
+            prev_tool_call = combined[start_pos:]
             
-            if remainder:
-                # There's more text after the separator - the base class can handle it
-                return super().parse_streaming_increment(new_text, tools)
-            else:
-                # No remainder - separator was at end of chunk
-                # Withhold the separator for the next chunk, to avoid a crash in base class
-                self._pending_separator = True
-                return super().parse_streaming_increment(prev_tool_call, tools)
-
-        # Default: delegate to base implementation with unmodified text.
+            # Remove leading comma from prev_tool_call if present
+            if prev_tool_call.lstrip().startswith(self.tool_call_separator):
+                prev_tool_call = prev_tool_call.lstrip()[len(self.tool_call_separator):]
+            
+            remainder = new_text[last_comma_pos + 1:].strip()
+            
+            try:
+                # Try to parse the JSON part
+                json.loads(prev_tool_call)
+                # Valid JSON found before separator
+                
+                if remainder:
+                    # There's more content after the separator
+                    return super().parse_streaming_increment(new_text, tools)
+                else:
+                    # Separator at end of chunk, set pending separator and process text without separator
+                    self._pending_separator = True
+                    # Remove the trailing comma from new_text before passing to base class
+                    return super().parse_streaming_increment(new_text[:last_comma_pos], tools)
+            except json.JSONDecodeError:
+                # Not valid JSON yet, delegate to base implementation
+                pass
+        
+        # No valid separator found, delegate to base implementation
         return super().parse_streaming_increment(new_text, tools)
 
     def structure_info(self) -> callable:

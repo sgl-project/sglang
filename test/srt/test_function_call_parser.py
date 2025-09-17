@@ -2245,58 +2245,6 @@ class TestJsonArrayParser(unittest.TestCase):
             str(context.exception),
         )
 
-    def test_has_tool_call(self):
-        """Test detection of JSON tool calls"""
-        # Test cases that should return True
-        self.assertTrue(self.detector.has_tool_call("["))
-        self.assertTrue(self.detector.has_tool_call('[{"name": "test"}]'))
-
-        # Test cases that should return False
-        self.assertFalse(self.detector.has_tool_call(""))
-        self.assertFalse(self.detector.has_tool_call("plain text"))
-        self.assertFalse(self.detector.has_tool_call("some other content"))
-        self.assertFalse(self.detector.has_tool_call('{"name": "test"}'))
-
-    def test_find_valid_separator(self):
-        """Test separator detection with brace counting"""
-        # Test simple case
-        text = '{"name": "test"},{"name": "test2"}'
-        sep_index = self.detector._find_valid_separator(text)
-        self.assertEqual(sep_index, 16)  # Position of comma between objects
-
-        # Test with nested braces
-        text = '{"name": "test", "nested": {"key": "value"}},{"name": "test2"}'
-        sep_index = self.detector._find_valid_separator(text)
-        self.assertEqual(sep_index, 44)  # Position of comma after nested object
-
-        # Test with no valid separator
-        text = '{"name": "test", "nested": {"key": "value"}}'
-        sep_index = self.detector._find_valid_separator(text)
-        self.assertEqual(sep_index, -1)
-
-        # Test with malformed braces
-        text = '{"name": "test", "nested": {"key": "value"}'
-        sep_index = self.detector._find_valid_separator(text)
-        self.assertEqual(sep_index, -1)
-
-    def test_parse_streaming_increment_with_separator_handling(self):
-        """Test parsing with separator handling across chunks"""
-        # First chunk ends with separator
-        self.detector.parse_streaming_increment(
-            '[{"name": "get_weather", "parameters": {"location": "Tokyo"}},', self.tools
-        )
-
-        # Should have set pending separator
-        self.assertTrue(self.detector._pending_separator)
-
-        # Second chunk starts with new object
-        result2 = self.detector.parse_streaming_increment(
-            '{"name": "search", "parameters": {"query": "weather"}}]', self.tools
-        )
-
-        # Should have processed the second object
-        self.assertIsInstance(result2, StreamingParseResult)
-
     def test_parse_streaming_increment_malformed_json(self):
         """Test parsing with malformed JSON"""
         # Test with malformed JSON
@@ -2334,36 +2282,166 @@ class TestJsonArrayParser(unittest.TestCase):
         # The base class should handle this
         self.assertIsInstance(result, StreamingParseResult)
 
-    def test_parse_streaming_increment_array_without_brackets(self):
-        """Test parsing array content without outer brackets"""
-        # Test array content without brackets (should be handled by base class)
-        text = '{"name": "get_weather", "parameters": {"location": "Tokyo"}}'
-        result = self.detector.parse_streaming_increment(text, self.tools)
-
-        # Should not parse as tool call since it doesn't start with [
-        self.assertEqual(len(result.calls), 0)
-
-    def test_brace_count_tracking(self):
-        """Test that brace counting works correctly across multiple calls"""
-        # Reset detector state
-        self.detector.brace_count = 0
-
-        # First call with opening brace
-        text1 = '{"name": "test"'
-        sep_index1 = self.detector._find_valid_separator(text1)
-        self.assertEqual(sep_index1, -1)  # No separator found
-        self.assertEqual(self.detector.brace_count, 1)  # One opening brace
-
-        # Reset for second test
-        self.detector.brace_count = 0
-
+    def test_json_parsing_with_commas(self):
+        """Test that JSON parsing works correctly with comma separators"""
         # Test with complete object and separator
-        text2 = '{"name": "test"},{"name": "test2"}'
-        sep_index2 = self.detector._find_valid_separator(text2)
-        self.assertEqual(sep_index2, 16)  # Separator found at position 16
-        self.assertEqual(
-            self.detector.brace_count, 0
-        )  # Back to zero after complete object
+        text = '[{"name": "get_weather", "parameters": {"location": "Tokyo"}},{"name": "get_weather", "parameters": {"location": "Paris"}}]'
+        result = self.detector.parse_streaming_increment(text, self.tools)
+        self.assertIsInstance(result, StreamingParseResult)
+        self.assertGreater(len(result.calls), 0, "Should parse tool calls from text with separators")
+
+    def test_braces_in_strings(self):
+        """Test that JSON with } characters inside strings works correctly"""
+        # Test case: JSON array with } inside string values - this should work with json.loads()
+        text = '[{"name": "get_weather", "parameters": {"location": "has } inside"}}'
+        
+        result = self.detector.parse_streaming_increment(text, self.tools)
+        self.assertIsInstance(result, StreamingParseResult)
+        self.assertGreater(len(result.calls), 0, "Should parse tool call with } in string")
+        
+        # Test with separator (streaming in progress)
+        text_with_separator = '[{"name": "get_weather", "parameters": {"location": "has } inside"}},{"name": "get_weather"'
+        result2 = self.detector.parse_streaming_increment(text_with_separator, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+        self.assertGreater(len(result2.calls), 0, "Should parse tool calls with separator and } in string")
+
+    def test_separator_in_same_chunk(self):
+        """Test that separator already present in chunk works correctly"""
+        # Test case: separator already in the chunk (streaming in progress)
+        text = '[{"name": "get_weather", "parameters": {"location": "Tokyo"}},{"name": "get_weather"'
+        
+        result = self.detector.parse_streaming_increment(text, self.tools)
+        self.assertIsInstance(result, StreamingParseResult)
+        self.assertGreater(len(result.calls), 0, "Should parse tool calls with separator in same chunk")
+
+    def test_separator_in_separate_chunk(self):
+        """Test that separator in separate chunk works correctly"""
+        # Test case: separator in separate chunk - this tests streaming behavior
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}'
+        chunk2 = ','
+        chunk3 = '{"name": "get_weather", "parameters": {"location": "Paris"}}'
+        
+        # Process first chunk
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        
+        # Process separator chunk
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+        
+        # Process second chunk (streaming in progress)
+        result3 = self.detector.parse_streaming_increment(chunk3, self.tools)
+        self.assertIsInstance(result3, StreamingParseResult)
+
+    def test_incomplete_json_across_chunks(self):
+        """Test that incomplete JSON across chunks works correctly"""
+        # Test case: incomplete JSON across chunks - this tests streaming behavior
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "Tokyo"'
+        chunk2 = '}},{"name": "get_weather"'
+        
+        # Process first chunk (incomplete)
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        
+        # Process second chunk (completes first object and starts second, streaming in progress)
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+
+    def test_malformed_json_recovery(self):
+        """Test that malformed JSON recovers gracefully"""
+        # Test with malformed JSON - should handle gracefully
+        malformed_text = '[{"name": "get_weather", "parameters": {"location": "unclosed string'
+        
+        result1 = self.detector.parse_streaming_increment(malformed_text, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        
+        # Test valid JSON after malformed - should work (streaming in progress)
+        valid_text = '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}'
+        result2 = self.detector.parse_streaming_increment(valid_text, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+
+    def test_nested_objects_with_commas(self):
+        """Test that nested objects with commas inside work correctly"""
+        # Test with nested objects that have commas - should work with json.loads()
+        text = '[{"name": "get_weather", "parameters": {"location": "Tokyo", "unit": "celsius"}}'
+        
+        result = self.detector.parse_streaming_increment(text, self.tools)
+        self.assertIsInstance(result, StreamingParseResult)
+        self.assertGreater(len(result.calls), 0, "Should parse tool call with nested objects")
+
+    def test_empty_objects(self):
+        """Test that empty objects work correctly"""
+        # Test with empty objects - should work with json.loads()
+        text = '[{"name": "get_weather", "parameters": {}}'
+        
+        result = self.detector.parse_streaming_increment(text, self.tools)
+        self.assertIsInstance(result, StreamingParseResult)
+
+    def test_whitespace_handling(self):
+        """Test that various whitespace scenarios work correctly"""
+        # Test with various whitespace patterns - should work with json.loads()
+        text = ' \n\n [{"name": "get_weather", "parameters": {"location": "Tokyo"}}'
+        
+        result = self.detector.parse_streaming_increment(text, self.tools)
+        self.assertIsInstance(result, StreamingParseResult)
+
+    def test_multiple_commas_in_chunk(self):
+        """Test that multiple commas in a single chunk work correctly"""
+        # Test with multiple commas - should find the right separator (streaming in progress)
+        text = '[{"name": "get_weather", "parameters": {"location": "Tokyo"}},{"name": "get_weather", "parameters": {"location": "Paris"}},{"name": "get_weather"'
+        
+        result = self.detector.parse_streaming_increment(text, self.tools)
+        self.assertIsInstance(result, StreamingParseResult)
+        self.assertGreater(len(result.calls), 0, "Should parse tool calls with multiple commas")
+
+    def test_complete_tool_call_with_trailing_comma(self):
+        """Test that complete tool call with trailing comma sets pending separator"""
+        # Test case: complete tool call followed by comma at end of chunk
+        text = '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}, '
+        
+        result = self.detector.parse_streaming_increment(text, self.tools)
+        self.assertIsInstance(result, StreamingParseResult)
+        self.assertGreater(len(result.calls), 0, "Should parse complete tool call")
+        self.assertTrue(self.detector._pending_separator, "Should set pending separator for trailing comma")
+        
+        # Test that next chunk with opening brace gets the separator prepended
+        next_chunk = '{"name": "get_weather", "parameters": {"location": "Paris"}}'
+        result2 = self.detector.parse_streaming_increment(next_chunk, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+        self.assertFalse(self.detector._pending_separator, "Should clear pending separator after processing")
+
+    def test_three_tool_calls_separate_chunks_with_commas(self):
+        """Test parsing 3 tool calls in separate chunks with commas at the end"""
+        # First tool call: 2 chunks
+        chunk1_1 = '[{"name": "get_weather", "parameters": '
+        result1_1 = self.detector.parse_streaming_increment(chunk1_1, self.tools)
+        chunk1_2 = '{"location": "Tokyo"}},'
+        result1_2 = self.detector.parse_streaming_increment(chunk1_2, self.tools)
+        self.assertIsInstance(result1_2, StreamingParseResult)
+        self.assertGreater(len(result1_2.calls), 0, "Should parse first tool call")
+        self.assertTrue(self.detector._pending_separator, "Should set pending separator for trailing comma")
+        
+        # Second tool call: 2 chunks
+        chunk2_1 = '{"name": "search", "parameters": '
+        result2_1 = self.detector.parse_streaming_increment(chunk2_1, self.tools)
+        chunk2_2 = '{"query": "restaurants"}},'
+        result2_2 = self.detector.parse_streaming_increment(chunk2_2, self.tools)
+        self.assertIsInstance(result2_2, StreamingParseResult)
+        self.assertGreater(len(result2_2.calls), 0, "Should parse second tool call")
+        self.assertTrue(self.detector._pending_separator, "Should set pending separator for trailing comma")
+        
+        # Third tool call: 2 chunks
+        chunk3_1 = '{"name": "get_weather", "parameters": '
+        result3_1 = self.detector.parse_streaming_increment(chunk3_1, self.tools)
+        chunk3_2 = '{"location": "Paris"}}]'
+        result3_2 = self.detector.parse_streaming_increment(chunk3_2, self.tools)
+        self.assertIsInstance(result3_2, StreamingParseResult)
+        self.assertGreater(len(result3_2.calls), 0, "Should parse third tool call")
+        self.assertFalse(self.detector._pending_separator, "Should clear pending separator after completion")
+        
+        # Verify all tool calls were parsed correctly
+        total_calls = len(result1_2.calls) + len(result2_2.calls) + len(result3_2.calls)
+        self.assertEqual(total_calls, 3, "Should have parsed exactly 3 tool calls")
 
 
 if __name__ == "__main__":
