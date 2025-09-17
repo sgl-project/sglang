@@ -1888,7 +1888,7 @@ def direct_register_custom_op(
     op_func: Callable,
     mutates_args: List[str],
     fake_impl: Optional[Callable] = None,
-    target_lib: Optional[Library] = None,
+    target_lib: Optional[Library] = None
 ):
     """
     `torch.library.custom_op` can have significant overhead because it
@@ -1937,7 +1937,7 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA")
+        my_lib.impl(op_name, op_func, "CUDA" if not is_npu() else "PrivateUse1")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:

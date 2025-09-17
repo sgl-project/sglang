@@ -8,6 +8,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import (
@@ -200,6 +201,7 @@ class W8A8Int8Config(QuantizationConfig):
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
+        self.enable_torch_compile = quant_config.get("enable_torch_compile", False)
         self.quant_description = quant_config
         self.is_dynamic = quant_config.get("is_dynamic", False)
         ignore = cast(List[str], quant_config.get("ignore", []))
@@ -568,7 +570,10 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 class NPU_W8A8LinearMethodImpl:
     """Linear method for NPU W8A8."""
 
-    def __init__(self) -> None:
+    quant_config = None
+
+    def __init__(self, quant_config) -> None:
+        NPU_W8A8LinearMethodImpl.quant_config = quant_config
         # aclnn quant matmul requires to transpose matrix B, set to true by default.
         self.transpose_weight = True
 
@@ -614,9 +619,16 @@ class NPU_W8A8LinearMethodImpl:
 
         original_dtype = x.dtype
         if original_dtype != torch.int8:
+            aclnn_input_scale_reciprocal = layer.aclnn_input_scale_reciprocal
+            if NPU_W8A8LinearMethodImpl.quant_config.enable_torch_compile and (
+                isinstance(layer, MergedColumnParallelLinear)
+                or isinstance(layer, QKVParallelLinear)
+            ):
+                aclnn_input_scale_reciprocal = 1.0 / aclnn_input_scale_reciprocal
+
             x = torch_npu.npu_quantize(
                 x,
-                layer.aclnn_input_scale_reciprocal,
+                aclnn_input_scale_reciprocal,
                 layer.aclnn_input_offset,
                 torch.qint8,
                 -1,
@@ -633,7 +645,7 @@ class NPU_W8A8LinearMethodImpl:
             layer.weight,
             layer.deq_scale,
             bias=quant_bias,
-            output_dtype=original_dtype,
+            output_dtype=layer.params_dtype,
         )
 
     def process_weights_after_loading(self, layer):
@@ -642,10 +654,23 @@ class NPU_W8A8LinearMethodImpl:
             layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
             requires_grad=False,
         )
-        layer.aclnn_input_scale_reciprocal = 1 / torch.nn.Parameter(
-            layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
-            requires_grad=False,
-        )
+        prev_layer_fuse_reciprocal = isinstance(
+            layer, MergedColumnParallelLinear
+        ) or isinstance(layer, QKVParallelLinear)
+        if (
+            NPU_W8A8LinearMethodImpl.quant_config.enable_torch_compile
+            and prev_layer_fuse_reciprocal
+        ):
+            layer.aclnn_input_scale_reciprocal = torch.nn.Parameter(
+                layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
+                requires_grad=False,
+            )
+        else:
+            layer.aclnn_input_scale_reciprocal = 1.0 / torch.nn.Parameter(
+                layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
+                requires_grad=False,
+            )
+
         layer.aclnn_input_offset = torch.nn.Parameter(
             layer.input_offset.data.repeat(expanding_factor).to(device="npu"),
             requires_grad=False,
@@ -740,7 +765,7 @@ class NPU_W8A8LinearMethod(LinearMethodBase):
         self.quant_method = (
             NPU_W8A8LinearMethodMTImpl()
             if useMindIETurbo
-            else NPU_W8A8LinearMethodImpl()
+            else NPU_W8A8LinearMethodImpl(quantization_config)
         )
 
     def create_weights(

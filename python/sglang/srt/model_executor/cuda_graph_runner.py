@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -39,8 +39,6 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
     get_attention_tp_size,
-    set_dp_buffer_len,
-    set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
@@ -76,6 +74,11 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 _is_hip = is_hip()
+
+from sglang.srt.model_executor.compilation.custom_ops import (
+    _set_dp_buffer_len,
+    _set_is_extend_in_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -520,7 +523,7 @@ class CudaGraphRunner:
             )
             logger.info(log_message)
 
-    def _capture_graph(self, graph, pool, stream, run_once_fn):
+    def _capture_graph(self, graph, pool, stream, run_once_fn, bs: int):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.model_runner.server_args.enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -660,8 +663,8 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
-            set_is_extend_in_batch(False)
+            _set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            _set_is_extend_in_batch(False)
 
             kwargs = {}
             if (
@@ -692,7 +695,7 @@ class CudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
         out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
+            graph, get_global_graph_memory_pool(), stream, run_once, bs
         )
 
         return graph, out

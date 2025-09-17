@@ -253,6 +253,8 @@ def get_quant_config(
                 return ModelOptFp8Config.from_config(config)
             elif "FP4" in quant_algo:
                 return ModelOptFp4Config.from_config(config)
+
+        config["enable_torch_compile"] = model_config.enable_torch_compile
         return quant_cls.from_config(config)
 
 

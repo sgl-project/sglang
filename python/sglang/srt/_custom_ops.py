@@ -4,12 +4,52 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import get_bool_env_var, is_hip, is_hpu, is_npu
+from sglang.srt.utils import (
+    direct_register_custom_op,
+    get_bool_env_var,
+    get_cmo_stream,
+    is_hip,
+    is_hpu,
+    is_npu,
+)
 
 logger = logging.getLogger(__name__)
 use_vllm_custom_allreduce = get_bool_env_var(
     "USE_VLLM_CUSTOM_ALLREDUCE", default="false"
 )
+
+
+import sglang.srt.utils
+
+
+@torch.library.custom_op("sglang::wait_cmo_stream", mutates_args=())
+def wait_cmo_stream() -> None:
+    if is_npu() and get_cmo_stream():
+        sglang.srt.utils.wait_cmo_stream()
+
+
+@wait_cmo_stream.register_fake
+def wait_cmo_stream_fake() -> None:
+    pass
+
+
+def prepare_weight_cache(handle: torch.Tensor, cache: List[torch.Tensor]) -> None:
+    sglang.srt.utils.prepare_weight_cache(handle, cache)
+
+
+def prepare_weight_cache_register_fake(
+    handle: torch.Tensor, cache: List[torch.Tensor]
+) -> None:
+    pass
+
+
+direct_register_custom_op(
+    op_name="prepare_weight_cache",
+    op_func=prepare_weight_cache,
+    mutates_args=["handle"],
+    fake_impl=prepare_weight_cache_register_fake,
+)
+
 
 if not is_hpu():
     # ROCm does not use vllm custom allreduce
