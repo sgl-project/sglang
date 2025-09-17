@@ -855,6 +855,10 @@ class ServerArgs:
             # assert self.speculative_num_steps < self.speculative_num_draft_tokens
 
         if self.speculative_algorithm == "LOOKAHEAD":
+            if not self.device.startswith("cuda"):
+                raise ValueError(
+                    "Lookahead speculative decoding only supports CUDA device."
+                )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
