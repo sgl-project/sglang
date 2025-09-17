@@ -541,7 +541,7 @@ class Scheduler(
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
         self.init_dp_balance(dp_balance_meta)
-        
+
         # Only emit KV events from tp rank 0
         if tp_rank == 0:
             self.init_kv_events(server_args.kv_events_config)
