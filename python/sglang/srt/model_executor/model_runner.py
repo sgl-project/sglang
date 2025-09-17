@@ -51,7 +51,7 @@ from sglang.srt.distributed import (
     set_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.elastic_ep.elastic_ep import get_global_elastic_ep_metadata
+from sglang.srt.elastic_ep.elastic_ep import get_elastic_ep_state
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -928,7 +928,8 @@ class ModelRunner:
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        if get_global_elastic_ep_metadata().using_elastic_ep:
+        if get_elastic_ep_state().using_elastic_ep:
+            # TODO: refactor the weights update when elastic ep
             old_expert_location_metadata = get_global_expert_location_metadata()
             assert old_expert_location_metadata is not None
             old_expert_location_metadata.update(

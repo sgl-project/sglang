@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple
 
-from sglang.srt.elastic_ep.elastic_ep import _init_global_elastic_ep_metadata, get_global_elastic_ep_metadata
+from sglang.srt.elastic_ep.elastic_ep import get_elastic_ep_state
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -145,9 +145,7 @@ class _MooncakeEPDispatcherImpl:
         self.first_execution = True
         self.timeout_us = 10000000
 
-        _init_global_elastic_ep_metadata()
-        global_elastic_ep_metadata = get_global_elastic_ep_metadata()
-        self.active_ranks = global_elastic_ep_metadata.active_ranks
+        self.active_ranks = get_elastic_ep_state().active_ranks
 
         self.handle = None
 
