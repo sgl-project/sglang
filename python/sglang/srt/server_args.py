@@ -2791,7 +2791,7 @@ class ServerArgs:
         # Add additional batch sizes based on GPU memory capacity
         if gpu_mem is not None:
             if gpu_mem > 90 * 1024 and self.cuda_graph_max_bs > 160:  # H200, H20
-                capture_bs += list(range(160, min(self.cuda_graph_max_bs + 1, 257), 8))
+                capture_bs += list(range(160, min(self.cuda_graph_max_bs + 1, 513), 8))
             if gpu_mem > 160 * 1000 and self.cuda_graph_max_bs > 256:  # B200, MI300
                 capture_bs += list(range(256, min(self.cuda_graph_max_bs + 1, 513), 16))
 
