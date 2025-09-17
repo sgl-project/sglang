@@ -19,6 +19,7 @@ from typing import Dict, Optional
 
 import torch
 
+from sglang.srt.afd.afd_type import AFDRole, get_afd_role
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -186,6 +187,7 @@ class LayerCommunicator:
         self.post_attention_layernorm = post_attention_layernorm
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
+        self.afd_role = get_afd_role()
 
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -218,6 +220,9 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         qaunt_format: str = "",
     ):
+        if self.afd_role == AFDRole.AFD_ROLE_FFN:
+            return hidden_states, residual
+
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
@@ -278,6 +283,9 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        if self.afd_role == AFDRole.AFD_ROLE_FFN:
+            return hidden_states, residual
+
         if cache is not None:
             self._context.cache = cache
 
@@ -295,6 +303,9 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if self.afd_role == AFDRole.AFD_ROLE_FFN:
+            return hidden_states, residual
+
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -304,6 +315,9 @@ class LayerCommunicator:
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
+        if self.afd_role is not None:
+            return False
+
         return (
             self.allow_reduce_scatter
             and self._communicate_summable_tensor_pair_fn
@@ -314,6 +328,9 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        if self.afd_role is not None:
+            return False
+
         speculative_algo = global_server_args_dict.get("speculative_algorithm", None)
         if (
             is_dp_attention_enabled()

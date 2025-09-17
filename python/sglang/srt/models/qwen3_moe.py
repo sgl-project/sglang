@@ -23,6 +23,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.afd.afd_model import AFDProxyAttention
+from sglang.srt.afd.afd_type import afd_is_attn, afd_is_ffn, get_afd_role
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -48,7 +50,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -123,7 +125,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.num_experts = (
                 config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
             )
-            self.top_k = config.num_experts_per_tok
+        self.top_k = config.num_experts_per_tok
 
     def forward(
         self,
@@ -132,6 +134,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+
+        if get_afd_role() is not None:
+            return self.forward_afd(hidden_states, forward_batch)
 
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(
@@ -146,6 +151,37 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
         ]
+
+    def forward_afd(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+
+        if afd_is_ffn():
+            self.experts(hidden_states, None)
+            return hidden_states
+
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+
+        if num_tokens == 0:
+            topk_ids = torch.full(
+                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            topk_weights = torch.empty(
+                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+            )
+
+            topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
+        else:
+            topk_output = self.topk(hidden_states, router_logits)
+
+        final_hidden_states = self.experts(hidden_states, topk_output, forward_batch)
+        return final_hidden_states
 
     def forward_normal(
         self,
@@ -461,22 +497,26 @@ class Qwen3MoeDecoderLayer(nn.Module):
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
-        self.self_attn = Qwen3MoeAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            attention_bias=attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            dual_chunk_attention_config=dual_chunk_attention_config,
-            alt_stream=alt_stream,
-        )
+
+        if afd_is_ffn():
+            self.self_attn = AFDProxyAttention()
+        else:
+            self.self_attn = Qwen3MoeAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                attention_bias=attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+                dual_chunk_attention_config=dual_chunk_attention_config,
+                alt_stream=alt_stream,
+            )
 
         self.layer_id = layer_id
 
@@ -694,6 +734,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
+        if afd_is_ffn():
+            return hidden_states
+
         if self.pp_group.is_last_rank:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
@@ -771,21 +814,28 @@ class Qwen3MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
+        if afd_is_ffn():
+            stacked_params_mapping = []
+        else:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
+
+        if afd_is_attn():
+            expert_params_mapping = []
+        else:
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.num_experts,
+            )
 
         # Cache params_dict to avoid repeated expensive traversal of model parameters
         if not hasattr(self, "_cached_params_dict"):
