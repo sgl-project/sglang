@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -26,6 +27,23 @@ class MatchResult(NamedTuple):
     last_device_node: Any
     last_host_node: Any
     host_hit_length: int = 0
+
+
+class PrefixCacheBackend(Enum):
+    radix = "radix"
+    radix_cpp = "radix_cpp"
+    chunk = "chunk"
+    hierarchical = "hierarchical"
+    hierarchical_cpp = "hierarchical_cpp"
+    lora = "lora"
+    lmcache = "lmcache"
+    swa_radix = "swa_radix"
+    swa_chunk = "swa_chunk"
+    none = "none"
+
+
+def get_prefix_cache_backend(backend: str) -> PrefixCacheBackend:
+    return PrefixCacheBackend(backend)
 
 
 class BasePrefixCache(ABC):
