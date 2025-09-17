@@ -1,9 +1,11 @@
 import json
 from json import JSONDecodeError, JSONDecoder
-from typing import Any, Tuple
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 import partial_json_parser
 from partial_json_parser.core.options import Allow
+
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
@@ -50,3 +52,83 @@ def _is_complete_json(input_str: str) -> bool:
         return True
     except JSONDecodeError:
         return False
+
+
+def get_json_schema_constraint(
+    tools: List[Tool], tool_choice: Union[ToolChoice, Literal["required"]]
+) -> Optional[dict]:
+    """
+    Get the JSON schema constraint for the specified tool choice.
+
+    Args:
+        tool_choice: The tool choice specification
+
+    Returns:
+        JSON schema dict, or None if no valid tools found
+    """
+
+    def get_tool_schema(tool):
+        return {
+            "properties": {
+                "name": {"type": "string", "enum": [tool.function.name]},
+                "parameters": (
+                    tool.function.parameters
+                    if tool.function.parameters
+                    else {"type": "object", "properties": {}}
+                ),
+            },
+            "required": ["name", "parameters"],
+        }
+
+    if isinstance(tool_choice, ToolChoice) or (
+        isinstance(tool_choice, dict) and "function" in tool_choice
+    ):
+        # For specific function choice, return the user's parameters schema directly
+        if isinstance(tool_choice, ToolChoice):
+            fn_name = tool_choice.function.name
+        else:
+            fn_name = tool_choice["function"]["name"]
+        for tool in tools:
+            if tool.function.name == fn_name:
+                return {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": get_tool_schema(tool),
+                }
+        return None
+    elif tool_choice == "required":
+
+        def get_tool_schema_defs(tools):
+            all_defs = {}
+            for tool in tools:
+                if tool.function.parameters is None:
+                    continue
+                # Make a copy to avoid modifying original
+                params = tool.function.parameters.copy()
+                defs = params.pop("$defs", {})
+                for def_name, def_schema in defs.items():
+                    if def_name in all_defs and all_defs[def_name] != def_schema:
+                        raise ValueError(
+                            f"Tool definition '{def_name}' has "
+                            "multiple schemas, which is not "
+                            "supported."
+                        )
+                    else:
+                        all_defs[def_name] = def_schema
+            return all_defs
+
+        json_schema = {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "anyOf": [get_tool_schema(tool) for tool in tools],
+            },
+        }
+        json_schema_defs = get_tool_schema_defs(tools)
+        if json_schema_defs:
+            json_schema["$defs"] = json_schema_defs
+        return json_schema
+
+    return None
