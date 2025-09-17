@@ -311,7 +311,7 @@ class BaseMultimodalProcessor(ABC):
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:") :]
+                path = image[len("video:"):]
                 # Estimate frames for the video
                 vr = VideoReader(path, ctx=cpu(0))
                 num_frames = len(vr)
@@ -693,10 +693,12 @@ class BaseMultimodalProcessor(ABC):
                     item.format = MultimodalInputFormat.PROCESSOR_OUTPUT
                 all_collected_items.extend(items)
             elif dict_item.get("format", None) == "precomputed_embedding":
+                feature = dict_item["feature"]
+                del dict_item["feature"]
                 all_collected_items.append(
                     MultimodalDataItem(
                         modality=modality,
-                        feature=dict_item["feature"],
+                        feature=feature,
                         format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
                         model_specific_data=dict_item,
                     )

@@ -177,7 +177,7 @@ class Engine(EngineBase):
         # - Single image for a single request
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
-        # - List of preprocessed pixel values, each as a dict containing field `format`: 'processor_output' and `feature`: the preprocessed pixel values
+        # - List of preprocessed outputs from a Huggingface processor, each as a dict containing `format`: 'processor_output' and other data
         # - List of precomputed image embeddings, each as a dict containing field `format`: 'precomputed_embedding' and `feature`: the precomputed embedding
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[MultimodalDataInputFormat] = None,
@@ -261,7 +261,7 @@ class Engine(EngineBase):
         # - Single image for a single request
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
-        # - List of preprocessed pixel values, each as a dict containing field `format`: 'processor_output' and `feature`: the preprocessed pixel values
+        # - List of preprocessed outputs from a Huggingface processor, each as a dict containing `format`: 'processor_output' and other data
         # - List of precomputed image embeddings, each as a dict containing field `format`: 'precomputed_embedding' and `feature`: the precomputed embedding
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[MultimodalDataInputFormat] = None,
