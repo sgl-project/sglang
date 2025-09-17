@@ -30,7 +30,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -46,10 +46,11 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 import triton
 import triton.language as tl
@@ -238,6 +239,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         self,
         config: Qwen3NextConfig,
         layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -277,6 +279,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             input_size=self.hidden_size,
             output_size=projection_size_qkvz,
             bias=False,
+            quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
@@ -284,6 +287,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             input_size=self.hidden_size,
             output_size=projection_size_ba,
             bias=False,
+            quant_config=None,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
@@ -327,7 +331,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             eps=self.layer_norm_epsilon,
             group_size=None,
             norm_before_gate=True,
-            device=torch.cuda.current_device(),
+            device=torch.get_device_module().current_device(),
             dtype=config.torch_dtype,
         )
 
@@ -335,6 +339,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             self.value_dim,
             self.hidden_size,
             bias=False,
+            quant_config=quant_config,
             input_is_parallel=True,
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
@@ -388,7 +393,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        DUAL_STREAM_TOKEN_THRESHOLD = 1024
+        DUAL_STREAM_TOKEN_THRESHOLD = 1024 if not _is_npu else 0
         seq_len, _ = hidden_states.shape
         if seq_len < DUAL_STREAM_TOKEN_THRESHOLD:
             current_stream = torch.cuda.current_stream()
@@ -454,6 +459,8 @@ class Qwen3GatedDeltaNet(nn.Module):
             "dt_bias": self.dt_bias,
             "layer_id": self.layer_id,
             "seq_len": seq_len,
+            "num_k_heads": self.num_k_heads,
+            "num_v_heads": self.num_v_heads,
             "z": z,
         }
 
@@ -490,7 +497,9 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.linear_attn = Qwen3GatedDeltaNet(config, layer_id, alt_stream)
+        self.linear_attn = Qwen3GatedDeltaNet(
+            config, layer_id, quant_config, alt_stream
+        )
 
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
@@ -518,24 +527,10 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
             )
-        if getattr(
-            config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)
-        ):
-            logger.warning_once(
-                "Using Gemma RMSNorm for input normalization and post attn normalization."
-            )
-            self.input_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
-            self.post_attention_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
-        else:
-            self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_attention_layernorm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
-
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -685,23 +680,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
             )
-        if getattr(
-            config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)
-        ):
-            logger.warning_once(
-                "Using Gemma RMSNorm for input normalization and post attn normalization."
-            )
-            self.input_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
-            self.post_attention_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
-        else:
-            self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_attention_layernorm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -844,13 +826,7 @@ class Qwen3NextModel(nn.Module):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
 
-        if getattr(
-            config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)
-        ):
-            logger.warning_once("Using Gemma RMSNorm for final normalization.")
-            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.infer_count = 0
 
     def forward(
@@ -965,7 +941,7 @@ class Qwen3NextForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

@@ -38,6 +38,7 @@ from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
+    DotsVLMConfig,
     ExaoneConfig,
     KimiVLConfig,
     LongcatFlashConfig,
@@ -60,6 +61,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     Step3VLConfig.model_type: Step3VLConfig,
     LongcatFlashConfig.model_type: LongcatFlashConfig,
     Qwen3NextConfig.model_type: Qwen3NextConfig,
+    DotsVLMConfig.model_type: DotsVLMConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
