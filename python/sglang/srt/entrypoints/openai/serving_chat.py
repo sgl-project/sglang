@@ -87,6 +87,19 @@ class OpenAIServingChat(OpenAIServingBase):
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
 
+        # Validate tool definitions
+        if request.tools:
+            for i, tool in enumerate(request.tools):
+                if not hasattr(tool, "function") or not tool.function:
+                    return f"Tool {i} is missing required 'function' field."
+                if not hasattr(tool.function, "name") or not tool.function.name:
+                    return f"Tool {i} function is missing required 'name' field."
+                if (
+                    not hasattr(tool.function, "parameters")
+                    or tool.function.parameters is None
+                ):
+                    return f"Tool {i} function is missing required 'parameters' field."
+
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
         if (

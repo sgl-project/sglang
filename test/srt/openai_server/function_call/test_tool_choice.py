@@ -459,6 +459,88 @@ class TestToolChoiceLlama32(CustomTestCase):
             str(context.exception),
         )
 
+    def test_invalid_json_schema_handling(self):
+        """Test what happens when user provides invalid JSON schema in request"""
+        # Test with malformed JSON in tool parameters - missing required "name" field
+        invalid_tools = [
+            {
+                "type": "function",
+                "function": {
+                    # Missing required "name" field
+                    "description": "Test function with invalid schema",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "test_field": {
+                                "type": "string",
+                                "description": "Test field",
+                            }
+                        },
+                        "required": ["test_field"],
+                    },
+                },
+            }
+        ]
+
+        messages = [
+            {
+                "role": "user",
+                "content": "Test the function",
+            }
+        ]
+
+        # Should raise BadRequestError due to missing required 'name' field
+        with self.assertRaises(openai.BadRequestError) as context:
+            self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                max_tokens=100,
+                temperature=0.1,
+                tools=invalid_tools,
+                tool_choice="required",
+                stream=False,
+            )
+
+        # Verify the error message indicates missing name field
+        error_msg = str(context.exception).lower()
+        self.assertIn("name", error_msg)
+
+    def test_invalid_tool_missing_parameters(self):
+        """Test what happens when tool function is missing parameters field"""
+        invalid_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "test_function",
+                    "description": "Test function missing parameters",
+                    # Missing "parameters" field
+                },
+            }
+        ]
+
+        messages = [
+            {
+                "role": "user",
+                "content": "Test the function",
+            }
+        ]
+
+        # Should raise BadRequestError due to missing required 'parameters' field
+        with self.assertRaises(openai.BadRequestError) as context:
+            self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                max_tokens=100,
+                temperature=0.1,
+                tools=invalid_tools,
+                tool_choice="required",
+                stream=False,
+            )
+
+        # Verify the error message indicates missing parameters field
+        error_msg = str(context.exception).lower()
+        self.assertIn("parameters", error_msg)
+
 
 class TestToolChoiceQwen25(TestToolChoiceLlama32):
     """Test tool_choice functionality with Qwen2.5 model"""
