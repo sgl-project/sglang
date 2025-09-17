@@ -1074,6 +1074,42 @@ fn default_repetition_penalty() -> f32 {
     1.0
 }
 
+impl Default for ResponsesRequest {
+    fn default() -> Self {
+        Self {
+            background: false,
+            include: None,
+            input: ResponseInput::Text(String::new()),
+            instructions: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            metadata: None,
+            model: None,
+            parallel_tool_calls: true,
+            previous_response_id: None,
+            reasoning: None,
+            service_tier: ServiceTier::default(),
+            store: true,
+            stream: false,
+            temperature: None,
+            tool_choice: ToolChoice::default(),
+            tools: Vec::new(),
+            top_logprobs: 0,
+            top_p: None,
+            truncation: Truncation::default(),
+            user: None,
+            request_id: generate_request_id(),
+            priority: 0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            stop: None,
+            top_k: default_top_k(),
+            min_p: 0.0,
+            repetition_penalty: default_repetition_penalty(),
+        }
+    }
+}
+
 impl ResponsesRequest {
     /// Default sampling parameters
     const DEFAULT_TEMPERATURE: f32 = 0.7;

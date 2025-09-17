@@ -2,9 +2,12 @@
 
 use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
+use crate::data_connector::{ResponseId, SharedResponseStorage, StoredResponse};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest,
+    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponseContentPart,
+    ResponseInput, ResponseOutputItem, ResponseStatus, ResponsesResponse,
 };
+use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -19,7 +22,6 @@ use std::{
 };
 
 /// Router for OpenAI backend
-#[derive(Debug)]
 pub struct OpenAIRouter {
     /// HTTP client for upstream OpenAI-compatible API
     client: reqwest::Client,
@@ -29,6 +31,17 @@ pub struct OpenAIRouter {
     circuit_breaker: CircuitBreaker,
     /// Health status
     healthy: AtomicBool,
+    /// Response storage for managing conversation history
+    response_storage: SharedResponseStorage,
+}
+
+impl std::fmt::Debug for OpenAIRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAIRouter")
+            .field("base_url", &self.base_url)
+            .field("healthy", &self.healthy)
+            .finish()
+    }
 }
 
 impl OpenAIRouter {
@@ -36,6 +49,7 @@ impl OpenAIRouter {
     pub async fn new(
         base_url: String,
         circuit_breaker_config: Option<CircuitBreakerConfig>,
+        response_storage: SharedResponseStorage,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
@@ -61,6 +75,7 @@ impl OpenAIRouter {
             base_url,
             circuit_breaker,
             healthy: AtomicBool::new(true),
+            response_storage,
         })
     }
 }
@@ -340,31 +355,230 @@ impl super::super::RouterTrait for OpenAIRouter {
 
     async fn route_responses(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::ResponsesRequest,
-        _model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        body: &crate::protocols::spec::ResponsesRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses endpoint not implemented for OpenAI router",
-        )
-            .into_response()
+        let url = format!("{}/v1/responses", self.base_url);
+
+        // Clone the body and override model if needed
+        let mut request_body = body.clone();
+        if let Some(model) = model_id {
+            request_body.model = Some(model.to_string());
+        }
+
+        // Forward the request - ResponsesRequest should serialize correctly for OpenAI
+        let request_builder = self.client.post(&url).json(&request_body);
+        
+        // Apply headers with filtering (skip content headers since we're using .json())
+        let request_builder = if let Some(headers) = headers {
+            apply_request_headers(headers, request_builder, true)
+        } else {
+            request_builder
+        };
+
+        match request_builder.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+
+                // Get the response body
+                match response.text().await {
+                    Ok(body_text) => {
+                        // Try to parse and store the response if store is enabled
+                        if body.store {
+                            if let Ok(openai_response) =
+                                serde_json::from_str::<ResponsesResponse>(&body_text)
+                            {
+                                // Extract the input for storage
+                                let input_text = match &body.input {
+                                    ResponseInput::Text(text) => text.clone(),
+                                    ResponseInput::Items(_) => "complex input".to_string(),
+                                };
+
+                                // Extract output text from the response
+                                let output_text = openai_response
+                                    .output
+                                    .iter()
+                                    .find_map(|item| {
+                                        if let ResponseOutputItem::Message { content, .. } = item {
+                                            content.iter().find_map(|c| {
+                                                if let ResponseContentPart::OutputText {
+                                                    text,
+                                                    ..
+                                                } = c
+                                                {
+                                                    Some(text.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or_default();
+
+                                // Store the response
+                                let mut stored_response = StoredResponse::new(
+                                    input_text,
+                                    output_text,
+                                    body.previous_response_id
+                                        .as_ref()
+                                        .map(|id| ResponseId::from_string(id.clone())),
+                                );
+
+                                stored_response.instructions = body.instructions.clone();
+                                stored_response.model = Some(openai_response.model.clone());
+                                stored_response.user = body.user.clone();
+                                stored_response.metadata =
+                                    body.metadata.clone().unwrap_or_default();
+
+                                // Use the ID from OpenAI
+                                stored_response.id =
+                                    ResponseId::from_string(openai_response.id.clone());
+
+                                // Store it (ignore errors since we still want to return the response)
+                                let _ = self.response_storage.store_response(stored_response).await;
+                            }
+                        }
+
+                        // Return the OpenAI response with properly filtered headers
+                        let mut response = (status, body_text).into_response();
+                        *response.headers_mut() = preserve_response_headers(&headers);
+                        response
+                    }
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to read response body: {}", e),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to forward request to OpenAI Responses API: {}", e),
+            )
+                .into_response(),
+        }
     }
 
-    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses retrieve endpoint not implemented for OpenAI router",
-        )
-            .into_response()
+    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        // First check local storage
+        let stored_id = ResponseId::from_string(response_id.to_string());
+        if let Ok(Some(stored_response)) = self.response_storage.get_response(&stored_id).await {
+            let openai_response = ResponsesResponse {
+                id: stored_response.id.0.clone(),
+                object: "response".to_string(),
+                created_at: stored_response.created_at.timestamp(),
+                model: stored_response
+                    .model
+                    .unwrap_or_else(|| "gpt-4o".to_string()),
+                output: vec![ResponseOutputItem::Message {
+                    id: format!("msg_{}", stored_response.id.0),
+                    role: "assistant".to_string(),
+                    status: "completed".to_string(),
+                    content: vec![ResponseContentPart::OutputText {
+                        text: stored_response.output,
+                        annotations: vec![],
+                        logprobs: None,
+                    }],
+                }],
+                status: ResponseStatus::Completed,
+                usage: None,
+                parallel_tool_calls: true,
+                tool_choice: "auto".to_string(),
+                tools: vec![],
+            };
+
+            return (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                serde_json::to_string(&openai_response).unwrap_or_else(|e| {
+                    format!("{{\"error\": \"Failed to serialize response: {}\"}}", e)
+                }),
+            )
+                .into_response();
+        }
+
+        // If not in local storage, forward to OpenAI
+        let url = format!("{}/v1/responses/{}", self.base_url, response_id);
+
+        let request_builder = self.client.get(&url);
+        
+        // Apply headers with filtering (don't skip content headers for GET)
+        let request_builder = if let Some(headers) = headers {
+            apply_request_headers(headers, request_builder, false)
+        } else {
+            request_builder
+        };
+
+        match request_builder.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+
+                match response.text().await {
+                    Ok(body_text) => {
+                        // Optionally store the retrieved response for future queries
+                        // (parsing and storing logic would go here if needed)
+
+                        let mut response = (status, body_text).into_response();
+                        *response.headers_mut() = preserve_response_headers(&headers);
+                        response
+                    }
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to read response body: {}", e),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to retrieve response from OpenAI: {}", e),
+            )
+                .into_response(),
+        }
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses cancel endpoint not implemented for OpenAI router",
-        )
-            .into_response()
+    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        // Forward to OpenAI's cancel endpoint
+        let url = format!("{}/v1/responses/{}/cancel", self.base_url, response_id);
+
+        let request_builder = self.client.post(&url);
+        
+        // Apply headers with filtering (skip content headers for POST without body)
+        let request_builder = if let Some(headers) = headers {
+            apply_request_headers(headers, request_builder, true)
+        } else {
+            request_builder
+        };
+
+        match request_builder.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+
+                match response.text().await {
+                    Ok(body_text) => {
+                        let mut response = (status, body_text).into_response();
+                        *response.headers_mut() = preserve_response_headers(&headers);
+                        response
+                    }
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to read response body: {}", e),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to cancel response on OpenAI: {}", e),
+            )
+                .into_response(),
+        }
     }
 
     async fn flush_cache(&self) -> Response {
