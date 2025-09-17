@@ -3,10 +3,11 @@ Configuration argument parser for command-line applications.
 Handles merging of YAML configuration files with command-line arguments.
 """
 
-import yaml
-from typing import List, Dict, Union, Any
-from pathlib import Path
 import logging
+from pathlib import Path
+from typing import Any, Dict, List, Union
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class ConfigArgumentMerger:
 
     def _extract_config_file_path(self, args: List[str]) -> str:
         """Extract the config file path from arguments."""
-        config_indices = [i for i, arg in enumerate(args) if arg == '--config']
+        config_indices = [i for i, arg in enumerate(args) if arg == "--config"]
 
         if len(config_indices) > 1:
             raise ValueError("Multiple config files specified! Only one allowed.")
@@ -57,13 +58,15 @@ class ConfigArgumentMerger:
 
         return args[config_index + 1]
 
-    def _insert_config_args(self, cli_args: List[str], config_args: List[str], config_file_path: str) -> List[str]:
+    def _insert_config_args(
+        self, cli_args: List[str], config_args: List[str], config_file_path: str
+    ) -> List[str]:
         """Insert configuration arguments into the CLI argument list."""
-        config_index = cli_args.index('--config')
+        config_index = cli_args.index("--config")
 
         # Split arguments around config file
         before_config = cli_args[:config_index]
-        after_config = cli_args[config_index + 2:]  # Skip --config and file path
+        after_config = cli_args[config_index + 2 :]  # Skip --config and file path
 
         # Handle different command structures
         if self._has_subcommand(before_config):
@@ -73,25 +76,37 @@ class ConfigArgumentMerger:
 
     def _has_subcommand(self, args: List[str]) -> bool:
         """Check if arguments start with a subcommand."""
-        return args and not args[0].startswith('-')
+        return args and not args[0].startswith("-")
 
-    def _merge_with_subcommand(self, before_config: List[str], config_args: List[str], after_config: List[str]) -> List[str]:
+    def _merge_with_subcommand(
+        self, before_config: List[str], config_args: List[str], after_config: List[str]
+    ) -> List[str]:
         """Merge config args when subcommand is present."""
         subcommand = before_config[0]
         remaining_args = before_config[1:]
 
         if subcommand == "serve":
-            return self._handle_serve_command(subcommand, remaining_args, config_args, after_config)
+            return self._handle_serve_command(
+                subcommand, remaining_args, config_args, after_config
+            )
         else:
             return [subcommand] + config_args + remaining_args + after_config
 
-    def _handle_serve_command(self, subcommand: str, remaining_args: List[str], config_args: List[str], after_config: List[str]) -> List[str]:
+    def _handle_serve_command(
+        self,
+        subcommand: str,
+        remaining_args: List[str],
+        config_args: List[str],
+        after_config: List[str],
+    ) -> List[str]:
         """Handle special logic for the 'serve' subcommand."""
-        has_model_in_cli = remaining_args and not remaining_args[0].startswith('-')
-        has_model_in_config = any(arg == '--model' for arg in config_args)
+        has_model_in_cli = remaining_args and not remaining_args[0].startswith("-")
+        has_model_in_config = any(arg == "--model" for arg in config_args)
 
         if not has_model_in_cli and not has_model_in_config:
-            raise ValueError("No model specified! Provide model as positional argument or in config file.")
+            raise ValueError(
+                "No model specified! Provide model as positional argument or in config file."
+            )
 
         if has_model_in_cli:
             model_arg = remaining_args[0]
@@ -116,7 +131,7 @@ class ConfigArgumentMerger:
         self._validate_yaml_file(file_path)
 
         try:
-            with open(file_path, 'r') as file:
+            with open(file_path, "r") as file:
                 config_data = yaml.safe_load(file)
         except Exception as e:
             logger.error(f"Failed to read config file {file_path}: {e}")
@@ -134,7 +149,7 @@ class ConfigArgumentMerger:
     def _validate_yaml_file(self, file_path: str) -> None:
         """Validate that the file is a YAML file."""
         path = Path(file_path)
-        if path.suffix.lower() not in ['.yaml', '.yml']:
+        if path.suffix.lower() not in [".yaml", ".yml"]:
             raise ValueError(f"Config file must be YAML format, got: {path.suffix}")
 
         if not path.exists():
@@ -158,18 +173,18 @@ class ConfigArgumentMerger:
         """Add boolean argument to the list."""
         if key in self.boolean_actions:
             # For boolean actions, always add the flag and value
-            args.extend([f'--{key}', str(value).lower()])
+            args.extend([f"--{key}", str(value).lower()])
         else:
             # For regular booleans, only add flag if True
             if value:
-                args.append(f'--{key}')
+                args.append(f"--{key}")
 
     def _add_list_arg(self, args: List[str], key: str, value: List[Any]) -> None:
         """Add list argument to the list."""
         if value:  # Only add if list is not empty
-            args.append(f'--{key}')
+            args.append(f"--{key}")
             args.extend(str(item) for item in value)
 
     def _add_scalar_arg(self, args: List[str], key: str, value: Any) -> None:
         """Add scalar argument to the list."""
-        args.extend([f'--{key}', str(value)])
+        args.extend([f"--{key}", str(value)])
