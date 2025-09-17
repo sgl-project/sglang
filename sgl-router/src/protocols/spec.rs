@@ -78,7 +78,7 @@ pub enum ChatMessage {
     },
     #[serde(rename = "assistant")]
     Assistant {
-        content: MessageContent,
+        content: Option<MessageContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -388,7 +388,10 @@ impl GenerationRequest for ChatCompletionRequest {
                     ..
                 } => {
                     // Combine content and reasoning content for routing decisions
-                    let user_content = extract_user_content(content).unwrap_or_default();
+                    let user_content = content
+                        .as_ref()
+                        .and_then(|c| extract_user_content(c))
+                        .unwrap_or_default();
                     let reasoning = reasoning_content.clone().unwrap_or_default();
                     if user_content.is_empty() && reasoning.is_empty() {
                         None

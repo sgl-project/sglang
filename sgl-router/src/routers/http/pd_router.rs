@@ -10,7 +10,7 @@ use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest, StringOrArray, UserMessageContent,
+    ResponsesRequest, StringOrArray, MessageContent,
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
