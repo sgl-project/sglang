@@ -173,32 +173,3 @@ class ConfigArgumentMerger:
     def _add_scalar_arg(self, args: List[str], key: str, value: Any) -> None:
         """Add scalar argument to the list."""
         args.extend([f'--{key}', str(value)])
-
-
-# Backward compatibility wrapper
-class LegacyConfigParser:
-    """Legacy wrapper for backward compatibility."""
-
-    def __init__(self, actions=None):
-        self._actions = actions or []
-        # Extract boolean action destinations
-        boolean_actions = []
-        for action in self._actions:
-            if hasattr(action, 'dest'):
-                # Check if it's a boolean action by looking for store_true in the type name
-                # or by checking if it's a Mock with a specific name pattern
-                action_type_str = str(type(action))
-                if ('store_true' in action_type_str or
-                    'StoreTrue' in action_type_str or
-                    'Mock' in action_type_str):  # For test mocks
-                    boolean_actions.append(action.dest)
-
-        self.merger = ConfigArgumentMerger(boolean_actions=boolean_actions)
-
-    def _pull_args_from_config(self, args: List[str]) -> List[str]:
-        """Legacy method name for backward compatibility."""
-        return self.merger.merge_config_with_args(args)
-
-    def load_config_file(self, file_path: str) -> List[str]:
-        """Legacy method name for backward compatibility."""
-        return self.merger._parse_yaml_config(file_path)
