@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.disaggregation.kv_events import (
+from sglang.srt.mem_cache.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
