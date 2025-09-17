@@ -18,8 +18,9 @@ from aibrix_kvcache.common.absl_logging import getLogger, log_every_n_seconds, l
 from aibrix_kvcache_storage import AibrixKVCacheStorage
 from torch.distributed import Backend, ProcessGroup
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
-from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -40,7 +41,7 @@ class AIBrixKVCacheStorageTest:
         config = HiCacheStorageConfig(
             tp_rank=0,
             tp_size=1,
-            is_mla_model=True,
+            is_mla_model=False,
             is_page_first_layout=True,
             model_name="test",
         )
@@ -62,9 +63,10 @@ class AIBrixKVCacheStorageTest:
                 0,
                 layer_num,
             )
+            mem_pool = MHATokenToKVPoolHost(kv_cache, 2, 0, page_size, "layer_first")
             query_length = batch_size * 2
             partial = batch_size
-            self.aibrix_kvcache = AibrixKVCacheStorage(config, kv_cache)
+            self.aibrix_kvcache = AibrixKVCacheStorage(config, mem_pool)
             target_shape = (2, layer_num, page_size, head_num, head_dim)
             rand_tensor = [
                 torch.rand(target_shape, dtype=torch.float16)

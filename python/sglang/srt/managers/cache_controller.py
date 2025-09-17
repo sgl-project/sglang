@@ -297,7 +297,7 @@ class HiCacheController:
                 )
 
                 self.storage_backend = AibrixKVCacheStorage(
-                    self.storage_config, self.mem_pool_device
+                    self.storage_config, self.mem_pool_host
                 )
             elif storage_backend == "hf3fs":
                 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (

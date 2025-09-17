@@ -14,47 +14,29 @@ from aibrix_kvcache import (
 from aibrix_kvcache.common.absl_logging import log_every_n_seconds
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
-from sglang.srt.mem_cache.memory_pool import (
-    KVCache,
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-)
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
 
 class AibrixKVCacheStorage(HiCacheStorage):
-    def __init__(self, config: HiCacheStorageConfig, kv_cache: KVCache):
-        tp_rank = config.tp_rank
-        tp_size = config.tp_size
-        self.page_size = kv_cache.page_size
+    def __init__(self, storage_config: HiCacheStorageConfig, mem_pool: HostKVCache):
+        if storage_config is not None:
+            self.is_mla_backend = storage_config.is_mla_model
+            self.local_rank = storage_config.tp_rank
+        else:
+            self.is_mla_backend = False
+            self.local_rank = 0
+        kv_cache = mem_pool.device_pool
+        self.page_size = mem_pool.page_size
         self.kv_cache_dtype = kv_cache.dtype
-        self.kv_cache = kv_cache
-        self.layer_num = self.kv_cache.layer_num
+        self.layer_num = kv_cache.layer_num
         self.kv_head_ids = [
-            tp_rank * self.kv_cache.head_num + i for i in range(self.kv_cache.head_num)
+            self.local_rank * kv_cache.head_num + i for i in range(kv_cache.head_num)
         ]
-        if isinstance(kv_cache, MLATokenToKVPool):
-            self.kv_cache_shape = (
-                self.layer_num,
-                self.page_size,
-                1,
-                self.kv_cache.kv_lora_rank + self.kv_cache.qk_rope_head_dim,
-            )
-            raise NotImplementedError(
-                "MLA is not supported by AibrixKVCacheStorage yet."
-            )
-        elif isinstance(kv_cache, MHATokenToKVPool):
-            self.kv_cache_shape = (
-                2,
-                self.layer_num,
-                self.page_size,
-                self.kv_cache.head_num,
-                self.kv_cache.head_dim,
-            )
-
+        if not self.is_mla_backend:
             self.layer_ids = range(
-                self.kv_cache.start_layer, self.kv_cache.end_layer
+                kv_cache.start_layer, kv_cache.end_layer
             )  # for pipeline parallel
 
             self.block_spec = KVCacheBlockSpec(
@@ -64,7 +46,7 @@ class AibrixKVCacheStorage(HiCacheStorage):
                 tensor_spec=KVCacheTensorSpec(
                     heads=self.kv_head_ids,
                     layers=self.layer_ids,
-                    head_size=self.kv_cache.head_dim,
+                    head_size=kv_cache.head_dim,
                 ),
             )
             logger.info(self.block_spec)
@@ -72,6 +54,10 @@ class AibrixKVCacheStorage(HiCacheStorage):
                 block_spec=self.block_spec, model_spec=ModelSpec(102400)
             )
             self.kv_cache_manager = BaseKVCacheManager(config)
+        else:
+            raise NotImplementedError(
+                "MLA is not supported by AibrixKVCacheStorage yet."
+            )
 
     def _aibrix_kvcache_metrics_report(self):
         self.kv_cache_manager.metrics.summary()
@@ -93,9 +79,11 @@ class AibrixKVCacheStorage(HiCacheStorage):
             kv_blocks = handle.to_tensors()
             assert len(kv_blocks) == len(target_locations)
             for i in range(len(kv_blocks)):
-                target_locations[i].reshape(kv_blocks[i].shape).copy_(
-                    kv_blocks[i]
-                ).reshape(target_locations[i].shape)
+                assert (
+                    target_locations[i].nbytes == kv_blocks[i].nbytes
+                ), f"{target_locations[i].nbytes}, {kv_blocks[i].nbytes}"
+                target_locations[i].copy_(kv_blocks[i].flatten())
+            handle.release()
             return target_locations
 
         return [None] * len(keys)
@@ -128,6 +116,9 @@ class AibrixKVCacheStorage(HiCacheStorage):
             logger.warning("aibrix_kvcache set allocate not enough")
             return False
         for i in range(len(tensors)):
+            assert (
+                tensors[i].nbytes == values[i].nbytes
+            ), f"{tensors[i].nbytes}, {values[i].nbytes}"
             tensors[i].reshape(values[i].shape).copy_(values[i]).reshape(
                 tensors[i].shape
             )
