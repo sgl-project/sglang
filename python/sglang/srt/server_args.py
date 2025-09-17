@@ -2935,4 +2935,3 @@ def auto_choose_speculative_params(self: ServerArgs):
     else:
         # The default value for all other models
         return (5, 4, 8)
-
