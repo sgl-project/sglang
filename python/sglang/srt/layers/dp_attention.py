@@ -144,7 +144,6 @@ class _DpGatheredBufferWrapper:
         return cls._global_num_tokens
 
     @classmethod
-<<<<<<< HEAD
     def get_dp_hidden_size(cls) -> int:
         return cls._hidden_size
 
@@ -155,10 +154,10 @@ class _DpGatheredBufferWrapper:
     @classmethod
     def get_dp_device(cls) -> torch.device:
         return cls._device
-=======
+
+    @classmethod
     def is_dp_max_padding(cls) -> bool:
         return cls._dp_max_padding
->>>>>>> fe71cb143 (Register allgather/reducescatter buffers with symm memory)
 
 
 def set_dp_buffer_len(
@@ -192,7 +191,6 @@ def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
 
 
-<<<<<<< HEAD
 def get_dp_hidden_size() -> int:
     return _DpGatheredBufferWrapper.get_dp_hidden_size()
 
@@ -203,10 +201,10 @@ def get_dp_dtype() -> torch.dtype:
 
 def get_dp_device() -> torch.device:
     return _DpGatheredBufferWrapper.get_dp_device()
-=======
+
+
 def is_dp_max_padding() -> bool:
     return _DpGatheredBufferWrapper.is_dp_max_padding()
->>>>>>> fe71cb143 (Register allgather/reducescatter buffers with symm memory)
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
