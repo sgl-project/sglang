@@ -873,8 +873,8 @@ class OpenAIServingChat(OpenAIServingBase):
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
         return ChoiceLogprobs(content=token_logprobs)
 
-    def _get_tool_id(self, tool_call_parser: str, name: str, index: int) -> str:
-        if tool_call_parser == "kimi_k2" and name is not None:
+    def _get_tool_id(self, name: str, index: int) -> str:
+        if self.tool_call_parser == "kimi_k2" and name is not None:
             return f"functions.{name}:{index}"
         else:
             return f"call_{uuid.uuid4().hex[:24]}"
@@ -904,7 +904,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 for i, tool in enumerate(tool_call_data):
                     tool_calls.append(
                         ToolCall(
-                            id=self._get_tool_id(tool_call_parser, tool.get("name"), i),
+                            id=self._get_tool_id(tool.get("name"), i),
                             index=i,
                             function=FunctionResponse(
                                 name=tool["name"],
@@ -920,7 +920,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 return ToolCallProcessingResult(None, text, finish_reason)
 
         # Use parser since output is not constrained by JSON schema
-        parser = FunctionCallParser(tools, tool_call_parser)
+        parser = FunctionCallParser(tools, self.tool_call_parser)
         if parser.has_tool_call(text):
             # Set finish reason to tool_calls since we detected tool calls
             if finish_reason["type"] == "stop":
@@ -934,7 +934,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_calls.append(
                         ToolCall(
                             id=self._get_tool_id(
-                                tool_call_parser, call_info.name, call_info.tool_index
+                                call_info.name, call_info.tool_index
                             ),
                             index=getattr(call_info, "tool_index", None),
                             function=FunctionResponse(
