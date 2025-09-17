@@ -29,51 +29,93 @@ The "❌" and "✅" symbols in the table above under "Page Size > 1" indicate wh
 
 - FlashInfer (Default for Non-Hopper Machines, e.g., A100, A40)
 ```bash
-python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend flashinfer
-python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-V3 --attention-backend flashinfer --trust-remote-code
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend flashinfer
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-V3 \
+  --attention-backend flashinfer \
+  --trust-remote-code
 ```
 
 - FlashAttention 3 (Default for Hopper Machines, e.g., H100, H200, H20)
 ```bash
-python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend fa3
-python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-V3 --trust-remote-code --attention-backend fa3
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend fa3
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-V3 \
+  --trust-remote-code \
+  --attention-backend fa3
 ```
 
 - Triton
 ```bash
-python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend triton
-python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-V3 --attention-backend triton --trust-remote-code
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend triton
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-V3 \
+  --attention-backend triton \
+  --trust-remote-code
 ```
 
 - Torch Native
 ```bash
-python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend torch_native
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend torch_native
 ```
 
 - FlashMLA
 ```bash
-python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attention-backend flashmla --trust-remote-code
-python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attention-backend flashmla --kv-cache-dtype fp8_e4m3 --trust-remote-code
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-R1 \
+  --attention-backend flashmla \
+  --trust-remote-code
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-R1 \
+  --attention-backend flashmla \
+  --kv-cache-dtype fp8_e4m3 \
+  --trust-remote-code
 ```
 
 - TRTLLM MLA (Optimized for Blackwell Architecture, e.g., B200)
 ```bash
-python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attention-backend trtllm_mla --trust-remote-code
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-R1 \
+  --attention-backend trtllm_mla \
+  --trust-remote-code
 ```
 
 - TRTLLM MLA with FP8 KV Cache (Higher concurrency, lower memory footprint)
 ```bash
-python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attention-backend trtllm_mla --kv-cache-dtype fp8_e4m3 --trust-remote-code
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-R1 \
+  --attention-backend trtllm_mla \
+  --kv-cache-dtype fp8_e4m3 \
+  --trust-remote-code
 ```
 
 - Ascend
 ```bash
-python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend ascend
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend ascend
 ```
 
 - Wave
 ```bash
-python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend wave
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend wave
 ```
 
 ## Steps to add a new attention backend
