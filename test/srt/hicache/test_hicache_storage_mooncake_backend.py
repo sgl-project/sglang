@@ -33,15 +33,9 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     def setUpClass(cls):
         """Set up test environment and launch Mooncake services before server setup"""
         # Find available ports for Mooncake services to avoid conflicts
-        # cls.mooncake_master_port = (
-        #     HiCacheStorageMooncakeBackendBaseMixin.mooncake_master_port_base
-        # )
         cls.mooncake_master_port = find_available_port(
             HiCacheStorageMooncakeBackendBaseMixin.mooncake_master_port_base
         )
-        # cls.mooncake_metadata_port = (
-        #     HiCacheStorageMooncakeBackendBaseMixin.mooncake_metadata_port_base
-        # )
         cls.mooncake_metadata_port = find_available_port(
             HiCacheStorageMooncakeBackendBaseMixin.mooncake_metadata_port_base
         )
@@ -71,38 +65,28 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
 
         # Start metadata service with configurable port
         try:
-            # Note: The metadata server port is typically configured via environment variable
-            # or command line argument. We'll set the environment variable before starting.
-            metadata_env = os.environ.copy()
-            metadata_env["MOONCAKE_METADATA_PORT"] = str(cls.mooncake_metadata_port)
-
+            # Start metadata server with port configuration
             cls.metadata_service_process = subprocess.Popen(
-                ["python3", "-m", "mooncake.http_metadata_server"],
+                ["python3", "-m", "mooncake.http_metadata_server", "--port", str(cls.mooncake_metadata_port)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 preexec_fn=os.setsid,  # Create new process group
-                env=metadata_env,
             )
-            print("Mooncake metadata service started")
+            print(f"Mooncake metadata service started on port {cls.mooncake_metadata_port}")
         except (FileNotFoundError, subprocess.SubprocessError) as e:
             print(f"Warning: Could not start Mooncake metadata service: {e}")
             cls.metadata_service_process = None
 
         # Start master service with configurable port
         try:
-            # Note: The master service port is typically configured via environment variable
-            # or command line argument. We'll set the environment variable before starting.
-            master_env = os.environ.copy()
-            master_env["MOONCAKE_MASTER_PORT"] = str(cls.mooncake_master_port)
-
+            # Start master server with port configuration
             cls.master_service_process = subprocess.Popen(
-                ["mooncake_master"],
+                ["mooncake_master", "--port", str(cls.mooncake_master_port)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 preexec_fn=os.setsid,  # Create new process group
-                env=master_env,
             )
-            print("Mooncake master service started")
+            print(f"Mooncake master service started on port {cls.mooncake_master_port}")
         except (FileNotFoundError, subprocess.SubprocessError) as e:
             print(f"Warning: Could not start Mooncake master service: {e}")
             cls.master_service_process = None
