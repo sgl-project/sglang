@@ -10,13 +10,13 @@ from typing import Optional
 
 import numpy as np
 import torch
+from sgl_kernel.scalar_type import ScalarType
 
 from sglang.srt.layers.quantization.marlin_utils import (
     GPTQ_MARLIN_TILE,
     marlin_permute_scales,
     marlin_zero_points,
 )
-from sglang.srt.layers.quantization.scalar_type import ScalarType
 from sglang.srt.layers.quantization.utils import (
     get_pack_factor,
     gptq_quantize_weights,

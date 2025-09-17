@@ -1,6 +1,8 @@
 import logging
 
-from sglang.srt.utils import get_bool_env_var, get_device_sm
+import torch
+
+from sglang.srt.utils import get_bool_env_var, get_device_sm, is_blackwell
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +23,5 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-try:
-    from deep_gemm import fp8_gemm_nt
-
-    # They have not given a name to this breaking change
-    DEEPGEMM_BLACKWELL = True
-except ImportError:
-    DEEPGEMM_BLACKWELL = False
-
+DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_blackwell()
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL

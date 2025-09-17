@@ -2,35 +2,36 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    List,
-    NamedTuple,
-    Optional,
-    Protocol,
-    Tuple,
-    Union,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
+from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
+    CombineInput,
+    CombineInputFormat,
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
 from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, load_json_config
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+    is_npu,
+    load_json_config,
+)
+
+_is_npu = is_npu()
 
 try:
     from deep_ep import Buffer, Config
 
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
+    if not _is_npu:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
 
     use_deepep = True
 except ImportError:
@@ -41,11 +42,6 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
-from sglang.srt.layers.moe.ep_moe.kernels import (
-    deepep_permute_triton_kernel,
-    deepep_post_reorder_triton_kernel,
-    deepep_run_moe_deep_preprocess,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -57,13 +53,14 @@ class DeepEPNormalOutput(NamedTuple):
     """DeepEP normal dispatch output."""
 
     hidden_states: torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
+    # hidden_states_scale
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.deepep_normal
+        return DispatchOutputFormat.DEEPEP_NORMAL
 
 
 class DeepEPLLOutput(NamedTuple):
@@ -77,11 +74,35 @@ class DeepEPLLOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.deepep_ll
+        return DispatchOutputFormat.DEEPEP_LL
 
 
 assert isinstance(DeepEPNormalOutput, DispatchOutput)
 assert isinstance(DeepEPLLOutput, DispatchOutput)
+
+
+class DeepEPNormalCombineInput(NamedTuple):
+    """DeepEP normal combine input."""
+
+    pass
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_NORMAL
+
+
+class DeepEPLLCombineInput(NamedTuple):
+    """DeepEP low latency combine input."""
+
+    pass
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_LL
+
+
+assert isinstance(DeepEPNormalCombineInput, CombineInput)
+assert isinstance(DeepEPLLCombineInput, CombineInput)
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -103,8 +124,8 @@ class DeepEPBuffer:
         hidden_size: int,
         param_bytes: int,
         deepep_mode: DeepEPMode,
-        num_max_dispatch_tokens_per_rank: int = None,
-        num_experts: int = None,
+        num_max_dispatch_tokens_per_rank: int = -1,
+        num_experts: int = -1,
     ):
         if cls._buffer is not None:
             return cls._buffer
@@ -131,8 +152,8 @@ class DeepEPBuffer:
                     num_rdma_bytes,
                 )
         if deepep_mode.enable_low_latency():
-            assert num_max_dispatch_tokens_per_rank is not None
-            assert num_experts is not None and num_experts % group.size() == 0
+            assert num_max_dispatch_tokens_per_rank != -1
+            assert num_experts != -1 and num_experts % group.size() == 0
             num_rdma_bytes = max(
                 Buffer.get_low_latency_rdma_size_hint(
                     num_max_dispatch_tokens_per_rank,
@@ -150,19 +171,20 @@ class DeepEPBuffer:
         else:
             raise NotImplementedError
 
-        total_num_sms = torch.cuda.get_device_properties(
-            device="cuda"
-        ).multi_processor_count
-        if (
-            (deepep_mode != DeepEPMode.LOW_LATENCY)
-            and not global_server_args_dict["enable_two_batch_overlap"]
-            and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
-        ):
-            logger.warning(
-                f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. "
-                f"This may result in highly suboptimal performance. "
-                f"Consider using --deepep-config to change the behavior."
-            )
+        if not _is_npu:
+            total_num_sms = torch.cuda.get_device_properties(
+                device="cuda"
+            ).multi_processor_count
+            if (
+                (deepep_mode != DeepEPMode.LOW_LATENCY)
+                and not is_tbo_enabled()
+                and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
+            ):
+                logger.warning(
+                    f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. "
+                    f"This may result in highly suboptimal performance. "
+                    f"Consider using --deepep-config to change the behavior."
+                )
 
         cls._buffer = Buffer(
             group,
@@ -200,7 +222,7 @@ class DeepEPConfig(BaseDispatcherConfig):
     _instance = None
 
     def __init__(self):
-        config_str = global_server_args_dict["deepep_config"]
+        config_str = get_deepep_config()
         if config_str:
             config_parsed = load_json_config(config_str)
             if torch.distributed.get_rank() == 0:
@@ -256,6 +278,9 @@ class _DeepEPDispatcherImplBase:
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
         )
+        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
+        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
+        assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.handle = None
 
@@ -393,7 +418,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            deepep_post_reorder_triton_kernel,
+        )
+
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
@@ -479,7 +508,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=True,
+            # TODO(shuw): pending https://github.com/deepseek-ai/DeepEP/pull/341
+            use_fp8=not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"),
         )
         return (
             hidden_states,
@@ -507,13 +537,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             masked_m
         )
 
-        return DeepEPLLOutput(
+        deepep_output = DeepEPLLOutput(
             hidden_states,
             topk_idx,
             topk_weights,
             masked_m,
             expected_m,
         )
+        return deepep_output
 
     def _dispatch_core(
         self,

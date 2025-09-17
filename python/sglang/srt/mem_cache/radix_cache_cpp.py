@@ -181,7 +181,7 @@ class RadixCacheCpp(BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.req_to_token_pool.free(req.req_pool_idx)
 
-    def cache_unfinished_req(self, req: Req):
+    def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         assert req.req_pool_idx is not None
         token_ids = req.fill_ids

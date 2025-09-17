@@ -17,13 +17,13 @@ jobs:
     runs-on: sgl-kernel-release-node
     strategy:
       matrix:
-        python-version: ['3.9']
-        cuda-version: ['11.8']
+        python-version: ["3.9"]
+        cuda-version: ["11.8"]
 
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5

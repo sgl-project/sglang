@@ -78,6 +78,9 @@ class SchedulerUpdateWeightsMixin:
         if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
+        for tag in tags:
+            self.offload_tags.add(tag)
+
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
@@ -97,6 +100,9 @@ class SchedulerUpdateWeightsMixin:
         if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
+        for tag in tags:
+            self.offload_tags.remove(tag)
+
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
@@ -115,8 +121,15 @@ class SchedulerUpdateWeightsMixin:
         url = params["url"]
 
         worker = self.tp_worker.worker
-
         worker.model_runner.save_remote_model(url)
+
+        if self.draft_worker is not None:
+            draft_url = params.get("draft_url", None)
+            assert (
+                draft_url is not None
+            ), "draft_url must be provided when draft model is enabled"
+            draft_worker = self.draft_worker.worker
+            draft_worker.model_runner.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
         worker = self.tp_worker.worker

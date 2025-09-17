@@ -9,8 +9,8 @@
 /python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy
 /python/sglang/srt/eplb @fzyzcjy
 /python/sglang/srt/function_call @CatherineSue
-/python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock @HaiShaw @ch-wan @BBuf @kushanam
-/python/sglang/srt/lora @Ying1123 @Fridge003
+/python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock @HaiShaw @ch-wan @BBuf @kushanam @Edwardf0t1
+/python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock
@@ -18,3 +18,4 @@
 /python/sglang/srt/speculative @Ying1123 @merrymercy @rkooo567 @kssteven418
 /sgl-kernel @zhyncs @ispobock @HandH1998 @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /sgl-router @slin1237 @ByronHsu
+/test/srt/test_modelopt* @Edwardf0t1

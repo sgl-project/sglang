@@ -60,8 +60,6 @@ class TreeNode:
         self.last_access_time = time.monotonic()
 
         self.hit_count = 0
-        # indicating the node is loading KV cache from host
-        self.loading = False
         # store the host indices of KV cache
         self.host_value = None
 
@@ -464,7 +462,7 @@ class SWARadixCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
 
-    def cache_unfinished_req(self, req: Req) -> None:
+    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[

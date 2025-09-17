@@ -6,17 +6,16 @@
 
 ## Installation
 
-For CUDA 11.8:
-
-```bash
-pip3 install sgl-kernel -i https://docs.sglang.ai/whl/cu118
-```
-
-For CUDA 12.1 or CUDA 12.4:
-
 ```bash
 pip3 install sgl-kernel
 ```
+
+For CUDA 12.4:
+
+```bash
+pip3 install sgl-kernel -i https://docs.sglang.ai/whl/cu124
+```
+
 ## Build from source
 
 Development build:
@@ -52,10 +51,12 @@ See CMakeLists.txt for more options.
 ### Parallel Build
 
 We highly recommend you build sgl-kernel with Ninja. Ninja can automatically build sgl-kernel in parallel.
-And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLEL_LEVEL` for parallel build like:
+And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLEL_LEVEL` and limit the
+nvcc threads to a single thread by setting `SGL_KERNEL_COMPILE_THREADS=1` for parallel build like:
 
 ```bash
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build \
+-Ccmake.define.SGL_KERNEL_COMPILE_THREADS=1 --color=always .
 ```
 
 ### ⚠️ Compilation Issue with `sgl-kernel` and CUDA 12.6
@@ -121,7 +122,7 @@ ptxas --version
 
 ## Development Environment Setup
 
-Use Docker to set up the development environment. See [Docker setup guide](https://github.com/sgl-project/sglang/blob/main/docs/references/development_guide_using_docker.md#setup-docker-container).
+Use Docker to set up the development environment. See [Docker setup guide](https://github.com/sgl-project/sglang/blob/main/docs/developer_guide/development_guide_using_docker.md#setup-docker-container).
 
 Create and enter development container:
 ```bash

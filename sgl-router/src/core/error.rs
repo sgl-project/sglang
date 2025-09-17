@@ -137,8 +137,7 @@ mod tests {
     fn test_worker_result_type_alias() {
         // Test Ok variant
         let result: WorkerResult<i32> = Ok(42);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
+        assert!(matches!(result, Ok(42)));
 
         // Test Err variant
         let error = WorkerError::WorkerNotFound {

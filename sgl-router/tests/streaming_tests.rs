@@ -4,7 +4,7 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{PolicyConfig, RetryConfig, RouterConfig, RoutingMode};
+use sglang_router_rs::config::{RouterConfig, RoutingMode};
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
 
@@ -20,23 +20,10 @@ impl TestContext {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
             port: 3004,
-            max_payload_size: 256 * 1024 * 1024,
-            request_timeout_secs: 600,
             worker_startup_timeout_secs: 1,
             worker_startup_check_interval_secs: 1,
-            dp_aware: false,
-            api_key: None,
-            discovery: None,
-            metrics: None,
-            log_dir: None,
-            log_level: None,
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
+            ..Default::default()
         };
 
         let mut workers = Vec::new();
@@ -56,11 +43,7 @@ impl TestContext {
         config.mode = RoutingMode::Regular { worker_urls };
 
         let app_context = common::create_test_context(config);
-        let router =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
-                .await
-                .unwrap()
-                .unwrap();
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
 
         if !workers.is_empty() {
@@ -98,7 +81,7 @@ impl TestContext {
         let worker_url = &worker_urls[0];
 
         let response = client
-            .post(&format!("{}{}", worker_url, endpoint))
+            .post(format!("{}{}", worker_url, endpoint))
             .json(&body)
             .send()
             .await
@@ -126,8 +109,8 @@ impl TestContext {
             if let Ok(bytes) = chunk {
                 let text = String::from_utf8_lossy(&bytes);
                 for line in text.lines() {
-                    if line.starts_with("data: ") {
-                        events.push(line[6..].to_string());
+                    if let Some(stripped) = line.strip_prefix("data: ") {
+                        events.push(stripped.to_string());
                     }
                 }
             }

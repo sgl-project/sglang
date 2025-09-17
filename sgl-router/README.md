@@ -4,7 +4,7 @@ SGLang router is a standalone Rust module that enables data parallelism across S
 
 ## Documentation
 
-- **User Guide**: [docs.sglang.ai/router/router.html](https://docs.sglang.ai/router/router.html)
+- **User Guide**: [docs.sglang.ai/advanced_features/router.html](https://docs.sglang.ai/advanced_features/router.html)
 
 ## Quick Start
 
@@ -43,7 +43,9 @@ python -m build && pip install --force-reinstall dist/*.whl
 ```
 
 #### Option B: Development Mode
+
 ```bash
+# Currently broken
 pip install -e .
 ```
 
@@ -56,7 +58,21 @@ pip install -e .
 cargo build
 ```
 
-#### Launch Router with Worker URLs in regular mode
+#### Using the Rust Binary Directly (Alternative to Python)
+```bash
+# Build the Rust binary
+cargo build --release
+
+# Launch router with worker URLs in regular mode
+./target/release/sglang-router \
+    --worker-urls http://worker1:8000 http://worker2:8000
+
+# Or use cargo run
+cargo run --release -- \
+    --worker-urls http://worker1:8000 http://worker2:8000
+```
+
+#### Launch Router with Python (Original Method)
 ```bash
 # Launch router with worker URLs
 python -m sglang_router.launch_router \
@@ -68,7 +84,22 @@ python -m sglang_router.launch_router \
 # Note that the prefill and decode URLs must be provided in the following format:
 # http://<ip>:<port> for  decode nodes
 # http://<ip>:<port> bootstrap-port for  prefill nodes, where bootstrap-port is optional
-# Launch router with worker URLs
+
+# Using Rust binary directly
+./target/release/sglang-router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://127.0.0.1:30001 9001 \
+    --prefill http://127.0.0.2:30002 9002 \
+    --prefill http://127.0.0.3:30003 9003 \
+    --prefill http://127.0.0.4:30004 9004 \
+    --decode http://127.0.0.5:30005 \
+    --decode http://127.0.0.6:30006 \
+    --decode http://127.0.0.7:30007 \
+    --host 0.0.0.0 \
+    --port 8080
+
+# Or using Python launcher
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
@@ -115,6 +146,39 @@ python -m sglang_router.launch_router \
     --prometheus-host 0.0.0.0 \
     --prometheus-port 9000
 ```
+
+### Retries and Circuit Breakers
+
+- Retries (regular router) are enabled by default with exponential backoff and jitter. You can tune them via CLI:
+
+```bash
+python -m sglang_router.launch_router \
+  --worker-urls http://localhost:8080 http://localhost:8081 \
+  --retry-max-retries 3 \
+  --retry-initial-backoff-ms 100 \
+  --retry-max-backoff-ms 10000 \
+  --retry-backoff-multiplier 2.0 \
+  --retry-jitter-factor 0.1
+```
+
+- Circuit Breaker defaults protect workers and auto-recover. Tune thresholds/timeouts:
+
+```bash
+python -m sglang_router.launch_router \
+  --worker-urls http://localhost:8080 http://localhost:8081 \
+  --cb-failure-threshold 5 \
+  --cb-success-threshold 2 \
+  --cb-timeout-duration-secs 30 \
+  --cb-window-duration-secs 60
+```
+
+Behavior summary:
+- Closed → Open after N consecutive failures (failure-threshold)
+- Open → HalfOpen after timeout (timeout-duration-secs)
+- HalfOpen → Closed after M consecutive successes (success-threshold)
+- Any failure in HalfOpen reopens immediately
+
+Retry predicate (regular router): retry on 408/429/500/502/503/504, otherwise return immediately. Backoff/jitter observed between attempts.
 
 ### Request ID Tracking
 
@@ -165,6 +229,15 @@ python -m sglang_router.launch_router \
     --service-discovery \
     --prefill-selector app=sglang component=prefill \
     --decode-selector app=sglang component=decode \
+    --service-discovery-namespace sglang-system
+
+# in lws case, such as tp16(1 leader pod, 1 worker pod)
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --service-discovery \
+    --prefill-selector app=sglang component=prefill role=leader\
+    --decode-selector app=sglang component=decode role=leader\
     --service-discovery-namespace sglang-system
 ```
 
@@ -305,6 +378,7 @@ Set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml`:
 The continuous integration pipeline includes comprehensive testing, benchmarking, and publishing:
 
 #### Build & Test
+
 1. **Build Wheels**: Uses `cibuildwheel` for manylinux x86_64 packages
 2. **Build Source Distribution**: Creates source distribution for pip fallback
 3. **Rust HTTP Server Benchmarking**: Performance testing of router overhead
@@ -316,7 +390,6 @@ The continuous integration pipeline includes comprehensive testing, benchmarking
 - **Container Images**: Docker images published using `/docker/Dockerfile.router`
 
 ## Features
-
 - **High Performance**: Rust-based routing with connection pooling and optimized request handling
 - **Advanced Load Balancing**: Multiple algorithms including:
   - **Cache-Aware**: Intelligent routing based on cache locality for optimal performance

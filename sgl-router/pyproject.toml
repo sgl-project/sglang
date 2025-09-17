@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-router"
-version = "0.1.8"
+version = "0.1.9"
 description = "High-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support"
 authors = [{name = "Byron Hsu", email = "byronhsu1230@gmail.com"}]
 requires-python = ">=3.8"
@@ -16,10 +16,19 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
+dependencies = [
+    "setproctitle",
+    "aiohttp",
+    "orjson",
+    "uvicorn",
+    "fastapi",
+]
+
 [project.optional-dependencies]
 dev = [
     "requests>=2.25.0",
 ]
+
 
 # https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
 [tool.setuptools.packages]
@@ -28,8 +37,3 @@ find = { where = ["py_src"] }
 # workaround for https://github.com/pypa/twine/issues/1216
 [tool.setuptools]
 license-files = []
-
-[[tool.setuptools-rust.ext-modules]]
-target = "sglang_router_rs"
-path = "Cargo.toml"
-binding = "PyO3"

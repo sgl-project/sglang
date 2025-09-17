@@ -11,21 +11,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+
+from __future__ import annotations
+
 import json
 import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.distributed
 import torch.nn.functional as F
 
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.model_loader import get_model_architecture
-from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,7 @@ class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     physical_to_logical_map_cpu: torch.Tensor
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
+    logical_to_all_physical_map_cpu: torch.Tensor  # CPU copy for performance
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
@@ -221,6 +227,7 @@ class ExpertLocationMetadata:
             physical_to_logical_map=physical_to_logical_map,
             physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
+            logical_to_all_physical_map_cpu=logical_to_all_physical_map_padded.cpu(),
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             logical_to_rank_dispatch_physical_map=(
                 compute_logical_to_rank_dispatch_physical_map(
@@ -251,6 +258,7 @@ class ExpertLocationMetadata:
             "physical_to_logical_map",
             "physical_to_logical_map_cpu",
             "logical_to_all_physical_map",
+            "logical_to_all_physical_map_cpu",
             "logical_to_all_physical_map_num_valid",
             "logical_to_rank_dispatch_physical_map",
         ]:
@@ -270,9 +278,10 @@ class ExpertLocationMetadata:
     def logical_to_all_physical(
         self, layer_id: int, logical_expert_id: int
     ) -> List[int]:
+        # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
         return [
             physical_expert_id
-            for physical_expert_id in self.logical_to_all_physical_map[
+            for physical_expert_id in self.logical_to_all_physical_map_cpu[
                 layer_id, logical_expert_id
             ].tolist()
             if physical_expert_id != -1
