@@ -52,7 +52,7 @@ def _is_complete_json(input_str: str) -> bool:
     except JSONDecodeError:
         return False
 
-def _get_json_schema_constraint(
+def get_json_schema_constraint(
     tools: List[Tool],
     tool_choice: Union[ToolChoice, Literal["required"]]
 ) -> Optional[dict]:

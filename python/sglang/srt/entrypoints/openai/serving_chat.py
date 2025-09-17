@@ -34,8 +34,8 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.function_call.utils import _get_json_schema_constraint
-from sglang.srt.function_call.json_array_detector import JsonArrayDetector
+from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -190,7 +190,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle JSON schema constraint directly for required or named tool choice
             if request.tool_choice == "required" or isinstance(request.tool_choice, ToolChoice) or (isinstance(request.tool_choice, dict) and "function" in request.tool_choice):
-                json_schema = _get_json_schema_constraint(request.tools, request.tool_choice)
+                json_schema = get_json_schema_constraint(request.tools, request.tool_choice)
                 tool_call_constraint = ("json_schema", json_schema)
             else:
                 tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
@@ -993,8 +993,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in parser_dict:
             # Use JSON detector directly for required or named tool choice
             if request.tool_choice == "required" or isinstance(request.tool_choice, ToolChoice) or (isinstance(request.tool_choice, dict) and "function" in request.tool_choice):
-                # Store JsonArrayDetector directly for JSON schema constraints
-                parser_dict[index] = JsonArrayDetector()
+                # Store JsonArrayParser directly for JSON schema constraints
+                parser_dict[index] = JsonArrayParser()
             else:
                 tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
                 parser_dict[index] = FunctionCallParser(
@@ -1004,8 +1004,8 @@ class OpenAIServingChat(OpenAIServingBase):
         
         parser = parser_dict[index]
 
-        # Handle both FunctionCallParser and JsonArrayDetector
-        if isinstance(parser, JsonArrayDetector):
+        # Handle both FunctionCallParser and JsonArrayParser
+        if isinstance(parser, JsonArrayParser):
             result = parser.parse_streaming_increment(delta, request.tools)
             normal_text, calls = result.normal_text, result.calls
         else:
@@ -1069,7 +1069,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _check_for_unstreamed_tool_args(
         self,
-        parser: Union[FunctionCallParser, JsonArrayDetector],
+        parser: Union[FunctionCallParser, JsonArrayParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         index: int,

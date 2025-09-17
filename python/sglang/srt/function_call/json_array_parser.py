@@ -6,11 +6,11 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 
 
-class JsonArrayDetector(BaseFormatDetector):
+class JsonArrayParser(BaseFormatDetector):
     """
-    Detector for JSON array tool calls when JSON schema constraints are active.
+    Parser for JSON array tool calls when JSON schema constraints are active.
     
-    This detector is used when tool_choice="required" or a specific tool is named,
+    This parser is used when tool_choice="required" or a specific tool is named,
     bypassing model-specific parsers in favor of direct JSON array parsing.
     """
 
@@ -45,7 +45,6 @@ class JsonArrayDetector(BaseFormatDetector):
                 return i
 
         return -1
-
 
     def has_tool_call(self, text: str) -> bool:
         """
