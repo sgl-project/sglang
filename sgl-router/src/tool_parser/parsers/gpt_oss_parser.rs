@@ -282,7 +282,7 @@ More text"#;
     }
 
     #[tokio::test]
-    async fn test_parse_gpt_oss_dahs_name() {
+    async fn test_parse_gpt_oss_dash_name() {
         let parser = GptOssParser::new();
         let input =
             r#"<|channel|>commentary to=functions.vendor-name_test<|constrain|>json<|message|>{"key": "value"}<|call|>"#;
