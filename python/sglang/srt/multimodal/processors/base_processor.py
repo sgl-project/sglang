@@ -311,7 +311,7 @@ class BaseMultimodalProcessor(ABC):
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:"):]
+                path = image[len("video:") :]
                 # Estimate frames for the video
                 vr = VideoReader(path, ctx=cpu(0))
                 num_frames = len(vr)
@@ -429,6 +429,51 @@ class BaseMultimodalProcessor(ABC):
 
         return futures, task_info
 
+    @staticmethod
+    def _validate_one_modality(modality: Modality, data_list: Optional[list]):
+        if data_list is None:
+            return
+        if not isinstance(data_list, list):
+            raise TypeError(f"{modality} must be a list or None, got {type(data_list)}")
+
+        formatted_indices = []
+        for idx, item in enumerate(data_list):
+            if isinstance(item, dict):
+                fmt = item.get("format")
+                if fmt in {"processor_output", "precomputed_embedding"}:
+                    formatted_indices.append(idx)
+
+        if formatted_indices:
+            if len(data_list) != 1:
+                raise ValueError(
+                    f"For {modality}, when providing a 'processor_output' or "
+                    f"'precomputed_embedding', you must pass exactly one item; "
+                    f"received {len(data_list)} items (formatted at indices {formatted_indices})."
+                )
+
+    @staticmethod
+    def validate_mm_data(
+        self,
+        image_data: Optional[list] = None,
+        video_data: Optional[list] = None,
+        audio_data: Optional[list] = None,
+    ):
+        """
+        Validate multimodal input lists per modality.
+
+        Rule per modality (image/video/audio):
+        - Either the list has exactly one item and that single item is a dict with
+          format in {"processor_output", "precomputed_embedding"};
+        - Or, the list contains only "normal" items (i.e., does not include any
+          item whose format is one of the two above).
+
+        Empty or None lists are considered valid.
+        """
+
+        BaseMultimodalProcessor._validate_one_modality(Modality.IMAGE, image_data)
+        BaseMultimodalProcessor._validate_one_modality(Modality.VIDEO, video_data)
+        BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
+
     def load_mm_data(
         self,
         prompt: str,
@@ -449,6 +494,9 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
+
+        BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
+
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
@@ -687,12 +735,13 @@ class BaseMultimodalProcessor(ABC):
 
         # Handle dict items (processed or precomputed)
         for modality, dict_item in dict_items:
-            if dict_item.get("format", None) == "processor_output":
+            input_format = dict_item.get("format", None)
+            if input_format == "processor_output":
                 items = self.collect_mm_items_from_processor_output(dict_item)
                 for item in items:
                     item.format = MultimodalInputFormat.PROCESSOR_OUTPUT
                 all_collected_items.extend(items)
-            elif dict_item.get("format", None) == "precomputed_embedding":
+            elif input_format == "precomputed_embedding":
                 feature = dict_item["feature"]
                 del dict_item["feature"]
                 all_collected_items.append(
