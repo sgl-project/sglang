@@ -349,15 +349,15 @@ def get_report_summary(
     rows = []
 
     for (
-            batch_size,
-            latency,
-            ttft,
-            input_throughput,
-            output_throughput,
-            _,
-            _,
-            acc_length,
-            trace_link,
+        batch_size,
+        latency,
+        ttft,
+        input_throughput,
+        output_throughput,
+        _,
+        _,
+        acc_length,
+        trace_link,
     ) in result:
         if is_blackwell():
             hourly_cost_per_gpu = 4  # $4/hour for one B200
