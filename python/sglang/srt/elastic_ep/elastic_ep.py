@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from threading import Lock
 from typing import Optional
 
 import torch
