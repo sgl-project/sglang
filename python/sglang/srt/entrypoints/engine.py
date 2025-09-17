@@ -33,6 +33,8 @@ import zmq
 import zmq.asyncio
 from PIL.Image import Image
 
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -137,6 +139,12 @@ class Engine(EngineBase):
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
+
+        if server_args.enable_trace:
+            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+            if server_args.disaggregation_mode == "null":
+                thread_label = "Tokenizer"
+                trace_set_thread_info(thread_label)
 
     def generate(
         self,
@@ -364,9 +372,9 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
-    def start_profile(self):
+    def start_profile(self, **kwargs):
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.start_profile())
+        loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
 
     def stop_profile(self):
         loop = asyncio.get_event_loop()
@@ -682,7 +690,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.8",
+            "0.3.9.post2",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

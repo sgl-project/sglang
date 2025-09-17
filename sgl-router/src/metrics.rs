@@ -143,6 +143,18 @@ pub fn init_metrics() {
         "Generate request duration"
     );
 
+    // Embedding request specific metrics
+    describe_counter!("sgl_router_embeddings_total", "Total embedding requests");
+    describe_histogram!(
+        "sgl_router_embeddings_duration_seconds",
+        "Embedding request duration"
+    );
+    describe_counter!(
+        "sgl_router_embeddings_errors_total",
+        "Embedding request errors"
+    );
+    describe_gauge!("sgl_router_embeddings_queue_size", "Embedding queue size");
+
     // Running requests gauge for cache-aware policy
     describe_gauge!(
         "sgl_router_running_requests",
@@ -438,6 +450,27 @@ impl RouterMetrics {
     // Generate request metrics
     pub fn record_generate_duration(duration: Duration) {
         histogram!("sgl_router_generate_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    // Embeddings metrics
+    pub fn record_embeddings_request() {
+        counter!("sgl_router_embeddings_total").increment(1);
+    }
+
+    pub fn record_embeddings_duration(duration: Duration) {
+        histogram!("sgl_router_embeddings_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    pub fn record_embeddings_error(error_type: &str) {
+        counter!(
+            "sgl_router_embeddings_errors_total",
+            "error_type" => error_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn set_embeddings_queue_size(size: usize) {
+        gauge!("sgl_router_embeddings_queue_size").set(size as f64);
     }
 
     // Running requests for cache-aware policy

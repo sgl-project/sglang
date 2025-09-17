@@ -377,6 +377,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
+                    dataset_path=bench_args.dataset_path,
                 )
             )
 
@@ -402,6 +403,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 profile=bench_args.profile,
                                 profile_steps=bench_args.profile_steps,
                                 profile_by_stage=bench_args.profile_by_stage,
+                                dataset_path=bench_args.dataset_path,
                             )[-1],
                         )
                     )
