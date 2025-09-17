@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
@@ -60,29 +59,7 @@ class SchedulerMetricsMixin:
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
-            self.metrics_collector = SchedulerMetricsCollector(
-                labels=labels,
-                bucket_eviction_duration=self.get_histogram_conf_from_env(
-                    "SGLANG_BUCKET_EVICTION_DURATION"
-                ),
-                bucket_load_back_duration=self.get_histogram_conf_from_env(
-                    "SGLANG_BUCKET_LOAD_BACK_DURATION"
-                ),
-                bucket_chunked_prefill_loop_count=self.get_histogram_conf_from_env(
-                    "SGLANG_BUCKET_CHUNKED_PREFILL_LOOP_COUNT"
-                ),
-            )
-
-    def get_histogram_conf_from_env(
-        self: Scheduler, env_var_name: str
-    ) -> Optional[List[float]]:
-        # env should be like "0.1,0.2,0.5,1,2"
-        if env_var_name in os.environ:
-            return None
-        env_var_value = os.environ[env_var_name]
-        if not env_var_value:
-            return None
-        return [float(x) for x in env_var_value.split(",")]
+            self.metrics_collector = SchedulerMetricsCollector(labels=labels)
 
     def init_dp_balance(self: Scheduler, dp_balance_meta: Optional[DPBalanceMeta]):
         self.balance_meta = dp_balance_meta

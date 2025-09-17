@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -22,6 +23,20 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+
+
+def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
+    """
+    Get the histogram configuration from the environment variable.
+    env value should be like "0.1,0.2,0.5,1,2"
+    """
+    if env_var_name not in os.environ:
+        return None
+    # if the env var is not set or empty, return None
+    env_var_value = os.environ[env_var_name]
+    if not env_var_value:
+        return None
+    return [float(x) for x in env_var_value.split(",")]
 
 
 @dataclass
@@ -179,9 +194,6 @@ class SchedulerMetricsCollector:
     def __init__(
         self,
         labels: Dict[str, str],
-        bucket_eviction_duration: Optional[List[float]] = None,
-        bucket_load_back_duration: Optional[List[float]] = None,
-        bucket_chunked_prefill_loop_count: Optional[List[float]] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Gauge, Histogram
@@ -535,6 +547,9 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        bucket_eviction_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_EVICTION_DURATION"
+        )
         if bucket_eviction_duration is None:
             bucket_eviction_duration = [
                 0.001,
@@ -556,6 +571,9 @@ class SchedulerMetricsCollector:
                 0.5,
                 1.0,
             ]
+        bucket_load_back_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_LOAD_BACK_DURATION"
+        )
         if bucket_load_back_duration is None:
             bucket_load_back_duration = [
                 0.001,
@@ -577,6 +595,9 @@ class SchedulerMetricsCollector:
                 0.5,
                 1.0,
             ]
+        bucket_chunked_prefill_loop_count = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_CHUNKED_PREFILL_LOOP_COUNT"
+        )
         if bucket_chunked_prefill_loop_count is None:
             bucket_chunked_prefill_loop_count = [
                 1,
