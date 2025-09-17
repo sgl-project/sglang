@@ -170,6 +170,10 @@ void downcast_fp8(
     int64_t offset,
     int64_t cuda_stream);
 
+void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
+void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
+void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
+
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
@@ -207,17 +211,23 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Dtype& out_dtype);
 void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
-void sgl_per_token_group_quant_8bit(
+void sgl_per_token_group_quant_fp8(
     at::Tensor input,
     at::Tensor output_q,
     at::Tensor output_s,
     int64_t group_size,
     double eps,
-    double min_8bit,
-    double max_8bit,
-    bool scale_ue8m0,
-    bool fuse_silu_and_mul,
-    const std::optional<torch::Tensor>& masked_m);
+    double fp8_min,
+    double fp8_max,
+    bool scale_ue8m0);
+void sgl_per_token_group_quant_int8(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double int8_min,
+    double int8_max);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void bmm_fp8(
@@ -569,6 +579,21 @@ void transfer_kv_direct(
     const at::Tensor dst_indices,
     int64_t page_size);
 
+void transfer_kv_per_layer_direct_pf_lf(
+    const std::vector<at::Tensor>& src_ptrs,
+    std::vector<at::Tensor> dst_ptrs,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t page_size);
+
+void transfer_kv_all_layer_direct_lf_pf(
+    const std::vector<at::Tensor>& src_ptrs,
+    std::vector<at::Tensor> dst_ptrs,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t page_size);
+
 /*
  * From FlashInfer
  */
@@ -722,4 +747,26 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
  */
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
 
-void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
+/*
+ * From csrc/mamba
+ */
+void causal_conv1d_update(
+    const at::Tensor& x,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens_,
+    const std::optional<at::Tensor>& conv_state_indices_,
+    int64_t pad_slot_id);
+
+void causal_conv1d_fwd(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id);

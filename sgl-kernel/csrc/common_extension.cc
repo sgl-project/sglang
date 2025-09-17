@@ -99,6 +99,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "mult, int offset, int cuda_stream) -> ()");
   m.impl("downcast_fp8", torch::kCUDA, &downcast_fp8);
 
+  m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
+  m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
+  m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
+  m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
+
+  m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
+  m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
+
   /*
    * From csrc/gemm
    */
@@ -121,9 +129,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fp8_blockwise_scaled_mm", torch::kCUDA, &fp8_blockwise_scaled_mm);
 
   m.def(
-      "sgl_per_token_group_quant_8bit(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
-      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
-  m.impl("sgl_per_token_group_quant_8bit", torch::kCUDA, &sgl_per_token_group_quant_8bit);
+      "sgl_per_token_group_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
+  m.impl("sgl_per_token_group_quant_fp8", torch::kCUDA, &sgl_per_token_group_quant_fp8);
+
+  m.def(
+      "sgl_per_token_group_quant_int8(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      " float eps, float int8_min, float int8_max) -> ()");
+  m.impl("sgl_per_token_group_quant_int8", torch::kCUDA, &sgl_per_token_group_quant_int8);
 
   m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kCUDA, &sgl_per_tensor_quant_fp8);
@@ -331,6 +344,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");
   m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);
+  m.def(
+      "transfer_kv_per_layer_direct_pf_lf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
+      "Tensor dst_indices, int layer_id, int page_size)->() ");
+  m.impl("transfer_kv_per_layer_direct_pf_lf", torch::kCUDA, &transfer_kv_per_layer_direct_pf_lf);
+  m.def(
+      "transfer_kv_all_layer_direct_lf_pf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
+      "Tensor dst_indices, int page_size) ->() ");
+  m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
 
   /*
    * From csrc/memory
@@ -434,8 +455,30 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor _ascales, Tensor! _out_feats) -> ()");
   m.impl("qserve_w4a8_per_group_gemm", torch::kCUDA, &qserve_w4a8_per_group_gemm);
 
-  m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
-  m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
+  /*
+   * From csrc/mamba
+   */
+  m.def(
+      "causal_conv1d_update(Tensor! x,"
+      "Tensor! conv_state,"
+      "Tensor! weight,"
+      "Tensor? bias_,"
+      "bool silu_activation,"
+      "Tensor? cache_seqlens_,"
+      "Tensor? conv_state_indices,"
+      "int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_update", torch::kCUDA, &causal_conv1d_update);
+
+  m.def(
+      "causal_conv1d_fwd(Tensor! x, Tensor! weight,"
+      "Tensor? bias_,"
+      "Tensor!? conv_states,"
+      "Tensor? query_start_loc,"
+      "Tensor? cache_indices,"
+      "Tensor? has_initial_state,"
+      "bool silu_activation,"
+      "int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
 }
 
 REGISTER_EXTENSION(common_ops)

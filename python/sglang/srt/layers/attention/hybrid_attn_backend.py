@@ -21,6 +21,7 @@ class HybridAttnBackend(AttentionBackend):
         self.model_runner = model_runner
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+        self.data_type = model_runner.kv_cache_dtype
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
@@ -34,7 +35,7 @@ class HybridAttnBackend(AttentionBackend):
 
         Note:
             - decode_or_idle: Always uses decode backend
-            - target_verify or draft_extend: Uses decode backend if speculative_attention_backend is "decode", otherwise prefill backend
+            - target_verify or draft_extend: Uses decode backend if speculative_attention_mode is "decode", otherwise prefill backend
             - prefill: Always uses prefill backend
         """
         if forward_mode.is_decode_or_idle():
@@ -42,8 +43,7 @@ class HybridAttnBackend(AttentionBackend):
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
             return (
                 self.decode_backend
-                if self.model_runner.server_args.speculative_attention_backend
-                == "decode"
+                if self.model_runner.server_args.speculative_attention_mode == "decode"
                 else self.prefill_backend
             )
         else:
@@ -57,7 +57,7 @@ class HybridAttnBackend(AttentionBackend):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
         if (
             self.model_runner.server_args.speculative_algorithm is not None
-            and self.model_runner.server_args.speculative_attention_backend == "prefill"
+            and self.model_runner.server_args.speculative_attention_mode == "prefill"
         ):
             # When speculative decoding is enabled, we need to initialize the backend
             # that will be used for target_verify.

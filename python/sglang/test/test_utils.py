@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Awaitable, Callable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
@@ -42,7 +42,8 @@ DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
+DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
+DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
@@ -51,6 +52,9 @@ DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
+
+# NVFP4 models
+DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-R1-0528-FP4"
 
 # FP8 models
 DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
@@ -1383,6 +1387,41 @@ async def send_concurrent_generate_requests(
                 return response.status
 
     tasks = [asyncio.create_task(async_generate()) for _ in range(num_requests)]
+    return await asyncio.gather(*tasks)
+
+
+async def send_concurrent_generate_requests_with_custom_params(
+    base_url: str,
+    custom_params: List[dict[str, Any]],
+) -> Tuple[int, Any]:
+    """Sends generate request concurrently with custom parameters and returns status code and response json tuple. Max concurrency is num_requests."""
+
+    base_payload = {
+        "text": """
+                System: You are a helpful assistant.
+                User: What is the capital of France?
+                Assistant: The capital of France is
+                """,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 50,
+        },
+    }
+
+    async def async_generate_with_priority(req):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base_url}/generate",
+                json=req,
+            ) as response:
+                resp_json = await response.json()
+                return (response.status, resp_json)
+
+    tasks = []
+    for c in custom_params:
+        req = base_payload.copy()
+        req.update(c)
+        tasks.append(asyncio.create_task(async_generate_with_priority(req)))
     return await asyncio.gather(*tasks)
 
 
