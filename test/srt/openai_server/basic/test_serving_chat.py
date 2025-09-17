@@ -354,11 +354,12 @@ class ServingChatTestCase(unittest.TestCase):
                 {"type": "function", "function": {"name": "get_weather"}},
             ]
 
-            tool_calls, remaining_text, _ = self.chat._process_tool_calls(
+            result = self.chat._process_tool_calls(
                 text="<|tool_calls_section_begin|>...",
                 tools=tools,
                 finish_reason=finish_reason,
             )
+            tool_calls, remaining_text = result.tool_calls, result.remaining_text
 
             self.assertIsNotNone(tool_calls)
             self.assertEqual(len(tool_calls), 1)
