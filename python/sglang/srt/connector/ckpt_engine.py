@@ -3,7 +3,8 @@
 import json
 import logging
 import subprocess
-from typing import Callable, Generator, List, Optional, Tuple, TypedDict
+from collections import OrderedDict
+from typing import Callable, Dict, Generator, List, Optional, Tuple, TypedDict
 from urllib.parse import urlparse
 
 import torch
@@ -54,29 +55,6 @@ class FlattenedTensorMetadata(TypedDict):
     offset: int
 
 
-def _extract_weights(
-    payload: list[FlattenedTensorMetadata], buffer: torch.Tensor
-) -> list[tuple[str, torch.Tensor]]:
-    """
-    Extracts individual weight tensors from a shared buffer using metadata.
-    """
-    assert buffer is not None
-    weights: list[tuple[str, torch.Tensor]] = []
-    for item in payload:
-        shape = torch.Size(item["shape"])
-        dtype, offset = item["dtype"], item["offset"]
-
-        # Calculate the size in bytes to slice the buffer.
-        size = dtype.itemsize * shape.numel()
-
-        # Slice the buffer, cast to the correct data type, and reshape.
-        tensor_data = buffer[offset : offset + size]
-        tensor = tensor_data.view(dtype=dtype).view(shape)
-
-        weights.append((item["name"], tensor))
-    return weights
-
-
 class CkptEngineConnector(BaseConnector):
 
     def __init__(self, url: str, device: torch.device = "cpu"):
@@ -89,6 +67,8 @@ class CkptEngineConnector(BaseConnector):
         self.socket = None
         self.buffer: Optional[torch.Tensor] = None
         self.local_rank = None
+        self.final_state_dict = OrderedDict()
+        self.pending_weights: Dict[str, torch.Tensor] = {}
 
     def get_zmq_handle(self, tp_rank: int):
         # FIXME: There needs a local rank
@@ -130,6 +110,50 @@ class CkptEngineConnector(BaseConnector):
     ) -> None:
         return
 
+    def _merge_and_store(self, gate_key, gate_tensor, up_key, up_tensor):
+        new_key = gate_key.replace("gate_proj", "gate_up_proj")
+        merged_tensor = torch.cat([gate_tensor, up_tensor], dim=0)
+        self.final_state_dict[new_key] = merged_tensor
+
+    def _extract_weights(
+        self, payload: list[FlattenedTensorMetadata], buffer: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
+        """
+        Extracts individual weight tensors from a shared buffer using metadata.
+        """
+        assert buffer is not None
+        weights: list[tuple[str, torch.Tensor]] = []
+        for item in payload:
+            shape = torch.Size(item["shape"])
+            dtype, offset = item["dtype"], item["offset"]
+
+            # Calculate the size in bytes to slice the buffer.
+            size = dtype.itemsize * shape.numel()
+
+            # Slice the buffer, cast to the correct data type, and reshape.
+            tensor_data = buffer[offset : offset + size]
+            tensor = tensor_data.view(dtype=dtype).view(shape)
+
+            if "mlp.gate_proj.weight" in item["name"]:
+                up_key = item["name"].replace("gate_proj", "up_proj")
+                if up_key in self.pending_weights:
+                    up_tensor = self.pending_weights.pop(up_key)
+                    self._merge_and_store(item["name"], tensor, up_key, up_tensor)
+                else:
+                    self.pending_weights[item["name"]] = tensor
+
+            elif "mlp.up_proj.weight" in item["name"]:
+                gate_key = item["name"].replace("up_proj", "gate_proj")
+                if gate_key in self.pending_weights:
+                    gate_tensor = self.pending_weights.pop(gate_key)
+                    self._merge_and_store(gate_key, gate_tensor, item["name"], tensor)
+                else:
+                    self.pending_weights[item["name"]] = tensor
+
+            else:
+                weights.append((item["name"], tensor))
+        return weights
+
     # Implemented as a no-op to make BaseConnector interface consistent.
     def weight_iterator(
         self, rank: int = 0
@@ -156,9 +180,12 @@ class CkptEngineConnector(BaseConnector):
 
             # Extract and yield all weights from the current payload.
             # The 'for' loop iterates over the list returned by _extract_weights.
-            for key, tensor in _extract_weights(payload, buffer):
+            for key, tensor in self._extract_weights(payload, buffer):
                 yield key, tensor
 
             # Acknowledge receipt of this batch
             torch.cuda.synchronize()
             self.socket.send(b"")
+
+        for key, tensor in self.final_state_dict.items():
+            yield key, tensor

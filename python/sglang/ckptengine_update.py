@@ -69,7 +69,7 @@ def split_tensors(
     return named_tensors
 
 
-def req_inference(endpoint: str, inference_parallel_size: int):
+def req_inference(inference_parallel_size: int):
     rank = int(os.getenv("RANK", None))
     src = rank // inference_parallel_size * inference_parallel_size
 
@@ -151,7 +151,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     rank = int(os.getenv("RANK"))
     world_size = int(os.getenv("WORLD_SIZE"))
-    req_func = req_inference(args.endpoint, args.inference_parallel_size)
+    req_func = req_inference(args.inference_parallel_size)
     ps = ParameterServer(auto_pg=True)
     if args.load_metas_file:
         join(
