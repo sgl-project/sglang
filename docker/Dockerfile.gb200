@@ -1,7 +1,8 @@
 ARG CUDA_VERSION=12.9.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
 
-ARG BUILD_TYPE=blackwell
+ARG BUILD_TYPE=blackwell_aarch64
+ARG BRANCH_TYPE=remote
 ARG DEEPEP_COMMIT=1b14ad661c7640137fcfe93cccb2694ede1220b0
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 ARG SGL_KERNEL_VERSION=0.3.10
@@ -62,10 +63,21 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
 # Fix DeepEP IBGDA symlink
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
-# Clone and install SGLang
+FROM scratch AS local_src
+COPY . /src
+
+FROM base AS build-image
+# Install SGLang
 WORKDIR /sgl-workspace
+ARG BRANCH_TYPE
+COPY --from=local_src /src /tmp/local_src
+RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+        cp -r /tmp/local_src /sgl-workspace/sglang; \
+    else \
+        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    fi \
+ && rm -rf /tmp/local_src
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
- && git clone --depth 1 https://github.com/sgl-project/sglang.git \
  && cd sglang \
  && case "$CUDA_VERSION" in \
       12.9.1) CUINDEX=129 ;; \
