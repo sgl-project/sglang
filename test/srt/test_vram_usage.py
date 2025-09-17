@@ -96,7 +96,7 @@ class TestVRAMUsageBenchServing(CustomTestCase):
             if process.poll() is None:
                 process.kill()
 
-        # Step 3: assert the VRAM usage increase is less than 4 GiB
+        # Step 3: assert the VRAM usage increase is less than 5 GiB
         increase_gb = peak_used_gb - before_used_gb
         self.assertLess(
             increase_gb,
