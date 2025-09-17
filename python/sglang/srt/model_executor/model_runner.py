@@ -516,6 +516,7 @@ class ModelRunner:
                     "aiter",
                     "flashinfer",
                     "fa3",
+                    "fa4",
                     "triton",
                     "flashmla",
                     "cutlass_mla",
@@ -563,18 +564,6 @@ class ModelRunner:
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
 
-        # TODO(kaixih@nvidia): remove this once we have a better solution for DP attention.
-        #  For more details, see: https://github.com/sgl-project/sglang/issues/8616
-        elif (
-            self.dp_size > 1
-            and is_sm100_supported()
-            and server_args.attention_backend != "triton"
-            and server_args.attention_backend == "trtllm_mla"
-        ):
-            logger.info(
-                "Disable chunked prefix cache when dp size > 1 and attention backend is not triton."
-            )
-            server_args.disable_chunked_prefix_cache = True
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
 
@@ -1806,6 +1795,15 @@ class ModelRunner:
             )
 
             return FlashAttentionBackend(self)
+        elif backend_str == "fa4":
+            assert (
+                self.use_mla_backend
+            ), "FlashAttention v4 Support is at an early stage, only MLA model supported now"
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            return FlashAttentionBackend(self, fa_impl_ver=4)
         elif backend_str == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
