@@ -44,7 +44,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
-    AscendFusedMLAPreprocess,
+    NPUFusedMLAPreprocess,
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.communicator import (
@@ -1235,7 +1235,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         elif attn_forward_method == AttnForwardMethod.MLA:
             if is_mla_preprocess_enabled():
                 if not self.mla_preprocess:
-                    self.mla_preprocess = AscendFusedMLAPreprocess(
+                    self.mla_preprocess = NPUFusedMLAPreprocess(
                         self.fused_qkv_a_proj_with_mqa,
                         self.q_a_layernorm,
                         self.kv_a_layernorm,

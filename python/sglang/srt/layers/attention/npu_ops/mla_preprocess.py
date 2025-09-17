@@ -46,7 +46,7 @@ def trans_rope_weight(weight, rope_dim):
     return weight.contiguous()
 
 
-class AscendFusedMLAPreprocess(torch.nn.Module):
+class NPUFusedMLAPreprocess(torch.nn.Module):
     def __init__(
         self,
         fused_qkv_a_proj_with_mqa,
