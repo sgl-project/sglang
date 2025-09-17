@@ -82,7 +82,6 @@ class TestVRAMUsageBenchServing(CustomTestCase):
         try:
             while process.poll() is None:
                 peak_used_gb = max(peak_used_gb, get_vram_used_gb())
-                # INSERT_YOUR_CODE
                 time.sleep(1.0)
             # Take one more measurement after process exits
             peak_used_gb = max(peak_used_gb, get_vram_used_gb())
