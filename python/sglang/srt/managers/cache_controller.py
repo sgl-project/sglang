@@ -250,7 +250,6 @@ class HiCacheController:
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
-        backup_skip: Operation[bool] = False,
         storage_backend_extra_config: Optional[str] = None,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -274,7 +273,7 @@ class HiCacheController:
                 self.storage_config.is_mla_model
                 # todo: load balancing
                 and self.storage_config.tp_rank != 0
-            ) or backup_skip
+            )
 
             if storage_backend == "file":
                 from sglang.srt.mem_cache.hicache_storage import HiCacheFile

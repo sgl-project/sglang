@@ -324,7 +324,6 @@ class ServerArgs:
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
-    hicache_backup_skip: bool = False,
     hicache_storage_backend_extra_config: Optional[str] = None
     # LMCache
     enable_lmcache: bool = False
@@ -1934,12 +1933,6 @@ class ServerArgs:
             choices=["best_effort", "wait_complete", "timeout"],
             default=ServerArgs.hicache_storage_prefetch_policy,
             help="Control when prefetching from the storage backend should stop.",
-        )
-        parser.add_argument(
-            "--hicache-backup-skip",
-            action="store_true",
-            default=ServerArgs.hicache_backup_skip,
-            help="HiCache skips kv backup, get kv only mode.",
         )
         parser.add_argument(
             "--hicache-storage-backend-extra-config",
