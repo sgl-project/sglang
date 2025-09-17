@@ -10,8 +10,8 @@ import dataclasses
 import json
 import os
 import random
+from typing import List
 
-import numpy as np
 import requests
 
 PROMPT_1 = "Tell me about Richard Feynman: "
@@ -55,7 +55,7 @@ class BenchArgs:
             "--test-mode",
             type=str,
             default=BenchArgs.test_mode,
-            choices=["single", "mixed"],
+            choices=["single", "mixed", "prefix"],
         )
 
     @classmethod
@@ -147,6 +147,45 @@ def send_mixed(args, batch_size: int):
     return prompt_1_ret, prompt_2_ret, long_prompt_ret
 
 
+def send_prefix(args, batch_size: int, prompts: List[str]):
+    requests.post(f"http://{args.host}:{args.port}/flush_cache")
+
+    batch_data = []
+    sampled_indices = []
+    for _ in range(batch_size):
+        sampled_index = random.randint(0, len(prompts) - 1)
+        sampled_indices.append(sampled_index)
+        batch_data.append(prompts[sampled_index])
+
+    json_data = {
+        "text": batch_data,
+        "sampling_params": {
+            "temperature": args.temperature,
+            "max_new_tokens": args.max_new_tokens,
+            "frequency_penalty": args.frequency_penalty,
+            "presence_penalty": args.presence_penalty,
+        },
+        "return_logprob": args.return_logprob,
+        "stream": args.stream,
+    }
+
+    response = requests.post(
+        f"http://{args.host}:{args.port}/generate",
+        json=json_data,
+        stream=args.stream,
+    )
+    ret = response.json()
+    if response.status_code != 200:
+        print(ret)
+        return -1, -1, -1
+
+    ret_dict = {i: [] for i in range(len(prompts))}
+    for i in range(batch_size):
+        ret_dict[sampled_indices[i]].append(ret[i]["text"])
+
+    return ret_dict
+
+
 def test_deterministic(args):
     # First do some warmups
     for i in range(3):
@@ -188,6 +227,27 @@ def test_deterministic(args):
         print(
             f"Long prompt: total samples: {len(output_long_prompt)}, Unique samples: {len(set(output_long_prompt))}"
         )
+
+    elif args.test_mode == "prefix":
+        # In prefix mode, we create prompts from the same long prompt, with different lengths of common prefix.
+        len_prefix = [1, 511, 2048, 4097]
+        num_prompts = len(len_prefix)
+        outputs = {i: [] for i in range(4)}
+        prompts = [LONG_PROMPT[: len_prefix[i]] for i in range(4)]
+        for i in range(1, args.n_trials + 1):
+            batch_size = i
+            ret_dict = send_prefix(args, batch_size, prompts)
+            msg = f"Testing Trial {i} with batch size {batch_size},"
+            for i in range(num_prompts):
+                msg += f" # prefix length {len_prefix[i]}: {len(ret_dict[i])},"
+            print(msg)
+            for i in range(num_prompts):
+                outputs[i].extend(ret_dict[i])
+
+        for i in range(num_prompts):
+            print(
+                f"Prompt {i} with prefix length {len_prefix[i]}: total samples: {len(outputs[i])}, Unique samples: {len(set(outputs[i]))}"
+            )
 
     else:
         raise ValueError(f"Invalid test mode: {args.test_mode}")
