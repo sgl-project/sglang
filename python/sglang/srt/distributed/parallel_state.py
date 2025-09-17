@@ -64,6 +64,9 @@ class GraphCaptureContext:
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+# use int value instead of ReduceOp.SUM to support torch compile
+REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
+
 
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]]
@@ -489,9 +492,7 @@ class GroupCoordinator:
 
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
-                torch.ops.sgl_kernel.shm_allreduce(
-                    input_, torch.distributed.ReduceOp.SUM
-                )
+                torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
@@ -1584,6 +1585,16 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
         # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
+
+
+def get_world_size():
+    """Return world size for the world group."""
+    return get_world_group().world_size
+
+
+def get_world_rank():
+    """Return my rank for the world group."""
+    return get_world_group().rank_in_group
 
 
 def get_tensor_model_parallel_world_size():

@@ -63,10 +63,7 @@ impl ServerHandler for MockSearchServer {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "Mock MCP Server".to_string(),
-                version: "1.0.0".to_string(),
-            },
+            server_info: Implementation::from_build_env(),
             instructions: Some("Mock server for testing".to_string()),
         }
     }

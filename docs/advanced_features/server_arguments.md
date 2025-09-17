@@ -43,10 +43,20 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
   ```bash
   # Node 0
-  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --dist-init-addr sgl-dev-0:50000 --nnodes 2 --node-rank 0
+  python -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+    --tp 4 \
+    --dist-init-addr sgl-dev-0:50000 \
+    --nnodes 2 \
+    --node-rank 0
 
   # Node 1
-  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --dist-init-addr sgl-dev-0:50000 --nnodes 2 --node-rank 1
+  python -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+    --tp 4 \
+    --dist-init-addr sgl-dev-0:50000 \
+    --nnodes 2 \
+    --node-rank 1
   ```
 
 Please consult the documentation below and [server_args.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py) to learn more about the arguments you may provide when launching a server.
@@ -209,6 +219,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-accept-threshold-single` | Accept a draft token if its probability in the target model is greater than this threshold. | 1.0 |
 | `--speculative-accept-threshold-acc` | The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc). | 1.0 |
 | `--speculative-token-map` | The path of the draft model's small vocab table. | None |
+| `--speculative-attention-mode` | Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'. | Prefill |
 
 ## Expert parallelism
 

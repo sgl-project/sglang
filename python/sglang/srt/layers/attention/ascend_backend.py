@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.ascend_ops.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_bool_env_var
@@ -36,6 +37,7 @@ class ForwardMetadata:
     extend_seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_list: Optional[List[int]] = None
+    seq_lens_list_cumsum: Optional[List[int]] = None
 
 
 class AscendAttnBackend(AttentionBackend):
@@ -86,6 +88,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        tp_size = get_attention_tp_size()
         self.forward_metadata = ForwardMetadata()
 
         self.forward_metadata.block_tables = (
@@ -99,9 +102,13 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.cpu().int()
             )
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
-        self.forward_metadata.seq_lens_list_cumsum = np.cumsum(
-            forward_batch.extend_seq_lens_cpu
-        )
+
+        seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
+        if forward_batch.is_extend_in_batch:
+            seq_lens_list_cumsum[-1] = (
+                (seq_lens_list_cumsum[-1] - 1) // tp_size + 1
+            ) * tp_size
+        self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
         self.graph_mode = False
 
@@ -371,7 +378,7 @@ class AscendAttnBackend(AttentionBackend):
                 -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
             )
 
-            q_nope = q.view(-1, layer.tp_q_head_num, 1, self.kv_lora_rank)
+            q_nope = q.view(-1, layer.tp_q_head_num, 1, self.kv_lora_rank).contiguous()
             q_rope = q_rope.view(-1, layer.tp_q_head_num, 1, self.qk_rope_head_dim)
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
