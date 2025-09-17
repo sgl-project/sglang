@@ -724,6 +724,185 @@ class HybridLinearKVPool(KVCache):
         )
 
 
+class LinearTokenToKVPool(KVCache):
+    def __init__(
+        self,
+        size: int,
+        linear_size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        linear_head_num: int,
+        head_dim: int,
+        softmax_layer_num: int,
+        linear_layer_num: int,
+        linear_layer_freq: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            softmax_layer_num + linear_layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.linear_head_num = linear_head_num
+        self.softmax_layer_num = softmax_layer_num
+        self.linear_layer_num = linear_layer_num
+        self.linear_size = linear_size
+        self.linear_layer_freq = linear_layer_freq
+        self._create_buffers()
+        self.layer_transfer_counter = None
+        self.device_module = torch.get_device_module(self.device)
+        self.alt_stream = self.device_module.Stream() if is_cuda else None
+        k_size, v_size = self.get_kv_size_bytes()
+        logger.info(
+            f"Softmax KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
+        )
+        linear_kv_size = self.get_linear_kv_size_bytes()
+        logger.info(
+            f"Linear KV Cache is allocated. #max_req_nums: {linear_size}, kv size: {linear_kv_size / GB:.2f} GB"
+        )
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # [size, head_num, head_dim] for each layer
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            self.k_buffer = [
+                torch.zeros(
+                    (self.size + self.page_size, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.softmax_layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (self.size + self.page_size, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.softmax_layer_num)
+            ]
+            self.linear_kv_buffer = [
+                torch.zeros(
+                    (self.linear_size, self.linear_head_num, self.head_dim, self.head_dim),
+                    # dtype=self.store_dtype,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for _ in range(self.linear_layer_num)
+            ]
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.linear_kv_buffer
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "k_buffer")
+        assert hasattr(self, "v_buffer")
+        k_size_bytes = 0
+        for k_cache in self.k_buffer:
+            k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
+        v_size_bytes = 0
+        for v_cache in self.v_buffer:
+            v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
+        return k_size_bytes, v_size_bytes
+
+    def get_linear_kv_size_bytes(self):
+        assert hasattr(self, "linear_kv_buffer")
+        kv_size_bytes = 0
+        for kv_cache in self.linear_kv_buffer:
+            kv_size_bytes += np.prod(kv_cache.shape) * 4  # fp32
+        return kv_size_bytes
+
+    def get_key_buffer(self, layer_id: int):
+        kv_buffer_idx = (layer_id - self.start_layer) // self.linear_layer_freq
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(kv_buffer_idx)
+        if self.store_dtype != self.dtype:
+            return self.k_buffer[kv_buffer_idx].view(self.dtype)
+        return self.k_buffer[kv_buffer_idx]
+
+    def get_value_buffer(self, layer_id: int):
+        kv_buffer_idx = (layer_id - self.start_layer) // self.linear_layer_freq
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(kv_buffer_idx)
+        if self.store_dtype != self.dtype:
+            return self.v_buffer[kv_buffer_idx].view(self.dtype)
+        return self.v_buffer[kv_buffer_idx]
+
+    def get_linear_kv_buffer(self, layer_id: int):
+        kv_buffer_idx = (layer_id - self.start_layer) - ((layer_id - self.start_layer) // self.linear_layer_freq)
+        if self.store_dtype != self.dtype:
+            return self.linear_kv_buffer[kv_buffer_idx].view(self.dtype)
+        return self.linear_kv_buffer[kv_buffer_idx]
+
+    def get_kv_buffer(self, layer_id: int):
+        if (layer_id + 1) % self.linear_layer_freq == 0:
+            return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+        else:
+            # linear only has 1 KV cache
+            kv_cache = self.get_linear_kv_buffer(layer_id)
+            return kv_cache, None
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+    ):
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        layer_id = layer.layer_id
+        if (layer_id + 1) % self.linear_layer_freq == 0:  # softmax layer
+            kv_buffer_idx = (layer_id - self.start_layer) // self.linear_layer_freq
+            if cache_k.dtype != self.dtype:
+                if k_scale is not None:
+                    cache_k.div_(k_scale)
+                if v_scale is not None:
+                    cache_v.div_(v_scale)
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.view(self.store_dtype)
+                cache_v = cache_v.view(self.store_dtype)
+            if get_is_capture_mode() and self.alt_stream is not None:
+                # Overlap the copy of K and V cache for small batch size
+                current_stream = self.device_module.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                self.k_buffer[kv_buffer_idx][loc] = cache_k
+                with self.device_module.stream(self.alt_stream):
+                    self.v_buffer[kv_buffer_idx][loc] = cache_v
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                self.k_buffer[kv_buffer_idx][loc] = cache_k
+                self.v_buffer[kv_buffer_idx][loc] = cache_v
+        else:  # linear layer
+            kv_buffer_idx = (layer_id - self.start_layer) - ((layer_id - self.start_layer) // self.linear_layer_freq)
+            self.linear_kv_buffer[kv_buffer_idx][loc] = cache_k
+
+    def get_flat_data(self, indices):
+        raise NotImplementedError()
+
+    def transfer(self, indices, flat_data):
+        raise NotImplementedError()
+
+    def transfer_per_layer(self, indices, flat_data, layer_id):
+        raise NotImplementedError()
+
+
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
 

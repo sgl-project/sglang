@@ -1,0 +1,707 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional, Union
+import math
+import numpy as np
+import torch
+from sglang.srt.layers.hybrid_linear.lightning_attn import lightning_attention, linear_decode_forward_triton
+from sglang.srt.layers.hybrid_linear.seg_la import SegLaMeta, seg_la_fwd
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.utils import get_compiler_backend
+import logging
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+from sgl_kernel import merge_state_v2
+from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size
+)
+
+def _build_slope_tensor(n_attention_heads: int):
+    def get_slopes(n):
+
+        def get_slopes_power_of_2(n):
+            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+            ratio = start
+            return [start * ratio**i for i in range(n)]
+
+        if math.log2(n).is_integer():
+            return get_slopes_power_of_2(n)
+        else:
+            closest_power_of_2 = 2 ** math.floor(math.log2(n))
+            return (
+                get_slopes_power_of_2(closest_power_of_2)
+                + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+            )
+
+    slopes = torch.tensor(
+        get_slopes(n_attention_heads), dtype=torch.float32
+    ).reshape(n_attention_heads, 1, 1)
+    return slopes
+
+def is_linear_layer(layer_idx, layer_group_size):
+    if layer_idx is None:
+        return False
+    if layer_group_size > 0:
+        return (layer_idx + 1) % layer_group_size != 0
+    else:
+        return False
+
+def get_num_prefills(forward_batch: ForwardBatch):
+    if forward_batch.forward_mode.is_extend():
+        return forward_batch.batch_size
+    elif forward_batch.forward_mode.is_mixed():
+        return (
+            len(forward_batch.extend_seq_lens)
+            if forward_batch.extend_seq_lens is not None
+            else 0
+        )
+    else:
+        return 0
+
+
+def get_num_prefill_tokens(forward_batch: ForwardBatch):
+    if forward_batch.forward_mode.is_extend() or forward_batch.forward_mode.is_mixed():
+        if forward_batch.extend_num_tokens is not None:
+            return forward_batch.extend_num_tokens
+        elif forward_batch.extend_seq_lens is not None:
+            return int(forward_batch.extend_seq_lens.sum().item())
+        else:
+            return 0
+    else:
+        return 0
+
+
+def get_num_decode_tokens(forward_batch: ForwardBatch):
+    if forward_batch.forward_mode.is_decode():
+        return forward_batch.batch_size
+    elif forward_batch.forward_mode.is_mixed():
+        num_prefills = get_num_prefills(forward_batch)
+        return max(0, forward_batch.batch_size - num_prefills)
+    else:
+        return 0
+
+class BailingLinearKernel:
+    """
+    Linear attention kernel implementation for Bailing models.
+
+    This class is adapted from MiniMaxText01LinearKernel in vllm:
+    https://github.com/vllm-project/vllm/blob/a9138e85b14047e06300685b48e3485b995425fb/vllm/model_executor/models/minimax_text_01.py#L289
+
+    The implementation maintains the same functionality while being renamed to
+    match our Bailing model naming convention.
+    """
+    @staticmethod
+    def jit_linear_forward_prefix(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_caches: torch.Tensor,
+        slope_rate: torch.Tensor,
+        block_size: int,
+        layer_idx: int = None,
+        **kwargs,
+    ) -> torch.Tensor:
+
+        slope_rate = slope_rate.to(torch.float32)
+        should_pad_dim = q.dim() == 3
+        if should_pad_dim:
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+        b, h, n, d = q.shape
+        e = d
+        kv_history = kv_caches.reshape(1, h, d, e).contiguous()
+        output, kv_history = lightning_attention(
+            q, k, v, slope_rate, block_size=block_size, kv_history=kv_history
+        )
+        kv_caches.copy_(kv_history[:, :, -1, :, :].reshape(h, d, e))
+        assert output.shape[0] == 1, "batch size must be 1"
+        return output.squeeze(0).transpose(0, 1).reshape([n, h*d]).contiguous()
+
+@dataclass
+class HybridLinearAttentionMetadata:
+    """Metadata to be init once in the model forward pass,
+    each layer's forward pass can reuse the metadata.
+
+    For each init metadata function, we will try set up them in below order
+    """
+
+    # Sequence lengths for the forward batch
+    cache_seqlens_int32: torch.Tensor = None
+    # Maximum sequence length for query
+    max_seq_len_q: int = 1
+    # Maximum sequence length for key
+    max_seq_len_k: int = 0
+    # Cumulative sequence lengths for query
+    cu_seqlens_q: torch.Tensor = None
+    # Cumulative sequence lengths for key
+    cu_seqlens_k: torch.Tensor = None
+    # Window size (typically used by Gemma)
+    page_table: torch.Tensor = None
+    req_pool_indices: torch.Tensor = None
+    # sequence lengths for query per request
+    seqlens_q: torch.Tensor = None
+    batch_size: int = 0
+    is_decode_req_tensor: torch.Tensor = None
+
+class HybridLinearAttentionBackend(AttentionBackend):
+    """FlashAttention backend implementation.
+
+    Note about the init:
+    - If no spec decoding
+        - FlashAttentionBackend will be init once when the server starts.
+    - If spec decoding
+        - FlashAttentionBackend will be init once for the target worker
+        - FlashAttentionMultiStepBackend will be once for the draft worker
+            - It will spawn num_steps FlashAttentionBackend for the draft worker
+
+    Note about CUDA Graph:
+    - We only support CUDA Graph for Decode (Normal Decode and Draft Decode) and Target Verify.
+    - We don't support CUDA Graph for Extend and Draft Extend.
+    - When server init, init_cuda_graph_state will be called first and then init_cuda_graph_capture will be called.
+    - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
+    """
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        skip_prefill: bool = False,
+        speculative_step_id=0,
+        topk=0,
+        speculative_num_steps=0,
+    ):
+        super().__init__()
+
+        assert not (
+            model_runner.sliding_window_size is not None
+            and model_runner.model_config.is_encoder_decoder
+        ), "Sliding window and cross attention are not supported together"
+
+        self.forward_metadata: HybridLinearAttentionMetadata = None
+        # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
+        self.max_context_len = model_runner.model_config.context_len
+        self.device = model_runner.device
+        self.decode_cuda_graph_metadata = {}
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+        self.page_size = model_runner.page_size
+        self.skip_prefill = skip_prefill
+        self.layer_group_size = model_runner.model_config.hf_config.layer_group_size
+        self.BLOCK = model_runner.model_config.block if hasattr(model_runner.model_config, "block") else 256
+        total_num_heads = model_runner.model_config.hf_config.num_attention_heads
+        tp_heads = total_num_heads // get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        slope_rate = _build_slope_tensor(total_num_heads)
+        num_hidden_layers = model_runner.model_config.hf_config.num_hidden_layers
+
+        if num_hidden_layers <= 1:
+            slope_rate_list = [slope_rate * (1 + 1e-5)]
+        else:
+            slope_rate_list = [slope_rate * (
+                1 - layer_id / (num_hidden_layers - 1) + 1e-5
+            ) for layer_id in range(num_hidden_layers)]
+        self.tp_slope = [slope_rate_list[layer_id][
+            tp_rank * tp_heads : (tp_rank + 1) * tp_heads
+        ].contiguous().to(self.device) for layer_id in range(num_hidden_layers)]
+        self.linear_backend = getattr(model_runner.model_config.hf_config, "linear_backend", "minimax")
+        logger.info(f'linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}')
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        metadata = HybridLinearAttentionMetadata()
+        seqlens_in_batch = forward_batch.seq_lens
+        batch_size = forward_batch.batch_size
+        device = seqlens_in_batch.device
+
+        if forward_batch.forward_mode.is_decode_or_idle():
+            # Normal Decode
+            metadata.req_pool_indices = forward_batch.req_pool_indices
+            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.max_seq_len_k = forward_batch.seq_lens.max().item()
+            metadata.cu_seqlens_q = torch.arange(
+                0, batch_size + 1, dtype=torch.int32, device=device
+            )
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+            ]
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            metadata.req_pool_indices = forward_batch.req_pool_indices
+            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.max_seq_len_k = forward_batch.seq_lens.max().item()
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+            ]
+            if (
+                any(forward_batch.extend_prefix_lens_cpu)
+                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
+            ):
+                extend_seq_lens = forward_batch.extend_seq_lens
+                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            else:
+                metadata.max_seq_len_q = metadata.max_seq_len_k
+                metadata.cu_seqlens_q = metadata.cu_seqlens_k
+
+        metadata.batch_size = forward_batch.batch_size
+        is_decode_req_tensor = torch.ones_like(forward_batch.seq_lens)
+        num_prefills = get_num_prefills(forward_batch)
+        is_decode_req_tensor[:num_prefills] = 0
+        metadata.is_decode_req_tensor = is_decode_req_tensor
+        metadata.seqlens_q = metadata.cu_seqlens_q.diff()
+
+        # Convert the page table to a strided format which is needed by FA3 API
+        if self.page_size > 1:
+            self.strided_indices = torch.arange(
+                0, metadata.page_table.shape[1], self.page_size, device=self.device
+            )
+            metadata.page_table = (
+                metadata.page_table[:, self.strided_indices] // self.page_size
+            )
+
+        self.forward_metadata = metadata
+
+    def _prefill_and_mix_infer(
+        self, q, k, v, kv_cache, state_indices_tensor, forward_batch, layer, cu_seqlens_q, cu_seqlens_k
+    ):
+        hidden = []
+        for _prefill_idx in range(get_num_prefills(forward_batch)):
+            if _prefill_idx >= len(forward_batch.extend_start_loc):
+                break
+            if _prefill_idx >= len(state_indices_tensor):
+                break
+
+            _start = forward_batch.extend_start_loc[_prefill_idx]
+
+            if _prefill_idx + 1 < len(forward_batch.extend_start_loc):
+                _end = forward_batch.extend_start_loc[_prefill_idx + 1]
+            else:
+                if forward_batch.extend_seq_lens is not None and _prefill_idx < len(
+                    forward_batch.extend_seq_lens
+                ):
+                    seq_len = forward_batch.extend_seq_lens[_prefill_idx]
+                    _end = _start + seq_len
+                else:
+                    _end = q.shape[0]
+
+            slot_id = state_indices_tensor[_prefill_idx]
+            qs = q[_start:_end].transpose(0, 1).contiguous()
+            ks = k[_start:_end].transpose(0, 1).contiguous()
+            vs = v[_start:_end].transpose(0, 1).contiguous()
+            slice_layer_cache = kv_cache[slot_id, ...]
+            batch_seqlen_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            batch_seqlen_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            if batch_seqlen_q[_prefill_idx] == batch_seqlen_k[_prefill_idx]:
+                slice_layer_cache.copy_(0).to(torch.float32)
+            out_slice = BailingLinearKernel.jit_linear_forward_prefix(
+                qs,
+                ks,
+                vs,
+                slice_layer_cache,
+                self.tp_slope[layer.layer_id],
+                self.BLOCK,
+                layer_idx=layer.layer_id,
+            )
+            hidden.append(out_slice.contiguous())
+        if get_num_decode_tokens(forward_batch) > 0:
+            hidden.append(
+                self._decode_infer(
+                    q, k, v, kv_cache, state_indices_tensor, forward_batch, layer
+                )
+            )
+
+        if not hidden:
+            return torch.empty((0, q.size(-1)), device=q.device, dtype=q.dtype)
+
+        hidden = torch.concat(hidden, dim=0).contiguous()
+        return hidden
+
+    def _decode_infer(self, q, k, v, kv_cache, state_indices_tensor, forward_batch, layer):
+        num_prefill_tokens = get_num_prefill_tokens(forward_batch)
+        num_prefills = get_num_prefills(forward_batch)
+        q = q[num_prefill_tokens:].unsqueeze(2).contiguous()
+        k = k[num_prefill_tokens:].unsqueeze(2).contiguous()
+        v = v[num_prefill_tokens:].unsqueeze(2).contiguous()
+        slot_id = state_indices_tensor[num_prefills:]
+
+        assert len(slot_id) == q.shape[0], (
+            f"slot_id length {len(slot_id)} does not match decode batch size {q.shape[0]}. "
+            "This indicates a bug in the upstream logic that should be investigated."
+        )
+        hidden = linear_decode_forward_triton(
+            q, k, v, kv_cache, self.tp_slope[layer.layer_id], slot_id, 32
+        )
+        return hidden
+
+    def linear_attention_entry(self, q, k, v, kv_cache, state_indices_tensor, attn_metadata, layer):
+        seg_meta = SegLaMeta(
+            batch_size=attn_metadata.batch_size,
+            max_q_length=None,
+            q_offsets=attn_metadata.cu_seqlens_q,
+            s_offsets=state_indices_tensor,
+            q_lengths=attn_metadata.seqlens_q,
+            s_scales=attn_metadata.is_decode_req_tensor,
+            mask=None,
+        )
+        hidden = seg_la_fwd(
+            q=q,
+            k=k,
+            v=v,
+            s=kv_cache,
+            decay_scales=self.tp_slope[layer.layer_id],
+            meta=seg_meta,
+            decouple=True
+        )
+        return hidden
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+        # For multi-head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+    ):
+        if k is not None and not is_linear_layer(layer.layer_id, self.layer_group_size):
+            assert v is not None
+            if save_kv_cache:
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
+
+        # Use precomputed metadata across all layers
+        metadata = self.forward_metadata
+
+        # Calculate window size (can be moved to metadata if layer properties don't change)
+        # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
+        # here is two side inclusive
+        window_size = (
+            (layer.sliding_window_size, 0)
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
+            else (-1, -1)
+        )
+        k_descale, v_descale = None, None
+        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
+        # has corresponding quantization method so that layer.k_scale is not None
+        if self.kv_cache_dtype_str != "auto" and layer.k_scale is not None:
+            descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+            k_descale = layer.k_scale.expand(descale_shape)
+            v_descale = layer.v_scale.expand(descale_shape)
+            q = q.to(self.kv_cache_dtype)
+        causal = not layer.is_cross_attention
+
+        # Get the appropriate page table based on whether we're using local attention
+        page_table = metadata.page_table
+        cu_seqlens_q = metadata.cu_seqlens_q
+        cache_seqlens = metadata.cache_seqlens_int32
+        max_seqlen_q = metadata.max_seq_len_q
+        max_seqlen_k = metadata.max_seq_len_k
+        cu_seqlens_k = metadata.cu_seqlens_k
+        state_indices_tensor = metadata.req_pool_indices
+        # Use Flash Attention for prefill
+        if not is_linear_layer(layer.layer_id, self.layer_group_size):
+            # Do softmax attention
+            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            key_cache = key_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            value_cache = value_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
+            if layer.is_cross_attention:
+                page_table = metadata.encoder_page_table
+                cache_seqlens = metadata.encoder_lens_int32
+                cu_seqlens_k = metadata.encoder_cu_seqlens_k
+                window_size = (-1, -1)
+
+            result = flash_attn_with_kvcache(
+                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k_new=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                softmax_scale=layer.scaling,
+                causal=causal,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+            o = result
+        else:
+            # Do linear attention
+            kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
+            if self.linear_backend == "minimax":
+                o = self._prefill_and_mix_infer(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim), k, v, kv_cache, state_indices_tensor, forward_batch, layer, cu_seqlens_q, cu_seqlens_k
+                )
+            elif self.linear_backend == "seg_la":
+                o = self.linear_attention_entry(q, k, v, kv_cache, state_indices_tensor, metadata, layer)
+            else:
+                raise ValueError(f"linear backend: {self.linear_backend} is not support for now")
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+        # For multi-head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if k is not None and not is_linear_layer(layer.layer_id, self.layer_group_size):
+            assert v is not None
+            if save_kv_cache:
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
+
+        # Use precomputed metadata across all layers
+        metadata = self.forward_metadata
+
+        causal = not layer.is_cross_attention
+
+        k_descale, v_descale = None, None
+        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
+        # has corresponding quantization method so that layer.k_scale is not None
+        if self.kv_cache_dtype_str != "auto":
+            if layer.k_scale is not None:
+                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
+            q = q.to(self.kv_cache_dtype)
+
+        if not is_linear_layer(layer.layer_id, self.layer_group_size):
+            # Do softmax attention
+
+            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            key_cache = key_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            value_cache = value_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
+            window_size = (
+                (layer.sliding_window_size, 0)
+                if layer.sliding_window_size is not None and layer.sliding_window_size > -1
+                else (-1, -1)
+            )
+            page_table = metadata.page_table
+            cache_seqlens = metadata.cache_seqlens_int32
+            cu_seqlens_k = metadata.cu_seqlens_k
+            max_seqlen_q = metadata.max_seq_len_q
+            q_reshaped = q.contiguous().view(
+                -1, layer.tp_q_head_num, layer.head_dim
+            )
+
+            # Default: single-token self-attention
+            result = flash_attn_with_kvcache(
+                q=q_reshaped,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_k_new=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                softmax_scale=layer.scaling,
+                causal=causal,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+            o = result
+        else:
+            # Do linear attention
+            kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
+            state_indices_tensor = metadata.req_pool_indices
+            if self.linear_backend == "minimax":
+                o = self._decode_infer(q, k, v, kv_cache, state_indices_tensor, forward_batch, layer)
+            elif self.linear_backend == "seg_la":
+                o = self.linear_attention_entry(
+                    q, k, v,
+                    kv_cache, state_indices_tensor,
+                    metadata, layer
+                )
+            else:
+                raise ValueError(f"linear backend: {self.linear_backend} is not support for now")
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        """Initialize CUDA graph state for the attention backend.
+
+        Args:
+            max_bs (int): Maximum batch size to support in CUDA graphs
+
+        This creates fixed-size tensors that will be reused during CUDA graph replay
+        to avoid memory allocations.
+        """
+        # This is being used by normal decode and draft decode when topk == 1
+        self.decode_cuda_graph_metadata = {
+            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "page_table": torch.zeros(
+                max_bs,
+                (self.max_context_len + self.page_size - 1) // self.page_size,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "strided_indices": torch.arange(
+                0, self.max_context_len, self.page_size, device=self.device
+            ),
+        }
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        """Initialize forward metadata for capturing CUDA graph."""
+        metadata = HybridLinearAttentionMetadata()
+
+        metadata.batch_size = bs
+        metadata.is_decode_req_tensor = torch.ones_like(seq_lens)
+
+        device = seq_lens.device
+        if forward_mode.is_decode_or_idle():
+            # Normal Decode
+            # Get sequence information
+            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+            batch_size = len(seq_lens)
+            device = seq_lens.device
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+            # Precompute maximum sequence length
+            metadata.max_seq_len_k = seq_lens.max().item()
+            # Precompute page table
+            metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
+                req_pool_indices, :
+            ]
+            metadata.req_pool_indices = req_pool_indices
+            # Precompute cumulative sequence lengths
+            metadata.cu_seqlens_q = torch.arange(
+                0, batch_size + 1, dtype=torch.int32, device=device
+            )
+            metadata.seqlens_q = metadata.cu_seqlens_q.diff()
+            self.decode_cuda_graph_metadata[bs] = metadata
+        self.forward_metadata = metadata
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: torch.Tensor = None,
+    ):
+        """Initialize forward metadata for replaying CUDA graph."""
+        req_pool_indices_long = req_pool_indices
+        # req_pool_indices_long[bs:] = -1
+        seq_lens = seq_lens[:bs]
+        seq_lens_cpu = seq_lens_cpu[:bs]
+        req_pool_indices = req_pool_indices[:bs]
+        device = seq_lens.device
+        metadata = None
+
+        if forward_mode.is_decode_or_idle():
+            # Normal Decode
+            metadata = self.decode_cuda_graph_metadata[bs]
+            max_len = seq_lens.max().item()
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+            metadata.max_seq_len_k = max_len
+            metadata.req_pool_indices = req_pool_indices_long
+            normal_decode_set_medadata(
+                metadata,
+                self.req_to_token,
+                req_pool_indices,
+                self.decode_cuda_graph_metadata["strided_indices"],
+                max_seq_pages,
+                seq_lens,
+                self.page_size,
+            )
+            metadata.batch_size = bs
+            metadata.is_decode_req_tensor = torch.ones_like(seq_lens)
+            if metadata.cu_seqlens_q is not None:
+                metadata.seqlens_q = metadata.cu_seqlens_q.diff()
+        self.forward_metadata = metadata
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        """Get the fill value for sequence length in CUDA graph."""
+        return 0
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def normal_decode_set_medadata(
+    metadata,
+    req_to_token,
+    req_pool_indices,
+    strided_indices,
+    max_seq_pages,
+    seq_lens,
+    page_size,
+):
+    metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+    metadata.cu_seqlens_k[1:].copy_(torch.cumsum(seq_lens, dim=0, dtype=torch.int32))
+    page_indices = req_to_token[
+        req_pool_indices[:, None],
+        strided_indices[:max_seq_pages][None, :],
+    ]
+    metadata.page_table[:, :max_seq_pages].copy_(page_indices // page_size)
+    metadata.page_table[:, max_seq_pages:].fill_(0)

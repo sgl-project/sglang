@@ -91,6 +91,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
+    LinearTokenToKVPool,
 )
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -476,6 +477,9 @@ class ModelRunner:
                     server_args.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
                     )
+                if getattr(self.model_config.hf_config, "layer_group_size", 0) > 1:
+                    server_args.attention_backend = "bailing_hybrid_linear"
+                    logger.info('Use Hybrid Linear backend!')
             else:
                 # MLA architecture
                 if is_hopper_with_cuda_12_3():
@@ -1132,6 +1136,47 @@ class ModelRunner:
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
+    def profile_linear_max_num_token(self, total_gpu_memory: int, max_num_reqs:int):
+        available_gpu_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
+        if self.is_draft_worker:
+            num_layers = getattr(
+                self.model_config.hf_config,
+                "num_nextn_predict_layers",
+                self.num_effective_layers,
+            )
+        else:
+            num_layers = self.num_effective_layers
+
+        softmax_layer_nums = num_layers // self.model_config.hf_config.layer_group_size
+        linear_layer_nums = num_layers - softmax_layer_nums
+
+        softmax_kv_cell_size = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * self.model_config.head_dim
+                * softmax_layer_nums
+                * 2
+                * torch._utils._element_size(self.kv_cache_dtype)
+            )
+        linear_kv_cell_size = (
+            self.model_config.get_num_attention_heads(get_attention_tp_size())
+                * self.model_config.head_dim
+                * self.model_config.head_dim
+                * linear_layer_nums
+                * 4  #fp32
+
+        )
+        linear_kvcache_memory = 1.0 * linear_kv_cell_size * max_num_reqs / (1<<30)
+        logger.info(f'Linear cache gpu memory:{linear_kvcache_memory}GB, max_num_reqs={max_num_reqs} .')
+        rest_memory = available_gpu_memory - total_gpu_memory * (1 - self.mem_fraction_static) - linear_kvcache_memory
+        assert rest_memory > 4, f"rest memory {rest_memory} is not enough and less than 4GB, please reduce max_num_reqs value!"
+        max_num_token = int(rest_memory * (1 << 30) // softmax_kv_cell_size)
+        return max_num_token
+
     @property
     def is_hybrid_gdn(self):
         return self.model_config.hf_config.architectures[0] in [
@@ -1245,7 +1290,12 @@ class ModelRunner:
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        if self.server_args.attention_backend == 'bailing_hybrid_linear':
+            if max_num_reqs is None:
+                max_num_reqs = 256
+            self.max_total_num_tokens = self.profile_linear_max_num_token(total_gpu_memory, max_num_reqs)
+        else:
+            self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
 
@@ -1459,6 +1509,23 @@ class ModelRunner:
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,
+                )
+            elif self.server_args.attention_backend == "bailing_hybrid_linear":
+                self.token_to_kv_pool = LinearTokenToKVPool(
+                    size=self.max_total_num_tokens,
+                    linear_size=max_num_reqs,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                    linear_head_num=self.model_config.num_attention_heads//get_attention_tp_size() ,
+                    head_dim=self.model_config.head_dim,
+                    softmax_layer_num=self.num_effective_layers // self.model_config.hf_config.layer_group_size,
+                    linear_layer_num=self.num_effective_layers - (self.num_effective_layers // self.model_config.hf_config.layer_group_size),
+                    linear_layer_freq=self.model_config.hf_config.layer_group_size,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
                 )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
@@ -1693,6 +1760,11 @@ class ModelRunner:
             )
 
             return DualChunkFlashAttentionBackend(self)
+        elif backend_str == "bailing_hybrid_linear":
+            from sglang.srt.layers.attention.bailing_hybrid_linear_backend import (
+                HybridLinearAttentionBackend,
+            )
+            return HybridLinearAttentionBackend(self)
         elif backend_str == "hybrid_linear_attn":
             assert (
                 self.is_hybrid_gdn

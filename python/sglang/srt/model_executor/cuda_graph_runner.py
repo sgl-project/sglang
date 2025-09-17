@@ -312,7 +312,10 @@ class CudaGraphRunner:
         # Graph inputs
         with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            if self.model_runner.server_args.attention_backend == "bailing_hybrid_linear":
+                self.req_pool_indices = torch.full((self.max_bs,), -1, dtype=torch.int32)
+            else:
+                self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
@@ -733,6 +736,8 @@ class CudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
+            if self.model_runner.server_args.attention_backend == "bailing_hybrid_linear":
+                self.req_pool_indices.fill_(-1)
 
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
