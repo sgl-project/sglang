@@ -361,15 +361,48 @@ impl super::super::RouterTrait for OpenAIRouter {
     ) -> Response {
         let url = format!("{}/v1/responses", self.base_url);
 
+        tracing::info!(
+            requested_store = body.store,
+            "openai_responses_store_decision"
+        );
+
         // Clone the body and override model if needed
         let mut request_body = body.clone();
         if let Some(model) = model_id {
             request_body.model = Some(model.to_string());
         }
+        // Prevent OpenAI from storing the response; we keep history locally instead.
+        request_body.store = false;
+
+        // Convert to JSON payload and strip SGLang-specific fields before forwarding
+        let mut payload = match serde_json::to_value(&request_body) {
+            Ok(value) => value,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to serialize responses request: {}", err),
+                )
+                    .into_response();
+            }
+        };
+        if let Some(obj) = payload.as_object_mut() {
+            for key in [
+                "request_id",
+                "priority",
+                "frequency_penalty",
+                "presence_penalty",
+                "stop",
+                "top_k",
+                "min_p",
+                "repetition_penalty",
+            ] {
+                obj.remove(key);
+            }
+        }
 
         // Forward the request - ResponsesRequest should serialize correctly for OpenAI
-        let request_builder = self.client.post(&url).json(&request_body);
-        
+        let request_builder = self.client.post(&url).json(&payload);
+
         // Apply headers with filtering (skip content headers since we're using .json())
         let request_builder = if let Some(headers) = headers {
             apply_request_headers(headers, request_builder, true)
@@ -387,60 +420,74 @@ impl super::super::RouterTrait for OpenAIRouter {
                     Ok(body_text) => {
                         // Try to parse and store the response if store is enabled
                         if body.store {
-                            if let Ok(openai_response) =
-                                serde_json::from_str::<ResponsesResponse>(&body_text)
-                            {
-                                // Extract the input for storage
-                                let input_text = match &body.input {
-                                    ResponseInput::Text(text) => text.clone(),
-                                    ResponseInput::Items(_) => "complex input".to_string(),
-                                };
+                            match serde_json::from_str::<ResponsesResponse>(&body_text) {
+                                Ok(openai_response) => {
+                                    // Extract the input for storage
+                                    let input_text = match &body.input {
+                                        ResponseInput::Text(text) => text.clone(),
+                                        ResponseInput::Items(_) => "complex input".to_string(),
+                                    };
 
-                                // Extract output text from the response
-                                let output_text = openai_response
-                                    .output
-                                    .iter()
-                                    .find_map(|item| {
-                                        if let ResponseOutputItem::Message { content, .. } = item {
-                                            content.iter().find_map(|c| {
-                                                if let ResponseContentPart::OutputText {
-                                                    text,
-                                                    ..
-                                                } = c
-                                                {
-                                                    Some(text.clone())
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                        } else {
-                                            None
+                                    // Extract output text from the response
+                                    let output_text = openai_response
+                                        .output
+                                        .iter()
+                                        .find_map(|item| {
+                                            if let ResponseOutputItem::Message { content, .. } =
+                                                item
+                                            {
+                                                content.iter().find_map(|c| match c {
+                                                    ResponseContentPart::OutputText {
+                                                        text,
+                                                        ..
+                                                    } => Some(text.clone()),
+                                                    _ => None,
+                                                })
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .unwrap_or_default();
+
+                                    // Store the response
+                                    let mut stored_response = StoredResponse::new(
+                                        input_text,
+                                        output_text,
+                                        body.previous_response_id
+                                            .as_ref()
+                                            .map(|id| ResponseId::from_string(id.clone())),
+                                    );
+
+                                    stored_response.instructions = body.instructions.clone();
+                                    stored_response.model = Some(openai_response.model.clone());
+                                    stored_response.user = body.user.clone();
+                                    stored_response.metadata =
+                                        body.metadata.clone().unwrap_or_default();
+
+                                    // Use the ID from OpenAI
+                                    stored_response.id =
+                                        ResponseId::from_string(openai_response.id.clone());
+
+                                    // Store it (log on failure but continue returning upstream response)
+                                    match self
+                                        .response_storage
+                                        .store_response(stored_response)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            tracing::info!("stored_openai_response" = %openai_response.id)
                                         }
-                                    })
-                                    .unwrap_or_default();
-
-                                // Store the response
-                                let mut stored_response = StoredResponse::new(
-                                    input_text,
-                                    output_text,
-                                    body.previous_response_id
-                                        .as_ref()
-                                        .map(|id| ResponseId::from_string(id.clone())),
-                                );
-
-                                stored_response.instructions = body.instructions.clone();
-                                stored_response.model = Some(openai_response.model.clone());
-                                stored_response.user = body.user.clone();
-                                stored_response.metadata =
-                                    body.metadata.clone().unwrap_or_default();
-
-                                // Use the ID from OpenAI
-                                stored_response.id =
-                                    ResponseId::from_string(openai_response.id.clone());
-
-                                // Store it (ignore errors since we still want to return the response)
-                                let _ = self.response_storage.store_response(stored_response).await;
+                                        Err(err) => {
+                                            tracing::warn!("failed_to_store_openai_response" = %openai_response.id, %err)
+                                        }
+                                    };
+                                }
+                                Err(err) => {
+                                    tracing::warn!("failed_to_parse_openai_response" = %err);
+                                }
                             }
+                        } else {
+                            tracing::info!("body_store_disabled");
                         }
 
                         // Return the OpenAI response with properly filtered headers
@@ -505,7 +552,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         let url = format!("{}/v1/responses/{}", self.base_url, response_id);
 
         let request_builder = self.client.get(&url);
-        
+
         // Apply headers with filtering (don't skip content headers for GET)
         let request_builder = if let Some(headers) = headers {
             apply_request_headers(headers, request_builder, false)
@@ -547,7 +594,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         let url = format!("{}/v1/responses/{}/cancel", self.base_url, response_id);
 
         let request_builder = self.client.post(&url);
-        
+
         // Apply headers with filtering (skip content headers for POST without body)
         let request_builder = if let Some(headers) = headers {
             apply_request_headers(headers, request_builder, true)

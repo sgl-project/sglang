@@ -60,14 +60,17 @@ pub fn apply_request_headers(
     skip_content_headers: bool,
 ) -> reqwest::RequestBuilder {
     // Always forward Authorization header first if present
-    if let Some(auth) = headers.get("authorization").or_else(|| headers.get("Authorization")) {
+    if let Some(auth) = headers
+        .get("authorization")
+        .or_else(|| headers.get("Authorization"))
+    {
         request_builder = request_builder.header("Authorization", auth.clone());
     }
-    
+
     // Forward other headers, filtering out problematic ones
     for (key, value) in headers.iter() {
         let key_str = key.as_str().to_lowercase();
-        
+
         // Skip headers that:
         // - Are set automatically by reqwest (content-type, content-length for POST/PUT)
         // - We already handled (authorization)
@@ -82,11 +85,11 @@ pub fn apply_request_headers(
             key_str == "trailers" ||
             key_str == "upgrade" ||
             (skip_content_headers && (key_str == "content-type" || key_str == "content-length"));
-            
+
         if !should_skip {
             request_builder = request_builder.header(key.clone(), value.clone());
         }
     }
-    
+
     request_builder
 }
