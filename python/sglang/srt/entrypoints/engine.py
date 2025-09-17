@@ -666,6 +666,13 @@ def _set_envs_and_config(server_args: ServerArgs):
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
+    if os.environ.get("CUTE_DSL_LOG_LEVEL") is None:
+        # Default to warning level, to avoid too many logs
+        os.environ["CUTE_DSL_LOG_LEVEL"] = "30"
+    if os.environ.get("CUTE_DSL_LOG_TO_CONSOLE") is None:
+        # Need to set log to console, otherwise the log level won't take effect
+        os.environ["CUTE_DSL_LOG_TO_CONSOLE"] = "1"
+
     # Can also be passed as argument
     os.environ["SGLANG_RUN_ID"] = (
         f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
@@ -690,7 +697,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.9.post2",
+            "0.3.10",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
