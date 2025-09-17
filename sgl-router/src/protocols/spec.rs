@@ -741,6 +741,8 @@ pub enum ResponseContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         logprobs: Option<ChatLogProbs>,
     },
+    #[serde(rename = "input_text")]
+    InputText { text: String },
     #[serde(other)]
     Unknown,
 }
@@ -1246,6 +1248,7 @@ impl GenerationRequest for ResponsesRequest {
                             .iter()
                             .filter_map(|part| match part {
                                 ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
+                                ResponseContentPart::InputText { text } => Some(text.clone()),
                                 ResponseContentPart::Unknown => None,
                             })
                             .collect();

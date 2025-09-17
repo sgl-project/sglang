@@ -77,7 +77,7 @@ pub fn apply_request_headers(
         // - Are hop-by-hop headers (connection, transfer-encoding)
         // - Should not be forwarded (host)
         let should_skip = key_str == "authorization" || // Already handled above
-            key_str == "host" || 
+            key_str == "host" ||
             key_str == "connection" ||
             key_str == "transfer-encoding" ||
             key_str == "keep-alive" ||

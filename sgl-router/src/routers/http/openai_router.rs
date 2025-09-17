@@ -4,8 +4,9 @@ use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
 use crate::data_connector::{ResponseId, SharedResponseStorage, StoredResponse};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest, ResponseContentPart,
-    ResponseInput, ResponseOutputItem, ResponseStatus, ResponsesResponse,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+    ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+    ResponseStatus, ResponsesRequest, ResponsesResponse,
 };
 use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
 use async_trait::async_trait;
@@ -16,10 +17,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
+use serde_json::{from_str, from_value, json, to_string, to_value, Value};
 use std::{
     any::Any,
     sync::atomic::{AtomicBool, Ordering},
 };
+use tracing::{info, warn};
 
 /// Router for OpenAI backend
 pub struct OpenAIRouter {
@@ -138,7 +141,7 @@ impl super::super::RouterTrait for OpenAIRouter {
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        let info = serde_json::json!({
+        let info = json!({
             "router_type": "openai",
             "workers": 1,
             "base_url": &self.base_url
@@ -222,7 +225,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         }
 
         // Serialize request body, removing SGLang-only fields
-        let mut payload = match serde_json::to_value(body) {
+        let mut payload = match to_value(body) {
             Ok(v) => v,
             Err(e) => {
                 return (
@@ -356,12 +359,12 @@ impl super::super::RouterTrait for OpenAIRouter {
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
-        body: &crate::protocols::spec::ResponsesRequest,
+        body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
         let url = format!("{}/v1/responses", self.base_url);
 
-        tracing::info!(
+        info!(
             requested_store = body.store,
             "openai_responses_store_decision"
         );
@@ -371,11 +374,77 @@ impl super::super::RouterTrait for OpenAIRouter {
         if let Some(model) = model_id {
             request_body.model = Some(model.to_string());
         }
+
+        let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
+        if let Some(prev_id_str) = request_body.previous_response_id.clone() {
+            let prev_id = ResponseId::from_string(prev_id_str.clone());
+            match self
+                .response_storage
+                .get_response_chain(&prev_id, None)
+                .await
+            {
+                Ok(chain) => {
+                    if !chain.responses.is_empty() {
+                        let mut items = Vec::new();
+                        for stored in chain.responses.iter() {
+                            let trimmed_id = stored.id.0.trim_start_matches("resp_");
+                            if !stored.input.is_empty() {
+                                items.push(ResponseInputOutputItem::Message {
+                                    id: format!("msg_u_{}", trimmed_id),
+                                    role: "user".to_string(),
+                                    status: Some("completed".to_string()),
+                                    content: vec![ResponseContentPart::InputText {
+                                        text: stored.input.clone(),
+                                    }],
+                                });
+                            }
+                            if !stored.output.is_empty() {
+                                items.push(ResponseInputOutputItem::Message {
+                                    id: format!("msg_a_{}", trimmed_id),
+                                    role: "assistant".to_string(),
+                                    status: Some("completed".to_string()),
+                                    content: vec![ResponseContentPart::OutputText {
+                                        text: stored.output.clone(),
+                                        annotations: vec![],
+                                        logprobs: None,
+                                    }],
+                                });
+                            }
+                        }
+                        conversation_items = Some(items);
+                    } else {
+                        info!(previous_response_id = %prev_id_str, "previous chain empty");
+                    }
+                }
+                Err(err) => {
+                    warn!(previous_response_id = %prev_id_str, %err, "failed to fetch previous response chain");
+                }
+            }
+            request_body.previous_response_id = None;
+        }
+
+        if let Some(mut items) = conversation_items {
+            match &request_body.input {
+                ResponseInput::Text(text) => {
+                    items.push(ResponseInputOutputItem::Message {
+                        id: format!("msg_u_current_{}", items.len()),
+                        role: "user".to_string(),
+                        status: Some("completed".to_string()),
+                        content: vec![ResponseContentPart::InputText { text: text.clone() }],
+                    });
+                }
+                ResponseInput::Items(existing) => {
+                    items.extend(existing.clone());
+                }
+            }
+            request_body.input = ResponseInput::Items(items);
+        }
+
         // Prevent OpenAI from storing the response; we keep history locally instead.
         request_body.store = false;
 
         // Convert to JSON payload and strip SGLang-specific fields before forwarding
-        let mut payload = match serde_json::to_value(&request_body) {
+        let mut payload = match to_value(&request_body) {
             Ok(value) => value,
             Err(err) => {
                 return (
@@ -418,79 +487,79 @@ impl super::super::RouterTrait for OpenAIRouter {
                 // Get the response body
                 match response.text().await {
                     Ok(body_text) => {
-                        // Try to parse and store the response if store is enabled
+                        let raw_response_value = from_str::<Value>(&body_text).ok();
+
                         if body.store {
-                            match serde_json::from_str::<ResponsesResponse>(&body_text) {
-                                Ok(openai_response) => {
-                                    // Extract the input for storage
-                                    let input_text = match &body.input {
-                                        ResponseInput::Text(text) => text.clone(),
-                                        ResponseInput::Items(_) => "complex input".to_string(),
-                                    };
+                            if let Some(raw_value) = raw_response_value.clone() {
+                                match from_value::<ResponsesResponse>(raw_value.clone()) {
+                                    Ok(openai_response) => {
+                                        let input_text = match &body.input {
+                                            ResponseInput::Text(text) => text.clone(),
+                                            ResponseInput::Items(_) => "complex input".to_string(),
+                                        };
 
-                                    // Extract output text from the response
-                                    let output_text = openai_response
-                                        .output
-                                        .iter()
-                                        .find_map(|item| {
-                                            if let ResponseOutputItem::Message { content, .. } =
-                                                item
-                                            {
-                                                content.iter().find_map(|c| match c {
-                                                    ResponseContentPart::OutputText {
-                                                        text,
-                                                        ..
-                                                    } => Some(text.clone()),
-                                                    _ => None,
-                                                })
-                                            } else {
-                                                None
+                                        let output_text = openai_response
+                                            .output
+                                            .iter()
+                                            .find_map(|item| {
+                                                if let ResponseOutputItem::Message {
+                                                    content, ..
+                                                } = item
+                                                {
+                                                    content.iter().find_map(|c| match c {
+                                                        ResponseContentPart::OutputText {
+                                                            text,
+                                                            ..
+                                                        } => Some(text.clone()),
+                                                        _ => None,
+                                                    })
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .unwrap_or_default();
+
+                                        let mut stored_response = StoredResponse::new(
+                                            input_text,
+                                            output_text,
+                                            body.previous_response_id
+                                                .as_ref()
+                                                .map(|id| ResponseId::from_string(id.clone())),
+                                        );
+
+                                        stored_response.instructions = body.instructions.clone();
+                                        stored_response.model = Some(openai_response.model.clone());
+                                        stored_response.user = body.user.clone();
+                                        stored_response.metadata =
+                                            body.metadata.clone().unwrap_or_default();
+                                        stored_response.id =
+                                            ResponseId::from_string(openai_response.id.clone());
+                                        stored_response.raw_response = raw_value;
+
+                                        match self
+                                            .response_storage
+                                            .store_response(stored_response)
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                info!(openai_response_id = %openai_response.id, "stored response locally")
                                             }
-                                        })
-                                        .unwrap_or_default();
-
-                                    // Store the response
-                                    let mut stored_response = StoredResponse::new(
-                                        input_text,
-                                        output_text,
-                                        body.previous_response_id
-                                            .as_ref()
-                                            .map(|id| ResponseId::from_string(id.clone())),
-                                    );
-
-                                    stored_response.instructions = body.instructions.clone();
-                                    stored_response.model = Some(openai_response.model.clone());
-                                    stored_response.user = body.user.clone();
-                                    stored_response.metadata =
-                                        body.metadata.clone().unwrap_or_default();
-
-                                    // Use the ID from OpenAI
-                                    stored_response.id =
-                                        ResponseId::from_string(openai_response.id.clone());
-
-                                    // Store it (log on failure but continue returning upstream response)
-                                    match self
-                                        .response_storage
-                                        .store_response(stored_response)
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            tracing::info!("stored_openai_response" = %openai_response.id)
-                                        }
-                                        Err(err) => {
-                                            tracing::warn!("failed_to_store_openai_response" = %openai_response.id, %err)
-                                        }
-                                    };
+                                            Err(err) => {
+                                                warn!(openai_response_id = %openai_response.id, %err, "failed to store response locally")
+                                            }
+                                        };
+                                    }
+                                    Err(err) => {
+                                        warn!(%err, "failed to parse OpenAI response for local storage")
+                                    }
                                 }
-                                Err(err) => {
-                                    tracing::warn!("failed_to_parse_openai_response" = %err);
-                                }
+                            } else {
+                                warn!("failed to parse raw OpenAI response JSON for storage");
                             }
                         } else {
-                            tracing::info!("body_store_disabled");
+                            info!("body_store_disabled");
                         }
 
-                        // Return the OpenAI response with properly filtered headers
                         let mut response = (status, body_text).into_response();
                         *response.headers_mut() = preserve_response_headers(&headers);
                         response
@@ -510,10 +579,20 @@ impl super::super::RouterTrait for OpenAIRouter {
         }
     }
 
-    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn get_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
         // First check local storage
         let stored_id = ResponseId::from_string(response_id.to_string());
         if let Ok(Some(stored_response)) = self.response_storage.get_response(&stored_id).await {
+            if !stored_response.raw_response.is_null() {
+                let response = (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    stored_response.raw_response.to_string(),
+                )
+                    .into_response();
+                return response;
+            }
+
             let openai_response = ResponsesResponse {
                 id: stored_response.id.0.clone(),
                 object: "response".to_string(),
@@ -541,52 +620,21 @@ impl super::super::RouterTrait for OpenAIRouter {
             return (
                 StatusCode::OK,
                 [("content-type", "application/json")],
-                serde_json::to_string(&openai_response).unwrap_or_else(|e| {
+                to_string(&openai_response).unwrap_or_else(|e| {
                     format!("{{\"error\": \"Failed to serialize response: {}\"}}", e)
                 }),
             )
                 .into_response();
         }
-
-        // If not in local storage, forward to OpenAI
-        let url = format!("{}/v1/responses/{}", self.base_url, response_id);
-
-        let request_builder = self.client.get(&url);
-
-        // Apply headers with filtering (don't skip content headers for GET)
-        let request_builder = if let Some(headers) = headers {
-            apply_request_headers(headers, request_builder, false)
-        } else {
-            request_builder
-        };
-
-        match request_builder.send().await {
-            Ok(response) => {
-                let status = response.status();
-                let headers = response.headers().clone();
-
-                match response.text().await {
-                    Ok(body_text) => {
-                        // Optionally store the retrieved response for future queries
-                        // (parsing and storing logic would go here if needed)
-
-                        let mut response = (status, body_text).into_response();
-                        *response.headers_mut() = preserve_response_headers(&headers);
-                        response
-                    }
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to read response body: {}", e),
-                    )
-                        .into_response(),
-                }
-            }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to retrieve response from OpenAI: {}", e),
-            )
-                .into_response(),
-        }
+        // If not in local storage, surface a not-found error
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "Response with id '{}' not found in local storage",
+                response_id
+            ),
+        )
+            .into_response()
     }
 
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
@@ -630,7 +678,7 @@ impl super::super::RouterTrait for OpenAIRouter {
 
     async fn flush_cache(&self) -> Response {
         (
-            StatusCode::NOT_IMPLEMENTED,
+            StatusCode::FORBIDDEN,
             "flush_cache not supported for OpenAI router",
         )
             .into_response()
@@ -638,7 +686,7 @@ impl super::super::RouterTrait for OpenAIRouter {
 
     async fn get_worker_loads(&self) -> Response {
         (
-            StatusCode::NOT_IMPLEMENTED,
+            StatusCode::FORBIDDEN,
             "get_worker_loads not supported for OpenAI router",
         )
             .into_response()
@@ -659,12 +707,12 @@ impl super::super::RouterTrait for OpenAIRouter {
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::EmbeddingRequest,
+        _body: &EmbeddingRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (
-            StatusCode::NOT_IMPLEMENTED,
-            "Embeddings endpoint not implemented for OpenAI backend",
+            StatusCode::FORBIDDEN,
+            "Embeddings endpoint not supported for OpenAI backend",
         )
             .into_response()
     }
@@ -676,8 +724,8 @@ impl super::super::RouterTrait for OpenAIRouter {
         _model_id: Option<&str>,
     ) -> Response {
         (
-            StatusCode::NOT_IMPLEMENTED,
-            "Rerank endpoint not implemented for OpenAI backend",
+            StatusCode::FORBIDDEN,
+            "Rerank endpoint not supported for OpenAI backend",
         )
             .into_response()
     }
