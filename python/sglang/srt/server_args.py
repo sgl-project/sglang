@@ -201,7 +201,6 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
-    preserve_proctitle: bool = False
 
     # Logging
     log_level: str = "info"
@@ -1309,11 +1308,6 @@ class ServerArgs:
             "--sleep-on-idle",
             action="store_true",
             help="Reduce CPU usage when sglang is idle.",
-        )
-        parser.add_argument(
-            "--preserve-proctitle",
-            action="store_true",
-            help="Preserve the original launch_server cmdline/skip setproctitle call.",
         )
 
         # Logging
