@@ -454,7 +454,10 @@ class TestToolChoiceLlama32(CustomTestCase):
             )
 
         # Verify the error message contains the expected text
-        self.assertIn("Tool 'nonexistent_function' not found in tools list", str(context.exception))
+        self.assertIn(
+            "Tool 'nonexistent_function' not found in tools list",
+            str(context.exception),
+        )
 
 
 class TestToolChoiceQwen25(TestToolChoiceLlama32):

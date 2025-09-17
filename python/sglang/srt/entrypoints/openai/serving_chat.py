@@ -23,9 +23,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     LogProbs,
     MessageProcessingResult,
     ToolCall,
+    ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
-    ToolCallProcessingResult,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -34,8 +34,8 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.function_call.utils import get_json_schema_constraint
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.utils import get_json_schema_constraint
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -73,10 +73,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
-        if (
-            request.tool_choice is not None
-            and not isinstance(request.tool_choice, str)
-        ):
+        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
             if not request.tools:
                 return "Tools cannot be empty if tool choice is set to a specific tool."
             tool_name = request.tool_choice.function.name
@@ -189,13 +186,24 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.function.model_dump() for item in request.tools]
 
             # Handle JSON schema constraint directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(request.tool_choice, ToolChoice) or (isinstance(request.tool_choice, dict) and "function" in request.tool_choice):
-                json_schema = get_json_schema_constraint(request.tools, request.tool_choice)
+            if (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ToolChoice)
+                or (
+                    isinstance(request.tool_choice, dict)
+                    and "function" in request.tool_choice
+                )
+            ):
+                json_schema = get_json_schema_constraint(
+                    request.tools, request.tool_choice
+                )
                 tool_call_constraint = ("json_schema", json_schema)
             else:
                 tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
                 parser = FunctionCallParser(request.tools, tool_call_parser)
-                tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+                tool_call_constraint = parser.get_structure_constraint(
+                    request.tool_choice
+                )
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -754,7 +762,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.tool_choice != "none" and request.tools:
                 tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
                 tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, tool_call_parser, finish_reason, request.tool_choice
+                    text,
+                    request.tools,
+                    tool_call_parser,
+                    finish_reason,
+                    request.tool_choice,
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -861,12 +873,14 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in the response"""
 
         # Handle required or named tool choice
-        if tool_choice == "required" or (isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"):
+        if tool_choice == "required" or (
+            isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
+        ):
             # Set finish reason to tool_calls since we're processing tool calls
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
-            
+
             try:
                 # For required tool choice, we expect a JSON array of tool calls
                 tool_call_data = json.loads(text)
@@ -877,8 +891,10 @@ class OpenAIServingChat(OpenAIServingBase):
                             id=self._get_tool_id(tool_call_parser, tool.get("name"), i),
                             index=i,
                             function=FunctionResponse(
-                                name=tool['name'], 
-                                arguments=json.dumps(tool['parameters'], ensure_ascii=False)
+                                name=tool["name"],
+                                arguments=json.dumps(
+                                    tool["parameters"], ensure_ascii=False
+                                ),
                             ),
                         )
                     )
@@ -886,11 +902,15 @@ class OpenAIServingChat(OpenAIServingBase):
             except json.JSONDecodeError as e:
                 logger.error(f"Tool call parsing error: {e}")
                 return ToolCallProcessingResult(None, text, finish_reason)
-        
+
         # Use JSON parser for required or named tool choice
-        if tool_choice == "required" or isinstance(tool_choice, ToolChoice) or (isinstance(tool_choice, dict) and "function" in tool_choice):
+        if (
+            tool_choice == "required"
+            or isinstance(tool_choice, ToolChoice)
+            or (isinstance(tool_choice, dict) and "function" in tool_choice)
+        ):
             tool_call_parser = "json"
-        
+
         # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, tool_call_parser)
         if parser.has_tool_call(text):
@@ -898,14 +918,16 @@ class OpenAIServingChat(OpenAIServingBase):
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
-            
+
             try:
                 text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = []
                 for call_info in call_info_list:
                     tool_calls.append(
                         ToolCall(
-                            id=self._get_tool_id(tool_call_parser, call_info.name, call_info.tool_index),
+                            id=self._get_tool_id(
+                                tool_call_parser, call_info.name, call_info.tool_index
+                            ),
                             index=getattr(call_info, "tool_index", None),
                             function=FunctionResponse(
                                 name=call_info.name, arguments=call_info.parameters
@@ -992,7 +1014,14 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
             # Use JSON detector directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(request.tool_choice, ToolChoice) or (isinstance(request.tool_choice, dict) and "function" in request.tool_choice):
+            if (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ToolChoice)
+                or (
+                    isinstance(request.tool_choice, dict)
+                    and "function" in request.tool_choice
+                )
+            ):
                 # Store JsonArrayParser directly for JSON schema constraints
                 parser_dict[index] = JsonArrayParser()
             else:
@@ -1001,7 +1030,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tools=request.tools,
                     tool_call_parser=tool_call_parser,
                 )
-        
+
         parser = parser_dict[index]
 
         # Handle both FunctionCallParser and JsonArrayParser
@@ -1080,8 +1109,8 @@ class OpenAIServingChat(OpenAIServingBase):
         even if the model generates the final arguments in the last chunk.
         """
         # Get the detector - either from FunctionCallParser or directly if json detector
-        detector = parser.detector if hasattr(parser, 'detector') else parser
-        
+        detector = parser.detector if hasattr(parser, "detector") else parser
+
         # Only check if we have tool calls and the detector has tracked data
         if (
             not hasattr(detector, "prev_tool_call_arr")
@@ -1101,9 +1130,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return None
 
         # Get expected vs actual arguments
-        expected_args = detector.prev_tool_call_arr[tool_index].get(
-            "arguments", {}
-        )
+        expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
         expected_call = json.dumps(expected_args, ensure_ascii=False)
         actual_call = detector.streamed_args_for_tool[tool_index]
 

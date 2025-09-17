@@ -921,8 +921,10 @@ class MessageProcessingResult:
 
 class ToolCallProcessingResult(NamedTuple):
     """Result of processing tool calls in a response."""
-    
-    tool_calls: Optional[List[Any]]  # List of ToolCall objects or None if parsing failed
+
+    tool_calls: Optional[
+        List[Any]
+    ]  # List of ToolCall objects or None if parsing failed
     remaining_text: str  # Text remaining after parsing tool calls
     finish_reason: Dict[str, Any]  # Updated finish reason dictionary
 

@@ -2239,19 +2239,22 @@ class TestJsonArrayParser(unittest.TestCase):
         """Test that the JsonArrayParser returns NotImplementedError for EBNF."""
         with self.assertRaises(NotImplementedError) as context:
             self.detector.build_ebnf(self.tools)
-        self.assertIn("EBNF generation is not supported for JSON schema constraints", str(context.exception))
+        self.assertIn(
+            "EBNF generation is not supported for JSON schema constraints",
+            str(context.exception),
+        )
 
     def test_has_tool_call(self):
         """Test detection of JSON tool calls"""
         # Test cases that should return True
         self.assertTrue(self.detector.has_tool_call("["))
-        self.assertTrue(self.detector.has_tool_call("[{\"name\": \"test\"}]"))
-        
+        self.assertTrue(self.detector.has_tool_call('[{"name": "test"}]'))
+
         # Test cases that should return False
         self.assertFalse(self.detector.has_tool_call(""))
         self.assertFalse(self.detector.has_tool_call("plain text"))
         self.assertFalse(self.detector.has_tool_call("some other content"))
-        self.assertFalse(self.detector.has_tool_call("{\"name\": \"test\"}"))
+        self.assertFalse(self.detector.has_tool_call('{"name": "test"}'))
 
 
 if __name__ == "__main__":
