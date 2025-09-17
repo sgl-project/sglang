@@ -23,6 +23,22 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.qwen3_next import Qwen3HybridLinearDecoderLayer, fused_gdn_gating
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.utils import is_npu
+
+if is_npu():
+    from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
+    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update_npu,
+    )
+    from sgl_kernel_npu.mamba.causal_conv1d import (
+        causal_conv1d_fn_npu,
+        causal_conv1d_update_npu,
+    )
+
+    chunk_gated_delta_rule = chunk_gated_delta_rule_npu
+    fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
+    causal_conv1d_fn = causal_conv1d_fn_npu
+    causal_conv1d_update = causal_conv1d_update_npu
 
 
 @dataclass
@@ -85,10 +101,12 @@ class MambaAttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(max_bs):
             self.state_indices_list.append(
-                torch.full((i + 1,), self.pad_slot_id, dtype=torch.int32, device="cuda")
+                torch.full(
+                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                )
             )
             self.query_start_loc_list.append(
-                torch.empty((i + 2,), dtype=torch.int32, device="cuda")
+                torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -110,7 +128,7 @@ class MambaAttnBackend(AttentionBackend):
                     bs * spec_info.draft_token_num + 1,
                     step=spec_info.draft_token_num,
                     dtype=torch.int32,
-                    device="cuda",
+                    device=self.device,
                 )
             )
         else:
@@ -152,7 +170,7 @@ class MambaAttnBackend(AttentionBackend):
                     bs * spec_info.draft_token_num + 1,
                     step=spec_info.draft_token_num,
                     dtype=torch.int32,
-                    device="cuda",
+                    device=self.device,
                 )
             )
             if num_padding > 0:

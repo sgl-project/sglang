@@ -149,8 +149,8 @@ class TpModelWorker:
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
         assert (
-            self.max_queued_requests > 0
-        ), "max_queued_requests is zero. We need to be at least 1 to schedule a request."
+            self.max_queued_requests is None or self.max_queued_requests >= 1
+        ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
@@ -259,6 +259,15 @@ class TpModelWorker:
 
             if skip_sample:
                 next_token_ids = None
+                # For prefill-only requests, we still need to compute logprobs even when sampling is skipped
+                if (
+                    model_worker_batch.is_prefill_only
+                    and model_worker_batch.return_logprob
+                ):
+                    # Compute logprobs without full sampling
+                    self.model_runner.compute_logprobs_only(
+                        logits_output, model_worker_batch
+                    )
             else:
                 next_token_ids = self.model_runner.sample(
                     logits_output, model_worker_batch

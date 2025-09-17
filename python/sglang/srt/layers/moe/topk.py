@@ -19,6 +19,7 @@ import math
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import (
+    TYPE_CHECKING,
     Callable,
     NamedTuple,
     Optional,
@@ -50,6 +51,9 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization import QuantizationConfig
 
 try:
     from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
@@ -94,6 +98,7 @@ class TopKConfig:
     torch_native: bool = False
     routed_scaling_factor: Optional[float] = None
     apply_routed_scaling_factor_on_output: bool = False
+    output_format: Optional[TopKOutputFormat] = None
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -196,9 +201,10 @@ class TopK(CustomOp):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         routed_scaling_factor: Optional[float] = None,
         apply_routed_scaling_factor_on_output: Optional[bool] = False,
-        force_topk: bool = False,
+        output_format: Optional[TopKOutputFormat] = None,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -218,10 +224,8 @@ class TopK(CustomOp):
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            output_format=output_format,
         )
-
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
-        self.force_topk = force_topk
 
     def forward_native(
         self,
@@ -248,7 +252,19 @@ class TopK(CustomOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        if self.use_triton_kernels:
+        if self.topk_config.output_format is not None:
+            output_format = self.topk_config.output_format
+        elif get_moe_runner_backend().is_triton_kernel():
+            output_format = TopKOutputFormat.TRITON_KERNEL
+        elif (
+            should_use_flashinfer_trtllm_moe()
+            or get_moe_runner_backend().is_flashinfer_mxfp4()
+        ):
+            output_format = TopKOutputFormat.BYPASSED
+        else:
+            output_format = TopKOutputFormat.STANDARD
+
+        if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
             routing_data, gather_idx, scatter_idx = routing(
                 router_logits,
@@ -256,10 +272,7 @@ class TopK(CustomOp):
                 sm_first=not self.topk_config.renormalize,
             )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
-        elif not self.force_topk and (
-            should_use_flashinfer_trtllm_moe()
-            or get_moe_runner_backend().is_flashinfer_mxfp4()
-        ):
+        elif output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
