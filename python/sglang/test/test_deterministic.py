@@ -2,7 +2,7 @@
 Batch the same prompt in random batch sizes, and test if the results are consistent across different trials.
 
 Usage:
-python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials> --test-mode <single|mixed> --profile
+python3 -m sglang.test.test_deterministic --n-trials <numer_of_trials> --test-mode <single|mixed|prefix> --profile
 """
 
 import argparse
