@@ -342,7 +342,11 @@ impl RouterManager {
     }
 
     /// Query server info from a worker URL
-    async fn query_server_info(&self, url: &str, api_key: &Option<String>) -> Result<ServerInfo, String> {
+    async fn query_server_info(
+        &self,
+        url: &str,
+        api_key: &Option<String>,
+    ) -> Result<ServerInfo, String> {
         let info_url = format!("{}/get_server_info", url.trim_end_matches('/'));
 
         let mut req_builder = self.client.get(&info_url);
