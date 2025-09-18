@@ -43,10 +43,20 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
   ```bash
   # Node 0
-  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --dist-init-addr sgl-dev-0:50000 --nnodes 2 --node-rank 0
+  python -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+    --tp 4 \
+    --dist-init-addr sgl-dev-0:50000 \
+    --nnodes 2 \
+    --node-rank 0
 
   # Node 1
-  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --dist-init-addr sgl-dev-0:50000 --nnodes 2 --node-rank 1
+  python -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+    --tp 4 \
+    --dist-init-addr sgl-dev-0:50000 \
+    --nnodes 2 \
+    --node-rank 1
   ```
 
 Please consult the documentation below and [server_args.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py) to learn more about the arguments you may provide when launching a server.
