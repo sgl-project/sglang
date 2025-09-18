@@ -61,6 +61,7 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     MultiTokenizerWrapper,
     OpenSessionReqOutput,
+    Ranks,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -362,6 +363,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
+                (Ranks, self.update_ranks),
             ]
         )
 
@@ -1705,6 +1707,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             }
         state.out_list.append(out)
         state.event.set()
+    
+    def update_ranks(self, ranks: Ranks):
+        self.send_to_scheduler.send_pyobj(ranks)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
