@@ -80,7 +80,23 @@ class CommonKVManager(BaseKVManager):
                 else:
                     host, _ = self.dist_init_addr.rsplit(":", 1)
             else:
-                host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
+                # IPv6-ready: resolve FQDN/IPv4/IPv6 via AF_UNSPEC and
+                # bracket-wrap IPv6 for safe "{host}:{port}" URL building.
+                _raw_host = self.dist_init_addr.rsplit(":", 1)[0]
+                try:
+                    infos = socket.getaddrinfo(
+                        _raw_host,
+                        None,
+                        family=socket.AF_UNSPEC,
+                        type=socket.SOCK_STREAM,
+                    )
+                    host = infos[0][4][0]  # let OS policy pick v4/v6
+                except socket.gaierror:
+                    # Fallback to the literal/FQDN if resolution fails now.
+                    host = _raw_host
+                # Wrap IPv6 literal with brackets so f"{host}:{port}" is valid.
+                if ":" in host and not host.startswith("["):
+                    host = f"[{host}]"
         else:
             # single node: bootstrap server's host is same as http server's host
             host = self.bootstrap_host
