@@ -103,20 +103,6 @@ class HiCacheStorage(ABC):
         """
         pass
 
-    @abstractmethod
-    def delete(self, key: str) -> bool:
-        """
-        Delete the entry associated with the given key.
-        """
-        pass
-
-    @abstractmethod
-    def clear(self) -> bool:
-        """
-        Clear all entries in the storage.
-        """
-        pass
-
     def batch_exists(self, keys: List[str]) -> int:
         """
         Check if the keys exist in the storage.
@@ -127,6 +113,9 @@ class HiCacheStorage(ABC):
             if not self.exists(keys[i]):
                 return i
         return len(keys)
+
+    def get_stats(self):
+        return None
 
 
 class HiCacheFile(HiCacheStorage):
@@ -223,15 +212,6 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
-
-    def delete(self, key: str) -> None:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        try:
-            os.remove(tensor_path)
-        except FileNotFoundError:
-            logger.warning(f"Key {key} does not exist. Cannot delete.")
-            return
 
     def clear(self) -> bool:
         try:
