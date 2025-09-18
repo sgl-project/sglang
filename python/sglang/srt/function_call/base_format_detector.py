@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List
 
 from partial_json_parser.core.options import Allow
+from partial_json_parser.core.exceptions import MalformedJSON
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.core_types import (
