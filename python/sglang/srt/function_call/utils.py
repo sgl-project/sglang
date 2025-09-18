@@ -8,6 +8,14 @@ from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
+_WS = " \t\r\n"
+
+
+def _skip_ws(s: str, i: int) -> int:
+    while i < len(s) and s[i] in _WS:
+        i += 1
+    return i
+
 
 def _find_common_prefix(s1: str, s2: str) -> str:
     prefix = ""
@@ -40,7 +48,30 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
     """
     try:
         return (partial_json_parser.loads(input_str, flags), len(input_str))
-    except JSONDecodeError as e:
+    except (JSONDecodeError, IndexError) as e:
+        # Handle case where we have a closing bracket without opening bracket
+        # e.g., '{ "json": "object" } ]' -> extract '{ "json": "object" }'
+        if isinstance(e, IndexError) and "pop from empty list" in str(e):
+            # If there's a trailing ']' without a matching '[', drop it and decode first value
+            pos = input_str.rfind("]")
+            if pos != -1:
+                # Ensure only whitespace after the found ']'
+                tail = input_str[pos + 1 :]
+                only_ws_after = True
+                for ch in tail:
+                    if ch not in _WS:
+                        only_ws_after = False
+                        break
+                if only_ws_after:
+                    candidate = input_str[:pos] + input_str[pos + 1 :]
+                    start2 = _skip_ws(candidate, 0)
+                    dec = JSONDecoder()
+                    try:
+                        obj, end = dec.raw_decode(candidate, start2)
+                        return obj, end
+                    except JSONDecodeError:
+                        raise
+
         if "Extra data" in e.msg:
             # Find the end of the leading whitespace
             # See JSONDecoder.decode for reference
@@ -52,7 +83,6 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
             except JSONDecodeError:
                 # Not even a single complete value available → re-raise original
                 raise
-
             return obj, end
         raise
 
