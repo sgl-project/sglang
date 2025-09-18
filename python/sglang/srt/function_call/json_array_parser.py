@@ -21,7 +21,6 @@ class JsonArrayParser(BaseFormatDetector):
         self.bot_token = "["
         self.eot_token = "]"
         self.tool_call_separator = ","
-        self._pending_separator = False
 
     def has_tool_call(self, text: str) -> bool:
         """
