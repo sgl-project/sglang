@@ -567,8 +567,7 @@ def apply_fp8_linear(
         num_token_padding = output_padding
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             num_token_padding = None
-        _scaled_fp8_quant = scaled_fp8_quant if _is_cuda else ops.scaled_fp8_quant
-        qinput, x_scale = _scaled_fp8_quant(
+        qinput, x_scale = scaled_fp8_quant(
             input_2d,
             input_scale,
             num_token_padding=num_token_padding,
@@ -591,7 +590,7 @@ def apply_fp8_linear(
                 # final solution should be: 1. add support to per-tensor activation scaling.
                 # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
                 if _is_hip and weight_scale.numel() == 1:
-                    qinput, x_scale = ops.scaled_fp8_quant(
+                    qinput, x_scale = scaled_fp8_quant(
                         input_2d,
                         input_scale,
                         use_per_token_if_dynamic=use_per_token_if_dynamic,
