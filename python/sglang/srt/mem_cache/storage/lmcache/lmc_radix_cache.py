@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from python.sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -78,6 +79,7 @@ class LMCRadixCache(RadixCache):
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         super().__init__(
             req_to_token_pool=req_to_token_pool,
@@ -85,6 +87,7 @@ class LMCRadixCache(RadixCache):
             page_size=page_size,
             disable=disable,
             enable_kv_cache_events=enable_kv_cache_events,
+            scheduler_metrics_collector=scheduler_metrics_collector,
         )
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()

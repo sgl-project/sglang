@@ -109,6 +109,7 @@ class SchedulerMetricsMixin:
             num_used, token_usage, _, _ = self._get_token_info()
             token_msg = f"token usage: {token_usage:.2f}, "
 
+        self.stats.new_token_ratio = adder.new_token_ratio
         num_new_seq = len(can_run_list)
         f = (
             f"Prefill batch. "
