@@ -113,6 +113,3 @@ Not dynamically. Restart the server with workloads that don't require FULL.
 
 **Q: How do I know which batches are captured?**
 Check startup logs or enable profiling; they enumerate captured batch sizes.
-
-## Developer Integration Notes (Advanced)
-Look in code: capture + recapture in `model_executor/cuda_graph_runner.py`; backend hooks in `layers/attention/*` (`base_attn_backend.py` defines the contract); distributed buffer registration in `distributed/device_communicators/*` and `parallel_state.py`; LoRA adjustments in `lora/lora_manager.py`; heuristics in `server_args.py`; speculative variants in `speculative/eagle_*_cuda_graph_runner.py`. Use `--enable-profile-cuda-graph` to inspect timings; `--disable-cuda-graph` to bisect.
