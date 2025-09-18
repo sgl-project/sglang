@@ -23,7 +23,7 @@ def _find_cuda_home():
     return cuda_home
 
 
-if torch.version.hip is None:
+if torch.version.cuda is not None:
     cuda_home = Path(_find_cuda_home())
 
     if (cuda_home / "lib").is_dir():
