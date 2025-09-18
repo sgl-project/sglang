@@ -21,6 +21,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromCkptEngineReqInput,
+    UpdateWeightsFromCkptEngineReqOutput,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,6 +76,18 @@ class SchedulerUpdateWeightsMixin:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
+
+    def update_weights_from_ckpt_engine(self, recv_req: UpdateWeightsFromCkptEngineReqInput):
+        """Update the online model parameter from tensors."""
+        success, message = self.tp_worker.update_weights_from_ckpt_engine(recv_req)
+        if success:
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return UpdateWeightsFromCkptEngineReqOutput(success, message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)

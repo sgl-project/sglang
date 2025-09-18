@@ -1198,6 +1198,51 @@ class ModelRunner:
 
         return True, "Success"
 
+    def update_weights_from_ckpt_engine(
+        self, model_path: str, load_format
+    ) -> tuple[bool, str]:
+        """Update engine weights in-place from the checkpoint engine."""
+        logger.info(
+            f"Update engine weights online from checkpoint engine begin. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+        self.model_config.model_path = model_path
+        load_config = LoadConfig(load_format=load_format)
+        loader = get_model_loader(load_config)
+        device_config = DeviceConfig(self.device, self.gpu_id)
+
+        def get_weight_iter(config):
+            iter = loader._get_weights_iterator(
+                DefaultModelLoader.Source.init_new(config, self.model)
+            )
+            return iter
+
+        def model_load_weights(model, iter):
+            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
+            return model
+
+        with set_default_torch_dtype(self.model_config.dtype):
+            try:
+                model = loader.load_model(model_config=self.model_config, device_config=device_config)
+            except Exception as e:
+                message = (
+                    f"Failed to update weights: {e}.\nRolling back to original weights."
+                )
+                del iter
+                gc.collect()
+                iter = get_weight_iter(self.model_config)
+                self.model = model_load_weights(self.model, iter)
+                return False, message
+
+        self.model = model
+        self.server_args.model_path = model_path
+        self.server_args.load_format = load_format
+        self.load_config = load_config
+
+        logger.info("Update weights from ckpt engine end.")
+        return True, "Succeeded to update model weights."
+
+
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100
     ) -> Optional[torch.Tensor]:

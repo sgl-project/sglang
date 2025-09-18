@@ -63,10 +63,13 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromCkptEngineReqInput,
+    UpdateWeightsFromCkptEngineReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
+from sglang.srt.configs.load_config import LoadFormat
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -166,6 +169,9 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_tensor_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_weights_from_ckpt_engine_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -231,6 +237,10 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromTensorReqOutput,
                     self.update_weights_from_tensor_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromCkptEngineReqOutput,
+                    self.update_weights_from_ckpt_engine_communicator.handle_recv,
                 ),
                 (
                     GetWeightsByNameReqOutput,
@@ -384,6 +394,28 @@ class TokenizerCommunicatorMixin:
         async with self.model_update_lock.writer_lock:
             result = (await self.update_weights_from_distributed_communicator(obj))[0]
             return result.success, result.message
+
+    async def update_weights_from_ckpt_engine(
+        self,
+        obj: UpdateWeightsFromCkptEngineReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+
+        # default the load format to ckpt_engine
+        if obj.load_format is None:
+            obj.load_format = LoadFormat.CKPT_ENGINE
+        logger.info("Start update_weights. Load format=%s", obj.load_format)
+
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
+        if True:  # Keep this redundant check to simplify some internal code sync
+            # Hold the lock if it is not async. This means that weight sync
+            # cannot run while requests are in progress.
+            async with self.model_update_lock.writer_lock:
+                result = (await self.update_weights_from_ckpt_engine_communicator(obj))[0]
+                return result.success, result.message
 
     async def init_weights_send_group_for_remote_instance(
         self,

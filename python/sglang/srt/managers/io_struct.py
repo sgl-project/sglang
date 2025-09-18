@@ -1035,6 +1035,26 @@ class UpdateWeightsFromTensorReqOutput:
 
 
 @dataclass
+class UpdateWeightsFromCkptEngineReqInput:
+    # The model path with the new weights
+    model_path: str
+    # The format to load the weights
+    load_format: Optional[str] = None
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+
+@dataclass
+class UpdateWeightsFromCkptEngineReqOutput:
+    success: bool
+    message: str
+    # Number of paused requests during weight sync.
+    num_paused_requests: Optional[int] = 0
+
+@dataclass
 class InitWeightsSendGroupForRemoteInstanceReqInput:
     # The master address
     master_address: str
