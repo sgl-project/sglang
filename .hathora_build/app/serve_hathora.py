@@ -141,6 +141,9 @@ if CONFIG.h100_only and not _is_h100_only():
 if CONFIG.hf_token:
     os.environ["HF_TOKEN"] = CONFIG.hf_token
 
+if getattr(CONFIG, "enable_expandable_segments", False):
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 if CONFIG.enable_metrics:
     # Ensure prometheus multi-process directory is configured
     try:
@@ -252,6 +255,7 @@ async def lifespan(app: FastAPI):
             kv_cache_dtype=kv_dtype,
             tp_size=CONFIG.tp_size,
             max_total_tokens=CONFIG.max_total_tokens,
+            enable_memory_saver=getattr(CONFIG, "enable_memory_saver", True),
             mem_fraction_static=CONFIG.mem_fraction_static,
             schedule_conservativeness=CONFIG.schedule_conservativeness,
             max_queued_requests=CONFIG.max_queued_requests,

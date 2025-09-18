@@ -31,6 +31,11 @@ class DeploymentConfig(BaseModel):
     log_requests: bool = Field(default=True)
     enable_p2p_check: bool = Field(default=False)
     enable_torch_compile: bool = Field(default=False)
+    enable_memory_saver: bool = Field(default=True, description="Enable memory saver to reduce VRAM usage")
+    enable_expandable_segments: bool = Field(
+        default=True,
+        description="If true, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to reduce fragmentation",
+    )
 
     # Platform constraints and heuristics
     h100_only: bool = Field(default=True, description="Fail fast if GPUs are not H100 class")
