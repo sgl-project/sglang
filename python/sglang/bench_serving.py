@@ -866,10 +866,16 @@ class DatasetRow:
     prompt: str
     prompt_len: int
     output_len: int
-    text_prompt_len: int
-    vision_prompt_len: int
+    text_prompt_len: Optional[int] = None
+    vision_prompt_len: Optional[int] = None
     image_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
+
+    def __post_init__(self):
+        if self.text_prompt_len is None:
+            self.text_prompt_len = self.prompt_len
+        if self.vision_prompt_len is None:
+            self.vision_prompt_len = 0
 
 
 async def get_mooncake_request_over_time(
@@ -1123,8 +1129,6 @@ def sample_sharegpt_requests(
                 prompt=prompt,
                 prompt_len=prompt_len,
                 output_len=output_len,
-                text_prompt_len=prompt_len,
-                vision_prompt_len=0,
             )
         )
 
@@ -1210,8 +1214,6 @@ def sample_random_requests(
                     prompt=input_content,
                     prompt_len=int(input_lens[i]),
                     output_len=int(output_lens[i]),
-                    text_prompt_len=int(input_lens[i]),
-                    vision_prompt_len=0,
                 )
             )
     else:
@@ -1230,8 +1232,6 @@ def sample_random_requests(
                     prompt=input_content,
                     prompt_len=int(input_lens[i]),
                     output_len=int(output_lens[i]),
-                    text_prompt_len=int(input_lens[i]),
-                    vision_prompt_len=0,
                 )
             )
 
@@ -1489,8 +1489,6 @@ def sample_generated_shared_prefix_requests(
                     prompt=full_prompt,
                     prompt_len=prompt_len,
                     output_len=output_len,
-                    text_prompt_len=prompt_len,
-                    vision_prompt_len=0,
                 )
             )
             total_input_tokens += prompt_len
