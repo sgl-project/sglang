@@ -763,9 +763,6 @@ class HiRadixCache(RadixCache):
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
 
-        if value is None:
-            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
-
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
