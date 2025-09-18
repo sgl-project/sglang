@@ -1,5 +1,3 @@
-import torch
-
 ATTENTION_BACKENDS = {}
 
 
@@ -13,6 +11,8 @@ def register_attention_backend(name):
 
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
+    import torch
+
     if not runner.use_mla_backend:
         from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
@@ -103,6 +103,8 @@ def create_flashmla_backend(runner):
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):
+    import torch
+
     assert (
         torch.cuda.get_device_capability()[0] == 8 and not runner.use_mla_backend
     ) or torch.cuda.get_device_capability()[0] == 9, (
