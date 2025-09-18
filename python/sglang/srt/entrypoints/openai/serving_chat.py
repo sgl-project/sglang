@@ -187,7 +187,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice
                 )
-
         # Use chat template
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
@@ -747,8 +746,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 and request.tools
                 and self.tool_call_parser
             ):
+                history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, finish_reason
+                    text, request.tools, finish_reason, history_tool_calls_cnt
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -843,6 +843,7 @@ class OpenAIServingChat(OpenAIServingBase):
         text: str,
         tools: List[Any],
         finish_reason: Dict[str, Any],
+        history_tool_calls_cnt: int = 0,
     ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
         """Process tool calls in the response"""
         parser = FunctionCallParser(tools, self.tool_call_parser)
@@ -859,7 +860,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         self.tool_call_parser == "kimi_k2"
                         and call_info.name is not None
                     ):
-                        tool_id = f"functions.{call_info.name}:{call_info.tool_index}"
+                        tool_id = f"functions.{call_info.name}:{history_tool_calls_cnt}"
+                        history_tool_calls_cnt += 1
                     else:
                         tool_id = f"call_{uuid.uuid4().hex[:24]}"
 
@@ -918,6 +920,28 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
+    def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
+        """Couting the 'history_tool_calls_cnt' value from request chat_template_kwargs.
+
+        NOTE: This method is only useful for models that include self-increasing
+        history tool call idx in tool calls id, such as kimi-k2
+
+        Args:
+            request_obj: The request object (or an item from a list of requests).
+        Returns:
+            The int value of 'history_tool_calls_cnt' if any, otherwise 0.
+        """
+        if self.tool_call_parser != "kimi_k2":
+            return 0
+
+        messages = getattr(request, "messages", [])
+        idx = 0
+        for msg in messages:
+            if msg.role == "assistant":
+                tool_calls = getattr(msg, "tool_calls", None)
+                idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
+        return idx
+
     def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
         """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
 
@@ -975,6 +999,7 @@ class OpenAIServingChat(OpenAIServingBase):
             yield f"data: {chunk.model_dump_json()}\n\n"
 
         # Yield tool calls
+        history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for call_item in calls:
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
@@ -984,7 +1009,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk: include ID and function name
                 if self.tool_call_parser == "kimi_k2":
                     # Align with Kimi-K2 format: functions.{name}:{index}
-                    tool_call_id = f"functions.{call_item.name}:{call_item.tool_index}"
+                    # The model generated index might be always 0 and make the model confuse with tool calls.
+                    # Follow the Kimi-K2 chat format, let's reset the latest index with `history_tool_calls_cnt` here.
+                    logger.debug(f"Process stream tool call idx parser: {self.tool_call_parser} name: {call_item.name}, index: {call_item.tool_index}, history: {history_tool_calls_cnt}")
+                    tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt}"
+                    history_tool_calls_cnt += 1
                 else:
                     tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
                 function_name = call_item.name
