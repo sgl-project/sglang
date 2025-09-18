@@ -1825,7 +1825,7 @@ class ModelOptModelLoader(DefaultModelLoader):
 
             # Create calibration dataloader
             calib_dataloader = get_dataset_dataloader(
-                dataset_name="cnn_dailymail",
+                dataset_name="cnn_dailymail",  # TODO: Consider making this configurable
                 tokenizer=tokenizer,
                 batch_size=36,  # TODO: Consider making this configurable
                 num_samples=512,  # TODO: Consider making this configurable
