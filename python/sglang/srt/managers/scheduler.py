@@ -72,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    DestroyWeightsUpdateGroupReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -566,6 +567,7 @@ class Scheduler(
                 (CloseSessionReqInput, self.close_session),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
+                (DestroyWeightsUpdateGroupReqInput, self.destroy_weights_update_group),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqInput,
                     self.init_weights_send_group_for_remote_instance,
@@ -667,6 +669,7 @@ class Scheduler(
                         else self.tp_cpu_group
                     ),
                     page_size=self.page_size,
+                    eviction_policy=server_args.radix_eviction_policy,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
@@ -719,6 +722,7 @@ class Scheduler(
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
+                    eviction_policy=server_args.radix_eviction_policy,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -727,6 +731,7 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
+                    eviction_policy=server_args.radix_eviction_policy,
                 )
 
         self.decode_mem_cache_buf_multiplier = (

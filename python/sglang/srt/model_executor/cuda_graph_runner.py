@@ -100,6 +100,7 @@ def freeze_gc(enable_cudagraph_gc: bool):
     finally:
         if should_freeze:
             gc.unfreeze()
+            gc.collect()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):

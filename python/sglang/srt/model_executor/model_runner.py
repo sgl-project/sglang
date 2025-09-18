@@ -1025,6 +1025,19 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
+    def destroy_weights_update_group(self, group_name):
+        try:
+            if group_name in self._model_update_group:
+                pg = self._model_update_group.pop(group_name)
+                torch.distributed.destroy_process_group(pg)
+                return True, "Succeeded to destroy custom process group."
+            else:
+                return False, "The group to be destroyed does not exist."
+        except Exception as e:
+            message = f"Failed to destroy custom process group: {e}."
+            logger.error(message)
+            return False, message
+
     def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
         """
         Update specific parameter in the model weights online
@@ -1773,6 +1786,12 @@ class ModelRunner:
             )
 
             return TorchNativeAttnBackend(self)
+        elif backend_str == "flex_attention":
+            from sglang.srt.layers.attention.torch_flex_backend import (
+                TorchFlexAttnBackend,
+            )
+
+            return TorchFlexAttnBackend(self)
         elif backend_str == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
