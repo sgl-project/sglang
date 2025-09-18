@@ -1543,7 +1543,7 @@ class CkptEngineModelLoader(BaseModelLoader):
     def load_model_from_ckpt_engine(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
-        socket = client.get_socket_handle(device_config.gpu_id)
+        client.get_socket_handle(device_config.gpu_id)
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -1552,7 +1552,7 @@ class CkptEngineModelLoader(BaseModelLoader):
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
         for key, tensor in weights_iterator:
             # FIXME: use more elegant method
-            if key == "model.embed_tokens.weight":
+            if key == "model.embed_tokens.weight" and key not in state_dict:
                 key = "lm_head.weight"
             if key not in state_dict:
                 continue
