@@ -395,6 +395,8 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
+    enable_torch_compile_fusion: bool = False
+    enable_torch_compile_graph_trace_logs: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -2338,6 +2340,16 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess.",
+        )
+        parser.add_argument(
+            "--enable-torch-compile-fusion",
+            action="store_true",
+            help="Enables operator fusion using custom torch compile/inductor passes.",
+        )
+        parser.add_argument(
+            "--enable-torch-compile-graph-trace-logs",
+            action="store_true",
+            help="Enables logging of traced before and after graphs for fusion passes, to be use with log level debug.",
         )
 
         # Debug tensor dumps
