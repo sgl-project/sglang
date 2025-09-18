@@ -96,6 +96,7 @@ ATTENTION_BACKEND_CHOICES = [
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
+    "fa4",
     "flashinfer",
     "flashmla",
     "trtllm_mla",
@@ -109,6 +110,8 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
 ]
+
+LORA_BACKEND_CHOICES = ["triton", "csgmv"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
@@ -169,16 +172,20 @@ class ServerArgs:
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
-    max_queued_requests: Optional[int] = sys.maxsize
+    max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
+    enable_priority_scheduling: bool = False
+    schedule_low_priority_values_first: bool = False
+    priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
+    radix_eviction_policy: str = "lru"
 
     # Runtime options
     device: Optional[str] = None
@@ -375,6 +382,7 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
@@ -1164,6 +1172,24 @@ class ServerArgs:
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
+            "--enable-priority-scheduling",
+            action="store_true",
+            default=ServerArgs.enable_priority_scheduling,
+            help="Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
+        )
+        parser.add_argument(
+            "--schedule-low-priority-values-first",
+            action="store_true",
+            default=ServerArgs.schedule_low_priority_values_first,
+            help="If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first.",
+        )
+        parser.add_argument(
+            "--priority-scheduling-preemption-threshold",
+            type=int,
+            default=ServerArgs.priority_scheduling_preemption_threshold,
+            help="Minimum difference in priorities for an incoming request to have to preempt running request(s).",
+        )
+        parser.add_argument(
             "--schedule-conservativeness",
             type=float,
             default=ServerArgs.schedule_conservativeness,
@@ -1601,7 +1627,8 @@ class ServerArgs:
         parser.add_argument(
             "--lora-backend",
             type=str,
-            default="triton",
+            choices=LORA_BACKEND_CHOICES,
+            default=ServerArgs.lora_backend,
             help="Choose the kernel backend for multi-LoRA serving.",
         )
 
@@ -1880,6 +1907,13 @@ class ServerArgs:
             choices=["write_back", "write_through", "write_through_selective"],
             default=ServerArgs.hicache_write_policy,
             help="The write policy of hierarchical cache.",
+        )
+        parser.add_argument(
+            "--radix-eviction-policy",
+            type=str,
+            choices=["lru", "lfu"],
+            default=ServerArgs.radix_eviction_policy,
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
         )
         parser.add_argument(
             "--hicache-io-backend",
@@ -2189,6 +2223,11 @@ class ServerArgs:
             help="Adopt base image processor instead of fast image processor.",
         )
         parser.add_argument(
+            "--keep-mm-feature-on-device",
+            action="store_true",
+            help="Keep multimodal feature tensors on device after processing to save D2H copy.",
+        )
+        parser.add_argument(
             "--enable-return-hidden-states",
             action="store_true",
             help="Enable returning hidden states with responses.",
@@ -2451,6 +2490,13 @@ class ServerArgs:
             "--generation-tokens-buckets", self.generation_tokens_buckets
         )
 
+        # Check scheduling policy
+        if self.enable_priority_scheduling:
+            assert self.schedule_policy in [
+                "fcfs",
+                "lof",
+            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
@@ -2645,7 +2691,7 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
 
-        elif "Llama4" in model_arch:
+        elif "Llama4" in model_arch and self.device != "cpu":
             assert self.attention_backend in {
                 "fa3",
                 "aiter",

@@ -24,6 +24,7 @@ suites = {
         TestFile("lora/test_lora_update.py", 400),
         TestFile("lora/test_lora_qwen3.py", 97),
         TestFile("lora/test_lora_radix_cache.py", 100),
+        TestFile("lora/test_chunked_sgmv_backend.py", 30),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -80,6 +81,7 @@ suites = {
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
+        TestFile("test_logprobs.py", 55),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
@@ -93,6 +95,7 @@ suites = {
         TestFile("test_original_logprobs.py", 200),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
+        TestFile("test_priority_scheduling.py", 100),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
         TestFile("test_regex_constrained.py", 64),
@@ -139,6 +142,7 @@ suites = {
     "per-commit-8-gpu": [
         # Disabled because it hangs on the CI.
         # TestFile("ep/test_moe_ep.py", 181),
+        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 800),
         TestFile("lora/test_lora_llama4.py", 600),
         TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_different_tp.py", 155),
