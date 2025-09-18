@@ -143,7 +143,7 @@ def get_backend_from_name(name: str) -> BaseLoRABackend:
         # from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 
         # return TritonLoRABackend
-        pass # FIXME: Hack to trigger CI, remove before merging.
+        pass  # FIXME: Hack to trigger CI, remove before merging.
     elif name == "csgmv":
         from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 
