@@ -1837,7 +1837,9 @@ class ModelOptModelLoader(DefaultModelLoader):
 
             # Apply quantization
             mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
-            mtq.print_quant_summary(model)
+
+            if get_tensor_model_parallel_rank() == 0:
+                mtq.print_quant_summary(model)
 
             # Save checkpoint if path provided
             if quantized_ckpt_save_path:
