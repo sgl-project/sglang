@@ -60,8 +60,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.eagle_utils_v2 import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 _is_npu = is_npu()
 
@@ -81,6 +81,10 @@ class ForwardMode(IntEnum):
     TARGET_VERIFY = auto()
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
+    # Used in speculative decoding: extend a batch in the draft model.
+    # This is used in eagle_worker_v2.
+    # It is almost the same as EXTEND, but returns all hidden states and logits.
+    DRAFT_EXTEND_V2 = auto()
 
     # A dummy first batch to start the pipeline for overlap scheduler.
     # It is now used for triggering the sampling_info_done event for the first prefill batch.
@@ -96,8 +100,9 @@ class ForwardMode(IntEnum):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
-            or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.DRAFT_EXTEND
+            or self == ForwardMode.DRAFT_EXTEND_V2
         )
 
     def is_decode(self):
@@ -117,6 +122,9 @@ class ForwardMode(IntEnum):
 
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
+
+    def is_draft_extend_v2(self):
+        return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self):
         return (
@@ -300,6 +308,7 @@ class ForwardBatch:
     # For padding
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
+    num_token_non_padded_cpu: int = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -361,10 +370,11 @@ class ForwardBatch:
             ret.num_token_non_padded = torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
+        ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync
         if batch.global_num_tokens is not None:
-            from sglang.srt.speculative.eagle_utils import (
+            from sglang.srt.speculative.eagle_utils_v2 import (
                 EagleDraftInput,
                 EagleVerifyInput,
             )
@@ -384,11 +394,11 @@ class ForwardBatch:
                 else:
                     assert isinstance(batch.spec_info, EagleVerifyInput)
                     global_num_tokens = [
-                        x * batch.spec_info.draft_token_num
+                        x * batch.spec_info.num_draft_tokens
                         for x in batch.global_num_tokens
                     ]
                     global_num_tokens_for_logprob = [
-                        x * batch.spec_info.draft_token_num
+                        x * batch.spec_info.num_draft_tokens
                         for x in batch.global_num_tokens_for_logprob
                     ]
             else:
@@ -420,16 +430,22 @@ class ForwardBatch:
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode():
+        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
-            ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            if isinstance(batch.extend_seq_lens, list):
+                ret.extend_seq_lens = torch.tensor(
+                    batch.extend_seq_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+            else:
+                ret.extend_seq_lens = batch.extend_seq_lens
+            if isinstance(batch.extend_prefix_lens, list):
+                ret.extend_prefix_lens = torch.tensor(
+                    batch.extend_prefix_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+            else:
+                ret.extend_prefix_lens = batch.extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
@@ -670,7 +686,7 @@ class ForwardBatch:
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
 
-        from sglang.srt.speculative.eagle_utils import EagleDraftInput
+        from sglang.srt.speculative.eagle_utils_v2 import EagleDraftInput
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
@@ -778,10 +794,10 @@ class ForwardBatch:
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
                 )
-            if spec_info.accept_length is not None:
-                spec_info.accept_length = self._pad_tensor_to_size(
-                    spec_info.accept_length, bs
-                )
+            # if spec_info.accept_length is not None:
+            #     spec_info.accept_length = self._pad_tensor_to_size(
+            #         spec_info.accept_length, bs
+            #     )
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens
             )
@@ -805,7 +821,7 @@ class ForwardBatch:
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
-                num_tokens = bs * self.spec_info.draft_token_num
+                num_tokens = bs * self.spec_info.num_draft_tokens
                 logits_output.next_token_logits = logits_output.next_token_logits[
                     :num_tokens
                 ]
@@ -926,6 +942,16 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+
+@dataclass
+class ForwardBatchOutput:
+    logits_output: Optional[torch.Tensor] = None
+    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
+    next_token_ids: Optional[torch.Tensor] = None  # shape: (b, 1)
+    can_run_cuda_graph: bool = False
+    spec_info: Optional[SpecInfo] = None
+    accept_length: Optional[torch.Tensor] = None
 
 
 def enable_num_token_non_padded(server_args):
