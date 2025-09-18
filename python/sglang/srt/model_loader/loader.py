@@ -103,6 +103,7 @@ from sglang.srt.utils import (
     get_device_capability,
     is_npu,
     is_pin_memory_available,
+    rank0_log,
     set_weight_attrs,
 )
 
@@ -544,7 +545,7 @@ class DefaultModelLoader(BaseModelLoader):
             **model_kwargs,
             trust_remote_code=True,
         )
-        logger.info(f"ModelOpt quantization requested: {model_config.modelopt_quant}")
+        rank0_log(f"ModelOpt quantization requested: {model_config.modelopt_quant}")
 
         quant_choice_str = model_config.modelopt_quant
         if not isinstance(quant_choice_str, str):
@@ -1795,19 +1796,21 @@ class ModelOptModelLoader(DefaultModelLoader):
             ) from e
 
         if is_quantized(model):
-            print("Model is already quantized, skipping quantization setup.")
+            rank0_log("Model is already quantized, skipping quantization setup.")
             return
         # Restore from checkpoint if provided
         if quantized_ckpt_restore_path:
             try:
                 mto.restore(model, quantized_ckpt_restore_path)
-                print(f"Restored quantized model from {quantized_ckpt_restore_path}")
+                rank0_log(
+                    f"Restored quantized model from {quantized_ckpt_restore_path}"
+                )
                 return
             except Exception as e:
-                print(
-                    f"Warning: Failed to restore from {quantized_ckpt_restore_path}: {e}"
+                logger.warning(
+                    f"Failed to restore from {quantized_ckpt_restore_path}: {e}"
                 )
-                print("Proceeding with calibration-based quantization...")
+                rank0_log("Proceeding with calibration-based quantization...")
 
         # Set up calibration-based quantization
         try:
@@ -1840,10 +1843,10 @@ class ModelOptModelLoader(DefaultModelLoader):
             if quantized_ckpt_save_path:
                 try:
                     mto.save(model, quantized_ckpt_save_path)
-                    print(f"Quantized model saved to {quantized_ckpt_save_path}")
+                    rank0_log(f"Quantized model saved to {quantized_ckpt_save_path}")
                 except Exception as e:
-                    print(
-                        f"Warning: Failed to save quantized checkpoint to {quantized_ckpt_save_path}: {e}"
+                    logger.warning(
+                        f"Failed to save quantized checkpoint to {quantized_ckpt_save_path}: {e}"
                     )
 
         except Exception as e:
@@ -1910,8 +1913,8 @@ class ModelOptModelLoader(DefaultModelLoader):
                 quantized_ckpt_save_path=quantized_ckpt_save_path,
             )
         except Exception as e:
-            print(f"Warning: ModelOpt quantization failed: {e}")
-            print("Proceeding without quantization...")
+            logger.warning(f"ModelOpt quantization failed: {e}")
+            rank0_log("Proceeding without quantization...")
 
         return model.eval()
 
