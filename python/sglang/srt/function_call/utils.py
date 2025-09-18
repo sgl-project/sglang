@@ -7,6 +7,14 @@ from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
+_WS = " \t\r\n"
+
+
+def _skip_ws(s: str, i: int) -> int:
+    while i < len(s) and s[i] in _WS:
+        i += 1
+    return i
+
 
 def _find_common_prefix(s1: str, s2: str) -> str:
     prefix = ""
@@ -41,8 +49,15 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
         return (partial_json_parser.loads(input_str, flags), len(input_str))
     except JSONDecodeError as e:
         if "Extra data" in e.msg:
+            start = _skip_ws(input_str, 0)
             dec = JSONDecoder()
-            return dec.raw_decode(input_str)
+            try:
+                obj, end = dec.raw_decode(input_str, start)
+            except JSONDecodeError:
+                # Not even a single complete value available → re-raise original
+                raise
+
+            return obj, end
         raise
 
 
