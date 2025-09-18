@@ -17,8 +17,9 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba.constants import PAD_SLOT_ID
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.qwen3_next import Qwen3HybridLinearDecoderLayer, fused_gdn_gating
@@ -52,7 +53,7 @@ class MambaAttnBackend(AttentionBackend):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
-        self.pad_slot_id = -1  # Default pad slot id
+        self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.forward_metadata: ForwardMetadata = None
@@ -213,9 +214,9 @@ class MambaAttnBackend(AttentionBackend):
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
 
-        conv_states, ssm_states, *rest = self.req_to_token_pool.get_mamba_params(
-            layer_id
-        )
+        layer_cache = self.req_to_token_pool.get_mamba_params(layer_id)
+        conv_states = layer_cache.conv
+        ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -293,13 +294,13 @@ class MambaAttnBackend(AttentionBackend):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
+        mamba_cache_params = self.req_to_token_pool.get_mamba_params(layer_id)
+        conv_states = mamba_cache_params.conv
+        ssm_states = mamba_cache_params.temporal
         if is_target_verify:
-            (
-                conv_states,
-                ssm_states,
-                intermediate_state_cache,
-                intermediate_conv_window_cache,
-            ) = self.req_to_token_pool.get_mamba_params(layer_id)
+            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
                 dtype=torch.bool,
@@ -307,9 +308,6 @@ class MambaAttnBackend(AttentionBackend):
             )
             conv_states_to_use = conv_states.clone()
         else:
-            conv_states, ssm_states, *rest = self.req_to_token_pool.get_mamba_params(
-                layer_id
-            )
             has_initial_states = forward_batch.extend_prefix_lens > 0
             conv_states_to_use = conv_states
 
@@ -409,10 +407,12 @@ class HybridLinearAttnBackend(AttentionBackend):
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
-        linear_attn_backend: AttentionBackend,
+        linear_attn_backend: MambaAttnBackend,
         full_attn_layers: list[int],
     ):
         self.full_attn_layers = full_attn_layers
+        self.full_attn_backend = full_attn_backend
+        self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -468,7 +468,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return self.attn_backend_list[0].get_cuda_graph_seq_len_fill_value()
+        return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()
 
     def forward_decode(
         self,
@@ -482,10 +482,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
         if layer_id in self.full_attn_layers:
-            return self.attn_backend_list[0].forward_decode(
+            return self.full_attn_backend.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.attn_backend_list[1].forward_decode(
+        return self.linear_attn_backend.forward_decode(
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
 
@@ -501,10 +501,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
         if layer_id in self.full_attn_layers:
-            return self.attn_backend_list[0].forward_extend(
+            return self.full_attn_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.attn_backend_list[1].forward_extend(
+        return self.linear_attn_backend.forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
 
@@ -547,20 +547,20 @@ class HybridLinearAttnBackend(AttentionBackend):
     def update_mamba_state_after_mtp_verify(self, accepted_length, model):
         request_number = accepted_length.shape[0]
 
-        state_indices_tensor = self.attn_backend_list[
-            1
-        ].forward_metadata.mamba_cache_indices[:request_number]
+        state_indices_tensor = (
+            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                :request_number
+            ]
+        )
 
-        mamba_caches = self.attn_backend_list[
-            1
-        ].req_to_token_pool.get_mamba_params_all_layers()
+        mamba_caches = (
+            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba_params_all_layers()
+        )
 
-        (
-            conv_states,
-            ssm_states,
-            intermediate_state_cache,
-            intermediate_conv_window_cache,
-        ) = mamba_caches
+        conv_states = mamba_caches.conv
+        ssm_states = mamba_caches.temporal
+        intermediate_state_cache = mamba_caches.intermediate_ssm
+        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window
 
         # SSM state updates (chunked to reduce peak memory)
         valid_mask = accepted_length > 0

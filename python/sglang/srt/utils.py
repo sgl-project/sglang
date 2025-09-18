@@ -20,6 +20,7 @@ import asyncio
 import builtins
 import ctypes
 import dataclasses
+import enum
 import functools
 import importlib
 import io
@@ -466,6 +467,11 @@ def is_pin_memory_available() -> bool:
 class LayerFn(Protocol):
 
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
+
+
+class LayerBlockType(enum.Enum):
+    attention = "attention"
+    mamba = "mamba"
 
 
 def make_layers(

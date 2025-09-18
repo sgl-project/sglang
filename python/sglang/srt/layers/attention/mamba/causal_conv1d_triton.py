@@ -6,10 +6,10 @@ from typing import Optional, Union
 
 import numpy as np
 import torch
-
-PAD_SLOT_ID = -1
 import triton
 import triton.language as tl
+
+from .constants import PAD_SLOT_ID
 
 
 @triton.jit()
