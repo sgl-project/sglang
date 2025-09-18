@@ -43,6 +43,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
     init_distributed_environment,
+    initialize_local_group,
     initialize_model_parallel,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
@@ -682,6 +683,11 @@ class ModelRunner:
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
+            )
+            initialize_local_group(
+                self.server_args.nnodes,
+                self.server_args.pp_size,
+                self.server_args.tp_size,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
