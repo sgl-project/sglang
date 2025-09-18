@@ -239,7 +239,6 @@ def multinomial_with_seed(inputs: torch.Tensor, seed: torch.Tensor) -> torch.Ten
         A tensor of shape (n,) where the i-th element is an index sampled
         from the distribution in `inputs[i]` using `seed[i]`.
     """
-    print(f"inputs.shape: {inputs.shape}, seed.shape: {seed.shape}")
     device = inputs.device
     seed = seed.to(device)
 
