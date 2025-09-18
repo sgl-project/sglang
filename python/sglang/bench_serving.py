@@ -780,6 +780,16 @@ class BenchmarkMetrics:
     generated_texts: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
+    def to_scalar_dict(self) -> Dict[str, Union[int, float, None]]:
+        """Convert BenchmarkMetrics to a dictionary containing only scalar fields."""
+        from dataclasses import asdict
+
+        data = asdict(self)
+        # Filter to only scalar types (int, float, None)
+        return {
+            k: v for k, v in data.items() if isinstance(v, (int, float)) or v is None
+        }
+
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 MOONCAKE_DATASET_URL = {
@@ -2149,48 +2159,22 @@ def run_benchmark(args_: argparse.Namespace):
         metrics: BenchmarkMetrics,
         run_idx: int,
         args: argparse.Namespace,
-        benchmark_duration: float,
-        accept_length: Optional[float],
     ):
-        # Convert BenchmarkMetrics to dict for CSV, keeping only scalar types
-        scalar_data = {
-            "model": args.model,
-            "run": run_idx,
-            "backend": args.backend,
-            "dataset_name": args.dataset_name,
-            "num_prompts": args.num_prompts,
-            "random_input_len": args.random_input_len,
-            "random_output_len": args.random_output_len,
-            "request_rate": args.request_rate,
-            "max_concurrency": args.max_concurrency,
-            "duration": benchmark_duration,
-            "completed": metrics.completed,
-            "total_input_tokens": metrics.total_input,
-            "total_output_tokens": metrics.total_output,
-            "total_output_tokens_retokenized": metrics.total_output_retokenized,
-            "request_throughput": metrics.request_throughput,
-            "input_throughput": metrics.input_throughput,
-            "output_throughput": metrics.output_throughput,
-            "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
-            "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
-            "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
-            "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
-            "mean_ttft_ms": metrics.mean_ttft_ms,
-            "median_ttft_ms": metrics.median_ttft_ms,
-            "std_ttft_ms": metrics.std_ttft_ms,
-            "p99_ttft_ms": metrics.p99_ttft_ms,
-            "mean_tpot_ms": metrics.mean_tpot_ms,
-            "median_tpot_ms": metrics.median_tpot_ms,
-            "std_tpot_ms": metrics.std_tpot_ms,
-            "p99_tpot_ms": metrics.p99_tpot_ms,
-            "mean_itl_ms": metrics.mean_itl_ms,
-            "median_itl_ms": metrics.median_itl_ms,
-            "std_itl_ms": metrics.std_itl_ms,
-            "p95_itl_ms": metrics.p95_itl_ms,
-            "p99_itl_ms": metrics.p99_itl_ms,
-            "concurrency": metrics.concurrency,
-            "accept_length": accept_length,
-        }
+        # Get scalar metrics and add run-specific fields
+        scalar_data = metrics.to_scalar_dict()
+        scalar_data.update(
+            {
+                "model": args.model,
+                "run": run_idx,
+                "backend": args.backend,
+                "dataset_name": args.dataset_name,
+                "num_prompts": args.num_prompts,
+                "random_input_len": args.random_input_len,
+                "random_output_len": args.random_output_len,
+                "request_rate": args.request_rate,
+                "max_concurrency": args.max_concurrency,
+            }
+        )
         # ensure field order is consistent across runs with model first
         fieldnames = ["model"] + [k for k in scalar_data.keys() if k != "model"]
         file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
@@ -2231,43 +2215,16 @@ def run_benchmark(args_: argparse.Namespace):
 
         # save to CSV if requested
         if save_to_csv_path and result is not None:
-            _write_csv_row(save_to_csv_path, result, i + 1, args, result.duration, None)
+            _write_csv_row(save_to_csv_path, result, i + 1, args)
 
         last_result = result
 
         # collect numeric summary fields for averaging later
         if result is not None:
+            # Get scalar metrics and convert to float for averaging
+            scalar_dict = result.to_scalar_dict()
             numeric_summaries.append(
-                {
-                    "duration": result.duration,
-                    "completed": float(result.completed),
-                    "total_input_tokens": float(result.total_input),
-                    "total_output_tokens": float(result.total_output),
-                    "total_output_tokens_retokenized": float(
-                        result.total_output_retokenized
-                    ),
-                    "request_throughput": result.request_throughput,
-                    "input_throughput": result.input_throughput,
-                    "output_throughput": result.output_throughput,
-                    "mean_e2e_latency_ms": result.mean_e2e_latency_ms,
-                    "median_e2e_latency_ms": result.median_e2e_latency_ms,
-                    "std_e2e_latency_ms": result.std_e2e_latency_ms,
-                    "p99_e2e_latency_ms": result.p99_e2e_latency_ms,
-                    "mean_ttft_ms": result.mean_ttft_ms,
-                    "median_ttft_ms": result.median_ttft_ms,
-                    "std_ttft_ms": result.std_ttft_ms,
-                    "p99_ttft_ms": result.p99_ttft_ms,
-                    "mean_tpot_ms": result.mean_tpot_ms,
-                    "median_tpot_ms": result.median_tpot_ms,
-                    "std_tpot_ms": result.std_tpot_ms,
-                    "p99_tpot_ms": result.p99_tpot_ms,
-                    "mean_itl_ms": result.mean_itl_ms,
-                    "median_itl_ms": result.median_itl_ms,
-                    "std_itl_ms": result.std_itl_ms,
-                    "p95_itl_ms": result.p95_itl_ms,
-                    "p99_itl_ms": result.p99_itl_ms,
-                    "concurrency": result.concurrency,
-                }
+                {k: float(v) if v is not None else 0.0 for k, v in scalar_dict.items()}
             )
 
         # flush cache between runs (except after last), regardless of args.flush_cache
