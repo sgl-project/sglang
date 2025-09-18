@@ -785,9 +785,12 @@ class BenchmarkMetrics:
         from dataclasses import asdict
 
         data = asdict(self)
-        # Filter to only scalar types (int, float, None)
+        # Filter to only scalar types (int, float, None) and exclude 'completed'
         return {
-            k: v for k, v in data.items() if isinstance(v, (int, float)) or v is None
+            k: v
+            for k, v in data.items()
+            if isinstance(v, (int, float)) or v is None
+            if k != "completed"  # Exclude completed column
         }
 
 
@@ -2175,8 +2178,10 @@ def run_benchmark(args_: argparse.Namespace):
                 "max_concurrency": args.max_concurrency,
             }
         )
-        # ensure field order is consistent across runs with model first
-        fieldnames = ["model"] + [k for k in scalar_data.keys() if k != "model"]
+        # ensure field order is consistent across runs with model first, run second
+        fieldnames = ["model", "run"] + [
+            k for k in scalar_data.keys() if k not in ["model", "run"]
+        ]
         file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
         with open(csv_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
