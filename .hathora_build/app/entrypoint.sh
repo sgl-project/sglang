@@ -22,6 +22,12 @@ export PORT=8000
 export ENABLE_METRICS="${ENABLE_METRICS:-false}"
 export H100_ONLY="${H100_ONLY:-false}"
 export AUTO_USE_FP8_ON_H100="${AUTO_USE_FP8_ON_H100:-true}"
+export SPEC_DECODE="${SPEC_DECODE:-}"  # if set to 1/true/yes enables speculative decoding
+
+export HF_TOKEN="${HF_TOKEN:-}"
+if [[ -z "${HUGGINGFACE_HUB_TOKEN}" && -n "${HF_TOKEN}" ]]; then
+  export HUGGINGFACE_HUB_TOKEN="${HF_TOKEN}"
+fi
 
 
 log "Starting SGLang Hathora entrypoint script."
@@ -37,6 +43,11 @@ log "LOG_LEVEL: $LOG_LEVEL"
 log "ENABLE_METRICS: $ENABLE_METRICS"
 log "H100_ONLY: $H100_ONLY"
 log "AUTO_USE_FP8_ON_H100: $AUTO_USE_FP8_ON_H100"
+if [[ -n "${SPEC_DECODE}" ]]; then
+  log "SPEC_DECODE: ${SPEC_DECODE} (speculative decoding enabled)"
+else
+  log "SPEC_DECODE: (unset; speculative decoding disabled)"
+fi
 
 # Detect GPUs and optionally enforce H100-only
 GPU_NAMES=$(nvidia-smi --query-gpu=name --format=csv,noheader | tr '\n' ',' || true)

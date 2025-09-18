@@ -71,9 +71,26 @@ def _load_deployment_config() -> DeploymentConfig:
             logger.warning(f"Failed to parse DEPLOYMENT_CONFIG_JSON: {e}")
 
     # Fallback: individual env vars
+    # Speculative decoding toggle: enable only if SPEC_DECODE is truthy
+    _spec_decode_enabled = os.environ.get("SPEC_DECODE", "").lower() in ("1", "true", "yes")
+    _spec_algo_default = None
+    if _spec_decode_enabled:
+        # If user specified the algorithm, honor it
+        _spec_algo_env = os.environ.get("SPECULATIVE_ALGORITHM")
+        if _spec_algo_env:
+            _spec_algo_default = _spec_algo_env
+        else:
+            # Choose a no-draft default unless a draft is provided
+            _draft_path = os.environ.get("SPECULATIVE_DRAFT_MODEL_PATH")
+            _model_path_env = os.environ.get("MODEL_PATH")
+            if _draft_path:
+                _spec_algo_default = "EAGLE"  # two-model mode
+            elif "eagle3" in _model_path_env:
+                _spec_algo_default = "EAGLE3"  # single-model eagle3
+
     return DeploymentConfig(
         hf_token=os.environ.get("HF_TOKEN"),
-        model_id=os.environ.get("MODEL_PATH", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
+        model_id=os.environ.get("MODEL_PATH"),
         revision=os.environ.get("REVISION"),
         dtype=os.environ.get("DTYPE", "auto"),
         quantization=os.environ.get("QUANTIZATION") or None,
@@ -103,8 +120,8 @@ def _load_deployment_config() -> DeploymentConfig:
         autoscale_target_queue_depth=(
             int(os.environ["AUTOSCALE_TARGET_QUEUE_DEPTH"]) if os.environ.get("AUTOSCALE_TARGET_QUEUE_DEPTH") else None
         ),
-        # Speculative decoding configs (default to EAGLE for higher throughput)
-        speculative_algorithm=os.environ.get("SPECULATIVE_ALGORITHM") or "EAGLE",
+        # Speculative decoding configs (enabled only if SPEC_DECODE is set)
+        speculative_algorithm=_spec_algo_default,
         speculative_draft_model_path=os.environ.get("SPECULATIVE_DRAFT_MODEL_PATH") or None,
         speculative_draft_model_revision=os.environ.get("SPECULATIVE_DRAFT_MODEL_REVISION") or None,
         speculative_num_steps=(int(os.environ["SPECULATIVE_NUM_STEPS"]) if os.environ.get("SPECULATIVE_NUM_STEPS") else 1),
@@ -212,8 +229,23 @@ async def lifespan(app: FastAPI):
             if kv_dtype == "auto":
                 kv_dtype = "fp8_e5m2"
 
+        # NOTE: Qwen3 spec-dec temporary disable block (re-enabled to ignore eagle for qwen3 for now)
+        spec_algo = CONFIG.speculative_algorithm
+        try:
+            if spec_algo is not None:
+                model_id_lower = (CONFIG.model_id or "").lower()
+                force_qwen3 = os.environ.get("SPEC_DECODE_QWEN3_ENABLE", "").lower() in ("1", "true", "yes")
+                if ("qwen3" in model_id_lower) and not force_qwen3:
+                    logger.warning(
+                        "Speculative decoding disabled for Qwen3 models by default. Set SPEC_DECODE_QWEN3_ENABLE=1 to force enable."
+                    )
+                    spec_algo = None
+        except Exception:
+            pass
+
         engine = sgl.Engine(
             model_path=CONFIG.model_id,
+            tokenizer_path=os.environ.get("TOKENIZER_PATH"),
             revision=CONFIG.revision,
             dtype=dtype,
             quantization=quant,
@@ -226,9 +258,10 @@ async def lifespan(app: FastAPI):
             enable_metrics=CONFIG.enable_metrics,
             enable_p2p_check=CONFIG.enable_p2p_check,
             enable_torch_compile=CONFIG.enable_torch_compile,
+            trust_remote_code=os.environ.get("TRUST_REMOTE_CODE", "").lower() in ("1", "true", "yes"),
             log_level="error",  # Reduce SGLang internal logging
-            # Speculative decoding passthrough
-            speculative_algorithm=CONFIG.speculative_algorithm,
+            # Speculative decoding passthrough (possibly adjusted above)
+            speculative_algorithm=spec_algo,
             speculative_draft_model_path=CONFIG.speculative_draft_model_path,
             speculative_draft_model_revision=CONFIG.speculative_draft_model_revision,
             speculative_num_steps=CONFIG.speculative_num_steps,
@@ -382,14 +415,8 @@ async def generate_response_sglang(
     inference_start_time = time.time()
     
     try:
-        if request.seed is not None:
-            raise HTTPException(status_code=400, detail="Parameter 'seed' is not supported per request")
-        if request.top_a is not None:
-            raise HTTPException(status_code=400, detail="Parameter 'top_a' is not supported")
-        if request.logprobs or (request.top_logprobs is not None):
-            raise HTTPException(status_code=400, detail="Parameter 'logprobs/top_logprobs' not supported in this endpoint")
-        if request.tools or request.tool_choice is not None or request.parallel_tool_calls is not None:
-            raise HTTPException(status_code=400, detail="Tool calling is not supported in this endpoint")
+        # Allow 'seed' and 'top_a' for compatibility; currently ignored by the backend
+        # Also accept 'logprobs/top_logprobs' and 'tools' related fields without effect
 
         sampling_params: Dict[str, Union[int, float, bool, str, List[str], List[int], Dict[str, float]]] = {
             "max_new_tokens": request.max_tokens,
@@ -408,10 +435,33 @@ async def generate_response_sglang(
             sampling_params["top_k"] = request.top_k if request.top_k > 0 else -1
         if request.stop is not None:
             sampling_params["stop"] = request.stop
+        # Sanitize stop_token_ids to integers only
         if request.stop_token_ids is not None:
-            sampling_params["stop_token_ids"] = request.stop_token_ids
-        if request.logit_bias is not None:
-            sampling_params["logit_bias"] = request.logit_bias
+            try:
+                stop_ids = []
+                for x in request.stop_token_ids:
+                    try:
+                        stop_ids.append(int(x))
+                    except Exception:
+                        continue
+                if stop_ids:
+                    sampling_params["stop_token_ids"] = stop_ids
+            except Exception:
+                logger.warning(f"[{request_id}] Ignoring invalid stop_token_ids: {request.stop_token_ids}")
+        # Sanitize logit_bias keys to integer token ids
+        if request.logit_bias is not None and isinstance(request.logit_bias, dict):
+            try:
+                cleaned_logit_bias = {}
+                for k, v in request.logit_bias.items():
+                    try:
+                        token_id = int(k)
+                        cleaned_logit_bias[str(token_id)] = float(v)
+                    except Exception:
+                        continue
+                if cleaned_logit_bias:
+                    sampling_params["logit_bias"] = cleaned_logit_bias
+            except Exception:
+                logger.warning(f"[{request_id}] Ignoring invalid logit_bias")
 
         if request.response_format and isinstance(request.response_format, dict):
             rf_type = request.response_format.get("type")
@@ -509,15 +559,8 @@ async def stream_response_sglang(
     logger.info(f"[{request_id}] Starting streaming generation for prompt length: {len(prompt)}")
     
     try:
-        # Validate unsupported params
-        if request.seed is not None:
-            raise HTTPException(status_code=400, detail="Parameter 'seed' is not supported per request")
-        if request.top_a is not None:
-            raise HTTPException(status_code=400, detail="Parameter 'top_a' is not supported")
-        if request.logprobs or (request.top_logprobs is not None):
-            raise HTTPException(status_code=400, detail="Parameter 'logprobs/top_logprobs' not supported in this endpoint")
-        if request.tools or request.tool_choice is not None or request.parallel_tool_calls is not None:
-            raise HTTPException(status_code=400, detail="Tool calling is not supported in this endpoint")
+        # Validate unsupported params (allow 'seed' and 'top_a' for compatibility; currently ignored)
+        # Also accept 'logprobs/top_logprobs' and 'tools' related fields without effect
 
         sampling_params: Dict[str, Union[int, float, bool, str, List[str], List[int], Dict[str, float]]] = {
             "max_new_tokens": request.max_tokens,
@@ -536,10 +579,33 @@ async def stream_response_sglang(
             sampling_params["top_k"] = request.top_k if request.top_k > 0 else -1
         if request.stop is not None:
             sampling_params["stop"] = request.stop
+        # Sanitize stop_token_ids to integers only
         if request.stop_token_ids is not None:
-            sampling_params["stop_token_ids"] = request.stop_token_ids
-        if request.logit_bias is not None:
-            sampling_params["logit_bias"] = request.logit_bias
+            try:
+                stop_ids = []
+                for x in request.stop_token_ids:
+                    try:
+                        stop_ids.append(int(x))
+                    except Exception:
+                        continue
+                if stop_ids:
+                    sampling_params["stop_token_ids"] = stop_ids
+            except Exception:
+                logger.warning(f"[{request_id}] Ignoring invalid stop_token_ids: {request.stop_token_ids}")
+        # Sanitize logit_bias keys to integer token ids
+        if request.logit_bias is not None and isinstance(request.logit_bias, dict):
+            try:
+                cleaned_logit_bias = {}
+                for k, v in request.logit_bias.items():
+                    try:
+                        token_id = int(k)
+                        cleaned_logit_bias[str(token_id)] = float(v)
+                    except Exception:
+                        continue
+                if cleaned_logit_bias:
+                    sampling_params["logit_bias"] = cleaned_logit_bias
+            except Exception:
+                logger.warning(f"[{request_id}] Ignoring invalid logit_bias")
         if request.response_format and isinstance(request.response_format, dict):
             rf_type = request.response_format.get("type")
             if rf_type == "json_schema":
@@ -564,40 +630,61 @@ async def stream_response_sglang(
         )
         
         token_count = 0
+
+        # Track previously emitted content length (excluding prompt)
+        prompt_len = len(prompt)
+        last_emitted_len = 0
+
+        # Send initial role chunk to follow typical streaming contract
+        role_choice = ChatCompletionStreamChoice(
+            index=0,
+            delta={"role": "assistant"},
+            finish_reason=None
+        )
+        role_response = ChatCompletionStreamResponse(
+            id=request_id,
+            model=request.model,
+            choices=[role_choice]
+        )
+        yield f"data: {role_response.model_dump_json()}\n\n"
         
         # Stream the tokens
         async for chunk in async_generator:
+            # Extract cumulative text and compute delta since last emission
+            content = chunk.get("text", "")
+            if not isinstance(content, str):
+                content = str(content)
+
+            if len(content) <= prompt_len:
+                # Nothing generated yet
+                await asyncio.sleep(0)
+                continue
+
+            generated_so_far = content[prompt_len:]
+            if len(generated_so_far) <= last_emitted_len:
+                # No new delta; skip sending an empty chunk
+                await asyncio.sleep(0)
+                continue
+
+            new_content = generated_so_far[last_emitted_len:]
+            last_emitted_len = len(generated_so_far)
+
             token_count += 1
             time_to_token = (time.time() - start_time) * 1000
-            
-            # Extract the new content from the chunk
-            # The chunk should contain the incremental text
-            content = chunk.get("text", "")
-            if content and len(content) > len(prompt):
-                new_content = content[len(prompt):]
-                if token_count == 1:
-                    # First token, remove any previous content
-                    new_content = new_content
-                else:
-                    # Get only the new part since last chunk
-                    # This is a simplified approach; in practice, you'd want more sophisticated diff
-                    pass
-            else:
-                new_content = ""
-            
+
             stream_choice = ChatCompletionStreamChoice(
                 index=0,
                 delta={"content": new_content},
                 finish_reason=None
             )
-            
+
             stream_response = ChatCompletionStreamResponse(
                 id=request_id,
                 model=request.model,
                 choices=[stream_choice],
                 time_to_token=time_to_token
             )
-            
+
             yield f"data: {stream_response.model_dump_json()}\n\n"
             await asyncio.sleep(0)  # Yield control to event loop
         

@@ -509,12 +509,35 @@ class Qwen3ForCausalLM(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
+        # Handle tied weights: if lm_head shares the same module/weight as embed_tokens,
+        # avoid double deletion/assignment which raises AttributeError.
+        same_module = self.lm_head is self.model.embed_tokens
+        same_weight_obj = (
+            hasattr(self.lm_head, "weight")
+            and hasattr(self.model.embed_tokens, "weight")
+            and self.lm_head.weight is self.model.embed_tokens.weight
+        )
+
+        # Safely replace embedding weights
+        if hasattr(self.model.embed_tokens, "weight"):
+            try:
+                del self.model.embed_tokens.weight
+            except Exception:
+                pass
         self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+
+        # Replace lm_head weights only if it's not the same module/weight
+        if not same_module and not same_weight_obj and hasattr(self.lm_head, "weight"):
+            try:
+                del self.lm_head.weight
+            except Exception:
+                pass
+            self.lm_head.weight = head
+
+        # Be defensive on CUDA sync
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
