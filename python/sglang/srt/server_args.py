@@ -537,6 +537,8 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    enable_torch_compile_fusion: bool = False
+    enable_torch_compile_graph_trace_logs: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -3650,6 +3652,18 @@ class ServerArgs:
             nargs="+",
             help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess.",
         )
+        parser.add_argument(
+            "--enable-torch-compile-fusion",
+            action="store_true",
+            help="Enables operator fusion using custom torch compile/inductor passes.",
+        )
+        parser.add_argument(
+            "--enable-torch-compile-graph-trace-logs",
+            action="store_true",
+            help="Enables logging of traced before and after graphs for fusion passes, to be use with log level debug.",
+        )
+
+        # Debug tensor dumps
         parser.add_argument(
             "--enable-deterministic-inference",
             action="store_true",
