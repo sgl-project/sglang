@@ -4,9 +4,10 @@ use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
 use crate::data_connector::{ResponseId, SharedResponseStorage, StoredResponse};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-    ResponseStatus, ResponsesGetParams, ResponsesRequest, ResponsesResponse,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, ReasoningInfo,
+    RerankRequest, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+    ResponseStatus, ResponseTextFormat, ResponsesGetParams, ResponsesRequest, ResponsesResponse,
+    ResponsesUsage, TextFormatType, UsageInfo,
 };
 use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
 use async_trait::async_trait;
@@ -26,8 +27,10 @@ use std::{
     convert::Infallible,
     sync::atomic::{AtomicBool, Ordering},
 };
-use tokio_stream::iter;
-use tracing::{info, warn};
+use tokio::sync::mpsc;
+use tokio_stream::{iter, wrappers::ReceiverStream};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 /// Router for OpenAI backend
 pub struct OpenAIRouter {
@@ -85,6 +88,532 @@ impl OpenAIRouter {
             healthy: AtomicBool::new(true),
             response_storage,
         })
+    }
+
+    async fn handle_non_streaming_response(
+        &self,
+        url: String,
+        headers: Option<&HeaderMap>,
+        payload: Value,
+        original_body: &ResponsesRequest,
+        original_previous_response_id: Option<String>,
+    ) -> Response {
+        let request_builder = self.client.post(&url).json(&payload);
+
+        // Apply headers with filtering
+        let request_builder = if let Some(headers) = headers {
+            apply_request_headers(headers, request_builder, true)
+        } else {
+            request_builder
+        };
+
+        match request_builder.send().await {
+            Ok(response) => {
+                let status = response.status();
+
+                if !status.is_success() {
+                    let error_text = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("Failed to get error body: {}", e));
+                    return (status, error_text).into_response();
+                }
+
+                // Parse the response
+                match response.json::<Value>().await {
+                    Ok(openai_response_json) => {
+                        // Build our complete response object
+                        let complete_response = self.build_complete_response(
+                            &openai_response_json,
+                            original_body,
+                            original_previous_response_id,
+                        );
+
+                        // Store the response internally
+                        if let Err(e) = self
+                            .store_response_internal(&complete_response, original_body)
+                            .await
+                        {
+                            warn!("Failed to store response: {}", e);
+                        }
+
+                        // Return the complete response object
+                        match serde_json::to_string(&complete_response) {
+                            Ok(json_str) => (
+                                StatusCode::OK,
+                                [("content-type", "application/json")],
+                                json_str,
+                            )
+                                .into_response(),
+                            Err(e) => {
+                                error!("Failed to serialize response: {}", e);
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    json!({"error": {"message": "Failed to serialize response", "type": "internal_error"}}).to_string(),
+                                ).into_response()
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse OpenAI response: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to parse response: {}", e),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to forward request to OpenAI: {}", e),
+            )
+                .into_response(),
+        }
+    }
+
+    async fn handle_streaming_response(
+        &self,
+        url: String,
+        headers: Option<&HeaderMap>,
+        payload: Value,
+        original_body: &ResponsesRequest,
+        original_previous_response_id: Option<String>,
+    ) -> Response {
+        // Set up streaming request
+        let mut request_builder = self.client.post(&url).json(&payload);
+
+        // Apply headers
+        if let Some(headers) = headers {
+            request_builder = apply_request_headers(headers, request_builder, true);
+        }
+
+        // Make the request
+        match request_builder.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    let error_text = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("Failed to get error body: {}", e));
+                    return (status, error_text).into_response();
+                }
+
+                // Set up channel for streaming
+                let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
+                let response_storage = self.response_storage.clone();
+                let body_clone = original_body.clone();
+                let prev_response_id = original_previous_response_id.clone();
+
+                // Spawn task to handle streaming response
+                tokio::spawn(async move {
+                    let mut accumulated_text = String::new();
+                    let mut response_id = format!("resp_{}", Uuid::new_v4().simple());
+                    let mut model_name = String::new();
+                    let mut total_tokens = 0u32;
+
+                    // Read the stream
+                    let mut stream = response.bytes_stream();
+                    let mut buffer = String::new();
+
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(bytes) => {
+                                buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                                // Process complete SSE events
+                                while let Some(event_end) = buffer.find("\n\n") {
+                                    let event = buffer[..event_end].to_string();
+                                    buffer = buffer[event_end + 2..].to_string();
+
+                                    if let Some(data) = event.strip_prefix("data: ") {
+                                        if data == "[DONE]" {
+                                            // Send final response object
+                                            let final_response =
+                                                Self::build_streaming_final_response(
+                                                    response_id.clone(),
+                                                    model_name.clone(),
+                                                    accumulated_text.clone(),
+                                                    total_tokens,
+                                                    &body_clone,
+                                                    prev_response_id.clone(),
+                                                );
+
+                                            // Store the response
+                                            Self::store_streaming_response(
+                                                &response_storage,
+                                                &final_response,
+                                                &body_clone,
+                                            )
+                                            .await;
+
+                                            // Send the final response
+                                            let _ = tx
+                                                .send(Ok(Event::default().data(
+                                                    serde_json::to_string(&final_response)
+                                                        .unwrap_or_default(),
+                                                )))
+                                                .await;
+                                            let _ =
+                                                tx.send(Ok(Event::default().data("[DONE]"))).await;
+                                            break;
+                                        }
+
+                                        // Parse the delta
+                                        if let Ok(delta_json) = serde_json::from_str::<Value>(data)
+                                        {
+                                            // Extract info from delta
+                                            if let Some(id) =
+                                                delta_json.get("id").and_then(|v| v.as_str())
+                                            {
+                                                response_id = id.to_string();
+                                            }
+                                            if let Some(model) =
+                                                delta_json.get("model").and_then(|v| v.as_str())
+                                            {
+                                                model_name = model.to_string();
+                                            }
+
+                                            // Extract text delta
+                                            if let Some(choices) =
+                                                delta_json.get("choices").and_then(|v| v.as_array())
+                                            {
+                                                for choice in choices {
+                                                    if let Some(delta) = choice.get("delta") {
+                                                        if let Some(content) = delta
+                                                            .get("content")
+                                                            .and_then(|v| v.as_str())
+                                                        {
+                                                            accumulated_text.push_str(content);
+                                                            total_tokens +=
+                                                                content.split_whitespace().count()
+                                                                    as u32; // Rough estimate
+
+                                                            // Send incremental update
+                                                            let incremental = json!({
+                                                                "id": response_id,
+                                                                "object": "response.delta",
+                                                                "delta": {
+                                                                    "content": content
+                                                                }
+                                                            });
+                                                            let _ = tx
+                                                                .send(Ok(Event::default()
+                                                                    .data(incremental.to_string())))
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Stream error: {}", e);
+                                // Send error event
+                                let error_event = json!({
+                                    "error": {
+                                        "message": format!("Stream error: {}", e),
+                                        "type": "stream_error"
+                                    }
+                                });
+                                let _ = tx
+                                    .send(Ok(Event::default().data(error_event.to_string())))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                // Return SSE stream
+                let stream = ReceiverStream::new(rx);
+                Sse::new(stream).into_response()
+            }
+            Err(e) => {
+                error!("Failed to initiate streaming request: {}", e);
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to forward streaming request: {}", e),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    fn build_complete_response(
+        &self,
+        openai_response: &Value,
+        original_body: &ResponsesRequest,
+        original_previous_response_id: Option<String>,
+    ) -> ResponsesResponse {
+        // Parse what we can from OpenAI response
+        let id = openai_response
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&original_body.request_id)
+            .to_string();
+
+        let model = openai_response
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| original_body.model.as_deref().unwrap_or("gpt-4"))
+            .to_string();
+
+        let created_at = openai_response
+            .get("created")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+        // Parse output
+        let mut output = Vec::new();
+        if let Some(choices) = openai_response.get("choices").and_then(|v| v.as_array()) {
+            for choice in choices {
+                if let Some(message) = choice.get("message") {
+                    let msg_id = format!("msg_{}", Uuid::new_v4().simple());
+                    let content_text = message
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    output.push(ResponseOutputItem::Message {
+                        id: msg_id,
+                        role: "assistant".to_string(),
+                        status: "completed".to_string(),
+                        content: vec![ResponseContentPart::OutputText {
+                            text: content_text,
+                            annotations: vec![],
+                            logprobs: None,
+                        }],
+                    });
+                }
+            }
+        }
+
+        // Parse usage
+        let usage = openai_response.get("usage").map(|u| {
+            let input_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let output_tokens = u
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let total_tokens =
+                u.get("total_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(input_tokens as u64 + output_tokens as u64) as u32;
+
+            ResponsesUsage::Classic(UsageInfo {
+                prompt_tokens: input_tokens,
+                completion_tokens: output_tokens,
+                total_tokens,
+                reasoning_tokens: None,
+                prompt_tokens_details: None,
+            })
+        });
+
+        // Build complete response
+        ResponsesResponse {
+            id,
+            object: "response".to_string(),
+            created_at,
+            status: ResponseStatus::Completed,
+            error: None,
+            incomplete_details: None,
+            instructions: original_body.instructions.clone(),
+            max_output_tokens: original_body.max_output_tokens,
+            model,
+            output,
+            parallel_tool_calls: original_body.parallel_tool_calls,
+            previous_response_id: original_previous_response_id,
+            reasoning: original_body.reasoning.as_ref().map(|r| ReasoningInfo {
+                effort: r.effort.as_ref().map(|e| format!("{:?}", e)),
+                summary: None,
+            }),
+            store: original_body.store, // Return what the user requested
+            temperature: original_body.temperature.or(Some(1.0)),
+            text: Some(ResponseTextFormat {
+                format: TextFormatType {
+                    format_type: "text".to_string(),
+                },
+            }),
+            tool_choice: match &original_body.tool_choice {
+                crate::protocols::spec::ToolChoice::Value(v) => match v {
+                    crate::protocols::spec::ToolChoiceValue::Auto => "auto".to_string(),
+                    crate::protocols::spec::ToolChoiceValue::Required => "required".to_string(),
+                    crate::protocols::spec::ToolChoiceValue::None => "none".to_string(),
+                },
+                crate::protocols::spec::ToolChoice::Function { .. } => "function".to_string(),
+            },
+            tools: original_body.tools.clone(),
+            top_p: original_body.top_p.or(Some(1.0)),
+            truncation: match &original_body.truncation {
+                crate::protocols::spec::Truncation::Auto => Some("auto".to_string()),
+                crate::protocols::spec::Truncation::Disabled => Some("disabled".to_string()),
+            },
+            usage,
+            user: original_body.user.clone(),
+            metadata: original_body.metadata.clone().unwrap_or_default(),
+        }
+    }
+
+    fn build_streaming_final_response(
+        response_id: String,
+        model: String,
+        text: String,
+        estimated_tokens: u32,
+        original_body: &ResponsesRequest,
+        original_previous_response_id: Option<String>,
+    ) -> ResponsesResponse {
+        let msg_id = format!("msg_{}", Uuid::new_v4().simple());
+
+        ResponsesResponse {
+            id: response_id,
+            object: "response".to_string(),
+            created_at: chrono::Utc::now().timestamp(),
+            status: ResponseStatus::Completed,
+            error: None,
+            incomplete_details: None,
+            instructions: original_body.instructions.clone(),
+            max_output_tokens: original_body.max_output_tokens,
+            model,
+            output: vec![ResponseOutputItem::Message {
+                id: msg_id,
+                role: "assistant".to_string(),
+                status: "completed".to_string(),
+                content: vec![ResponseContentPart::OutputText {
+                    text,
+                    annotations: vec![],
+                    logprobs: None,
+                }],
+            }],
+            parallel_tool_calls: original_body.parallel_tool_calls,
+            previous_response_id: original_previous_response_id,
+            reasoning: original_body.reasoning.as_ref().map(|r| ReasoningInfo {
+                effort: r.effort.as_ref().map(|e| format!("{:?}", e)),
+                summary: None,
+            }),
+            store: original_body.store,
+            temperature: original_body.temperature.or(Some(1.0)),
+            text: Some(ResponseTextFormat {
+                format: TextFormatType {
+                    format_type: "text".to_string(),
+                },
+            }),
+            tool_choice: "auto".to_string(),
+            tools: original_body.tools.clone(),
+            top_p: original_body.top_p.or(Some(1.0)),
+            truncation: Some("disabled".to_string()),
+            usage: Some(ResponsesUsage::Classic(UsageInfo {
+                prompt_tokens: estimated_tokens / 2, // Rough estimate
+                completion_tokens: estimated_tokens / 2,
+                total_tokens: estimated_tokens,
+                reasoning_tokens: None,
+                prompt_tokens_details: None,
+            })),
+            user: original_body.user.clone(),
+            metadata: original_body.metadata.clone().unwrap_or_default(),
+        }
+    }
+
+    async fn store_response_internal(
+        &self,
+        response: &ResponsesResponse,
+        original_body: &ResponsesRequest,
+    ) -> Result<(), String> {
+        let input_text = match &original_body.input {
+            ResponseInput::Text(text) => text.clone(),
+            ResponseInput::Items(_) => "complex input".to_string(),
+        };
+
+        let output_text = response
+            .output
+            .iter()
+            .find_map(|item| {
+                if let ResponseOutputItem::Message { content, .. } = item {
+                    content.iter().find_map(|c| match c {
+                        ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        let mut stored_response = StoredResponse::new(
+            input_text,
+            output_text,
+            original_body
+                .previous_response_id
+                .as_ref()
+                .map(|id| ResponseId::from_string(id.clone())),
+        );
+
+        stored_response.instructions = original_body.instructions.clone();
+        stored_response.model = Some(response.model.clone());
+        stored_response.user = original_body.user.clone();
+        stored_response.metadata = original_body.metadata.clone().unwrap_or_default();
+        stored_response.id = ResponseId::from_string(response.id.clone());
+        stored_response.raw_response = serde_json::to_value(response).unwrap_or(Value::Null);
+
+        self.response_storage
+            .store_response(stored_response)
+            .await
+            .map_err(|e| format!("Failed to store response: {}", e))?;
+
+        info!(response_id = %response.id, "Stored response locally");
+        Ok(())
+    }
+
+    async fn store_streaming_response(
+        response_storage: &SharedResponseStorage,
+        response: &ResponsesResponse,
+        original_body: &ResponsesRequest,
+    ) {
+        let input_text = match &original_body.input {
+            ResponseInput::Text(text) => text.clone(),
+            ResponseInput::Items(_) => "complex input".to_string(),
+        };
+
+        let output_text = response
+            .output
+            .iter()
+            .find_map(|item| {
+                if let ResponseOutputItem::Message { content, .. } = item {
+                    content.iter().find_map(|c| match c {
+                        ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        let mut stored_response = StoredResponse::new(
+            input_text,
+            output_text,
+            original_body
+                .previous_response_id
+                .as_ref()
+                .map(|id| ResponseId::from_string(id.clone())),
+        );
+
+        stored_response.instructions = original_body.instructions.clone();
+        stored_response.model = Some(response.model.clone());
+        stored_response.user = original_body.user.clone();
+        stored_response.metadata = original_body.metadata.clone().unwrap_or_default();
+        stored_response.id = ResponseId::from_string(response.id.clone());
+        stored_response.raw_response = serde_json::to_value(response).unwrap_or(Value::Null);
+
+        if let Err(e) = response_storage.store_response(stored_response).await {
+            warn!(response_id = %response.id, error = %e, "Failed to store streaming response");
+        } else {
+            info!(response_id = %response.id, "Stored streaming response locally");
+        }
     }
 }
 
@@ -371,7 +900,8 @@ impl super::super::RouterTrait for OpenAIRouter {
 
         info!(
             requested_store = body.store,
-            "openai_responses_store_decision"
+            is_streaming = body.stream,
+            "openai_responses_request"
         );
 
         // Clone the body and override model if needed
@@ -380,6 +910,10 @@ impl super::super::RouterTrait for OpenAIRouter {
             request_body.model = Some(model.to_string());
         }
 
+        // Store the original previous_response_id for the response
+        let original_previous_response_id = request_body.previous_response_id.clone();
+
+        // Handle previous_response_id by loading prior context
         let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
         if let Some(prev_id_str) = request_body.previous_response_id.clone() {
             let prev_id = ResponseId::from_string(prev_id_str.clone());
@@ -425,6 +959,7 @@ impl super::super::RouterTrait for OpenAIRouter {
                     warn!(previous_response_id = %prev_id_str, %err, "failed to fetch previous response chain");
                 }
             }
+            // Clear previous_response_id from request since we're converting to conversation
             request_body.previous_response_id = None;
         }
 
@@ -445,7 +980,7 @@ impl super::super::RouterTrait for OpenAIRouter {
             request_body.input = ResponseInput::Items(items);
         }
 
-        // Prevent OpenAI from storing the response; we keep history locally instead.
+        // Always set store=false for OpenAI (we store internally)
         request_body.store = false;
 
         // Convert to JSON payload and strip SGLang-specific fields before forwarding
@@ -474,114 +1009,27 @@ impl super::super::RouterTrait for OpenAIRouter {
             }
         }
 
-        // Forward the request - ResponsesRequest should serialize correctly for OpenAI
-        let request_builder = self.client.post(&url).json(&payload);
-
-        // Apply headers with filtering (skip content headers since we're using .json())
-        let request_builder = if let Some(headers) = headers {
-            apply_request_headers(headers, request_builder, true)
-        } else {
-            request_builder
-        };
-
-        match request_builder.send().await {
-            Ok(response) => {
-                let status = response.status();
-                let headers = response.headers().clone();
-
-                // Get the response body
-                match response.text().await {
-                    Ok(body_text) => {
-                        let raw_response_value = serde_json::from_str::<Value>(&body_text).ok();
-
-                        if body.store {
-                            if let Some(raw_value) = raw_response_value.clone() {
-                                match serde_json::from_value::<ResponsesResponse>(raw_value.clone())
-                                {
-                                    Ok(openai_response) => {
-                                        let input_text = match &body.input {
-                                            ResponseInput::Text(text) => text.clone(),
-                                            ResponseInput::Items(_) => "complex input".to_string(),
-                                        };
-
-                                        let output_text = openai_response
-                                            .output
-                                            .iter()
-                                            .find_map(|item| {
-                                                if let ResponseOutputItem::Message {
-                                                    content, ..
-                                                } = item
-                                                {
-                                                    content.iter().find_map(|c| match c {
-                                                        ResponseContentPart::OutputText {
-                                                            text,
-                                                            ..
-                                                        } => Some(text.clone()),
-                                                        _ => None,
-                                                    })
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .unwrap_or_default();
-
-                                        let mut stored_response = StoredResponse::new(
-                                            input_text,
-                                            output_text,
-                                            body.previous_response_id
-                                                .as_ref()
-                                                .map(|id| ResponseId::from_string(id.clone())),
-                                        );
-
-                                        stored_response.instructions = body.instructions.clone();
-                                        stored_response.model = Some(openai_response.model.clone());
-                                        stored_response.user = body.user.clone();
-                                        stored_response.metadata =
-                                            body.metadata.clone().unwrap_or_default();
-                                        stored_response.id =
-                                            ResponseId::from_string(openai_response.id.clone());
-                                        stored_response.raw_response = raw_value;
-
-                                        match self
-                                            .response_storage
-                                            .store_response(stored_response)
-                                            .await
-                                        {
-                                            Ok(_) => {
-                                                info!(openai_response_id = %openai_response.id, "stored response locally")
-                                            }
-                                            Err(err) => {
-                                                warn!(openai_response_id = %openai_response.id, %err, "failed to store response locally")
-                                            }
-                                        };
-                                    }
-                                    Err(err) => {
-                                        warn!(%err, "failed to parse OpenAI response for local storage")
-                                    }
-                                }
-                            } else {
-                                warn!("failed to parse raw OpenAI response JSON for storage");
-                            }
-                        } else {
-                            info!("body_store_disabled");
-                        }
-
-                        let mut response = (status, body_text).into_response();
-                        *response.headers_mut() = preserve_response_headers(&headers);
-                        response
-                    }
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to read response body: {}", e),
-                    )
-                        .into_response(),
-                }
-            }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to forward request to OpenAI Responses API: {}", e),
+        // Check if streaming is requested
+        if body.stream {
+            // Handle streaming response
+            self.handle_streaming_response(
+                url,
+                headers,
+                payload,
+                body,
+                original_previous_response_id,
             )
-                .into_response(),
+            .await
+        } else {
+            // Handle non-streaming response
+            self.handle_non_streaming_response(
+                url,
+                headers,
+                payload,
+                body,
+                original_previous_response_id,
+            )
+            .await
         }
     }
 
@@ -619,6 +1067,11 @@ impl super::super::RouterTrait for OpenAIRouter {
                 id: stored_response.id.0.clone(),
                 object: "response".to_string(),
                 created_at: stored_response.created_at.timestamp(),
+                status: ResponseStatus::Completed,
+                error: None,
+                incomplete_details: None,
+                instructions: stored_response.instructions.clone(),
+                max_output_tokens: None,
                 model: stored_response
                     .model
                     .unwrap_or_else(|| "gpt-4o".to_string()),
@@ -632,11 +1085,23 @@ impl super::super::RouterTrait for OpenAIRouter {
                         logprobs: None,
                     }],
                 }],
-                status: ResponseStatus::Completed,
-                usage: None,
                 parallel_tool_calls: true,
+                previous_response_id: stored_response.previous_response_id.map(|id| id.0),
+                reasoning: None,
+                store: true,
+                temperature: Some(1.0),
+                text: Some(ResponseTextFormat {
+                    format: TextFormatType {
+                        format_type: "text".to_string(),
+                    },
+                }),
                 tool_choice: "auto".to_string(),
                 tools: vec![],
+                top_p: Some(1.0),
+                truncation: Some("disabled".to_string()),
+                usage: None,
+                user: stored_response.user.clone(),
+                metadata: stored_response.metadata.clone(),
             };
 
             if stream_requested {

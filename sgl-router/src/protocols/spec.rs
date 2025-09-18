@@ -833,6 +833,29 @@ pub enum ResponseStatus {
     Cancelled,
 }
 
+// ============= Reasoning Info =============
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReasoningInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+// ============= Text Format =============
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ResponseTextFormat {
+    pub format: TextFormatType,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TextFormatType {
+    #[serde(rename = "type")]
+    pub format_type: String,
+}
+
 // ============= Include Fields =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1318,6 +1341,25 @@ pub struct ResponsesResponse {
     #[serde(default = "current_timestamp")]
     pub created_at: i64,
 
+    /// Response status
+    pub status: ResponseStatus,
+
+    /// Error information if status is failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+
+    /// Incomplete details if response was truncated
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<Value>,
+
+    /// System instructions used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+
+    /// Max output tokens setting
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+
     /// Model name
     pub model: String,
 
@@ -1325,16 +1367,29 @@ pub struct ResponsesResponse {
     #[serde(default)]
     pub output: Vec<ResponseOutputItem>,
 
-    /// Response status
-    pub status: ResponseStatus,
-
-    /// Usage information
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<ResponsesUsage>,
-
     /// Whether parallel tool calls are enabled
     #[serde(default = "default_true")]
     pub parallel_tool_calls: bool,
+
+    /// Previous response ID if this is a continuation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+
+    /// Reasoning information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningInfo>,
+
+    /// Whether the response is stored
+    #[serde(default = "default_true")]
+    pub store: bool,
+
+    /// Temperature setting used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Text format settings
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<ResponseTextFormat>,
 
     /// Tool choice setting
     #[serde(default = "default_tool_choice")]
@@ -1343,6 +1398,26 @@ pub struct ResponsesResponse {
     /// Available tools
     #[serde(default)]
     pub tools: Vec<ResponseTool>,
+
+    /// Top-p setting used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+
+    /// Truncation strategy used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<String>,
+
+    /// Usage information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ResponsesUsage>,
+
+    /// User identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Additional metadata
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
 }
 
 fn default_object_type() -> String {
@@ -1369,11 +1444,26 @@ impl ResponsesResponse {
             id: request.request_id.clone(),
             object: "response".to_string(),
             created_at: created_time,
+            status,
+            error: None,
+            incomplete_details: None,
+            instructions: request.instructions.clone(),
+            max_output_tokens: request.max_output_tokens,
             model: model_name,
             output,
-            status,
-            usage: usage.map(ResponsesUsage::Classic),
             parallel_tool_calls: request.parallel_tool_calls,
+            previous_response_id: request.previous_response_id.clone(),
+            reasoning: request.reasoning.as_ref().map(|r| ReasoningInfo {
+                effort: r.effort.as_ref().map(|e| format!("{:?}", e)),
+                summary: None,
+            }),
+            store: request.store,
+            temperature: request.temperature,
+            text: Some(ResponseTextFormat {
+                format: TextFormatType {
+                    format_type: "text".to_string(),
+                },
+            }),
             tool_choice: match &request.tool_choice {
                 ToolChoice::Value(ToolChoiceValue::Auto) => "auto".to_string(),
                 ToolChoice::Value(ToolChoiceValue::Required) => "required".to_string(),
@@ -1381,6 +1471,14 @@ impl ResponsesResponse {
                 ToolChoice::Function { .. } => "function".to_string(),
             },
             tools: request.tools.clone(),
+            top_p: request.top_p,
+            truncation: match &request.truncation {
+                Truncation::Auto => Some("auto".to_string()),
+                Truncation::Disabled => Some("disabled".to_string()),
+            },
+            usage: usage.map(ResponsesUsage::Classic),
+            user: request.user.clone(),
+            metadata: request.metadata.clone().unwrap_or_default(),
         }
     }
 
@@ -1390,13 +1488,26 @@ impl ResponsesResponse {
             id: request_id,
             object: "response".to_string(),
             created_at: current_timestamp(),
+            status,
+            error: None,
+            incomplete_details: None,
+            instructions: None,
+            max_output_tokens: None,
             model,
             output: Vec::new(),
-            status,
-            usage: None,
             parallel_tool_calls: true,
+            previous_response_id: None,
+            reasoning: None,
+            store: true,
+            temperature: None,
+            text: None,
             tool_choice: "auto".to_string(),
             tools: Vec::new(),
+            top_p: None,
+            truncation: None,
+            usage: None,
+            user: None,
+            metadata: HashMap::new(),
         }
     }
 
