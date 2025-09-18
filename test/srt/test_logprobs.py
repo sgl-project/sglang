@@ -12,6 +12,7 @@ import torch
 import sglang as sgl
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    is_in_ci,
     write_github_step_summary,
 )
 
@@ -38,6 +39,14 @@ NUM_SAMPLES = 1000
 LOGPROB_SAMPLE_RATIO = 0.5
 TEMPERATURE = 1.0
 
+# Default engine configuration
+DEFAULT_ENGINE_CONFIG = {
+    "model_path": DENSE_MODEL_NAME,
+    "random_seed": 42,
+    "skip_tokenizer_init": True,
+    "mem_fraction_static": 0.85,
+}
+
 
 class TestLogprobsDense(unittest.TestCase):
 
@@ -45,44 +54,36 @@ class TestLogprobsDense(unittest.TestCase):
     def setUpClass(cls):
         """Set up the test class - initialize the engine once for all tests."""
         print(f"Launching SGLang Engine with {DENSE_MODEL_NAME}...")
-        cls.engine = sgl.Engine(
-            model_path=DENSE_MODEL_NAME,
-            random_seed=42,
-            skip_tokenizer_init=True,
-            mem_fraction_static=0.85,
-        )
+        cls.engine = sgl.Engine(**DEFAULT_ENGINE_CONFIG)
 
     @classmethod
     def tearDownClass(cls):
         """Clean up after all tests - shutdown the engine."""
-        cls.engine.shutdown()
-        torch.cuda.empty_cache()
+        cls._shutdown_engine()
+
+    @classmethod
+    def _shutdown_engine(cls):
+        """Safely shutdown the current engine"""
+        if hasattr(cls, "engine") and cls.engine is not None:
+            print("Shutting down current engine...")
+            cls.engine.shutdown()
+            torch.cuda.empty_cache()
 
     @classmethod
     def restart_engine_with_config(cls, **kwargs):
         """Create engine with custom configuration"""
-        if hasattr(cls, "engine") and cls.engine is not None:
-            cls.tearDownClass()
+        # Safely shutdown existing engine
+        cls._shutdown_engine()
 
-        default_config = {
-            "model_path": DENSE_MODEL_NAME,
-            "random_seed": 42,
-            "skip_tokenizer_init": True,
-            "mem_fraction_static": 0.7,
-        }
-
-        chunk_size = kwargs.get("chunk_size", None)
-        kwargs.pop("chunk_size")
+        # Set chunk size
+        chunk_size = kwargs.pop("chunk_size", None)
         if chunk_size is not None:
             print(f"Setting SGLANG_LOGITS_PROCESSER_CHUNK_SIZE to {chunk_size}")
             os.environ["SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"] = str(chunk_size)
 
-        max_running_requests = kwargs.get("max_running_requests", None)
-        if max_running_requests is not None:
-            print(f"Setting max_running_requests to {max_running_requests}")
-
-        default_config.update(kwargs)
-        cls.engine = sgl.Engine(**default_config)
+        # Create engine with merged configuration
+        engine_config = {**DEFAULT_ENGINE_CONFIG, **kwargs}
+        cls.engine = sgl.Engine(**engine_config)
 
     def load_test_data(self):
         """Load test data from Hugging Face dataset with retry mechanism."""
@@ -142,29 +143,40 @@ class TestLogprobsDense(unittest.TestCase):
         # Load test data with retry mechanism
         records = self.load_test_data()
 
-        configs = [
+        # Fast configs for CI
+        fast_configs = [
             {"num_samples": NUM_SAMPLES},
             {"num_samples": 42, "chunk_size": 1, "max_running_requests": 16},
             {"num_samples": NUM_SAMPLES, "chunk_size": 128, "max_running_requests": 16},
-            # these configs are too slow to test in CI
-            # {"num_samples": 42, "chunk_size": 2, "max_running_requests": 16},
-            # {"num_samples": 42, "chunk_size": 3, "max_running_requests": 16},
-            # {"num_samples": NUM_SAMPLES, "chunk_size": 128, "max_running_requests": 8},
-            # {"num_samples": NUM_SAMPLES, "chunk_size": 128, "max_running_requests": 32},
-            # {"num_samples": NUM_SAMPLES, "chunk_size": 128, "max_running_requests": 128},
-            # {"num_samples": NUM_SAMPLES, "chunk_size": 256, "max_running_requests": 8},
-            # {"num_samples": NUM_SAMPLES, "chunk_size": 256, "max_running_requests": 32},
-            # {"num_samples": NUM_SAMPLES, "chunk_size": 256, "max_running_requests": 128},
         ]
 
-        for config in configs:
-            default_config = {
+        # Slow configs (skip in CI)
+        slow_configs = [
+            {"num_samples": 42, "chunk_size": 2, "max_running_requests": 16},
+            {"num_samples": 42, "chunk_size": 3, "max_running_requests": 16},
+            {"num_samples": NUM_SAMPLES, "chunk_size": 128, "max_running_requests": 8},
+            {"num_samples": NUM_SAMPLES, "chunk_size": 128, "max_running_requests": 32},
+            {
                 "num_samples": NUM_SAMPLES,
-                "logprob_sample_ratio": LOGPROB_SAMPLE_RATIO,
-                "temperature": TEMPERATURE,
-            }
-            default_config.update(config)
+                "chunk_size": 128,
+                "max_running_requests": 128,
+            },
+            {"num_samples": NUM_SAMPLES, "chunk_size": 256, "max_running_requests": 8},
+            {"num_samples": NUM_SAMPLES, "chunk_size": 256, "max_running_requests": 32},
+            {
+                "num_samples": NUM_SAMPLES,
+                "chunk_size": 256,
+                "max_running_requests": 128,
+            },
+        ]
 
+        # Combine configs based on environment
+        configs = fast_configs
+        if not is_in_ci():
+            configs.extend(slow_configs)
+
+        # Run tests
+        for config in configs:
             with self.subTest(config=config):
                 print(f"Testing with config: {config}")
                 chunk_size = config.get("chunk_size", None)
@@ -209,10 +221,12 @@ class TestLogprobsDense(unittest.TestCase):
                 ]
 
                 # Some configs must restart the engine to take effect
-                self.restart_engine_with_config(
-                    chunk_size=chunk_size,
-                    max_running_requests=max_running_requests,
-                )
+                if chunk_size is not None or max_running_requests is not None:
+                    self.restart_engine_with_config(
+                        chunk_size=chunk_size,
+                        max_running_requests=max_running_requests,
+                    )
+
                 outputs = self.engine.generate(
                     input_ids=input_ids,
                     sampling_params=sampling_params,
@@ -277,13 +291,14 @@ class TestLogprobsDense(unittest.TestCase):
                 )
 
                 # Write results to GitHub summary
-                summary_content = f"""
+                if is_in_ci():
+                    summary_content = f"""
 - **Configuration**: {{"num_samples": {num_samples}, "logprob_sample_ratio": {LOGPROB_SAMPLE_RATIO}, "temperature": {TEMPERATURE}}}
 - **Max of max Δ**: {max_of_max:.6g}
 - **Mean of mean Δ**: {mean_of_mean:.6g}
 - **Status**: {'✅ Passed' if max_of_max <= DENSE_TOLERANCE_MAX_DIFF and mean_of_mean <= DENSE_TOLERANCE_MEAN_DIFF else '❌ Failed'}
 """
-                write_github_step_summary(summary_content)
+                    write_github_step_summary(summary_content)
 
                 # Basic validation
                 self.assertIsInstance(all_max, list)
