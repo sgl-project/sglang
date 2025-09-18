@@ -7,7 +7,7 @@ use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, ReasoningInfo,
     RerankRequest, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
     ResponseStatus, ResponseTextFormat, ResponsesGetParams, ResponsesRequest, ResponsesResponse,
-    ResponsesUsage, TextFormatType, UsageInfo,
+    ResponsesUsage, TextFormatType, ToolChoice, ToolChoiceValue, Truncation, UsageInfo,
 };
 use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
 use async_trait::async_trait;
@@ -440,18 +440,18 @@ impl OpenAIRouter {
                 },
             }),
             tool_choice: match &original_body.tool_choice {
-                crate::protocols::spec::ToolChoice::Value(v) => match v {
-                    crate::protocols::spec::ToolChoiceValue::Auto => "auto".to_string(),
-                    crate::protocols::spec::ToolChoiceValue::Required => "required".to_string(),
-                    crate::protocols::spec::ToolChoiceValue::None => "none".to_string(),
+                ToolChoice::Value(v) => match v {
+                    ToolChoiceValue::Auto => "auto".to_string(),
+                    ToolChoiceValue::Required => "required".to_string(),
+                    ToolChoiceValue::None => "none".to_string(),
                 },
-                crate::protocols::spec::ToolChoice::Function { .. } => "function".to_string(),
+                ToolChoice::Function { .. } => "function".to_string(),
             },
             tools: original_body.tools.clone(),
             top_p: original_body.top_p.or(Some(1.0)),
             truncation: match &original_body.truncation {
-                crate::protocols::spec::Truncation::Auto => Some("auto".to_string()),
-                crate::protocols::spec::Truncation::Disabled => Some("disabled".to_string()),
+                Truncation::Auto => Some("auto".to_string()),
+                Truncation::Disabled => Some("disabled".to_string()),
             },
             usage,
             user: original_body.user.clone(),
