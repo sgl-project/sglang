@@ -21,7 +21,7 @@ export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 export PORT=8000
 export ENABLE_METRICS="${ENABLE_METRICS:-false}"
 export H100_ONLY="${H100_ONLY:-false}"
-export AUTO_USE_FP8_ON_H100="${AUTO_USE_FP8_ON_H100:-true}"
+export AUTO_USE_FP8_ON_H100="${AUTO_USE_FP8_ON_H100:-false}"
 export SPEC_DECODE="${SPEC_DECODE:-}"  # if set to 1/true/yes enables speculative decoding
 
 export HF_TOKEN="${HF_TOKEN:-}"

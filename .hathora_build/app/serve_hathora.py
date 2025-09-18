@@ -227,10 +227,10 @@ async def lifespan(app: FastAPI):
         quant = CONFIG.quantization
         if _is_h100_only() and CONFIG.auto_use_fp8_on_h100:
             if dtype == "auto" and (not quant or quant == "auto"):
-                # prefer fp8 weights when available
-                quant = "fp8"
+                # prefer bf16/auto unless explicitly opted into FP8 via env
+                pass
             if kv_dtype == "auto":
-                kv_dtype = "fp8_e5m2"
+                pass
 
         # NOTE: Qwen3 spec-dec temporary disable block (re-enabled to ignore eagle for qwen3 for now)
         spec_algo = CONFIG.speculative_algorithm
@@ -248,7 +248,7 @@ async def lifespan(app: FastAPI):
 
         engine = sgl.Engine(
             model_path=CONFIG.model_id,
-            tokenizer_path=os.environ.get("TOKENIZER_PATH"),
+            tokenizer_path=(os.environ.get("TOKENIZER_PATH") or CONFIG.model_id),
             revision=CONFIG.revision,
             dtype=dtype,
             quantization=quant,
@@ -256,6 +256,7 @@ async def lifespan(app: FastAPI):
             tp_size=CONFIG.tp_size,
             max_total_tokens=CONFIG.max_total_tokens,
             enable_memory_saver=getattr(CONFIG, "enable_memory_saver", True),
+            disable_custom_all_reduce=True,
             mem_fraction_static=CONFIG.mem_fraction_static,
             schedule_conservativeness=CONFIG.schedule_conservativeness,
             max_queued_requests=CONFIG.max_queued_requests,
@@ -381,25 +382,41 @@ class ChatCompletionStreamResponse(BaseModel):
 
 
 def extract_prompt_from_messages(messages: List[ChatMessage]) -> str:
-    """Extract a formatted prompt from chat messages."""
+    """Extract a formatted prompt from chat messages.
+
+    Prefer the HF tokenizer's built-in chat template when available; fall back to a
+    simple plain-text template otherwise.
+    """
     logger.debug(f"Extracting prompt from {len(messages)} messages")
-    
-    # For simplicity, we'll use a basic chat template
-    # In production, you'd want to use the model's specific chat template
+
+    # Try to use the model's tokenizer chat template
+    try:
+        tok = getattr(getattr(engine, "tokenizer_manager", None), "tokenizer", None)
+        if tok is not None and hasattr(tok, "apply_chat_template"):
+            conv = [{"role": m.role, "content": m.content} for m in messages]
+            prompt = tok.apply_chat_template(
+                conv,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            logger.debug("Applied HF chat template for prompt construction")
+            return prompt
+    except Exception as e:
+        logger.warning(f"Chat template application failed, falling back: {e}")
+
+    # Fallback: minimal plain-text formatting
     formatted_messages = []
     for msg in messages:
         if msg.role == "system":
             formatted_messages.append(f"System: {msg.content}")
         elif msg.role == "user":
-            formatted_messages.append(f"Human: {msg.content}")
+            formatted_messages.append(f"User: {msg.content}")
         elif msg.role == "assistant":
             formatted_messages.append(f"Assistant: {msg.content}")
-    
-    # Add the Assistant: prefix for the response
+
     formatted_messages.append("Assistant:")
     prompt = "\n".join(formatted_messages)
-    
-    logger.debug(f"Formatted prompt: {prompt[:100]}...")
+    logger.debug(f"Formatted prompt (fallback): {prompt[:100]}...")
     return prompt
 
 
@@ -635,8 +652,7 @@ async def stream_response_sglang(
         
         token_count = 0
 
-        # Track previously emitted content length (excluding prompt)
-        prompt_len = len(prompt)
+        # Track previously emitted content length from cumulative generated text
         last_emitted_len = 0
 
         # Send initial role chunk to follow typical streaming contract
@@ -654,24 +670,18 @@ async def stream_response_sglang(
         
         # Stream the tokens
         async for chunk in async_generator:
-            # Extract cumulative text and compute delta since last emission
+            # Engine yields cumulative completion text (without the prompt)
             content = chunk.get("text", "")
             if not isinstance(content, str):
                 content = str(content)
 
-            if len(content) <= prompt_len:
-                # Nothing generated yet
+            if len(content) <= last_emitted_len:
+                # No new delta yet
                 await asyncio.sleep(0)
                 continue
 
-            generated_so_far = content[prompt_len:]
-            if len(generated_so_far) <= last_emitted_len:
-                # No new delta; skip sending an empty chunk
-                await asyncio.sleep(0)
-                continue
-
-            new_content = generated_so_far[last_emitted_len:]
-            last_emitted_len = len(generated_so_far)
+            new_content = content[last_emitted_len:]
+            last_emitted_len = len(content)
 
             token_count += 1
             time_to_token = (time.time() - start_time) * 1000

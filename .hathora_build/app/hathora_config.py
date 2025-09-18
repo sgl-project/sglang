@@ -39,7 +39,7 @@ class DeploymentConfig(BaseModel):
 
     # Platform constraints and heuristics
     h100_only: bool = Field(default=True, description="Fail fast if GPUs are not H100 class")
-    auto_use_fp8_on_h100: bool = Field(default=True, description="If H100, prefer fp8 weights + fp8 kv cache when safe")
+    auto_use_fp8_on_h100: bool = Field(default=False, description="If H100, prefer fp8 weights + fp8 kv cache when safe (opt-in)")
 
     # Speculative decoding (EAGLE / EAGLE3)
     speculative_algorithm: Optional[str] = Field(default=None, description="None|EAGLE|EAGLE3|STANDALONE")
