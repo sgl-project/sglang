@@ -35,6 +35,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_size,
+    get_dp_device,
+    get_dp_dtype,
+    get_dp_hidden_size,
     get_global_dp_buffer,
     get_local_attention_dp_size,
     set_dp_buffer_len,
@@ -46,9 +49,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import dump_to_file, use_intel_amx_backend
+from sglang.srt.utils import dump_to_file, is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 @dataclasses.dataclass
@@ -67,7 +72,10 @@ class LogitsProcessorOutput:
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
-    next_token_token_ids_logprobs_val: Optional[List] = None
+    # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
+    next_token_token_ids_logprobs_val: Optional[
+        List[Union[List[float], torch.Tensor]]
+    ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -180,10 +188,13 @@ class LogitsMetadata:
             )
         else:
             dp_local_start_pos = cumtokens[dp_rank - 1]
-        dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = dp_local_num_tokens
+        self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+
+        hidden_size = get_dp_hidden_size()
+        dtype = get_dp_dtype()
+        device = get_dp_device()
 
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage
@@ -191,10 +202,13 @@ class LogitsMetadata:
         else:
             self.global_dp_buffer_len = self.global_dp_buffer_len
 
-        set_dp_buffer_len(
-            self.global_dp_buffer_len,
-            self.dp_local_num_tokens,
-            self.global_num_tokens_for_logprob_cpu,
+        self.gathered_buffer = torch.empty(
+            (
+                self.global_dp_buffer_len,
+                hidden_size,
+            ),
+            dtype=dtype,
+            device=device,
         )
 
 
@@ -441,7 +455,7 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata()
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(),
+                logits_metadata.gathered_buffer,
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
@@ -517,7 +531,12 @@ class LogitsProcessor(nn.Module):
             logits = logits[:, : self.config.vocab_size].float()
 
         if self.final_logit_softcapping:
-            fused_softcap(logits, self.final_logit_softcapping)
+            if not _is_npu:
+                fused_softcap(logits, self.final_logit_softcapping)
+            else:
+                logits = self.final_logit_softcapping * torch.tanh(
+                    logits / self.final_logit_softcapping
+                )
 
         return logits
 
