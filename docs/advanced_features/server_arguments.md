@@ -179,8 +179,8 @@ Please consult the documentation below and [`server_args.py`](python/sglang/srt/
 | `--api-key` | Set API key of the server. It is also used in the OpenAI API compatible server. | None |
 | `--served-model-name` | Override the model name returned by the v1/models endpoint in OpenAI API server. | None |
 | `--weight-version` | Version identifier for the model weights. | default |
-| `--chat-template` | The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server. | None |
-| `--completion-template` | The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently. | None |
+| `--chat-template` | The builtin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server. | None |
+| `--completion-template` | The builtin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently. | None |
 | `--file-storage-path` | The path of the file storage in backend. | sglang_storage |
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | False |
 | `--reasoning-parser` | Specify the parser for reasoning models. | None |
