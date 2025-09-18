@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
+import requests
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -234,7 +235,8 @@ class NixlKVManager(CommonKVManager):
                 del self.prefill_tp_size_table[failed_bootstrap_addr]
             if failed_bootstrap_addr in self.prefill_dp_size_table:
                 del self.prefill_dp_size_table[failed_bootstrap_addr]
-            # TODO (smor): once PP is supported, we need to remove failed boostrap address from that table as well.
+            if failed_bootstrap_addr in self.prefill_pp_size_table:
+                del self.prefill_pp_size_table[failed_bootstrap_addr]
 
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
                 failed_bootstrap_addr, []
