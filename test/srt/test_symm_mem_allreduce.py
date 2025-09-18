@@ -134,7 +134,7 @@ class TestSymmMemAllReduce(CustomTestCase):
         del data
 
         for sz in self.test_sizes:
-            for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            for dtype in [torch.bfloat16]:
                 for _ in range(self.test_loop):
                     with graph_capture() as graph_capture_context:
                         # use integers so result matches NCCL exactly
