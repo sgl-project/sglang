@@ -70,6 +70,7 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActiveRanksOutput,
     BaseBatchReq,
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
@@ -2114,6 +2115,14 @@ class Scheduler(
             batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
             )
+            if self.server_args.enable_dp_attention:
+                # Get the tensors indicating rank activeness
+                tp_active_ranks = get_tp_active_ranks().detach().cpu().numpy()
+                tp_active_ranks_cpu = get_tp_active_ranks_cpu().detach().numpy()
+                tp_active_ranks &= tp_active_ranks_cpu
+                self.send_to_tokenizer.send_output(
+                    ActiveRanksOutput(status=tp_active_ranks.tolist())
+                )
             return batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
