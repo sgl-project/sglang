@@ -88,15 +88,16 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
-        if _is_cuda:
-            return self.forward_cuda
-        elif _is_hip:
-            return self.forward_hip
-        elif _is_cpu and _is_cpu_amx_available:
-            return self.forward_cpu
-        elif _is_npu:
-            return self.forward_npu
-        elif _is_xpu:
-            return self.forward_xpu
-        else:
-            return self.forward_native
+        # if _is_cuda:
+        #     return self.forward_cuda
+        # elif _is_hip:
+        #     return self.forward_hip
+        # elif _is_cpu and _is_cpu_amx_available:
+        #     return self.forward_cpu
+        # elif _is_npu:
+        #     return self.forward_npu
+        # elif _is_xpu:
+        #     return self.forward_xpu
+        # else:
+        #     return self.forward_native
+        return self.forward_native
