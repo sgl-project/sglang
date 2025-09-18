@@ -56,7 +56,7 @@ If OOM during capture, try (in order):
 - Slightly reduce `--mem-fraction-static`.
 - Enable `--enable-cudagraph-gc` (last resort; slows capture).
 - Reduce hidden mode demand (avoid requesting hidden states unless needed).
-- (If unset) Note: default `mem_fraction_static` is computed heuristically from GPU memory, parallel size, speculative decoding, and DP attention; see Hyperparameter Tuning for the formula.
+- (If unset) Note: default `mem_fraction_static` is computed heuristically from GPU memory, parallel size, speculative decoding, and DP attention; see [Hyperparameter Tuning](hyperparameter_tuning.md) for the formula.
 
 ## Disabling or Limiting CUDA Graph
 Flags:
