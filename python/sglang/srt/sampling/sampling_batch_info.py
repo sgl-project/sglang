@@ -26,6 +26,9 @@ class SamplingBatchInfo:
     top_ks: torch.Tensor
     min_ps: torch.Tensor
 
+    # Used for deterministic sampling
+    sampling_seed: torch.Tensor
+
     # Whether all requests use greedy sampling
     is_all_greedy: bool
 
@@ -92,6 +95,9 @@ class SamplingBatchInfo:
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
         )
+        sampling_seed = torch.tensor(
+            [r.sampling_seed for r in reqs], dtype=torch.int32, device=device
+        )
 
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
@@ -157,6 +163,7 @@ class SamplingBatchInfo:
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
+            sampling_seed=sampling_seed,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
@@ -238,6 +245,7 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "sampling_seed",
         ]:
             value = getattr(self, item, None)
             setattr(self, item, value[keep_indices_device])
@@ -342,6 +350,7 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "sampling_seed",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
