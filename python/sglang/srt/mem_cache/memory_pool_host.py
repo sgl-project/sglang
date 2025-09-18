@@ -537,7 +537,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
             )
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout == "page_first":
+        elif self.layout in ["page_first", "page_first_direct"]:
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
                     kv_buffer_data_ptr
@@ -806,7 +806,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 * (self.kv_lora_rank + self.qk_rope_head_dim)
             )
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout == "page_first":
+        elif self.layout in ["page_first", "page_first_direct"]:
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
                     kv_buffer_data_ptr
