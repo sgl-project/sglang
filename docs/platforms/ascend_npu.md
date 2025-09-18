@@ -174,6 +174,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 export HCCL_BUFFSIZE=200
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
+export SGLANG_NPU_USE_MLAPO=1
 
 drun sglang-npu:main \
     python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \

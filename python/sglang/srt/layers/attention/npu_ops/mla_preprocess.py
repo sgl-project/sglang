@@ -235,9 +235,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.dtype = hidden_states.dtype
 
         cos, sin = self.get_sin_cos(positions)
-        k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(
-            forward_batch
-        )
+        k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
 
         q_nope_out = torch.empty(
             (hidden_states.shape[0], self.w_kc.shape[0], k_cache.shape[-1]),
