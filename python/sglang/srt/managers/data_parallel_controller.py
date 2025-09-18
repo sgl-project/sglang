@@ -169,7 +169,7 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def update_ranks(self, ranks: Ranks):
-        self.status Ranks.status
+        self.status = ranks.status
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
