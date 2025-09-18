@@ -74,11 +74,10 @@ def req_inference(inference_parallel_size: int):
     src = rank // inference_parallel_size * inference_parallel_size
 
     def req_func(socket_paths: list[tuple[str, str]]):
-        if rank == src:
-            request_inference_to_update(
-                CKPTENGINE_PORT + rank,
-                dict(socket_paths[src : src + inference_parallel_size]),
-            )
+        request_inference_to_update(
+            CKPTENGINE_PORT + rank,
+            dict(socket_paths[src : src + inference_parallel_size]),
+        )
 
     return req_func
 
@@ -146,7 +145,7 @@ if __name__ == "__main__":
     parser.add_argument("--load-metas-file", type=str, default=None)
     parser.add_argument("--sleep-time", type=int, default=0)
     parser.add_argument("--inference-parallel-size", type=int, default=8)
-    parser.add_argument("--checkpoint-name", type=str, default="my-checkpoint-iter-0")
+    parser.add_argument("--checkpoint-name", type=str, default="sglang-ckpt-iter-0")
     parser.add_argument("--update-method", type=str, default="broadcast")
     args = parser.parse_args()
     rank = int(os.getenv("RANK"))
