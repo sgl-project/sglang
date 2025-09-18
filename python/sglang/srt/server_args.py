@@ -185,6 +185,7 @@ class ServerArgs:
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
+    radix_eviction_policy: str = "lru"
 
     # Runtime options
     device: Optional[str] = None
@@ -381,6 +382,7 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
@@ -1907,6 +1909,13 @@ class ServerArgs:
             help="The write policy of hierarchical cache.",
         )
         parser.add_argument(
+            "--radix-eviction-policy",
+            type=str,
+            choices=["lru", "lfu"],
+            default=ServerArgs.radix_eviction_policy,
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+        )
+        parser.add_argument(
             "--hicache-io-backend",
             type=str,
             choices=["direct", "kernel"],
@@ -2212,6 +2221,11 @@ class ServerArgs:
             "--disable-fast-image-processor",
             action="store_true",
             help="Adopt base image processor instead of fast image processor.",
+        )
+        parser.add_argument(
+            "--keep-mm-feature-on-device",
+            action="store_true",
+            help="Keep multimodal feature tensors on device after processing to save D2H copy.",
         )
         parser.add_argument(
             "--enable-return-hidden-states",
