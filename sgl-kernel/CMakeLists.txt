@@ -46,7 +46,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        a49a78ffefc86a87160dfe0ccc3a3a2d1622c918
+    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -318,6 +318,7 @@ set(SOURCES
     "csrc/kvcacheio/transfer.cu"
 
     "csrc/speculative/eagle_utils.cu"
+    "csrc/speculative/lookahead_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
 
