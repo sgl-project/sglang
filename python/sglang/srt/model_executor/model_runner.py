@@ -1191,18 +1191,11 @@ class ModelRunner:
                 target_dtype = (
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
-                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
-                    )
-                )
+                weight = torch.empty(1, dtype=target_dtype, device=self.device)
+                weight._fake = True
+                weight._original_shape = shape
+                weight._group = self._model_update_group[group_name]
                 weights.append((name, weight))
-            for handle in handles:
-                handle.wait()
 
             self.model.load_weights(weights)
             return True, "Succeeded to update parameter online."

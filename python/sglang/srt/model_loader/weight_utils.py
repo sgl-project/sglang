@@ -837,10 +837,23 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
         x = x[:]
     return x
 
+def bcast_weight(weight):
+    assert weight._original_shape and weight._group
+    real_weight = torch.empty(weight._original_shape, dtype=weight.dtype, device=weight.device)
+
+    torch.distributed.broadcast(
+        real_weight,
+        src=0,
+        group=weight._group,
+        async_op=False,
+    )
+    return real_weight
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
+        if hasattr(loaded_weight, "_fake") and loaded_weight._fake:
+            loaded_weight = bcast_weight(loaded_weight)
         if param.numel() == 1 and loaded_weight.numel() == 1:
             # Sometimes scalar values aren't considered tensors with shapes
             # so if both param and loaded_weight are a scalar,
