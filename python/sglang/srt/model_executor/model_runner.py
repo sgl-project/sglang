@@ -158,6 +158,7 @@ try:
     )
 
     CHECKPOINT_ENGINE_AVAILABLE = True
+    import pickle
 except ImportError:
     CHECKPOINT_ENGINE_AVAILABLE = False
     ParameterServer = None
@@ -296,6 +297,23 @@ class ModelRunner:
 
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
+
+        self.ps = None
+        if (
+            CHECKPOINT_ENGINE_AVAILABLE
+            and ParameterServer is not None
+            and self.server_args.enable_ckpt_engine
+        ):
+            self.ps = ParameterServer(auto_pg=True)
+            self.ps.register_checkpoint(
+                self.server_args.ckpt_register_name,
+                files=[],
+                named_tensor=self.model.named_parameters(),
+            )
+            self.ps.gather_metas(self.server_args.ckpt_register_name)
+            # TODO: Using json to transfer meta
+            with open(self.server_args.ckpt_save_meta_file_name, "wb") as f:
+                pickle.dump(self.ps.get_metas(), f)
 
         # Temporary cached values
         self.support_pp = (

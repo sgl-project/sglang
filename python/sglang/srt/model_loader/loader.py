@@ -1551,6 +1551,8 @@ class CkptEngineModelLoader(BaseModelLoader):
         weights_iterator = self._get_weights_iterator(client)
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
         for key, tensor in weights_iterator:
+            if key == "model.embed_tokens.weight":
+                key = "lm_head.weight"
             # If loading with LoRA enabled, additional padding may
             # be added to certain parameters. We only load into a
             # narrowed view of the parameter data.
