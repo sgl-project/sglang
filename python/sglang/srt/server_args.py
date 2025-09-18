@@ -1019,7 +1019,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-ckpt-engine",
-            type=bool,
+            action="store_true",
             default=ServerArgs.enable_ckpt_engine,
             help="Enable loading weights from mooncake Checkpoint Engine.",
         )
