@@ -1,4 +1,5 @@
 import json
+import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -50,51 +51,23 @@ class JsonArrayParser(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
-        Parse JSON array tool calls using json.loads() validation.
-        Checks the last comma to find valid JSON boundaries.
+        Streaming logic:
+        - If a pending separator exists and new_text isn't just whitespace, prepend a comma and clear the flag.
+        - If new_text ends with "}," allowing whitespace between '}' and ',' and at end, remove the comma and set pending for next chunk.
+        - Delegate to base implementation with the modified text.
         """
-        # If we receive the whole array at once, remove the array brackets.
-        # Otherwise the base class only removes '[' at the start and crashes because of the trailing ']'.
-        if new_text.strip().startswith(self.bot_token) and new_text.strip().endswith(self.eot_token):
-            new_text = new_text.lstrip(self.bot_token).rstrip(self.eot_token)
-            return super().parse_streaming_increment(new_text, tools)
-        # Handle pending separator from previous chunk
-        if self._pending_separator:
-            if new_text.strip().startswith("{"):
-                new_text = self.tool_call_separator + new_text
-                self._pending_separator = False
-        
-        last_comma_pos = new_text.rfind(self.tool_call_separator)
-        if last_comma_pos > 0:
-            # Found a potential separator, check if content before it is valid JSON
-            combined = self._buffer + new_text[:last_comma_pos]
-            start_pos = combined.find(self.bot_token) + 1
-            prev_tool_call = combined[start_pos:]
-            
-            # Remove leading comma from prev_tool_call if present
-            if prev_tool_call.lstrip().startswith(self.tool_call_separator):
-                prev_tool_call = prev_tool_call.lstrip()[len(self.tool_call_separator):]
-            
-            remainder = new_text[last_comma_pos + 1:].strip()
-            
-            try:
-                # Try to parse the JSON part
-                json.loads(prev_tool_call)
-                # Valid JSON found before separator
-                
-                if remainder:
-                    # There's more content after the separator
-                    return super().parse_streaming_increment(new_text, tools)
-                else:
-                    # Separator at end of chunk, set pending separator and process text without separator
-                    self._pending_separator = True
-                    # Remove the trailing comma from new_text before passing to base class
-                    return super().parse_streaming_increment(new_text[:last_comma_pos], tools)
-            except json.JSONDecodeError:
-                # Not valid JSON yet, delegate to base implementation
-                pass
-        
-        # No valid separator found, delegate to base implementation
+        # Apply pending separator if there is non-whitespace content in this chunk
+        if self._pending_separator and new_text.strip():
+            new_text = "," + new_text
+            self._pending_separator = False
+
+        # Detect a trailing "}," with any whitespace between '}' and ',' and at the end
+        if re.search(r"}\s*,\s*$", new_text):
+            # Remove the trailing comma but preserve surrounding whitespace
+            new_text = re.sub(r"}(\s*),(\s*)$", r"}\1\2", new_text, count=1)
+            # Mark pending separator for the next non-whitespace chunk
+            self._pending_separator = True
+
         return super().parse_streaming_increment(new_text, tools)
 
     def structure_info(self) -> callable:
