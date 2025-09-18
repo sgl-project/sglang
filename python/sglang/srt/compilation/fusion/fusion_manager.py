@@ -22,6 +22,7 @@ from sglang.srt.compilation.fusion.fusion_context import (
     get_fusion_context,
 )
 from sglang.srt.compilation.fusion.fusion_utils import hash_dict
+from sglang.srt.compilation.fusion.passes.fused_activation import FusedActivationPass
 from sglang.srt.server_args import ServerArgs
 
 
@@ -40,6 +41,9 @@ class FusionManager(CustomGraphPass):
 
     def configure(self, server_args: ServerArgs):
         self.config = FusionConfig.from_server_args(server_args)
+
+        if self.config.enable_fused_activation_pass:
+            self.passes.append(FusedActivationPass(self.config))
 
     def uuid(self):
         state = {"config": self.config.uuid(), "passes": []}

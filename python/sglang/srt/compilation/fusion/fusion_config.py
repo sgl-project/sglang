@@ -26,6 +26,8 @@ class FusionConfig:
     device: str
     model_dtype: str
 
+    enable_fused_activation_pass: bool
+
     enable_torch_compile_graph_trace_logs: bool
 
     def uuid(self):
@@ -36,5 +38,6 @@ class FusionConfig:
         return FusionConfig(
             device=server_args.device if server_args.device else None,
             model_dtype=server_args.dtype if server_args.dtype else None,
+            enable_fused_activation_pass=server_args.enable_fused_activation_pass,
             enable_torch_compile_graph_trace_logs=server_args.enable_torch_compile_graph_trace_logs,
         )
