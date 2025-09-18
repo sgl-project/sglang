@@ -161,7 +161,7 @@ impl RouterManager {
         let model_id = if let Some(model_id) = config.model_id {
             model_id
         } else {
-            match self.query_server_info(&config.url).await {
+            match self.query_server_info(&config.url, &config.api_key).await {
                 Ok(info) => {
                     // Extract model_id from server info
                     info.model_id
@@ -342,10 +342,14 @@ impl RouterManager {
     }
 
     /// Query server info from a worker URL
-    async fn query_server_info(&self, url: &str) -> Result<ServerInfo, String> {
+    async fn query_server_info(&self, url: &str, api_key: &Option<String>) -> Result<ServerInfo, String> {
         let info_url = format!("{}/get_server_info", url.trim_end_matches('/'));
 
-        match self.client.get(&info_url).send().await {
+        let mut req_builder = self.client.get(&info_url);
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+        match req_builder.send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     response
