@@ -31,6 +31,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import is_cpu, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -122,29 +123,6 @@ def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
             new_offset += actual_shard_size
         return new_shard_offsets
     return shard_offsets
-
-
-def pad_or_narrow_weight(
-    loaded_weight: torch.Tensor, input_dim: int, start_idx: int, shard_size: int
-) -> torch.Tensor:
-    # Padding with zeros for special case
-    valid_size = max(loaded_weight.shape[input_dim] - start_idx, 0)
-
-    if valid_size > 0:
-        loaded_slice = loaded_weight.narrow(input_dim, start_idx, valid_size)
-        pad_shape = list(loaded_weight.shape)
-        pad_shape[input_dim] = shard_size - valid_size
-        pad = torch.zeros(
-            pad_shape, dtype=loaded_weight.dtype, device=loaded_weight.device
-        )
-        return torch.cat([loaded_slice, pad], dim=input_dim)
-
-    # All padding
-    pad_shape = list(loaded_weight.shape)
-    pad_shape[input_dim] = shard_size
-    return torch.zeros(
-        pad_shape, dtype=loaded_weight.dtype, device=loaded_weight.device
-    )
 
 
 class LinearBase(torch.nn.Module):
