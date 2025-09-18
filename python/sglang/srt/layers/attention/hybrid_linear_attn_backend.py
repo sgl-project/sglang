@@ -13,6 +13,9 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from sglang.srt.layers.attention.mamba.causal_conv1d import (
+    causal_conv1d_fn as causal_conv1d_fn_sgl,
+)
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -334,7 +337,7 @@ class MambaAttnBackend(AttentionBackend):
                 mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
             )
         else:
-            mixed_qkv = causal_conv1d_fn(
+            mixed_qkv = causal_conv1d_fn_sgl(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 bias,

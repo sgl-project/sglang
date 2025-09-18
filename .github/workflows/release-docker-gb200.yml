@@ -33,4 +33,4 @@ jobs:
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           tag=v${version}-cu129-gb200
 
-          docker buildx build --platform linux/arm64 --push --output type=image -t lmsysorg/sglang:${tag} -f docker/Dockerfile.gb200 --build-arg CUDA_VERSION=12.9.1 --build-arg BUILD_TYPE=blackwell --no-cache .
+          docker buildx build --platform linux/arm64 --push --output type=image -t lmsysorg/sglang:${tag} -f docker/Dockerfile.gb200 --build-arg CUDA_VERSION=12.9.1 --build-arg BUILD_TYPE=blackwell_aarch64 --no-cache .
