@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     is_cuda,
@@ -118,6 +119,17 @@ DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
+MOE_RUNNER_BACKEND_CHOICES = [
+    "auto",
+    "triton",
+    "triton_kernel",
+    "flashinfer_trtllm",
+    "flashinfer_cutlass",
+    "flashinfer_mxfp4",
+    "flashinfer_cutedsl",
+    "cutlass_fp8",
+]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -138,6 +150,10 @@ def add_disagg_transfer_backend_choices(choices):
 
 def add_grammar_backend_choices(choices):
     GRAMMAR_BACKEND_CHOICES.extend(choices)
+
+
+def add_moe_runner_backend_choices(choices):
+    MOE_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -286,18 +302,12 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
+    speculative_moe_runner_backend: str = "auto"
 
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep"] = "none"
-    moe_runner_backend: Literal[
-        "auto",
-        "triton",
-        "triton_kernel",
-        "flashinfer_trtllm",
-        "flashinfer_cutlass",
-        "flashinfer_mxfp4",
-    ] = "auto"
+    moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
@@ -718,6 +728,17 @@ class ServerArgs:
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
+
+        if get_bool_env_var("SGLANG_CUTLASS_MOE"):
+            logger.warning(
+                "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass_fp8 and/or --speculative-moe-runner-backend=cutlass_fp8 instead"
+            )
+            self.moe_runner_backend = "cutlass_fp8"
+            self.speculative_moe_runner_backend = "cutlass_fp8"
+        if self.moe_runner_backend == "cutlass_fp8":
+            assert (
+                self.ep_size == 1
+            ), "cutlass_fp8 MoE is only supported with ep_size == 1"
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -1750,6 +1771,13 @@ class ServerArgs:
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             default=ServerArgs.speculative_attention_mode,
         )
+        parser.add_argument(
+            "--speculative-moe-runner-backend",
+            type=str,
+            choices=MOE_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.speculative_moe_runner_backend,
+            help="Choose the runner backend for MoE in speculative decoding.",
+        )
 
         # Expert parallelism
         parser.add_argument(
@@ -1770,15 +1798,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-runner-backend",
             type=str,
-            choices=[
-                "auto",
-                "triton",
-                "triton_kernel",
-                "flashinfer_trtllm",
-                "flashinfer_cutlass",
-                "flashinfer_mxfp4",
-                "flashinfer_cutedsl",
-            ],
+            choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
         )
