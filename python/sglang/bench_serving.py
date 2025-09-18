@@ -13,6 +13,7 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 import argparse
 import asyncio
 import base64
+import csv
 import io
 import json
 import os
@@ -769,6 +770,15 @@ class BenchmarkMetrics:
     std_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     concurrency: float
+    duration: float = 0.0
+    accept_length: Optional[float] = None
+    # Additional result details
+    input_lens: List[int] = field(default_factory=list)
+    output_lens: List[int] = field(default_factory=list)
+    ttfts: List[float] = field(default_factory=list)
+    itls: List[List[float]] = field(default_factory=list)
+    generated_texts: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -1585,6 +1595,94 @@ def calculate_metrics(
     return metrics, output_lens
 
 
+def _print_benchmark_summary(
+    *,
+    backend: str,
+    request_rate_display: Union[str, float],
+    max_concurrency: Optional[int],
+    metrics: BenchmarkMetrics,
+    benchmark_duration: float,
+    accept_length: Optional[float],
+    repeat: int,
+    is_avg: bool,
+    run_idx: Optional[int] = None,
+):
+    if is_avg and repeat > 1:
+        title = f" Serving Benchmark Result ({repeat} runs' avg) "
+    elif run_idx is not None:
+        title = f" Serving Benchmark Result (run {run_idx}) "
+    else:
+        title = " Serving Benchmark Result "
+
+    print("\n{s:{c}^{n}}".format(s=title, n=50, c="="))
+    print("{:<40} {:<10}".format("Backend:", backend))
+    print("{:<40} {:<10}".format("Traffic request rate:", request_rate_display))
+    print(
+        "{:<40} {:<10}".format(
+            "Max request concurrency:",
+            max_concurrency if max_concurrency else "not set",
+        )
+    )
+    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
+    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+    if hasattr(metrics, "total_output_retokenized"):
+        print(
+            "{:<40} {:<10}".format(
+                "Total generated tokens (retokenized):",
+                metrics.total_output_retokenized,
+            )
+        )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Request throughput (req/s):", metrics.request_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Input token throughput (tok/s):", metrics.input_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Output token throughput (tok/s):", metrics.output_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Total token throughput (tok/s):", metrics.total_throughput
+        )
+    )
+    print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
+    if accept_length:
+        print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
+    print(
+        "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
+        )
+    )
+    print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
+    print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
+    print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
+    if hasattr(metrics, "p99_ttft_ms"):
+        print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+    print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
+    print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
+    print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
+    if hasattr(metrics, "p95_itl_ms"):
+        print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
+    if hasattr(metrics, "p99_itl_ms"):
+        print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
+    if hasattr(metrics, "max_itl_ms"):
+        print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+    print("=" * 50)
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1604,6 +1702,8 @@ async def benchmark(
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
     mooncake_num_rounds=1,
+    run_idx: Optional[int] = None,
+    suppress_print: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1780,120 +1880,30 @@ async def benchmark(
         tokenizer=tokenizer,
         backend=backend,
     )
+    metrics.duration = benchmark_duration
+    metrics.accept_length = accept_length
 
-    print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
-    print("{:<40} {:<10}".format("Backend:", backend))
-    print(
-        "{:<40} {:<10}".format(
-            "Traffic request rate:", "trace" if use_trace_timestamps else request_rate
+    if not suppress_print:
+        _print_benchmark_summary(
+            backend=backend,
+            request_rate_display=("trace" if use_trace_timestamps else request_rate),
+            max_concurrency=max_concurrency,
+            metrics=metrics,
+            benchmark_duration=benchmark_duration,
+            accept_length=accept_length,
+            repeat=1,
+            is_avg=False,
+            run_idx=run_idx,
         )
-    )
-    print(
-        "{:<40} {:<10}".format(
-            "Max request concurrency:",
-            max_concurrency if max_concurrency else "not set",
-        )
-    )
-    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
-    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
-    print(
-        "{:<40} {:<10}".format(
-            "Total generated tokens (retokenized):", metrics.total_output_retokenized
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Request throughput (req/s):", metrics.request_throughput
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Input token throughput (tok/s):", metrics.input_throughput
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Output token throughput (tok/s):", metrics.output_throughput
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Total token throughput (tok/s):", metrics.total_throughput
-        )
-    )
-    print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
-    if accept_length:
-        print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
-    print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
-    print(
-        "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
-        )
-    )
-    print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
-    print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
-    print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
-    print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
-    print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
-    print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
-    print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
-    print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
-    print("=" * 50)
 
-    if (
-        metrics.median_ttft_ms is not None
-        and metrics.mean_itl_ms is not None
-        and metrics.output_throughput is not None
-    ):
-        result = {
-            # Arguments
-            "backend": args.backend,
-            "dataset_name": args.dataset_name,
-            "request_rate": "trace" if use_trace_timestamps else request_rate,
-            "max_concurrency": max_concurrency,
-            "sharegpt_output_len": args.sharegpt_output_len,
-            "random_input_len": args.random_input_len,
-            "random_output_len": args.random_output_len,
-            "random_range_ratio": args.random_range_ratio,
-            # Results
-            "duration": benchmark_duration,
-            "completed": metrics.completed,
-            "total_input_tokens": metrics.total_input,
-            "total_output_tokens": metrics.total_output,
-            "total_output_tokens_retokenized": metrics.total_output_retokenized,
-            "request_throughput": metrics.request_throughput,
-            "input_throughput": metrics.input_throughput,
-            "output_throughput": metrics.output_throughput,
-            "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
-            "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
-            "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
-            "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
-            "mean_ttft_ms": metrics.mean_ttft_ms,
-            "median_ttft_ms": metrics.median_ttft_ms,
-            "std_ttft_ms": metrics.std_ttft_ms,
-            "p99_ttft_ms": metrics.p99_ttft_ms,
-            "mean_tpot_ms": metrics.mean_tpot_ms,
-            "median_tpot_ms": metrics.median_tpot_ms,
-            "std_tpot_ms": metrics.std_tpot_ms,
-            "p99_tpot_ms": metrics.p99_tpot_ms,
-            "mean_itl_ms": metrics.mean_itl_ms,
-            "median_itl_ms": metrics.median_itl_ms,
-            "std_itl_ms": metrics.std_itl_ms,
-            "p95_itl_ms": metrics.p95_itl_ms,
-            "p99_itl_ms": metrics.p99_itl_ms,
-            "concurrency": metrics.concurrency,
-            "accept_length": accept_length,
-        }
-    else:
-        print(f"Error running benchmark for request rate: {request_rate}")
-        print("-" * 30)
+    # Add result details to metrics
+    metrics.input_lens = [output.prompt_len for output in outputs]
+    metrics.output_lens = output_lens
+    metrics.ttfts = [output.ttft for output in outputs]
+    metrics.itls = [output.itl for output in outputs]
+    metrics.generated_texts = [output.generated_text for output in outputs]
+    metrics.errors = [output.error for output in outputs]
+    result = metrics
 
     # Determine output file name
     if args.output_file:
@@ -1913,24 +1923,58 @@ async def benchmark(
                 f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
             )
 
-    result_details = {
-        "input_lens": [output.prompt_len for output in outputs],
-        "output_lens": output_lens,
-        "ttfts": [output.ttft for output in outputs],
-        "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
-        "errors": [output.error for output in outputs],
-    }
-
     # Append results to a JSONL file
-    with open(output_file_name, "a") as file:
-        if args.output_details:
-            result_for_dump = result | result_details
-        else:
-            result_for_dump = result
-        file.write(json.dumps(result_for_dump) + "\n")
+    if result is not None:
+        with open(output_file_name, "a") as file:
+            common = {
+                "backend": args.backend,
+                "dataset_name": args.dataset_name,
+                "request_rate": "trace" if use_trace_timestamps else request_rate,
+                "max_concurrency": max_concurrency,
+                "sharegpt_output_len": args.sharegpt_output_len,
+                "random_input_len": args.random_input_len,
+                "random_output_len": args.random_output_len,
+                "random_range_ratio": args.random_range_ratio,
+                "duration": result.duration,
+                "completed": result.completed,
+                "total_input_tokens": result.total_input,
+                "total_output_tokens": result.total_output,
+                "total_output_tokens_retokenized": result.total_output_retokenized,
+                "request_throughput": result.request_throughput,
+                "input_throughput": result.input_throughput,
+                "output_throughput": result.output_throughput,
+                "mean_e2e_latency_ms": result.mean_e2e_latency_ms,
+                "median_e2e_latency_ms": result.median_e2e_latency_ms,
+                "std_e2e_latency_ms": result.std_e2e_latency_ms,
+                "p99_e2e_latency_ms": result.p99_e2e_latency_ms,
+                "mean_ttft_ms": result.mean_ttft_ms,
+                "median_ttft_ms": result.median_ttft_ms,
+                "std_ttft_ms": result.std_ttft_ms,
+                "p99_ttft_ms": result.p99_ttft_ms,
+                "mean_tpot_ms": result.mean_tpot_ms,
+                "median_tpot_ms": result.median_tpot_ms,
+                "std_tpot_ms": result.std_tpot_ms,
+                "p99_tpot_ms": result.p99_tpot_ms,
+                "mean_itl_ms": result.mean_itl_ms,
+                "median_itl_ms": result.median_itl_ms,
+                "std_itl_ms": result.std_itl_ms,
+                "p95_itl_ms": result.p95_itl_ms,
+                "p99_itl_ms": result.p99_itl_ms,
+                "concurrency": result.concurrency,
+                "accept_length": result.accept_length,
+            }
+            detail = {
+                "input_lens": result.input_lens,
+                "output_lens": result.output_lens,
+                "ttfts": result.ttfts,
+                "itls": result.itls,
+                "generated_texts": result.generated_texts,
+                "errors": result.errors,
+            }
+            result_for_dump = common | (detail if args.output_details else {})
+            file.write(json.dumps(result_for_dump) + "\n")
 
-    return result | result_details
+    return result
 
 
 def check_chat_template(model_path):
@@ -2093,28 +2137,200 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
 
-    return asyncio.run(
-        benchmark(
-            backend=backend,
-            api_url=api_url,
-            base_url=base_url,
-            model_id=model_id,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            request_rate=args.request_rate,
-            max_concurrency=args.max_concurrency,
-            disable_tqdm=args.disable_tqdm,
-            lora_names=args.lora_name,
-            extra_request_body=extra_request_body,
-            profile=args.profile,
-            pd_separated=args.pd_separated,
-            flush_cache=args.flush_cache,
-            warmup_requests=args.warmup_requests,
-            use_trace_timestamps=args.use_trace_timestamps,
-            mooncake_slowdown_factor=args.mooncake_slowdown_factor,
-            mooncake_num_rounds=args.mooncake_num_rounds,
+    # Handle repeats and optional CSV saving
+    num_repeats = getattr(args, "repeat", 1)
+    save_to_csv_path = None
+    if num_repeats > 1:
+        save_to_csv_path = args.save_to_csv
+
+    def _write_csv_row(
+        csv_path: str,
+        metrics: BenchmarkMetrics,
+        run_idx: int,
+        args: argparse.Namespace,
+        benchmark_duration: float,
+        accept_length: Optional[float],
+    ):
+        # Convert BenchmarkMetrics to dict for CSV, keeping only scalar types
+        scalar_data = {
+            "model": args.model,
+            "run": run_idx,
+            "backend": args.backend,
+            "dataset_name": args.dataset_name,
+            "request_rate": args.request_rate,
+            "max_concurrency": args.max_concurrency,
+            "duration": benchmark_duration,
+            "completed": metrics.completed,
+            "total_input_tokens": metrics.total_input,
+            "total_output_tokens": metrics.total_output,
+            "total_output_tokens_retokenized": metrics.total_output_retokenized,
+            "request_throughput": metrics.request_throughput,
+            "input_throughput": metrics.input_throughput,
+            "output_throughput": metrics.output_throughput,
+            "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
+            "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
+            "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
+            "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
+            "mean_ttft_ms": metrics.mean_ttft_ms,
+            "median_ttft_ms": metrics.median_ttft_ms,
+            "std_ttft_ms": metrics.std_ttft_ms,
+            "p99_ttft_ms": metrics.p99_ttft_ms,
+            "mean_tpot_ms": metrics.mean_tpot_ms,
+            "median_tpot_ms": metrics.median_tpot_ms,
+            "std_tpot_ms": metrics.std_tpot_ms,
+            "p99_tpot_ms": metrics.p99_tpot_ms,
+            "mean_itl_ms": metrics.mean_itl_ms,
+            "median_itl_ms": metrics.median_itl_ms,
+            "std_itl_ms": metrics.std_itl_ms,
+            "p95_itl_ms": metrics.p95_itl_ms,
+            "p99_itl_ms": metrics.p99_itl_ms,
+            "concurrency": metrics.concurrency,
+            "accept_length": accept_length,
+        }
+        # ensure field order is consistent across runs with model first
+        fieldnames = ["model"] + [k for k in scalar_data.keys() if k != "model"]
+        file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(scalar_data)
+
+    last_result = None
+    numeric_summaries: List[Dict[str, float]] = []
+    for i in range(num_repeats):
+        # run benchmark
+        result, benchmark_duration = asyncio.run(
+            benchmark(
+                backend=backend,
+                api_url=api_url,
+                base_url=base_url,
+                model_id=model_id,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                request_rate=args.request_rate,
+                max_concurrency=args.max_concurrency,
+                disable_tqdm=args.disable_tqdm,
+                lora_names=args.lora_name,
+                extra_request_body=extra_request_body,
+                profile=args.profile,
+                pd_separated=args.pd_separated,
+                flush_cache=args.flush_cache,
+                warmup_requests=args.warmup_requests,
+                use_trace_timestamps=args.use_trace_timestamps,
+                mooncake_slowdown_factor=args.mooncake_slowdown_factor,
+                mooncake_num_rounds=args.mooncake_num_rounds,
+                run_idx=i + 1,
+                suppress_print=num_repeats > 1,
+            )
         )
-    )
+
+        # save to CSV if requested
+        if save_to_csv_path and result is not None:
+            _write_csv_row(
+                save_to_csv_path, result, i + 1, args, benchmark_duration, None
+            )
+
+        last_result = result
+
+        # collect numeric summary fields for averaging later
+        if result is not None:
+            numeric_summaries.append(
+                {
+                    "duration": benchmark_duration,
+                    "completed": float(result.completed),
+                    "total_input_tokens": float(result.total_input),
+                    "total_output_tokens": float(result.total_output),
+                    "total_output_tokens_retokenized": float(
+                        result.total_output_retokenized
+                    ),
+                    "request_throughput": result.request_throughput,
+                    "input_throughput": result.input_throughput,
+                    "output_throughput": result.output_throughput,
+                    "mean_e2e_latency_ms": result.mean_e2e_latency_ms,
+                    "median_e2e_latency_ms": result.median_e2e_latency_ms,
+                    "std_e2e_latency_ms": result.std_e2e_latency_ms,
+                    "p99_e2e_latency_ms": result.p99_e2e_latency_ms,
+                    "mean_ttft_ms": result.mean_ttft_ms,
+                    "median_ttft_ms": result.median_ttft_ms,
+                    "std_ttft_ms": result.std_ttft_ms,
+                    "p99_ttft_ms": result.p99_ttft_ms,
+                    "mean_tpot_ms": result.mean_tpot_ms,
+                    "median_tpot_ms": result.median_tpot_ms,
+                    "std_tpot_ms": result.std_tpot_ms,
+                    "p99_tpot_ms": result.p99_tpot_ms,
+                    "mean_itl_ms": result.mean_itl_ms,
+                    "median_itl_ms": result.median_itl_ms,
+                    "std_itl_ms": result.std_itl_ms,
+                    "p95_itl_ms": result.p95_itl_ms,
+                    "p99_itl_ms": result.p99_itl_ms,
+                    "concurrency": result.concurrency,
+                }
+            )
+
+        # flush cache between runs (except after last), regardless of args.flush_cache
+        if i < num_repeats - 1:
+            try:
+                requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    # Print averaged summary if multiple runs
+    if num_repeats > 1 and numeric_summaries:
+        avg = {
+            k: sum(d[k] for d in numeric_summaries) / len(numeric_summaries)
+            for k in numeric_summaries[0].keys()
+        }
+        # Construct averaged BenchmarkMetrics instance
+        m = BenchmarkMetrics(
+            completed=int(avg.get("completed", 0)),
+            total_input=int(avg.get("total_input_tokens", 0)),
+            total_output=int(avg.get("total_output_tokens", 0)),
+            total_output_retokenized=int(avg.get("total_output_tokens_retokenized", 0)),
+            request_throughput=avg.get("request_throughput", 0.0),
+            input_throughput=avg.get("input_throughput", 0.0),
+            output_throughput=avg.get("output_throughput", 0.0),
+            output_throughput_retokenized=0.0,
+            total_throughput=avg.get("input_throughput", 0.0)
+            + avg.get("output_throughput", 0.0),
+            total_throughput_retokenized=0.0,
+            mean_ttft_ms=avg.get("mean_ttft_ms", 0.0),
+            median_ttft_ms=avg.get("median_ttft_ms", 0.0),
+            std_ttft_ms=avg.get("std_ttft_ms", 0.0),
+            p99_ttft_ms=avg.get("p99_ttft_ms", 0.0),
+            mean_tpot_ms=avg.get("mean_tpot_ms", 0.0),
+            median_tpot_ms=avg.get("median_tpot_ms", 0.0),
+            std_tpot_ms=avg.get("std_tpot_ms", 0.0),
+            p99_tpot_ms=avg.get("p99_tpot_ms", 0.0),
+            mean_itl_ms=avg.get("mean_itl_ms", 0.0),
+            median_itl_ms=avg.get("median_itl_ms", 0.0),
+            std_itl_ms=avg.get("std_itl_ms", 0.0),
+            p95_itl_ms=avg.get("p95_itl_ms", 0.0),
+            p99_itl_ms=avg.get("p99_itl_ms", 0.0),
+            max_itl_ms=avg.get("max_itl_ms", 0.0),
+            mean_e2e_latency_ms=avg.get("mean_e2e_latency_ms", 0.0),
+            median_e2e_latency_ms=avg.get("median_e2e_latency_ms", 0.0),
+            std_e2e_latency_ms=avg.get("std_e2e_latency_ms", 0.0),
+            p99_e2e_latency_ms=avg.get("p99_e2e_latency_ms", 0.0),
+            concurrency=avg.get("concurrency", 0.0),
+        )
+
+        _print_benchmark_summary(
+            backend=backend,
+            request_rate_display=(
+                args.request_rate if not args.use_trace_timestamps else "trace"
+            ),
+            max_concurrency=args.max_concurrency,
+            metrics=m,  # averaged metrics-like object
+            benchmark_duration=avg.get("duration", 0.0),
+            accept_length=None,
+            repeat=num_repeats,
+            is_avg=True,
+            run_idx=None,
+        )
+
+    return last_result
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -2401,6 +2617,21 @@ if __name__ == "__main__":
             "toolagent",
         ],
         help="Underlying workload for the mooncake dataset.",
+    )
+    parser.add_argument(
+        "--save-to-csv",
+        dest="save_to_csv",
+        type=str,
+        default="bench_serving.csv",
+        help="Path to a CSV file to append per-run summary rows.",
+    )
+    parser.add_argument(
+        "--repeat",
+        "--num-repeats",
+        dest="repeat",
+        type=int,
+        default=1,
+        help="Number of repeats for the benchmark. Will take the average result and flush cache between runs, and save the result to CSV.",
     )
     args = parser.parse_args()
     run_benchmark(args)
