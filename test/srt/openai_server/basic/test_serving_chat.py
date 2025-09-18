@@ -460,7 +460,7 @@ class ServingChatTestCase(unittest.TestCase):
                 },
             ],
             tools=[{"type": "function", "function": {"name": "get_weather"}}],
-            stream=True,
+            stream=False,
         )
 
         # Mock FunctionCallParser.parse_non_stream to return one tool call
