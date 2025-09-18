@@ -447,12 +447,9 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         if self.has_vision:
             # TODO: make this more general
-            print(f"{config=}")
-            print(getattr(config, "quantization_config", {}))
             ignore_quant_layers = getattr(config, "quantization_config", {}).get(
                 "ignore", {}
             )
-            print(f"{ignore_quant_layers=}")
             if (
                 "model.layers.vision_model*" in ignore_quant_layers
                 and "model.layers.multi_modal_projector*" in ignore_quant_layers
@@ -460,7 +457,6 @@ class Llama4ForConditionalGeneration(nn.Module):
                 vision_quant_config = None
             else:
                 vision_quant_config = quant_config
-            print(f"{quant_config=}")
             self.vision_model = Llama4VisionModel(
                 config.vision_config,
                 quant_config=vision_quant_config,
