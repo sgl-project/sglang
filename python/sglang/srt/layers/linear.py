@@ -124,6 +124,29 @@ def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
     return shard_offsets
 
 
+def pad_or_narrow_weight(
+    loaded_weight: torch.Tensor, input_dim: int, start_idx: int, shard_size: int
+) -> torch.Tensor:
+    # Padding with zeros for special case
+    valid_size = max(loaded_weight.shape[input_dim] - start_idx, 0)
+
+    if valid_size > 0:
+        loaded_slice = loaded_weight.narrow(input_dim, start_idx, valid_size)
+        pad_shape = list(loaded_weight.shape)
+        pad_shape[input_dim] = shard_size - valid_size
+        pad = torch.zeros(
+            pad_shape, dtype=loaded_weight.dtype, device=loaded_weight.device
+        )
+        return torch.cat([loaded_slice, pad], dim=input_dim)
+
+    # All padding
+    pad_shape = list(loaded_weight.shape)
+    pad_shape[input_dim] = shard_size
+    return torch.zeros(
+        pad_shape, dtype=loaded_weight.dtype, device=loaded_weight.device
+    )
+
+
 class LinearBase(torch.nn.Module):
     """Base linear layer.
 
@@ -628,31 +651,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
                     end_idx = start_idx + shard_size
                     if end_idx > loaded_weight.shape[output_dim]:
-                        # Need to pad with zeros
-                        valid_size = max(loaded_weight.shape[output_dim] - start_idx, 0)
-                        if valid_size > 0:
-                            loaded_slice = loaded_weight.narrow(
-                                output_dim, start_idx, valid_size
-                            )
-                            pad_shape = list(loaded_weight.shape)
-                            pad_shape[output_dim] = shard_size - valid_size
-                            pad = torch.zeros(
-                                pad_shape,
-                                dtype=loaded_weight.dtype,
-                                device=loaded_weight.device,
-                            )
-                            loaded_weight = torch.cat(
-                                [loaded_slice, pad], dim=output_dim
-                            )
-                        else:
-                            # All padding
-                            pad_shape = list(loaded_weight.shape)
-                            pad_shape[output_dim] = shard_size
-                            loaded_weight = torch.zeros(
-                                pad_shape,
-                                dtype=loaded_weight.dtype,
-                                device=loaded_weight.device,
-                            )
+                        loaded_weight = pad_or_narrow_weight(
+                            loaded_weight, output_dim, start_idx, shard_size
+                        )
                     else:
                         loaded_weight = loaded_weight.narrow(
                             output_dim, start_idx, shard_size
@@ -1334,29 +1335,9 @@ class RowParallelLinear(LinearBase):
                 # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
                 end_idx = start_idx + shard_size
                 if end_idx > loaded_weight.shape[input_dim]:
-                    # Need to pad with zeros
-                    valid_size = max(loaded_weight.shape[input_dim] - start_idx, 0)
-                    if valid_size > 0:
-                        loaded_slice = loaded_weight.narrow(
-                            input_dim, start_idx, valid_size
-                        )
-                        pad_shape = list(loaded_weight.shape)
-                        pad_shape[input_dim] = shard_size - valid_size
-                        pad = torch.zeros(
-                            pad_shape,
-                            dtype=loaded_weight.dtype,
-                            device=loaded_weight.device,
-                        )
-                        loaded_weight = torch.cat([loaded_slice, pad], dim=input_dim)
-                    else:
-                        # All padding
-                        pad_shape = list(loaded_weight.shape)
-                        pad_shape[input_dim] = shard_size
-                        loaded_weight = torch.zeros(
-                            pad_shape,
-                            dtype=loaded_weight.dtype,
-                            device=loaded_weight.device,
-                        )
+                    loaded_weight = pad_or_narrow_weight(
+                        loaded_weight, input_dim, start_idx, shard_size
+                    )
                 else:
                     loaded_weight = loaded_weight.narrow(
                         input_dim, start_idx, shard_size
