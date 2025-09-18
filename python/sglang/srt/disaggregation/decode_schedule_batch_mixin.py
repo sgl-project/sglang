@@ -131,19 +131,25 @@ class ScheduleBatchDisaggregationDecodeMixin:
         if not self.spec_algorithm.is_none():
 
             b = len(self.reqs)
-            topk_p = torch.arange(
-                b * server_args.speculative_eagle_topk,
-                0,
-                -1,
-                device=self.device,
-                dtype=torch.float32,
+            topk = server_args.speculative_eagle_topk
+            topk_p = torch.stack(
+                [
+                    torch.as_tensor(
+                        req.output_topk_p[:topk], device=device, dtype=torch.float32
+                    )
+                    for req in self.reqs
+                ],
+                dim=0,
             )
-            topk_p = topk_p.reshape(b, server_args.speculative_eagle_topk)
-            topk_p /= b * server_args.speculative_eagle_topk
-            topk_index = torch.arange(
-                b * server_args.speculative_eagle_topk, device=self.device
+            topk_index = torch.stack(
+                [
+                    torch.as_tensor(
+                        req.output_topk_index[:topk], device=device, dtype=torch.int64
+                    )
+                    for req in self.reqs
+                ],
+                dim=0,
             )
-            topk_index = topk_index.reshape(b, server_args.speculative_eagle_topk)
 
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
