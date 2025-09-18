@@ -167,9 +167,9 @@ class NemotronHMambaDecoderLayer(nn.Module):
         *,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-        mamba2_metadata: Mamba2Metadata,
-        mamba2_cache_params: MambaPool.State,
-        mamba_cache_state_indices_tensor: torch.Tensor,
+        layer_cache: MambaPool.State,
+        layer_cache_indices: torch.Tensor,
+        metadata: Mamba2Metadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
@@ -179,11 +179,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
 
         output = torch.empty_like(hidden_states)
         self.mixer.forward(
-            hidden_states,
-            output,
-            mamba2_cache_params,
-            mamba_cache_state_indices_tensor,
-            mamba2_metadata,
+            hidden_states, output, layer_cache, layer_cache_indices, metadata
         )
         return output, residual
 
@@ -364,42 +360,39 @@ class NemotronHModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         residual = None
-        num_non_mamba_layers = 0
-        for i, layer in enumerate(self.layers):
-            layer_mamba2_cache_params = None
-            if isinstance(layer, NemotronHMambaDecoderLayer):
-                mamba2_metadata = prepare_mamba2_metadata(
-                    forward_batch, chunk_size=self.config.chunk_size
-                )  # TODO
-                pool = forward_batch.req_to_token_pool
-                assert isinstance(pool, HybridReqToTokenPool)
-                layer_mamba2_cache_params = pool.get_mamba_params(
-                    i - num_non_mamba_layers
-                )
-                state_indices_tensor = pool.get_mamba_indices(
-                    forward_batch.req_pool_indices
-                )
-                hidden_states, residual = layer.forward(
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    mamba2_cache_params=layer_mamba2_cache_params,
-                    mamba_cache_state_indices_tensor=state_indices_tensor,
-                    mamba2_metadata=mamba2_metadata,
-                )
-            else:
-                if isinstance(layer, NemotronHAttentionDecoderLayer):
+        reverse_mamba_layers = list(reversed(self.config.mamba_layer_ids))
+        for layer in self.layers:
+            match layer:
+                case NemotronHMambaDecoderLayer():
+                    # TODO
+                    metadata = prepare_mamba2_metadata(
+                        forward_batch, chunk_size=self.config.chunk_size
+                    )
+                    pool = forward_batch.req_to_token_pool
+                    assert isinstance(pool, HybridReqToTokenPool)
+                    layer_cache = pool.mamba2_layer_cache(reverse_mamba_layers.pop())
+                    layer_indices = pool.get_mamba_indices(
+                        forward_batch.req_pool_indices
+                    )
+                    hidden_states, residual = layer.forward(
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        layer_cache=layer_cache,
+                        layer_cache_indices=layer_indices,
+                        metadata=metadata,
+                    )
+                case NemotronHAttentionDecoderLayer():
                     hidden_states, residual = layer.forward(
                         hidden_states=hidden_states,
                         residual=residual,
                         forward_batch=forward_batch,
                     )
-                elif isinstance(layer, NemotronHMLPDecoderLayer):
+                case NemotronHMLPDecoderLayer():
                     hidden_states, residual = layer.forward(
                         hidden_states=hidden_states, residual=residual
                     )
-                else:
+                case _:
                     raise ValueError(f"Unknown layer type: {type(layer)}")
-                num_non_mamba_layers += 1
 
         if not get_pp_group().is_last_rank:
             return PPProxyTensors(

@@ -27,8 +27,6 @@ from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .layernorm_gated import rms_norm_gated
 from .mamba import mamba_v2_sharded_weight_loader
 from .mamba2_metadata import Mamba2Metadata, update_metadata
-
-# from .mamba_cache import MambaCacheParams
 from .mamba_ssm import selective_state_update
 from .ssd_combined import mamba_chunk_scan_combined
 
@@ -343,9 +341,9 @@ class MambaMixer2(CustomOp):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
-        mamba2_cache_params: MambaPool.State,
-        mamba_cache_state_indices_tensor: torch.Tensor,
-        mamba2_metadata: Mamba2Metadata,
+        layer_cache: MambaPool.State,
+        layer_cache_indices: torch.Tensor,
+        metadata: Mamba2Metadata,
     ):
         pass
 
@@ -353,39 +351,35 @@ class MambaMixer2(CustomOp):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
-        mamba2_cache_params: MambaPool.State,
-        mamba_cache_state_indices_tensor: torch.Tensor,
-        mamba2_metadata: Mamba2Metadata,
+        layer_cache: MambaPool.State,
+        layer_cache_indices: torch.Tensor,
+        metadata: Mamba2Metadata,
     ):
         CustomOp.forward(
-            self,
-            hidden_states,
-            output,
-            mamba2_cache_params,
-            mamba2_metadata,
+            self, hidden_states, output, layer_cache, layer_cache_indices, metadata
         )
 
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
-        mamba2_cache_params: MambaPool.State,
-        mamba_cache_state_indices_tensor: torch.Tensor,
-        mamba2_metadata: Mamba2Metadata,
+        layer_cache: MambaPool.State,
+        layer_cache_indices: torch.Tensor,
+        metadata: Mamba2Metadata,
     ):
-        # mamba2_metadata contains metadata necessary for the mamba2 triton
+        # metadata contains metadata necessary for the mamba2 triton
         # kernels to operate in continuous batching and in chunked prefill
         # modes; they are computed at top-level model forward since they
         # stay the same and reused for all mamba layers in the same iteration
-        conv_state = mamba2_cache_params.conv
-        ssm_state = mamba2_cache_params.temporal
-        state_indices_tensor = mamba_cache_state_indices_tensor
-        has_initial_states_p = mamba2_metadata.has_initial_states
-        prep_initial_states = mamba2_metadata.prep_initial_states
-        chunk_size = mamba2_metadata.chunk_size
-        seq_idx_p = mamba2_metadata.seq_idx
-        chunk_indices_p = mamba2_metadata.chunk_indices
-        chunk_offsets_p = mamba2_metadata.chunk_offsets
+        conv_state = layer_cache.conv
+        ssm_state = layer_cache.temporal
+        state_indices_tensor = layer_cache_indices
+        has_initial_states_p = metadata.has_initial_states
+        prep_initial_states = metadata.prep_initial_states
+        chunk_size = metadata.chunk_size
+        seq_idx_p = metadata.seq_idx
+        chunk_indices_p = metadata.chunk_indices
+        chunk_offsets_p = metadata.chunk_offsets
 
         groups_time_state_size = self.n_groups * self.ssm_state_size
 
@@ -417,9 +411,9 @@ class MambaMixer2(CustomOp):
             dim=-1,
         )
 
-        num_prefills = mamba2_metadata.num_prefills  # request count
-        num_decodes = mamba2_metadata.num_decode_tokens  # token count (=request)
-        num_prefill_tokens = mamba2_metadata.num_prefill_tokens  # token count
+        num_prefills = metadata.num_prefills  # request count
+        num_decodes = metadata.num_decode_tokens  # token count (=request)
+        num_prefill_tokens = metadata.num_prefill_tokens  # token count
         has_prefill = num_prefills > 0
         has_decode = num_decodes > 0
         num_actual_tokens = num_prefill_tokens + num_decodes
@@ -444,7 +438,7 @@ class MambaMixer2(CustomOp):
             dim=0,
         )
         query_start_loc_p = (
-            mamba2_metadata.query_start_loc[: num_prefills + 1] if has_prefill else None
+            metadata.query_start_loc[: num_prefills + 1] if has_prefill else None
         )
 
         # Preallocate output tensor to avoid memcpy cost for merging prefill
@@ -471,8 +465,8 @@ class MambaMixer2(CustomOp):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
-            if mamba2_metadata.cu_seqlen is None:
-                mamba2_metadata = update_metadata(x, query_start_loc_p, mamba2_metadata)
+            if metadata.cu_seqlen is None:
+                metadata = update_metadata(x, query_start_loc_p, metadata)
             hidden_states_B_C_p = causal_conv1d_fn(
                 x,
                 conv_weights,
@@ -481,7 +475,7 @@ class MambaMixer2(CustomOp):
                 conv_states=conv_state,
                 has_initial_state=has_initial_states_p,
                 cache_indices=state_indices_tensor_p,
-                metadata=mamba2_metadata,
+                metadata=metadata,
                 query_start_loc=query_start_loc_p,
             ).transpose(0, 1)[:num_prefill_tokens]
 
@@ -560,7 +554,7 @@ class MambaMixer2(CustomOp):
             )
 
             # - the hidden is reshaped into (bs, num_heads, head_dim)
-            # - mamba2_cache_params.ssm_state's slots will be selected
+            # - layer_state.ssm_state's slots will be selected
             #   using state_indices_tensor_d
             # NOTE: final output is an in-place update of out tensor
             selective_state_update(

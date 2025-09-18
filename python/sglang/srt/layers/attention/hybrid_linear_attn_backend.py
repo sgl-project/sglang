@@ -214,7 +214,7 @@ class MambaAttnBackend(AttentionBackend):
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
 
-        layer_cache = self.req_to_token_pool.get_mamba_params(layer_id)
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = layer_cache.conv
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -294,7 +294,7 @@ class MambaAttnBackend(AttentionBackend):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        mamba_cache_params = self.req_to_token_pool.get_mamba_params(layer_id)
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = mamba_cache_params.conv
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
