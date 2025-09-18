@@ -242,7 +242,7 @@ class RadixCache(BasePrefixCache):
             match ends inside a stored segment.
 
         Internal updates:
-            * Refreshes access metadata (timestamps / hit counters) used by the
+            * Refreshes access metadata (timestamps) used by the
                 configured eviction strategy.
             * If the lookup ends inside a stored segment the node is split once
                 to expose a precise boundary; this structural refinement improves
