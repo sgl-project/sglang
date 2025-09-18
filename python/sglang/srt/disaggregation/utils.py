@@ -210,7 +210,7 @@ class MetadataBuffers:
                 req.output_topk_p
             )
             self.output_topk_index[req.metadata_buffer_index, :topk].copy_(
-                req.hidden_states_tensor
+                req.output_topk_index
             )
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
