@@ -8,6 +8,7 @@ CUDA Graph capture records a representative forward pass and replays it with nea
 ## When It Is Active
 CUDA Graph is enabled by default (omit `--disable-cuda-graph`).
 It targets smaller batch sizes (internal defaults) unless you extend the range. Larger batches fall back to normal execution.
+You cannot serve requests in the server during the capture process.
 
 ### Selecting Batch Sizes
 Control which batch sizes are captured:
@@ -47,20 +48,15 @@ Recapture triggers:
 - Speculative decoding needs LAST or FULL.
 - Draft/extend speculative flows.
 
-Cost: one latency spike while rebuilding graphs.
-
-Mitigation:
-- If you will need FULL, start with `--enable-return-hidden-states`.
-- Avoid workloads that frequently alternate hidden state needs.
-
 ## Memory Impact
 Memory components: model weights + KV cache pool + CUDA graph buffers + activations.
-Graph buffer size grows with: number of captured batch sizes, largest batch size, hidden mode (`FULL > LAST > NULL`).
-If OOM during capture:
-- Lower `--cuda-graph-max-bs` or shrink the explicit list.
-- Drop rarely used large batch sizes.
-- Try `--enable-cudagraph-gc` (last resort).
+Graph buffer size increases with: (1) number of captured batch sizes, (2) largest captured batch size, (3) hidden mode (`FULL > LAST > NULL`).
+If OOM during capture, try (in order):
+- Remove rarely used largest batch sizes or lower `--cuda-graph-max-bs`.
 - Slightly reduce `--mem-fraction-static`.
+- Enable `--enable-cudagraph-gc` (last resort; slows capture).
+- Reduce hidden mode demand (avoid requesting hidden states unless needed).
+- (If unset) Note: default `mem_fraction_static` is computed heuristically from GPU memory, parallel size, speculative decoding, and DP attention; see Hyperparameter Tuning for the formula.
 
 ## Disabling or Limiting CUDA Graph
 Flags:
@@ -71,13 +67,12 @@ Flags:
 ## Troubleshooting
 | Symptom | Possible Cause | Action |
 |--------|----------------|--------|
-| OOM during capture | Too many / too large captured batch sizes; FULL hidden mode | Reduce capture list or max, avoid FULL unless needed, enable GC during capture, lower mem_fraction_static |
-| Latency spike once after startup | Recapture to higher hidden mode | Accept first-hit cost; pre-warm by sending a request needing highest mode |
+| OOM during capture | Too many / too large captured batch sizes; FULL hidden mode | See above section on memory impact |
 | Lower throughput than expected on small batches | CUDA Graph disabled or not capturing those sizes | Add them via `--cuda-graph-bs` or raise `--cuda-graph-max-bs` |
 | Profiling needs kernel names | CUDA Graph obscures launch details | Use `--disable-cuda-graph` for profiling run |
-| Quantization instability (e.g., int8dq issue) | Known interaction with capture | Temporarily disable CUDA Graph as noted in quantization docs |
+| Quantization instability (e.g., int8dq issue) | Known interaction with capture | Temporarily disable CUDA Graph |
 
-## Quick Reference of Relevant Flags
+## Flags summary
 - `--cuda-graph-bs`
 - `--cuda-graph-max-bs`
 - `--disable-cuda-graph`
@@ -90,7 +85,6 @@ Flags:
 Recommended:
 - Keep CUDA Graph enabled.
 - Leave GC frozen (do not set `--enable-cudagraph-gc`).
-- Capture only a practical span of batch sizes.
 - Avoid `FULL` unless you need embeddings or full hidden outputs.
 
 ## Example Launch Adjusting CUDA Graph Range

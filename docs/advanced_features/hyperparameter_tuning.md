@@ -51,6 +51,18 @@ Check the `available_gpu_mem` value.
 
 Another straightforward approach is to increase `--mem-fraction-static` in increments of 0.01 until you encounter OOM errors for your workloads.
 
+#### Internal Details
+If you do not set `--mem-fraction-static`, SGLang derives it from the detected GPU memory and parallel sizes. It conceptually reserves memory for (activations + CUDA graph buffers + speculative / DP attention overhead) and gives the rest to model weights + KV cache:
+
+```
+mem_fraction_static = (gpu_mem - reserved_mem) / gpu_mem
+```
+The reserved portion scales with:
+- GPU memory tiers (e.g. larger H100/H200 class reserve more to allow bigger `chunked_prefill_size` and wider CUDA graph capture range)
+- Total parallel size (`tp * pp`) to account for replicated activation footprints
+- Speculative decoding (adds 2–6 GB depending on algorithm, more for standalone draft model)
+- Data parallel attention (adds extra buffer headroom)
+
 ### Avoid out-of-memory errors by tuning `--chunked-prefill-size`, `--mem-fraction-static`, and `--max-running-requests`
 
 If you encounter out-of-memory (OOM) errors, you can adjust the following parameters:
