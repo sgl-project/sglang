@@ -586,6 +586,22 @@ impl DPAwareWorker {
             base_url,
         }
     }
+
+    /// Create a new DP-aware worker with a pre-configured base worker
+    /// This is primarily used by the builder pattern
+    pub fn with_base_worker(
+        base_worker: BasicWorker,
+        base_url: String,
+        dp_rank: usize,
+        dp_size: usize,
+    ) -> Self {
+        Self {
+            base_worker,
+            dp_rank,
+            dp_size,
+            base_url,
+        }
+    }
 }
 
 #[async_trait]
@@ -1102,7 +1118,7 @@ pub fn start_health_checker(
 
             // Periodically reset load counters to prevent drift
             // Only do this when we believe all workers should be idle
-            if check_count % LOAD_RESET_INTERVAL == 0 {
+            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
                 let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
                 // Only reset if load appears to be very low (likely drift)
                 if max_load <= 2 {
