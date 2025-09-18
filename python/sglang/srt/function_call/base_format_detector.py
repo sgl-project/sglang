@@ -160,44 +160,48 @@ class BaseFormatDetector(ABC):
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
         try:
-            tool_call_pos = current_text.find(self.bot_token)
-            if tool_call_pos != -1:
-                start_idx = tool_call_pos + len(self.bot_token)
-            elif self.current_tool_id > 0 and current_text.startswith(
-                self.tool_call_separator
-            ):
-                start_idx = len(self.tool_call_separator)
-            else:
-                start_idx = 0
+            try:
+                tool_call_pos = current_text.find(self.bot_token)
+                if tool_call_pos != -1:
+                    start_idx = tool_call_pos + len(self.bot_token)
+                elif self.current_tool_id > 0 and current_text.startswith(
+                    self.tool_call_separator
+                ):
+                    start_idx = len(self.tool_call_separator)
+                else:
+                    start_idx = 0
 
-            if start_idx >= len(current_text):
+                if start_idx >= len(current_text):
+                    return StreamingParseResult()
+
+                (obj, end_idx) = _partial_json_loads(current_text[start_idx:], flags)
+
+                is_current_complete = _is_complete_json(
+                    current_text[start_idx : start_idx + end_idx]
+                )
+
+                # Validate tool name if present
+                if "name" in obj and obj["name"] not in self._tool_indices:
+                    # Invalid tool name - reset state
+                    self._buffer = ""
+                    self.current_tool_id = -1
+                    self.current_tool_name_sent = False
+                    if self.streamed_args_for_tool:
+                        self.streamed_args_for_tool.pop()
+                    return StreamingParseResult()
+
+                # Handle parameters/arguments consistency
+                # NOTE: we assume here that the obj is always partial of a single tool call
+                if "parameters" in obj:
+                    assert (
+                        "arguments" not in obj
+                    ), "model generated both parameters and arguments"
+                    obj["arguments"] = obj["parameters"]
+
+                current_tool_call = obj
+
+            except MalformedJSON:
                 return StreamingParseResult()
-
-            (obj, end_idx) = _partial_json_loads(current_text[start_idx:], flags)
-
-            is_current_complete = _is_complete_json(
-                current_text[start_idx : start_idx + end_idx]
-            )
-
-            # Validate tool name if present
-            if "name" in obj and obj["name"] not in self._tool_indices:
-                # Invalid tool name - reset state
-                self._buffer = ""
-                self.current_tool_id = -1
-                self.current_tool_name_sent = False
-                if self.streamed_args_for_tool:
-                    self.streamed_args_for_tool.pop()
-                return StreamingParseResult()
-
-            # Handle parameters/arguments consistency
-            # NOTE: we assume here that the obj is always partial of a single tool call
-            if "parameters" in obj:
-                assert (
-                    "arguments" not in obj
-                ), "model generated both parameters and arguments"
-                obj["arguments"] = obj["parameters"]
-
-            current_tool_call = obj
 
             if not current_tool_call:
                 return StreamingParseResult()
