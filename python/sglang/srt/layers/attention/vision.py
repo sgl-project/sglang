@@ -365,12 +365,11 @@ class VisionAscendAttention(nn.Module):
         if cu_seqlens is None:
             cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
 
-        cu_seqlens = cu_seqlens.to(torch.int32)
-        cu_seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-        if cu_seqlens.is_npu:
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        if seq_lens.is_npu:
             # cu_seqlens must be on cpu because of operator restriction
-            cu_seqlens = cu_seqlens.to("cpu")
-        _, num_heads, hidden_size = q.shape
+            seq_lens = seq_lens.to("cpu")
+        _, num_heads, head_size = q.shape
         num_kv_heads = k.shape[1]
         output = torch.empty_like(q)
 
@@ -379,8 +378,8 @@ class VisionAscendAttention(nn.Module):
             query=q,
             key=k,
             value=v,
-            seq_len=cu_seqlens,
-            scale_value=hidden_size**-0.5,
+            seq_len=seq_lens.to(torch.int32),
+            scale_value=head_size**-0.5,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             out=output,

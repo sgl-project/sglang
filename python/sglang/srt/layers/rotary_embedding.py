@@ -34,6 +34,9 @@ if _use_aiter:
 if is_npu():
     import torch_npu
 
+    NPU_ROTARY_MUL_MAX_NUM_HEADS = 1000
+    NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
+
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
@@ -1897,7 +1900,12 @@ def apply_rotary_pos_emb_npu(
         cos: [num_tokens, head_size]
         sin: [num_tokens, head_size]
     """
-    if cos.dim() != 2 or q.dim() != 3 or q.shape[1] >= 1000 or q.shape[2] >= 896:
+    if (
+        cos.dim() != 2
+        or q.dim() != 3
+        or q.shape[1] >= NPU_ROTARY_MUL_MAX_NUM_HEADS
+        or q.shape[2] >= NPU_ROTARY_MUL_MAX_HEAD_SIZE
+    ):
         # Note: num_heads and head_size of q must be less than 1000 and 896, respectively
         return apply_rotary_pos_emb_native(q, k, cos, sin, unsqueeze_dim)
     cos = cos.unsqueeze(unsqueeze_dim).unsqueeze(0)
