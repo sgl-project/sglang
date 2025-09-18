@@ -2249,9 +2249,9 @@ def run_benchmark(args_: argparse.Namespace):
         # Construct averaged BenchmarkMetrics instance
         m = BenchmarkMetrics(
             completed=int(avg.get("completed", 0)),
-            total_input=int(avg.get("total_input_tokens", 0)),
-            total_output=int(avg.get("total_output_tokens", 0)),
-            total_output_retokenized=int(avg.get("total_output_tokens_retokenized", 0)),
+            total_input=int(avg.get("total_input", 0)),
+            total_output=int(avg.get("total_output", 0)),
+            total_output_retokenized=int(avg.get("total_output_retokenized", 0)),
             request_throughput=avg.get("request_throughput", 0.0),
             input_throughput=avg.get("input_throughput", 0.0),
             output_throughput=avg.get("output_throughput", 0.0),
