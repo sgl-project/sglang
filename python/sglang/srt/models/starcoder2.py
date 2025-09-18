@@ -22,8 +22,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/starcoder2.py
 """ PyTorch Starcoder2 model."""
 from collections.abc import Iterable
-from itertools import islice
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -36,7 +35,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -46,10 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
 
 
@@ -239,7 +235,14 @@ class Starcoder2Model(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.embed_tokens",
         )
-        self.start_layer, self.end_layer, self.layers = make_layers(
+
+        pp_group = get_pp_group()
+        pp_size = pp_group.world_size
+        pp_rank = pp_group.rank
+        self.start_layer = pp_rank * config.num_hidden_layers // pp_size
+        self.end_layer = (pp_rank + 1) * config.num_hidden_layers // pp_size
+
+        self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Starcoder2DecoderLayer(
                 config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
@@ -253,24 +256,19 @@ class Starcoder2Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
+        if inputs_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
-            hidden_states = input_embeds
-
-        # Apply blocks one-by-one.
-        for layer_id, decoder_layer in enumerate(self.layers):
-            # shape: (batch_size, seq_len, d_model)
-            hidden_states = decoder_layer(
+            hidden_states = inputs_embeds
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            hidden_states = layer(
                 positions,
                 hidden_states,
                 forward_batch,
             )
-
-        # Apply final layer norm.
-        # shape: (batch_size, seq_len or 1, d_model)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -302,9 +300,7 @@ class Starcoder2ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.lm_head",
             )
-        self.logits_processor = LogitsProcessor(
-            self.unpadded_vocab_size, config.vocab_size
-        )
+        self.logits_processor = LogitsProcessor(config=config)
 
     def forward(
         self,
