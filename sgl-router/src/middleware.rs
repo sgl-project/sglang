@@ -113,38 +113,14 @@ where
 
         let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
 
-        // Insert request ID into request extensions
+        // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));
-
-        // Create a span with the request ID for this request
-        let span = tracing::info_span!(
-            "http_request",
-            method = %req.method(),
-            uri = %req.uri(),
-            version = ?req.version(),
-            request_id = %request_id
-        );
-
-        // Log within the span
-        let _enter = span.enter();
-        tracing::info!(
-            target: "sglang_router_rs::request",
-            "started processing request"
-        );
-        drop(_enter);
-
-        // Capture values we need in the async block
-        let method = req.method().clone();
-        let uri = req.uri().clone();
-        let version = req.version();
 
         // Call the inner service
         let future = self.inner.call(req);
 
         Box::pin(async move {
-            let start_time = Instant::now();
             let mut response = future.await?;
-            let latency = start_time.elapsed();
 
             // Add request ID to response headers
             response.headers_mut().insert(
@@ -152,36 +128,6 @@ where
                 HeaderValue::from_str(&request_id)
                     .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
             );
-
-            // Log the response with proper request ID in span
-            let status = response.status();
-            let span = tracing::info_span!(
-                "http_request",
-                method = %method,
-                uri = %uri,
-                version = ?version,
-                request_id = %request_id,
-                status = %status,
-                latency = ?latency
-            );
-
-            let _enter = span.enter();
-            if status.is_server_error() {
-                tracing::error!(
-                    target: "sglang_router_rs::response",
-                    "request failed with server error"
-                );
-            } else if status.is_client_error() {
-                tracing::warn!(
-                    target: "sglang_router_rs::response",
-                    "request failed with client error"
-                );
-            } else {
-                tracing::info!(
-                    target: "sglang_router_rs::response",
-                    "finished processing request"
-                );
-            }
 
             Ok(response)
         })
@@ -225,7 +171,11 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
-        // Don't log here - we already log in RequestIdService with the proper request_id
+        // Log the request start
+        info!(
+            target: "sglang_router_rs::request",
+            "started processing request"
+        );
     }
 }
 
@@ -251,7 +201,24 @@ impl<B> OnResponse<B> for ResponseLogger {
         span.record("status_code", status.as_u16());
         span.record("latency", format!("{:?}", latency));
 
-        // Don't log here - RequestIdService handles all logging with proper request IDs
+        // Log the response completion
+        let _enter = span.enter();
+        if status.is_server_error() {
+            error!(
+                target: "sglang_router_rs::response",
+                "request failed with server error"
+            );
+        } else if status.is_client_error() {
+            warn!(
+                target: "sglang_router_rs::response",
+                "request failed with client error"
+            );
+        } else {
+            info!(
+                target: "sglang_router_rs::response",
+                "finished processing request"
+            );
+        }
     }
 }
 

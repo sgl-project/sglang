@@ -135,6 +135,7 @@ from sglang.srt.utils import (
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_sm100_supported,
+    log_info_on_rank0,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     parse_connector_type,
@@ -515,6 +516,7 @@ class ModelRunner:
                     "aiter",
                     "flashinfer",
                     "fa3",
+                    "fa4",
                     "triton",
                     "flashmla",
                     "cutlass_mla",
@@ -562,18 +564,6 @@ class ModelRunner:
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
 
-        # TODO(kaixih@nvidia): remove this once we have a better solution for DP attention.
-        #  For more details, see: https://github.com/sgl-project/sglang/issues/8616
-        elif (
-            self.dp_size > 1
-            and is_sm100_supported()
-            and server_args.attention_backend != "triton"
-            and server_args.attention_backend == "trtllm_mla"
-        ):
-            logger.info(
-                "Disable chunked prefix cache when dp size > 1 and attention backend is not triton."
-            )
-            server_args.disable_chunked_prefix_cache = True
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
 
@@ -1352,7 +1342,18 @@ class ModelRunner:
     ):
         # Determine the kv cache dtype
         if self.server_args.kv_cache_dtype == "auto":
-            self.kv_cache_dtype = self.dtype
+            quant_config = getattr(self.model, "quant_config", None)
+            kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+            if (
+                isinstance(kv_cache_quant_algo, str)
+                and kv_cache_quant_algo.upper() == "FP8"
+            ):
+                if _is_hip:
+                    self.kv_cache_dtype = torch.float8_e4m3fnuz
+                else:
+                    self.kv_cache_dtype = torch.float8_e4m3fn
+            else:
+                self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
             if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = torch.float8_e5m2fnuz
@@ -1367,6 +1368,8 @@ class ModelRunner:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
+
+        log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if SGLANG_CI_SMALL_KV_SIZE:
@@ -1786,6 +1789,15 @@ class ModelRunner:
             )
 
             return FlashAttentionBackend(self)
+        elif backend_str == "fa4":
+            assert (
+                self.use_mla_backend
+            ), "FlashAttention v4 Support is at an early stage, only MLA model supported now"
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            return FlashAttentionBackend(self, fa_impl_ver=4)
         elif backend_str == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
