@@ -1,22 +1,15 @@
 import json
-import os
 import unittest
 import warnings
-from datetime import datetime
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     check_model_scores,
     parse_models,
-    popen_launch_server,
     popen_launch_server_wrapper,
     write_results_to_json,
 )
@@ -98,7 +91,12 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             print(f"Error reading results.json: {e}")
 
         # Check all scores after collecting all results
-        check_model_scores(all_results, self.__class__.__name__, MODEL_SCORE_THRESHOLDS, model_count)
+        check_model_scores(
+            all_results,
+            self.__class__.__name__,
+            model_accuracy_thresholds=MODEL_SCORE_THRESHOLDS,
+            model_count=model_count,
+        )
 
 
 if __name__ == "__main__":

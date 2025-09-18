@@ -104,8 +104,8 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
         check_model_scores(
             all_results,
             self.__class__.__name__,
-            model_accuracy_thresholds,
-            model_latency_thresholds,
+            model_accuracy_thresholds=model_accuracy_thresholds,
+            model_latency_thresholds=model_latency_thresholds,
         )
 
 

@@ -1548,7 +1548,11 @@ def parse_models(model_string: str):
 
 
 def check_model_scores(
-    results, test_name, model_accuracy_thresholds, model_latency_thresholds=None, model_count = None
+    results,
+    test_name,
+    model_accuracy_thresholds,
+    model_latency_thresholds=None,
+    model_count=None,
 ):
     """
     results: list of tuple of (model_path, accuracy, latency)
@@ -1594,7 +1598,9 @@ def check_model_scores(
     if is_in_ci():
         write_github_step_summary(f"## {test_name}\n{summary}")
 
-    some_model_failed_to_get_result = len(results) != (model_count or len(model_accuracy_thresholds))
+    some_model_failed_to_get_result = len(results) != (
+        model_count or len(model_accuracy_thresholds)
+    )
     if failed_models or some_model_failed_to_get_result:
         raise AssertionError("\n".join(failed_models))
 
