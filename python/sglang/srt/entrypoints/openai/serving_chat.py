@@ -921,16 +921,16 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
-    def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
-        """Couting the 'history_tool_calls_cnt' value from request chat_template_kwargs.
+        """Counting the 'history_tool_calls_cnt' value from request chat_template_kwargs.
 
         NOTE: This method is only useful for models that include self-increasing
         history tool call idx in tool calls id, such as kimi-k2
 
         Args:
-            request_obj: The request object (or an item from a list of requests).
+            request: The request object (or an item from a list of requests).
         Returns:
             The int value of 'history_tool_calls_cnt' if any, otherwise 0.
+        """
         """
         if self.tool_call_parser != "kimi_k2":
             return 0
