@@ -1,19 +1,12 @@
 import json
 from json import JSONDecodeError, JSONDecoder
+from json.decoder import WHITESPACE
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 import partial_json_parser
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
-
-_WS = " \t\r\n"
-
-
-def _skip_ws(s: str, i: int) -> int:
-    while i < len(s) and s[i] in _WS:
-        i += 1
-    return i
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
@@ -49,10 +42,13 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
         return (partial_json_parser.loads(input_str, flags), len(input_str))
     except JSONDecodeError as e:
         if "Extra data" in e.msg:
-            start = _skip_ws(input_str, 0)
+            # Find the end of the leading whitespace
+            # See JSONDecoder.decode for reference
+            match = WHITESPACE.match(input_str)
+            start_index = match.end() if match else 0
             dec = JSONDecoder()
             try:
-                obj, end = dec.raw_decode(input_str, start)
+                obj, end = dec.raw_decode(input_str, start_index)
             except JSONDecodeError:
                 # Not even a single complete value available → re-raise original
                 raise
