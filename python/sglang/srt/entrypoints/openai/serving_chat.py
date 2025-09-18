@@ -922,16 +922,18 @@ class OpenAIServingChat(OpenAIServingBase):
         return reasoning_parser.parse_stream_chunk(delta)
 
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
-        """Counting the 'history_tool_calls_cnt' value from request chat_template_kwargs.
+        """Counts the number of tool calls in the request's message history.
 
         NOTE: This method is only useful for models that include self-increasing
         history tool call idx in tool calls id, such as kimi-k2
 
         Args:
-            request_obj: The request object (or an item from a list of requests).
+            request: The chat completion request object.
+
         Returns:
-            The int value of 'history_tool_calls_cnt' if any, otherwise 0.
+            The total number of tool calls in the history, or 0 if not applicable.
         """
+
         if self.tool_call_parser != "kimi_k2":
             return 0
 
@@ -1012,8 +1014,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Align with Kimi-K2 format: functions.{name}:{index}
                     # The model generated index might be always 0 and make the model confuse with tool calls.
                     # Follow the Kimi-K2 chat format, let's reset the latest index with `history_tool_calls_cnt` here.
-                    logger.debug(f"Process stream tool call idx parser: {self.tool_call_parser} name: {call_item.name}, index: {call_item.tool_index}, history: {history_tool_calls_cnt}")
-                    tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt}"
+                    logger.debug(
+                        f"Process stream tool call idx parser: {self.tool_call_parser} name: {call_item.name}, index: {call_item.tool_index}, history: {history_tool_calls_cnt}"
+                    )
+                    tool_call_id = (
+                        f"functions.{call_item.name}:{history_tool_calls_cnt}"
+                    )
                     history_tool_calls_cnt += 1
                 else:
                     tool_call_id = f"call_{uuid.uuid4().hex[:24]}"

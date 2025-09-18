@@ -476,14 +476,17 @@ class ServingChatTestCase(unittest.TestCase):
             # Kimi-K2 series models might generate fixed number tool_indx,
             # ignoring the tool calls history and mess up all the following tool calls
             call_info.tool_index = 0
-            
+
             call_info2 = Mock()
             call_info2.name = "get_weather"
             call_info2.parameters = '{"city":"Tokyo"}'
             call_info2.tool_index = 0
 
             parser_instance.has_tool_call.return_value = True
-            parser_instance.parse_non_stream.return_value = ("", [call_info, call_info2])
+            parser_instance.parse_non_stream.return_value = (
+                "",
+                [call_info, call_info2],
+            )
 
             finish_reason = {"type": "stop", "matched": None}
             tools = [
