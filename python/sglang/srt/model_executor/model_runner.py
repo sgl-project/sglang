@@ -271,8 +271,6 @@ class ModelRunner:
         self._model_update_group = {}
         self._weights_send_group = {}
 
-        enable_batch_invariant_mode()
-
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
 
@@ -389,6 +387,9 @@ class ModelRunner:
                     "Please specify the heavy channel type for double sparsity optimization."
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
+
+        # Enable batch invariant mode
+        enable_batch_invariant_mode()
 
         # Init memory pool and attention backends
         self.init_memory_pool(

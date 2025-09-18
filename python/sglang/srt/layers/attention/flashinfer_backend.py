@@ -221,6 +221,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=self.decode_wrappers,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                fixed_split_size=2048,
+                disable_split_kv=False,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
         elif forward_batch.forward_mode.is_draft_extend():
@@ -332,7 +334,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.workspace_buffer,
                         "NHD",
                         use_cuda_graph=True,
-                        use_tensor_cores=self.decode_use_tensor_cores,
+                        use_tensor_cores=True,
                         paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
                         paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buffer=self.kv_last_page_len[
@@ -349,6 +351,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
+                fixed_split_size=-1,
+                disable_split_kv=True,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
@@ -441,6 +445,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                fixed_split_size=-1,
+                disable_split_kv=True,
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -637,8 +643,6 @@ class FlashInferIndicesUpdaterDecode:
             assert self.attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
 
-        self.fixed_split_size = 2048
-
     def update(
         self,
         req_pool_indices: torch.Tensor,
@@ -650,6 +654,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
+        fixed_split_size: int = 2048,
+        disable_split_kv: bool = False,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -665,6 +671,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
+        fixed_split_size: int = 2048,
+        disable_split_kv: bool = False,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -676,7 +684,8 @@ class FlashInferIndicesUpdaterDecode:
             None,
             spec_info,
             seq_lens_cpu,
-            fixed_split_size=self.fixed_split_size,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
         )
 
     def update_sliding_window(
@@ -777,6 +786,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_cpu: Optional[torch.Tensor],
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: int = 2048,
+        disable_split_kv: bool = False,
     ):
         if spec_info is None:
             bs = len(req_pool_indices)
@@ -832,6 +842,7 @@ class FlashInferIndicesUpdaterDecode:
             q_data_type=self.q_data_type,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
         )
 
         if locally_override:
