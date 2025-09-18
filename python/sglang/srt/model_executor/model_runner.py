@@ -308,7 +308,7 @@ class ModelRunner:
             self.ps.register_checkpoint(
                 self.server_args.ckpt_register_name,
                 files=[],
-                named_tensor=self.model.named_parameters(),
+                named_tensors=list(self.model.named_parameters()),
             )
             self.ps.gather_metas(self.server_args.ckpt_register_name)
             # TODO: Using json to transfer meta
