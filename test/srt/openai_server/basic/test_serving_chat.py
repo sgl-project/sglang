@@ -473,7 +473,7 @@ class ServingChatTestCase(unittest.TestCase):
             # Build a mock ToolCallItem-like object
             call_info = Mock()
             call_info.name = "get_weather"
-            call_info.parameters = '{"city":"Loa Angeles"}'
+            call_info.parameters = '{"city":"Los Angeles"}'
             # Kimi-K2 series models might generate fixed number tool_indx,
             # ignoring the tool calls history and mess up all the following tool calls 
             call_info.tool_index = 0
