@@ -747,9 +747,9 @@ class ServerArgs:
 
         # Hicache
         if self.hicache_storage_backend == "mooncake":
-            # to use mooncake storage backend, the following conditions must be met:
-            self.hicache_io_backend = "kernel"
-            self.hicache_mem_layout = "page_first"
+            assert (
+                self.hicache_mem_layout in ["page_first", "page_first_direct"]
+            ), f"mooncake store storage backend does not support {self.hicache_mem_layout} layout"
 
         if self.hicache_mem_layout == "page_first_direct":
             if self.hicache_io_backend != "direct":
