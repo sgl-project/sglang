@@ -3,8 +3,6 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-import queue
-import socket
 import struct
 import threading
 import time
@@ -25,12 +23,7 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    format_tcp_address,
-    get_int_env_var,
-    get_local_ip_auto,
-    is_valid_ipv6_address,
-)
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +159,104 @@ class NixlKVManager(CommonKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _start_heartbeat_checker_thread(self):
+        """
+        Start the heartbeat checker thread for Decode worker.
+        TODO (smor): unite nixl heartbeat checker with mooncake's.
+        """
+
+        def heartbeat_checker():
+            while True:
+                time.sleep(self.heartbeat_interval)
+                with self.connection_lock:
+                    addresses = list(self.prefill_dp_size_table.keys())
+
+                for bootstrap_addr in addresses:
+                    session = None
+                    try:
+                        with self.session_pool_lock:
+                            session = self.session_pool[bootstrap_addr]
+                        response = session.get(
+                            f"http://{bootstrap_addr}/health",
+                            timeout=(2, 3),
+                            headers={"Connection": "keep-alive"},
+                        )
+                        if response.status_code == 200:
+                            self.heartbeat_failures[bootstrap_addr] = 0
+
+                            current_rooms = self.addr_to_rooms_tracker[
+                                bootstrap_addr
+                            ].copy()
+
+                            for bootstrap_room in current_rooms:
+                                # Remove successful transfers from the tracker
+                                if bootstrap_room not in self.transfer_statuses:
+                                    self.addr_to_rooms_tracker[bootstrap_addr].discard(
+                                        bootstrap_room
+                                    )
+                        else:
+                            logger.info(
+                                f"Attempting to reconnect to {bootstrap_addr}..."
+                            )
+                            self.heartbeat_failures[bootstrap_addr] = (
+                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                            )
+                            with self.session_pool_lock:
+                                if bootstrap_addr in self.session_pool:
+                                    del self.session_pool[bootstrap_addr]
+                    except Exception:
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        self.heartbeat_failures[bootstrap_addr] = (
+                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                        )
+
+                    if (
+                        self.heartbeat_failures.get(bootstrap_addr, 0)
+                        >= self.max_failures
+                    ):
+                        self._handle_node_failure(bootstrap_addr)
+                        with self.session_pool_lock:
+                            if bootstrap_addr in self.session_pool:
+                                del self.session_pool[bootstrap_addr]
+
+        threading.Thread(target=heartbeat_checker, daemon=True).start()
+
+    def _handle_node_failure(self, failed_bootstrap_addr):
+        """Handle failure of a prefill node."""
+        with self.connection_lock:
+            keys_to_remove = [
+                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+            ]
+            for k in keys_to_remove:
+                del self.connection_pool[k]
+            if failed_bootstrap_addr in self.prefill_tp_size_table:
+                del self.prefill_tp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_dp_size_table:
+                del self.prefill_dp_size_table[failed_bootstrap_addr]
+            # TODO (smor): once PP is supported, we need to remove failed boostrap address from that table as well.
+
+            possible_affected_rooms = self.addr_to_rooms_tracker.get(
+                failed_bootstrap_addr, []
+            )
+            if failed_bootstrap_addr in self.addr_to_rooms_tracker:
+                del self.addr_to_rooms_tracker[failed_bootstrap_addr]
+
+        # Mark all pending transfers associated with the failed node as failed
+        affected_rooms = []
+        for room in possible_affected_rooms:
+            if (
+                room in self.transfer_statuses
+                and not self.transfer_statuses[room].is_done()
+            ):
+                # Mark the transfer as failed by setting a special state
+                self.transfer_statuses[room].num_kvs_expected = -1  # Indicates failure
+                affected_rooms.append(room)
+
+        logger.error(
+            f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
+            f"{len(affected_rooms)} transfers affected"
+        )
 
     def check_status(self, bootstrap_room: int):
         return self.request_status[bootstrap_room]
@@ -559,104 +650,6 @@ class NixlKVManager(CommonKVManager):
                     self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
-
-def _start_heartbeat_checker_thread(self):
-        """
-        Start the heartbeat checker thread for Decode worker.
-        TODO (smor): unite nixl heartbeat checker with mooncake's.
-        """
-
-        def heartbeat_checker():
-            while True:
-                time.sleep(self.heartbeat_interval)
-                with self.connection_lock:
-                    addresses = list(self.prefill_dp_size_table.keys())
-
-                for bootstrap_addr in addresses:
-                    session = None
-                    try:
-                        with self.session_pool_lock:
-                            session = self.session_pool[bootstrap_addr]
-                        response = session.get(
-                            f"http://{bootstrap_addr}/health",
-                            timeout=(2, 3),
-                            headers={"Connection": "keep-alive"},
-                        )
-                        if response.status_code == 200:
-                            self.heartbeat_failures[bootstrap_addr] = 0
-
-                            current_rooms = self.addr_to_rooms_tracker[
-                                bootstrap_addr
-                            ].copy()
-
-                            for bootstrap_room in current_rooms:
-                                # Remove successful transfers from the tracker
-                                if bootstrap_room not in self.transfer_statuses:
-                                    self.addr_to_rooms_tracker[bootstrap_addr].discard(
-                                        bootstrap_room
-                                    )
-                        else:
-                            logger.info(
-                                f"Attempting to reconnect to {bootstrap_addr}..."
-                            )
-                            self.heartbeat_failures[bootstrap_addr] = (
-                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                            )
-                            with self.session_pool_lock:
-                                if bootstrap_addr in self.session_pool:
-                                    del self.session_pool[bootstrap_addr]
-                    except Exception:
-                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
-                        self.heartbeat_failures[bootstrap_addr] = (
-                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                        )
-
-                    if (
-                        self.heartbeat_failures.get(bootstrap_addr, 0)
-                        >= self.max_failures
-                    ):
-                        self._handle_node_failure(bootstrap_addr)
-                        with self.session_pool_lock:
-                            if bootstrap_addr in self.session_pool:
-                                del self.session_pool[bootstrap_addr]
-
-        threading.Thread(target=heartbeat_checker, daemon=True).start()
-
-    def _handle_node_failure(self, failed_bootstrap_addr):
-        """Handle failure of a prefill node."""
-        with self.connection_lock:
-            keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
-            ]
-            for k in keys_to_remove:
-                del self.connection_pool[k]
-            if failed_bootstrap_addr in self.prefill_tp_size_table:
-                del self.prefill_tp_size_table[failed_bootstrap_addr]
-            if failed_bootstrap_addr in self.prefill_dp_size_table:
-                del self.prefill_dp_size_table[failed_bootstrap_addr]
-            # TODO (smor): once PP is supported, we need to remove failed boostrap address from that table as well.
-
-            possible_affected_rooms = self.addr_to_rooms_tracker.get(
-                failed_bootstrap_addr, []
-            )
-            if failed_bootstrap_addr in self.addr_to_rooms_tracker:
-                del self.addr_to_rooms_tracker[failed_bootstrap_addr]
-
-        # Mark all pending transfers associated with the failed node as failed
-        affected_rooms = []
-        for room in possible_affected_rooms:
-            if (
-                room in self.transfer_statuses
-                and not self.transfer_statuses[room].is_done()
-            ):
-                # Mark the transfer as failed by setting a special state
-                self.transfer_statuses[room].num_kvs_expected = -1  # Indicates failure
-                affected_rooms.append(room)
-
-        logger.error(
-            f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
-            f"{len(affected_rooms)} transfers affected"
-        )
 
 
 class NixlKVSender(CommonKVSender):
