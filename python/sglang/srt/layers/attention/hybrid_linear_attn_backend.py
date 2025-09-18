@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba.causal_conv1d import causal_conv1d_fn as causal_conv1d_fn_sgl
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -334,7 +335,7 @@ class MambaAttnBackend(AttentionBackend):
                 mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
             )
         else:
-            mixed_qkv = causal_conv1d_fn(
+            mixed_qkv = causal_conv1d_fn_sgl(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 bias,
