@@ -1590,6 +1590,7 @@ def calculate_metrics(
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
+        duration=dur_s,
     )
 
     return metrics, output_lens
@@ -1608,7 +1609,7 @@ def _print_benchmark_summary(
     run_idx: Optional[int] = None,
 ):
     if is_avg and repeat > 1:
-        title = f" Serving Benchmark Result ({repeat} runs' avg) "
+        title = f" Serving Benchmark Result ({repeat} run avg) "
     elif run_idx is not None:
         title = f" Serving Benchmark Result (run {run_idx}) "
     else:
@@ -1624,7 +1625,7 @@ def _print_benchmark_summary(
         )
     )
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
+    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", metrics.duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
     if hasattr(metrics, "total_output_retokenized"):
@@ -1783,8 +1784,9 @@ async def benchmark(
             f"are correctly specified. Error: {warmup_outputs[0].error}"
         )
     else:
+        run_label = " " + str(run_idx) if run_idx is not None else ""
         print(
-            f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
+            f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run{run_label}..."
         )
 
     # Flush cache
@@ -1880,7 +1882,6 @@ async def benchmark(
         tokenizer=tokenizer,
         backend=backend,
     )
-    metrics.duration = benchmark_duration
     metrics.accept_length = accept_length
 
     if not suppress_print:
@@ -1889,7 +1890,7 @@ async def benchmark(
             request_rate_display=("trace" if use_trace_timestamps else request_rate),
             max_concurrency=max_concurrency,
             metrics=metrics,
-            benchmark_duration=benchmark_duration,
+            benchmark_duration=metrics.duration,
             accept_length=accept_length,
             repeat=1,
             is_avg=False,
@@ -2157,6 +2158,9 @@ def run_benchmark(args_: argparse.Namespace):
             "run": run_idx,
             "backend": args.backend,
             "dataset_name": args.dataset_name,
+            "num_prompts": args.num_prompts,
+            "random_input_len": args.random_input_len,
+            "random_output_len": args.random_output_len,
             "request_rate": args.request_rate,
             "max_concurrency": args.max_concurrency,
             "duration": benchmark_duration,
@@ -2200,7 +2204,7 @@ def run_benchmark(args_: argparse.Namespace):
     numeric_summaries: List[Dict[str, float]] = []
     for i in range(num_repeats):
         # run benchmark
-        result, benchmark_duration = asyncio.run(
+        result = asyncio.run(
             benchmark(
                 backend=backend,
                 api_url=api_url,
@@ -2227,9 +2231,7 @@ def run_benchmark(args_: argparse.Namespace):
 
         # save to CSV if requested
         if save_to_csv_path and result is not None:
-            _write_csv_row(
-                save_to_csv_path, result, i + 1, args, benchmark_duration, None
-            )
+            _write_csv_row(save_to_csv_path, result, i + 1, args, result.duration, None)
 
         last_result = result
 
@@ -2237,7 +2239,7 @@ def run_benchmark(args_: argparse.Namespace):
         if result is not None:
             numeric_summaries.append(
                 {
-                    "duration": benchmark_duration,
+                    "duration": result.duration,
                     "completed": float(result.completed),
                     "total_input_tokens": float(result.total_input),
                     "total_output_tokens": float(result.total_output),
@@ -2315,6 +2317,7 @@ def run_benchmark(args_: argparse.Namespace):
             p99_e2e_latency_ms=avg.get("p99_e2e_latency_ms", 0.0),
             concurrency=avg.get("concurrency", 0.0),
         )
+        m.duration = avg.get("duration", 0.0)
 
         _print_benchmark_summary(
             backend=backend,
@@ -2323,7 +2326,7 @@ def run_benchmark(args_: argparse.Namespace):
             ),
             max_concurrency=args.max_concurrency,
             metrics=m,  # averaged metrics-like object
-            benchmark_duration=avg.get("duration", 0.0),
+            benchmark_duration=m.duration,
             accept_length=None,
             repeat=num_repeats,
             is_avg=True,
