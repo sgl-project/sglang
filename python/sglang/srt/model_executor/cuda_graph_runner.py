@@ -114,6 +114,21 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
             _to_torch(sub, reverse, num_tokens)
 
 
+def _torch_compile_wrapper(forward):
+    return torch.compile(
+        torch.no_grad()(forward),
+        mode=os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"),
+        dynamic=False,
+    )
+
+
+def torch_compile(model: torch.nn.Module, server_args):
+    set_torch_compile_config(server_args)
+    _to_torch(model, reverse=False, num_tokens=1)
+    model.forward = _torch_compile_wrapper(model.forward)
+    _to_torch(model, reverse=True, num_tokens=1)
+
+
 @contextmanager
 def patch_model(
     model: torch.nn.Module,
@@ -132,13 +147,7 @@ def patch_model(
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
             # even with ENABLE_INTRA_NODE_COMM=1.
             # tp_group.ca_comm = None
-            yield torch.compile(
-                torch.no_grad()(model.forward),
-                mode=os.environ.get(
-                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-                ),
-                dynamic=False,
-            )
+            yield _torch_compile_wrapper(model.forward)
         else:
             yield model.forward
     finally:
@@ -147,13 +156,20 @@ def patch_model(
             tp_group.ca_comm = backup_ca_comm
 
 
-def set_torch_compile_config():
+def set_torch_compile_config(server_args):
     import torch._dynamo.config
     import torch._inductor.config
 
     torch._inductor.config.coordinate_descent_tuning = True
     torch._inductor.config.triton.unique_kernel_names = True
     torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
+
+    if server_args.enable_torch_compile_fusion:
+        from sglang.srt.compilation.fusion.fusion_manager import FusionManager
+
+        fusion_manager = FusionManager(server_args)
+
+        torch._inductor.config.post_grad_custom_post_pass = fusion_manager
 
     # FIXME: tmp workaround
     torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -306,7 +322,7 @@ class CudaGraphRunner:
         )
 
         if self.enable_torch_compile:
-            set_torch_compile_config()
+            set_torch_compile_config(self.model_runner.server_args)
 
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
