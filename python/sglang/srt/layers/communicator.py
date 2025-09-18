@@ -136,6 +136,7 @@ class LayerScatterModes:
                 if (
                     # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                     not get_moe_a2a_backend().is_none()
+                    or get_afd_role()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 )
                 else ScatterMode.FULL
