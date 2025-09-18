@@ -279,7 +279,7 @@ class RadixCache(BasePrefixCache):
             return 0
 
         if value is None:
-            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
+            value = torch.tensor(key.token_ids, dtype=torch.int64)
         return self._insert_helper(self.root_node, key, value)
 
     def cache_finished_req(self, req: Req):
