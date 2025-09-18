@@ -1,5 +1,3 @@
-import ctypes
-
 MiB = 1024 * 1024
 
 SYMM_MEM_ALL_REDUCE_MAX_SIZES = {

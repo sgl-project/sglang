@@ -208,7 +208,7 @@ class GroupCoordinator:
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_pymscclpp: bool  # a hint of whether to use PyMsccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
-    use_symm_mem: bool  # a hint of whether to use SymmMemAllReduce
+    use_torch_symm_mem: bool  # a hint of whether to use SymmMemAllReduce
     use_message_queue_broadcaster: (
         bool  # a hint of whether to use message queue broadcaster
     )
@@ -226,7 +226,7 @@ class GroupCoordinator:
         use_pynccl: bool,
         use_pymscclpp: bool,
         use_custom_allreduce: bool,
-        use_symm_mem: bool,
+        use_torch_symm_mem: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
         use_npu_communicator: bool,
@@ -275,7 +275,7 @@ class GroupCoordinator:
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
-        self.use_symm_mem = use_symm_mem
+        self.use_torch_symm_mem = use_torch_symm_mem
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
@@ -343,7 +343,7 @@ class GroupCoordinator:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
 
         self.symm_mem_comm: Optional[SymmMemCommunicator] = None
-        if self.use_symm_mem and self.world_size > 1:
+        if self.use_torch_symm_mem and self.world_size > 1:
             self.symm_mem_comm = SymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -453,6 +453,7 @@ class GroupCoordinator:
             # custom allreduce       | enabled | enabled |
             # PyNccl                 | disabled| enabled |
             # PyMscclpp              | disabled| enabled |
+            # TorchSymmMem           | disabled| enabled |
             # torch.distributed      | enabled | disabled|
             #
             # Note: When custom quick allreduce is enabled, a runtime check
@@ -1223,7 +1224,7 @@ def init_world_group(
         use_pynccl=False,
         use_pymscclpp=False,
         use_custom_allreduce=False,
-        use_symm_mem=False,
+        use_torch_symm_mem=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
@@ -1254,7 +1255,7 @@ def init_model_parallel_group(
         use_pynccl=not _is_npu,
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
-        use_symm_mem=use_symm_mem_allreduce,
+        use_torch_symm_mem=use_symm_mem_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
         use_npu_communicator=True,
