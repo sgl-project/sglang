@@ -217,7 +217,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Initialize metadata for CUDA graph capture."""
 
         # Delegate to parent for non-decode modes.
-        if not forward_mode.is_decode_or_idle():
+        if not forward_mode.is_decode_or_idle() and not forward_mode.is_target_verify():
             return super().init_forward_metadata_capture_cuda_graph(
                 bs,
                 num_tokens,
@@ -232,6 +232,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Capture with full width so future longer sequences are safe during replay
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
+
+        if forward_mode.is_target_verify():
+            seq_lens += spec_info.draft_token_num
 
         create_flashmla_kv_indices_triton[(bs,)](
             self.req_to_token,
@@ -270,7 +273,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Replay CUDA graph with new inputs."""
         # Delegate to parent for non-decode modes.
-        if not forward_mode.is_decode_or_idle():
+        if not forward_mode.is_decode_or_idle() and not forward_mode.is_target_verify():
             return super().init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -283,6 +286,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
+
+        if forward_mode.is_target_verify():
+            seq_lens += spec_info.draft_token_num
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[(bs,)](
@@ -332,7 +338,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 cum_seq_lens_q,
                 seq_lens,
             )
-        elif forward_batch.forward_mode.is_decode_or_idle():
+        elif (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             bs = forward_batch.batch_size
 
             # Get maximum sequence length.
@@ -341,13 +350,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             else:
                 max_seq = forward_batch.seq_lens.max().item()
 
+            seq_lens = forward_batch.seq_lens
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens += forward_batch.spec_info.draft_token_num
+
             max_seqlen_pad = self._calc_padded_blocks(max_seq)
             block_kv_indices = self._create_block_kv_indices(
                 bs,
                 max_seqlen_pad,
                 forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens.device,
+                seq_lens,
+                seq_lens.device,
             )
 
             max_seq_len_val = int(max_seq)
@@ -553,52 +566,30 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-    ):
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
-        ):
-            return super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
-            )
-        # chunked prefix cache is not enabled, use Flashinfer MLA prefill kernel
-        if forward_batch.attn_attend_prefix_cache is None:
+    ) -> torch.Tensor:
+        if forward_batch.forward_mode.is_draft_extend():
             return super().forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
 
-        if not forward_batch.attn_attend_prefix_cache:
-            q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-            k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-            v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
-            output = flashinfer.prefill.trtllm_ragged_attention_deepseek(
-                query=q,
-                key=k,
-                value=v,
-                workspace_buffer=self.workspace_buffer,
-                seq_lens=self.forward_prefill_metadata.seq_lens,
-                max_q_len=self.forward_prefill_metadata.max_seq_len,
-                max_kv_len=self.forward_prefill_metadata.max_seq_len,
-                bmm1_scale=layer.scaling,
-                bmm2_scale=1.0,
-                o_sf_scale=1.0,
-                batch_size=forward_batch.batch_size,
-                window_left=-1,
-                cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
-                cum_seq_lens_kv=self.forward_prefill_metadata.cum_seq_lens,
-                enable_pdl=False,
-                is_causal=True,
-                return_lse=forward_batch.mha_return_lse,
-            )
-        else:
+        if forward_batch.attn_attend_prefix_cache:
             if not (
                 forward_batch.attn_attend_prefix_cache is not None
                 and forward_batch.mha_return_lse
             ):
-                output = super().forward_extend(
+                return super().forward_extend(
                     q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
                 )
             else:
+                # Save KV cache if requested
+                if save_kv_cache:
+                    assert (
+                        k is not None and k_rope is not None
+                    ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, k_rope
+                    )
+
                 # MHA for chunked prefix kv cache when running model with MLA
                 assert forward_batch.prefix_chunk_idx is not None
                 assert forward_batch.prefix_chunk_cu_seq_lens is not None
@@ -610,7 +601,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 k = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype)
                 v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype)
                 output_shape = (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
-                output = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                return flashinfer.prefill.trtllm_ragged_attention_deepseek(
                     query=q,
                     key=k,
                     value=v,
@@ -630,7 +621,90 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     return_lse=True,
                     out=torch.zeros(*output_shape, dtype=q.dtype, device=q.device),
                 )
-        return output
+
+        # Save KV cache if requested
+        if save_kv_cache:
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, k_rope
+            )
+
+        if q_rope is not None:
+            q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            q = torch.cat([q, q_rope], dim=-1)
+
+        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        if k_rope is not None:
+            k = torch.cat([k, k_rope], dim=-1)
+        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+
+        v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+
+        if forward_batch.forward_mode.is_target_verify():
+            metadata = (
+                getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+                or self.forward_decode_metadata
+            )
+
+            # Ensure query has shape [bs, num_draft_tokens, num_q_heads, head_dim]
+            bs = forward_batch.batch_size
+            q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+
+            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+
+            q_scale = 1.0
+            k_scale = (
+                layer.k_scale_float
+                if getattr(layer, "k_scale_float", None) is not None
+                else 1.0
+            )
+
+            bmm1_scale = q_scale * k_scale * layer.scaling
+
+            raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=metadata.block_kv_indices,
+                seq_lens=forward_batch.seq_lens.to(torch.int32)
+                + forward_batch.spec_info.draft_token_num,
+                max_seq_len=metadata.max_seq_len,
+                bmm1_scale=bmm1_scale,
+            )
+
+            # Reshape output directly without slicing
+            output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return output
+
+        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            query=q,
+            key=k,
+            value=v,
+            workspace_buffer=self.workspace_buffer,
+            seq_lens=self.forward_prefill_metadata.seq_lens,
+            max_q_len=self.forward_prefill_metadata.max_seq_len,
+            max_kv_len=self.forward_prefill_metadata.max_seq_len,
+            bmm1_scale=layer.scaling,
+            bmm2_scale=1.0,
+            o_sf_scale=1.0,
+            batch_size=forward_batch.batch_size,
+            window_left=-1,
+            cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
+            cum_seq_lens_kv=self.forward_prefill_metadata.cum_seq_lens,
+            enable_pdl=False,
+            is_causal=True,
+            return_lse=forward_batch.mha_return_lse,
+        )
 
 
 class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
