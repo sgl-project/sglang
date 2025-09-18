@@ -211,15 +211,42 @@ class RadixCache(BasePrefixCache):
         self._record_all_cleared_event()
 
     def match_prefix(self, key: BaseKey, **kwargs) -> MatchResult:
-        """Find the matching prefix from the radix tree.
+        """Find the longest cached prefix of ``key`` in the radix tree.
+
+        The logical namespace for prefix matching is determined by both the
+        token id sequence and the optional ``extra_key`` carried by ``BaseKey``.
+        Entries that share identical leading token ids but have *different*
+        ``extra_key`` values are intentionally kept disjoint and never share
+        prefix nodes. This is useful to:
+
+        * Isolate KV cache lines for different LoRA / adapter IDs.
+        * Separate requests that intentionally should not share state (e.g.,
+          different sampling salt, cache version, or retrieval augmentation
+          context) by supplying a distinct ``extra_key``.
+
         Args:
+            key (BaseKey): The lookup key containing a list of token ids and an
+                optional ``extra_key`` namespace tag. If ``page_size > 1`` the
+                length is internally truncated to a multiple of ``page_size``
+                before matching. Passing an empty key returns an empty result
+                with the root as the last node.
+            **kwargs: Reserved for future extensions (ignored currently).
+
         Returns:
-            key: A BaseKey contains a list of token IDs to find a matching prefix.
-            A tuple of a tensor of matching prefix token IDs and
-            the last node that contains the prefix values. Note that
-            this API can modify the internal state of the Radix tree.
-            The last node create a new child if the prefix is shorter
-            than the last node's value.
+            MatchResult: ``device_indices`` is a 1-D ``torch.int64`` tensor of
+            the concatenated KV cache indices corresponding to the longest
+            cached prefix (may be length 0). ``last_device_node`` and
+            ``last_host_node`` (currently the same) are the tree node objects
+            representing the terminal node of the matched prefix. This method
+            may mutate internal structure by splitting an existing node if the
+            match ends inside a stored segment.
+
+        Internal updates:
+            * Refreshes access metadata (timestamps / hit counters) used by the
+                configured eviction strategy.
+            * If the lookup ends inside a stored segment the node is split once
+                to expose a precise boundary; this structural refinement improves
+                subsequent match efficiency and does not duplicate data.
         """
         if self.disable or len(key) == 0:
             return MatchResult(
