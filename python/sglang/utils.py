@@ -1,6 +1,8 @@
 """Common utilities"""
 
+import functools
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -16,11 +18,13 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
 from json import dumps
-from typing import Any, Callable, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, List, Optional, Tuple, Type, Union, get_type_hints
 
 import numpy as np
 import pybase64
 import requests
+import triton
+import triton.language as tl
 from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
@@ -540,3 +544,106 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
+
+
+class CachedKernel:
+    """
+    Wrapper that allows kernel[grid](...) syntax with caching.
+
+    This wrapper caches compiled Triton kernels based on a custom key function to potentially avoid
+    the heavy cost of triton kernel lookup, when the kernel lookup logic could be simlified. By default,
+    the cache key is generated from the grid and parameters with `tl.constexpr` type hints.
+    """
+
+    def __init__(self, fn, key_fn=None):
+        self.fn = fn
+        self.key_fn = key_fn
+
+        # Get the function signature and type hints
+        self.signature = inspect.signature(fn)
+
+        assert isinstance(fn, triton.runtime.jit.JITFunction)
+        original_fn = fn.fn
+        self.signature = inspect.signature(original_fn)
+        self.type_hints = get_type_hints(original_fn)
+        # Identify constexpr parameters
+        self.constexpr_params = []
+        for param_name in self.signature.parameters:
+            hint = self.type_hints.get(param_name)
+            if hint is tl.constexpr:
+                self.constexpr_params.append(param_name)
+
+        functools.update_wrapper(self, original_fn)
+
+        self.kernel_cache = {}
+
+    def _default_key_fn(self, grid, *args, **kwargs):
+        """Default key function that uses grid and constexpr parameters."""
+        bound = self.signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        constexpr_values = {
+            bound.arguments[param_name] for param_name in self.constexpr_params
+        }
+
+        return f"{grid}_{",".join(str(cv) for cv in constexpr_values)}"
+
+    def __getitem__(self, grid: tuple[int, int, int]):
+        """Return a callable that will execute the kernel with the given grid."""
+        assert (
+            isinstance(grid, tuple) and len(grid) <= 3
+        ), "Currently we only support grid as a tuple."
+        grid = grid + (1,) * (3 - len(grid))
+
+        def launcher(*args, **kwargs):
+            if self.key_fn:
+                key = self.key_fn(grid, *args, **kwargs)
+            else:
+                key = self._default_key_fn(grid, *args, **kwargs)
+
+            cached_kernel = self.kernel_cache.get(key)
+
+            if cached_kernel is None:
+                self.kernel_cache[key] = self.fn[grid](*args, **kwargs)
+            else:
+                param_names = list(self.signature.parameters.keys())
+                all_args = list(args)
+
+                # Add kwargs in the order they appear in the function signature
+                for param_name in param_names[len(args) :]:
+                    if param_name in kwargs:
+                        all_args.append(kwargs[param_name])
+
+                cached_kernel[grid](*all_args)
+
+            return cached_kernel
+
+        return launcher
+
+
+def cached_triton_kernel(fn=None, *, key_fn: Callable[..., str] = None):
+    """
+    Decorator that caches compiled kernels.
+
+    By default, uses only grid and parameters with tl.constexpr type hints as cache key.
+
+    Can be used as:
+        @cached_triton_kernel
+        def func...
+
+        OR
+
+        @cached_triton_kernel(key_fn=...)
+        def func...
+
+    Args:
+        key_fn: Optional function to generate cache key from (grid, *args, **kwargs).
+                Should return a string. If None, uses grid + constexpr parameters as key.
+    """
+
+    def decorator(func):
+        return CachedKernel(func, key_fn)
+
+    if fn is not None:
+        return decorator(fn)
+
+    return decorator
