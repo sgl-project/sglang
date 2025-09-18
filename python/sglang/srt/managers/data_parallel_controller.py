@@ -443,12 +443,23 @@ class DataParallelController:
             return
 
         if self.server_args.disaggregation_mode == "null":
-            self.workers[self.round_robin_counter].send_pyobj(req)
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
+            while True:
+                if self.status[self.round_robin_counter] == 1:
+                    self.workers[self.round_robin_counter].send_pyobj(req)
+                    self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                        self.workers
+                    )
+                    break
+                self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                        self.workers
+                    )
         else:
-            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+            id = req.bootstrap_room % len(self.workers)
+            while True:
+                if self.status[id] == 1:
+                    self.workers[id].send_pyobj(req)
+                    break
+                id = (id + 1) % len(self.workers)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
