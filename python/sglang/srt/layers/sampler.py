@@ -241,25 +241,15 @@ def multinomial_with_seed(inputs: torch.Tensor, seed: torch.Tensor) -> torch.Ten
     """
     device = inputs.device
     seed = seed.to(device)
-
     n, m = inputs.shape
-
     col_indices = torch.arange(m, device=device).unsqueeze(0)
-
     seed_expanded = seed.unsqueeze(-1)
-
     hashed = seed_expanded * 73856093 ^ col_indices * 19349663
-
     uniform_samples = (hashed % (2**24)).float() / (2**24)
-
     epsilon = 1e-9
-
     gumbel_noise = -torch.log(-torch.log(uniform_samples + epsilon) + epsilon)
-
     log_probs = torch.log(inputs + epsilon)
-
     perturbed_log_probs = log_probs + gumbel_noise
-
     return torch.argmax(perturbed_log_probs, dim=1, keepdim=True)
 
 
