@@ -48,7 +48,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
@@ -61,8 +61,10 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         )
         is_first = True
         all_results = []
+        model_count = 0
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
+                model_count += 1
                 with self.subTest(model=model):
                     process = popen_launch_server_wrapper(
                         self.base_url, model, "", ["--tp", "2"] if is_tp2 else []
@@ -96,7 +98,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             print(f"Error reading results.json: {e}")
 
         # Check all scores after collecting all results
-        check_model_scores(all_results, self.__class__.__name__, MODEL_SCORE_THRESHOLDS)
+        check_model_scores(all_results, self.__class__.__name__, MODEL_SCORE_THRESHOLDS, model_count)
 
 
 if __name__ == "__main__":
