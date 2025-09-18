@@ -53,7 +53,7 @@ pub struct RouterManager {
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
 
     /// Default router for requests without specific routing
-    default_router: Option<RouterId>,
+    default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
 
     /// HTTP client for querying worker info
     client: reqwest::Client,
@@ -75,27 +75,29 @@ impl RouterManager {
             worker_registry,
             policy_registry,
             routers: Arc::new(DashMap::new()),
-            default_router: None,
+            default_router: Arc::new(std::sync::RwLock::new(None)),
             client,
             config,
         }
     }
 
     /// Register a router with the manager
-    pub fn register_router(&mut self, id: RouterId, router: Arc<dyn RouterTrait>) {
+    pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
         // Store router
         self.routers.insert(id.clone(), router);
 
         // Set as default if first router
-        if self.default_router.is_none() {
-            self.default_router = Some(id.clone());
+        let mut default_router = self.default_router.write().unwrap();
+        if default_router.is_none() {
+            *default_router = Some(id.clone());
             info!("Set default router to {}", id.as_str());
         }
     }
 
     /// Set the default router
-    pub fn set_default_router(&mut self, id: RouterId) {
-        self.default_router = Some(id);
+    pub fn set_default_router(&self, id: RouterId) {
+        let mut default_router = self.default_router.write().unwrap();
+        *default_router = Some(id);
     }
 
     /// Get the number of registered routers
@@ -130,7 +132,8 @@ impl RouterManager {
         }
 
         // Fall back to default router
-        if let Some(ref default_id) = self.default_router {
+        let default_router = self.default_router.read().unwrap();
+        if let Some(ref default_id) = *default_router {
             self.routers.get(default_id).map(|r| r.clone())
         } else {
             None
@@ -808,7 +811,7 @@ impl std::fmt::Debug for RouterManager {
         f.debug_struct("RouterManager")
             .field("routers_count", &self.routers.len())
             .field("workers_count", &self.worker_registry.get_all().len())
-            .field("default_router", &self.default_router)
+            .field("default_router", &*self.default_router.read().unwrap())
             .finish()
     }
 }
