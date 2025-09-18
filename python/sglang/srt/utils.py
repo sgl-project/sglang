@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import builtins
 import ctypes
@@ -81,11 +82,9 @@ from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
 from torch import nn
-from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-from triton.runtime.cache import FileCacheManager
 from typing_extensions import Literal
 
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -166,6 +165,7 @@ is_ampere_with_cuda_12_3 = lambda: _check(8)
 is_hopper_with_cuda_12_3 = lambda: _check(9)
 
 
+@lru_cache(maxsize=1)
 def is_blackwell():
     if not is_cuda():
         return False
@@ -190,6 +190,7 @@ _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
+    # FIXME: move your environment variable to sglang.environ
     value = os.getenv(name, default)
     value = value.lower()
 
@@ -207,6 +208,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
 
 
 def get_int_env_var(name: str, default: int = 0) -> int:
+    # FIXME: move your environment variable to sglang.environ
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
@@ -434,7 +436,9 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        free_gpu_memory = psutil.virtual_memory().available
+        total_free_memory = psutil.virtual_memory().available
+        n_numa_node: int = len(get_cpu_ids_by_node())
+        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -746,6 +750,25 @@ def load_image(
     return image, image_size
 
 
+def get_image_bytes(image_file: Union[str, bytes]):
+    if isinstance(image_file, bytes):
+        return image_file
+    elif image_file.startswith("http://") or image_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(image_file, timeout=timeout)
+        return response.content
+    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
+        with open(image_file, "rb") as f:
+            return f.read()
+    elif image_file.startswith("data:"):
+        image_file = image_file.split(",")[1]
+        return pybase64.b64decode(image_file)
+    elif isinstance(image_file, str):
+        return pybase64.b64decode(image_file)
+    else:
+        raise NotImplementedError(f"Invalid image: {image_file}")
+
+
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
     from decord import VideoReader, cpu, gpu
@@ -799,6 +822,33 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     finally:
         if tmp_file and os.path.exists(tmp_file.name):
             os.unlink(tmp_file.name)
+
+
+def encode_video(video_path, frame_count_limit=None):
+    # Lazy import because decord is not available on some arm platforms.
+    from decord import VideoReader, cpu
+
+    if not os.path.exists(video_path):
+        logger.error(f"Video {video_path} does not exist")
+        return []
+
+    if frame_count_limit == 0:
+        return []
+
+    def uniform_sample(l, n):
+        gap = len(l) / n
+        idxs = [int(i * gap + gap / 2) for i in range(n)]
+        return [l[i] for i in idxs]
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
+    frame_indices = [i for i in range(0, len(vr), sample_fps)]
+    if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
+        frame_indices = uniform_sample(frame_indices, frame_count_limit)
+
+    frames = vr.get_batch(frame_indices).asnumpy()
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
+    return frames
 
 
 def suppress_other_loggers():
@@ -941,6 +991,13 @@ def set_ulimit(target_soft_limit=65535):
             )
         except ValueError as e:
             logger.warning(f"Fail to set RLIMIT_STACK: {e}")
+
+
+def rank0_log(msg: str):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.info(msg)
 
 
 def add_api_key_middleware(app, api_key: str):
@@ -1157,7 +1214,7 @@ def pytorch_profile(name, func, *args, data_size=-1):
 
 def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-):
+) -> zmq.Socket:
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -1429,6 +1486,7 @@ def init_custom_process_group(
     store=None,
     group_name=None,
     pg_options=None,
+    device_id=None,
 ):
     from torch.distributed.distributed_c10d import (
         Backend,
@@ -1482,6 +1540,7 @@ def init_custom_process_group(
         group_name=group_name,
         **{pg_options_param_name: pg_options},
         timeout=timeout,
+        device_id=device_id,
     )
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
@@ -3033,6 +3092,44 @@ def check_cuda_result(raw_output):
     return results
 
 
+def get_physical_device_id(pytorch_device_id: int) -> int:
+    """
+    Convert PyTorch logical device ID to physical device ID.
+    """
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    assert (
+        cuda_visible_devices is not None
+    ), "CUDA_VISIBLE_DEVICES should be set in a scheduler"
+    device_list = cuda_visible_devices.split(",")
+    assert (
+        len(device_list) == 1
+    ), "CUDA_VISIBLE_DEVICES should be set to a single device in a scheduler"
+    return int(device_list[0])
+
+
+def get_device_sm_nvidia_smi():
+    try:
+        # Run nvidia-smi command and capture output
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        # Get the first line of output (assuming at least one GPU exists)
+        compute_cap_str = result.stdout.strip().split("\n")[0]
+
+        # Convert string (e.g., "9.0") to tuple of integers (9, 0)
+        major, minor = map(int, compute_cap_str.split("."))
+        return (major, minor)
+
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
+        # Handle cases where nvidia-smi isn't available or output is unexpected
+        print(f"Error getting compute capability: {e}")
+        return (0, 0)  # Default/fallback value
+
+
 def numa_bind_to_node(node: int):
     libnuma = ctypes.CDLL("libnuma.so")
     if libnuma.numa_available() < 0:
@@ -3040,3 +3137,42 @@ def numa_bind_to_node(node: int):
 
     libnuma.numa_run_on_node(ctypes.c_int(node))
     libnuma.numa_set_localalloc()
+
+
+def json_list_type(value):
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid JSON list: {value}. Please provide a valid JSON list."
+        )
+
+
+@contextmanager
+def temp_set_cuda_visible_devices(gpu_id: int):
+    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if original_cuda_visible_devices:
+        cuda_visible_devices = original_cuda_visible_devices.split(",")
+    else:
+        cuda_visible_devices = []
+
+    str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
+    yield
+    if original_cuda_visible_devices:
+        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+    else:
+        del os.environ["CUDA_VISIBLE_DEVICES"]
+
+
+def get_extend_input_len_swa_limit(
+    sliding_window_size: int, chunked_prefill_size: int, page_size: int
+) -> int:
+    # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
+    #    and between prefills, we run swa_radix_cache.cache_unfinished_req(),
+    #    so we unlock the previously locked nodes.
+    # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
+    #    in that case, each prefill contains chunked_prefill_size tokens,
+    #    and we can only free out-of-sliding-window kv indices after each prefill.
+    # 3. page_size is because we want to have 1 token extra for generated tokens.
+    return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
