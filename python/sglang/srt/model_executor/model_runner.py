@@ -212,39 +212,6 @@ class RankZeroFilter(logging.Filter):
         return True
 
 
-def parameter_server_func(
-    pipe_conn: Connection,
-    ckpt_register_name,
-    ckpt_save_meta_file_name,
-    named_tensors,
-    tp_rank,
-):
-    try:
-        ps = None
-        ps = ParameterServer(auto_pg=True)
-
-        ps.register_checkpoint(
-            ckpt_register_name,
-            files=[],
-            named_tensors=named_tensors,
-        )
-
-        ps.init_process_group()
-        ps.gather_metas(ckpt_register_name)
-
-        if tp_rank == 0:
-            print("XUCHUN: tp rank 0 dump")
-            with open(ckpt_save_meta_file_name, "wb") as f:
-                pickle.dump(ps.get_metas(), f)
-
-        pipe_conn.send({"status": "ok"})
-    except Exception as e:
-        pipe_conn.send({"status": "error"})
-
-    while True:
-        continue
-
-
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
@@ -333,7 +300,23 @@ class ModelRunner:
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
 
-        self.init_ckpt_engine()
+        self.ps = None
+        if (
+            CHECKPOINT_ENGINE_AVAILABLE
+            and ParameterServer is not None
+            and self.server_args.enable_ckpt_engine
+        ):
+            self.ps = ParameterServer(auto_pg=True)
+            self.ps.register_checkpoint(
+                self.server_args.ckpt_register_name,
+                files=[],
+                named_tensors=list(self.model.named_parameters()),
+            )
+            self.ps.gather_metas(self.server_args.ckpt_register_name)
+            # TODO: Using json to transfer meta
+            if self.tp_rank == 0:
+                with open(self.server_args.ckpt_save_meta_file_name, "wb") as f:
+                    pickle.dump(self.ps.get_metas(), f)
 
         # Temporary cached values
         self.support_pp = (
@@ -343,30 +326,6 @@ class ModelRunner:
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
-
-    def init_ckpt_engine(self):
-        if (
-            CHECKPOINT_ENGINE_AVAILABLE
-            and ParameterServer is not None
-            and self.server_args.enable_ckpt_engine
-        ):
-            parent_conn, child_conn = mp.Pipe()
-            args_for_ckpt = (
-                child_conn,
-                self.server_args.ckpt_register_name,
-                self.server_args.ckpt_save_meta_file_name,
-                list(self.model.named_parameters()),
-                self.tp_rank,
-            )
-            ps_process = mp.Process(target=parameter_server_func, args=args_for_ckpt)
-            ps_process.start()
-            child_conn.close()
-            try:
-                response = parent_conn.recv()
-                if response["status"] != "ok":
-                    print("Failed to create ps")
-            except EOFError:
-                print(f"[pid:{os.getpid()}] Child failed")
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
