@@ -65,6 +65,8 @@ However, for some models, especially at large tensor parallelism sizes, CUDA gra
 Therefore, it may be beneficial to increase `--cuda-graph-max-bs` to a larger value.
 Note that CUDA graph consumes more memory, so you may need to reduce `--mem-fraction-static` at the same time.
 
+For a deeper explanation of capture order, hidden state modes, GC trade-offs, and troubleshooting, see the dedicated CUDA Graph guide: `advanced_features/cuda_graphs.md`.
+
 ### Tune `--dp-size` and `--tp-size`
 
 Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput. Refer to [sglang router](../advanced_features/router.md) for a better data parallelism rather than using `dp_size` parameter.
