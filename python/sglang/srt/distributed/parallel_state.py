@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_int_env_var,
+    is_cpu,
     is_cuda_alike,
     is_hip,
     is_npu,
@@ -51,6 +52,9 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+
+IS_ONE_DEVICE_PER_PROCESS = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
 
 
 @dataclass
@@ -59,6 +63,9 @@ class GraphCaptureContext:
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
+# use int value instead of ReduceOp.SUM to support torch compile
+REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
 
 def _split_tensor_dict(
@@ -223,10 +230,12 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
     ):
+        # Set group info
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
+        # Set rank info
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
         self.device_group = None
@@ -250,15 +259,16 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
+        device_id = 0 if IS_ONE_DEVICE_PER_PROCESS else local_rank
         if is_cuda_alike():
-            self.device = torch.device(f"cuda:{local_rank}")
+            self.device = torch.device(f"cuda:{device_id}")
         elif _is_npu:
-            self.device = torch.device(f"npu:{local_rank}")
+            self.device = torch.device(f"npu:{device_id}")
         else:
             self.device = torch.device("cpu")
-
         self.device_module = torch.get_device_module(self.device)
 
+        # Import communicators
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
@@ -270,6 +280,9 @@ class GroupCoordinator:
         # lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
+        )
+        from sglang.srt.distributed.device_communicators.pymscclpp import (
+            PyMscclppCommunicator,
         )
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
@@ -287,10 +300,6 @@ class GroupCoordinator:
                 group=self.cpu_group,
                 device=self.device,
             )
-
-        from sglang.srt.distributed.device_communicators.pymscclpp import (
-            PyMscclppCommunicator,
-        )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
         if use_pymscclpp and self.world_size > 1:
@@ -326,30 +335,30 @@ class GroupCoordinator:
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
 
+        # Create communicator for other hardware backends
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
+        )
+        from sglang.srt.distributed.device_communicators.npu_communicator import (
+            NpuCommunicator,
+        )
+        from sglang.srt.distributed.device_communicators.xpu_communicator import (
+            XpuCommunicator,
         )
 
         self.hpu_communicator: Optional[HpuCommunicator] = None
         if use_hpu_communicator and self.world_size > 1:
             self.hpu_communicator = HpuCommunicator(group=self.device_group)
 
-        from sglang.srt.distributed.device_communicators.xpu_communicator import (
-            XpuCommunicator,
-        )
-
         self.xpu_communicator: Optional[XpuCommunicator] = None
         if use_xpu_communicator and self.world_size > 1:
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
-
-        from sglang.srt.distributed.device_communicators.npu_communicator import (
-            NpuCommunicator,
-        )
 
         self.npu_communicator: Optional[NpuCommunicator] = None
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
+        # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
             MessageQueue,
         )
@@ -483,9 +492,7 @@ class GroupCoordinator:
 
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
-                torch.ops.sgl_kernel.shm_allreduce(
-                    input_, torch.distributed.ReduceOp.SUM
-                )
+                torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
@@ -849,6 +856,11 @@ class GroupCoordinator:
         )
         return obj_list
 
+    def all_gather_object(self, obj: Any) -> List[Any]:
+        objs = [None] * self.world_size
+        torch.distributed.all_gather_object(objs, obj, group=self.cpu_group)
+        return objs
+
     def send_object(self, obj: Any, dst: int) -> None:
         """Send the input object list to the destination rank."""
         """NOTE: `dst` is the local rank of the destination rank."""
@@ -868,17 +880,16 @@ class GroupCoordinator:
         size_tensor = torch.tensor(
             [object_tensor.numel()],
             dtype=torch.long,
-            device=torch.cuda.current_device(),
+            device="cpu",
         )
-
         # Send object size
-        torch.distributed.send(
-            size_tensor, dst=self.ranks[dst], group=self.device_group
-        )
+        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
         # Send object
         torch.distributed.send(
-            object_tensor, dst=self.ranks[dst], group=self.device_group
+            object_tensor,
+            dst=self.ranks[dst],
+            group=self.device_group,
         )
 
         return None
@@ -893,13 +904,11 @@ class GroupCoordinator:
             src != self.rank_in_group
         ), "Invalid source rank. Source rank is the same as the current rank."
 
-        size_tensor = torch.empty(
-            1, dtype=torch.long, device=torch.cuda.current_device()
-        )
+        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
         rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.device_group
+            size_tensor, src=self.ranks[src], group=self.cpu_group
         )
 
         # Tensor to receive serialized objects into.
@@ -917,7 +926,7 @@ class GroupCoordinator:
             rank_object == rank_size
         ), "Received object sender rank does not match the size sender rank."
 
-        obj = pickle.loads(object_tensor.cpu().numpy().tobytes())
+        obj = pickle.loads(object_tensor.cpu().numpy())
 
         return obj
 
@@ -1450,43 +1459,49 @@ def initialize_model_parallel(
         _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
     moe_ep_size = expert_model_parallel_size
-
     moe_tp_size = tensor_model_parallel_size // moe_ep_size
+
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
-        for j in range(moe_tp_size):
-            st = i * tensor_model_parallel_size + j
-            en = (i + 1) * tensor_model_parallel_size + j
-            ranks = list(range(st, en, moe_tp_size))
-            group_ranks.append(ranks)
 
-    _MOE_EP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_custom_allreduce=False,
-        group_name="moe_ep",
-    )
+    if moe_ep_size == tensor_model_parallel_size:
+        _MOE_EP = _TP
+    else:
+        # TODO(ch-wan): use split_group to save memory
+        group_ranks = []
+        for i in range(num_tensor_model_parallel_groups):
+            for j in range(moe_tp_size):
+                st = i * tensor_model_parallel_size + j
+                en = (i + 1) * tensor_model_parallel_size + j
+                ranks = list(range(st, en, moe_tp_size))
+                group_ranks.append(ranks)
+        _MOE_EP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="moe_ep",
+        )
 
     global _MOE_TP
     assert _MOE_TP is None, "expert model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
-        for j in range(moe_ep_size):
-            st = i * tensor_model_parallel_size + j * moe_tp_size
-            en = i * tensor_model_parallel_size + (j + 1) * moe_tp_size
-            ranks = list(range(st, en))
-            group_ranks.append(ranks)
 
-    _MOE_TP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_custom_allreduce=False,
-        group_name="moe_tp",
-    )
+    if moe_tp_size == tensor_model_parallel_size:
+        _MOE_TP = _TP
+    else:
+        # TODO(ch-wan): use split_group to save memory
+        group_ranks = []
+        for i in range(num_tensor_model_parallel_groups):
+            for j in range(moe_ep_size):
+                st = i * tensor_model_parallel_size + j * moe_tp_size
+                en = i * tensor_model_parallel_size + (j + 1) * moe_tp_size
+                ranks = list(range(st, en))
+                group_ranks.append(ranks)
+        _MOE_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="moe_tp",
+        )
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
@@ -1572,6 +1587,16 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
         _TP = old_tp_group
 
 
+def get_world_size():
+    """Return world size for the world group."""
+    return get_world_group().world_size
+
+
+def get_world_rank():
+    """Return my rank for the world group."""
+    return get_world_group().rank_in_group
+
+
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     return get_tp_group().world_size
@@ -1580,6 +1605,16 @@ def get_tensor_model_parallel_world_size():
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     return get_tp_group().rank_in_group
+
+
+def get_pipeline_model_parallel_world_size():
+    """Return world size for the pipeline model parallel group."""
+    return get_pp_group().world_size
+
+
+def get_pipeline_model_parallel_rank():
+    """Return my rank for the pipeline model parallel group."""
+    return get_pp_group().rank_in_group
 
 
 def get_moe_expert_parallel_world_size():
@@ -1634,7 +1669,7 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
 
         ray.shutdown()
     gc.collect()
-    if not current_platform.is_cpu():
+    if not _is_cpu:
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
             if hasattr(torch._C, "_host_emptyCache"):

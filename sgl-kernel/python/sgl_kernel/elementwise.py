@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from sgl_kernel.utils import get_cuda_stream, is_arch_support_pdl
@@ -271,6 +271,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
     fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
@@ -307,6 +308,10 @@ def apply_rope_with_cos_sin_cache_inplace(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
+    if enable_pdl is None:
+        # the non-fused branch does not yet support PDL, but after we switch to our impl for that branch it will
+        enable_pdl = is_arch_support_pdl() and (fused_set_kv_buffer_arg is not None)
+
     if (a := fused_set_kv_buffer_arg) is not None:
         assert a.k_scale is None, "k_scale is not yet supported"
         assert a.v_scale is None, "v_scale is not yet supported"
@@ -323,6 +328,7 @@ def apply_rope_with_cos_sin_cache_inplace(
         cos_sin_cache,
         positions.long(),
         (not is_neox),
+        enable_pdl,
         get_cuda_stream(),
         (
             _view_3d(fused_set_kv_buffer_arg.value)
@@ -361,3 +367,27 @@ def downcast_fp8(
     torch.ops.sgl_kernel.downcast_fp8(
         k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset, get_cuda_stream()
     )
+
+
+def copy_to_gpu_no_ce(input: List[int], output: torch.Tensor):
+    torch.ops.sgl_kernel.copy_to_gpu_no_ce(input, output)
+
+
+def concat_mla_k(
+    k: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+):
+    torch.ops.sgl_kernel.concat_mla_k(k, k_nope, k_rope)
+
+
+def concat_mla_absorb_q(
+    a: torch.Tensor,
+    b: torch.Tensor,
+):
+    *batch_dims, _ = a.shape
+    out = torch.empty(
+        (*batch_dims, a.shape[-1] + b.shape[-1]), device=a.device, dtype=a.dtype
+    )
+    torch.ops.sgl_kernel.concat_mla_absorb_q(a, b, out)
+    return out

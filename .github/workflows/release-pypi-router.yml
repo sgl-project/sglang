@@ -47,7 +47,14 @@ jobs:
         env:
           CIBW_BUILD: "cp38-manylinux_x86_64 cp39-manylinux_x86_64 cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64"
           CIBW_BEFORE_ALL: |
-            yum update && yum install -y openssl-devel && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            yum update -y && yum install -y openssl-devel wget unzip && \
+            # Install latest protoc (v32.0) that supports proto3
+            cd /tmp && \
+            wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip && \
+            unzip protoc-32.0-linux-x86_64.zip -d /usr/local && \
+            rm protoc-32.0-linux-x86_64.zip && \
+            # Install Rust
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           CIBW_ENVIRONMENT: "PATH=$HOME/.cargo/bin:$PATH"
 
       - name: List built packages

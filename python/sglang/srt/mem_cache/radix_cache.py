@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.evict_policy import EvictionStrategy, LFUStrategy, LRUStrategy
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
@@ -53,8 +54,6 @@ class TreeNode:
         self.last_access_time = time.monotonic()
 
         self.hit_count = 0
-        # indicating the node is loading KV cache from host
-        self.loading = False
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0
@@ -62,7 +61,6 @@ class TreeNode:
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
-        self.backuped_storage = False
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -125,6 +123,7 @@ class RadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
         enable_kv_cache_events: bool = False,
+        eviction_policy: str = "lru",
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -144,6 +143,15 @@ class RadixCache(BasePrefixCache):
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = lambda key: tuple(key[:page_size])
+
+        if eviction_policy.lower() == "lru":
+            self.eviction_strategy: EvictionStrategy = LRUStrategy()
+        elif eviction_policy.lower() == "lfu":
+            self.eviction_strategy: EvictionStrategy = LFUStrategy()
+        else:
+            raise ValueError(
+                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu'."
+            )
         self.reset()
 
     ##### Public API #####
@@ -152,6 +160,7 @@ class RadixCache(BasePrefixCache):
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
+        self.root_node.host_value = []
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
@@ -194,7 +203,7 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: List, value=None):
+    def insert(self, key: List, value=None, chunked=False):
         if self.disable:
             return 0
 
@@ -239,7 +248,7 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req):
+    def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
@@ -260,7 +269,9 @@ class RadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
+        new_prefix_len = self.insert(
+            page_aligned_token_ids, page_aligned_kv_indices, chunked=chunked
+        )
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
@@ -296,11 +307,14 @@ class RadixCache(BasePrefixCache):
             return
 
         leaves = self._collect_leaves()
-        heapq.heapify(leaves)
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node) for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
 
         num_evicted = 0
-        while num_evicted < num_tokens and len(leaves):
-            x = heapq.heappop(leaves)
+        while num_evicted < num_tokens and len(eviction_heap):
+            _priority, x = heapq.heappop(eviction_heap)
 
             if x == self.root_node:
                 break
@@ -312,7 +326,8 @@ class RadixCache(BasePrefixCache):
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0:
-                heapq.heappush(leaves, x.parent)
+                new_priority = self.eviction_strategy.get_priority(x.parent)
+                heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
 

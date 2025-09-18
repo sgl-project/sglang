@@ -38,9 +38,12 @@ from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
+    DotsVLMConfig,
     ExaoneConfig,
     KimiVLConfig,
+    LongcatFlashConfig,
     MultiModalityConfig,
+    Qwen3NextConfig,
     Step3VLConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
@@ -56,6 +59,9 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
     Step3VLConfig.model_type: Step3VLConfig,
+    LongcatFlashConfig.model_type: LongcatFlashConfig,
+    Qwen3NextConfig.model_type: Qwen3NextConfig,
+    DotsVLMConfig.model_type: DotsVLMConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -125,6 +131,14 @@ def get_config(
     if is_gguf:
         kwargs["gguf_file"] = model
         model = Path(model).parent
+
+    if is_remote_url(model):
+        # BaseConnector implements __del__() to clean up the local dir.
+        # Since config files need to exist all the time, so we DO NOT use
+        # with statement to avoid closing the client.
+        client = create_remote_connector(model)
+        client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
+        model = client.get_local_dir()
 
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
@@ -263,6 +277,11 @@ def get_tokenizer(
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+    if tokenizer_name.endswith(".json"):
+        from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
+
+        return TiktokenTokenizer(tokenizer_name)
+
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
@@ -363,13 +382,22 @@ def get_processor(
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
     try:
-        processor = AutoProcessor.from_pretrained(
-            tokenizer_name,
-            *args,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        if "InternVL3_5" in tokenizer_name:
+            processor = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        else:
+            processor = AutoProcessor.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
     except ValueError as e:
         error_message = str(e)

@@ -20,6 +20,11 @@ def SiluAndMul(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x[..., :d]) * x[..., d:]
 
 
+def GeluAndMul(x: torch.Tensor, approximate="tanh") -> torch.Tensor:
+    d = x.shape[-1] // 2
+    return F.gelu(x[..., :d], approximate=approximate) * x[..., d:]
+
+
 def per_token_quant_int8(x):
     x = x.float()
     absmax = x.abs().max(dim=-1).values
