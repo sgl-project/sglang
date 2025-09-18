@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     launch_dummy_health_check_server,
     prepare_model_and_tokenizer,
+    rank0_log,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
@@ -126,7 +127,7 @@ class Engine(EngineBase):
         self.port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
-        print(f"Launching subprocesses with {server_args=}")
+        rank0_log("Launching subprocesses for distributed inference...")
 
         # Launch subprocesses
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
