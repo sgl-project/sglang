@@ -93,6 +93,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
     "torch_native",
+    "flex_attention",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -592,6 +593,15 @@ class ServerArgs:
                 "Cuda graph is disabled because of using torch native attention backend"
             )
             self.disable_cuda_graph = True
+
+        if self.attention_backend == "flex_attention":
+            logger.warning(
+                "Cuda graph is disabled because of using torch Flex Attention backend"
+            )
+            self.disable_cuda_graph = True
+            assert (
+                self.speculative_algorithm is None
+            ), "Speculative decoding is currently not supported with Flex Attention backend"
 
         if is_npu() and self.attention_backend in ["ascend", "hybrid_linear_attn"]:
             logger.warning(
