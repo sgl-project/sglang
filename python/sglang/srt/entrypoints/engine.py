@@ -47,6 +47,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -433,6 +434,19 @@ class Engine(EngineBase):
             self.tokenizer_manager.init_weights_update_group(obj, None)
         )
 
+    def destroy_weights_update_group(
+        self,
+        group_name: str,
+    ):
+        """Destroy parameter update group."""
+        obj = DestroyWeightsUpdateGroupReqInput(
+            group_name=group_name,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.destroy_weights_update_group(obj, None)
+        )
+
     def update_weights_from_distributed(
         self,
         names: list[str],
@@ -665,6 +679,13 @@ def _set_envs_and_config(server_args: ServerArgs):
     # flashinfer uses this environment variable for various kernels from MoE to quant kernels
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         os.environ["TRTLLM_ENABLE_PDL"] = "1"
+
+    if os.environ.get("CUTE_DSL_LOG_LEVEL") is None:
+        # Default to warning level, to avoid too many logs
+        os.environ["CUTE_DSL_LOG_LEVEL"] = "30"
+    if os.environ.get("CUTE_DSL_LOG_TO_CONSOLE") is None:
+        # Need to set log to console, otherwise the log level won't take effect
+        os.environ["CUTE_DSL_LOG_TO_CONSOLE"] = "1"
 
     # Can also be passed as argument
     os.environ["SGLANG_RUN_ID"] = (
