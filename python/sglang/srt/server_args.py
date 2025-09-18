@@ -538,6 +538,7 @@ class ServerArgs:
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     enable_torch_compile_fusion: bool = False
+    enable_fused_activation_pass: bool = False
     enable_torch_compile_graph_trace_logs: bool = False
 
     # Dynamic batch tokenizer
@@ -3656,6 +3657,11 @@ class ServerArgs:
             "--enable-torch-compile-fusion",
             action="store_true",
             help="Enables operator fusion using custom torch compile/inductor passes.",
+        )
+        parser.add_argument(
+            "--enable-fused-activation-pass",
+            action="store_true",
+            help="Enables the fused activation pass for torch compile fusion, to be used with --enable-torch-compile-fusion.",
         )
         parser.add_argument(
             "--enable-torch-compile-graph-trace-logs",
