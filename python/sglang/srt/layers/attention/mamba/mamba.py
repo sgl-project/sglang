@@ -135,7 +135,7 @@ class Mamba2CacheParams:
         # - they are typically small
         #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
-        return Mamba2StateShape(conv=conv_state_shape, ssm=temporal_state_shape)
+        return Mamba2StateShape(conv=conv_state_shape, temporal=temporal_state_shape)
 
     @property
     def mamba_cache_per_req(self) -> int:
