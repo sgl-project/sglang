@@ -37,8 +37,19 @@ import numpy as np
 import requests
 import safetensors.torch
 import torch
-from accelerate import infer_auto_device_map, init_empty_weights
-from accelerate.utils import get_max_memory
+
+# Try to import accelerate (optional dependency)
+try:
+    from accelerate import infer_auto_device_map, init_empty_weights
+    from accelerate.utils import get_max_memory
+
+    HAS_ACCELERATE = True
+except ImportError:
+    HAS_ACCELERATE = False
+    infer_auto_device_map = None
+    init_empty_weights = None
+    get_max_memory = None
+
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -488,6 +499,11 @@ class DefaultModelLoader(BaseModelLoader):
         This method handles the common model loading logic shared between
         DefaultModelLoader (conditional) and ModelOptModelLoader (dedicated).
         """
+        if not HAS_ACCELERATE:
+            raise ImportError(
+                "accelerate is required for ModelOpt quantization. "
+                "Please install it with: pip install accelerate"
+            )
 
         hf_config = AutoConfig.from_pretrained(
             model_config.model_path, trust_remote_code=True
