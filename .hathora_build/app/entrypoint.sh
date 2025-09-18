@@ -25,7 +25,7 @@ export AUTO_USE_FP8_ON_H100="${AUTO_USE_FP8_ON_H100:-false}"
 export SPEC_DECODE="${SPEC_DECODE:-}"  # if set to 1/true/yes enables speculative decoding
 
 export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
-export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
 export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 
