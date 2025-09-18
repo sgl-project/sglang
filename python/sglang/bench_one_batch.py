@@ -417,11 +417,14 @@ def latency_test_run_once(
 
     profiler = None
     if profile:
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+        if hasattr(torch.profiler.ProfilerActivity, "XPU"):
+            activities.append(torch.profiler.ProfilerActivity.XPU)
         profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=activities,
             with_stack=True,
             record_shapes=profile_record_shapes,
         )
@@ -454,12 +457,15 @@ def latency_test_run_once(
     for i in range(output_len - 1):
         synchronize(device)
         if profile and i == output_len / 2:
+            activities = [
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+            if hasattr(torch.profiler.ProfilerActivity, "XPU"):
+                activities.append(torch.profiler.ProfilerActivity.XPU)
             profiler = None
             profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
+                activities=activities,
                 with_stack=True,
                 record_shapes=profile_record_shapes,
             )
