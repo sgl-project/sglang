@@ -24,6 +24,11 @@ export H100_ONLY="${H100_ONLY:-false}"
 export AUTO_USE_FP8_ON_H100="${AUTO_USE_FP8_ON_H100:-false}"
 export SPEC_DECODE="${SPEC_DECODE:-}"  # if set to 1/true/yes enables speculative decoding
 
+export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
+export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+
 export HF_TOKEN="${HF_TOKEN:-}"
 if [[ -z "${HUGGINGFACE_HUB_TOKEN}" && -n "${HF_TOKEN}" ]]; then
   export HUGGINGFACE_HUB_TOKEN="${HF_TOKEN}"
@@ -43,6 +48,10 @@ log "LOG_LEVEL: $LOG_LEVEL"
 log "ENABLE_METRICS: $ENABLE_METRICS"
 log "H100_ONLY: $H100_ONLY"
 log "AUTO_USE_FP8_ON_H100: $AUTO_USE_FP8_ON_H100"
+log "NCCL_SHM_DISABLE: $NCCL_SHM_DISABLE"
+log "NCCL_P2P_DISABLE: $NCCL_P2P_DISABLE"
+log "NCCL_P2P_LEVEL: $NCCL_P2P_LEVEL"
+log "NCCL_IB_DISABLE: $NCCL_IB_DISABLE"
 if [[ -n "${SPEC_DECODE}" ]]; then
   log "SPEC_DECODE: ${SPEC_DECODE} (speculative decoding enabled)"
 else
