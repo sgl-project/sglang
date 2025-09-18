@@ -51,23 +51,8 @@ class JsonArrayParser(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
-        Streaming logic:
-        - If a pending separator exists and new_text isn't just whitespace, prepend a comma and clear the flag.
-        - If new_text ends with "}," allowing whitespace between '}' and ',' and at end, remove the comma and set pending for next chunk.
-        - Delegate to base implementation with the modified text.
+        Streaming incremental parsing with tool validation.
         """
-        # Apply pending separator if there is non-whitespace content in this chunk
-        if self._pending_separator and new_text.strip():
-            new_text = "," + new_text
-            self._pending_separator = False
-
-        # Detect a trailing "}," with any whitespace between '}' and ',' and at the end
-        if re.search(r"}\s*,\s*$", new_text):
-            # Remove the trailing comma but preserve surrounding whitespace
-            new_text = re.sub(r"}(\s*),(\s*)$", r"}\1\2", new_text, count=1)
-            # Mark pending separator for the next non-whitespace chunk
-            self._pending_separator = True
-
         return super().parse_streaming_increment(new_text, tools)
 
     def structure_info(self) -> callable:
