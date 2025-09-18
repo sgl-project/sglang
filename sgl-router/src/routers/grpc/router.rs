@@ -212,11 +212,11 @@ impl RouterTrait for GrpcRouter {
 
     async fn route_chat(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::ChatCompletionRequest,
-        _model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        body: &crate::protocols::spec::ChatCompletionRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        self.route_chat_impl(headers, body, model_id).await
     }
 
     async fn route_completion(
