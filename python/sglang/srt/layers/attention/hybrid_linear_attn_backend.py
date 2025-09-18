@@ -13,11 +13,13 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from sglang.srt.layers.attention.mamba.causal_conv1d import (
+    causal_conv1d_fn as causal_conv1d_fn_sgl,
+)
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from sglang.srt.layers.attention.mamba.causal_conv1d import causal_conv1d_fn as causal_conv1d_fn_sgl
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
