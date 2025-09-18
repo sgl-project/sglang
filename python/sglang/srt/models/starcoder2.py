@@ -220,7 +220,7 @@ class Starcoder2Model(nn.Module):
 
     def __init__(
         self,
-        config=Starcoder2Config,
+        config: Starcoder2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
