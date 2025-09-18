@@ -564,18 +564,6 @@ class ModelRunner:
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
 
-        # TODO(kaixih@nvidia): remove this once we have a better solution for DP attention.
-        #  For more details, see: https://github.com/sgl-project/sglang/issues/8616
-        elif (
-            self.dp_size > 1
-            and is_sm100_supported()
-            and server_args.attention_backend != "triton"
-            and server_args.attention_backend == "trtllm_mla"
-        ):
-            logger.info(
-                "Disable chunked prefix cache when dp size > 1 and attention backend is not triton."
-            )
-            server_args.disable_chunked_prefix_cache = True
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
 
