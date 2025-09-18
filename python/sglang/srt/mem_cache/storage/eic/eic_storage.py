@@ -379,18 +379,24 @@ class EICStorage(HiCacheStorage):
             return 0
         eic_keys = self._get_eic_key(keys, suffix)
         logger.debug(f"eic exists {len(keys)}")
-        keys_vec = eic.StringVector()
-        for key in eic_keys:
-            keys_vec.append(key)
-        exist_option = eic.ExistOption()
-        exist_option.ns = self.eic_namespace
-        status_code, exist_outcome = self.connection.mexist(keys_vec, exist_option)
-        if status_code != eic.StatusCode.SUCCESS:
-            logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
-            return 0
-        for i, err_code in enumerate(exist_outcome.status_codes):
-            if err_code != eic.StatusCode.SUCCESS:
-                return i
+        suc_count = 0
+        exist_bs = 1024
+        for i in range(0, len(eic_keys), exist_bs):
+            batch_keys = eic_keys[i : i + exist_bs]
+            keys_vec = eic.StringVector()
+            for key in batch_keys:
+                keys_vec.append(key)
+            exist_option = eic.ExistOption()
+            exist_option.ns = self.eic_namespace
+            status_code, exist_outcome = self.connection.mexist(keys_vec, exist_option)
+            if status_code != eic.StatusCode.SUCCESS:
+                logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
+                return suc_count
+            for i, err_code in enumerate(exist_outcome.status_codes):
+                if err_code != eic.StatusCode.SUCCESS:
+                    return suc_count
+                else:
+                    suc_count += 1
         return len(keys)
 
     def delete(self, key) -> None:
