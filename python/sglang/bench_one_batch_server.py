@@ -17,9 +17,11 @@ import itertools
 import json
 import multiprocessing
 import os
+import random
 import time
 from typing import List, Tuple
 
+import numpy as np
 import requests
 
 from sglang.bench_serving import get_tokenizer, sample_random_requests
@@ -33,6 +35,7 @@ from sglang.test.test_utils import is_in_ci, write_github_step_summary
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
+    seed: int = 42
     batch_size: Tuple[int] = (1,)
     input_len: Tuple[int] = (1024,)
     output_len: Tuple[int] = (16,)
@@ -47,10 +50,13 @@ class BenchArgs:
     profile: bool = False
     profile_steps: int = 3
     profile_by_stage: bool = False
+    dataset_path: str = ""
+    parallel_batch: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
+        parser.add_argument("--seed", type=int, default=BenchArgs.seed)
         parser.add_argument(
             "--batch-size", type=int, nargs="+", default=BenchArgs.batch_size
         )
@@ -83,6 +89,13 @@ class BenchArgs:
             "--profile-steps", type=int, default=BenchArgs.profile_steps
         )
         parser.add_argument("--profile-by-stage", action="store_true")
+        parser.add_argument(
+            "--dataset-path",
+            type=str,
+            default=BenchArgs.dataset_path,
+            help="Path to the dataset.",
+        )
+        parser.add_argument("--parallel-batch", action="store_true")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -138,6 +151,8 @@ def run_one_case(
     profile: bool = False,
     profile_steps: int = 3,
     profile_by_stage: bool = False,
+    dataset_path: str = "",
+    parallel_batch: bool = False,
 ):
     requests.post(url + "/flush_cache")
     input_requests = sample_random_requests(
@@ -146,7 +161,7 @@ def run_one_case(
         num_prompts=batch_size,
         range_ratio=1.0,
         tokenizer=tokenizer,
-        dataset_path="",
+        dataset_path=dataset_path,
         random_sample=True,
         return_text=False,
     )
@@ -184,6 +199,7 @@ def run_one_case(
             },
             "return_logprob": return_logprob,
             "stream": True,
+            **({"parallel_batch": parallel_batch} if parallel_batch else {}),
         },
         stream=True,
     )
@@ -345,6 +361,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             run_name="",
             result_filename="",
             tokenizer=tokenizer,
+            dataset_path=bench_args.dataset_path,
+            parallel_batch=bench_args.parallel_batch,
         )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
@@ -368,6 +386,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
+                    dataset_path=bench_args.dataset_path,
+                    parallel_batch=bench_args.parallel_batch,
                 )
             )
 
@@ -393,6 +413,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 profile=bench_args.profile,
                                 profile_steps=bench_args.profile_steps,
                                 profile_by_stage=bench_args.profile_by_stage,
+                                dataset_path=bench_args.dataset_path,
+                                parallel_batch=bench_args.parallel_batch,
                             )[-1],
                         )
                     )
@@ -420,6 +442,10 @@ def main():
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 

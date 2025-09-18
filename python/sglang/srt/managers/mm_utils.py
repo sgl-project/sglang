@@ -629,6 +629,7 @@ def general_mm_embed_routine(
     embed_tokens = language_model.get_input_embeddings()
     if (
         not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_target_verify()
         and forward_batch.contains_mm_inputs()
     ):
         mm_inputs_list = [
