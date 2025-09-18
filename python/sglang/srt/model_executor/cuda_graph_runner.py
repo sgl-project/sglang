@@ -275,6 +275,7 @@ class CudaGraphRunner:
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_lookahead()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -441,11 +442,21 @@ class CudaGraphRunner:
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
+        is_lookahead_supported = (
+            (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+            if self.model_runner.spec_algorithm.is_lookahead()
+            else True
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
+            and is_lookahead_supported
         )
 
     def capture(self) -> None:
@@ -855,6 +866,20 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+
+        elif self.model_runner.spec_algorithm.is_lookahead():
+            from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+
+            spec_info = LookaheadVerifyInput(
+                draft_token=None,
+                tree_mask=self.custom_mask,
+                positions=None,
+                retrive_index=None,
+                retrive_next_token=None,
+                retrive_next_sibling=None,
+                draft_token_num=self.num_tokens_per_bs,
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         return spec_info
 
