@@ -4,7 +4,7 @@ use super::pd_types::{api_path, PDRouterError};
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, RetryExecutor,
-    Worker, WorkerFactory, WorkerLoadGuard, WorkerRegistry, WorkerType,
+    Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
@@ -220,13 +220,12 @@ impl PDRouter {
 
         // Create Worker for the new prefill server with circuit breaker configuration
         // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        let worker = WorkerFactory::create_prefill_with_config(
-            url.clone(),
-            bootstrap_port,
-            self.circuit_breaker_config.clone(),
-        );
+        let worker = BasicWorkerBuilder::new(url.clone())
+            .worker_type(WorkerType::Prefill { bootstrap_port })
+            .circuit_breaker_config(self.circuit_breaker_config.clone())
+            .build();
 
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker_arc: Arc<dyn Worker> = Arc::new(worker);
 
         // Register the worker in the registry
         self.worker_registry.register(worker_arc.clone());
@@ -261,12 +260,12 @@ impl PDRouter {
 
         // Create Worker for the new decode server with circuit breaker configuration
         // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        let worker = WorkerFactory::create_decode_with_config(
-            url.clone(),
-            self.circuit_breaker_config.clone(),
-        );
+        let worker = BasicWorkerBuilder::new(url.clone())
+            .worker_type(WorkerType::Decode)
+            .circuit_breaker_config(self.circuit_breaker_config.clone())
+            .build();
 
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker_arc: Arc<dyn Worker> = Arc::new(worker);
 
         // Register the worker in the registry
         self.worker_registry.register(worker_arc.clone());
