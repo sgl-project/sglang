@@ -459,7 +459,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
-            self.evictable_size_ += len(key)
+            self.evictable_size_ += len(value)
             self._record_store_event(new_node)
         return total_prefix_length
 
@@ -486,7 +486,7 @@ class RadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        self.evictable_size_ -= len(node.key)
+        self.evictable_size_ -= len(node.value)
 
     def _total_size_helper(self):
         total_size = 0
