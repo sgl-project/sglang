@@ -661,10 +661,7 @@ impl Worker for DPAwareWorker {
 pub struct WorkerFactory;
 
 impl WorkerFactory {
-    /// Create a BasicWorkerBuilder for customizable worker creation
-    pub fn builder(url: impl Into<String>) -> BasicWorkerBuilder {
-        BasicWorkerBuilder::new(url)
-    }
+
 
     /// Create a DPAwareWorkerBuilder for customizable DP-aware worker creation
     pub fn dp_builder(
@@ -806,75 +803,6 @@ impl WorkerFactory {
         }
 
         Ok(dp_size as usize)
-    }
-
-    /// Private helper to create DP-aware workers of any type
-    async fn create_dp_aware_workers_of_type(
-        url: &str,
-        api_key: &Option<String>,
-        worker_type: WorkerType,
-    ) -> WorkerResult<Vec<Box<dyn Worker>>> {
-        let dp_size = Self::get_worker_dp_size(url, api_key).await?;
-
-        let workers = (0..dp_size)
-            .map(|rank| Self::create_dp_aware(url.to_string(), rank, dp_size, worker_type.clone()))
-            .collect();
-
-        Ok(workers)
-    }
-
-    /// Create DP-aware regular workers from a single URL
-    pub async fn create_dp_aware_regular_workers(
-        url: &str,
-        api_key: &Option<String>,
-    ) -> WorkerResult<Vec<Box<dyn Worker>>> {
-        Self::create_dp_aware_workers_of_type(url, api_key, WorkerType::Regular).await
-    }
-
-    /// Create DP-aware prefill workers from a single URL
-    pub async fn create_dp_aware_prefill_workers(
-        url: &str,
-        bootstrap_port: Option<u16>,
-        api_key: &Option<String>,
-    ) -> WorkerResult<Vec<Box<dyn Worker>>> {
-        Self::create_dp_aware_workers_of_type(url, api_key, WorkerType::Prefill { bootstrap_port })
-            .await
-    }
-
-    /// Create DP-aware decode workers from a single URL
-    pub async fn create_dp_aware_decode_workers(
-        url: &str,
-        api_key: &Option<String>,
-    ) -> WorkerResult<Vec<Box<dyn Worker>>> {
-        Self::create_dp_aware_workers_of_type(url, api_key, WorkerType::Decode).await
-    }
-
-    /// Create workers based on configuration (for regular router)
-    pub async fn create_workers(
-        urls: Vec<String>,
-        dp_aware: bool,
-        api_key: &Option<String>,
-    ) -> WorkerResult<Vec<Box<dyn Worker>>> {
-        if dp_aware {
-            // Create futures for all worker creations
-            let worker_futs = urls
-                .iter()
-                .map(|url| Self::create_dp_aware_regular_workers(url, api_key));
-
-            // Execute all futures concurrently and flatten results
-            let all_workers = futures::future::try_join_all(worker_futs)
-                .await?
-                .into_iter()
-                .flatten()
-                .collect();
-
-            Ok(all_workers)
-        } else {
-            Ok(urls
-                .into_iter()
-                .map(|url| Self::create_regular(url))
-                .collect())
-        }
     }
 }
 
@@ -1697,23 +1625,6 @@ mod tests {
             }
         );
     }
-
-    #[tokio::test]
-    async fn test_factory_create_workers_regular() {
-        let urls = vec!["http://w1:8080".to_string(), "http://w2:8080".to_string()];
-
-        let workers = WorkerFactory::create_workers(urls, false, &None)
-            .await
-            .unwrap();
-
-        assert_eq!(workers.len(), 2);
-        assert!(!workers[0].is_dp_aware());
-        assert!(!workers[1].is_dp_aware());
-        assert_eq!(workers[0].url(), "http://w1:8080");
-        assert_eq!(workers[1].url(), "http://w2:8080");
-    }
-
-    // ===== Circuit Breaker Integration Tests =====
 
     #[test]
     fn test_worker_circuit_breaker() {
