@@ -594,7 +594,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     )?;
 
     let app_context = Arc::new(app_context);
-    
+
     info!(
         "Initializing workers for routing mode: {:?}",
         config.router_config.mode
