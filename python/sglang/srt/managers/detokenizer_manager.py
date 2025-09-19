@@ -297,7 +297,7 @@ def run_detokenizer_process(
         else:
             manager.event_loop()
     except Exception:
-        manager.socket_mapping.clear_all_sockets()
+        manager.maybe_clear_socket_mapping()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)

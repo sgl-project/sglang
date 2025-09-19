@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
-use sglang_router_rs::core::{BasicWorker, Worker, WorkerType};
+use sglang_router_rs::core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType};
 use sglang_router_rs::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
@@ -12,12 +12,11 @@ use sglang_router_rs::routers::http::pd_types::{
 };
 
 fn create_test_worker() -> BasicWorker {
-    BasicWorker::new(
-        "http://test-server:8000".to_string(),
-        WorkerType::Prefill {
+    BasicWorkerBuilder::new("http://test-server:8000")
+        .worker_type(WorkerType::Prefill {
             bootstrap_port: Some(5678),
-        },
-    )
+        })
+        .build()
 }
 
 // Helper function to get bootstrap info from worker

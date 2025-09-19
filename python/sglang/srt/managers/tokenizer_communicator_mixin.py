@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
 import time
@@ -18,16 +19,21 @@ from typing import (
 )
 
 import fastapi
+import zmq
 
 from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetLoadReqInput,
+    GetLoadReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -75,14 +81,17 @@ class _Communicator(Generic[T]):
 
     enable_multi_tokenizer = False
 
-    def __init__(self, sender, fan_out: int):
+    def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
         self._sender = sender
         self._fan_out = fan_out
+        self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
         self._ready_queue: Deque[asyncio.Future] = deque()
 
-    async def __call__(self, obj):
+        assert mode in ["queueing", "watching"]
+
+    async def queueing_call(self, obj: T):
         ready_event = asyncio.Event()
         if self._result_event is not None or len(self._ready_queue) > 0:
             self._ready_queue.append(ready_event)
@@ -106,6 +115,28 @@ class _Communicator(Generic[T]):
 
         return result_values
 
+    async def watching_call(self, obj):
+        if self._result_event is None:
+            assert self._result_values is None
+            self._result_values = []
+            self._result_event = asyncio.Event()
+
+            if obj:
+                if _Communicator.enable_multi_tokenizer:
+                    obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
+                self._sender.send_pyobj(obj)
+
+        await self._result_event.wait()
+        result_values = copy.deepcopy(self._result_values)
+        self._result_event = self._result_values = None
+        return result_values
+
+    async def __call__(self, obj):
+        if self._mode == "queueing":
+            return await self.queueing_call(obj)
+        else:
+            return await self.watching_call(obj)
+
     def handle_recv(self, recv_obj: T):
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
@@ -118,6 +149,9 @@ class TokenizerCommunicatorMixin:
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         # Communicators
         self.init_weights_update_group_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.destroy_weights_update_group_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.update_weights_from_distributed_communicator = _Communicator(
@@ -165,6 +199,9 @@ class TokenizerCommunicatorMixin:
         self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.get_load_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size, mode="watching"
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -174,6 +211,10 @@ class TokenizerCommunicatorMixin:
                 (
                     InitWeightsUpdateGroupReqOutput,
                     self.init_weights_update_group_communicator.handle_recv,
+                ),
+                (
+                    DestroyWeightsUpdateGroupReqOutput,
+                    self.destroy_weights_update_group_communicator.handle_recv,
                 ),
                 (
                     UpdateWeightsFromDistributedReqOutput,
@@ -234,6 +275,10 @@ class TokenizerCommunicatorMixin:
                 (
                     LoRAUpdateResult,
                     self.update_lora_adapter_communicator.handle_recv,
+                ),
+                (
+                    GetLoadReqOutput,
+                    self.get_load_communicator.handle_recv,
                 ),
             ]
         )
@@ -307,6 +352,18 @@ class TokenizerCommunicatorMixin:
             self.server_args.dp_size == 1
         ), "dp_size must be 1 for init parameter update group"
         result = (await self.init_weights_update_group_communicator(obj))[0]
+        return result.success, result.message
+
+    async def destroy_weights_update_group(
+        self,
+        obj: DestroyWeightsUpdateGroupReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for destroy parameter update group"
+        result = (await self.destroy_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
     async def update_weights_from_distributed(
@@ -528,10 +585,6 @@ class TokenizerCommunicatorMixin:
         )
         return [res.updated for res in responses]
 
-    async def get_load(self: TokenizerManager) -> dict:
-        # TODO(lsyin): fake load report server
-        if not self.current_load_lock.locked():
-            async with self.current_load_lock:
-                internal_state = await self.get_internal_state()
-                self.current_load = internal_state[0]["load"]
-        return {"load": self.current_load}
+    async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
+        req = GetLoadReqInput()
+        return await self.get_load_communicator(req)
