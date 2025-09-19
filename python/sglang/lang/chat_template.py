@@ -531,6 +531,12 @@ def match_deepseek(model_path: str):
 
 
 @register_chat_template_matching_function
+def match_orion(model_path: str):
+    if "orion" in model_path.lower():
+        return "claude"
+
+
+@register_chat_template_matching_function
 def match_deepseek_janus_pro(model_path: str):
     if re.search(r"janus", model_path, re.IGNORECASE):
         return "janus-pro"
