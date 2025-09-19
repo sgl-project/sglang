@@ -99,6 +99,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "mult, int offset, int cuda_stream) -> ()");
   m.impl("downcast_fp8", torch::kCUDA, &downcast_fp8);
 
+  m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
+  m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
+  m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
+  m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
+
+  m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
+  m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
+
   /*
    * From csrc/gemm
    */
@@ -284,6 +292,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
 
   m.def(
+      "reconstruct_indices_from_tree_mask(Tensor tree_mask, Tensor verified_seq_len, Tensor positions, "
+      "Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "int batch_size, int draft_token_num) -> ()");
+  m.impl("reconstruct_indices_from_tree_mask", torch::kCUDA, &reconstruct_indices_from_tree_mask);
+
+  m.def(
       "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
       "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
       "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> "
@@ -446,11 +460,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "qserve_w4a8_per_group_gemm(Tensor _in_feats, Tensor _kernel, Tensor _zeros, Tensor _scales_i8, Tensor _wscales, "
       "Tensor _ascales, Tensor! _out_feats) -> ()");
   m.impl("qserve_w4a8_per_group_gemm", torch::kCUDA, &qserve_w4a8_per_group_gemm);
-
-  m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
-  m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
-  m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
-  m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
 
   /*
    * From csrc/mamba

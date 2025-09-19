@@ -134,11 +134,18 @@ class MooncakeStore(HiCacheStorage):
                 self.config = MooncakeStoreConfig.load_from_env()
                 logger.info("Mooncake Configuration loaded from env successfully.")
 
+            tp_scale_factor = 1 if storage_config is None else storage_config.tp_size
+
+            per_tp_global_segment_size = (
+                self.config.global_segment_size // tp_scale_factor
+            )
+            per_tp_local_buffer_size = self.config.local_buffer_size // tp_scale_factor
+
             ret_code = self.store.setup(
                 self.config.local_hostname,
                 self.config.metadata_server,
-                self.config.global_segment_size,
-                self.config.local_buffer_size,
+                per_tp_global_segment_size,
+                per_tp_local_buffer_size,
                 self.config.protocol,
                 self.config.device_name,
                 self.config.master_server_address,
