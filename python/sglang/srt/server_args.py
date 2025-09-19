@@ -2198,6 +2198,21 @@ class ServerArgs:
                 self.disable_overlap_schedule
             ), "PD-Multiplexing is not compatible with overlap schedule."
 
+            # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
+            import torch
+
+            parts = torch.__version__.split("+", 1)[0].split(".")
+            major = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+            minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            logger.debug(
+                f"Detected torch version: {torch.__version__}, parsed as major: {major}, minor: {minor}"
+            )
+            if (major, minor) >= (2, 6):
+                logger.warning(
+                    "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x "
+                    "Please manually install torch 2.6.x"
+                )
+
         # Check multi tokenizer
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
 
