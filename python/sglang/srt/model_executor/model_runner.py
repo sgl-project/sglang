@@ -104,7 +104,7 @@ from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader, broadcast_weight
+from sglang.srt.model_loader.weight_utils import broadcast_weight, default_weight_loader
 from sglang.srt.offloader import (
     create_offloader_from_server_args,
     get_offloader,
