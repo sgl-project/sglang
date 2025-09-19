@@ -396,6 +396,9 @@ class RequestStage(str, enum.Enum):
     TOKENIZE = "tokenize"
     TOKENIZER_DISPATCH = "dispatch"
 
+    # DP controller
+    DC_DISPATCH = "dc_dispatch"
+
     # common/non-disaggregation
     PREFILL_WAITING = "prefill_waiting"
     REQUEST_PROCESS = "request_process"
