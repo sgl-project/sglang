@@ -47,18 +47,17 @@ impl RouterFactory {
             ConnectionMode::Http => {
                 // Route to HTTP implementation based on routing mode
                 match &ctx.router_config.mode {
-                    RoutingMode::Regular { worker_urls } => {
-                        Self::create_regular_router(worker_urls, ctx).await
+                    RoutingMode::Regular { .. } => {
+                        // Workers already initialized in registry
+                        Self::create_regular_router(ctx).await
                     }
                     RoutingMode::PrefillDecode {
-                        prefill_urls,
-                        decode_urls,
                         prefill_policy,
                         decode_policy,
+                        ..
                     } => {
+                        // Workers already initialized in registry
                         Self::create_pd_router(
-                            prefill_urls,
-                            decode_urls,
                             prefill_policy.as_ref(),
                             decode_policy.as_ref(),
                             &ctx.router_config.policy,
@@ -76,19 +75,17 @@ impl RouterFactory {
 
     /// Create a regular router
     pub async fn create_regular_router(
-        worker_urls: &[String],
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         // Create regular router with context
-        let router = Router::new(worker_urls.to_vec(), ctx).await?;
+        // Workers should already be initialized in the registry
+        let router = Router::new(ctx).await?;
 
         Ok(Box::new(router))
     }
 
     /// Create a PD router with injected policy
     pub async fn create_pd_router(
-        prefill_urls: &[(String, Option<u16>)],
-        decode_urls: &[String],
         prefill_policy_config: Option<&PolicyConfig>,
         decode_policy_config: Option<&PolicyConfig>,
         main_policy_config: &PolicyConfig,
@@ -105,7 +102,8 @@ impl RouterFactory {
         ctx.policy_registry.set_decode_policy(decode_policy);
 
         // Create PD router with context (policies are in PolicyRegistry)
-        let router = PDRouter::new(prefill_urls.to_vec(), decode_urls.to_vec(), ctx).await?;
+        // Workers should already be initialized in the registry
+        let router = PDRouter::new(ctx).await?;
 
         Ok(Box::new(router))
     }
