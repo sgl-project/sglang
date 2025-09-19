@@ -23,14 +23,16 @@ from sglang.srt.compilation.fusion.fusion_context import (
 )
 from sglang.srt.compilation.fusion.fusion_utils import hash_dict
 from sglang.srt.compilation.fusion.passes.fused_activation import FusedActivationPass
+from sglang.srt.compilation.fusion.passes.rmsnorm_quant import RMSNormQuantPass
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
 
 class FusionManager(CustomGraphPass):
-    def __init__(self, server_args: ServerArgs):
+    def __init__(self, server_args: ServerArgs, model_config: ModelConfig):
         self.passes: list[CustomGraphPass] = []
 
-        self.configure(server_args)
+        self.configure(server_args, model_config)
 
     def __call__(self, graph: fx.Graph):
         with fusion_context():
@@ -39,8 +41,13 @@ class FusionManager(CustomGraphPass):
 
             get_fusion_context().log_stats()
 
-    def configure(self, server_args: ServerArgs):
-        self.config = FusionConfig.from_server_args(server_args)
+    def configure(self, server_args: ServerArgs, model_config: ModelConfig):
+        self.config = FusionConfig.from_server_args_and_model_config(
+            server_args, model_config
+        )
+
+        if self.config.enable_rmsnorm_quant_pass:
+            self.passes.append(RMSNormQuantPass(self.config))
 
         if self.config.enable_fused_activation_pass:
             self.passes.append(FusedActivationPass(self.config))

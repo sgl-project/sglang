@@ -26,9 +26,14 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.layers.attention.dummy_backend import DummyAttentionBackend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.loader import _get_quantization_config
-from sglang.srt.model_loader.utils import get_model_architecture, post_load_weights
+from sglang.srt.model_loader.utils import (
+    get_model_architecture,
+    post_load_weights,
+    set_default_torch_dtype,
+)
 from sglang.srt.model_loader.weight_utils import initialize_dummy_weights
 from sglang.srt.server_args import ServerArgs
 
@@ -65,21 +70,24 @@ def model_layer(
         model_config, load_config, packed_modules_mapping
     )
 
-    # layer initialization
-    layer = layer_initializer(model_config.hf_config, quant_config)
-    layer.to(device="cuda")
+    with set_default_torch_dtype(model_config.dtype):
+        # layer initialization
+        layer = layer_initializer(model_config.hf_config, quant_config)
+        layer.to(device="cuda")
 
-    # Post processing step of dummy model loader
-    for _, module in layer.named_modules():
-        quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None:
-            quant_method.process_weights_after_loading(module)
+        # Post processing step of dummy model loader
+        for _, module in layer.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(module)
 
-    initialize_dummy_weights(layer)
-    post_load_weights(layer, model_config)
+        initialize_dummy_weights(layer)
+        post_load_weights(layer, model_config)
+
+    attn_backend = DummyAttentionBackend()
 
     try:
-        yield layer, model_config
+        yield layer.eval(), model_config, attn_backend
     finally:
         destroy_model_parallel()
         destroy_distributed_environment()
