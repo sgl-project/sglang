@@ -1,11 +1,11 @@
 """
 Unit tests for the RadixCache implementation.
 
-This module tests the core functionality of RadixCache, BaseKey, and TreeNode
+This module tests the core functionality of RadixCache, RadixKey, and TreeNode
 following SGLang testing patterns.
 
 Test Coverage:
-- BaseKey: token ID management, slicing, iteration, representation
+- RadixKey: token ID management, slicing, iteration, representation
 - TreeNode: node properties, reference counting, hash values
 - RadixCache: insert/match operations, eviction, page alignment, error handling
 - Cache events and request handling
@@ -24,19 +24,19 @@ import unittest.mock
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
-from sglang.srt.mem_cache.radix_cache import BaseKey, RadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4
 
 
-class TestBaseKey(unittest.TestCase):
-    """Test cases for BaseKey class."""
+class TestRadixKey(unittest.TestCase):
+    """Test cases for RadixKey class."""
 
     def test_init_basic(self):
-        """Test basic initialization of BaseKey."""
+        """Test basic initialization of RadixKey."""
         token_ids = [1, 2, 3, 4]
-        key = BaseKey(token_ids)
+        key = RadixKey(token_ids)
         self.assertEqual(key.token_ids, token_ids)
         self.assertIsNone(key.extra_key)
 
@@ -44,22 +44,22 @@ class TestBaseKey(unittest.TestCase):
         """Test initialization with extra_key."""
         token_ids = [1, 2, 3]
         extra_key = "test_key"
-        key = BaseKey(token_ids, extra_key)
+        key = RadixKey(token_ids, extra_key)
         self.assertEqual(key.token_ids, token_ids)
         self.assertEqual(key.extra_key, extra_key)
 
     def test_len(self):
         """Test __len__ method."""
-        key = BaseKey([1, 2, 3])
+        key = RadixKey([1, 2, 3])
         self.assertEqual(len(key), 3)
 
-        empty_key = BaseKey([])
+        empty_key = RadixKey([])
         self.assertEqual(len(empty_key), 0)
 
     def test_iter(self):
         """Test __iter__ method."""
         token_ids = [1, 2, 3, 4]
-        key = BaseKey(token_ids)
+        key = RadixKey(token_ids)
         self.assertEqual(list(key), token_ids)
 
     def test_len_and_iter(self):
@@ -72,7 +72,7 @@ class TestBaseKey(unittest.TestCase):
 
         for tokens, expected in test_cases:
             with self.subTest(tokens=tokens):
-                key = BaseKey(tokens)
+                key = RadixKey(tokens)
                 self.assertEqual(len(key), expected)
                 self.assertEqual(list(key), tokens)
 
@@ -86,18 +86,18 @@ class TestBaseKey(unittest.TestCase):
 
         for tokens, index, expected in test_cases:
             with self.subTest(tokens=tokens, index=index):
-                key = BaseKey(tokens)
+                key = RadixKey(tokens)
                 result = key[index]
-                self.assertIsInstance(result, BaseKey)
+                self.assertIsInstance(result, RadixKey)
                 self.assertEqual(result.token_ids, expected)
 
     def test_getitem_slice(self):
         """Test __getitem__ with slice and edge cases."""
-        key = BaseKey([1, 2, 3, 4, 5], "extra")
+        key = RadixKey([1, 2, 3, 4, 5], "extra")
 
         # Basic slice
         sliced = key[1:4]
-        self.assertIsInstance(sliced, BaseKey)
+        self.assertIsInstance(sliced, RadixKey)
         self.assertEqual(sliced.token_ids, [2, 3, 4])
         self.assertEqual(sliced.extra_key, "extra")
 
@@ -107,22 +107,22 @@ class TestBaseKey(unittest.TestCase):
 
     def test_getitem_invalid_index(self):
         """Test __getitem__ with invalid indices."""
-        key = BaseKey([1, 2, 3])
+        key = RadixKey([1, 2, 3])
         with self.assertRaises(IndexError):
             _ = key[10]  # Out of bounds
 
     def test_repr(self):
         """Test __repr__ method."""
-        key = BaseKey([1, 2, 3], "test")
+        key = RadixKey([1, 2, 3], "test")
         repr_str = repr(key)
-        self.assertIn("BaseKey", repr_str)
+        self.assertIn("RadixKey", repr_str)
         self.assertIn("extra_key='test'", repr_str)
         self.assertIn("[1, 2, 3]", repr_str)
 
     def test_repr_long_token_ids(self):
         """Test __repr__ with long token_ids."""
         long_tokens = list(range(15))
-        key = BaseKey(long_tokens)
+        key = RadixKey(long_tokens)
         repr_str = repr(key)
         self.assertIn("...", repr_str)  # Should be truncated
 
@@ -262,7 +262,7 @@ class TestRadixCache(unittest.TestCase):
         )
 
         # Insert some data
-        cache.insert(BaseKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
+        cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
         self.assertGreater(cache.total_size(), 0)
 
         # Reset
@@ -282,7 +282,7 @@ class TestRadixCache(unittest.TestCase):
                     disable=disable_cache,
                 )
 
-                key = BaseKey([1, 2, 3])
+                key = RadixKey([1, 2, 3])
                 value = torch.tensor([10, 20, 30], dtype=torch.int64)
                 prefix_len = cache.insert(key, value)
 
@@ -296,12 +296,12 @@ class TestRadixCache(unittest.TestCase):
                 self.assertEqual(cache.evictable_size(), 3)
 
                 # Test match_prefix
-                result = cache.match_prefix(BaseKey([1, 2, 3]))
+                result = cache.match_prefix(RadixKey([1, 2, 3]))
                 self.assertEqual(len(result.device_indices), 3)
                 torch.testing.assert_close(result.device_indices, value)
 
                 # Test partial match
-                result = cache.match_prefix(BaseKey([1, 2]))
+                result = cache.match_prefix(RadixKey([1, 2]))
                 self.assertEqual(len(result.device_indices), 2)
                 torch.testing.assert_close(
                     result.device_indices, torch.tensor([10, 20], dtype=torch.int64)
@@ -313,7 +313,7 @@ class TestRadixCache(unittest.TestCase):
             req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=1
         )
 
-        key = BaseKey([1, 2, 3])
+        key = RadixKey([1, 2, 3])
         prefix_len = cache.insert(key, None)
 
         # When None is passed, it should create value from token_ids
@@ -328,10 +328,10 @@ class TestRadixCache(unittest.TestCase):
 
         self.assertEqual(cache.total_size(), 0)
 
-        cache.insert(BaseKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
+        cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
         self.assertEqual(cache.total_size(), 3)
 
-        cache.insert(BaseKey([4, 5]), torch.tensor([40, 50], dtype=torch.int64))
+        cache.insert(RadixKey([4, 5]), torch.tensor([40, 50], dtype=torch.int64))
         self.assertEqual(cache.total_size(), 5)
 
     def test_kv_cache_events(self):
@@ -352,7 +352,7 @@ class TestRadixCache(unittest.TestCase):
                 )
 
                 # Insert data
-                cache.insert(BaseKey([1, 2, 3, 4, 5]), None)
+                cache.insert(RadixKey([1, 2, 3, 4, 5]), None)
 
                 # Take events
                 events = cache.take_events()
@@ -382,7 +382,7 @@ class TestRadixCache(unittest.TestCase):
         )
 
         # Insert and then evict data
-        cache.insert(BaseKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
+        cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
         cache.evict(3)
 
         # Take events - should include both store and remove events
@@ -406,20 +406,20 @@ class TestRadixCache(unittest.TestCase):
 
         # Insert same token sequence with different extra keys
         cache.insert(
-            BaseKey([1, 2, 3], "key1"), torch.tensor([10, 20, 30], dtype=torch.int64)
+            RadixKey([1, 2, 3], "key1"), torch.tensor([10, 20, 30], dtype=torch.int64)
         )
         cache.insert(
-            BaseKey([1, 2, 3], "key2"), torch.tensor([40, 50, 60], dtype=torch.int64)
+            RadixKey([1, 2, 3], "key2"), torch.tensor([40, 50, 60], dtype=torch.int64)
         )
         cache.insert(
-            BaseKey([1, 2, 3], None), torch.tensor([70, 80, 90], dtype=torch.int64)
+            RadixKey([1, 2, 3], None), torch.tensor([70, 80, 90], dtype=torch.int64)
         )
 
         # Keys with different extra_key should not match each other
-        result1 = cache.match_prefix(BaseKey([1, 2, 3], "key1"))
-        result2 = cache.match_prefix(BaseKey([1, 2, 3], "key2"))
-        result3 = cache.match_prefix(BaseKey([1, 2, 3], None))
-        result4 = cache.match_prefix(BaseKey([1, 2, 3], "nonexistent"))
+        result1 = cache.match_prefix(RadixKey([1, 2, 3], "key1"))
+        result2 = cache.match_prefix(RadixKey([1, 2, 3], "key2"))
+        result3 = cache.match_prefix(RadixKey([1, 2, 3], None))
+        result4 = cache.match_prefix(RadixKey([1, 2, 3], "nonexistent"))
 
         # Each should match only its own data
         self.assertEqual(len(result1.device_indices), 3)
@@ -447,10 +447,10 @@ class TestRadixCache(unittest.TestCase):
         )
 
         # Insert sequence
-        cache.insert(BaseKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
+        cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
 
         # Get node
-        result = cache.match_prefix(BaseKey([1, 2, 3]))
+        result = cache.match_prefix(RadixKey([1, 2, 3]))
         node = result.last_device_node
 
         initial_evictable = cache.evictable_size()
@@ -478,8 +478,8 @@ class TestRadixCache(unittest.TestCase):
         )
 
         # Insert sequences
-        cache.insert(BaseKey([1, 2]), torch.tensor([10, 20], dtype=torch.int64))
-        cache.insert(BaseKey([3, 4]), torch.tensor([30, 40], dtype=torch.int64))
+        cache.insert(RadixKey([1, 2]), torch.tensor([10, 20], dtype=torch.int64))
+        cache.insert(RadixKey([3, 4]), torch.tensor([30, 40], dtype=torch.int64))
 
         initial_size = cache.total_size()
 
@@ -507,9 +507,9 @@ class TestRadixCache(unittest.TestCase):
                 )
 
                 tokens = list(range(sequence_length))
-                cache.insert(BaseKey(tokens), torch.tensor(tokens, dtype=torch.int64))
+                cache.insert(RadixKey(tokens), torch.tensor(tokens, dtype=torch.int64))
 
-                result = cache.match_prefix(BaseKey(tokens))
+                result = cache.match_prefix(RadixKey(tokens))
                 self.assertGreater(len(result.device_indices), 0)
 
                 # Match length should be page-aligned
@@ -522,7 +522,7 @@ class TestRadixCache(unittest.TestCase):
             req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=1
         )
 
-        cache.insert(BaseKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
+        cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
 
         # Just test that it doesn't crash
         try:
@@ -536,8 +536,8 @@ class TestRadixCache(unittest.TestCase):
             req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=1
         )
 
-        cache.insert(BaseKey([1, 2]), torch.tensor([10, 20], dtype=torch.int64))
-        cache.insert(BaseKey([3, 4]), torch.tensor([30, 40], dtype=torch.int64))
+        cache.insert(RadixKey([1, 2]), torch.tensor([10, 20], dtype=torch.int64))
+        cache.insert(RadixKey([3, 4]), torch.tensor([30, 40], dtype=torch.int64))
 
         all_values = cache.all_values_flatten()
         self.assertEqual(len(all_values), 4)
@@ -558,12 +558,12 @@ class TestRadixCache(unittest.TestCase):
                 # Insert a long sequence that will be split later.
                 seq1 = [1, 2, 3, 4, 5, 6, 7, 8]
                 val1 = torch.tensor([x * 10 for x in seq1], dtype=torch.int64)
-                cache.insert(BaseKey(seq1), val1)
+                cache.insert(RadixKey(seq1), val1)
 
                 # Insert a diverging branch to create an internal node on the path.
                 seq2 = [1, 2, 9, 10]
                 val2 = torch.tensor([x * 10 for x in seq2], dtype=torch.int64)
-                cache.insert(BaseKey(seq2), val2)
+                cache.insert(RadixKey(seq2), val2)
                 print(cache.pretty_print())
 
                 baseline_total = cache.total_size()
@@ -573,23 +573,23 @@ class TestRadixCache(unittest.TestCase):
                 # Match that causes a split inside an existing node:
                 # take first 4 tokens of seq1, then diverge.
                 query1 = [1, 2, 3, 4, 999, 1000]
-                result1 = cache.match_prefix(BaseKey(query1))
+                result1 = cache.match_prefix(RadixKey(query1))
                 torch.testing.assert_close(result1.device_indices, val1[:4])
                 # No data change after structural split during matching.
                 self.assertEqual(cache.total_size(), baseline_total)
 
                 # Full match of the long sequence still returns the full indices.
-                result_full = cache.match_prefix(BaseKey(seq1))
+                result_full = cache.match_prefix(RadixKey(seq1))
                 torch.testing.assert_close(result_full.device_indices, val1)
 
                 # Another split deeper on the path (after matching 6 tokens, then diverge).
                 query2 = [1, 2, 3, 4, 5, 6, 777, 888]
-                result2 = cache.match_prefix(BaseKey(query2))
+                result2 = cache.match_prefix(RadixKey(query2))
                 torch.testing.assert_close(result2.device_indices, val1[:6])
                 self.assertEqual(cache.total_size(), baseline_total)
 
                 # Matching the short diverging branch should return exactly its indices.
-                result_branch = cache.match_prefix(BaseKey(seq2))
+                result_branch = cache.match_prefix(RadixKey(seq2))
                 torch.testing.assert_close(result_branch.device_indices, val2)
 
 

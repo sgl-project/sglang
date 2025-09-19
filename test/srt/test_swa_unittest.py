@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import BaseKey
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
 
@@ -121,7 +121,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
         )
-        prefix_len = tree.insert(BaseKey(req1_token_ids), req1_kv_indices)
+        prefix_len = tree.insert(RadixKey(req1_token_ids), req1_kv_indices)
         print(
             f"req1: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
         )
@@ -130,7 +130,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
         )
-        prefix_len = tree.insert(BaseKey(req2_token_ids), req2_kv_indices)
+        prefix_len = tree.insert(RadixKey(req2_token_ids), req2_kv_indices)
         print(
             f"req2: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
         )
@@ -139,7 +139,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
         )
-        prefix_len = tree.insert(BaseKey(req3_token_ids), req3_kv_indices)
+        prefix_len = tree.insert(RadixKey(req3_token_ids), req3_kv_indices)
         print(
             f"req3: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
         )
@@ -148,7 +148,7 @@ class TestSWA(unittest.TestCase):
         print(
             f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
         )
-        prefix_len = tree.insert(BaseKey(req4_token_ids), req4_kv_indices)
+        prefix_len = tree.insert(RadixKey(req4_token_ids), req4_kv_indices)
         print(
             f"req4: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
         )
@@ -170,7 +170,7 @@ class TestSWA(unittest.TestCase):
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(BaseKey(req5_token_ids))
+        result = tree.match_prefix(RadixKey(req5_token_ids))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -178,7 +178,7 @@ class TestSWA(unittest.TestCase):
         assert len(kv_indices) == 0
 
         req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(BaseKey(req6_token_ids))
+        result = tree.match_prefix(RadixKey(req6_token_ids))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"

@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     TreeNodeCpp,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import BaseKey
+from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -94,7 +94,7 @@ class RadixCacheCpp(BasePrefixCache):
             raise NotImplementedError("Host cache is not supported yet")
         self.tree.reset()
 
-    def match_prefix(self, key: BaseKey, **kwargs) -> MatchResult:
+    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
             self.tree.match_prefix(key.token_ids)
         )
@@ -105,11 +105,11 @@ class RadixCacheCpp(BasePrefixCache):
             host_hit_length=host_indices_length,
         )
 
-    def _insert(self, key: BaseKey, value: torch.Tensor) -> int:
+    def _insert(self, key: RadixKey, value: torch.Tensor) -> int:
         """
         Insert a key-value pair into the radix tree.
         Args:
-            key (BaseKey): The key to insert, represented as a BaseKey.
+            key (RadixKey): The key to insert, represented as a RadixKey.
             value (torch.Tensor): The value to associate with the key.
         Returns:
             int: Number of device indices that were already present in the tree before the insertion.
@@ -161,7 +161,7 @@ class RadixCacheCpp(BasePrefixCache):
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        new_prefix_len = self._insert(BaseKey(token_ids, req.extra_key), kv_indices)
+        new_prefix_len = self._insert(RadixKey(token_ids, req.extra_key), kv_indices)
 
         # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
         assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
@@ -192,7 +192,7 @@ class RadixCacheCpp(BasePrefixCache):
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        new_prefix_len = self._insert(BaseKey(token_ids, req.extra_key), kv_indices)
+        new_prefix_len = self._insert(RadixKey(token_ids, req.extra_key), kv_indices)
 
         # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
         assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
@@ -200,7 +200,7 @@ class RadixCacheCpp(BasePrefixCache):
         # TODO(dark): optimize the `insert` and `match` (e.g. merge into 1 function)
         # The prefix indices need to updated to reuse the kv indices in the pool
         new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(
-            BaseKey(token_ids, req.extra_key).token_ids
+            RadixKey(token_ids, req.extra_key).token_ids
         )
         new_indices = self._merge_tensor(new_indices_vec)
         assert new_prefix_len <= len(new_indices)

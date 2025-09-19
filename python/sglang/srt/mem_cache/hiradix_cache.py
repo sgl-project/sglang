@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.mem_cache.radix_cache import BaseKey, RadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -570,7 +570,7 @@ class HiRadixCache(RadixCache):
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
             last_host_node,
-            BaseKey(
+            RadixKey(
                 token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
             ),
             written_indices,
@@ -594,7 +594,7 @@ class HiRadixCache(RadixCache):
 
         return True
 
-    def match_prefix(self, key: BaseKey, **kwargs):
+    def match_prefix(self, key: RadixKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         if self.disable or len(key) == 0:
             return MatchResult(
@@ -668,7 +668,9 @@ class HiRadixCache(RadixCache):
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
 
-    def _insert_helper_host(self, node: TreeNode, key: BaseKey, host_value, hash_value):
+    def _insert_helper_host(
+        self, node: TreeNode, key: RadixKey, host_value, hash_value
+    ):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
@@ -702,7 +704,7 @@ class HiRadixCache(RadixCache):
             node.children[child_key] = new_node
         return matched_length
 
-    def _match_prefix_helper(self, node: TreeNode, key: BaseKey):
+    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         value = []
@@ -728,7 +730,7 @@ class HiRadixCache(RadixCache):
 
         return value, node
 
-    def _split_node(self, key: BaseKey, child: TreeNode, split_len: int):
+    def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
@@ -755,7 +757,7 @@ class HiRadixCache(RadixCache):
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    def insert(self, key: BaseKey, value=None, chunked=False):
+    def insert(self, key: RadixKey, value=None, chunked=False):
         if len(key) == 0:
             return 0
 
