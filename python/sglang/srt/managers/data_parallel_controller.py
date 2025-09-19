@@ -445,10 +445,12 @@ class DataParallelController:
         if self.server_args.disaggregation_mode == "null":
             while True:
                 if self.status[self.round_robin_counter] == 1:
+                    print(f"choose worker {self.round_robin_counter}")
                     self.workers[self.round_robin_counter].send_pyobj(req)
                     self.round_robin_counter = (self.round_robin_counter + 1) % len(
                         self.workers
                     )
+                    
                     break
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                         self.workers
