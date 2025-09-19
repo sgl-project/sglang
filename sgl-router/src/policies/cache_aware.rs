@@ -451,7 +451,7 @@ impl Drop for CacheAwarePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, WorkerType};
+    use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[test]
     fn test_cache_aware_with_balanced_load() {
@@ -462,16 +462,18 @@ mod tests {
         };
         let policy = CacheAwarePolicy::with_config(config);
         let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(BasicWorker::new(
-                "http://w1:8000".to_string(),
-                WorkerType::Regular,
-                Some("test_api_key".to_string()),
-            )),
-            Arc::new(BasicWorker::new(
-                "http://w2:8000".to_string(),
-                WorkerType::Regular,
-                Some("test_api_key".to_string()),
-            )),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .api_key("test_api_key")
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .api_key("test_api_key")
+                    .build(),
+            ),
         ];
 
         // Initialize the policy with workers
@@ -499,16 +501,12 @@ mod tests {
             max_tree_size: 10000,
         });
 
-        let worker1 = BasicWorker::new(
-            "http://w1:8000".to_string(),
-            WorkerType::Regular,
-            Some("test_api_key".to_string()),
-        );
-        let worker2 = BasicWorker::new(
-            "http://w2:8000".to_string(),
-            WorkerType::Regular,
-            Some("test_api_key".to_string()),
-        );
+        let worker1 = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let worker2 = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
 
         // Create significant load imbalance
         for _ in 0..20 {
@@ -534,16 +532,16 @@ mod tests {
         };
         let policy = CacheAwarePolicy::with_config(config);
         let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(BasicWorker::new(
-                "http://w1:8000".to_string(),
-                WorkerType::Regular,
-                Some("test_api_key".to_string()),
-            )),
-            Arc::new(BasicWorker::new(
-                "http://w2:8000".to_string(),
-                WorkerType::Regular,
-                Some("test_api_key".to_string()),
-            )),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
         ];
 
         policy.init_workers(&workers);

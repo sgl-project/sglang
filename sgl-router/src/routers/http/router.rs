@@ -1,7 +1,7 @@
 use crate::config::types::RetryConfig;
 use crate::core::{
-    is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthConfig, RetryExecutor, Worker,
-    WorkerRegistry, WorkerType,
+    is_retryable_status, BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, RetryExecutor,
+    Worker, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
@@ -88,20 +88,22 @@ impl Router {
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
             // For now, create worker without model_id
-            let worker = BasicWorker::new(
-                url.clone(),
-                WorkerType::Regular,
-                ctx.router_config.api_key.clone(),
-            )
-            .with_circuit_breaker_config(core_cb_config.clone())
-            .with_health_config(HealthConfig {
-                timeout_secs: ctx.router_config.health_check.timeout_secs,
-                check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                endpoint: ctx.router_config.health_check.endpoint.clone(),
-                failure_threshold: ctx.router_config.health_check.failure_threshold,
-                success_threshold: ctx.router_config.health_check.success_threshold,
-            });
+            let worker_builder = BasicWorkerBuilder::new(url.clone())
+                .worker_type(WorkerType::Regular)
+                .circuit_breaker_config(core_cb_config.clone())
+                .health_config(HealthConfig {
+                    timeout_secs: ctx.router_config.health_check.timeout_secs,
+                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                    endpoint: ctx.router_config.health_check.endpoint.clone(),
+                    failure_threshold: ctx.router_config.health_check.failure_threshold,
+                    success_threshold: ctx.router_config.health_check.success_threshold,
+                });
 
+            let worker = if let Some(api_key) = ctx.router_config.api_key.clone() {
+                worker_builder.api_key(api_key).build()
+            } else {
+                worker_builder.build()
+            };
             let worker_arc = Arc::new(worker);
             ctx.worker_registry.register(worker_arc.clone());
 
@@ -1008,12 +1010,18 @@ impl Router {
                                 }
                                 info!("Added worker: {}", dp_url);
                                 // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-                                let new_worker = BasicWorker::new(
-                                    dp_url.to_string(),
-                                    WorkerType::Regular,
-                                    api_key.clone(),
-                                )
-                                .with_circuit_breaker_config(self.circuit_breaker_config.clone());
+                                let new_worker_builder =
+                                    BasicWorkerBuilder::new(dp_url.to_string())
+                                        .worker_type(WorkerType::Regular)
+                                        .circuit_breaker_config(
+                                            self.circuit_breaker_config.clone(),
+                                        );
+
+                                let new_worker = if let Some(api_key) = api_key {
+                                    new_worker_builder.api_key(api_key).build()
+                                } else {
+                                    new_worker_builder.build()
+                                };
 
                                 let worker_arc = Arc::new(new_worker);
                                 self.worker_registry.register(worker_arc.clone());
@@ -1046,12 +1054,16 @@ impl Router {
                             info!("Added worker: {}", worker_url);
 
                             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-                            let new_worker = BasicWorker::new(
-                                worker_url.to_string(),
-                                WorkerType::Regular,
-                                api_key.clone(),
-                            )
-                            .with_circuit_breaker_config(self.circuit_breaker_config.clone());
+                            let new_worker_builder =
+                                BasicWorkerBuilder::new(worker_url.to_string())
+                                    .worker_type(WorkerType::Regular)
+                                    .circuit_breaker_config(self.circuit_breaker_config.clone());
+
+                            let new_worker = if let Some(api_key) = api_key {
+                                new_worker_builder.api_key(api_key).build()
+                            } else {
+                                new_worker_builder.build()
+                            };
 
                             let worker_arc = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
@@ -1627,13 +1639,14 @@ mod tests {
         ));
 
         // Register test workers
-        let worker1 = BasicWorker::new(
-            "http://worker1:8080".to_string(),
-            WorkerType::Regular,
-            Some("test_api_key".to_string()),
-        );
-        let worker2 =
-            BasicWorker::new("http://worker2:8080".to_string(), WorkerType::Regular, None);
+        let worker1 = BasicWorkerBuilder::new("http://worker1:8080")
+            .worker_type(WorkerType::Regular)
+            .api_key("test_api_key")
+            .build();
+        let worker2 = BasicWorkerBuilder::new("http://worker2:8080")
+            .worker_type(WorkerType::Regular)
+            .api_key("test_api_key")
+            .build();
         worker_registry.register(Arc::new(worker1));
         worker_registry.register(Arc::new(worker2));
 
