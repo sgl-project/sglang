@@ -110,6 +110,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Other platforms
     "intel_amx",
     "ascend",
+    "intel_xpu",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv"]
@@ -677,6 +678,13 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.disable_cuda_graph = True
             self.disable_radix_cache = True
+
+        if self.attention_backend == "intel_xpu":
+            if self.page_size not in [32, 64, 128]:
+                logger.warning(
+                    f"Intel XPU attention backend only supports page_size of 32, 64 or 128, changing page_size from {self.page_size} to 128."
+                )
+                self.page_size = 128
 
         # Set page size
         if self.page_size is None:
