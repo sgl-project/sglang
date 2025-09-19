@@ -13,11 +13,14 @@
 # ==============================================================================
 """Sampling parameters for text generation."""
 
+import logging
 import sre_parse
 from typing import Any, Dict, List, Optional, Union
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+
+logger = logging.getLogger(__name__)
 
 
 class SamplingParams:
@@ -213,10 +216,12 @@ def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
         elif token == sre_parse.MAX_REPEAT:
             _, max_num_repeat, inner_subpattern = value
             if max_num_repeat == sre_parse.MAX_REPEAT:
-                total = MAX_LEN
+                total += MAX_LEN
             else:
                 total += max_num_repeat * _max_length_from_subpattern(inner_subpattern)
         else:
-            assert NotImplementedError(f"Unhandled token: {token}")
+            logger.error(f"Got unhandled token: {token}")
+
+            total += MAX_LEN
 
     return total

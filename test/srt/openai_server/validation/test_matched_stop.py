@@ -178,10 +178,11 @@ class TestRegexPatternMaxLength(unittest.TestCase):
             "(a(bca|de(fg|hi){2,3})j){2}kl": 22,
             # - Innermost alt: "fg" vs "hi" → 2
             # - Repeat {2,3}: max = 3 * 2 = 6
-            # - "bca(...)" or "de(...)" → 3 + 6 = 9
-            # - Whole group: "a" (1) + group (9) + "j"(1) = 11
-            # - Repeat {2} → 22
-            # - Add "kl"(2) → 24
+            # - Inner group "de(...)": 2 (for "de") + 6 = 8.
+            # - "bca" or "de(...)" → max(3, 8) = 8
+            # - Whole group: "a" (1) + group (8) + "j"(1) = 10
+            # - Repeat {2} → 20
+            # - Add "kl"(2) → 22
             "(foo(bar|baz(qux){1,2}))|(x(yz){5,10})": 21,
             # Branch 1:
             #   "foo"(3) + max("bar"(3), "baz"(3)+"qux"{2} = 3 + 6 = 9) = 3 + 9 = 12
