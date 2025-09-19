@@ -28,8 +28,8 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
-import requests
 import numpy as np
+import requests
 import torch
 import torch.distributed as dist
 
@@ -100,12 +100,12 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.compilation.backend import SGLangBackend
 from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
 from sglang.srt.model_executor.compilation.compilation_counter import (
     compilation_counter,
 )
+from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,

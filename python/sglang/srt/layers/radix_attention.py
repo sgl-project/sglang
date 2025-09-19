@@ -24,8 +24,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-from sglang.srt.utils import direct_register_custom_op
 from sglang.srt.context_manager import get_forward_context
+from sglang.srt.utils import direct_register_custom_op
 
 
 class AttentionType(Enum):
@@ -137,7 +137,7 @@ class RadixAttention(nn.Module):
         #         **kwargs,
         #     )
         return torch.ops.sglang.unified_attention_with_output(
-                q, k, v, save_kv_cache, self.layer_id
+            q, k, v, save_kv_cache, self.layer_id
         )
 
 
