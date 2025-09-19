@@ -15,7 +15,7 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -91,7 +91,7 @@ class _LayerModeComputationContext:
     layer_id: int
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
-    attn_input_tp_scattered: Optional[bool]
+    attn_input_tp_scattered: Optional[bool] = None
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
@@ -304,7 +304,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_input_use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
         if attn_input_use_reduce_scatter:
@@ -326,7 +326,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_input_use_reduce_scatter,
+        attn_input_use_reduce_scatter: bool = False,
     ):
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
@@ -654,16 +654,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = layernorm(hidden_states, residual)
         else:
-            tp_size = context.tp_size
-            tp_rank = context.tp_rank
-            t_size = hidden_states.shape[0]
-            split_sizes = [
-                t_size // tp_size + (rank < (t_size % tp_size))
-                for rank in range(tp_size)
+            scattered_states = hidden_states.tensor_split(context.tp_size)[
+                context.tp_rank
             ]
-            start_size = sum(split_sizes[:tp_rank])
-            end_size = start_size + split_sizes[tp_rank]
-            hidden_states[start_size:end_size] += residual
+            scattered_states += residual
             residual = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states = layernorm(residual)
         return hidden_states, residual
