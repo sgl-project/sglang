@@ -88,6 +88,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
@@ -778,6 +779,22 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.post("/update_weights_from_ipc")
+async def update_weights_from_ipc(
+    obj: UpdateWeightsFromIPCReqInput, request: Request
+):
+    """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
+    success, message = (
+        await _global_state.tokenizer_manager.update_weights_from_ipc(obj, request)
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+
 @app.post("/update_weight_version")
 async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
     """Update the weight version. This operation requires no active requests."""
@@ -1172,6 +1189,39 @@ def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
     """Update weight version if provided."""
     if weight_version is not None:
         _global_state.tokenizer_manager.server_args.weight_version = weight_version
+
+
+@app.post("/collective_rpc")
+async def collective_rpc(request: Request):
+    """Collective RPC endpoint for compatibility with checkpoint-engine (similar to vLLM)."""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=f"JSON decode error: {e}")
+    method = body.get("method")
+    if method is None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="Missing 'method' in request body")
+    # Handle the update_weights_from_ipc method specifically
+    if method == "update_weights_from_ipc":
+        args = body.get("args", [])
+        if not args or not isinstance(args[0], dict):
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="Invalid args for update_weights_from_ipc")
+        zmq_handles = args[0]
+        success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
+            UpdateWeightsFromIPCReqInput(zmq_handles=zmq_handles), request
+        )
+        if success:
+            return ORJSONResponse(content={"results": [{"success": True, "message": message}]})
+        else:
+            return ORJSONResponse(
+                content={"results": [{"success": False, "message": message}]},
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+    else:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED,
+            detail=f"Method '{method}' not implemented in SGLang collective_rpc"
+        )
 
 
 def _create_error_response(e):

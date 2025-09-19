@@ -37,6 +37,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
@@ -361,6 +362,15 @@ class TpModelWorker:
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        """Update weights from IPC for checkpoint-engine integration."""
+        try:
+            success, message = self.model_runner.update_weights_from_ipc(recv_req)
+            return success, message
+        except Exception as e:
+            logger.error(f"IPC weight update failed: {e}")
+            return False, str(e)
 
     def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
         return self.model_runner.lora_manager.validate_lora_batch(lora_ids)
