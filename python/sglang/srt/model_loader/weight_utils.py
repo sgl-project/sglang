@@ -850,8 +850,13 @@ def broadcast_weight(weight: torch.Tensor) -> torch.Tensor:
     Returns:
         The real tensor with weights broadcasted from the source.
     """
+    assert hasattr(weight, "_original_shape") and hasattr(
+        weight, "_group"
+    ), "Expect a fake weight instead of a real one"
     assert weight._original_shape and weight._group
-    real_weight = torch.empty(weight._original_shape, dtype=weight.dtype, device=weight.device)
+    real_weight = torch.empty(
+        weight._original_shape, dtype=weight.dtype, device=weight.device
+    )
 
     torch.distributed.broadcast(
         real_weight,
@@ -861,14 +866,17 @@ def broadcast_weight(weight: torch.Tensor) -> torch.Tensor:
     )
     return real_weight
 
+
 def weight_loader_hook(loader):
     """Decorator to handle hook for loaded weight"""
+
     def loader_wrapper(param: torch.Tensor, loaded_weight: torch.Tensor):
-        if hasattr(loaded_weight, "_hook_func"):
-            loaded_weight = loaded_weight._hook_func()
-        return loader(param, loaded_weight)
+        if hasattr(loaded_weight, "_hook_func") and callable(loaded_weight._hook_func):
+            weight = loaded_weight._hook_func()
+        return loader(param, weight)
 
     return loader_wrapper
+
 
 @weight_loader_hook
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:

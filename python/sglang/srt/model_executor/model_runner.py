@@ -130,7 +130,15 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
 )
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.weight_utils import default_weight_loader, broadcast_weight
+from sglang.srt.offloader import (
+    create_offloader_from_server_args,
+    get_offloader,
+    set_offloader,
+)
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.remote_instance_weight_loader_utils import (
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
