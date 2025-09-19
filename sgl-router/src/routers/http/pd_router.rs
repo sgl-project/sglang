@@ -3,8 +3,8 @@
 use super::pd_types::{api_path, PDRouterError};
 use crate::config::types::RetryConfig;
 use crate::core::{
-    is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthConfig, RetryExecutor, Worker,
-    WorkerFactory, WorkerLoadGuard, WorkerRegistry, WorkerType,
+    is_retryable_status, BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, RetryExecutor,
+    Worker, WorkerFactory, WorkerLoadGuard, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
@@ -389,34 +389,35 @@ impl PDRouter {
 
         // Register prefill workers in the registry
         for (url, port) in prefill_urls {
-            let worker = BasicWorker::new(
-                url,
-                WorkerType::Prefill {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill {
                     bootstrap_port: port,
-                },
-            )
-            .with_circuit_breaker_config(core_cb_config.clone())
-            .with_health_config(HealthConfig {
-                timeout_secs: ctx.router_config.health_check.timeout_secs,
-                check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                endpoint: ctx.router_config.health_check.endpoint.clone(),
-                failure_threshold: ctx.router_config.health_check.failure_threshold,
-                success_threshold: ctx.router_config.health_check.success_threshold,
-            });
-            ctx.worker_registry.register(Arc::new(worker));
-        }
-
-        // Register decode workers in the registry
-        for url in decode_urls {
-            let worker = BasicWorker::new(url, WorkerType::Decode)
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
+                })
+                .circuit_breaker_config(core_cb_config.clone())
+                .health_config(HealthConfig {
                     timeout_secs: ctx.router_config.health_check.timeout_secs,
                     check_interval_secs: ctx.router_config.health_check.check_interval_secs,
                     endpoint: ctx.router_config.health_check.endpoint.clone(),
                     failure_threshold: ctx.router_config.health_check.failure_threshold,
                     success_threshold: ctx.router_config.health_check.success_threshold,
-                });
+                })
+                .build();
+            ctx.worker_registry.register(Arc::new(worker));
+        }
+
+        // Register decode workers in the registry
+        for url in decode_urls {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Decode)
+                .circuit_breaker_config(core_cb_config.clone())
+                .health_config(HealthConfig {
+                    timeout_secs: ctx.router_config.health_check.timeout_secs,
+                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                    endpoint: ctx.router_config.health_check.endpoint.clone(),
+                    failure_threshold: ctx.router_config.health_check.failure_threshold,
+                    success_threshold: ctx.router_config.health_check.success_threshold,
+                })
+                .build();
             ctx.worker_registry.register(Arc::new(worker));
         }
 
@@ -2116,7 +2117,7 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, WorkerType};
+    use crate::core::WorkerType;
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -2139,7 +2140,9 @@ mod tests {
     }
 
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {
-        let worker = BasicWorker::new(url, worker_type);
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .build();
         worker.set_healthy(healthy);
         Box::new(worker)
     }
