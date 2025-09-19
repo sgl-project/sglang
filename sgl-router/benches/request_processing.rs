@@ -48,50 +48,15 @@ fn default_generate_request() -> GenerateRequest {
 }
 
 /// Create a default ChatCompletionRequest for benchmarks with minimal fields set
+#[allow(deprecated)]
 fn default_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
-        model: String::new(),
+        // Required fields in OpenAI order
         messages: vec![],
-        max_tokens: None,
-        max_completion_tokens: None,
-        temperature: None,
-        top_p: None,
-        n: None,
-        stream: false,
-        stream_options: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        logit_bias: None,
-        logprobs: false,
-        top_logprobs: None,
-        user: None,
-        response_format: None,
-        seed: None,
-        tools: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        function_call: None,
-        functions: None,
-        // SGLang Extensions
-        top_k: None,
-        min_p: None,
-        min_tokens: None,
-        repetition_penalty: None,
-        regex: None,
-        ebnf: None,
-        stop_token_ids: None,
-        no_stop_trim: false,
-        ignore_eos: false,
-        continue_final_message: false,
-        skip_special_tokens: true,
-        // SGLang Extensions
-        lora_path: None,
-        session_params: None,
-        separate_reasoning: true,
-        stream_reasoning: true,
-        chat_template_kwargs: None,
-        return_hidden_states: false,
+        model: String::new(),
+
+        // Use default for all other fields
+        ..Default::default()
     }
 }
 

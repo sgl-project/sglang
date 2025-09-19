@@ -179,7 +179,7 @@ pub struct FunctionCallDelta {
 
 // ============= Request =============
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
     pub messages: Vec<ChatMessage>,
