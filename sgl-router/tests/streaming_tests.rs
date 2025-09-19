@@ -40,9 +40,20 @@ impl TestContext {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
 
-        config.mode = RoutingMode::Regular { worker_urls };
+        config.mode = RoutingMode::Regular {
+            worker_urls: worker_urls.clone(),
+        };
 
-        let app_context = common::create_test_context(config);
+        let app_context = common::create_test_context(config.clone());
+
+        // Initialize workers in the registry before creating router
+        if !worker_urls.is_empty() {
+            use sglang_router_rs::routers::WorkerInitializer;
+            WorkerInitializer::initialize_workers(&config, &app_context.worker_registry)
+                .await
+                .expect("Failed to initialize workers");
+        }
+
         let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
 
