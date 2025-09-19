@@ -1,5 +1,6 @@
 import logging
-from typing import List
+
+from typing import List, Tuple, Optional
 
 import torch
 import torch.distributed as dist
@@ -107,9 +108,9 @@ class Sampler(nn.Module):
                             check_nan=self.use_nan_detection,
                         )
                 elif global_server_args_dict["sampling_backend"] == "pytorch":
-                    # A slower fallback implementation with torch native operations.
+
                     batch_next_token_ids = (
-                        top_k_top_p_min_p_sampling_from_probs_torch_deterministic(
+                        top_k_top_p_min_p_sampling_from_probs_torch(
                             probs,
                             sampling_info.top_ks,
                             sampling_info.top_ps,
@@ -174,8 +175,13 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
     need_min_p_sampling: bool,
+    sampling_seed: Optional[torch.Tensor],
 ):
-    """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
+    """
+    A top-k, top-p and min-p sampling implementation with native pytorch operations.
+    When sampling_seed is not None, deterministic inference will be enabled, it will sample 
+    with the sampling_seed of each request, which is a slower fallback implementation.
+    """
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
@@ -187,35 +193,10 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     if need_min_p_sampling:
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
-
-    sampled_index = torch.multinomial(probs_sort, num_samples=1)
-    # int32 range is enough to represent the token ids
-    probs_idx = probs_idx.to(torch.int32)
-    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
-    return batch_next_token_ids
-
-
-def top_k_top_p_min_p_sampling_from_probs_torch_deterministic(
-    probs: torch.Tensor,
-    top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
-    min_ps: torch.Tensor,
-    need_min_p_sampling: bool,
-    sampling_seed: torch.Tensor,
-):
-    """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-
-    if need_min_p_sampling:
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
-    sampled_index = multinomial_with_seed(probs_sort, sampling_seed)
+    if sampling_seed is not None:
+        sampled_index = multinomial_with_seed(probs_sort, sampling_seed)
+    else:
+        sampled_index = torch.multinomial(probs_sort, num_samples=1)
     # int32 range is enough to represent the token ids
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
