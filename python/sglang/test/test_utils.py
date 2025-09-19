@@ -19,6 +19,7 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from urllib.parse import quote
 
 import aiohttp
 import numpy as np
@@ -1492,6 +1493,7 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
     summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
 
     base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
+
     # Optional: a relay page that fetches the trace and postMessages it to Perfetto UI.
     # See: https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui
     relay_base = (
@@ -1505,6 +1507,8 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
         )
 
         filenames = result.get("trace_links")
+        print(f"{filenames=}")
+
         filenames_iter = iter(filenames)
         if metrics:
             for line in result["output"].splitlines():
@@ -1517,11 +1521,8 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
                     # find the data lines
                     # Reconstruct the row and append a placeholder artifact link for profile
                     parts = [part.strip() for part in line.split("|") if part.strip()]
-                    try:
-                        from urllib.parse import quote
-                    except ImportError:
-                        quote = None
 
+                    print(f"{line=}")
                     raw_link = f"{base_url}/{next(filenames_iter)}"
                     # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
                     relay_link = (
