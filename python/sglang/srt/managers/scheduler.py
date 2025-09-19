@@ -565,6 +565,17 @@ class Scheduler(
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
 
+        # Init prefill kv split size when deterministic inference is enabled with flashinfer attention backend
+        if (
+            self.server_args.enable_deterministic_inference
+            and self.server_args.attention_backend == "flashinfer"
+        ):
+            self.truncation_align_size = (
+                self.server_args.flashinfer_prefill_split_tile_size
+            )
+        else:
+            self.truncation_align_size = None
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -1846,7 +1857,11 @@ class Scheduler(
                     continue
 
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=(self.chunked_req is not None),
+                truncation_align_size=self.truncation_align_size,
+            )
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:

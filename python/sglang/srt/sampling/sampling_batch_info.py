@@ -27,7 +27,7 @@ class SamplingBatchInfo:
     min_ps: torch.Tensor
 
     # Used for deterministic sampling
-    sampling_seed: torch.Tensor
+    sampling_seed: Optional[torch.Tensor] = None
 
     # Whether all requests use greedy sampling
     is_all_greedy: bool
@@ -78,6 +78,7 @@ class SamplingBatchInfo:
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args_dict = cls._get_global_server_args_dict()
+        enable_deterministic = global_server_args_dict["enable_deterministic_inference"]
 
         reqs = batch.reqs
         device = batch.device
@@ -95,8 +96,12 @@ class SamplingBatchInfo:
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
         )
-        sampling_seed = torch.tensor(
-            [r.sampling_seed for r in reqs], dtype=torch.int32, device=device
+        sampling_seed = (
+            torch.tensor(
+                [r.sampling_seed for r in reqs], dtype=torch.int32, device=device
+            )
+            if enable_deterministic
+            else None
         )
 
         logit_bias = None

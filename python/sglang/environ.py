@@ -197,6 +197,9 @@ class Envs:
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
 
+    # Deterministic inference
+    SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+
     # fmt: on
 
 

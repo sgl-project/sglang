@@ -541,7 +541,9 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def add_one_req(self, req: Req, has_chunked_req: bool):
+    def add_one_req(
+        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+    ):
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
@@ -600,14 +602,16 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
-                # Split-kv size for prefill is hard-coded to 4096 here
-                # Also we want to assert that chunked prefill size is multiple of split-kv-size
-                # Cut trunc_len to the nearest multiple of split_kv_size
-                split_kv_size = 4096
-                if trunc_len < split_kv_size:
-                    return AddReqResult.OTHER
-                else:
-                    trunc_len = split_kv_size * (trunc_len // split_kv_size)
+                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
+                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
+                # we need the prefill prefix length to be multiple of attention split size
+                if truncation_align_size is not None:
+                    if trunc_len < truncation_align_size:
+                        return AddReqResult.OTHER
+                    else:
+                        trunc_len = truncation_align_size * (
+                            trunc_len // truncation_align_size
+                        )
 
                 # Chunked prefill
                 req.extend_input_len = trunc_len

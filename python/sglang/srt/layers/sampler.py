@@ -118,16 +118,28 @@ class Sampler(nn.Module):
                         )
                 elif global_server_args_dict["sampling_backend"] == "pytorch":
                     # A slower fallback implementation with torch native operations.
-                    batch_next_token_ids = (
-                        top_k_top_p_min_p_sampling_from_probs_torch_deterministic(
-                            probs,
-                            sampling_info.top_ks,
-                            sampling_info.top_ps,
-                            sampling_info.min_ps,
-                            sampling_info.need_min_p_sampling,
-                            sampling_info.sampling_seed,
+                    # When deterministic inference is enabled, sample with the sampling_seed of each request
+                    if global_server_args_dict["enable_deterministic_inference"]:
+                        batch_next_token_ids = (
+                            top_k_top_p_min_p_sampling_from_probs_torch_deterministic(
+                                probs,
+                                sampling_info.top_ks,
+                                sampling_info.top_ps,
+                                sampling_info.min_ps,
+                                sampling_info.need_min_p_sampling,
+                                sampling_info.sampling_seed,
+                            )
                         )
-                    )
+                    else:
+                        batch_next_token_ids = (
+                            top_k_top_p_min_p_sampling_from_probs_torch(
+                                probs,
+                                sampling_info.top_ks,
+                                sampling_info.top_ps,
+                                sampling_info.min_ps,
+                                sampling_info.need_min_p_sampling,
+                            )
+                        )
                 else:
                     raise ValueError(
                         f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"

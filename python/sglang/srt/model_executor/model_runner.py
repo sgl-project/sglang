@@ -30,7 +30,6 @@ from urllib.parse import urlparse
 import requests
 import torch
 import torch.distributed as dist
-from batch_invariant_ops import enable_batch_invariant_mode
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -389,7 +388,10 @@ class ModelRunner:
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         # Enable batch invariant mode
-        enable_batch_invariant_mode()
+        if server_args.enable_deterministic_inference:
+            from batch_invariant_ops import enable_batch_invariant_mode
+
+            enable_batch_invariant_mode()
 
         # Init memory pool and attention backends
         self.init_memory_pool(

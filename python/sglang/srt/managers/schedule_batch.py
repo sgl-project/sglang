@@ -111,6 +111,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_symm_mem",
     "enable_custom_logit_processor",
     "disaggregation_mode",
+    "enable_deterministic_inference",
 ]
 
 # Put some global args for easy access
@@ -474,7 +475,11 @@ class Req:
         self.input_embeds = input_embeds
 
         # Used for deterministic sampling
-        self.sampling_seed = hash_string_to_int(self.origin_input_text)
+        self.sampling_seed = (
+            hash_string_to_int(self.origin_input_text)
+            if global_server_args_dict["enable_deterministic_inference"]
+            else None
+        )
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids

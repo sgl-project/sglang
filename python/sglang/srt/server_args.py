@@ -118,6 +118,8 @@ DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -436,6 +438,11 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
+
+    # For deterministic inference
+    enable_deterministic_inference: bool = False
+    flashinfer_prefill_split_tile_size: int = 4096
+    flashinfer_decode_split_tile_size: int = 2048
 
     # Deprecated arguments
     enable_ep_moe: bool = False
@@ -979,6 +986,33 @@ class ServerArgs:
             raise ValueError(
                 "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-customer-labels."
             )
+
+        # Deterministic inference
+        os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = (
+            "1" if self.enable_deterministic_inference else "0"
+        )
+        if self.enable_deterministic_inference:
+            # Check batch_invariant_ops dependency
+            import importlib
+
+            if not importlib.util.find_spec("batch_invariant_ops"):
+                raise ValueError(
+                    "batch_invariant_ops is not installed. Please install it from https://github.com/thinking-machines-lab/batch_invariant_ops/."
+                )
+
+            # Check some settings
+            self.disable_radix_cache = True
+            logger.warning(
+                "Currently radix cache is disabled for deterministic inference. It will be supported in the future."
+            )
+            self.sampling_backend = "pytorch"
+            logger.warning(
+                "Sampling backend is set to pytorch for deterministic inference."
+            )
+            if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
+                raise ValueError(
+                    f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
+                )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -2468,6 +2502,25 @@ class ServerArgs:
             type=int,
             default=ServerArgs.sm_group_num,
             help="Number of sm partition groups.",
+        )
+
+        # For deterministic inference
+        parser.add_argument(
+            "--enable-deterministic-inference",
+            action="store_true",
+            help="Enable deterministic inference mode with batch invariant ops.",
+        )
+        parser.add_argument(
+            "--flashinfer-prefill-split-tile-size",
+            type=int,
+            default=ServerArgs.flashinfer_prefill_split_tile_size,
+            help="The size of split KV tile in flash infer prefill. Only used for deterministic inference.",
+        )
+        parser.add_argument(
+            "--flashinfer-decode-split-tile-size",
+            type=int,
+            default=ServerArgs.flashinfer_decode_split_tile_size,
+            help="The size of split KV tile in flash infer decode. Only used for deterministic inference.",
         )
 
         # Deprecated arguments
