@@ -563,6 +563,7 @@ impl StopConditionsProvider for ChatCompletionRequest {
 }
 
 impl TokenLimitsProvider for ChatCompletionRequest {
+    #[allow(deprecated)]
     fn get_max_tokens(&self) -> Option<u32> {
         // Prefer max_completion_tokens over max_tokens if both are set
         self.max_completion_tokens.or(self.max_tokens)
@@ -676,6 +677,7 @@ impl ChatCompletionRequest {
     }
 
     /// Validate cross-parameter relationships specific to chat completions
+    #[allow(deprecated)]
     pub fn validate_chat_cross_parameters(&self) -> Result<(), ValidationError> {
         // Validate that both max_tokens and max_completion_tokens aren't set
         utils::validate_conflicting_parameters(
@@ -871,53 +873,24 @@ mod tests {
     mod chat_tests {
         use super::*;
 
+        #[allow(deprecated)]
         fn create_valid_chat_request() -> ChatCompletionRequest {
             ChatCompletionRequest {
-                model: "gpt-4".to_string(),
                 messages: vec![ChatMessage::User {
                     role: "user".to_string(),
                     content: UserMessageContent::Text("Hello".to_string()),
                     name: None,
                 }],
+                model: "gpt-4".to_string(),
+                // Set specific fields we want to test
                 temperature: Some(1.0),
                 top_p: Some(0.9),
                 n: Some(1),
-                stream: false,
-                stream_options: None,
-                stop: None,
                 max_tokens: Some(100),
-                max_completion_tokens: None,
-                presence_penalty: Some(0.0),
                 frequency_penalty: Some(0.0),
-                logit_bias: None,
-                user: None,
-                seed: None,
-                logprobs: false,
-                top_logprobs: None,
-                response_format: None,
-                tools: None,
-                tool_choice: None,
-                parallel_tool_calls: None,
-                functions: None,
-                function_call: None,
-                // SGLang extensions
-                top_k: None,
-                min_p: None,
-                min_tokens: None,
-                repetition_penalty: None,
-                regex: None,
-                ebnf: None,
-                stop_token_ids: None,
-                no_stop_trim: false,
-                ignore_eos: false,
-                continue_final_message: false,
-                skip_special_tokens: true,
-                lora_path: None,
-                session_params: None,
-                separate_reasoning: true,
-                stream_reasoning: true,
-                chat_template_kwargs: None,
-                return_hidden_states: false,
+                presence_penalty: Some(0.0),
+                // Use default for all other fields
+                ..Default::default()
             }
         }
 
@@ -938,19 +911,29 @@ mod tests {
         }
 
         #[test]
-        fn test_chat_conflicts() {
+        #[allow(deprecated)]
+        fn test_chat_cross_parameter_conflicts() {
             let mut request = create_valid_chat_request();
 
-            // Conflicting max_tokens
+            // Test 1: max_tokens vs max_completion_tokens conflict
             request.max_tokens = Some(100);
             request.max_completion_tokens = Some(200);
-            assert!(request.validate().is_err());
+            assert!(request.validate().is_err(), "Should reject both max_tokens and max_completion_tokens");
 
-            // Logprobs without top_logprobs
+            // Reset for next test
             request.max_tokens = None;
+            request.max_completion_tokens = None;
+
+            // Test 2: tools vs functions conflict (deprecated)
+            request.tools = Some(vec![]);
+            request.functions = Some(vec![]);
+            assert!(request.validate().is_err(), "Should reject both tools and functions");
+
+            // Test 3: logprobs=true should be valid even without top_logprobs
+            let mut request = create_valid_chat_request();
             request.logprobs = true;
             request.top_logprobs = None;
-            assert!(request.validate().is_err());
+            assert!(request.validate().is_ok(), "logprobs=true without top_logprobs should be valid");
         }
 
         #[test]
@@ -1137,6 +1120,7 @@ mod tests {
         }
 
         #[test]
+        #[allow(deprecated)]
         fn test_min_max_tokens_validation() {
             let mut request = create_valid_chat_request();
 
