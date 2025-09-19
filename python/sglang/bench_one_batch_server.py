@@ -17,9 +17,11 @@ import itertools
 import json
 import multiprocessing
 import os
+import random
 import time
 from typing import List, Tuple
 
+import numpy as np
 import requests
 
 from sglang.bench_serving import get_tokenizer, sample_random_requests
@@ -33,6 +35,7 @@ from sglang.test.test_utils import is_in_ci, write_github_step_summary
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
+    seed: int = 42
     batch_size: Tuple[int] = (1,)
     input_len: Tuple[int] = (1024,)
     output_len: Tuple[int] = (16,)
@@ -53,6 +56,7 @@ class BenchArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
+        parser.add_argument("--seed", type=int, default=BenchArgs.seed)
         parser.add_argument(
             "--batch-size", type=int, nargs="+", default=BenchArgs.batch_size
         )
@@ -438,6 +442,10 @@ def main():
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 
