@@ -293,6 +293,8 @@ void moe_align_block_size(
 void topk_softmax(
     torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
 
+void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
+
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
     at::Tensor& bias,
