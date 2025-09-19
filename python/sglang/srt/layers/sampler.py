@@ -118,28 +118,13 @@ class Sampler(nn.Module):
                         )
                 elif global_server_args_dict["sampling_backend"] == "pytorch":
                     # A slower fallback implementation with torch native operations.
-                    # When deterministic inference is enabled, sample with the sampling_seed of each request
-                    if global_server_args_dict["enable_deterministic_inference"]:
-                        batch_next_token_ids = (
-                            top_k_top_p_min_p_sampling_from_probs_torch_deterministic(
-                                probs,
-                                sampling_info.top_ks,
-                                sampling_info.top_ps,
-                                sampling_info.min_ps,
-                                sampling_info.need_min_p_sampling,
-                                sampling_info.sampling_seed,
-                            )
-                        )
-                    else:
-                        batch_next_token_ids = (
-                            top_k_top_p_min_p_sampling_from_probs_torch(
-                                probs,
-                                sampling_info.top_ks,
-                                sampling_info.top_ps,
-                                sampling_info.min_ps,
-                                sampling_info.need_min_p_sampling,
-                            )
-                        )
+                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probs,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        sampling_info.min_ps,
+                        sampling_info.need_min_p_sampling,
+                    )
                 else:
                     raise ValueError(
                         f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
@@ -264,64 +249,6 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
-
-
-def top_k_top_p_min_p_sampling_from_probs_torch_deterministic(
-    probs: torch.Tensor,
-    top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
-    min_ps: torch.Tensor,
-    need_min_p_sampling: bool,
-    sampling_seed: torch.Tensor,
-):
-    """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-
-    if need_min_p_sampling:
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
-    sampled_index = multinomial_with_seed(probs_sort, sampling_seed)
-    # int32 range is enough to represent the token ids
-    probs_idx = probs_idx.to(torch.int32)
-    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
-    return batch_next_token_ids
-
-
-def multinomial_with_seed(inputs: torch.Tensor, seed: torch.Tensor) -> torch.Tensor:
-    """
-    Samples n elements from an input tensor `inputs` of shape (n, m) using
-    a unique random seed for each row. This is a deterministic batched alternative to
-    `torch.multinomial`.
-
-    Args:
-        inputs: A float tensor of shape (n, m) representing n categorical
-                distributions with m categories each. The values are treated
-                as weights and do not need to sum to 1.
-        seed:   An integer tensor of shape (n,) containing the random seed
-                for each corresponding row in `inputs`.
-
-    Returns:
-        A tensor of shape (n,) where the i-th element is an index sampled
-        from the distribution in `inputs[i]` using `seed[i]`.
-    """
-    device = inputs.device
-    seed = seed.to(device)
-    n, m = inputs.shape
-    col_indices = torch.arange(m, device=device).unsqueeze(0)
-    seed_expanded = seed.unsqueeze(-1)
-    hashed = seed_expanded * 73856093 ^ col_indices * 19349663
-    uniform_samples = (hashed % (2**24)).float() / (2**24)
-    epsilon = 1e-9
-    gumbel_noise = -torch.log(-torch.log(uniform_samples + epsilon) + epsilon)
-    log_probs = torch.log(inputs + epsilon)
-    perturbed_log_probs = log_probs + gumbel_noise
-    return torch.argmax(perturbed_log_probs, dim=1, keepdim=True)
 
 
 def sampling_from_probs_torch(probs: torch.Tensor):
