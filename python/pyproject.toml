@@ -92,7 +92,7 @@ tracing = [
 all = ["sglang[test]", "sglang[decord]"]
 blackwell = ["sglang[test]", "sglang[decord]"]
 blackwell_aarch64 = ["sglang[test]"]
-dev = ["sglang[test]"]
+dev = ["sglang[test]", "sglang[decord]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
