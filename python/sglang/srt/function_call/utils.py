@@ -49,40 +49,10 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
     try:
         return (partial_json_parser.loads(input_str, flags), len(input_str))
     except (JSONDecodeError, IndexError) as e:
-        # Handle case where we have a closing bracket without opening bracket
-        # e.g., '{ "json": "object" } ]' -> extract '{ "json": "object" }'
-        if isinstance(e, IndexError) and "pop from empty list" in str(e):
-            # If there's a trailing ']' without a matching '[', drop it and decode first value
-            pos = input_str.rfind("]")
-            if pos != -1:
-                # Ensure only whitespace after the found ']'
-                tail = input_str[pos + 1 :]
-                only_ws_after = True
-                for ch in tail:
-                    if ch not in _WS:
-                        only_ws_after = False
-                        break
-                if only_ws_after:
-                    candidate = input_str[:pos] + input_str[pos + 1 :]
-                    start2 = _skip_ws(candidate, 0)
-                    dec = JSONDecoder()
-                    try:
-                        obj, end = dec.raw_decode(candidate, start2)
-                        return obj, end
-                    except JSONDecodeError:
-                        raise
-
-        if "Extra data" in e.msg:
-            # Find the end of the leading whitespace
-            # See JSONDecoder.decode for reference
-            match = WHITESPACE.match(input_str)
-            start_index = match.end() if match else 0
-            dec = JSONDecoder()
-            try:
-                obj, end = dec.raw_decode(input_str, start_index)
-            except JSONDecodeError:
-                # Not even a single complete value available → re-raise original
-                raise
+        msg = getattr(e, "msg", str(e))
+        if "Extra data" in msg or "pop from empty list" in msg:
+            start = WHITESPACE.match(input_str, 0).end()
+            obj, end = JSONDecoder().raw_decode(input_str, start)
             return obj, end
         raise
 
