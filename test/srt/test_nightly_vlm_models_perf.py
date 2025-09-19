@@ -122,14 +122,14 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                 finally:
                     kill_process_tree(process.pid)
 
-            if model_results:
-                report_part = generate_markdown_report_nightly(
-                    model,
-                    model_results,
-                    self.input_lens,
-                    self.output_lens,
-                )
-                self.full_report += report_part + "\n"
+                if model_results:
+                    report_part = generate_markdown_report_nightly(
+                        model,
+                        model_results,
+                        self.input_lens,
+                        self.output_lens,
+                    )
+                    self.full_report += report_part + "\n"
 
         if is_in_ci():
             write_github_step_summary(self.full_report)

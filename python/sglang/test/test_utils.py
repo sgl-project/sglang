@@ -1523,14 +1523,23 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
                     parts = [part.strip() for part in line.split("|") if part.strip()]
 
                     print(f"{line=}")
-                    raw_link = f"{base_url}/{next(filenames_iter)}"
-                    # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
-                    relay_link = (
-                        f"{relay_base}?src={quote(raw_link, safe='')}"
-                        if quote
-                        else f"{relay_base}?src={raw_link}"
-                    )
-                    row = f"| {' | '.join(parts[:-1])} | [trace]({relay_link}) |\n"
+                    try:
+                        raw_link = f"{base_url}/{next(filenames_iter)}"
+
+                        # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
+                        relay_link = (
+                            f"{relay_base}?src={quote(raw_link, safe='')}"
+                            if quote
+                            else f"{relay_base}?src={raw_link}"
+                        )
+                    except StopIteration as e:
+                        relay_link = None
+                        pass
+
+                    if relay_link:
+                        row = f"| {' | '.join(parts[:-1])} | [trace]({relay_link}) |\n"
+                    else:
+                        row = f"| {' | '.join(parts[:-1])} | NA | \n"
 
                     summary += row
     return summary
