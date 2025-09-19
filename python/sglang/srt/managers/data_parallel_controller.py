@@ -170,9 +170,6 @@ class DataParallelController:
 
     def update_ranks(self, ranks: Ranks):
         self.status = ranks.status
-        print("NEW RANKS!!!")
-        print(self.status)
-        print("END!!!!!")
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -448,10 +445,6 @@ class DataParallelController:
         if self.server_args.disaggregation_mode == "null":
             while True:
                 if self.status[self.round_robin_counter] == 1:
-                    print("ATTION !!!!!!!")
-                    print(self.round_robin_counter)
-                    print(self.status)
-                    print("END!!!!!!!")
                     self.workers[self.round_robin_counter].send_pyobj(req)
                     self.round_robin_counter = (self.round_robin_counter + 1) % len(
                         self.workers
