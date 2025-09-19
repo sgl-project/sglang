@@ -59,7 +59,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         max_slice_size = output_dim
         return chunked_sgmv_lora_expand_forward(
             x=x,
-            lora_weight_b=weights,
+            weights=weights,
             batch_info=self.batch_info,
             slice_offsets=output_offset,
             max_slice_size=max_slice_size,
@@ -91,7 +91,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
         lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
-            lora_weight_b=qkv_lora_b,
+            weights=qkv_lora_b,
             batch_info=self.batch_info,
             slice_offsets=output_offset,
             max_slice_size=max_qkv_out_dim,
@@ -125,7 +125,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
         lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
-            lora_weight_b=gate_up_lora_b,
+            weights=gate_up_lora_b,
             batch_info=self.batch_info,
             slice_offsets=output_offset,
             max_slice_size=output_dim,
