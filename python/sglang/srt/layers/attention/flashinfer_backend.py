@@ -1432,6 +1432,9 @@ def fast_decode_plan(
                     head_dim,
                     head_dim,
                     False,  # causal
+                    window_left,
+                    -1,
+                    False,
                 )
             except Exception as e:
                 raise RuntimeError(f"Error in standard plan: {e}")
