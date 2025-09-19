@@ -340,6 +340,11 @@ pub struct ChatCompletionRequest {
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,
+
+    /// Enable parallel batch processing (SGLang extension)
+    /// When true and batch detected, distribute items across multiple workers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_batch: Option<bool>,
 }
 
 impl GenerationRequest for ChatCompletionRequest {
@@ -580,6 +585,11 @@ pub struct CompletionRequest {
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,
+
+    /// Enable parallel batch processing (SGLang extension)
+    /// When true and batch detected, distribute items across multiple workers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_batch: Option<bool>,
 
     /// Additional fields including bootstrap info for PD routing
     #[serde(flatten)]
@@ -1732,7 +1742,7 @@ pub struct GenerateRequest {
 
     /// Text input - SGLang native format
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
+    pub text: Option<StringOrArray>,
 
     /// Input IDs for tokenized input
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1770,6 +1780,11 @@ pub struct GenerateRequest {
     /// Request ID for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
+
+    /// Enable parallel batch processing (SGLang extension)
+    /// When true and batch detected, distribute items across multiple workers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_batch: Option<bool>,
 }
 
 impl GenerationRequest for GenerateRequest {
@@ -1785,7 +1800,10 @@ impl GenerationRequest for GenerateRequest {
     fn extract_text_for_routing(&self) -> String {
         // Check fields in priority order: text, prompt, inputs
         if let Some(ref text) = self.text {
-            return text.clone();
+            return match text {
+                StringOrArray::String(s) => s.clone(),
+                StringOrArray::Array(v) => v.join(" "),
+            };
         }
 
         if let Some(ref prompt) = self.prompt {

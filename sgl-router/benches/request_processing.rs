@@ -44,6 +44,7 @@ fn default_generate_request() -> GenerateRequest {
         session_params: None,
         return_hidden_states: false,
         rid: None,
+        parallel_batch: None,
     }
 }
 
@@ -92,6 +93,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         stream_reasoning: true,
         chat_template_kwargs: None,
         return_hidden_states: false,
+        parallel_batch: None,
     }
 }
 
@@ -132,6 +134,7 @@ fn default_completion_request() -> CompletionRequest {
         lora_path: None,
         session_params: None,
         return_hidden_states: false,
+        parallel_batch: None,
         other: serde_json::Map::new(),
     }
 }
@@ -139,7 +142,9 @@ fn default_completion_request() -> CompletionRequest {
 // Sample request data for benchmarks
 fn create_sample_generate_request() -> GenerateRequest {
     GenerateRequest {
-        text: Some("Write a story about artificial intelligence".to_string()),
+        text: Some(StringOrArray::String(
+            "Write a story about artificial intelligence".to_string(),
+        )),
         parameters: Some(GenerateParameters {
             max_new_tokens: Some(100),
             temperature: Some(0.8),
@@ -459,17 +464,19 @@ fn bench_throughput_by_size(c: &mut Criterion) {
 
     // Create requests of different sizes
     let small_generate = GenerateRequest {
-        text: Some("Hi".to_string()),
+        text: Some(StringOrArray::String("Hi".to_string())),
         ..default_generate_request()
     };
 
     let medium_generate = GenerateRequest {
-        text: Some("Write a medium length story about AI".repeat(10)),
+        text: Some(StringOrArray::String(
+            "Write a medium length story about AI".repeat(10),
+        )),
         ..default_generate_request()
     };
 
     let large_generate = GenerateRequest {
-        text: Some("Write a very long and detailed story about artificial intelligence and its impact on society".repeat(100)),
+        text: Some(StringOrArray::String("Write a very long and detailed story about artificial intelligence and its impact on society".repeat(100))),
         ..default_generate_request()
     };
 
