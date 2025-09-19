@@ -43,7 +43,7 @@ jobs:
       - name: Push HTML to sgl-project.github.io
         timeout-minutes: 60
         env:
-          GITHUB_TOKEN: ${{ secrets.DOCUMENTATION_PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_DOCUMENTATION }}
         run: |
           cd docs
           make html

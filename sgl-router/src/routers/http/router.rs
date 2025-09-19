@@ -547,7 +547,7 @@ impl Router {
 
                 // Keep a clone for potential cleanup on retry
                 let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone_worker())
+                    Some(worker.clone())
                 } else {
                     None
                 };

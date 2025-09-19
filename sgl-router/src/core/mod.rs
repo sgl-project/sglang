@@ -11,6 +11,7 @@ pub mod error;
 pub mod retry;
 pub mod token_bucket;
 pub mod worker;
+pub mod worker_builder;
 pub mod worker_registry;
 
 // Re-export commonly used types at the module level
@@ -23,4 +24,5 @@ pub use worker::{
     start_health_checker, BasicWorker, ConnectionMode, DPAwareWorker, HealthChecker, HealthConfig,
     Worker, WorkerCollection, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
+pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};

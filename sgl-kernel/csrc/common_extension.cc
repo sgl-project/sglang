@@ -104,6 +104,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
   m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
 
+  m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
+  m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
+
   /*
    * From csrc/gemm
    */
@@ -287,6 +290,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
       "Tensor target_predict, int cuda_stream) -> ()");
   m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
+
+  m.def(
+      "reconstruct_indices_from_tree_mask(Tensor tree_mask, Tensor verified_seq_len, Tensor positions, "
+      "Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "int batch_size, int draft_token_num) -> ()");
+  m.impl("reconstruct_indices_from_tree_mask", torch::kCUDA, &reconstruct_indices_from_tree_mask);
 
   m.def(
       "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "

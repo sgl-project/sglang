@@ -74,16 +74,6 @@ if should_use_flashinfer_trtllm_moe():
 logger = logging.getLogger(__name__)
 
 
-def _is_fp4_quantization_enabled():
-    """Check if ModelOpt FP4 quantization is enabled."""
-    try:
-        # Use the same simple check that works for class selection
-        quantization = global_server_args_dict.get("quantization")
-        return quantization == "modelopt_fp4"
-    except:
-        return False
-
-
 def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
     # Guess tokens per expert assuming perfect expert distribution first.
     num_tokens_per_expert = (num_tokens * top_k) // num_experts

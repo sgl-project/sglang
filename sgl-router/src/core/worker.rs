@@ -75,9 +75,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get worker-specific metadata
     fn metadata(&self) -> &WorkerMetadata;
 
-    /// Clone the worker (for trait objects)
-    fn clone_worker(&self) -> Box<dyn Worker>;
-
     /// Get the circuit breaker for this worker
     fn circuit_breaker(&self) -> &CircuitBreaker;
 
@@ -557,10 +554,6 @@ impl Worker for BasicWorker {
         &self.metadata
     }
 
-    fn clone_worker(&self) -> Box<dyn Worker> {
-        Box::new(self.clone())
-    }
-
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
     }
@@ -586,6 +579,22 @@ impl DPAwareWorker {
         let worker_url = format!("{}@{}", base_url, dp_rank);
         let base_worker = BasicWorker::new(worker_url, worker_type);
 
+        Self {
+            base_worker,
+            dp_rank,
+            dp_size,
+            base_url,
+        }
+    }
+
+    /// Create a new DP-aware worker with a pre-configured base worker
+    /// This is primarily used by the builder pattern
+    pub fn with_base_worker(
+        base_worker: BasicWorker,
+        base_url: String,
+        dp_rank: usize,
+        dp_size: usize,
+    ) -> Self {
         Self {
             base_worker,
             dp_rank,
@@ -648,10 +657,6 @@ impl Worker for DPAwareWorker {
 
     fn metadata(&self) -> &WorkerMetadata {
         self.base_worker.metadata()
-    }
-
-    fn clone_worker(&self) -> Box<dyn Worker> {
-        Box::new(self.clone())
     }
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
@@ -807,6 +812,37 @@ impl WorkerFactory {
         circuit_breaker_config: CircuitBreakerConfig,
     ) -> Box<dyn Worker> {
         let mut worker = BasicWorker::new(url.clone(), WorkerType::Regular)
+            .with_circuit_breaker_config(circuit_breaker_config);
+
+        // Add labels to metadata
+        worker.metadata.labels = labels;
+
+        Box::new(worker)
+    }
+
+    /// Create a prefill worker with labels
+    pub fn create_prefill_with_labels(
+        url: String,
+        bootstrap_port: Option<u16>,
+        labels: std::collections::HashMap<String, String>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        let mut worker = BasicWorker::new(url.clone(), WorkerType::Prefill { bootstrap_port })
+            .with_circuit_breaker_config(circuit_breaker_config);
+
+        // Add labels to metadata
+        worker.metadata.labels = labels;
+
+        Box::new(worker)
+    }
+
+    /// Create a decode worker with labels
+    pub fn create_decode_with_labels(
+        url: String,
+        labels: std::collections::HashMap<String, String>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        let mut worker = BasicWorker::new(url.clone(), WorkerType::Decode)
             .with_circuit_breaker_config(circuit_breaker_config);
 
         // Add labels to metadata
@@ -1073,7 +1109,7 @@ pub fn start_health_checker(
 
             // Check health of all workers
             let workers_to_check = match workers.read() {
-                Ok(guard) => guard.iter().map(|w| w.clone_worker()).collect::<Vec<_>>(),
+                Ok(guard) => guard.clone(),
                 Err(poisoned) => {
                     tracing::error!("Worker lock poisoned: {}", poisoned);
                     continue;
@@ -1082,7 +1118,7 @@ pub fn start_health_checker(
 
             // Periodically reset load counters to prevent drift
             // Only do this when we believe all workers should be idle
-            if check_count % LOAD_RESET_INTERVAL == 0 {
+            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
                 let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
                 // Only reset if load appears to be very low (likely drift)
                 if max_load <= 2 {
@@ -1131,10 +1167,8 @@ pub fn start_health_checker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::RwLock;
     use std::thread;
     use std::time::Duration;
-    use tokio::time::timeout;
 
     // Test WorkerType
     #[test]
@@ -1343,27 +1377,6 @@ mod tests {
             worker.increment_processed();
             assert_eq!(worker.processed_requests(), i);
         }
-    }
-
-    #[test]
-    fn test_clone_worker() {
-        let original = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
-        original.increment_load();
-        original.increment_processed();
-        original.set_healthy(false);
-
-        let cloned = original.clone_worker();
-
-        // Verify cloned worker has same URL and type
-        assert_eq!(cloned.url(), original.url());
-        assert_eq!(cloned.worker_type(), original.worker_type());
-
-        // Load counters should be independent (cloned shares the Arc)
-        assert_eq!(cloned.load(), original.load());
-
-        // Modify original and verify clone is affected (shared state)
-        original.increment_load();
-        assert_eq!(cloned.load(), original.load());
     }
 
     // Test concurrent operations
@@ -1693,39 +1706,6 @@ mod tests {
         // but it tests that the sync wrapper doesn't panic
         let result = worker.check_health();
         assert!(result.is_err());
-    }
-
-    // Test HealthChecker background task
-    #[tokio::test]
-    async fn test_health_checker_startup() {
-        let worker = Arc::new(BasicWorker::new(
-            "http://w1:8080".to_string(),
-            WorkerType::Regular,
-        )) as Arc<dyn Worker>;
-        let workers = Arc::new(RwLock::new(vec![worker]));
-
-        let checker = start_health_checker(workers.clone(), 60);
-
-        // Verify it starts without panic
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Shutdown
-        checker.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_health_checker_shutdown() {
-        let worker = Arc::new(BasicWorker::new(
-            "http://w1:8080".to_string(),
-            WorkerType::Regular,
-        )) as Arc<dyn Worker>;
-        let workers = Arc::new(RwLock::new(vec![worker]));
-
-        let checker = start_health_checker(workers.clone(), 60);
-
-        // Shutdown should complete quickly
-        let shutdown_result = timeout(Duration::from_secs(1), checker.shutdown()).await;
-        assert!(shutdown_result.is_ok());
     }
 
     // Performance test for load counter

@@ -9,6 +9,7 @@ on:
     branches: [ main ]
     paths:
       - "sgl-router/**"
+    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -21,7 +22,7 @@ env:
 
 jobs:
   unit-test-rust:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -81,7 +82,7 @@ jobs:
         run: sccache --show-stats
 
   pytest-rust:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: BM.A10.4
     timeout-minutes: 25
     steps:

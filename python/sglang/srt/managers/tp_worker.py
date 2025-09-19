@@ -29,6 +29,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -149,8 +150,8 @@ class TpModelWorker:
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
         assert (
-            self.max_queued_requests > 0
-        ), "max_queued_requests is zero. We need to be at least 1 to schedule a request."
+            self.max_queued_requests is None or self.max_queued_requests >= 1
+        ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
@@ -301,6 +302,12 @@ class TpModelWorker:
             recv_req.world_size,
             recv_req.group_name,
             recv_req.backend,
+        )
+        return success, message
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        success, message = self.model_runner.destroy_weights_update_group(
+            recv_req.group_name,
         )
         return success, message
 

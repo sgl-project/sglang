@@ -67,6 +67,23 @@ pub struct RouterConfig {
     pub model_path: Option<String>,
     /// Explicit tokenizer path (overrides model_path tokenizer if provided)
     pub tokenizer_path: Option<String>,
+    /// History backend configuration (memory or none, default: memory)
+    #[serde(default = "default_history_backend")]
+    pub history_backend: HistoryBackend,
+}
+
+fn default_history_backend() -> HistoryBackend {
+    HistoryBackend::Memory
+}
+
+/// History backend configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryBackend {
+    /// In-memory storage (default)
+    Memory,
+    /// No history storage
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -363,6 +380,7 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: default_history_backend(),
         }
     }
 }
@@ -484,31 +502,9 @@ mod tests {
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
             port: 8080,
-            max_payload_size: 1024,
-            request_timeout_secs: 30,
-            worker_startup_timeout_secs: 60,
-            worker_startup_check_interval_secs: 5,
-            dp_aware: false,
-            api_key: None,
-            discovery: Some(DiscoveryConfig::default()),
-            metrics: Some(MetricsConfig::default()),
             log_dir: Some("/var/log".to_string()),
             log_level: Some("debug".to_string()),
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: HealthCheckConfig::default(),
-            enable_igw: false,
-            queue_size: 100,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
-            connection_mode: ConnectionMode::Http,
-            model_path: None,
-            tokenizer_path: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -517,8 +513,11 @@ mod tests {
         assert_eq!(config.host, deserialized.host);
         assert_eq!(config.port, deserialized.port);
         assert_eq!(config.max_payload_size, deserialized.max_payload_size);
-        assert!(deserialized.discovery.is_some());
-        assert!(deserialized.metrics.is_some());
+        assert_eq!(config.log_dir, deserialized.log_dir);
+        assert_eq!(config.log_level, deserialized.log_level);
+        // discovery and metrics are None in Default implementation
+        assert!(deserialized.discovery.is_none());
+        assert!(deserialized.metrics.is_none());
     }
 
     // ============= RoutingMode Tests =============
@@ -948,6 +947,7 @@ mod tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: default_history_backend(),
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1011,6 +1011,7 @@ mod tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: default_history_backend(),
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1070,6 +1071,7 @@ mod tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: default_history_backend(),
         };
 
         assert!(config.has_service_discovery());

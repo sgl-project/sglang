@@ -164,10 +164,19 @@ class DeepEPBuffer:
                 num_rdma_bytes,
             )
 
+        # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
         if deepep_mode == DeepEPMode.NORMAL:
-            num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
-        elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            num_qps_per_rank = DeepEPConfig.get_instance().num_sms
+        elif deepep_mode == DeepEPMode.LOW_LATENCY:
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
             num_qps_per_rank = num_experts // group.size()
+        elif deepep_mode == DeepEPMode.AUTO:
+            # low-latency and normal mode all need run
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            num_qps_per_rank = max(
+                DeepEPConfig.get_instance().num_sms, num_experts // group.size()
+            )
         else:
             raise NotImplementedError
 
