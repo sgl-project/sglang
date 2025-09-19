@@ -101,6 +101,9 @@ class RouterArgs:
     oracle_pool_min: int = 1
     oracle_pool_max: int = 16
     oracle_pool_timeout_secs: int = 30
+    # Trace
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
 
     @staticmethod
     def add_cli_args(
@@ -545,6 +548,17 @@ class RouterArgs:
                 os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
             ),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
+        )
+        parser.add_argument(
+            f"--{prefix}enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            f"--{prefix}otlp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
 
     @classmethod
