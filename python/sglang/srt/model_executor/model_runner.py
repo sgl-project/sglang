@@ -535,7 +535,6 @@ class ModelRunner:
                     "cutlass_mla",
                     "trtllm_mla",
                     "ascend",
-                    "intel_xpu",
                 ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
