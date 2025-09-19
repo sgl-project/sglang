@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+SPLIT_SIZE = 128
 
 class TreeNode:
 
@@ -123,6 +124,11 @@ class RadixCache(BasePrefixCache):
         disable: bool = False,
         enable_kv_cache_events: bool = False,
     ):
+        if SPLIT_SIZE != 0:
+            if page_size != 1:
+                raise ValueError("SPLIT_SIZE is not supported for page_size != 1")
+            page_size = SPLIT_SIZE
+
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
@@ -166,7 +172,7 @@ class RadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
-        if self.disable or len(key) == 0:
+        def empty_match_result():
             return MatchResult(
                 device_indices=torch.empty(
                     (0,),
@@ -177,9 +183,15 @@ class RadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
+        if self.disable or len(key) == 0:
+            return empty_match_result()
+
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
+
+        if len(key) == 0:
+            return empty_match_result()
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
@@ -437,7 +449,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
-            self.evictable_size_ += len(value)
+            self.evictable_size_ += len(key)
             self._record_store_event(new_node)
         return total_prefix_length
 

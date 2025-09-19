@@ -866,7 +866,7 @@ class FlashInferIndicesUpdaterPrefill:
             assert self.attn_backend.num_wrappers == 1
             self.update = self.update_single_wrapper
 
-        self.fixed_split_size = 4096
+        self.fixed_split_size = 128
 
     def update(
         self,
@@ -1020,7 +1020,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         use_sliding_window_kv_pool: bool = False,
-        fixed_split_size: int = 4096,
+        fixed_split_size: int = 128,
     ):
         bs = len(seq_lens)
         if spec_info is None:
