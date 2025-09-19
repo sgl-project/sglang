@@ -526,7 +526,9 @@ def get_cmo_stream():
 def prepare_weight_cache(handle, cache):
     import torch_npu
 
-    PREFETCH_MAX_SIZE = 1000000000
+    NPU_PREFETCH_MAX_SIZE_BYTES = (
+        1000000000  # 1GB, a large value to prefetch entire weight
+    )
     stream = get_cmo_stream()
     stream.wait_stream(torch.npu.current_stream())
     with torch.npu.stream(stream):
@@ -535,13 +537,13 @@ def prepare_weight_cache(handle, cache):
                 torch_npu.npu_prefetch(
                     weight,
                     handle,
-                    PREFETCH_MAX_SIZE,
+                    NPU_PREFETCH_MAX_SIZE_BYTES,
                 )
         else:
             torch_npu.npu_prefetch(
                 cache,
                 handle,
-                PREFETCH_MAX_SIZE,
+                NPU_PREFETCH_MAX_SIZE_BYTES,
             )
 
 
