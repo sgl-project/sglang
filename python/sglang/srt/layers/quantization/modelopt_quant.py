@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -712,6 +713,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
+        self.gemm_backend = os.environ.get("SGLANG_FP4_GEMM_BACKEND")
 
     def create_weights(
         self,
@@ -856,6 +858,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             w_scale_interleaved,
             layer.alpha,
             output_dtype,
+            **(dict(backend=x) if (x := self.gemm_backend) is not None else dict()),
         )
         if bias is not None:
             out = out + bias
