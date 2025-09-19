@@ -2,7 +2,7 @@
 
 use crate::config::types::RetryConfig;
 use crate::core::{
-    BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig, Worker, WorkerType,
+    BasicWorkerBuilder, CircuitBreakerConfig, HealthChecker, HealthConfig, Worker, WorkerType,
 };
 use crate::grpc::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
@@ -108,20 +108,19 @@ impl GrpcRouter {
         // Move clients from the HashMap to the workers
         for url in &worker_urls {
             if let Some(client) = grpc_clients.remove(url) {
-                let worker = BasicWorker::with_connection_mode(
-                    url.clone(),
-                    WorkerType::Regular,
-                    crate::core::ConnectionMode::Grpc { port: None },
-                )
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: ctx.router_config.health_check.timeout_secs,
-                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                    endpoint: ctx.router_config.health_check.endpoint.clone(),
-                    failure_threshold: ctx.router_config.health_check.failure_threshold,
-                    success_threshold: ctx.router_config.health_check.success_threshold,
-                })
-                .with_grpc_client(client);
+                let worker = BasicWorkerBuilder::new(url.clone())
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(crate::core::ConnectionMode::Grpc { port: None })
+                    .circuit_breaker_config(core_cb_config.clone())
+                    .health_config(HealthConfig {
+                        timeout_secs: ctx.router_config.health_check.timeout_secs,
+                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                        endpoint: ctx.router_config.health_check.endpoint.clone(),
+                        failure_threshold: ctx.router_config.health_check.failure_threshold,
+                        success_threshold: ctx.router_config.health_check.success_threshold,
+                    })
+                    .grpc_client(client)
+                    .build();
 
                 workers.push(Arc::new(worker) as Arc<dyn Worker>);
             } else {

@@ -119,7 +119,10 @@ Note: If `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting
 
 Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` layout (which optimizes memory access patterns for KV cache operations).
 
-There are two ways to configure Mooncake: 1. Using environment variables; 2. Using extra-config of sglang arguments.
+There are three ways to prepare mooncakes:
+1. Use environment variables;
+2. Use json configuration files;
+3. Additional configuration using the sglang parameter.
 
 **Using env variables to configure Mooncake**
 
@@ -142,6 +145,21 @@ Parameter Explanation:
 * `MOONCAKE_PROTOCOL`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
 * `MOONCAKE_DEVICE`: The RDMA devices used by Mooncake. This parameter is required only when the protocol is set to `"rdma"`. Available devices can be listed using the `ibv_devices` command.
 * `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory (in bytes) contributed to the global memory pool. If at least one `store service` is launched, then this value could be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
+
+**Using JSON file to configure Mooncake**
+
+```bash
+export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicache/mooncake_config.json
+echo '{
+    "local_hostname": "localhost",
+    "metadata_server": "http://localhost:8080/metadata",
+    "master_server_address": "localhost:50051",
+    "protocol": "rdma",
+    "device_name": "mlx5_0,mlx5_1",
+    "global_segment_size": 2684354560,
+    "local_buffer_size": 0
+}' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
+```
 
 **Using extra-config of sglang arguments to configure Mooncake**
 

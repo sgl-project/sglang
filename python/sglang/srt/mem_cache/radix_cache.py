@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.evict_policy import EvictionStrategy, LFUStrategy, LRUStrategy
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
@@ -122,6 +123,7 @@ class RadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
         enable_kv_cache_events: bool = False,
+        eviction_policy: str = "lru",
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -141,6 +143,15 @@ class RadixCache(BasePrefixCache):
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = lambda key: tuple(key[:page_size])
+
+        if eviction_policy.lower() == "lru":
+            self.eviction_strategy: EvictionStrategy = LRUStrategy()
+        elif eviction_policy.lower() == "lfu":
+            self.eviction_strategy: EvictionStrategy = LFUStrategy()
+        else:
+            raise ValueError(
+                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu'."
+            )
         self.reset()
 
     ##### Public API #####
@@ -296,11 +307,14 @@ class RadixCache(BasePrefixCache):
             return
 
         leaves = self._collect_leaves()
-        heapq.heapify(leaves)
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node) for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
 
         num_evicted = 0
-        while num_evicted < num_tokens and len(leaves):
-            x = heapq.heappop(leaves)
+        while num_evicted < num_tokens and len(eviction_heap):
+            _priority, x = heapq.heappop(eviction_heap)
 
             if x == self.root_node:
                 break
@@ -312,7 +326,8 @@ class RadixCache(BasePrefixCache):
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0:
-                heapq.heappush(leaves, x.parent)
+                new_priority = self.eviction_strategy.get_priority(x.parent)
+                heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
 

@@ -2,7 +2,7 @@
 
 use crate::config::types::RetryConfig;
 use crate::core::{
-    BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig, Worker, WorkerType,
+    BasicWorkerBuilder, CircuitBreakerConfig, HealthChecker, HealthConfig, Worker, WorkerType,
 };
 use crate::grpc::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
@@ -130,23 +130,22 @@ impl GrpcPDRouter {
         let prefill_workers: Vec<Arc<dyn Worker>> = prefill_urls
             .iter()
             .map(|(url, bootstrap_port)| {
-                let worker = BasicWorker::with_connection_mode(
-                    url.clone(),
-                    WorkerType::Prefill {
+                let worker = BasicWorkerBuilder::new(url.clone())
+                    .worker_type(WorkerType::Prefill {
                         bootstrap_port: *bootstrap_port,
-                    },
-                    crate::core::ConnectionMode::Grpc {
+                    })
+                    .connection_mode(crate::core::ConnectionMode::Grpc {
                         port: *bootstrap_port,
-                    },
-                )
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: ctx.router_config.health_check.timeout_secs,
-                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                    endpoint: ctx.router_config.health_check.endpoint.clone(),
-                    failure_threshold: ctx.router_config.health_check.failure_threshold,
-                    success_threshold: ctx.router_config.health_check.success_threshold,
-                });
+                    })
+                    .circuit_breaker_config(core_cb_config.clone())
+                    .health_config(HealthConfig {
+                        timeout_secs: ctx.router_config.health_check.timeout_secs,
+                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                        endpoint: ctx.router_config.health_check.endpoint.clone(),
+                        failure_threshold: ctx.router_config.health_check.failure_threshold,
+                        success_threshold: ctx.router_config.health_check.success_threshold,
+                    })
+                    .build();
                 Arc::new(worker) as Arc<dyn Worker>
             })
             .collect();
@@ -155,19 +154,18 @@ impl GrpcPDRouter {
         let decode_workers: Vec<Arc<dyn Worker>> = decode_urls
             .iter()
             .map(|url| {
-                let worker = BasicWorker::with_connection_mode(
-                    url.clone(),
-                    WorkerType::Decode,
-                    crate::core::ConnectionMode::Grpc { port: None },
-                )
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: ctx.router_config.health_check.timeout_secs,
-                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                    endpoint: ctx.router_config.health_check.endpoint.clone(),
-                    failure_threshold: ctx.router_config.health_check.failure_threshold,
-                    success_threshold: ctx.router_config.health_check.success_threshold,
-                });
+                let worker = BasicWorkerBuilder::new(url.clone())
+                    .worker_type(WorkerType::Decode)
+                    .connection_mode(crate::core::ConnectionMode::Grpc { port: None })
+                    .circuit_breaker_config(core_cb_config.clone())
+                    .health_config(HealthConfig {
+                        timeout_secs: ctx.router_config.health_check.timeout_secs,
+                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                        endpoint: ctx.router_config.health_check.endpoint.clone(),
+                        failure_threshold: ctx.router_config.health_check.failure_threshold,
+                        success_threshold: ctx.router_config.health_check.success_threshold,
+                    })
+                    .build();
                 Arc::new(worker) as Arc<dyn Worker>
             })
             .collect();

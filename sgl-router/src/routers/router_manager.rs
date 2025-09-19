@@ -5,7 +5,7 @@
 //! - Multi-Router Mode (enable_igw=true): RouterManager coordinates everything
 
 use crate::config::RouterConfig;
-use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
+use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig, Worker, WorkerRegistry, WorkerType};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesRequest,
@@ -208,22 +208,29 @@ impl RouterManager {
         }
 
         let worker = match config.worker_type.as_deref() {
-            Some("prefill") => WorkerFactory::create_prefill_with_labels(
-                config.url.clone(),
-                config.bootstrap_port,
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            Some("decode") => WorkerFactory::create_decode_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            _ => WorkerFactory::create_regular_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
+            Some("prefill") => Box::new(
+                BasicWorkerBuilder::new(config.url.clone())
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: config.bootstrap_port,
+                    })
+                    .labels(labels.clone())
+                    .circuit_breaker_config(CircuitBreakerConfig::default())
+                    .build(),
+            ) as Box<dyn Worker>,
+            Some("decode") => Box::new(
+                BasicWorkerBuilder::new(config.url.clone())
+                    .worker_type(WorkerType::Decode)
+                    .labels(labels.clone())
+                    .circuit_breaker_config(CircuitBreakerConfig::default())
+                    .build(),
+            ) as Box<dyn Worker>,
+            _ => Box::new(
+                BasicWorkerBuilder::new(config.url.clone())
+                    .worker_type(WorkerType::Regular)
+                    .labels(labels.clone())
+                    .circuit_breaker_config(CircuitBreakerConfig::default())
+                    .build(),
+            ) as Box<dyn Worker>,
         };
 
         // Register worker

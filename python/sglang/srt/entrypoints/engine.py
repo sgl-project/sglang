@@ -47,6 +47,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -433,6 +434,19 @@ class Engine(EngineBase):
             self.tokenizer_manager.init_weights_update_group(obj, None)
         )
 
+    def destroy_weights_update_group(
+        self,
+        group_name: str,
+    ):
+        """Destroy parameter update group."""
+        obj = DestroyWeightsUpdateGroupReqInput(
+            group_name=group_name,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.destroy_weights_update_group(obj, None)
+        )
+
     def update_weights_from_distributed(
         self,
         names: list[str],
@@ -689,7 +703,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.3.1",
+            "0.4.0rc1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -697,7 +711,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.10",
+            "0.3.11",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

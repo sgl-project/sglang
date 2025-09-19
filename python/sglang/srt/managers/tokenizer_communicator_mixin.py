@@ -24,6 +24,8 @@ import zmq
 from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -149,6 +151,9 @@ class TokenizerCommunicatorMixin:
         self.init_weights_update_group_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.destroy_weights_update_group_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.update_weights_from_distributed_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -206,6 +211,10 @@ class TokenizerCommunicatorMixin:
                 (
                     InitWeightsUpdateGroupReqOutput,
                     self.init_weights_update_group_communicator.handle_recv,
+                ),
+                (
+                    DestroyWeightsUpdateGroupReqOutput,
+                    self.destroy_weights_update_group_communicator.handle_recv,
                 ),
                 (
                     UpdateWeightsFromDistributedReqOutput,
@@ -343,6 +352,18 @@ class TokenizerCommunicatorMixin:
             self.server_args.dp_size == 1
         ), "dp_size must be 1 for init parameter update group"
         result = (await self.init_weights_update_group_communicator(obj))[0]
+        return result.success, result.message
+
+    async def destroy_weights_update_group(
+        self,
+        obj: DestroyWeightsUpdateGroupReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for destroy parameter update group"
+        result = (await self.destroy_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
     async def update_weights_from_distributed(
