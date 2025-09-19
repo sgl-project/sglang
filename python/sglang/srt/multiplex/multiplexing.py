@@ -25,7 +25,14 @@ class SchedulerMultiplexMixin:
     def adjust_stream_groups(self) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
         if not self.running_batch.is_empty() and self.split_prefill_batch:
             decode_bs = self.running_batch.batch_size()
-            stream_idx =  max(1, min(self.real_sm_group_num - 2, decode_bs * (self.real_sm_group_num - 2) // 36))
+            manual_divisions = self.pdmux_config.manual_divisions
+            if manual_divisions:
+                for i in range(len(manual_divisions)):
+                    _, _, threshold = manual_divisions[i]
+                    if decode_bs >= threshold:
+                        stream_idx = i + 1
+            else:
+                stream_idx =  max(1, min(self.real_sm_group_num - 2, decode_bs * (self.real_sm_group_num - 2) // 36))
             set_current_stream_idx(stream_idx)
         elif not self.running_batch.is_empty():
             set_current_stream_idx(self.real_sm_group_num - 1)
@@ -65,9 +72,7 @@ class SchedulerMultiplexMixin:
         torch.cuda.empty_cache()
 
         logger.debug("Starting event loop for pd multiplexing...")
-        logger.debug(
-            f"sm_counts: {len(self.sm_counts)}\n mem:{torch.cuda.memory_allocated()}"
-        )
+        
         while True:
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
@@ -90,7 +95,6 @@ class SchedulerMultiplexMixin:
                     and self.running_batch.is_empty()
                 )
                 if self.running_batch.is_empty() and self.split_prefill_batch is None:
-                    # print(f"Running batch is None or empty, stream_idx: {stream_idx}, sm_counts: {self.sm_counts}")
                     self.check_memory()
                     self.check_tree_cache()
                     self.new_token_ratio = self.init_new_token_ratio
@@ -104,14 +108,13 @@ class SchedulerMultiplexMixin:
                 decode_stream = stream_group[1]
                 adjust_stream_group = False
                 logger.debug(
-                    f"Adjusting stream groups: {stream_idx}, prefill sm:{self.sm_counts[stream_idx][0]}, decode sm:{self.sm_counts[stream_idx][1]}"
+                    f"Adjusting stream groups: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"
                 )
 
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 # process decode batch
                 if self.running_batch and not self.running_batch.is_empty():
-                    # logger.debug("Running decode batch...")
                     decode_result = self.run_batch(self.running_batch)
                     decode_done = True
                 else:
@@ -127,7 +130,7 @@ class SchedulerMultiplexMixin:
                     forward_count = (
                         max(
                             1,
-                            65536
+                            self.pdmux_config.split_forward_token_budget
                             // self.split_prefill_batch.extend_num_tokens,
                         )
                         if self.split_prefill_batch.extend_num_tokens > 0
@@ -141,9 +144,6 @@ class SchedulerMultiplexMixin:
                         next_split_index - self.split_prefill_batch.split_index
                     )
 
-                    # logger.debug(
-                    #     f"Running split prefill batch {self.split_prefill_batch.split_index} with forward count: {forward_count}..."
-                    # )
                     self.split_prefill_batch.split_forward_count = forward_count
                     prefill_result = self.run_batch(self.split_prefill_batch)
                     if next_split_index == self.model_config.num_hidden_layers:
@@ -160,7 +160,6 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 decode_stream.synchronize()
                 if decode_done:
-                    # logger.debug(f"Processing decode batch result...")
                     self.process_batch_result(self.running_batch, decode_result)
 
             with torch.cuda.stream(prefill_stream):
@@ -175,9 +174,7 @@ class SchedulerMultiplexMixin:
                     )
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
-                    # print(f"Flags after allreduce: {flags.item()}")
                     if flags.item() == self.tp_size:
-                        # logger.debug(f"Processing prefill batch result...")
                         self.process_batch_result(self.split_prefill_batch, prefill_result)
                         if self.running_batch and not self.running_batch.is_empty():
                             self.running_batch.merge_batch(self.split_prefill_batch)

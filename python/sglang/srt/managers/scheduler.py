@@ -147,6 +147,7 @@ from sglang.srt.multiplex.pdmux_context import (
     get_sm_counts,
     get_stream_groups,
     initialize_stream_groups,
+    load_pdmux_config,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -310,10 +311,14 @@ class Scheduler(
 
         if self.enable_pdmux:
             # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
-            initialize_stream_groups(gpu_id, server_args.sm_group_num - 2)
+            self.pdmux_config = load_pdmux_config(server_args.pdmux_config_path)
+            initialize_stream_groups(gpu_id, self.pdmux_config)
             self.stream_groups = get_stream_groups()
             self.sm_counts = get_sm_counts()
             self.real_sm_group_num = len(self.stream_groups)
+            logger.info(
+                f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
+            )
 
         # Init tokenizer
         self.init_tokenizer()

@@ -373,6 +373,7 @@ class ServerArgs:
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
+    pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8
 
     # Deprecated arguments
@@ -2076,6 +2077,12 @@ class ServerArgs:
             action="store_true",
             help="Enable PD-Multiplexing, PD running on greenctx stream.",
         )
+        parser.add_argument(
+            "--pdmux-config-path",
+            type=str,
+            default=None,
+            help="The path of the PD-Multiplexing config file.",
+        )
 
         parser.add_argument(
             "--sm-group-num",
@@ -2204,13 +2211,11 @@ class ServerArgs:
             parts = torch.__version__.split("+", 1)[0].split(".")
             major = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
             minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-            logger.debug(
-                f"Detected torch version: {torch.__version__}, parsed as major: {major}, minor: {minor}"
-            )
-            if (major, minor) >= (2, 6):
+            if (major, minor) > (2, 6):
                 logger.warning(
-                    "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x "
-                    "Please manually install torch 2.6.x"
+                    "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x \n"
+                    f"  current torch version is {torch.__version__}. \n"
+                    "  Please manually install torch 2.6.x"
                 )
 
         # Check multi tokenizer
