@@ -128,8 +128,13 @@ impl GrpcRouter {
             }
         }
 
-        // Get workers from registry for policy initialization
-        let workers = worker_registry.get_by_type(&WorkerType::Regular);
+        // Get only gRPC workers from registry for policy initialization
+        let workers = worker_registry.get_workers_filtered(
+            None, // any model
+            Some(WorkerType::Regular),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false, // include unhealthy workers during initialization
+        );
 
         // Initialize policy with workers if needed
         if let Some(cache_aware) = policy
@@ -285,7 +290,12 @@ impl WorkerManagement for GrpcRouter {
 
     fn get_worker_urls(&self) -> Vec<String> {
         self.worker_registry
-            .get_by_type(&WorkerType::Regular)
+            .get_workers_filtered(
+                None, // any model
+                Some(WorkerType::Regular),
+                Some(crate::core::ConnectionMode::Grpc { port: None }),
+                false, // include all workers
+            )
             .iter()
             .map(|w| w.url().to_string())
             .collect()

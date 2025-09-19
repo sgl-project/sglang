@@ -171,10 +171,15 @@ impl GrpcPDRouter {
             }
         }
 
-        // Initialize policies with workers if needed
-        let prefill_workers = worker_registry.get_by_type(&WorkerType::Prefill {
-            bootstrap_port: None,
-        });
+        // Initialize policies with workers if needed - filter for gRPC workers only
+        let prefill_workers = worker_registry.get_workers_filtered(
+            None, // any model
+            Some(WorkerType::Prefill {
+                bootstrap_port: None,
+            }),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false, // include unhealthy workers during initialization
+        );
         if let Some(cache_aware) = prefill_policy
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
@@ -182,7 +187,12 @@ impl GrpcPDRouter {
             cache_aware.init_workers(&prefill_workers);
         }
 
-        let decode_workers = worker_registry.get_by_type(&WorkerType::Decode);
+        let decode_workers = worker_registry.get_workers_filtered(
+            None, // any model
+            Some(WorkerType::Decode),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false, // include unhealthy workers during initialization
+        );
         if let Some(cache_aware) = decode_policy
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
@@ -212,10 +222,20 @@ impl GrpcPDRouter {
 
 impl std::fmt::Debug for GrpcPDRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let prefill_workers = self.worker_registry.get_by_type(&WorkerType::Prefill {
-            bootstrap_port: None,
-        });
-        let decode_workers = self.worker_registry.get_by_type(&WorkerType::Decode);
+        let prefill_workers = self.worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Prefill {
+                bootstrap_port: None,
+            }),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false,
+        );
+        let decode_workers = self.worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Decode),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false,
+        );
         f.debug_struct("GrpcPDRouter")
             .field("prefill_workers_count", &prefill_workers.len())
             .field("decode_workers_count", &decode_workers.len())
@@ -342,14 +362,24 @@ impl WorkerManagement for GrpcPDRouter {
     fn get_worker_urls(&self) -> Vec<String> {
         let mut urls = Vec::new();
 
-        // Get prefill worker URLs
-        let prefill_workers = self.worker_registry.get_by_type(&WorkerType::Prefill {
-            bootstrap_port: None,
-        });
+        // Get gRPC prefill worker URLs only
+        let prefill_workers = self.worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Prefill {
+                bootstrap_port: None,
+            }),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false,
+        );
         urls.extend(prefill_workers.iter().map(|w| w.url().to_string()));
 
-        // Get decode worker URLs
-        let decode_workers = self.worker_registry.get_by_type(&WorkerType::Decode);
+        // Get gRPC decode worker URLs only
+        let decode_workers = self.worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Decode),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false,
+        );
         urls.extend(decode_workers.iter().map(|w| w.url().to_string()));
 
         urls
