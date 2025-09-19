@@ -23,6 +23,7 @@ export ENABLE_METRICS="${ENABLE_METRICS:-false}"
 export H100_ONLY="${H100_ONLY:-false}"
 export AUTO_USE_FP8_ON_H100="${AUTO_USE_FP8_ON_H100:-false}"
 export SPEC_DECODE="${SPEC_DECODE:-}"  # if set to 1/true/yes enables speculative decoding
+export ALLOW_CONTINUE_ON_LOW_SHM="${ALLOW_CONTINUE_ON_LOW_SHM:-1}"
 
 export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
@@ -73,6 +74,86 @@ else
   log "SPEC_DECODE: (unset; speculative decoding disabled)"
 fi
 
+# Auto-detect TP early if not set, to make guards accurate
+if [[ -z "${TP_SIZE}" ]]; then
+  NGPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
+  if [[ "${NGPU}" -gt 0 ]]; then
+    if [[ "${NGPU}" -ge 8 ]]; then TP_CHOSEN=8
+    elif [[ "${NGPU}" -ge 4 ]]; then TP_CHOSEN=4
+    elif [[ "${NGPU}" -ge 2 ]]; then TP_CHOSEN=2
+    else TP_CHOSEN=1
+    fi
+    export TP_SIZE="${TP_CHOSEN}"
+    log "Auto-setting TP_SIZE=${TP_SIZE} based on ${NGPU} GPUs"
+  fi
+fi
+
+# Guard: detect small /dev/shm and fail-fast or auto-degrade; scale requirement by effective world size
+SHM_BYTES=$(df -B1 /dev/shm 2>/dev/null | awk 'NR==2 {print $2}')
+if [[ -z "${SHM_BYTES}" ]]; then SHM_BYTES=0; fi
+
+# Read PD disaggregation decode TP if provided (support two env spellings)
+DISAGG_DECODE_TP_VAL="${DISAGGREGATION_DECODE_TP:-${DISAGG_DECODE_TP:-}}"
+if [[ -z "${DISAGG_DECODE_TP_VAL}" ]]; then DISAGG_DECODE_TP_VAL=1; fi
+
+TP_CUR=${TP_SIZE:-1}
+EFFECTIVE_TP=${TP_CUR}
+if [[ "${DISAGG_DECODE_TP_VAL}" =~ ^[0-9]+$ ]] && [[ "${DISAGG_DECODE_TP_VAL}" -gt "${EFFECTIVE_TP}" ]]; then
+  EFFECTIVE_TP=${DISAGG_DECODE_TP_VAL}
+fi
+
+# Clamp effective TP to supported set {1,2,4,8}
+if [[ "${EFFECTIVE_TP}" -ge 8 ]]; then EFFECTIVE_TP=8
+elif [[ "${EFFECTIVE_TP}" -ge 4 ]]; then EFFECTIVE_TP=4
+elif [[ "${EFFECTIVE_TP}" -ge 2 ]]; then EFFECTIVE_TP=2
+else EFFECTIVE_TP=1
+fi
+
+# Defaults per parallel size; overridable via env
+default_bytes_for() {
+  case "$1" in
+    1) echo $((256 * 1024 * 1024)) ;;
+    2) echo $((512 * 1024 * 1024)) ;;
+    4) echo $((1024 * 1024 * 1024)) ;;
+    8) echo $((2 * 1024 * 1024 * 1024)) ;;
+    *) echo $((2 * 1024 * 1024 * 1024)) ;;
+  esac
+}
+
+override_bytes_env="MIN_SHM_BYTES_TP_${EFFECTIVE_TP}"
+MIN_REQUIRED=$(default_bytes_for "${EFFECTIVE_TP}")
+eval "OVERRIDE_VAL=\${${override_bytes_env}:-}"
+if [[ -n "${OVERRIDE_VAL}" ]]; then MIN_REQUIRED=${OVERRIDE_VAL}; fi
+
+# If too small, decide action
+if [[ "${EFFECTIVE_TP}" -ge 2 && "${SHM_BYTES}" -lt "${MIN_REQUIRED}" ]]; then
+  log "WARN: /dev/shm too small for effective parallel size=${EFFECTIVE_TP}."
+  log "  Detected /dev/shm: ${SHM_BYTES} bytes; required: ${MIN_REQUIRED} bytes."
+
+  ALLOW_CONTINUE_ON_LOW_SHM_LC=$(echo "${ALLOW_CONTINUE_ON_LOW_SHM:-}" | tr '[:upper:]' '[:lower:]')
+
+  if [[ "${ALLOW_CONTINUE_ON_LOW_SHM_LC}" =~ ^(1|true|yes)$ ]]; then
+    log "Continuing with TP_SIZE=${TP_CUR}, effective_parallel=${EFFECTIVE_TP}; NCCL may fail under load."
+  else
+    export TP_SIZE=1
+    EFFECTIVE_TP=1
+    log "Auto-degrading TP_SIZE to 1 due to small /dev/shm. Set ALLOW_CONTINUE_ON_LOW_SHM=1 to skip."
+  fi
+fi
+
+# Heuristic NCCL tuning by available shm
+channels=1
+buffsize=$((1 * 1024 * 1024))
+if [[ "${SHM_BYTES}" -ge $((2 * 1024 * 1024 * 1024)) ]]; then
+  channels=4; buffsize=$((4 * 1024 * 1024))
+elif [[ "${SHM_BYTES}" -ge $((1024 * 1024 * 1024)) ]]; then
+  channels=2; buffsize=$((2 * 1024 * 1024))
+fi
+export NCCL_MIN_NCHANNELS=${NCCL_MIN_NCHANNELS:-${channels}}
+export NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS:-${channels}}
+export NCCL_BUFFSIZE=${NCCL_BUFFSIZE:-${buffsize}}
+log "NCCL tuning: channels=${channels}, buffsize=${buffsize} bytes, shm=${SHM_BYTES} bytes"
+
 # Detect GPUs and optionally enforce H100-only
 GPU_NAMES=$(nvidia-smi --query-gpu=name --format=csv,noheader | tr '\n' ',' || true)
 log "Detected GPUs: ${GPU_NAMES}"
@@ -83,15 +164,6 @@ if [[ "${H100_ONLY}" == "true" ]]; then
   fi
 fi
 
-# If multiple GPUs and TP_SIZE is auto, set to number of GPUs up to 8
-if [[ -z "${TP_SIZE}" ]]; then
-  NGPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
-  if [[ "$NGPU" -gt 0 ]]; then
-    if [[ "$NGPU" -gt 8 ]]; then NGPU=8; fi
-    export TP_SIZE="$NGPU"
-    log "Auto-setting TP_SIZE=${TP_SIZE} based on ${NGPU} GPUs"
-  fi
-fi
 
 # Extra diagnostics to investigate NCCL/SHM issues
 log "==== Diagnostic: /dev/shm usage ===="

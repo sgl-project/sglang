@@ -254,6 +254,8 @@ async def lifespan(app: FastAPI):
             quantization=quant,
             kv_cache_dtype=kv_dtype,
             tp_size=CONFIG.tp_size,
+            disaggregation_decode_tp=os.environ.get("DISAGGREGATION_DECODE_TP") or os.environ.get("DISAGG_DECODE_TP"),
+            disaggregation_prefill_pp=os.environ.get("DISAGGREGATION_PREFILL_PP"),
             max_total_tokens=CONFIG.max_total_tokens,
             enable_memory_saver=getattr(CONFIG, "enable_memory_saver", True),
             disable_custom_all_reduce=True,

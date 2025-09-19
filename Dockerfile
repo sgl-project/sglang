@@ -20,6 +20,18 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV PATH=${CUDA_HOME}/bin:${PATH}
 ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
+# Safe NCCL defaults and async error handling
+ENV TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+    NCCL_DEBUG=INFO \
+    NCCL_DEBUG_SUBSYS=INIT,ENV,SHM,P2P,NET \
+    NCCL_P2P_LEVEL=SYS \
+    NCCL_IB_DISABLE=1 \
+    NCCL_P2P_DISABLE=1 \
+    NCCL_SHM_DISABLE=1 \
+    NCCL_BUFFSIZE=1048576 \
+    NCCL_MIN_NCHANNELS=1 \
+    NCCL_MAX_NCHANNELS=1
+
 # Copy the application code
 COPY .hathora_build/app/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
@@ -33,6 +45,9 @@ RUN chmod +x ./entrypoint.sh
 
 # Expose the port the app runs on
 EXPOSE 8000
+
+# Healthcheck for orchestrators
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 CMD curl -fsS http://127.0.0.1:8000/health || exit 1
 
 # Use entrypoint script
 ENTRYPOINT ["./entrypoint.sh"]
