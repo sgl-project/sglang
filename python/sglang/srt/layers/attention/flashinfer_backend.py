@@ -131,8 +131,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.enable_deterministic = (
             model_runner.server_args.enable_deterministic_inference
         )
-        self.prefill_split_tile_size = -1
-        self.decode_split_tile_size = -1
+        self.prefill_split_tile_size = None
+        self.decode_split_tile_size = None
         self.disable_cuda_graph_kv_split = False
         if self.enable_deterministic:
             self.decode_use_tensor_cores = True
@@ -373,7 +373,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
-                fixed_split_size=-1,
+                fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
@@ -467,7 +467,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
-                fixed_split_size=-1,
+                fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
         elif forward_mode.is_target_verify():
@@ -676,8 +676,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
-        fixed_split_size: Optional[int],
-        disable_split_kv: Optional[bool],
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: Optional[bool] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -693,8 +693,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
-        fixed_split_size: Optional[int],
-        disable_split_kv: Optional[bool],
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: Optional[bool] = None,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -706,10 +706,8 @@ class FlashInferIndicesUpdaterDecode:
             None,
             spec_info,
             seq_lens_cpu,
-            fixed_split_size=fixed_split_size if fixed_split_size is not None else -1,
-            disable_split_kv=(
-                disable_split_kv if disable_split_kv is not None else False
-            ),
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
         )
 
     def update_sliding_window(
@@ -723,6 +721,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: Optional[bool] = None,
     ):
         assert self.sliding_window_size is not None
         for wrapper_id in range(2):
@@ -773,6 +773,8 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: Optional[bool] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -809,8 +811,8 @@ class FlashInferIndicesUpdaterDecode:
         ],
         seq_lens_cpu: Optional[torch.Tensor],
         use_sliding_window_kv_pool: bool = False,
-        fixed_split_size: int = -1,
-        disable_split_kv: bool = False,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: Optional[bool] = None,
     ):
         if spec_info is None:
             bs = len(req_pool_indices)
@@ -866,7 +868,9 @@ class FlashInferIndicesUpdaterDecode:
             q_data_type=self.q_data_type,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
-            disable_split_kv=disable_split_kv,
+            disable_split_kv=(
+                disable_split_kv if disable_split_kv is not None else False
+            ),
         )
 
         if locally_override:
@@ -918,7 +922,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
-        fixed_split_size: Optional[int],
+        fixed_split_size: Optional[int] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -936,7 +940,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
-        fixed_split_size: Optional[int],
+        fixed_split_size: Optional[int] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -960,7 +964,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.qo_indptr[0],
             use_ragged,
             spec_info,
-            fixed_split_size=fixed_split_size if fixed_split_size is not None else -1,
+            fixed_split_size=fixed_split_size,
         )
 
     def update_sliding_window(
@@ -976,6 +980,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
+        fixed_split_size: Optional[int] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1024,6 +1029,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
+        fixed_split_size: Optional[int] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1069,7 +1075,7 @@ class FlashInferIndicesUpdaterPrefill:
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
         use_sliding_window_kv_pool: bool = False,
-        fixed_split_size: int = -1,
+        fixed_split_size: Optional[int] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1375,7 +1381,7 @@ def fast_decode_plan(
     rope_theta: Optional[float] = None,
     non_blocking: bool = True,
     fixed_split_size: Optional[int] = None,
-    disable_split_kv: Optional[bool] = None,
+    disable_split_kv: bool = False,
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
@@ -1401,6 +1407,9 @@ def fast_decode_plan(
 
     if self.use_tensor_cores:
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+        # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
+        if fixed_split_size is None:
+            fixed_split_size = -1
 
     if self.is_cuda_graph_enabled:
         if batch_size != self._fixed_batch_size:
