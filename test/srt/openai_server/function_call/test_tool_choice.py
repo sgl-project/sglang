@@ -343,6 +343,203 @@ class TestToolChoiceLlama32(CustomTestCase):
 
         self.assertEqual(found_name, "get_weather")
 
+    def test_required_arguments_are_valid_json_non_streaming(self):
+        """Arguments in non-streaming required mode should be valid JSON"""
+        tools = self.get_test_tools()
+        messages = self.get_test_messages()
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.1,
+            tools=tools,
+            tool_choice="required",
+            stream=False,
+        )
+
+        tool_calls = response.choices[0].message.tool_calls
+        self.assertIsNotNone(tool_calls)
+        self.assertGreater(len(tool_calls), 0)
+
+        for tool_call in tool_calls:
+            self.assertIsNotNone(tool_call.function.name)
+            self.assertIsNotNone(tool_call.function.arguments)
+            try:
+                args = json.loads(tool_call.function.arguments)
+                self.assertIsInstance(args, dict)
+            except json.JSONDecodeError:
+                self.fail(
+                    f"Invalid JSON in tool call arguments: {tool_call.function.arguments}"
+                )
+
+    def test_specific_function_arguments_are_valid_json_non_streaming(self):
+        """Arguments for a specific function choice should be valid JSON"""
+        tools = self.get_test_tools()
+        messages = self.get_test_messages()
+
+        tool_choice = {"type": "function", "function": {"name": "get_weather"}}
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.1,
+            tools=tools,
+            tool_choice=tool_choice,
+            stream=False,
+        )
+
+        tool_calls = response.choices[0].message.tool_calls
+        self.assertIsNotNone(tool_calls)
+        self.assertGreater(len(tool_calls), 0)
+
+        for tool_call in tool_calls:
+            self.assertEqual(tool_call.function.name, "get_weather")
+            try:
+                args = json.loads(tool_call.function.arguments)
+                self.assertIsInstance(args, dict)
+            except json.JSONDecodeError:
+                self.fail(
+                    f"Invalid JSON in tool call arguments: {tool_call.function.arguments}"
+                )
+
+    def test_required_streaming_arguments_chunks_json(self):
+        """In streaming required mode, complete tool call arguments should be valid JSON when all chunks are combined"""
+        tools = self.get_test_tools()
+        messages = self.get_test_messages()
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.1,
+            tools=tools,
+            tool_choice="required",
+            stream=True,
+        )
+
+        # Collect all tool call chunks and reconstruct complete tool calls
+        tool_calls_by_index = {}
+        for chunk in response:
+            if chunk.choices[0].delta.tool_calls:
+                for tool_call_delta in chunk.choices[0].delta.tool_calls:
+                    tool_index = tool_call_delta.index
+
+                    # Initialize tool call if not seen before
+                    if tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[tool_index] = {
+                            "id": tool_call_delta.id,
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+
+                    # Update function name if present (first chunk)
+                    if tool_call_delta.function and tool_call_delta.function.name:
+                        tool_calls_by_index[tool_index]["function"][
+                            "name"
+                        ] = tool_call_delta.function.name
+
+                    # Accumulate arguments (all chunks)
+                    if tool_call_delta.function and tool_call_delta.function.arguments:
+                        tool_calls_by_index[tool_index]["function"][
+                            "arguments"
+                        ] += tool_call_delta.function.arguments
+
+        self.assertGreater(len(tool_calls_by_index), 0)
+
+        # Validate that complete tool calls have valid JSON arguments
+        for tool_call in tool_calls_by_index.values():
+            self.assertIsNotNone(tool_call["function"]["name"])
+            self.assertIsNotNone(tool_call["function"]["arguments"])
+
+            # The complete arguments should be valid JSON
+            try:
+                args = json.loads(tool_call["function"]["arguments"])
+                self.assertIsInstance(args, dict)
+            except json.JSONDecodeError:
+                self.fail(
+                    f"Invalid JSON in complete tool call arguments: {tool_call['function']['arguments']}"
+                )
+
+    def test_complex_parameters_required_non_streaming(self):
+        """Validate complex nested parameter schemas in non-streaming required mode"""
+        complex_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "analyze_data",
+                    "description": "Analyze complex data structures",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "data": {
+                                "type": "object",
+                                "properties": {
+                                    "metrics": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "config": {
+                                        "type": "object",
+                                        "properties": {
+                                            "threshold": {"type": "number"},
+                                            "enabled": {"type": "boolean"},
+                                        },
+                                    },
+                                },
+                                "required": ["metrics"],
+                            },
+                            "options": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "value": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                        "required": ["data"],
+                    },
+                },
+            }
+        ]
+
+        messages = [
+            {
+                "role": "user",
+                "content": "Analyze some data with metrics and configuration",
+            }
+        ]
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.1,
+            tools=complex_tools,
+            tool_choice="required",
+            stream=False,
+        )
+
+        tool_calls = response.choices[0].message.tool_calls
+        self.assertIsNotNone(tool_calls)
+        self.assertGreater(len(tool_calls), 0)
+
+        for tool_call in tool_calls:
+            self.assertEqual(tool_call.function.name, "analyze_data")
+            try:
+                args = json.loads(tool_call.function.arguments)
+                self.assertIsInstance(args, dict)
+                self.assertIn("data", args)
+                self.assertIsInstance(args["data"], dict)
+            except json.JSONDecodeError:
+                self.fail(
+                    f"Invalid JSON in complex tool call arguments: {tool_call.function.arguments}"
+                )
+
     def test_multi_tool_scenario_auto(self):
         """Test multi-tool scenario with tool_choice='auto'"""
         tools = self.get_travel_tools()
