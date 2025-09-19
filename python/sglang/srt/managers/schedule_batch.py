@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import enum
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,6 +37,7 @@ import copy
 import dataclasses
 import logging
 import threading
+import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
@@ -61,7 +64,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.lora_radix_cache import LoRAKey, LoRARadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.metrics.collector import TimeStats
+from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -71,6 +74,7 @@ from sglang.srt.utils import flatten_nested_list, support_triton
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -407,6 +411,23 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+class RequestStage(str, enum.Enum):
+    # prefill
+    PREFILL_WAITING = "prefill_waiting"
+
+    # disaggregation prefill
+    PREFILL_PREPARE = "prefill_prepare"
+    PREFILL_BOOTSTRAP = "prefill_bootstrap"
+    PREFILL_FORWARD = "prefill_forward"
+    PREFILL_TRANSFER_KV_CACHE = "prefill_transfer_kv_cache"
+
+    # disaggregation decode
+    DECODE_PREPARE = "decode_prepare"
+    DECODE_BOOTSTRAP = "decode_bootstrap"
+    DECODE_WAITING = "decode_waiting"
+    DECODE_TRANSFERRED = "decode_transferred"
+
+
 class Req:
     """The input and output status of a request."""
 
@@ -433,6 +454,8 @@ class Req:
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        priority: Optional[int] = None,
+        metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -483,6 +506,7 @@ class Req:
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
+        self.priority = priority
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -590,10 +614,12 @@ class Req:
         self.spec_verify_ct = 0
 
         # For metrics
+        self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats()
         self.has_log_time_stats: bool = False
         self.queue_time_start = None
         self.queue_time_end = None
+        self.last_tic = time.monotonic()
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -625,6 +651,16 @@ class Req:
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         return self.sampling_params.max_new_tokens == 0
+
+    def add_latency(self, stage: RequestStage):
+        if self.metrics_collector is None:
+            return
+        assert stage.name in RequestStage.__members__, f"{stage=} is invalid"
+        now = time.monotonic()
+        self.metrics_collector.observe_request_latency_seconds(
+            stage.value, now - self.last_tic
+        )
+        self.last_tic = now
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -915,7 +951,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
+    spec_info: Optional[
+        Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+    ] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1484,37 +1522,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
-
-            if server_args.disaggregation_mode == "decode":
-                req.offload_kv_cache(
-                    self.req_to_token_pool, self.token_to_kv_pool_allocator
-                )
-
-            if isinstance(self.tree_cache, ChunkCache):
-                # ChunkCache does not have eviction
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : seq_lens_cpu[idx]
-                ]
-                self.token_to_kv_pool_allocator.free(token_indices)
-                self.req_to_token_pool.free(req.req_pool_idx)
-            else:
-                # TODO: apply more fine-grained retraction
-                last_uncached_pos = (
-                    len(req.prefix_indices) // server_args.page_size
-                ) * server_args.page_size
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
-                ]
-                self.token_to_kv_pool_allocator.free(token_indices)
-                self.req_to_token_pool.free(req.req_pool_idx)
-
-                # release the last node
-                if self.is_hybrid:
-                    self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
-                else:
-                    self.tree_cache.dec_lock_ref(req.last_node)
-
-            req.reset_for_retract()
+            self.release_req(idx, len(sorted_indices), server_args)
 
             if len(retracted_reqs) == 0:
                 # Corner case: only one request left
@@ -1534,6 +1542,44 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio
+
+    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+        req = self.reqs[idx]
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
+
+        if server_args.disaggregation_mode == "decode":
+            req.offload_kv_cache(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
+        if isinstance(self.tree_cache, ChunkCache):
+            # ChunkCache does not have eviction
+            token_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : seq_lens_cpu[idx]
+            ]
+            self.token_to_kv_pool_allocator.free(token_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
+        else:
+            # TODO: apply more fine-grained retraction
+            last_uncached_pos = (
+                len(req.prefix_indices) // server_args.page_size
+            ) * server_args.page_size
+            token_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
+            ]
+            self.token_to_kv_pool_allocator.free(token_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
+
+            # release the last node
+            if self.is_hybrid:
+                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+            else:
+                self.tree_cache.dec_lock_ref(req.last_node)
+
+            # NOTE(lsyin): we should use the newly evictable memory instantly.
+            num_tokens = remaing_req_count * global_config.retract_decode_steps
+            self._evict_tree_cache_if_needed(num_tokens)
+
+        req.reset_for_retract()
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status
@@ -1557,7 +1603,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+        if (
+            self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            or self.spec_algorithm.is_lookahead()
+        ):
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
@@ -1932,7 +1982,9 @@ class ModelWorkerBatch:
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: Optional[
+        Union[EagleVerifyInput, EagleDraftInput, LookaheadVerifyInput]
+    ] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1

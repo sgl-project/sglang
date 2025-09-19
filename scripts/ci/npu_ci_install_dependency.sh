@@ -64,4 +64,5 @@ git clone --depth 1 https://github.com/sgl-project/sgl-kernel-npu.git --branch $
 
 
 ### Install SGLang
+rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
 ${PIP_INSTALL} -v -e "python[srt_npu]"
