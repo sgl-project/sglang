@@ -233,9 +233,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
 
-        # if forward_mode.is_target_verify():
-        #     seq_lens += spec_info.draft_token_num
-
         create_flashmla_kv_indices_triton[(bs,)](
             self.req_to_token,
             req_pool_indices,
@@ -286,9 +283,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
-
-        # if forward_mode.is_target_verify():
-        #     seq_lens += spec_info.draft_token_num
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[(bs,)](
@@ -351,11 +345,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq = forward_batch.seq_lens.max().item()
 
             seq_lens = forward_batch.seq_lens
-            if forward_batch.forward_mode.is_target_verify():
-                # TODO (pranavm): Revert:
-                # seq_lens += forward_batch.spec_info.draft_token_num
-
-                super().init_forward_metadata(forward_batch)
 
             max_seqlen_pad = self._calc_padded_blocks(max_seq)
             block_kv_indices = self._create_block_kv_indices(
@@ -575,11 +564,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
 
-        if forward_batch.forward_mode.is_target_verify():
-            actual_output = super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
-            )
-
         # Save KV cache if requested
         if save_kv_cache:
             assert (
@@ -645,13 +629,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             # Reshape output directly without slicing
             output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-            if torch.cuda.current_device() == 0:
-                # print(f"{seq_lens=}\n{metadata.max_seq_len=}\n{metadata.block_kv_indices=}")
-                print(
-                    f"=====\n{actual_output.shape=}\n{actual_output=}\n=====\n{output.shape=}\n{output=}\n====="
-                )
-
             return output
 
         if forward_batch.attn_attend_prefix_cache:
