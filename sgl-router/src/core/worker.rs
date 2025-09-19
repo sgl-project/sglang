@@ -685,18 +685,6 @@ impl WorkerFactory {
         )
     }
 
-    /// Create a regular worker with custom circuit breaker configuration
-    pub fn create_regular_with_config(
-        url: String,
-        circuit_breaker_config: CircuitBreakerConfig,
-    ) -> Box<dyn Worker> {
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .circuit_breaker_config(circuit_breaker_config)
-                .build(),
-        )
-    }
-
     /// Create a prefill worker with optional bootstrap port
     pub fn create_prefill(url: String, bootstrap_port: Option<u16>) -> Box<dyn Worker> {
         use crate::core::BasicWorkerBuilder;
@@ -707,90 +695,12 @@ impl WorkerFactory {
         )
     }
 
-    /// Create a prefill worker with custom circuit breaker configuration
-    pub fn create_prefill_with_config(
-        url: String,
-        bootstrap_port: Option<u16>,
-        circuit_breaker_config: CircuitBreakerConfig,
-    ) -> Box<dyn Worker> {
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Prefill { bootstrap_port })
-                .circuit_breaker_config(circuit_breaker_config)
-                .build(),
-        )
-    }
-
     /// Create a decode worker
     pub fn create_decode(url: String) -> Box<dyn Worker> {
         use crate::core::BasicWorkerBuilder;
         Box::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Decode)
-                .build(),
-        )
-    }
-
-    /// Create a decode worker with custom circuit breaker configuration
-    pub fn create_decode_with_config(
-        url: String,
-        circuit_breaker_config: CircuitBreakerConfig,
-    ) -> Box<dyn Worker> {
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Decode)
-                .circuit_breaker_config(circuit_breaker_config)
-                .build(),
-        )
-    }
-
-    /// Create workers from URLs with automatic type detection
-    #[allow(clippy::type_complexity)]
-    pub fn create_from_urls(
-        regular_urls: Vec<String>,
-        prefill_urls: Vec<(String, Option<u16>)>,
-        decode_urls: Vec<String>,
-    ) -> (
-        Vec<Box<dyn Worker>>,
-        Vec<Box<dyn Worker>>,
-        Vec<Box<dyn Worker>>,
-    ) {
-        let regular_workers: Vec<Box<dyn Worker>> =
-            regular_urls.into_iter().map(Self::create_regular).collect();
-
-        let prefill_workers: Vec<Box<dyn Worker>> = prefill_urls
-            .into_iter()
-            .map(|(url, port)| Self::create_prefill(url, port))
-            .collect();
-
-        let decode_workers: Vec<Box<dyn Worker>> =
-            decode_urls.into_iter().map(Self::create_decode).collect();
-
-        (regular_workers, prefill_workers, decode_workers)
-    }
-
-    /// Create a gRPC worker
-    pub fn create_grpc(url: String, worker_type: WorkerType, port: Option<u16>) -> Box<dyn Worker> {
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(worker_type)
-                .connection_mode(ConnectionMode::Grpc { port })
-                .build(),
-        )
-    }
-
-    /// Create a gRPC worker with custom circuit breaker configuration
-    pub fn create_grpc_with_config(
-        url: String,
-        worker_type: WorkerType,
-        port: Option<u16>,
-        circuit_breaker_config: CircuitBreakerConfig,
-    ) -> Box<dyn Worker> {
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(worker_type)
-                .connection_mode(ConnectionMode::Grpc { port })
-                .circuit_breaker_config(circuit_breaker_config)
                 .build(),
         )
     }
@@ -1491,33 +1401,6 @@ mod tests {
         let worker = WorkerFactory::create_decode("http://decode:8080".to_string());
         assert_eq!(worker.url(), "http://decode:8080");
         assert_eq!(worker.worker_type(), WorkerType::Decode);
-    }
-
-    #[test]
-    fn test_create_from_urls() {
-        let regular_urls = vec![
-            "http://regular1:8080".to_string(),
-            "http://regular2:8080".to_string(),
-        ];
-        let prefill_urls = vec![
-            ("http://prefill1:8080".to_string(), Some(9090)),
-            ("http://prefill2:8080".to_string(), None),
-        ];
-        let decode_urls = vec![
-            "http://decode1:8080".to_string(),
-            "http://decode2:8080".to_string(),
-        ];
-
-        let (regular, prefill, decode) =
-            WorkerFactory::create_from_urls(regular_urls, prefill_urls, decode_urls);
-
-        assert_eq!(regular.len(), 2);
-        assert_eq!(prefill.len(), 2);
-        assert_eq!(decode.len(), 2);
-
-        assert_eq!(regular[0].url(), "http://regular1:8080");
-        assert_eq!(prefill[0].url(), "http://prefill1:8080");
-        assert_eq!(decode[0].url(), "http://decode1:8080");
     }
 
     // Test WorkerLoadGuard
