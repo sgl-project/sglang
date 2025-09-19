@@ -17,7 +17,7 @@ on:
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
-    types: [synchronize, labeled]
+      types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -42,7 +42,7 @@ jobs:
               - "python/**"
               - "scripts/ci/**"
               - "test/**"
-              - ".github/workflows/pr-test.yml"
+              - ".github/workflows/pr-test-amd.yml"
 
   check-changes-sgl-kernel:
     runs-on: ubuntu-latest
@@ -82,9 +82,7 @@ jobs:
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, unit-test-frontend-amd]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -110,9 +108,7 @@ jobs:
 
   unit-test-backend-2-gpu-amd:
     needs: [check-changes]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -137,9 +133,7 @@ jobs:
 
   unit-test-backend-4-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -164,9 +158,7 @@ jobs:
 
   unit-test-backend-8-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -191,9 +183,7 @@ jobs:
 
   performance-test-1-gpu-part-1-amd:
     needs: check-changes
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -234,9 +224,7 @@ jobs:
 
   performance-test-1-gpu-part-2-amd:
     needs: check-changes
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -271,9 +259,7 @@ jobs:
 
   performance-test-2-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -318,9 +304,7 @@ jobs:
 
   accuracy-test-1-gpu-amd:
     needs: check-changes
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -347,9 +331,7 @@ jobs:
 
   accuracy-test-2-gpu-amd:
     needs: [check-changes, accuracy-test-1-gpu-amd]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
