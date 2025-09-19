@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+
 class TreeNode:
 
     counter = 0
@@ -176,6 +177,7 @@ class RadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
+
         def empty_match_result():
             return MatchResult(
                 device_indices=torch.empty(
