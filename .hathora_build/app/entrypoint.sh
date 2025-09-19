@@ -28,6 +28,9 @@ export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
 export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,ENV,SHM,P2P,NET}"
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
 
 export HF_TOKEN="${HF_TOKEN:-}"
 if [[ -z "${HUGGINGFACE_HUB_TOKEN}" && -n "${HF_TOKEN}" ]]; then
@@ -52,6 +55,9 @@ log "NCCL_SHM_DISABLE: $NCCL_SHM_DISABLE"
 log "NCCL_P2P_DISABLE: $NCCL_P2P_DISABLE"
 log "NCCL_P2P_LEVEL: $NCCL_P2P_LEVEL"
 log "NCCL_IB_DISABLE: $NCCL_IB_DISABLE"
+log "NCCL_DEBUG: $NCCL_DEBUG"
+log "NCCL_DEBUG_SUBSYS: $NCCL_DEBUG_SUBSYS"
+log "NCCL_ASYNC_ERROR_HANDLING: $NCCL_ASYNC_ERROR_HANDLING"
 if [[ -n "${SPEC_DECODE}" ]]; then
   log "SPEC_DECODE: ${SPEC_DECODE} (speculative decoding enabled)"
 else
@@ -78,8 +84,34 @@ if [[ -z "${TP_SIZE}" ]]; then
   fi
 fi
 
+# Extra diagnostics to investigate NCCL/SHM issues
+log "==== Diagnostic: /dev/shm usage ===="
+df -h /dev/shm || true
+cat /proc/mounts | grep shm || true
+ls -lah /dev/shm | head -n 50 || true
 
+log "==== Diagnostic: GPU topology (nvidia-smi topo -m) ===="
+nvidia-smi topo -m || true
 
+log "==== Diagnostic: NCCL environment dump ===="
+env | grep -E '^NCCL_' | sort || true
+
+log "==== Diagnostic: Torch/CUDA/NCCL versions ===="
+python - <<'PY' || true
+import os, sys
+try:
+    import torch
+    print({
+        'torch_version': torch.__version__,
+        'cuda_version': getattr(torch.version, 'cuda', None),
+        'nccl_available': hasattr(torch.distributed, 'is_nccl_available') and torch.distributed.is_nccl_available(),
+        'nccl_version': getattr(getattr(torch, 'cuda', None), 'nccl', None) and getattr(torch.cuda.nccl, 'version', lambda: None)(),
+        'visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+    })
+except Exception as e:
+    print('torch introspection failed:', e)
+print('NCCL env:', {k:v for k,v in os.environ.items() if k.startswith('NCCL_')})
+PY
 
 CLEANED_UP=0
 function cleanup() {
