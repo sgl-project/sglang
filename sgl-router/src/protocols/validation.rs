@@ -657,19 +657,13 @@ impl ChatCompletionRequest {
 
     /// Validate chat API specific logprobs requirements
     pub fn validate_chat_logprobs(&self) -> Result<(), ValidationError> {
-        // In chat API, if logprobs=true, top_logprobs must be specified
-        if self.logprobs && self.top_logprobs.is_none() {
-            return Err(ValidationError::MissingRequired {
-                parameter: "top_logprobs".to_string(),
-            });
-        }
-
-        // If top_logprobs is specified, logprobs should be true
+        // OpenAI rule: If top_logprobs is specified, logprobs must be true
+        // But logprobs=true without top_logprobs is valid (returns basic logprobs)
         if self.top_logprobs.is_some() && !self.logprobs {
             return Err(ValidationError::InvalidValue {
-                parameter: "logprobs".to_string(),
-                value: "false".to_string(),
-                reason: "must be true when top_logprobs is specified".to_string(),
+                parameter: "top_logprobs".to_string(),
+                value: self.top_logprobs.unwrap().to_string(),
+                reason: "top_logprobs is only allowed when logprobs is enabled".to_string(),
             });
         }
 
@@ -929,11 +923,17 @@ mod tests {
             request.functions = Some(vec![]);
             assert!(request.validate().is_err(), "Should reject both tools and functions");
 
-            // Test 3: logprobs=true should be valid even without top_logprobs
+            // Test 3: logprobs=true without top_logprobs should be valid
             let mut request = create_valid_chat_request();
             request.logprobs = true;
             request.top_logprobs = None;
             assert!(request.validate().is_ok(), "logprobs=true without top_logprobs should be valid");
+
+            // Test 4: top_logprobs without logprobs=true should fail (OpenAI rule)
+            let mut request = create_valid_chat_request();
+            request.logprobs = false;
+            request.top_logprobs = Some(5);
+            assert!(request.validate().is_err(), "top_logprobs without logprobs=true should fail");
         }
 
         #[test]
@@ -1080,14 +1080,14 @@ mod tests {
         fn test_logprobs_validation() {
             let mut request = create_valid_chat_request();
 
-            // Valid logprobs configuration
+            // Valid logprobs configuration with top_logprobs
             request.logprobs = true;
             request.top_logprobs = Some(10);
             assert!(request.validate().is_ok());
 
-            // logprobs=true without top_logprobs should fail
+            // logprobs=true without top_logprobs should be valid (OpenAI behavior)
             request.top_logprobs = None;
-            assert!(request.validate().is_err());
+            assert!(request.validate().is_ok(), "logprobs=true without top_logprobs should be valid");
 
             // top_logprobs without logprobs=true should fail
             request.logprobs = false;
