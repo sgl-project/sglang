@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageC
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
-
+DEFAULT_MOONCAKE_CONFIG_PATH_ENV = "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"
 logger = logging.getLogger(__name__)
 
 
@@ -28,13 +28,13 @@ class MooncakeStoreConfig:
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
         """Load the config from a JSON file."""
-        file_path = os.getenv("MOONCAKE_CONFIG_PATH")
-        if file_path is None:
-            raise ValueError(
-                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
-            )
-        with open(file_path) as fin:
-            config = json.load(fin)
+        file_path = os.getenv(DEFAULT_MOONCAKE_CONFIG_PATH_ENV)
+        try:
+            with open(file_path) as fin:
+                config = json.load(fin)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
+
         return MooncakeStoreConfig(
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
@@ -101,6 +101,7 @@ class MooncakeStoreConfig:
 
 
 class MooncakeStore(HiCacheStorage):
+
     def __init__(self, storage_config: HiCacheStorageConfig = None):
         try:
             from mooncake.store import MooncakeDistributedStore
@@ -129,16 +130,27 @@ class MooncakeStore(HiCacheStorage):
                 logger.info(
                     "Mooncake Configuration loaded from extra_config successfully."
                 )
+            elif os.getenv(DEFAULT_MOONCAKE_CONFIG_PATH_ENV):
+                # Load from config file
+                self.config = MooncakeStoreConfig.from_file()
+                logger.info("Mooncake Configuration loaded from file successfully.")
             else:
                 # Load from environment variables
                 self.config = MooncakeStoreConfig.load_from_env()
                 logger.info("Mooncake Configuration loaded from env successfully.")
 
+            tp_scale_factor = 1 if storage_config is None else storage_config.tp_size
+
+            per_tp_global_segment_size = (
+                self.config.global_segment_size // tp_scale_factor
+            )
+            per_tp_local_buffer_size = self.config.local_buffer_size // tp_scale_factor
+
             ret_code = self.store.setup(
                 self.config.local_hostname,
                 self.config.metadata_server,
-                self.config.global_segment_size,
-                self.config.local_buffer_size,
+                per_tp_global_segment_size,
+                per_tp_local_buffer_size,
                 self.config.protocol,
                 self.config.device_name,
                 self.config.master_server_address,

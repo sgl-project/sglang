@@ -170,6 +170,10 @@ void downcast_fp8(
     int64_t offset,
     int64_t cuda_stream);
 
+void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
+void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
+void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
+
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
@@ -452,6 +456,16 @@ void verify_tree_greedy(
     at::Tensor retrive_next_sibling,
     at::Tensor target_predict,
     int64_t cuda_stream = 0);
+
+void reconstruct_indices_from_tree_mask(
+    at::Tensor tree_mask,
+    at::Tensor verified_seq_len,
+    at::Tensor positions,             // mutable
+    at::Tensor retrive_index,         // mutable
+    at::Tensor retrive_next_token,    // mutable
+    at::Tensor retrive_next_sibling,  // mutable
+    int64_t batch_size,
+    int64_t draft_token_num);
 
 void build_tree_kernel_efficient(
     at::Tensor parent_list,
@@ -742,9 +756,6 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
  * From csrc/memory
  */
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
-
-void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
-void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 
 /*
  * From csrc/mamba

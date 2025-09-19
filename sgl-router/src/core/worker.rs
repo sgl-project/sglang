@@ -1,4 +1,6 @@
 use super::{CircuitBreaker, CircuitBreakerConfig, WorkerError, WorkerResult};
+use crate::core::CircuitState;
+use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 use crate::grpc::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
@@ -75,9 +77,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get worker-specific metadata
     fn metadata(&self) -> &WorkerMetadata;
 
-    /// Clone the worker (for trait objects)
-    fn clone_worker(&self) -> Box<dyn Worker>;
-
     /// Get the circuit breaker for this worker
     fn circuit_breaker(&self) -> &CircuitBreaker;
 
@@ -99,22 +98,22 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
         if before != after {
             let from = match before {
-                crate::core::CircuitState::Closed => "closed",
-                crate::core::CircuitState::Open => "open",
-                crate::core::CircuitState::HalfOpen => "half_open",
+                CircuitState::Closed => "closed",
+                CircuitState::Open => "open",
+                CircuitState::HalfOpen => "half_open",
             };
             let to = match after {
-                crate::core::CircuitState::Closed => "closed",
-                crate::core::CircuitState::Open => "open",
-                crate::core::CircuitState::HalfOpen => "half_open",
+                CircuitState::Closed => "closed",
+                CircuitState::Open => "open",
+                CircuitState::HalfOpen => "half_open",
             };
             RouterMetrics::record_cb_state_transition(self.url(), from, to);
         }
 
         let state_code = match self.circuit_breaker().state() {
-            crate::core::CircuitState::Closed => 0u8,
-            crate::core::CircuitState::Open => 1u8,
-            crate::core::CircuitState::HalfOpen => 2u8,
+            CircuitState::Closed => 0u8,
+            CircuitState::Open => 1u8,
+            CircuitState::HalfOpen => 2u8,
         };
         RouterMetrics::set_cb_state(self.url(), state_code);
     }
@@ -154,6 +153,82 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Check if this worker can handle a specific request
     fn can_handle(&self, _req: &serde_json::Value) -> bool {
         true
+    }
+
+    // === Multi-router support ===
+
+    // TODO: - Enhanced Worker Discovery
+    // The Worker trait should handle async discovery of metadata from the worker itself
+    // rather than having service discovery or other components query /get_server_info.
+    // This keeps service discovery decoupled from worker-specific APIs.
+    //
+    // Proposed additions:
+    // - async fn discover_metadata(&mut self) -> Result<(), Error>
+    //   Query /get_server_info and populate metadata labels with model_id, priority, cost, etc.
+    // - async fn validate_configuration(&self) -> Result<(), Error>
+    //   Ensure worker has required configuration for its mode (e.g., tokenizer for gRPC)
+    // - Make worker creation async to allow metadata discovery during initialization
+    //
+    // This way service discovery just calls router.add_worker() and the worker
+    // handles its own metadata discovery internally.
+
+    /// Get the model ID this worker serves
+    fn model_id(&self) -> &str {
+        self.metadata()
+            .labels
+            .get("model_id")
+            .map(|s| s.as_str())
+            .unwrap_or("unknown")
+    }
+
+    /// Get the priority of this worker (higher value = higher priority)
+    fn priority(&self) -> u32 {
+        self.metadata()
+            .labels
+            .get("priority")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50) // Default priority is 50 (mid-range)
+    }
+
+    /// Get the cost factor of this worker (1.0 = baseline)
+    fn cost(&self) -> f32 {
+        self.metadata()
+            .labels
+            .get("cost")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0)
+    }
+
+    /// Get the tokenizer path for this worker (gRPC mode only)
+    fn tokenizer_path(&self) -> Option<&str> {
+        self.metadata()
+            .labels
+            .get("tokenizer_path")
+            .map(|s| s.as_str())
+    }
+
+    /// Get the reasoning parser type for this worker (gRPC mode only)
+    fn reasoning_parser(&self) -> Option<&str> {
+        self.metadata()
+            .labels
+            .get("reasoning_parser")
+            .map(|s| s.as_str())
+    }
+
+    /// Get the tool parser type for this worker (gRPC mode only)
+    fn tool_parser(&self) -> Option<&str> {
+        self.metadata()
+            .labels
+            .get("tool_parser")
+            .map(|s| s.as_str())
+    }
+
+    /// Get the chat template for this worker (gRPC mode only)
+    fn chat_template(&self) -> Option<&str> {
+        self.metadata()
+            .labels
+            .get("chat_template")
+            .map(|s| s.as_str())
     }
 }
 
@@ -481,10 +556,6 @@ impl Worker for BasicWorker {
         &self.metadata
     }
 
-    fn clone_worker(&self) -> Box<dyn Worker> {
-        Box::new(self.clone())
-    }
-
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
     }
@@ -510,6 +581,22 @@ impl DPAwareWorker {
         let worker_url = format!("{}@{}", base_url, dp_rank);
         let base_worker = BasicWorker::new(worker_url, worker_type);
 
+        Self {
+            base_worker,
+            dp_rank,
+            dp_size,
+            base_url,
+        }
+    }
+
+    /// Create a new DP-aware worker with a pre-configured base worker
+    /// This is primarily used by the builder pattern
+    pub fn with_base_worker(
+        base_worker: BasicWorker,
+        base_url: String,
+        dp_rank: usize,
+        dp_size: usize,
+    ) -> Self {
         Self {
             base_worker,
             dp_rank,
@@ -574,10 +661,6 @@ impl Worker for DPAwareWorker {
         self.base_worker.metadata()
     }
 
-    fn clone_worker(&self) -> Box<dyn Worker> {
-        Box::new(self.clone())
-    }
-
     fn circuit_breaker(&self) -> &CircuitBreaker {
         self.base_worker.circuit_breaker()
     }
@@ -625,6 +708,20 @@ impl Worker for DPAwareWorker {
 pub struct WorkerFactory;
 
 impl WorkerFactory {
+    /// Create a BasicWorkerBuilder for customizable worker creation
+    pub fn builder(url: impl Into<String>) -> BasicWorkerBuilder {
+        BasicWorkerBuilder::new(url)
+    }
+
+    /// Create a DPAwareWorkerBuilder for customizable DP-aware worker creation
+    pub fn dp_builder(
+        base_url: impl Into<String>,
+        dp_rank: usize,
+        dp_size: usize,
+    ) -> DPAwareWorkerBuilder {
+        DPAwareWorkerBuilder::new(base_url, dp_rank, dp_size)
+    }
+
     /// Create a regular worker
     pub fn create_regular(url: String) -> Box<dyn Worker> {
         Box::new(BasicWorker::new(url, WorkerType::Regular))
@@ -636,8 +733,9 @@ impl WorkerFactory {
         circuit_breaker_config: CircuitBreakerConfig,
     ) -> Box<dyn Worker> {
         Box::new(
-            BasicWorker::new(url, WorkerType::Regular)
-                .with_circuit_breaker_config(circuit_breaker_config),
+            BasicWorkerBuilder::new(url)
+                .circuit_breaker_config(circuit_breaker_config)
+                .build(),
         )
     }
 
@@ -656,8 +754,10 @@ impl WorkerFactory {
         circuit_breaker_config: CircuitBreakerConfig,
     ) -> Box<dyn Worker> {
         Box::new(
-            BasicWorker::new(url, WorkerType::Prefill { bootstrap_port })
-                .with_circuit_breaker_config(circuit_breaker_config),
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill { bootstrap_port })
+                .circuit_breaker_config(circuit_breaker_config)
+                .build(),
         )
     }
 
@@ -672,8 +772,10 @@ impl WorkerFactory {
         circuit_breaker_config: CircuitBreakerConfig,
     ) -> Box<dyn Worker> {
         Box::new(
-            BasicWorker::new(url, WorkerType::Decode)
-                .with_circuit_breaker_config(circuit_breaker_config),
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Decode)
+                .circuit_breaker_config(circuit_breaker_config)
+                .build(),
         )
     }
 
@@ -719,8 +821,56 @@ impl WorkerFactory {
         circuit_breaker_config: CircuitBreakerConfig,
     ) -> Box<dyn Worker> {
         Box::new(
-            BasicWorker::with_connection_mode(url, worker_type, ConnectionMode::Grpc { port })
-                .with_circuit_breaker_config(circuit_breaker_config),
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc { port })
+                .circuit_breaker_config(circuit_breaker_config)
+                .build(),
+        )
+    }
+
+    /// Create a regular worker with custom labels (for multi-router support)
+    pub fn create_regular_with_labels(
+        url: String,
+        labels: std::collections::HashMap<String, String>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        Box::new(
+            BasicWorkerBuilder::new(url)
+                .labels(labels)
+                .circuit_breaker_config(circuit_breaker_config)
+                .build(),
+        )
+    }
+
+    /// Create a prefill worker with labels
+    pub fn create_prefill_with_labels(
+        url: String,
+        bootstrap_port: Option<u16>,
+        labels: std::collections::HashMap<String, String>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        Box::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill { bootstrap_port })
+                .labels(labels)
+                .circuit_breaker_config(circuit_breaker_config)
+                .build(),
+        )
+    }
+
+    /// Create a decode worker with labels
+    pub fn create_decode_with_labels(
+        url: String,
+        labels: std::collections::HashMap<String, String>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        Box::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Decode)
+                .labels(labels)
+                .circuit_breaker_config(circuit_breaker_config)
+                .build(),
         )
     }
 
@@ -941,6 +1091,11 @@ impl fmt::Debug for HealthChecker {
 }
 
 impl HealthChecker {
+    /// Create a new HealthChecker
+    pub fn new(handle: tokio::task::JoinHandle<()>, shutdown: Arc<AtomicBool>) -> Self {
+        Self { handle, shutdown }
+    }
+
     /// Shutdown the health checker gracefully
     pub async fn shutdown(self) {
         self.shutdown.store(true, Ordering::Release);
@@ -950,7 +1105,7 @@ impl HealthChecker {
 
 /// Start an async background health checker for a collection of workers
 pub fn start_health_checker(
-    workers: std::sync::Arc<std::sync::RwLock<Vec<Box<dyn Worker>>>>,
+    workers: std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<dyn Worker>>>>,
     check_interval_secs: u64,
 ) -> HealthChecker {
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -977,7 +1132,7 @@ pub fn start_health_checker(
 
             // Check health of all workers
             let workers_to_check = match workers.read() {
-                Ok(guard) => guard.iter().map(|w| w.clone_worker()).collect::<Vec<_>>(),
+                Ok(guard) => guard.clone(),
                 Err(poisoned) => {
                     tracing::error!("Worker lock poisoned: {}", poisoned);
                     continue;
@@ -1035,10 +1190,8 @@ pub fn start_health_checker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::RwLock;
     use std::thread;
     use std::time::Duration;
-    use tokio::time::timeout;
 
     // Test WorkerType
     #[test]
@@ -1247,27 +1400,6 @@ mod tests {
             worker.increment_processed();
             assert_eq!(worker.processed_requests(), i);
         }
-    }
-
-    #[test]
-    fn test_clone_worker() {
-        let original = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
-        original.increment_load();
-        original.increment_processed();
-        original.set_healthy(false);
-
-        let cloned = original.clone_worker();
-
-        // Verify cloned worker has same URL and type
-        assert_eq!(cloned.url(), original.url());
-        assert_eq!(cloned.worker_type(), original.worker_type());
-
-        // Load counters should be independent (cloned shares the Arc)
-        assert_eq!(cloned.load(), original.load());
-
-        // Modify original and verify clone is affected (shared state)
-        original.increment_load();
-        assert_eq!(cloned.load(), original.load());
     }
 
     // Test concurrent operations
@@ -1599,35 +1731,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // Test HealthChecker background task
-    #[tokio::test]
-    async fn test_health_checker_startup() {
-        let workers = Arc::new(RwLock::new(vec![WorkerFactory::create_regular(
-            "http://w1:8080".to_string(),
-        )]));
-
-        let checker = start_health_checker(workers.clone(), 60);
-
-        // Verify it starts without panic
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Shutdown
-        checker.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_health_checker_shutdown() {
-        let workers = Arc::new(RwLock::new(vec![WorkerFactory::create_regular(
-            "http://w1:8080".to_string(),
-        )]));
-
-        let checker = start_health_checker(workers.clone(), 60);
-
-        // Shutdown should complete quickly
-        let shutdown_result = timeout(Duration::from_secs(1), checker.shutdown()).await;
-        assert!(shutdown_result.is_ok());
-    }
-
     // Performance test for load counter
     #[test]
     fn test_load_counter_performance() {
@@ -1830,10 +1933,7 @@ mod tests {
 
         // Initial state should be available
         assert!(worker.is_available());
-        assert_eq!(
-            worker.circuit_breaker().state(),
-            crate::core::CircuitState::Closed
-        );
+        assert_eq!(worker.circuit_breaker().state(), CircuitState::Closed);
 
         // Record some failures
         worker.record_outcome(false);
@@ -1855,7 +1955,7 @@ mod tests {
 
     #[test]
     fn test_worker_with_circuit_breaker_config() {
-        let config = crate::core::CircuitBreakerConfig {
+        let config = CircuitBreakerConfig {
             failure_threshold: 2,
             success_threshold: 1,
             timeout_duration: Duration::from_millis(100),
@@ -1876,17 +1976,11 @@ mod tests {
 
         // Should be half-open
         assert!(worker.is_available());
-        assert_eq!(
-            worker.circuit_breaker().state(),
-            crate::core::CircuitState::HalfOpen
-        );
+        assert_eq!(worker.circuit_breaker().state(), CircuitState::HalfOpen);
 
         // Success should close it
         worker.record_outcome(true);
-        assert_eq!(
-            worker.circuit_breaker().state(),
-            crate::core::CircuitState::Closed
-        );
+        assert_eq!(worker.circuit_breaker().state(), CircuitState::Closed);
     }
 
     #[test]
@@ -1904,10 +1998,7 @@ mod tests {
 
         // Should not be available
         assert!(!dp_worker.is_available());
-        assert_eq!(
-            dp_worker.circuit_breaker().state(),
-            crate::core::CircuitState::Open
-        );
+        assert_eq!(dp_worker.circuit_breaker().state(), CircuitState::Open);
     }
 
     // ===== Integration tests =====
