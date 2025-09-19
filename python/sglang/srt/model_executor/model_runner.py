@@ -427,7 +427,7 @@ class ModelRunner:
             None,
         )
 
-        with set_forward_context(forward_batch):
+        with set_forward_context(forward_batch, self.attention_layers):
             outputs = model(
                 input_ids=forward_batch.input_ids,
                 positions=forward_batch.positions,
@@ -585,7 +585,7 @@ class ModelRunner:
             None,
         )
 
-        with set_forward_context(forward_batch):
+        with set_forward_context(forward_batch, self.attention_layers):
             outputs = model(
                 input_ids=forward_batch.input_ids,
                 positions=forward_batch.positions,
@@ -1154,6 +1154,11 @@ class ModelRunner:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+
+        self.attention_layers = []
+        for layer in self.model.model.layers:
+            if hasattr(layer, "self_attn"):
+                self.attention_layers.append(layer.self_attn.attn)
 
     def update_expert_location(
         self,
@@ -2425,15 +2430,14 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
 
         if forward_batch.forward_mode.is_decode():
-            print(f"set_forward_context in forward_decode")
-            with set_forward_context(forward_batch):
+            with set_forward_context(forward_batch, self.attention_layers):
                 ret = self.forward_decode(
                     forward_batch,
                     skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
         elif forward_batch.forward_mode.is_extend():
-            with set_forward_context(forward_batch):
+            with set_forward_context(forward_batch, self.attention_layers):
                 ret = self.forward_extend(
                     forward_batch,
                     skip_attn_backend_init=skip_attn_backend_init,
@@ -2446,7 +2450,7 @@ class ModelRunner:
                 forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_idle():
-            with set_forward_context(forward_batch):
+            with set_forward_context(forward_batch, self.attention_layers):
                 ret = self.forward_idle(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )

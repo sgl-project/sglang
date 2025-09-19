@@ -654,6 +654,7 @@ def latency_test(
         server_args.device,
         log_decode_step=0,
         profile=False,
+        profile_record_shapes=False,
         profile_filename_prefix="",
         prefill_static_ctx=prefill_static_ctx,
     )
@@ -669,6 +670,7 @@ def latency_test(
         server_args.device,
         log_decode_step=0,
         profile=False,
+        profile_record_shapes=False,
         profile_filename_prefix="",
         prefill_static_ctx=prefill_static_ctx,
     )
@@ -687,7 +689,8 @@ def latency_test(
         bench_args.output_len[0],
         server_args.device,
         log_decode_step=0,
-        profile=True,
+        profile=False,
+        profile_record_shapes=False,
         profile_filename_prefix="",
         prefill_static_ctx=prefill_static_ctx,
     )

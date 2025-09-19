@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 from sglang.srt.utils import direct_register_custom_op
-from sglang.srt.context_manager import get_forward_context, set_forward_attention_layer
+from sglang.srt.context_manager import get_forward_context
 
 
 class AttentionType(Enum):
@@ -136,10 +136,9 @@ class RadixAttention(nn.Module):
         #         save_kv_cache,
         #         **kwargs,
         #     )
-        with set_forward_attention_layer(self):
-            return torch.ops.sglang.unified_attention_with_output(
-                    q, k, v, save_kv_cache
-            )
+        return torch.ops.sglang.unified_attention_with_output(
+                q, k, v, save_kv_cache, self.layer_id
+        )
 
 
 def unified_attention_with_output(
@@ -147,10 +146,12 @@ def unified_attention_with_output(
     key: torch.Tensor,
     value: torch.Tensor,
     save_kv_cache: bool,
+    layer_id: int,
 ) -> torch.Tensor:
     context = get_forward_context()
     forward_batch = context.forward_batch
-    attention_layer = context.attention_layer
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
     return forward_batch.attn_backend.forward(
         query, key, value, attention_layer, forward_batch, save_kv_cache
     )
@@ -161,6 +162,7 @@ def unified_attention_with_output_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     save_kv_cache: bool,
+    layer_id: int,
 ) -> torch.Tensor:
     return torch.empty_like(query)
 

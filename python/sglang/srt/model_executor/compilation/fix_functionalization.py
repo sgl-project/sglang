@@ -37,62 +37,62 @@ class FixFunctionalizationPass(SGLangInductorPass):
             kwargs = node.kwargs
             at_target = node.args[0]
 
-            if at_target == torch.ops._C.rotary_embedding.default:
-                query = kwargs["query"]
-                mm_node = query.args[0].args[0]
+            # if at_target == torch.ops._C.rotary_embedding.default:
+            #     query = kwargs["query"]
+            #     mm_node = query.args[0].args[0]
 
-                # rotary_embedding is a special case: the two mutating inputs
-                # are query and key, which are slices of mm_node.
-                # While functionalized, results at[1] and at[2] are scattered
-                # back into mm_node. After de-functionalization, we can just
-                # use mm_node directly.
-                for idx, user in self.getitem_users(node).items():
-                    for user_of_getitem in user.users:
-                        if is_func(
-                            user_of_getitem, torch.ops.aten.slice_scatter.default
-                        ):
-                            user_of_getitem.replace_all_uses_with(mm_node)
-                            self._remove(user_of_getitem)
-                    self._remove(user)
+            #     # rotary_embedding is a special case: the two mutating inputs
+            #     # are query and key, which are slices of mm_node.
+            #     # While functionalized, results at[1] and at[2] are scattered
+            #     # back into mm_node. After de-functionalization, we can just
+            #     # use mm_node directly.
+            #     for idx, user in self.getitem_users(node).items():
+            #         for user_of_getitem in user.users:
+            #             if is_func(
+            #                 user_of_getitem, torch.ops.aten.slice_scatter.default
+            #             ):
+            #                 user_of_getitem.replace_all_uses_with(mm_node)
+            #                 self._remove(user_of_getitem)
+            #         self._remove(user)
 
-                self.insert_defunctionalized(graph, node)
-                self._remove(node)
+            #     self.insert_defunctionalized(graph, node)
+            #     self._remove(node)
 
             # rms_norm replacements avoid the most copies for LLaMa.
-            elif at_target == torch.ops._C.fused_add_rms_norm.default:
-                mutated_args = {1: "input", 2: "residual"}
-                self.defunctionalize(graph, node, mutated_args)
-            elif (
-                at_target == torch.ops._C.fused_add_rms_norm_static_fp8_quant.default
-            ):  # noqa: E501
-                mutated_args = {1: "result", 2: "residual"}
-                self.defunctionalize(graph, node, mutated_args)
-            elif (
-                at_target == torch.ops._C.rms_norm_dynamic_per_token_quant.default
-            ):  # noqa: E501
-                mutated_args = {1: "result", 2: "scale", 3: "residual"}
-                self.defunctionalize(graph, node, mutated_args)
-            elif at_target in [
-                torch.ops._C.rms_norm.default,
-                torch.ops._C.rms_norm_static_fp8_quant.default,
-            ]:
-                mutated_args = {1: "result"}
-                self.defunctionalize(graph, node, mutated_args)
-            # For some reason we need to specify the args for both
-            # silu_and_mul and silu_and_mul_quant. The kwargs
-            # pathway gets the wrong answer.
-            elif at_target == torch.ops._C.silu_and_mul.default:
-                mutated_args = {1: "result"}
-                self.defunctionalize(
-                    graph, node, mutated_args, args=("result", "input")
-                )
-            elif at_target == torch.ops._C.silu_and_mul_quant.default:
-                mutated_args = {1: "result"}
-                self.defunctionalize(
-                    graph, node, mutated_args, args=("result", "input", "scale")
-                )
-            else:
-                continue  # skip the count
+            # if at_target == torch.ops._C.fused_add_rms_norm.default:
+            #     mutated_args = {1: "input", 2: "residual"}
+            #     self.defunctionalize(graph, node, mutated_args)
+            # elif (
+            #     at_target == torch.ops._C.fused_add_rms_norm_static_fp8_quant.default
+            # ):  # noqa: E501
+            #     mutated_args = {1: "result", 2: "residual"}
+            #     self.defunctionalize(graph, node, mutated_args)
+            # elif (
+            #     at_target == torch.ops._C.rms_norm_dynamic_per_token_quant.default
+            # ):  # noqa: E501
+            #     mutated_args = {1: "result", 2: "scale", 3: "residual"}
+            #     self.defunctionalize(graph, node, mutated_args)
+            # elif at_target in [
+            #     torch.ops._C.rms_norm.default,
+            #     torch.ops._C.rms_norm_static_fp8_quant.default,
+            # ]:
+            #     mutated_args = {1: "result"}
+            #     self.defunctionalize(graph, node, mutated_args)
+            # # For some reason we need to specify the args for both
+            # # silu_and_mul and silu_and_mul_quant. The kwargs
+            # # pathway gets the wrong answer.
+            # elif at_target == torch.ops._C.silu_and_mul.default:
+            #     mutated_args = {1: "result"}
+            #     self.defunctionalize(
+            #         graph, node, mutated_args, args=("result", "input")
+            #     )
+            # elif at_target == torch.ops._C.silu_and_mul_quant.default:
+            #     mutated_args = {1: "result"}
+            #     self.defunctionalize(
+            #         graph, node, mutated_args, args=("result", "input", "scale")
+            #     )
+            # else:
+            continue  # skip the count
 
             count += 1
 

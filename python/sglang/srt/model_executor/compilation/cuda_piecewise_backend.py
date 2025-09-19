@@ -23,10 +23,10 @@ def weak_ref_tensor(tensor: Any) -> Any:
     The new tensor will share the same data as the original tensor,
     but will not keep the original tensor alive.
     """
-    if isinstance(tensor, torch.Tensor):
-        return torch.ops._C.weak_ref_tensor(tensor)
-    else:
-        return tensor
+    # if isinstance(tensor, torch.Tensor):
+    #     return torch.ops._C.weak_ref_tensor(tensor)
+    # else:
+    return tensor
 
 
 def weak_ref_tensors(
