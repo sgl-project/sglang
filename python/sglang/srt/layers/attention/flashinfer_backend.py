@@ -380,12 +380,10 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
-            # Avoid using fast_decode_plan for deterministic inference
-            if not self.enable_deterministic:
-                for i in range(self.num_wrappers):
-                    decode_wrappers[i].begin_forward = partial(
-                        fast_decode_plan, decode_wrappers[i]
-                    )
+            for i in range(self.num_wrappers):
+                decode_wrappers[i].begin_forward = partial(
+                    fast_decode_plan, decode_wrappers[i]
+                )
         elif forward_mode.is_target_verify():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -1486,8 +1484,8 @@ def fast_decode_plan(
                     head_dim,
                     False,  # causal
                     window_left,
-                    -1,
-                    False,
+                    fixed_split_size,
+                    disable_split_kv,
                 )
             except Exception as e:
                 raise RuntimeError(f"Error in standard plan: {e}")
