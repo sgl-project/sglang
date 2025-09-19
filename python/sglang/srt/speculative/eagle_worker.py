@@ -771,6 +771,10 @@ class EAGLEWorker(TpModelWorker):
 
         return score_list, token_list, parents_list
 
+    def clear_cache_pool(self):
+        self.model_runner.req_to_token_pool.clear()
+        self.model_runner.token_to_kv_pool_allocator.clear()
+
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.return_hidden_states = False

@@ -47,6 +47,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -431,6 +432,19 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.init_weights_update_group(obj, None)
+        )
+
+    def destroy_weights_update_group(
+        self,
+        group_name: str,
+    ):
+        """Destroy parameter update group."""
+        obj = DestroyWeightsUpdateGroupReqInput(
+            group_name=group_name,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.destroy_weights_update_group(obj, None)
         )
 
     def update_weights_from_distributed(
