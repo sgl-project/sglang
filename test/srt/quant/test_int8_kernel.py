@@ -13,10 +13,6 @@ from sglang.srt.layers.quantization.int8_kernel import (
 from sglang.test.test_utils import CustomTestCase
 
 
-def to_int8(tensor: torch.Tensor) -> torch.Tensor:
-    return torch.round(tensor.clamp(min=-128, max=127)).to(dtype=torch.int8)
-
-
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
     """Matrix multiplication function that supports per-token input quantization and per-column weight quantization"""
     A = A.to(torch.float32)
@@ -198,20 +194,14 @@ class TestW8A8Int8Gemm(CustomTestCase):
 
     def _w8a8_int8_gemm(self, M, N, K, dtype, seed, with_bias):
         torch.manual_seed(seed)
-        a = to_int8(
-            torch.randn(
-                (M, K),
-            )
-            * 5
+        a = torch.randn(
+            (M, K),
         )
-        b = to_int8(
-            torch.randn(
-                (N, K),
-            )
-            * 5
+        b = torch.randn(
+            (N, K),
         )
-        scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
-        scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
+        a, scale_a = per_token_quant_int8(a)
+        b, scale_b = per_token_quant_int8(b)
         if with_bias:
             bias = torch.randn((N,), device="cuda", dtype=dtype) * 10
         else:
