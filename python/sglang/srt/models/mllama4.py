@@ -542,7 +542,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         # For text-only models, return None or raise an error
         if not self.has_vision or self.vision_model is None:
             raise ValueError("Vision model not available for text-only checkpoint")
-        print("get_image_feature")
         pixel_values = (
             torch.concat([item.feature for item in items])
             .to(next(self.vision_model.parameters()).device)
