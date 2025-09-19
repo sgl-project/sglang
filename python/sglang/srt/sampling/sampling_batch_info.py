@@ -26,9 +26,6 @@ class SamplingBatchInfo:
     top_ks: torch.Tensor
     min_ps: torch.Tensor
 
-    # Used for deterministic sampling
-    sampling_seed: Optional[torch.Tensor] = None
-
     # Whether all requests use greedy sampling
     is_all_greedy: bool
 
@@ -62,6 +59,9 @@ class SamplingBatchInfo:
     custom_logit_processor: Optional[
         Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
     ] = None
+
+    # Used for deterministic sampling
+    sampling_seed: Optional[torch.Tensor] = None
 
     # Device
     device: str = "cuda"
