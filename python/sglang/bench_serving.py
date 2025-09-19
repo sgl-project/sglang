@@ -2191,6 +2191,7 @@ def run_benchmark(args_: argparse.Namespace):
 
     last_result = None
     numeric_summaries: List[Dict[str, float]] = []
+    all_results: List[BenchmarkMetrics] = []
     for i in range(num_repeats):
         # run benchmark
         result = asyncio.run(
@@ -2226,6 +2227,7 @@ def run_benchmark(args_: argparse.Namespace):
 
         # collect numeric summary fields for averaging later
         if result is not None:
+            all_results.append(result)
             # Get scalar metrics and convert to float for averaging
             scalar_dict = result.to_scalar_dict()
             numeric_summaries.append(
@@ -2247,9 +2249,13 @@ def run_benchmark(args_: argparse.Namespace):
             k: sum(d[k] for d in numeric_summaries) / len(numeric_summaries)
             for k in numeric_summaries[0].keys()
         }
+        # Average completed requests across all runs
+        avg_completed = sum(result.completed for result in all_results) / len(
+            all_results
+        )
         # Construct averaged BenchmarkMetrics instance
         m = BenchmarkMetrics(
-            completed=int(avg.get("completed", 0)),
+            completed=int(avg_completed),
             total_input=int(avg.get("total_input", 0)),
             total_output=int(avg.get("total_output", 0)),
             total_output_retokenized=int(avg.get("total_output_retokenized", 0)),
