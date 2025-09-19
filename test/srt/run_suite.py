@@ -267,6 +267,7 @@ suite_amd = {
         TestFile("test_torch_compile.py", 169),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
+        # TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_triton_sliding_window.py", 250),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
