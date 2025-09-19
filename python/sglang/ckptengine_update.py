@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import pickle
+import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -11,11 +12,88 @@ import requests
 import torch
 import torch.distributed as dist
 import zmq
-from checkpoint_engine.ps import ParameterServer, request_inference_to_update
+from checkpoint_engine.ps import (
+    ParameterServer,
+    _gen_h2d_buckets,
+    _to_named_tensor,
+    request_inference_to_update,
+)
 from loguru import logger
 from safetensors import safe_open
+from torch.multiprocessing.reductions import reduce_tensor
 
 CKPTENGINE_PORT = 33001
+
+
+def my_custom_update_p2p(
+    self,
+    checkpoint_name: str,
+    req_func: Callable[[list[tuple[str, str]]], None],
+    ranks: list[int],
+):
+    assert self._p2p_store is not None, "p2p store is not initialized"
+    assert ranks, "ranks should be set"
+    if len(self._current_global_parameter_metas) == 0:
+        raise ValueError("parameter metas is empty")
+    assert (
+        dist.is_initialized()
+    ), "process group is not initialized when update model per bucket p2p"
+
+    need_update = self._rank in ranks
+    logger.info(
+        f"[rank{self._rank}] update checkpoint {checkpoint_name} p2p, {need_update=} with {ranks=}, "
+        f"gpu_count {self._gpu_count}, world_size {self._world_size}"
+    )
+
+    if not need_update:
+        return
+
+    # first execute a barrier to avoid subsequent cuda oom
+    dist.barrier()
+
+    bucket_size, _ = self._detect_bucket_size(disable_h2d_buffer=True)
+    buffer = torch.empty(bucket_size * 2, dtype=torch.uint8, device="cuda")
+    ipc_buffer_name = "__ipc_buffer___"
+    self._p2p_store.register_named_tensors({ipc_buffer_name: buffer})
+    logger.info(
+        f"[rank{self._rank}] register buffer, shape={buffer.shape}, dtype={buffer.dtype}, data_ptr={buffer.data_ptr()}, nbytes={buffer.nbytes}"
+    )
+    handle = reduce_tensor(buffer)
+
+    buckets = _gen_h2d_buckets(self._current_global_parameter_metas, bucket_size)
+    socket, socket_paths = self._bind_zmq_socket()
+    req_thread = threading.Thread(
+        target=req_func,
+        args=(socket_paths,),
+    )
+    req_thread.start()
+    socket.send_pyobj(handle)
+    last_owner_rank = self._rank
+    for gidx, (owner_rank, bucket) in enumerate(buckets):
+        self._logger_rank0(
+            f"[rank{self._rank}] begin to update bucket {gidx + 1}/{len(buckets)} owner_rank {owner_rank} in checkpoint {checkpoint_name}, bucket_size: {bucket.size / 1024 / 1024:.2f}MiB, length: {len(bucket.items)}. "
+        )
+        _buffer = buffer[gidx % 2 * bucket_size : gidx % 2 * bucket_size + bucket.size]
+        if dist.get_rank() == 0:
+            self._copy_to_buffer(checkpoint_name, bucket, _buffer, owner_rank)
+        # broadcast the collected data to all ranks
+        dist.broadcast(_buffer, src=0)
+        if last_owner_rank == self._rank:
+            socket.recv()
+        dist.barrier()
+        if owner_rank == self._rank:
+            socket.send_pyobj(_to_named_tensor(bucket.items, gidx % 2 * bucket_size))
+        last_owner_rank = owner_rank
+
+    if last_owner_rank == self._rank:
+        socket.recv()
+    socket.send_pyobj(None)
+    socket.recv()
+    req_thread.join()
+    dist.barrier()
+    socket.close()
+    self._p2p_store.unregister_named_tensors([ipc_buffer_name])
+    torch.cuda.empty_cache()
 
 
 @contextmanager
@@ -151,7 +229,9 @@ if __name__ == "__main__":
     rank = int(os.getenv("RANK"))
     world_size = int(os.getenv("WORLD_SIZE"))
     req_func = req_inference(args.inference_parallel_size)
+    ParameterServer._update_per_bucket_p2p = my_custom_update_p2p
     ps = ParameterServer(auto_pg=True)
+    ps._gpu_count = args.inference_parallel_size
     if args.load_metas_file:
         join(
             ps,
