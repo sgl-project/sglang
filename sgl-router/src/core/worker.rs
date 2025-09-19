@@ -328,15 +328,15 @@ pub struct WorkerMetadata {
 /// Basic worker implementation
 #[derive(Clone)]
 pub struct BasicWorker {
-    metadata: WorkerMetadata,
-    load_counter: Arc<AtomicUsize>,
-    processed_counter: Arc<AtomicUsize>,
-    healthy: Arc<AtomicBool>,
-    consecutive_failures: Arc<AtomicUsize>,
-    consecutive_successes: Arc<AtomicUsize>,
-    circuit_breaker: CircuitBreaker,
+    pub metadata: WorkerMetadata,
+    pub load_counter: Arc<AtomicUsize>,
+    pub processed_counter: Arc<AtomicUsize>,
+    pub healthy: Arc<AtomicBool>,
+    pub consecutive_failures: Arc<AtomicUsize>,
+    pub consecutive_successes: Arc<AtomicUsize>,
+    pub circuit_breaker: CircuitBreaker,
     /// Optional gRPC client for gRPC workers
-    grpc_client: Option<Arc<Mutex<SglangSchedulerClient>>>,
+    pub grpc_client: Option<Arc<Mutex<SglangSchedulerClient>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -351,56 +351,6 @@ impl fmt::Debug for BasicWorker {
 }
 
 impl BasicWorker {
-    pub fn new(url: String, worker_type: WorkerType) -> Self {
-        Self::with_connection_mode(url, worker_type, ConnectionMode::Http)
-    }
-
-    pub fn with_connection_mode(
-        url: String,
-        worker_type: WorkerType,
-        connection_mode: ConnectionMode,
-    ) -> Self {
-        let metadata = WorkerMetadata {
-            url: url.clone(),
-            worker_type,
-            connection_mode,
-            labels: std::collections::HashMap::new(),
-            health_config: HealthConfig::default(),
-        };
-
-        Self {
-            metadata,
-            load_counter: Arc::new(AtomicUsize::new(0)),
-            processed_counter: Arc::new(AtomicUsize::new(0)),
-            healthy: Arc::new(AtomicBool::new(true)),
-            consecutive_failures: Arc::new(AtomicUsize::new(0)),
-            consecutive_successes: Arc::new(AtomicUsize::new(0)),
-            circuit_breaker: CircuitBreaker::new(),
-            grpc_client: None,
-        }
-    }
-
-    pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
-        self.metadata.labels = labels;
-        self
-    }
-
-    pub fn with_health_config(mut self, config: HealthConfig) -> Self {
-        self.metadata.health_config = config;
-        self
-    }
-
-    pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
-        self.circuit_breaker = CircuitBreaker::with_config(config);
-        self
-    }
-
-    /// Set the gRPC client for gRPC workers
-    pub fn with_grpc_client(mut self, client: SglangSchedulerClient) -> Self {
-        self.grpc_client = Some(Arc::new(Mutex::new(client)));
-        self
-    }
-
     pub fn normalised_url(&self) -> WorkerResult<&str> {
         if self.url().contains("@") {
             // Need to extract the URL from "http://host:port@dp_rank"
@@ -577,9 +527,12 @@ pub struct DPAwareWorker {
 impl DPAwareWorker {
     /// Create a new DP-aware worker of any type
     pub fn new(base_url: String, dp_rank: usize, dp_size: usize, worker_type: WorkerType) -> Self {
+        use crate::core::BasicWorkerBuilder;
         // Create URL with DP rank suffix for identification
         let worker_url = format!("{}@{}", base_url, dp_rank);
-        let base_worker = BasicWorker::new(worker_url, worker_type);
+        let base_worker = BasicWorkerBuilder::new(worker_url)
+            .worker_type(worker_type)
+            .build();
 
         Self {
             base_worker,
@@ -724,7 +677,12 @@ impl WorkerFactory {
 
     /// Create a regular worker
     pub fn create_regular(url: String) -> Box<dyn Worker> {
-        Box::new(BasicWorker::new(url, WorkerType::Regular))
+        use crate::core::BasicWorkerBuilder;
+        Box::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .build(),
+        )
     }
 
     /// Create a regular worker with custom circuit breaker configuration
@@ -741,10 +699,12 @@ impl WorkerFactory {
 
     /// Create a prefill worker with optional bootstrap port
     pub fn create_prefill(url: String, bootstrap_port: Option<u16>) -> Box<dyn Worker> {
-        Box::new(BasicWorker::new(
-            url,
-            WorkerType::Prefill { bootstrap_port },
-        ))
+        use crate::core::BasicWorkerBuilder;
+        Box::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill { bootstrap_port })
+                .build(),
+        )
     }
 
     /// Create a prefill worker with custom circuit breaker configuration
@@ -763,7 +723,12 @@ impl WorkerFactory {
 
     /// Create a decode worker
     pub fn create_decode(url: String) -> Box<dyn Worker> {
-        Box::new(BasicWorker::new(url, WorkerType::Decode))
+        use crate::core::BasicWorkerBuilder;
+        Box::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Decode)
+                .build(),
+        )
     }
 
     /// Create a decode worker with custom circuit breaker configuration
@@ -806,11 +771,12 @@ impl WorkerFactory {
 
     /// Create a gRPC worker
     pub fn create_grpc(url: String, worker_type: WorkerType, port: Option<u16>) -> Box<dyn Worker> {
-        Box::new(BasicWorker::with_connection_mode(
-            url,
-            worker_type,
-            ConnectionMode::Grpc { port },
-        ))
+        Box::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc { port })
+                .build(),
+        )
     }
 
     /// Create a gRPC worker with custom circuit breaker configuration
@@ -999,35 +965,6 @@ impl WorkerFactory {
                 .map(|url| Self::create_regular(url))
                 .collect())
         }
-    }
-}
-
-/// Helper trait for collections of workers
-pub trait WorkerCollection {
-    fn healthy_workers(&self) -> Vec<&dyn Worker>;
-    fn total_load(&self) -> usize;
-    fn find_worker(&self, url: &str) -> Option<&dyn Worker>;
-    fn find_worker_mut(&mut self, url: &str) -> Option<&mut Box<dyn Worker>>;
-}
-
-impl WorkerCollection for Vec<Box<dyn Worker>> {
-    fn healthy_workers(&self) -> Vec<&dyn Worker> {
-        self.iter()
-            .filter(|w| w.is_healthy())
-            .map(|w| w.as_ref())
-            .collect()
-    }
-
-    fn total_load(&self) -> usize {
-        self.iter().map(|w| w.load()).sum()
-    }
-
-    fn find_worker(&self, url: &str) -> Option<&dyn Worker> {
-        self.iter().find(|w| w.url() == url).map(|w| w.as_ref())
-    }
-
-    fn find_worker_mut(&mut self, url: &str) -> Option<&mut Box<dyn Worker>> {
-        self.iter_mut().find(|w| w.url() == url)
     }
 }
 
@@ -1275,7 +1212,10 @@ mod tests {
     // Test BasicWorker
     #[test]
     fn test_basic_worker_creation() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
         assert_eq!(worker.url(), "http://test:8080");
         assert_eq!(worker.worker_type(), WorkerType::Regular);
         assert!(worker.is_healthy());
@@ -1289,8 +1229,11 @@ mod tests {
         labels.insert("env".to_string(), "prod".to_string());
         labels.insert("zone".to_string(), "us-west".to_string());
 
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
-            .with_labels(labels.clone());
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .labels(labels.clone())
+            .build();
 
         assert_eq!(worker.metadata().labels, labels);
     }
@@ -1305,8 +1248,11 @@ mod tests {
             success_threshold: 2,
         };
 
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
-            .with_health_config(custom_config.clone());
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(custom_config.clone())
+            .build();
 
         assert_eq!(worker.metadata().health_config.timeout_secs, 15);
         assert_eq!(worker.metadata().health_config.check_interval_secs, 45);
@@ -1316,21 +1262,26 @@ mod tests {
     // Test Worker trait implementation
     #[test]
     fn test_worker_url() {
-        let worker = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://worker1:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
         assert_eq!(worker.url(), "http://worker1:8080");
     }
 
     #[test]
     fn test_worker_type_getter() {
-        let regular = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        use crate::core::BasicWorkerBuilder;
+        let regular = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
         assert_eq!(regular.worker_type(), WorkerType::Regular);
 
-        let prefill = BasicWorker::new(
-            "http://test:8080".to_string(),
-            WorkerType::Prefill {
+        let prefill = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Prefill {
                 bootstrap_port: Some(9090),
-            },
-        );
+            })
+            .build();
         assert_eq!(
             prefill.worker_type(),
             WorkerType::Prefill {
@@ -1338,13 +1289,18 @@ mod tests {
             }
         );
 
-        let decode = BasicWorker::new("http://test:8080".to_string(), WorkerType::Decode);
+        let decode = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Decode)
+            .build();
         assert_eq!(decode.worker_type(), WorkerType::Decode);
     }
 
     #[test]
     fn test_health_status() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
 
         // Initial state is healthy
         assert!(worker.is_healthy());
@@ -1360,7 +1316,10 @@ mod tests {
 
     #[test]
     fn test_load_counter_operations() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
 
         // Initial load is 0
         assert_eq!(worker.load(), 0);
@@ -1390,7 +1349,10 @@ mod tests {
 
     #[test]
     fn test_processed_counter() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
 
         // Initial count is 0
         assert_eq!(worker.processed_requests(), 0);
@@ -1405,10 +1367,12 @@ mod tests {
     // Test concurrent operations
     #[tokio::test]
     async fn test_concurrent_load_increments() {
-        let worker = Arc::new(BasicWorker::new(
-            "http://test:8080".to_string(),
-            WorkerType::Regular,
-        ));
+        use crate::core::BasicWorkerBuilder;
+        let worker = Arc::new(
+            BasicWorkerBuilder::new("http://test:8080")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
 
         let mut handles = vec![];
 
@@ -1432,10 +1396,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_load_decrements() {
-        let worker = Arc::new(BasicWorker::new(
-            "http://test:8080".to_string(),
-            WorkerType::Regular,
-        ));
+        use crate::core::BasicWorkerBuilder;
+        let worker = Arc::new(
+            BasicWorkerBuilder::new("http://test:8080")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
 
         // Set initial load to 100
         for _ in 0..100 {
@@ -1465,10 +1431,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_health_updates() {
-        let worker = Arc::new(BasicWorker::new(
-            "http://test:8080".to_string(),
-            WorkerType::Regular,
-        ));
+        use crate::core::BasicWorkerBuilder;
+        let worker = Arc::new(
+            BasicWorkerBuilder::new("http://test:8080")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
 
         let mut handles = vec![];
 
@@ -1552,84 +1520,13 @@ mod tests {
         assert_eq!(decode[0].url(), "http://decode1:8080");
     }
 
-    // Test WorkerCollection trait
-    #[test]
-    fn test_healthy_workers_filter() {
-        let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
-            WorkerFactory::create_regular("http://w3:8080".to_string()),
-        ];
-
-        // Set some workers unhealthy
-        workers[0].set_healthy(false);
-        workers[2].set_healthy(false);
-
-        let healthy = workers.healthy_workers();
-        assert_eq!(healthy.len(), 1);
-        assert_eq!(healthy[0].url(), "http://w2:8080");
-    }
-
-    #[test]
-    fn test_total_load_calculation() {
-        let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
-            WorkerFactory::create_regular("http://w3:8080".to_string()),
-        ];
-
-        // Set different loads
-        workers[0].increment_load();
-        workers[0].increment_load(); // load = 2
-
-        workers[1].increment_load();
-        workers[1].increment_load();
-        workers[1].increment_load(); // load = 3
-
-        workers[2].increment_load(); // load = 1
-
-        assert_eq!(workers.total_load(), 6);
-    }
-
-    #[test]
-    fn test_find_worker() {
-        let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
-            WorkerFactory::create_regular("http://w3:8080".to_string()),
-        ];
-
-        // Found case
-        let found = workers.find_worker("http://w2:8080");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().url(), "http://w2:8080");
-
-        // Not found case
-        let not_found = workers.find_worker("http://w4:8080");
-        assert!(not_found.is_none());
-    }
-
-    #[test]
-    fn test_find_worker_mut() {
-        let mut workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
-        ];
-
-        // Find and modify
-        if let Some(worker) = workers.find_worker_mut("http://w1:8080") {
-            worker.set_healthy(false);
-        }
-
-        // Verify modification
-        assert!(!workers[0].is_healthy());
-        assert!(workers[1].is_healthy());
-    }
-
     // Test WorkerLoadGuard
     #[test]
     fn test_load_guard_single_worker() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
         assert_eq!(worker.load(), 0);
 
         {
@@ -1667,10 +1564,12 @@ mod tests {
 
     #[test]
     fn test_load_guard_panic_safety() {
-        let worker = Arc::new(BasicWorker::new(
-            "http://test:8080".to_string(),
-            WorkerType::Regular,
-        ));
+        use crate::core::BasicWorkerBuilder;
+        let worker = Arc::new(
+            BasicWorkerBuilder::new("http://test:8080")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
         assert_eq!(worker.load(), 0);
 
         // Clone for use inside catch_unwind
@@ -1723,7 +1622,10 @@ mod tests {
     fn test_check_health_sync_wrapper() {
         // We can't easily test the actual HTTP call without mocking,
         // but we can verify the sync wrapper works
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
 
         // This will fail because there's no server at this URL,
         // but it tests that the sync wrapper doesn't panic
@@ -1734,9 +1636,12 @@ mod tests {
     // Performance test for load counter
     #[test]
     fn test_load_counter_performance() {
+        use crate::core::BasicWorkerBuilder;
         use std::time::Instant;
 
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
         let iterations = 1_000_000;
 
         let start = Instant::now();
@@ -1929,7 +1834,10 @@ mod tests {
 
     #[test]
     fn test_worker_circuit_breaker() {
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
 
         // Initial state should be available
         assert!(worker.is_available());
@@ -1962,8 +1870,11 @@ mod tests {
             window_duration: Duration::from_secs(60),
         };
 
-        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
-            .with_circuit_breaker_config(config);
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .circuit_breaker_config(config)
+            .build();
 
         // Should open after 2 failures
         worker.record_outcome(false);
