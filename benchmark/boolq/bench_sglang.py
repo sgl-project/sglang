@@ -52,12 +52,12 @@ def main(args):
     ######### SGL Program Begin #########
     #####################################
 
-    import sglang as sgl
+    from sglang.lang.api import function, gen
 
-    @sgl.lang.api.function
+    @function
     def few_shot_boolq(s, question):
         s += few_shots + question
-        s += sgl.gen("answer", max_tokens=5, stop=["\n"])
+        s += gen("answer", max_tokens=5, stop=["\n"])
 
     #####################################
     ########## SGL Program End ##########

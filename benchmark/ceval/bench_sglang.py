@@ -73,11 +73,11 @@ def main(args):
     ######### SGL Program Begin #########
     #####################################
 
-    import sglang as sgl
+    from sglang.lang.api import function, gen
 
-    @sgl.lang.api.function
+    @function
     def few_shot_ceval(s, examples, question):
-        s += examples + question + sgl.gen("Answer")
+        s += examples + question + gen("Answer")
 
     #####################################
     ########## SGL Program End ##########
