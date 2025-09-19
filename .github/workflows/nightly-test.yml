@@ -48,7 +48,7 @@ jobs:
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/mickqian/SGLang-test-nightly/main/traces/${{ github.run_id }}
-          PERFETTO_DEEPLINK_RELAY: ${{ vars.PERFETTO_DEEPLINK_RELAY_URL }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
           rm -rf test/srt/performance_profiles_text_models/
           cd test/srt
@@ -112,7 +112,7 @@ jobs:
         timeout-minutes: 240
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/mickqian/SGLang-test-nightly/main/traces/${{ github.run_id }}
-          PERFETTO_DEEPLINK_RELAY: ${{ vars.PERFETTO_DEEPLINK_RELAY_URL }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
           rm -rf test/srt/performance_profiles_vlms/
           cd test/srt

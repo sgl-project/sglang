@@ -1496,9 +1496,7 @@ def generate_markdown_report_nightly(model, results, input_len, output_len):
 
     # Optional: a relay page that fetches the trace and postMessages it to Perfetto UI.
     # See: https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui
-    relay_base = (
-        "https://mickqian.github.io/sglang-ci-perfetto-relay-page/perfetto_relay.html"
-    )
+    relay_base = os.getenv("PERFETTO_RELAY_URL", "").rstrip("/")
     for result in results:
         # Extract the metrics row that bench_one_batch_server prints (without the profile column)
         metrics = re.search(
