@@ -100,6 +100,28 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
 
+        ################################################
+        ################################################
+        # Add after line 103, before "# Check arguments"
+        
+        # Enable deterministic inference with batch-invariant operations
+        # Similar to FlashInfer backend implementation
+        self.enable_deterministic = (
+            model_runner.server_args.enable_deterministic_inference
+        )
+        
+        # Configure deterministic inference settings
+        if self.enable_deterministic:
+            # Use fixed split tile size for batch invariance
+            if self.split_tile_size is None:
+                # Set default split tile size if not specified
+                self.split_tile_size = 256  # Default value for deterministic mode
+                self.max_kv_splits = (
+                    self.max_context_len + self.split_tile_size - 1
+                ) // self.split_tile_size
+        ################################################
+        ################################################
+
         # Check arguments
         assert not (
             model_runner.sliding_window_size is not None
@@ -139,6 +161,84 @@ class TritonAttnBackend(AttentionBackend):
         # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
 
+    #########################################
+    #########################################
+    def get_num_kv_splits(
+        self,
+        num_kv_splits: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ):
+        num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
+        # NOTE(alcanderian): Considering speculative_decodeing,
+        # num_kv_splits.shape[0] will be topk * real_num_token.
+        # And the real_num_token is num_seq in decoding phase.
+        num_group = num_token // num_seq
+
+        assert (
+            num_group * num_seq == num_token
+        ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+
+        # For deterministic inference, always use fixed split tile size
+        # This ensures batch invariance - same sequence length always gets same split count
+        if self.enable_deterministic and self.split_tile_size is not None:
+            # num_kv_splits[:] = (
+            #     seq_lens + self.split_tile_size - 1
+            # ) // self.split_tile_size
+            # return
+            
+            # Expend seq_lens to match num_token
+            if num_group > 1:
+                # For speculative decoding, repeat seq_lens for each group
+                expanded_seq_lens = seq_lens.repeat_interleave(num_group)
+            else:
+                expanded_seq_lens = seq_lens
+            
+            num_kv_splits[:] = (
+                expanded_seq_lens + self.split_tile_size - 1
+            ) // self.split_tile_size
+            return
+
+        # Legacy dynamic splitting logic (non-deterministic)
+        if self.static_kv_splits or self.device_core_count <= 0:
+            num_kv_splits.fill_(self.max_kv_splits)
+            return
+
+        if self.split_tile_size is not None:
+            # num_kv_splits[:] = (
+            #     seq_lens + self.split_tile_size - 1
+            # ) // self.split_tile_size
+            # return
+            
+            # expand seq_lens to match num_token 
+            if num_group > 1:
+                expanded_seq_lens = seq_lens.repeat_interleave(num_group)
+            else:
+                expanded_seq_lens = seq_lens
+                
+            num_kv_splits[:] = (
+                expanded_seq_lens + self.split_tile_size - 1
+            ) // self.split_tile_size
+            return
+
+
+        if num_seq < 256:
+            SCHEDULE_SEQ = 256
+        else:
+            SCHEDULE_SEQ = triton.next_power_of_2(num_seq)
+
+        get_num_kv_splits_triton[(1,)](
+            num_kv_splits,
+            seq_lens,
+            num_seq,
+            num_group,
+            self.num_head,
+            self.num_kv_head,
+            self.max_kv_splits,
+            self.device_core_count,
+            MAX_NUM_SEQ=SCHEDULE_SEQ,
+        )
+
+        '''
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,
@@ -180,6 +280,9 @@ class TritonAttnBackend(AttentionBackend):
             self.device_core_count,
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
+        '''
+    #########################################
+    #########################################
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -389,6 +492,18 @@ class TritonAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+
+        ########################################
+        ########################################
+        # For deterministic inference, use consistent buffer allocation
+        if self.enable_deterministic:
+            # Use fixed split count based on split tile size
+            fixed_splits = self.max_kv_splits
+        else:
+            fixed_splits = self.max_kv_splits
+        ########################################
+        ########################################
+
         self.cuda_graph_attn_logits = torch.zeros(
             (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
             dtype=torch.float32,
@@ -399,9 +514,25 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        self.cuda_graph_num_kv_splits = torch.full(
+
+        ########################################
+        ########################################
+        # For deterministic inference, always use fixed split count
+        if self.enable_deterministic:
+            self.cuda_graph_num_kv_splits = torch.full(
+                (max_num_tokens,), fixed_splits, dtype=torch.int32, device=self.device
+            )
+        else:
+            self.cuda_graph_num_kv_splits = torch.full(
             (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device
         )
+
+        # self.cuda_graph_num_kv_splits = torch.full(
+        #     (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device
+        # )
+        ########################################
+        ########################################
+        
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
                 (max_num_tokens * self.max_context_len),
@@ -1105,3 +1236,25 @@ def update_sliding_window_buffer_cuda_graph(
             )
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
+
+
+
+# def validate_deterministic_config(server_args):
+#     """
+#     Validate configuration for deterministic inference mode.
+#     Ensures all necessary parameters are set correctly for batch invariance.
+#     """
+#     if server_args.enable_deterministic_inference:
+#         if server_args.triton_attention_split_tile_size is None:
+#             logger.warning(
+#                 "Deterministic inference enabled but split_tile_size not set. "
+#                 "Using default value of 256. For better performance, consider "
+#                 "tuning this parameter based on your model and hardware."
+#             )
+        
+#         logger.info(
+#             f"Deterministic inference enabled with split_tile_size: "
+#             f"{server_args.triton_attention_split_tile_size}"
+#         )
+    
+#     return True
