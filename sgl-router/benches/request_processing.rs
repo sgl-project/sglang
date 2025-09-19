@@ -126,6 +126,7 @@ fn create_sample_generate_request() -> GenerateRequest {
     }
 }
 
+#[allow(deprecated)]
 fn create_sample_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
@@ -170,6 +171,7 @@ fn create_sample_completion_request() -> CompletionRequest {
     }
 }
 
+#[allow(deprecated)]
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
         role: "system".to_string(),
@@ -205,7 +207,6 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         presence_penalty: Some(0.1),
         frequency_penalty: Some(0.1),
         top_logprobs: Some(5),
-        user: Some("benchmark_user".to_string()),
         seed: Some(42),
         parallel_tool_calls: Some(true),
         ..default_chat_completion_request()
