@@ -23,8 +23,7 @@ class DisaggregationHiCacheBase(TestDisaggregationBase):
 
     @classmethod
     def setUpClass(cls):
-        # cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.model = "/sgl-workspace/mnt/Qwen-8B"
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname
         base_port = str(parsed_url.port)
@@ -179,7 +178,6 @@ class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):
 
         # Second request - should hit cache (faster)
         response2 = self.send_request(repeated_prompt, max_tokens=100)
-        print(f"response2: {response2}")
 
         # Assert cached tokens cnt
         self.assertGreater(response2["meta_info"]["cached_tokens"], 700)

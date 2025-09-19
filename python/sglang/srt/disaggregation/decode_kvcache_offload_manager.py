@@ -188,6 +188,6 @@ class DecodeKVCacheOffloadManager:
             # Release host memory
             self.decode_host_mem_pool.free(host_indices)
 
-            logger.info(
+            logger.debug(
                 f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} ms."
             )
