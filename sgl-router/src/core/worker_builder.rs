@@ -1,5 +1,7 @@
-use super::circuit_breaker::CircuitBreakerConfig;
-use super::worker::{BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerType};
+use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use super::worker::{
+    BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+};
 use crate::grpc::client::SglangSchedulerClient;
 use std::collections::HashMap;
 
@@ -88,23 +90,30 @@ impl BasicWorkerBuilder {
 
     /// Build the BasicWorker instance
     pub fn build(self) -> BasicWorker {
-        // Use the existing constructor methods for now
-        let mut worker =
-            BasicWorker::with_connection_mode(self.url, self.worker_type, self.connection_mode);
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize},
+            Arc,
+        };
+        use tokio::sync::Mutex;
 
-        // Apply optional configurations using existing methods
-        if !self.labels.is_empty() {
-            worker = worker.with_labels(self.labels);
+        let metadata = WorkerMetadata {
+            url: self.url.clone(),
+            worker_type: self.worker_type,
+            connection_mode: self.connection_mode,
+            labels: self.labels,
+            health_config: self.health_config,
+        };
+
+        BasicWorker {
+            metadata,
+            load_counter: Arc::new(AtomicUsize::new(0)),
+            processed_counter: Arc::new(AtomicUsize::new(0)),
+            healthy: Arc::new(AtomicBool::new(true)),
+            consecutive_failures: Arc::new(AtomicUsize::new(0)),
+            consecutive_successes: Arc::new(AtomicUsize::new(0)),
+            circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
+            grpc_client: self.grpc_client.map(|client| Arc::new(Mutex::new(client))),
         }
-
-        worker = worker.with_health_config(self.health_config);
-        worker = worker.with_circuit_breaker_config(self.circuit_breaker_config);
-
-        if let Some(client) = self.grpc_client {
-            worker = worker.with_grpc_client(client);
-        }
-
-        worker
     }
 }
 
