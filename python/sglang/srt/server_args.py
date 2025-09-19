@@ -441,8 +441,6 @@ class ServerArgs:
 
     # For deterministic inference
     enable_deterministic_inference: bool = False
-    flashinfer_prefill_split_tile_size: int = 4096
-    flashinfer_decode_split_tile_size: int = 2048
 
     # Deprecated arguments
     enable_ep_moe: bool = False
@@ -2505,18 +2503,6 @@ class ServerArgs:
             "--enable-deterministic-inference",
             action="store_true",
             help="Enable deterministic inference mode with batch invariant ops.",
-        )
-        parser.add_argument(
-            "--flashinfer-prefill-split-tile-size",
-            type=int,
-            default=ServerArgs.flashinfer_prefill_split_tile_size,
-            help="The size of split KV tile in flash infer prefill. Only used for deterministic inference.",
-        )
-        parser.add_argument(
-            "--flashinfer-decode-split-tile-size",
-            type=int,
-            default=ServerArgs.flashinfer_decode_split_tile_size,
-            help="The size of split KV tile in flash infer decode. Only used for deterministic inference.",
         )
 
         # Deprecated arguments

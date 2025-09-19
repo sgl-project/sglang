@@ -199,6 +199,8 @@ class Envs:
 
     # Deterministic inference
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
+    SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
 
     # fmt: on
 

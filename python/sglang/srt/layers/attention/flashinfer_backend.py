@@ -31,6 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
 from sglang.srt.utils import (
+    get_int_env_var,
     is_flashinfer_available,
     is_sm100_supported,
     next_power_of_2,
@@ -101,25 +102,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
 
-        # When deterministic inference is enabled, tensor cores should be used for decode
-        # Also set split tile sizes for prefill and decode, and disable kv split for cuda graph
-        # More information can be found here: https://github.com/flashinfer-ai/flashinfer/pull/1675
-        self.enable_deterministic = (
-            model_runner.server_args.enable_deterministic_inference
-        )
-        self.prefill_split_tile_size = -1
-        self.decode_split_tile_size = -1
-        self.disable_cuda_graph_kv_split = False
-        if self.enable_deterministic:
-            self.decode_use_tensor_cores = True
-            self.prefill_split_tile_size = (
-                model_runner.server_args.flashinfer_prefill_split_tile_size
-            )
-            self.decode_split_tile_size = (
-                model_runner.server_args.flashinfer_decode_split_tile_size
-            )
-            self.disable_cuda_graph_kv_split = True
-
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -143,15 +125,31 @@ class FlashInferAttnBackend(AttentionBackend):
         ):
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
+        # When deterministic inference is enabled, tensor cores should be used for decode
+        # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
+        # More information can be found here: https://github.com/flashinfer-ai/flashinfer/pull/1675
+        self.enable_deterministic = (
+            model_runner.server_args.enable_deterministic_inference
+        )
+        self.prefill_split_tile_size = -1
+        self.decode_split_tile_size = -1
+        self.disable_cuda_graph_kv_split = False
+        if self.enable_deterministic:
+            self.decode_use_tensor_cores = True
+            self.prefill_split_tile_size = get_int_env_var(
+                "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096
+            )
+            self.decode_split_tile_size = get_int_env_var(
+                "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
+            )
+            self.disable_cuda_graph_kv_split = True
+            global_config.flashinfer_workspace_size = 2048 * 1024 * 1024
+
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
             # different from flashinfer zero_init_global_workspace_buffer
-            global_workspace_size = (
-                2048 * 1024 * 1024
-                if self.enable_deterministic
-                else global_config.flashinfer_workspace_size
-            )
+            global_workspace_size = global_config.flashinfer_workspace_size
             global_workspace_buffer = torch.empty(
                 global_workspace_size,
                 dtype=torch.uint8,
