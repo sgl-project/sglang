@@ -52,6 +52,10 @@ if _is_npu:
     import torch_npu
 
 
+def get_tensor_size_bytes(t: torch.Tensor):
+    return np.prod(t.shape) * t.dtype.itemsize
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -127,7 +131,7 @@ class MambaPool:
         if speculative_num_draft_tokens is not None:
             # Cache intermediate SSM states per draft token during target verify
             # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-            intermediate_ssm_state_cache = torch.empty(
+            intermediate_ssm_state_cache = torch.zeros(
                 size=(
                     num_mamba_layers,
                     size + 1,
@@ -141,7 +145,7 @@ class MambaPool:
             )
             # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
             # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
-            intermediate_conv_window_cache = torch.empty(
+            intermediate_conv_window_cache = torch.zeros(
                 size=(
                     num_mamba_layers,
                     size + 1,
@@ -158,16 +162,23 @@ class MambaPool:
                 intermediate_ssm_state_cache,
                 intermediate_conv_window_cache,
             )
+            logger.info(
+                f"Mamba Cache is allocated. "
+                f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+            )
         else:
             self.mamba_cache = (conv_state, temporal_state)
+            logger.info(
+                f"Mamba Cache is allocated. "
+                f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+            )
         self.size = size
         self.free_slots = list(range(size))
         self.mem_usage = self.get_mamba_size() / GB
-        logger.info(
-            f"Mamba Cache is allocated. "
-            f"conv_state size: {conv_state.numel() * conv_state.itemsize / GB:.2f}GB, "
-            f"ssm_state size: {temporal_state.numel() * temporal_state.itemsize / GB:.2f}GB "
-        )
 
     def get_mamba_params_all_layers(self):
         return [self.mamba_cache[i] for i in range(len(self.mamba_cache))]
@@ -176,10 +187,7 @@ class MambaPool:
         return [self.mamba_cache[i][layer_id] for i in range(len(self.mamba_cache))]
 
     def get_mamba_size(self):
-        return (
-            np.prod(self.mamba_cache[0].shape) * self.mamba_cache[0].dtype.itemsize
-            + np.prod(self.mamba_cache[1].shape) * self.mamba_cache[1].dtype.itemsize
-        )
+        return sum(get_tensor_size_bytes(t) for t in self.mamba_cache)
 
     def available_size(self):
         return len(self.free_slots)
@@ -240,7 +248,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layers)}
 
         self.device = device
-        self.req_index_to_mamba_index_mapping: torch.Tensor = torch.empty(
+        self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             size, dtype=torch.int32, device=self.device
         )
 
@@ -492,10 +500,10 @@ class MHATokenToKVPool(KVCache):
         assert hasattr(self, "v_buffer")
         k_size_bytes = 0
         for k_cache in self.k_buffer:
-            k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
+            k_size_bytes += get_tensor_size_bytes(k_cache)
         v_size_bytes = 0
         for v_cache in self.v_buffer:
-            v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
+            v_size_bytes += get_tensor_size_bytes(v_cache)
         return k_size_bytes, v_size_bytes
 
     # for disagg
@@ -649,6 +657,7 @@ class HybridLinearKVPool(KVCache):
         self,
         size: int,
         dtype: torch.dtype,
+        page_size: int,
         head_num: int,
         head_dim: int,
         full_attention_layer_ids: List[int],
@@ -659,10 +668,14 @@ class HybridLinearKVPool(KVCache):
         self.dtype = dtype
         self.device = device
         self.full_layer_nums = len(full_attention_layer_ids)
-        self.page_size = 1
+        self.page_size = page_size
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
-        self.full_kv_pool = MHATokenToKVPool(
+        if _is_npu:
+            TokenToKVPoolClass = AscendTokenToKVPool
+        else:
+            TokenToKVPoolClass = MHATokenToKVPool
+        self.full_kv_pool = TokenToKVPoolClass(
             size=size,
             page_size=self.page_size,
             dtype=dtype,
@@ -722,6 +735,9 @@ class HybridLinearKVPool(KVCache):
             v_scale,
             layer_id_override=layer_id,
         )
+
+    def get_v_head_dim(self):
+        return self.full_kv_pool.get_value_buffer(0).shape[-1]
 
 
 class SWAKVPool(KVCache):
@@ -904,8 +920,12 @@ class AscendTokenToKVPool(MHATokenToKVPool):
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
     ):
-        layer_id = layer.layer_id
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -1065,7 +1085,7 @@ class MLATokenToKVPool(KVCache):
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
         for kv_cache in self.kv_buffer:
-            kv_size_bytes += np.prod(kv_cache.shape) * kv_cache.dtype.itemsize
+            kv_size_bytes += get_tensor_size_bytes(kv_cache)
         return kv_size_bytes
 
     # for disagg
@@ -1228,9 +1248,9 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
         assert hasattr(self, "v_buffer")
         kv_size_bytes = 0
         for k_cache in self.k_buffer:
-            kv_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
+            kv_size_bytes += get_tensor_size_bytes(k_cache)
         for v_cache in self.v_buffer:
-            kv_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
+            kv_size_bytes += get_tensor_size_bytes(v_cache)
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):

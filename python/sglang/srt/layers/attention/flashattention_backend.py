@@ -305,6 +305,7 @@ class FlashAttentionBackend(AttentionBackend):
         speculative_step_id=0,
         topk=0,
         speculative_num_steps=0,
+        fa_impl_ver=3,
     ):
         super().__init__()
 
@@ -337,6 +338,8 @@ class FlashAttentionBackend(AttentionBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+
+        self.fa_impl_ver = fa_impl_ver
 
         # Local attention settings
         self.attention_chunk_size = (
@@ -712,6 +715,8 @@ class FlashAttentionBackend(AttentionBackend):
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
+        if self.fa_impl_ver != 3:
+            kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -738,6 +743,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use Flash Attention for prefill
         if not self.use_mla:
+            assert self.fa_impl_ver in [3], "Only FA3 support here"
             # Do multi-head attention
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
@@ -830,6 +836,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
+                        **kwargs,
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
@@ -844,6 +851,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
+                        **kwargs,
                     )
                 if forward_batch.mha_return_lse:
                     output, lse, *rest = output
@@ -851,6 +859,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
+                assert self.fa_impl_ver in [3], "Only FA3 support here"
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
@@ -939,6 +948,7 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        assert self.fa_impl_ver in [3], "Only FA3 support decoding"
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -985,6 +995,8 @@ class FlashAttentionBackend(AttentionBackend):
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
+        if self.fa_impl_ver != 3:
+            kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
 

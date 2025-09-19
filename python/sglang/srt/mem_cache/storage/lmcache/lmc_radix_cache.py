@@ -78,6 +78,7 @@ class LMCRadixCache(RadixCache):
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        eviction_policy: str = "lru",
     ):
         super().__init__(
             req_to_token_pool=req_to_token_pool,
@@ -85,6 +86,7 @@ class LMCRadixCache(RadixCache):
             page_size=page_size,
             disable=disable,
             enable_kv_cache_events=enable_kv_cache_events,
+            eviction_policy=eviction_policy,
         )
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()

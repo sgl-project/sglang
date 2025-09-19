@@ -16,11 +16,13 @@ _is_xpu = is_xpu()
 if not (_is_npu or _is_xpu):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
+        transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
         transfer_kv_per_layer,
+        transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
@@ -78,6 +80,7 @@ class HostKVCache(abc.ABC):
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align the host memory pool size to the page size
         self.size = self.size - (self.size % self.page_size)
+        self.page_num = self.size // self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
@@ -317,6 +320,15 @@ class MHATokenToKVPoolHost(HostKVCache):
             dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
         elif self.layout == "page_first":
             dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
+        elif self.layout == "page_first_direct":
+            dims = (
+                2,
+                self.page_num,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
@@ -370,19 +382,31 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
-            assert (
-                self.layout == "layer_first"
-            ), f"Direct IO backend only supports layer_first layout."
-            transfer_kv_direct(
-                src_layers=[self.k_buffer[layer_id], self.v_buffer[layer_id]],
-                dst_layers=[
-                    device_pool.k_buffer[layer_id],
-                    device_pool.v_buffer[layer_id],
-                ],
-                src_indices=host_indices,
-                dst_indices=device_indices,
-                page_size=self.page_size,
-            )
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[self.k_buffer[layer_id], self.v_buffer[layer_id]],
+                    dst_layers=[
+                        device_pool.k_buffer[layer_id],
+                        device_pool.v_buffer[layer_id],
+                    ],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first_direct":
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[self.k_buffer, self.v_buffer],
+                    dst_ptrs=[
+                        device_pool.k_buffer[layer_id],
+                        device_pool.v_buffer[layer_id],
+                    ],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -416,16 +440,24 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
-            assert (
-                self.layout == "layer_first"
-            ), f"Direct IO backend only supports layer_first layout."
-            transfer_kv_direct(
-                src_layers=device_pool.k_buffer + device_pool.v_buffer,
-                dst_layers=self.k_data_refs + self.v_data_refs,
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                page_size=self.page_size,
-            )
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=device_pool.k_buffer + device_pool.v_buffer,
+                    dst_layers=self.k_data_refs + self.v_data_refs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first_direct":
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=device_pool.k_buffer + device_pool.v_buffer,
+                    dst_ptrs=[self.k_buffer, self.v_buffer],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -434,6 +466,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             return self.kv_buffer[:, :, index : index + self.page_size, :, :].flatten()
         elif self.layout == "page_first":
             return self.kv_buffer[:, index : index + self.page_size, :, :, :].flatten()
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            return self.kv_buffer[:, real_index : real_index + 1, :, :, :, :].flatten()
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
@@ -460,6 +495,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             self.kv_buffer[:, index : index + self.page_size, :, :, :] = (
                 data_page.reshape(
                     2, self.page_size, self.layer_num, self.head_num, self.head_dim
+                )
+            )
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
+                data_page.reshape(
+                    2, 1, self.layer_num, self.page_size, self.head_num, self.head_dim
                 )
             )
         else:
@@ -580,6 +622,14 @@ class MLATokenToKVPoolHost(HostKVCache):
                 1,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             )
+        elif self.layout == "page_first_direct":
+            dims = (
+                self.page_num,
+                self.layer_num,
+                self.page_size,
+                1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = (
@@ -619,16 +669,25 @@ class MLATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
-            assert (
-                self.layout == "layer_first"
-            ), f"Direct IO backend only supports layer_first layout."
-            transfer_kv_direct(
-                src_layers=[self.kv_buffer[layer_id]],
-                dst_layers=[device_pool.kv_buffer[layer_id]],
-                src_indices=host_indices,
-                dst_indices=device_indices,
-                page_size=self.page_size,
-            )
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[self.kv_buffer[layer_id]],
+                    dst_layers=[device_pool.kv_buffer[layer_id]],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first_direct":
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[self.kv_buffer],
+                    dst_ptrs=[device_pool.kv_buffer[layer_id]],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -656,16 +715,24 @@ class MLATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
-            assert (
-                self.layout == "layer_first"
-            ), f"Direct IO backend only supports layer_first layout."
-            transfer_kv_direct(
-                src_layers=device_pool.kv_buffer,
-                dst_layers=self.data_refs,
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                page_size=self.page_size,
-            )
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=device_pool.kv_buffer,
+                    dst_layers=self.data_refs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first_direct":
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=device_pool.kv_buffer,
+                    dst_ptrs=[self.kv_buffer],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -674,6 +741,9 @@ class MLATokenToKVPoolHost(HostKVCache):
             return self.kv_buffer[:, index : index + self.page_size, :, :].flatten()
         elif self.layout == "page_first":
             return self.kv_buffer[index : index + self.page_size, :, :, :].flatten()
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            return self.kv_buffer[real_index : real_index + 1, :, :, :, :].flatten()
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
@@ -702,6 +772,15 @@ class MLATokenToKVPoolHost(HostKVCache):
             self.kv_buffer[index : index + self.page_size, :, :, :] = data_page.reshape(
                 self.page_size,
                 self.layer_num,
+                1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            )
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            self.kv_buffer[real_index : real_index + 1, :, :, :, :] = data_page.reshape(
+                1,
+                self.layer_num,
+                self.page_size,
                 1,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             )

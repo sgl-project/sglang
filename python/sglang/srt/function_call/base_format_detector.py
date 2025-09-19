@@ -162,12 +162,9 @@ class BaseFormatDetector(ABC):
 
         try:
             try:
-                if current_text.startswith(self.bot_token):
-                    start_idx = len(self.bot_token)
-                elif self.current_tool_id > 0 and current_text.startswith(
-                    self.tool_call_separator + self.bot_token
-                ):
-                    start_idx = len(self.tool_call_separator + self.bot_token)
+                tool_call_pos = current_text.find(self.bot_token)
+                if tool_call_pos != -1:
+                    start_idx = tool_call_pos + len(self.bot_token)
                 elif self.current_tool_id > 0 and current_text.startswith(
                     self.tool_call_separator
                 ):

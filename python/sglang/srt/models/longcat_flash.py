@@ -260,7 +260,7 @@ class LongcatFlashMoE(nn.Module):
         )
         self.topk.forward = self.topk.forward_native
 
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=self.num_experts,
             top_k=self.top_k,
             layer_id=self.layer_id,
@@ -853,7 +853,7 @@ class LongcatFlashForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
