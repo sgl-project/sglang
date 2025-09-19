@@ -375,6 +375,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
+                fixed_split_size=-1,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
@@ -470,6 +471,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                fixed_split_size=-1,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
         elif forward_mode.is_target_verify():
