@@ -912,7 +912,10 @@ mod tests {
             // Test 1: max_tokens vs max_completion_tokens conflict
             request.max_tokens = Some(100);
             request.max_completion_tokens = Some(200);
-            assert!(request.validate().is_err(), "Should reject both max_tokens and max_completion_tokens");
+            assert!(
+                request.validate().is_err(),
+                "Should reject both max_tokens and max_completion_tokens"
+            );
 
             // Reset for next test
             request.max_tokens = None;
@@ -921,19 +924,28 @@ mod tests {
             // Test 2: tools vs functions conflict (deprecated)
             request.tools = Some(vec![]);
             request.functions = Some(vec![]);
-            assert!(request.validate().is_err(), "Should reject both tools and functions");
+            assert!(
+                request.validate().is_err(),
+                "Should reject both tools and functions"
+            );
 
             // Test 3: logprobs=true without top_logprobs should be valid
             let mut request = create_valid_chat_request();
             request.logprobs = true;
             request.top_logprobs = None;
-            assert!(request.validate().is_ok(), "logprobs=true without top_logprobs should be valid");
+            assert!(
+                request.validate().is_ok(),
+                "logprobs=true without top_logprobs should be valid"
+            );
 
             // Test 4: top_logprobs without logprobs=true should fail (OpenAI rule)
             let mut request = create_valid_chat_request();
             request.logprobs = false;
             request.top_logprobs = Some(5);
-            assert!(request.validate().is_err(), "top_logprobs without logprobs=true should fail");
+            assert!(
+                request.validate().is_err(),
+                "top_logprobs without logprobs=true should fail"
+            );
         }
 
         #[test]
@@ -1087,7 +1099,10 @@ mod tests {
 
             // logprobs=true without top_logprobs should be valid (OpenAI behavior)
             request.top_logprobs = None;
-            assert!(request.validate().is_ok(), "logprobs=true without top_logprobs should be valid");
+            assert!(
+                request.validate().is_ok(),
+                "logprobs=true without top_logprobs should be valid"
+            );
 
             // top_logprobs without logprobs=true should fail
             request.logprobs = false;
