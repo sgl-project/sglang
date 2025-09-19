@@ -36,7 +36,7 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -569,11 +569,12 @@ def fused_experts_impl(
                         routed_scaling_factor,
                     )
                 else:
-                    moe_sum_reduce_triton(
+                    moe_sum_reduce(
                         intermediate_cache3.view(*intermediate_cache3.shape),
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],
                         routed_scaling_factor,
                     )
+
         elif _is_hip:
             if _use_aiter:
                 moe_sum(
