@@ -147,8 +147,8 @@ def _torch_compile_wrapper(forward):
     )
 
 
-def torch_compile(model: torch.nn.Module, server_args):
-    set_torch_compile_config(server_args)
+def torch_compile(model: torch.nn.Module, server_args, model_config):
+    set_torch_compile_config(server_args, model_config)
     _to_torch(model, reverse=False, num_tokens=1)
     model.forward = _torch_compile_wrapper(model.forward)
     _to_torch(model, reverse=True, num_tokens=1)
@@ -181,7 +181,7 @@ def patch_model(
             tp_group.ca_comm = backup_ca_comm
 
 
-def set_torch_compile_config(server_args):
+def set_torch_compile_config(server_args, model_config):
     import torch._dynamo.config
     import torch._inductor.config
 
@@ -192,7 +192,7 @@ def set_torch_compile_config(server_args):
     if server_args.enable_torch_compile_fusion:
         from sglang.srt.compilation.fusion.fusion_manager import FusionManager
 
-        fusion_manager = FusionManager(server_args)
+        fusion_manager = FusionManager(server_args, model_config)
 
         torch._inductor.config.post_grad_custom_post_pass = fusion_manager
 
@@ -323,7 +323,9 @@ class CudaGraphRunner:
         self.encoder_len_fill_value = 0
 
         if self.enable_torch_compile:
-            set_torch_compile_config(self.model_runner.server_args)
+            set_torch_compile_config(
+                self.model_runner.server_args, self.model_runner.model_config
+            )
 
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(

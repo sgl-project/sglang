@@ -14,6 +14,7 @@
 
 import copy
 import os
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -23,30 +24,30 @@ from transformers import LlamaConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.cuda_graph_runner import torch_compile
-from sglang.srt.models.llama import LlamaMLP
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.llama import LlamaDecoderLayer
 from sglang.srt.server_args import ServerArgs
 from sglang.test.model_factory import model_layer
 
 
-def init_llama_mlp(
+def init_llama_decoder(
     config: LlamaConfig, quant_config: Optional[QuantizationConfig]
 ) -> torch.nn.Module:
-    return LlamaMLP(
-        config.hidden_size,
-        config.intermediate_size,
-        config.hidden_act,
+    return LlamaDecoderLayer(
+        config,
+        0,
         quant_config,
-        "llama_mlp",
+        "llama",
     )
 
 
 test_data = [
     {
         "models": [
-            "meta-llama/Llama-3.2-1B",
             "RedHatAI/Llama-2-7b-chat-hf-FP8",
+            "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
         ],
-        "layer_initializer": init_llama_mlp,
+        "layer_initializer": init_llama_decoder,
     }
 ]
 
@@ -58,12 +59,12 @@ for data in test_data:
 
 
 @pytest.mark.parametrize("model, layer_initializer", test_cases)
-def test_fused_activation_pass(model, layer_initializer):
+def test_fused_add_rmsnorm_quant_pass(model, layer_initializer):
     server_args = ServerArgs(
         model_path=model,
         enable_torch_compile=True,
         enable_torch_compile_fusion=True,
-        enable_fused_activation_pass=True,
+        enable_rmsnorm_quant_pass=True,
         nccl_port=12345
         + int(os.environ.get("PYTEST_XDIST_WORKER", "gw0").split("gw")[1]),
     )
@@ -74,30 +75,51 @@ def test_fused_activation_pass(model, layer_initializer):
     # from sglang.srt.utils import configure_logger
     # configure_logger(server_args, " TEST_LOGGER")
 
-    with model_layer(server_args, layer_initializer) as (layer, model_config, _):
+    with model_layer(server_args, layer_initializer) as (
+        layer,
+        model_config,
+        dummy_atten_backend,
+    ):
         ref_layer = copy.deepcopy(layer)
 
         # prepare input
         num_tokens = 2
+        dummy_atten_backend.set_out(
+            torch.rand(
+                (
+                    num_tokens,
+                    model_config.hf_config.hidden_size
+                    * model_config.hf_config.num_attention_heads,
+                ),
+                device="cuda",
+                dtype=model_config.dtype,
+            )
+        )
+        position = torch.randint(100, (num_tokens,), dtype=torch.int64, device="cuda")
         hidden_states = torch.rand(
             (num_tokens, model_config.hf_config.hidden_size),
             device="cuda",
             dtype=model_config.dtype,
         )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            attn_backend=dummy_atten_backend,
+        )
 
-        ref_res = ref_layer(hidden_states)
+        ref_res = ref_layer(position, hidden_states, forward_batch, None)
 
         # same torch compile setup as model runner
         torch_compile(layer, server_args, model_config)
 
-        res, source_codes = run_and_get_code(layer.forward, hidden_states)
+        res, source_codes = run_and_get_code(
+            layer.forward, position, hidden_states, forward_batch, None
+        )
         code = "\n".join(source_codes)
 
         torch.testing.assert_close(ref_res, res)
-        assert "sglang.fused_swiglu" in code
-        assert "sgl_kernel.silu_and_mul" not in code
+        assert "_C.fused_add_rms_norm_static_fp8_quant" in code
+        assert "sgl_kernel.fused_add_rmsnorm" not in code
 
 
 if __name__ == "__main__":
-    # pytest.main([__file__])
-    test_fused_activation_pass("meta-llama/Llama-3.2-1B", init_llama_mlp)
+    pytest.main([__file__])

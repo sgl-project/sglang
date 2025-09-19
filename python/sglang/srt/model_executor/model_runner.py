@@ -2451,7 +2451,7 @@ class ModelRunner:
 
         if self.device != "cpu" and self.server_args.disable_cuda_graph:
             if self.server_args.enable_torch_compile:
-                torch_compile(self.model, self.server_args)
+                torch_compile(self.model, self.server_args, self.model_config)
             return
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:

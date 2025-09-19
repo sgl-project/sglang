@@ -9,6 +9,7 @@ suites = {
     "per-commit-1-gpu": [
         TestFile("test_eagle_constrained_decoding.py", 100),
         TestFile("compilation/fusion/passes/test_fused_activation.py", 30),
+        TestFile("compilation/fusion/passes/test_rmsnorm_quant.py", 30),
         TestFile("compilation/fusion/triton_ops/test_triton_fused_swiglu.py", 60),
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         TestFile("hicache/test_hicache_storage.py", 127),
