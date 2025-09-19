@@ -6,6 +6,10 @@ import unittest
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_URL_FOR_TEST,
     _parse_int_list_env,
     find_traces_under_path,
@@ -23,16 +27,14 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
-            (parse_models("zai-org/GLM-4.5-Air-FP8"), False, True),
-            (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
-        cls.batch_sizes = [1, 1]
+        cls.batch_sizes = [1, 1, 8, 32, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "512"))
         os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -100,29 +102,12 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                             for trace_dir in trace_dirs
                         ]
 
-                        print(f"{trace_dirs=}")
-                        print(f"{trace_filenames_from_all_dirs=}")
-
                         trace_file_names = []
                         for trace_files in trace_filenames_from_all_dirs:
                             for trace_file in sorted(trace_files):
                                 if "trace.json.gz" in trace_file:
                                     trace_file_names.append(trace_file)
                                     break
-
-                        # extend_trace_filenames = [
-                        #     trace_file
-                        #     for trace_files in trace_filenames_from_all_dirs
-                        #     for trace_file in sorted(trace_files)
-                        # ]
-                        # print(f"{extend_trace_filenames=}")
-                        #
-                        # extend_trace_filenames = [
-                        #     trace_files[0]
-                        #     for trace_files in extend_trace_filenames
-                        # ]
-
-                        print(f"{trace_file_names=}")
 
                         # because the profile_id dir under PROFILE_DIR
                         extend_trace_file_relative_path_from_profile_dirs = [
@@ -131,8 +116,6 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                                 trace_file_names, trace_dirs
                             )
                         ]
-
-                        print(f"{extend_trace_file_relative_path_from_profile_dirs=}")
 
                         model_results.append(
                             {
@@ -150,7 +133,6 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                         )
                         self.full_report += report_part + "\n"
 
-        print(f"{self.full_report}")
         if is_in_ci():
             write_github_step_summary(self.full_report)
 
