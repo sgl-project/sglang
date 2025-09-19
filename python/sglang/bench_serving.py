@@ -2236,6 +2236,7 @@ def run_benchmark(args_: argparse.Namespace):
         if i < num_repeats - 1:
             try:
                 requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+                print("Flushed cache")
             except Exception:
                 pass
             time.sleep(1.0)
