@@ -409,6 +409,9 @@ class ServerArgs:
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
+    # -1 mean dump all layers.
+    debug_tensor_dump_layers: int = -1
+    # TODO(guoyuhong): clean the old dumper code.
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
     debug_tensor_dump_prefill_only: bool = False
@@ -2479,6 +2482,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_output_folder,
             help="The output folder for dumping tensors.",
+        )
+        parser.add_argument(
+            "--debug-tensor-dump-layers",
+            type=int,
+            default=-1,
+            help="The layer number for dumping tensors.",
         )
         parser.add_argument(
             "--debug-tensor-dump-input-file",

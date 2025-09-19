@@ -18,13 +18,16 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 logger = logging.getLogger(__name__)
 
 
 class TensorDumper:
-    def __init__(self, dump_dir: str, tp_size: int, tp_rank: int, pp_rank: int):
+    def __init__(
+        self, dump_dir: str, dump_layers: int, tp_size: int, tp_rank: int, pp_rank: int
+    ):
+        self._dump_layers = dump_layers
         self._forward_pass_id = 0
         self._pid = os.getpid()
         self._current_tensors = {}
@@ -59,6 +62,11 @@ class TensorDumper:
             self._current_tensors[name + ".forward_batch_info.positions"] = (
                 tensor_item.positions.cpu()
             )
+        elif isinstance(tensor_item, PPProxyTensors):
+            for tensor_name in tensor_item.tensors.keys():
+                self._current_tensors[name + ".pp_proxy_tensors." + tensor_name] = (
+                    tensor_item.tensors[tensor_name].cpu()
+                )
         else:
             logger.warning(f"Unsupported type: {type(tensor_item)}: {tensor_item}")
 
@@ -73,27 +81,39 @@ class TensorDumper:
         self._current_tensors = {}
         self._forward_pass_id += 1
 
-    def _add_hook_recursive(self, model, prefix, dump_module_name="model"):
-        has_dump_module = False
+    def _add_hook_recursive(
+        self, model, prefix, top_level_module_name, layers_module_name
+    ):
+        model_top_level_module_matched = False
+        layers_prefix = top_level_module_name + "." + layers_module_name
         for name, module in model._modules.items():
-            do_dump = False
+            top_level_model = False
             if len(prefix) == 0:
                 cur_name = name
-                if cur_name == dump_module_name:
-                    has_dump_module = True
-                    do_dump = True
+                if cur_name == top_level_module_name:
+                    model_top_level_module_matched = True
+                    top_level_model = True
             else:
                 cur_name = prefix + "." + name
+            if self._dump_layers > 0 and name.isdigit() and prefix == layers_prefix:
+                # If we only need n layers, skip the reset layers.
+                # Most models' layout is like model.layers.0.
+                cur_layer = int(name)
+                if cur_layer >= self._dump_layers:
+                    continue
             if module is not None:
-                temp, sub_count = self._add_hook_recursive(module, cur_name)
-                has_dump_module = has_dump_module or temp
-                if sub_count == 0 or do_dump:
+                _, sub_count = self._add_hook_recursive(
+                    module, cur_name, top_level_module_name, layers_module_name
+                )
+                if sub_count == 0 or top_level_model:
                     # Avoid duplicated output hooks, e.g. self_attn may contain:
                     # self_attn.qkv_proj, self_attn.attn & self_attn.o_proj.
                     # Therefore, we do not need to add output hooks for self_attn,
                     # since the output of self_attn should be the same to self_attn.o_proj.
-                    module.register_forward_hook(self._dump_hook(cur_name, do_dump))
-        return has_dump_module, len(model._modules.items())
+                    module.register_forward_hook(
+                        self._dump_hook(cur_name, top_level_model)
+                    )
+        return model_top_level_module_matched, len(model._modules.items())
 
     def _dump_hook(self, tensor_name, do_dump):
         def inner_dump_hook(module, input, output):
@@ -110,9 +130,21 @@ class TensorDumper:
 
 
 def register_forward_hook_for_model(
-    model, dump_dir: str, tp_size: int, tp_rank: int, pp_rank: int
+    model, dump_dir: str, dump_layers: int, tp_size: int, tp_rank: int, pp_rank: int
 ):
-    tensor_dumper = TensorDumper(dump_dir, tp_size, tp_rank, pp_rank)
-    has_dump_module, _ = tensor_dumper._add_hook_recursive(model, "")
-    assert has_dump_module, "model should have a module named 'model'"
+    tensor_dumper = TensorDumper(dump_dir, dump_layers, tp_size, tp_rank, pp_rank)
+    # Most models have the layerout like:
+    # XxxxForCausalLM
+    #     (model): XxxxModel
+    #         (layers): ModuleList
+    # If the model is not constructed with this layout,
+    # environment variable can be used to specify the module names.
+    top_level_module_name = os.getenv("TENSOR_DUMP_TOP_LEVEL_MODULE_NAME", "model")
+    layers_module_name = os.getenv("TENSOR_DUMP_LAYERS_MODULE_NAME", "layers")
+    model_top_level_module_matched, _ = tensor_dumper._add_hook_recursive(
+        model, "", top_level_module_name, layers_module_name
+    )
+    assert (
+        model_top_level_module_matched
+    ), f"model should have a module named {top_level_module_name}"
     return tensor_dumper

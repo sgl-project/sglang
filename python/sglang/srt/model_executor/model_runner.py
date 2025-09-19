@@ -832,6 +832,7 @@ class ModelRunner:
             register_forward_hook_for_model(
                 self.model,
                 self.server_args.debug_tensor_dump_output_folder,
+                self.server_args.debug_tensor_dump_layers,
                 self.tp_size,
                 self.tp_rank,
                 self.pp_rank,
