@@ -7,6 +7,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.nvila import NVILAForConditionalGeneration
+from sglang.srt.models.nvila_lite import NVILALiteForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -17,7 +18,10 @@ NUM_VIDEO_FRAMES = 8
 
 
 class NVILAMultimodalProcessor(BaseMultimodalProcessor):
-    models: list[type[nn.Module]] = [NVILAForConditionalGeneration]
+    models: list[type[nn.Module]] = [
+        NVILAForConditionalGeneration,
+        NVILALiteForConditionalGeneration,
+    ]
 
     def __init__(
         self,
@@ -51,16 +55,8 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
         base_output = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
-            image_data=(
-                request_obj.image_data
-                if isinstance(request_obj.image_data, list)
-                else [request_obj.image_data]
-            ),
-            video_data=(
-                request_obj.video_data
-                if isinstance(request_obj.video_data, list)
-                else [request_obj.video_data]
-            ),
+            image_data=request_obj.image_data,  # type: ignore
+            video_data=request_obj.video_data,  # type: ignore
         )
 
         for i, video in enumerate(base_output.videos):  # type: ignore
