@@ -234,10 +234,6 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
 
-    /// Configuration for model predictions
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prediction: Option<PredictionConfig>,
-
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
@@ -302,10 +298,6 @@ pub struct ChatCompletionRequest {
     /// Verbosity level for debugging
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verbosity: Option<i32>,
-
-    /// Configuration for web search
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub web_search_options: Option<WebSearchOptions>,
 
     // ============= SGLang Extensions =============
     /// Top-k sampling parameter (-1 to disable)
