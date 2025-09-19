@@ -15,6 +15,7 @@ You can test them according to your needs.
 | **TRTLLM MLA**           | ✅                | ❌                 | ✅      | ✅                 | ❌              |
 | **Ascend**               | ✅                | ❌                 | ✅      | ❌                 | ❌              |
 | **Wave**                 | ✅                | ❌                 | ❌      | ❌                 | ❌              |
+| **Intel XPU**            | ✅                | ❌                 | ❌      | ✅                 | ❌              |
 
 **Notes:**
 - TRTLLM MLA only implements decode operations. For prefill operations (including multimodal inputs), it falls back to FlashInfer MLA backend.
@@ -109,6 +110,13 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --attention-backend ascend
+```
+
+- Intel XPU
+```bash
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend intel_xpu
 ```
 
 - Wave
