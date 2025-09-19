@@ -392,13 +392,20 @@ class MultimodalInputs:
 
 
 class RequestStage(str, enum.Enum):
-    # prefill
+    # Tokenizer
+    TOKENIZE = "tokenize"
+    TOKENIZER_DISPATCH = "dispatch"
+
+    # common/non-disaggregation
     PREFILL_WAITING = "prefill_waiting"
+    REQUEST_PROCESS = "request_process"
+    DECODE_LOOP = "decode_loop"
+    PREFILL_FORWARD = "prefill_forward"
+    PREFILL_CHUNKED_FORWARD = "chunked_prefill"
 
     # disaggregation prefill
     PREFILL_PREPARE = "prefill_prepare"
     PREFILL_BOOTSTRAP = "prefill_bootstrap"
-    PREFILL_FORWARD = "prefill_forward"
     PREFILL_TRANSFER_KV_CACHE = "prefill_transfer_kv_cache"
 
     # disaggregation decode
@@ -406,6 +413,7 @@ class RequestStage(str, enum.Enum):
     DECODE_BOOTSTRAP = "decode_bootstrap"
     DECODE_WAITING = "decode_waiting"
     DECODE_TRANSFERRED = "decode_transferred"
+    DECODE_FAKE_OUTPUT = "fake_output"
 
 
 class Req:
