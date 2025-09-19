@@ -1,4 +1,4 @@
-use super::{CircuitBreaker, CircuitBreakerConfig, WorkerError, WorkerResult};
+use super::{CircuitBreaker, WorkerError, WorkerResult};
 use crate::core::CircuitState;
 use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 use crate::grpc::SglangSchedulerClient;
@@ -525,23 +525,6 @@ pub struct DPAwareWorker {
 }
 
 impl DPAwareWorker {
-    /// Create a new DP-aware worker of any type
-    pub fn new(base_url: String, dp_rank: usize, dp_size: usize, worker_type: WorkerType) -> Self {
-        use crate::core::BasicWorkerBuilder;
-        // Create URL with DP rank suffix for identification
-        let worker_url = format!("{}@{}", base_url, dp_rank);
-        let base_worker = BasicWorkerBuilder::new(worker_url)
-            .worker_type(worker_type)
-            .build();
-
-        Self {
-            base_worker,
-            dp_rank,
-            dp_size,
-            base_url,
-        }
-    }
-
     /// Create a new DP-aware worker with a pre-configured base worker
     /// This is primarily used by the builder pattern
     pub fn with_base_worker(
@@ -661,92 +644,6 @@ impl Worker for DPAwareWorker {
 pub struct WorkerFactory;
 
 impl WorkerFactory {
-
-
-    /// Create a DPAwareWorkerBuilder for customizable DP-aware worker creation
-    pub fn dp_builder(
-        base_url: impl Into<String>,
-        dp_rank: usize,
-        dp_size: usize,
-    ) -> DPAwareWorkerBuilder {
-        DPAwareWorkerBuilder::new(base_url, dp_rank, dp_size)
-    }
-
-    /// Create a regular worker
-    pub fn create_regular(url: String) -> Box<dyn Worker> {
-        use crate::core::BasicWorkerBuilder;
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Regular)
-                .build(),
-        )
-    }
-
-    /// Create a prefill worker with optional bootstrap port
-    pub fn create_prefill(url: String, bootstrap_port: Option<u16>) -> Box<dyn Worker> {
-        use crate::core::BasicWorkerBuilder;
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Prefill { bootstrap_port })
-                .build(),
-        )
-    }
-
-    /// Create a decode worker
-    pub fn create_decode(url: String) -> Box<dyn Worker> {
-        use crate::core::BasicWorkerBuilder;
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Decode)
-                .build(),
-        )
-    }
-
-    /// Create a regular worker with custom labels (for multi-router support)
-    pub fn create_regular_with_labels(
-        url: String,
-        labels: std::collections::HashMap<String, String>,
-        circuit_breaker_config: CircuitBreakerConfig,
-    ) -> Box<dyn Worker> {
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .labels(labels)
-                .circuit_breaker_config(circuit_breaker_config)
-                .build(),
-        )
-    }
-
-    /// Create a prefill worker with labels
-    pub fn create_prefill_with_labels(
-        url: String,
-        bootstrap_port: Option<u16>,
-        labels: std::collections::HashMap<String, String>,
-        circuit_breaker_config: CircuitBreakerConfig,
-    ) -> Box<dyn Worker> {
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Prefill { bootstrap_port })
-                .labels(labels)
-                .circuit_breaker_config(circuit_breaker_config)
-                .build(),
-        )
-    }
-
-    /// Create a decode worker with labels
-    pub fn create_decode_with_labels(
-        url: String,
-        labels: std::collections::HashMap<String, String>,
-        circuit_breaker_config: CircuitBreakerConfig,
-    ) -> Box<dyn Worker> {
-        Box::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Decode)
-                .labels(labels)
-                .circuit_breaker_config(circuit_breaker_config)
-                .build(),
-        )
-    }
-
     /// Create a DP-aware worker of specified type
     pub fn create_dp_aware(
         base_url: String,
@@ -754,9 +651,13 @@ impl WorkerFactory {
         dp_size: usize,
         worker_type: WorkerType,
     ) -> Box<dyn Worker> {
-        Box::new(DPAwareWorker::new(base_url, dp_rank, dp_size, worker_type))
+        Box::new(
+            DPAwareWorkerBuilder::new(base_url, dp_rank, dp_size)
+                .worker_type(worker_type)
+                .build(),
+        )
     }
-
+    #[allow(dead_code)]
     /// Get DP size from a worker
     async fn get_worker_dp_size(url: &str, api_key: &Option<String>) -> WorkerResult<usize> {
         let mut req_builder = WORKER_CLIENT.get(format!("{}/get_server_info", url));
@@ -809,7 +710,13 @@ impl WorkerFactory {
 /// Convert a list of worker URLs to worker trait objects
 pub fn urls_to_workers(urls: Vec<String>) -> Vec<Box<dyn Worker>> {
     urls.into_iter()
-        .map(WorkerFactory::create_regular)
+        .map(|url| {
+            Box::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ) as Box<dyn Worker>
+        })
         .collect()
 }
 
@@ -880,7 +787,7 @@ impl HealthChecker {
 
 /// Start an async background health checker for a collection of workers
 pub fn start_health_checker(
-    workers: std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<dyn Worker>>>>,
+    workers: Arc<std::sync::RwLock<Vec<Arc<dyn Worker>>>>,
     check_interval_secs: u64,
 ) -> HealthChecker {
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -965,6 +872,7 @@ pub fn start_health_checker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::CircuitBreakerConfig;
     use std::thread;
     use std::time::Duration;
 
@@ -1297,7 +1205,11 @@ mod tests {
     // Test WorkerFactory
     #[test]
     fn test_create_regular_worker() {
-        let worker = WorkerFactory::create_regular("http://regular:8080".to_string());
+        let worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://regular:8080")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
         assert_eq!(worker.url(), "http://regular:8080");
         assert_eq!(worker.worker_type(), WorkerType::Regular);
     }
@@ -1305,7 +1217,13 @@ mod tests {
     #[test]
     fn test_create_prefill_worker() {
         // With bootstrap port
-        let worker1 = WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9090));
+        let worker1: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(9090),
+                })
+                .build(),
+        );
         assert_eq!(worker1.url(), "http://prefill:8080");
         assert_eq!(
             worker1.worker_type(),
@@ -1315,7 +1233,13 @@ mod tests {
         );
 
         // Without bootstrap port
-        let worker2 = WorkerFactory::create_prefill("http://prefill:8080".to_string(), None);
+        let worker2: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .build(),
+        );
         assert_eq!(
             worker2.worker_type(),
             WorkerType::Prefill {
@@ -1326,7 +1250,11 @@ mod tests {
 
     #[test]
     fn test_create_decode_worker() {
-        let worker = WorkerFactory::create_decode("http://decode:8080".to_string());
+        let worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://decode:8080")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
         assert_eq!(worker.url(), "http://decode:8080");
         assert_eq!(worker.worker_type(), WorkerType::Decode);
     }
@@ -1352,9 +1280,21 @@ mod tests {
     #[test]
     fn test_load_guard_multiple_workers() {
         let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
-            WorkerFactory::create_regular("http://w3:8080".to_string()),
+            Box::new(
+                BasicWorkerBuilder::new("http://w1:8080")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Box::new(
+                BasicWorkerBuilder::new("http://w2:8080")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Box::new(
+                BasicWorkerBuilder::new("http://w3:8080")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
         ];
 
         let worker_refs: Vec<&dyn Worker> = workers.iter().map(|w| w.as_ref()).collect();
@@ -1420,8 +1360,16 @@ mod tests {
     #[test]
     fn test_workers_to_urls() {
         let workers: Vec<Box<dyn Worker>> = vec![
-            WorkerFactory::create_regular("http://w1:8080".to_string()),
-            WorkerFactory::create_regular("http://w2:8080".to_string()),
+            Box::new(
+                BasicWorkerBuilder::new("http://w1:8080")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Box::new(
+                BasicWorkerBuilder::new("http://w2:8080")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
         ];
 
         let urls = workers_to_urls(&workers);
@@ -1472,8 +1420,9 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_creation() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 2, 4, WorkerType::Regular);
+        let dp_worker = DPAwareWorkerBuilder::new("http://worker1:8080", 2, 4)
+            .worker_type(WorkerType::Regular)
+            .build();
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@2");
         assert_eq!(dp_worker.base_url(), "http://worker1:8080");
@@ -1485,14 +1434,11 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_creation_prefill() {
-        let dp_worker = DPAwareWorker::new(
-            "http://worker1:8080".to_string(),
-            1,
-            2,
-            WorkerType::Prefill {
+        let dp_worker = DPAwareWorkerBuilder::new("http://worker1:8080", 1, 2)
+            .worker_type(WorkerType::Prefill {
                 bootstrap_port: Some(9090),
-            },
-        );
+            })
+            .build();
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@1");
         assert!(dp_worker.is_dp_aware());
@@ -1506,8 +1452,9 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_creation_decode() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 0, 4, WorkerType::Decode);
+        let dp_worker = DPAwareWorkerBuilder::new("http://worker1:8080", 0, 4)
+            .worker_type(WorkerType::Decode)
+            .build();
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@0");
         assert!(dp_worker.is_dp_aware());
@@ -1516,8 +1463,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_dp_aware_prepare_request() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 3, 8, WorkerType::Regular);
+        let dp_worker = DPAwareWorkerBuilder::new("http://worker1:8080", 3, 8)
+            .worker_type(WorkerType::Regular)
+            .build();
 
         let original_req = serde_json::json!({
             "prompt": "Hello",
@@ -1533,8 +1481,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_dp_aware_prepare_request_invalid() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 0, 4, WorkerType::Regular);
+        let dp_worker = DPAwareWorkerBuilder::new("http://worker1:8080", 0, 4)
+            .worker_type(WorkerType::Regular)
+            .build();
 
         // Non-object JSON should fail
         let invalid_req = serde_json::json!("not an object");
@@ -1551,8 +1500,9 @@ mod tests {
 
     #[test]
     fn test_dp_aware_endpoint_url() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 1, 4, WorkerType::Regular);
+        let dp_worker = DPAwareWorkerBuilder::new("http://worker1:8080", 1, 4)
+            .worker_type(WorkerType::Regular)
+            .build();
 
         assert_eq!(
             dp_worker.endpoint_url("/generate"),
@@ -1566,8 +1516,9 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_delegated_methods() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker1:8080".to_string(), 0, 2, WorkerType::Regular);
+        let dp_worker = DPAwareWorkerBuilder::new("http://worker1:8080", 0, 2)
+            .worker_type(WorkerType::Regular)
+            .build();
 
         // Test health status
         assert!(dp_worker.is_healthy());
@@ -1690,8 +1641,9 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_circuit_breaker() {
-        let dp_worker =
-            DPAwareWorker::new("http://worker:8080".to_string(), 0, 2, WorkerType::Regular);
+        let dp_worker = DPAwareWorkerBuilder::new("http://worker:8080", 0, 2)
+            .worker_type(WorkerType::Regular)
+            .build();
 
         // Should have circuit breaker
         assert!(dp_worker.is_available());
@@ -1711,9 +1663,23 @@ mod tests {
     #[tokio::test]
     async fn test_mixed_worker_types() {
         // Create a mix of worker types
-        let regular = WorkerFactory::create_regular("http://regular:8080".to_string());
-        let prefill = WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9090));
-        let decode = WorkerFactory::create_decode("http://decode:8080".to_string());
+        let regular: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://regular:8080")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let prefill: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(9090),
+                })
+                .build(),
+        );
+        let decode: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://decode:8080")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
         let dp_aware_regular =
             WorkerFactory::create_dp_aware("http://dp:8080".to_string(), 0, 2, WorkerType::Regular);
         let dp_aware_prefill = WorkerFactory::create_dp_aware(
