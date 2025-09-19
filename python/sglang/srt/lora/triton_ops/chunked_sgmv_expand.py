@@ -142,7 +142,7 @@ def _chunked_lora_expand_kernel(
 
 def chunked_sgmv_lora_expand_forward(
     x: torch.Tensor,
-    lora_weight_b: torch.Tensor,
+    weights: torch.Tensor,
     batch_info: LoRABatchInfo,
     slice_offsets: torch.Tensor,
     max_slice_size: int,
@@ -150,19 +150,24 @@ def chunked_sgmv_lora_expand_forward(
 ) -> torch.Tensor:
 
     # x: (s, slice_num * r)
-    # lora_weight_b: (num_lora, output_dim, r)
+    # weights: (num_lora, output_dim, r)
     # slice_offsets: boundaries for different slices in the output dimension
     # output: (s, output_dim)
 
     # Compute lora_output with shape (s, output_dim) as follows:
     # For each slice i, accumulates:
-    # lora_output[:, slice_offsets[i]:slice_offsets[i+1]] += scaling * sgemm(x[:, i*cur_rank:(i+1)*cur_rank], lora_weight_b[:, slice_offsets[i]:slice_offsets[i+1], :])
+    # lora_output[:, slice_offsets[i]:slice_offsets[i+1]] += scaling * sgemm(x[:, i*cur_rank:(i+1)*cur_rank], weights[:, slice_offsets[i]:slice_offsets[i+1], :])
+
+    assert x.is_contiguous()
+    assert weights.is_contiguous()
+    assert len(x.shape) == 2
+    assert len(weights.shape) == 3
 
     # Get dims
     M = x.shape[0]
     input_dim = x.shape[1]
-    OUTPUT_DIM = lora_weight_b.shape[1]
-    MAX_RANK = lora_weight_b.shape[2]
+    OUTPUT_DIM = weights.shape[1]
+    MAX_RANK = weights.shape[2]
     num_slices = len(slice_offsets) - 1
     assert input_dim == num_slices * MAX_RANK
 
@@ -186,7 +191,7 @@ def chunked_sgmv_lora_expand_forward(
 
     _chunked_lora_expand_kernel[grid](
         x=x,
-        weights=lora_weight_b,
+        weights=weights,
         output=output,
         seg_indptr=batch_info.seg_indptr,
         weight_indices=batch_info.weight_indices,
