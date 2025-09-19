@@ -17,7 +17,7 @@ on:
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
-    types: [synchronize, labeled]
+      types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -42,7 +42,7 @@ jobs:
               - "python/**"
               - "scripts/ci/**"
               - "test/**"
-              - ".github/workflows/pr-test.yml"
+              - ".github/workflows/pr-test-amd.yml"
 
   check-changes-sgl-kernel:
     runs-on: ubuntu-latest
@@ -80,7 +80,8 @@ jobs:
           cd test/lang
           python3 run_suite.py --suite per-commit
 
-  accuracy-test-1-gpu-amd:
+  unit-test-backend-1-gpu-amd:
+    needs: [check-changes, unit-test-frontend-amd]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
@@ -106,10 +107,8 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 8
 
   unit-test-backend-2-gpu-amd:
-    needs: [check-changes, unit-test-frontend-amd]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+    needs: [check-changes]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -132,7 +131,8 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd
 
-  accuracy-test-2-gpu-amd:
+  unit-test-backend-4-gpu-amd:
+    needs: [check-changes, unit-test-backend-2-gpu-amd]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
@@ -156,7 +156,8 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-4-gpu-amd
 
-  mla-test-1-gpu-amd:
+  unit-test-backend-8-gpu-amd:
+    needs: [check-changes, unit-test-backend-2-gpu-amd]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
@@ -181,6 +182,7 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 3600
 
   performance-test-1-gpu-part-1-amd:
+    needs: check-changes
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
@@ -221,6 +223,7 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
 
   performance-test-1-gpu-part-2-amd:
+    needs: check-changes
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
@@ -254,7 +257,8 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
-  bench-test-2-gpu-amd:
+  performance-test-2-gpu-amd:
+    needs: [check-changes, unit-test-backend-2-gpu-amd]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
@@ -298,11 +302,9 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
-  unit-test-backend-1-gpu-amd:
-    needs: [check-changes, unit-test-frontend-amd]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+  accuracy-test-1-gpu-amd:
+    needs: check-changes
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
@@ -326,6 +328,31 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
           bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
           bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
+
+  accuracy-test-2-gpu-amd:
+    needs: [check-changes, accuracy-test-1-gpu-amd]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2, linux-mi35x-gpu-2]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Evaluate accuracy (TP=2)
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_moe_eval_accuracy_large.py
 
   unit-test-backend-1-gpu-amd-mi35x:
     needs: [check-changes, unit-test-frontend-amd]
@@ -353,33 +380,6 @@ jobs:
         timeout-minutes: 50
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd-mi35x
-
-  unit-test-backend-8-gpu-amd:
-    needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi300-gpu-8]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 60
-        run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 3600
 
   unit-test-sgl-kernel-amd:
     needs: check-changes-sgl-kernel
@@ -419,10 +419,10 @@ jobs:
     needs: [
       check-changes, check-changes-sgl-kernel,
       unit-test-frontend-amd, unit-test-backend-1-gpu-amd,
-      unit-test-backend-2-gpu-amd, unit-test-backend-8-gpu-amd,
-      performance-test-1-gpu-part-1-amd, performance-test-1-gpu-part-2-amd, bench-test-2-gpu-amd,
+      unit-test-backend-2-gpu-amd, unit-test-backend-4-gpu-amd, unit-test-backend-8-gpu-amd,
+      performance-test-1-gpu-part-1-amd, performance-test-1-gpu-part-2-amd, performance-test-2-gpu-amd,
       accuracy-test-1-gpu-amd, accuracy-test-2-gpu-amd,
-      unit-test-backend-1-gpu-amd-mi35x, unit-test-sgl-kernel-amd, mla-test-1-gpu-amd
+      unit-test-backend-1-gpu-amd-mi35x, unit-test-sgl-kernel-amd,
     ]
     runs-on: ubuntu-latest
     steps:
