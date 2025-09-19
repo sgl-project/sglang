@@ -67,6 +67,7 @@ dependencies = [
   "tiktoken",
   "anthropic>=0.20.0",
   "torch_memory_saver==0.0.8",
+  "nvidia-cutlass-dsl==4.2.0",
 ]
 
 [project.optional-dependencies]
@@ -89,9 +90,9 @@ tracing = [
     "opentelemetry-exporter-otlp-proto-grpc",
 ]
 all = ["sglang[test]", "sglang[decord]"]
-blackwell = ["nvidia-cutlass-dsl==4.2.0", "sglang[test]", "sglang[decord]"]
-blackwell_aarch64 = ["nvidia-cutlass-dsl==4.2.0", "sglang[test]"]
-dev = ["sglang[test]"]
+blackwell = ["sglang[test]", "sglang[decord]"]
+blackwell_aarch64 = ["sglang[test]"]
+dev = ["sglang[test]", "sglang[decord]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
