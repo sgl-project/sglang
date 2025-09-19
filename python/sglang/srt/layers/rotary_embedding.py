@@ -113,7 +113,7 @@ class RotaryEmbedding(CustomOp):
         if (
             (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu and _is_cpu_amx_available)
-            and not _is_xpu
+            and not (_is_xpu)
         ):
             from vllm._custom_ops import rotary_embedding
 
@@ -164,6 +164,7 @@ class RotaryEmbedding(CustomOp):
             positions = positions + offsets
         positions = positions.flatten()
         num_tokens = positions.shape[0]
+        self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
         cos_sin = self.cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
 
