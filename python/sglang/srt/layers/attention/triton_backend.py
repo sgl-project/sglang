@@ -100,8 +100,6 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
 
-        ################################################
-        ################################################
         # Add after line 103, before "# Check arguments"
         
         # Enable deterministic inference with batch-invariant operations
@@ -119,8 +117,6 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_kv_splits = (
                     self.max_context_len + self.split_tile_size - 1
                 ) // self.split_tile_size
-        ################################################
-        ################################################
 
         # Check arguments
         assert not (
@@ -161,8 +157,6 @@ class TritonAttnBackend(AttentionBackend):
         # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
 
-    #########################################
-    #########################################
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,
@@ -237,52 +231,6 @@ class TritonAttnBackend(AttentionBackend):
             self.device_core_count,
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
-
-        '''
-    def get_num_kv_splits(
-        self,
-        num_kv_splits: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ):
-        num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
-        # NOTE(alcanderian): Considering speculative_decodeing,
-        # num_kv_splits.shape[0] will be topk * real_num_token.
-        # And the real_num_token is num_seq in decoding phase.
-        num_group = num_token // num_seq
-
-        assert (
-            num_group * num_seq == num_token
-        ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
-
-        if self.static_kv_splits or self.device_core_count <= 0:
-            num_kv_splits.fill_(self.max_kv_splits)
-            return
-
-        if self.split_tile_size is not None:
-            num_kv_splits[:] = (
-                seq_lens + self.split_tile_size - 1
-            ) // self.split_tile_size
-            return
-
-        if num_seq < 256:
-            SCHEDULE_SEQ = 256
-        else:
-            SCHEDULE_SEQ = triton.next_power_of_2(num_seq)
-
-        get_num_kv_splits_triton[(1,)](
-            num_kv_splits,
-            seq_lens,
-            num_seq,
-            num_group,
-            self.num_head,
-            self.num_kv_head,
-            self.max_kv_splits,
-            self.device_core_count,
-            MAX_NUM_SEQ=SCHEDULE_SEQ,
-        )
-        '''
-    #########################################
-    #########################################
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -493,16 +441,12 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
 
-        ########################################
-        ########################################
         # For deterministic inference, use consistent buffer allocation
         if self.enable_deterministic:
             # Use fixed split count based on split tile size
             fixed_splits = self.max_kv_splits
         else:
             fixed_splits = self.max_kv_splits
-        ########################################
-        ########################################
 
         self.cuda_graph_attn_logits = torch.zeros(
             (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
@@ -515,8 +459,6 @@ class TritonAttnBackend(AttentionBackend):
             device=self.device,
         )
 
-        ########################################
-        ########################################
         # For deterministic inference, always use fixed split count
         if self.enable_deterministic:
             self.cuda_graph_num_kv_splits = torch.full(
@@ -526,12 +468,6 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_num_kv_splits = torch.full(
             (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device
         )
-
-        # self.cuda_graph_num_kv_splits = torch.full(
-        #     (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device
-        # )
-        ########################################
-        ########################################
         
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
