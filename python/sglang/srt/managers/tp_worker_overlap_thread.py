@@ -25,6 +25,7 @@ import psutil
 import torch
 
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -174,21 +175,28 @@ class TpModelWorkerClient:
             # Run forward
             logits_output, next_token_ids, can_run_cuda_graph = (
                 self.worker.forward_batch_generation(
-                    model_worker_batch, model_worker_batch.launch_done
+                    model_worker_batch,
+                    model_worker_batch.launch_done,
+                    #  Skip sampling for prefill-only requests
+                    skip_sample=model_worker_batch.is_prefill_only,
                 )
             )
 
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
+            if model_worker_batch.is_prefill_only:
+                # For prefill-only requests, create dummy token IDs on CPU
+                next_token_ids = torch.zeros(bs, dtype=torch.long)
             self.future_token_ids_map[
                 future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
             ] = next_token_ids
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.to("cpu", non_blocking=True)
-                )
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                    )
                 if logits_output.input_token_logprobs is not None:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.to("cpu", non_blocking=True)
@@ -197,7 +205,9 @@ class TpModelWorkerClient:
                 logits_output.hidden_states = logits_output.hidden_states.to(
                     "cpu", non_blocking=True
                 )
-            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+            # Only copy to CPU if not already on CPU
+            if next_token_ids.device.type != "cpu":
+                next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
 
             self.output_queue.put(
@@ -221,10 +231,10 @@ class TpModelWorkerClient:
             logits_output.next_token_logprobs = (
                 logits_output.next_token_logprobs.tolist()
             )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
-                )
+        if logits_output.input_token_logprobs is not None:
+            logits_output.input_token_logprobs = tuple(
+                logits_output.input_token_logprobs.tolist()
+            )
         next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids, can_run_cuda_graph
 
@@ -267,6 +277,10 @@ class TpModelWorkerClient:
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.worker.init_weights_update_group(recv_req)
+        return success, message
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        success, message = self.worker.destroy_weights_update_group(recv_req)
         return success, message
 
     def init_weights_send_group_for_remote_instance(
