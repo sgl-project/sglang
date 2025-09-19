@@ -606,7 +606,7 @@ mod tests {
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
         });
 
-        let router = Router::new(vec![], &app_context).await.unwrap();
+        let router = Router::new(&app_context).await.unwrap();
         Arc::new(router) as Arc<dyn RouterTrait>
     }
 
