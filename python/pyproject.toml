@@ -62,7 +62,7 @@ srt = [
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "flashinfer_python==0.3.1",
+    "flashinfer_python==0.4.0rc1",
 ]
 
 blackwell = [
@@ -72,7 +72,7 @@ blackwell = [
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "flashinfer_python==0.3.1",
+    "flashinfer_python==0.4.0rc1",
     "nvidia-cutlass-dsl==4.1.0",
 ]
 
