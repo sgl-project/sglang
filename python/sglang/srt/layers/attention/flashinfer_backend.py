@@ -129,7 +129,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if global_workspace_buffer is None:
             # different from flashinfer zero_init_global_workspace_buffer
             global_workspace_buffer = torch.empty(
-                2048 * 1024 * 1024,
+                128 * 1024 * 1024,
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
@@ -220,7 +220,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=self.decode_wrappers,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
-                fixed_split_size=2048,
+                fixed_split_size=128,
                 disable_split_kv=False,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
@@ -647,7 +647,7 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        fixed_split_size: int = 2048,
+        fixed_split_size: int = 128,
         disable_split_kv: bool = False,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
@@ -662,7 +662,7 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        fixed_split_size: int = 2048,
+        fixed_split_size: int = 128,
         disable_split_kv: bool = False,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
@@ -770,7 +770,7 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
         use_sliding_window_kv_pool: bool = False,
-        fixed_split_size: int = 2048,
+        fixed_split_size: int = 128,
         disable_split_kv: bool = False,
     ):
         if spec_info is None:
