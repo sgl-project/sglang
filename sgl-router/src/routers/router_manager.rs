@@ -161,7 +161,7 @@ impl RouterManager {
         let model_id = if let Some(model_id) = config.model_id {
             model_id
         } else {
-            match self.query_server_info(&config.url).await {
+            match self.query_server_info(&config.url, &config.api_key).await {
                 Ok(info) => {
                     // Extract model_id from server info
                     info.model_id
@@ -208,29 +208,44 @@ impl RouterManager {
         }
 
         let worker = match config.worker_type.as_deref() {
-            Some("prefill") => Box::new(
-                BasicWorkerBuilder::new(config.url.clone())
+            Some("prefill") => {
+                let mut builder = BasicWorkerBuilder::new(config.url.clone())
                     .worker_type(WorkerType::Prefill {
                         bootstrap_port: config.bootstrap_port,
                     })
                     .labels(labels.clone())
-                    .circuit_breaker_config(CircuitBreakerConfig::default())
-                    .build(),
-            ) as Box<dyn Worker>,
-            Some("decode") => Box::new(
-                BasicWorkerBuilder::new(config.url.clone())
+                    .circuit_breaker_config(CircuitBreakerConfig::default());
+
+                if let Some(api_key) = config.api_key.clone() {
+                    builder = builder.api_key(api_key);
+                }
+
+                Box::new(builder.build()) as Box<dyn Worker>
+            }
+            Some("decode") => {
+                let mut builder = BasicWorkerBuilder::new(config.url.clone())
                     .worker_type(WorkerType::Decode)
                     .labels(labels.clone())
-                    .circuit_breaker_config(CircuitBreakerConfig::default())
-                    .build(),
-            ) as Box<dyn Worker>,
-            _ => Box::new(
-                BasicWorkerBuilder::new(config.url.clone())
+                    .circuit_breaker_config(CircuitBreakerConfig::default());
+
+                if let Some(api_key) = config.api_key.clone() {
+                    builder = builder.api_key(api_key);
+                }
+
+                Box::new(builder.build()) as Box<dyn Worker>
+            }
+            _ => {
+                let mut builder = BasicWorkerBuilder::new(config.url.clone())
                     .worker_type(WorkerType::Regular)
                     .labels(labels.clone())
-                    .circuit_breaker_config(CircuitBreakerConfig::default())
-                    .build(),
-            ) as Box<dyn Worker>,
+                    .circuit_breaker_config(CircuitBreakerConfig::default());
+
+                if let Some(api_key) = config.api_key.clone() {
+                    builder = builder.api_key(api_key);
+                }
+
+                Box::new(builder.build()) as Box<dyn Worker>
+            }
         };
 
         // Register worker
@@ -346,10 +361,18 @@ impl RouterManager {
     }
 
     /// Query server info from a worker URL
-    async fn query_server_info(&self, url: &str) -> Result<ServerInfo, String> {
+    async fn query_server_info(
+        &self,
+        url: &str,
+        api_key: &Option<String>,
+    ) -> Result<ServerInfo, String> {
         let info_url = format!("{}/get_server_info", url.trim_end_matches('/'));
 
-        match self.client.get(&info_url).send().await {
+        let mut req_builder = self.client.get(&info_url);
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+        match req_builder.send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     response
@@ -477,10 +500,15 @@ impl RouterManager {
 #[async_trait]
 impl WorkerManagement for RouterManager {
     /// Add a worker - in multi-router mode, this adds to the registry
-    async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+    async fn add_worker(
+        &self,
+        worker_url: &str,
+        api_key: &Option<String>,
+    ) -> Result<String, String> {
         // Create a basic worker config request
         let config = WorkerConfigRequest {
             url: worker_url.to_string(),
+            api_key: api_key.clone(),
             model_id: None,
             worker_type: None,
             priority: None,

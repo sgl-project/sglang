@@ -389,16 +389,20 @@ async fn handle_pod_event(
                 if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
                     match &pod_info.pod_type {
                         Some(PodType::Prefill) => pd_router
-                            .add_prefill_server(worker_url.clone(), pod_info.bootstrap_port)
+                            .add_prefill_server(
+                                worker_url.clone(),
+                                pd_router.api_key.clone(),
+                                pod_info.bootstrap_port,
+                            )
                             .await
                             .map_err(|e| e.to_string()),
                         Some(PodType::Decode) => pd_router
-                            .add_decode_server(worker_url.clone())
+                            .add_decode_server(worker_url.clone(), pd_router.api_key.clone())
                             .await
                             .map_err(|e| e.to_string()),
                         Some(PodType::Regular) | None => {
                             // Fall back to regular add_worker for regular pods
-                            router.add_worker(&worker_url).await
+                            router.add_worker(&worker_url, &pd_router.api_key).await
                         }
                     }
                 } else {
@@ -406,7 +410,8 @@ async fn handle_pod_event(
                 }
             } else {
                 // Regular mode or no pod type specified
-                router.add_worker(&worker_url).await
+                // In pod, no need api key
+                router.add_worker(&worker_url, &None).await
             };
 
             match result {

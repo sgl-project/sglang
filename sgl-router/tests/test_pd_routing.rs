@@ -54,6 +54,7 @@ mod test_pd_routing {
                 .worker_type(WorkerType::Prefill {
                     bootstrap_port: Some(9000),
                 })
+                .api_key("test_api_key")
                 .build(),
         );
         assert_eq!(prefill_worker.url(), "http://prefill:8080");
@@ -68,6 +69,7 @@ mod test_pd_routing {
         let decode_worker: Box<dyn Worker> = Box::new(
             BasicWorkerBuilder::new("http://decode:8080")
                 .worker_type(WorkerType::Decode)
+                .api_key("test_api_key")
                 .build(),
         );
         assert_eq!(decode_worker.url(), "http://decode:8080");
@@ -80,6 +82,7 @@ mod test_pd_routing {
         let regular_worker: Box<dyn Worker> = Box::new(
             BasicWorkerBuilder::new("http://regular:8080")
                 .worker_type(WorkerType::Regular)
+                .api_key("test_api_key")
                 .build(),
         );
         assert_eq!(regular_worker.url(), "http://regular:8080");
@@ -295,6 +298,7 @@ mod test_pd_routing {
                 .worker_type(WorkerType::Prefill {
                     bootstrap_port: Some(9000),
                 })
+                .api_key("test_api_key")
                 .build(),
         );
 
@@ -698,6 +702,7 @@ mod test_pd_routing {
                 .worker_type(WorkerType::Prefill {
                     bootstrap_port: Some(9000),
                 })
+                .api_key("test_api_key")
                 .build(),
         );
 
@@ -834,6 +839,7 @@ mod test_pd_routing {
                     .worker_type(WorkerType::Prefill {
                         bootstrap_port: Some(9000),
                     })
+                    .api_key("test_api_key")
                     .build(),
             );
 

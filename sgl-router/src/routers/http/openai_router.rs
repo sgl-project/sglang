@@ -67,7 +67,11 @@ impl OpenAIRouter {
 
 #[async_trait]
 impl super::super::WorkerManagement for OpenAIRouter {
-    async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
+    async fn add_worker(
+        &self,
+        _worker_url: &str,
+        _api_key: &Option<String>,
+    ) -> Result<String, String> {
         Err("Cannot add workers to OpenAI router".to_string())
     }
 
