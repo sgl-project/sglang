@@ -1172,25 +1172,3 @@ def update_sliding_window_buffer_cuda_graph(
             )
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
-
-
-
-# def validate_deterministic_config(server_args):
-#     """
-#     Validate configuration for deterministic inference mode.
-#     Ensures all necessary parameters are set correctly for batch invariance.
-#     """
-#     if server_args.enable_deterministic_inference:
-#         if server_args.triton_attention_split_tile_size is None:
-#             logger.warning(
-#                 "Deterministic inference enabled but split_tile_size not set. "
-#                 "Using default value of 256. For better performance, consider "
-#                 "tuning this parameter based on your model and hardware."
-#             )
-        
-#         logger.info(
-#             f"Deterministic inference enabled with split_tile_size: "
-#             f"{server_args.triton_attention_split_tile_size}"
-#         )
-    
-#     return True
