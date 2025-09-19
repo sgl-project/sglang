@@ -134,7 +134,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import default_weight_loader, broadcast_weight
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -1195,6 +1195,7 @@ class ModelRunner:
                 weight._fake = True
                 weight._original_shape = shape
                 weight._group = self._model_update_group[group_name]
+                weight._hook_func = broadcast_weight.__get__(weight, torch.Tensor)
                 weights.append((name, weight))
 
             self.model.load_weights(weights)

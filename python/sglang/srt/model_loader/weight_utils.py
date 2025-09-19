@@ -837,7 +837,19 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
         x = x[:]
     return x
 
-def bcast_weight(weight):
+
+def broadcast_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Create a real tensor and broadcast weights from the source.
+
+    This function is used to handle "fake" tensors which are placeholders
+    to avoid large memory allocation before the actual weight loading.
+
+    Args:
+        weight: The fake tensor containing metadata (_original_shape, _group).
+
+    Returns:
+        The real tensor with weights broadcasted from the source.
+    """
     assert weight._original_shape and weight._group
     real_weight = torch.empty(weight._original_shape, dtype=weight.dtype, device=weight.device)
 
@@ -849,11 +861,19 @@ def bcast_weight(weight):
     )
     return real_weight
 
+def weight_loader_hook(loader):
+    """Decorator to handle hook for loaded weight"""
+    def loader_wrapper(param: torch.Tensor, loaded_weight: torch.Tensor):
+        if hasattr(loaded_weight, "_hook_func"):
+            loaded_weight = loaded_weight._hook_func()
+        return loader(param, loaded_weight)
+
+    return loader_wrapper
+
+@weight_loader_hook
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
-        if hasattr(loaded_weight, "_fake") and loaded_weight._fake:
-            loaded_weight = bcast_weight(loaded_weight)
         if param.numel() == 1 and loaded_weight.numel() == 1:
             # Sometimes scalar values aren't considered tensors with shapes
             # so if both param and loaded_weight are a scalar,
@@ -872,6 +892,7 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         raise
 
 
+@weight_loader_hook
 def row_parallel_weight_loader(
     param: torch.Tensor, loaded_weight: torch.Tensor
 ) -> None:
@@ -893,6 +914,7 @@ LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
+    @weight_loader_hook
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         tp_rank = get_attention_tp_rank()
 
@@ -910,6 +932,7 @@ def composed_weight_loader(
 ) -> LoaderFunction:
     """Create a weight loader that post-processes the weights after loading"""
 
+    @weight_loader_hook
     def composed_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         loader(param, loaded_weight)
         param.data.copy_(fn(param))
