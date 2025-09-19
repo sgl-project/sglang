@@ -1,6 +1,8 @@
 import os
 import unittest
 from types import SimpleNamespace
+import time
+
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k

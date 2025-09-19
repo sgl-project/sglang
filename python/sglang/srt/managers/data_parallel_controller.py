@@ -170,6 +170,9 @@ class DataParallelController:
 
     def update_ranks(self, ranks: Ranks):
         self.status = ranks.status
+        print("NEW RANKS!!!")
+        print(self.status)
+        print("END!!!!!")
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
