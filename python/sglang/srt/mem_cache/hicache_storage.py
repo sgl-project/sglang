@@ -45,7 +45,6 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
-    # todo, potentially pass model and TP configs into storage backend
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
@@ -75,7 +74,6 @@ class HiCacheStorage(ABC):
         """
         pass
 
-    # TODO: Deprecate?
     @abstractmethod
     def get(
         self,
@@ -89,7 +87,7 @@ class HiCacheStorage(ABC):
         """
         pass
 
-    # TODO: Deprecate?
+    # TODO: Deprecate
     @abstractmethod
     def batch_get(
         self,
@@ -103,7 +101,6 @@ class HiCacheStorage(ABC):
         """
         pass
 
-    # TODO: Deprecate?
     @abstractmethod
     def set(
         self,
@@ -118,7 +115,7 @@ class HiCacheStorage(ABC):
         """
         pass
 
-    # TODO: Deprecate?
+    # TODO: Deprecate
     @abstractmethod
     def batch_set(
         self,
@@ -133,7 +130,6 @@ class HiCacheStorage(ABC):
         """
         pass
 
-    # TODO: Deprecate?
     @abstractmethod
     def exists(self, key: str) -> bool:
         """

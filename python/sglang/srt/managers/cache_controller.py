@@ -337,8 +337,8 @@ class HiCacheController:
             self.page_set_func = self._generic_page_set
 
             if self.storage_backend_type in ["hf3fs", "mooncake"]:
-                self.page_get_func = self._generic_page_get_v1
-                self.page_set_func = self._generic_page_set_v1
+                self.page_get_func = self._page_get_zero_copy
+                self.page_set_func = self._page_set_zero_copy
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -622,7 +622,7 @@ class HiCacheController:
         for chunk in chunks:
             self.host_mem_release_queue.put(chunk)
 
-    def _generic_page_get_v1(self, operation, hash_values, host_indices):
+    def _page_get_zero_copy(self, operation, hash_values, host_indices):
         results = self.storage_backend.batch_get_v1(hash_values, host_indices)
         inc = 0
         for i in range(len(hash_values)):
@@ -634,6 +634,7 @@ class HiCacheController:
             inc += self.page_size
         operation.increment(inc)
 
+    # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices):
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
@@ -792,7 +793,7 @@ class HiCacheController:
         self.backup_queue.put(operation)
         return operation.id
 
-    # non-zero copy
+    # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices) -> bool:
         data = [
             self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
@@ -800,8 +801,7 @@ class HiCacheController:
         ]
         return self.storage_backend.batch_set(hash_values, data)
 
-    # zero copy
-    def _generic_page_set_v1(self, hash_values, host_indices) -> bool:
+    def _page_set_zero_copy(self, hash_values, host_indices) -> bool:
         return all(self.storage_backend.batch_set_v1(hash_values, host_indices))
 
     # Backup batch by batch
