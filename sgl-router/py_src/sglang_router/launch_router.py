@@ -10,8 +10,7 @@ from sglang_router.router_args import RouterArgs
 logger = logging.getLogger("router")
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 try:

@@ -19,8 +19,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from sglang_router.router_args import RouterArgs
 from sglang_router.service_discovery import (
+    ServiceDiscoveryConfig,
     create_service_discovery,
-    ServiceDiscoveryConfig
 )
 
 logger = logging.getLogger(__name__)
@@ -48,10 +48,10 @@ class MiniLoadBalancer:
         self.host = router_args.host
         self.port = router_args.port
         self.timeout = router_args.request_timeout_secs
-        
+
         # Initialize service discovery
         self.service_discovery = create_service_discovery(router_args)
-        
+
         # Initialize URLs from router args or service discovery
         if router_args.service_discovery:
             # URLs will be populated by service discovery
@@ -94,30 +94,38 @@ class MiniLoadBalancer:
                     "When service discovery is enabled, --router-service-discovery-namespace must be specified"
                 )
             if router_args.prefill_selector and not router_args.decode_selector:
-                print("Only prefill selector specified - decode pods will use general selector")
+                print(
+                    "Only prefill selector specified - decode pods will use general selector"
+                )
             if router_args.decode_selector and not router_args.prefill_selector:
-                print("Only decode selector specified - prefill pods will use general selector")
-            print(f"Service discovery enabled - URLs will be discovered automatically from namespace: {router_args.service_discovery_namespace}")
+                print(
+                    "Only decode selector specified - prefill pods will use general selector"
+                )
+            print(
+                f"Service discovery enabled - URLs will be discovered automatically from namespace: {router_args.service_discovery_namespace}"
+            )
 
     def start(self):
         """Start the load balancer."""
         global lb
         lb = self
-        
+
         # Start service discovery if enabled (synchronous)
-        if hasattr(self.service_discovery, 'start'):
+        if hasattr(self.service_discovery, "start"):
             self.service_discovery.start()
             # Update URLs from service discovery
             self._update_urls_from_service_discovery()
-        
+
         try:
             # Start the web server (uvicorn requires asyncio)
-            config = uvicorn.Config(app, host=self.host, port=self.port, log_level="info")
+            config = uvicorn.Config(
+                app, host=self.host, port=self.port, log_level="info"
+            )
             server = uvicorn.Server(config)
-            
+
             # Run the server with proper signal handling
             asyncio.run(self._run_server_with_signals(server))
-                
+
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt, shutting down...")
         except Exception as e:
@@ -125,7 +133,7 @@ class MiniLoadBalancer:
             raise
         finally:
             # Clean up service discovery
-            if hasattr(self.service_discovery, 'stop'):
+            if hasattr(self.service_discovery, "stop"):
                 try:
                     self.service_discovery.stop()
                 except Exception as e:
@@ -135,25 +143,24 @@ class MiniLoadBalancer:
         """Run the uvicorn server with proper signal handling."""
         # Set up signal handlers for graceful shutdown
         shutdown_event = asyncio.Event()
-        
+
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, initiating graceful shutdown...")
             shutdown_event.set()
-        
+
         # Register signal handlers
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-        
+
         # Create tasks for both server and shutdown monitoring
         server_task = asyncio.create_task(server.serve())
         shutdown_task = asyncio.create_task(shutdown_event.wait())
-        
+
         # Wait for either server to complete or shutdown signal
         done, pending = await asyncio.wait(
-            [server_task, shutdown_task],
-            return_when=asyncio.FIRST_COMPLETED
+            [server_task, shutdown_task], return_when=asyncio.FIRST_COMPLETED
         )
-        
+
         # Cancel remaining tasks
         for task in pending:
             task.cancel()
@@ -161,36 +168,38 @@ class MiniLoadBalancer:
                 await task
             except asyncio.CancelledError:
                 pass
-        
+
         if shutdown_event.is_set():
             logger.info("Shutdown signal received, stopping server...")
             server.should_exit = True
 
     def _update_urls_from_service_discovery(self):
         """Update URLs from service discovery."""
-        if hasattr(self.service_discovery, 'get_prefill_urls'):
+        if hasattr(self.service_discovery, "get_prefill_urls"):
             prefill_urls = self.service_discovery.get_prefill_urls()
             self.prefill_urls = [url[0] for url in prefill_urls]
             self.prefill_bootstrap_ports = [url[1] for url in prefill_urls]
-            
-        if hasattr(self.service_discovery, 'get_decode_urls'):
+
+        if hasattr(self.service_discovery, "get_decode_urls"):
             self.decode_urls = self.service_discovery.get_decode_urls()
-            
-        logger.info(f"Updated URLs from service discovery - Prefill: {len(self.prefill_urls)}, Decode: {len(self.decode_urls)}")
+
+        logger.info(
+            f"Updated URLs from service discovery - Prefill: {len(self.prefill_urls)}, Decode: {len(self.decode_urls)}"
+        )
 
     def select_pair(self):
         # Update URLs from service discovery if available
-        if hasattr(self.service_discovery, 'get_prefill_urls'):
+        if hasattr(self.service_discovery, "get_prefill_urls"):
             prefill_urls = self.service_discovery.get_prefill_urls()
             if prefill_urls:
                 self.prefill_urls = [url[0] for url in prefill_urls]
                 self.prefill_bootstrap_ports = [url[1] for url in prefill_urls]
-                
-        if hasattr(self.service_discovery, 'get_decode_urls'):
+
+        if hasattr(self.service_discovery, "get_decode_urls"):
             decode_urls = self.service_discovery.get_decode_urls()
             if decode_urls:
                 self.decode_urls = decode_urls
-        
+
         assert len(self.prefill_urls) > 0, "No prefill servers available"
         assert len(self.decode_urls) > 0, "No decode servers available"
         pidx = random.randint(0, len(self.prefill_urls) - 1)
@@ -312,11 +321,11 @@ async def health_check():
 @app.get("/health/service_discovery")
 async def service_discovery_health():
     """Health check endpoint for service discovery status."""
-    if not lb or not hasattr(lb, 'service_discovery'):
+    if not lb or not hasattr(lb, "service_discovery"):
         return {"status": "disabled", "message": "Service discovery not available"}
-    
+
     service_discovery = lb.service_discovery
-    if hasattr(service_discovery, 'get_stats'):
+    if hasattr(service_discovery, "get_stats"):
         stats = service_discovery.get_stats()
         return {
             "status": "active",
@@ -326,20 +335,20 @@ async def service_discovery_health():
             "events_processed": stats["events_processed"],
             "events_ignored": stats["events_ignored"],
             "prefill_urls": service_discovery.get_prefill_urls(),
-            "decode_urls": service_discovery.get_decode_urls()
+            "decode_urls": service_discovery.get_decode_urls(),
         }
-    elif hasattr(service_discovery, 'get_pod_count'):
+    elif hasattr(service_discovery, "get_pod_count"):
         pod_count = service_discovery.get_pod_count()
         prefill_count = len(service_discovery.get_prefill_urls())
         decode_count = len(service_discovery.get_decode_urls())
-        
+
         return {
             "status": "active",
             "pod_count": pod_count,
             "prefill_servers": prefill_count,
             "decode_servers": decode_count,
             "prefill_urls": service_discovery.get_prefill_urls(),
-            "decode_urls": service_discovery.get_decode_urls()
+            "decode_urls": service_discovery.get_decode_urls(),
         }
     else:
         return {"status": "mock", "message": "Using mock service discovery"}
