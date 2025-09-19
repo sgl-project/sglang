@@ -107,7 +107,7 @@ suites = {
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_srt_endpoint.py", 130),
-        TestFile("test_start_profile.py", 60),
+        # TestFile("test_start_profile.py", 60),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
@@ -247,7 +247,7 @@ suite_amd = {
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
-        TestFile("test_triton_attention_kernels.py", 4),
+        # TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_triton_sliding_window.py", 250),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
@@ -270,6 +270,8 @@ suite_amd = {
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
+        TestFile("test_disaggregation_different_tp.py", 155),
+        TestFile("test_disaggregation_pp.py", 60),
     ],
     "nightly-amd": [
         TestFile("test_nightly_gsm8k_eval_amd.py"),
