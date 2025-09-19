@@ -191,7 +191,7 @@ class RuntimeEndpoint(BaseBackend):
         self._assert_success(res)
 
         obj = res.json()
-        
+
         if isinstance(obj, list):
             comps = [item["text"] for item in obj]
             meta_infos = [item["meta_info"] for item in obj]
