@@ -86,6 +86,9 @@ class RouterArgs:
     # Tokenizer configuration
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
+    # Trace
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
 
     @staticmethod
     def add_cli_args(
@@ -445,6 +448,17 @@ class RouterArgs:
             type=str,
             default=None,
             help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+        )
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            "--otlp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
 
     @classmethod

@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.tracing.trace import trace_event, trace_slice, trace_slice_end
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
 
 logger = logging.getLogger(__name__)
@@ -254,6 +255,7 @@ class DecodePreallocQueue:
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)
+            trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -423,6 +425,9 @@ class DecodePreallocQueue:
             )
             decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
             decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
+            trace_slice_end(
+                RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True
+            )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -648,8 +653,16 @@ class DecodeTransferQueue:
                         [decode_req.req], decode_req.req.return_logprob
                     )
                     self.tree_cache.cache_finished_req(decode_req.req)
+                    trace_slice_end(
+                        "quick_finish", decode_req.req.rid, thread_finish_flag=True
+                    )
                 else:
                     transferred_reqs.append(decode_req.req)
+                    trace_slice_end(
+                        RequestStage.DECODE_TRANSFERRED,
+                        decode_req.req.rid,
+                        auto_next_anon=True,
+                    )
 
                 indices_to_remove.add(i)
             elif poll in [
@@ -697,6 +710,12 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
+                    for req in batch.reqs:
+                        trace_slice(
+                            RequestStage.DECODE_FAKE_OUTPUT,
+                            req.rid,
+                            auto_next_anon=True,
+                        )
                     if prepare_mlp_sync_flag:
                         self._prepare_idle_batch_and_run(None)
                 else:
@@ -741,6 +760,12 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
+                    for req in batch.reqs:
+                        trace_slice(
+                            RequestStage.DECODE_FAKE_OUTPUT,
+                            req.rid,
+                            auto_next_anon=True,
+                        )
                     if prepare_mlp_sync_flag:
                         batch_, result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
@@ -831,6 +856,9 @@ class SchedulerDisaggregationDecodeMixin:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
 
+        if ret:
+            for req in ret.reqs:
+                trace_event("schedule", req.rid)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
