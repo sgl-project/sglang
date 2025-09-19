@@ -1378,6 +1378,8 @@ def fast_decode_plan(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     non_blocking: bool = True,
+    fixed_split_size: Optional[int] = None,
+    disable_split_kv: Optional[bool] = None,
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
