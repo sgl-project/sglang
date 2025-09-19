@@ -85,7 +85,10 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        force_fused=False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if force_fused:
+            return self.forward_with_allreduce_fusion(x, residual)
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
         if residual is not None:
@@ -236,6 +239,7 @@ class RMSNorm(CustomOp):
                     weight=self.weight,
                     eps=self.variance_epsilon,
                 )
+
                 if fused_result[0] is not None:
                     return fused_result
 

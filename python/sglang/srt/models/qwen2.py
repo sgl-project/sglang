@@ -25,6 +25,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -49,12 +50,14 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, get_bool_env_var, make_layers
 
 Qwen2Config = None
 
 
 logger = logging.getLogger(__name__)
+
+USE_FUSED_NORM_MAX_BATCH = 128
 
 
 class Qwen2MLP(nn.Module):
@@ -228,19 +231,38 @@ class Qwen2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.fuse_norm_reduce = False
+
+    def set_ar_norm_fused_mode(self, hidden_states):
+        fused_ar_norm = False
+        if hidden_states.shape[0] <= USE_FUSED_NORM_MAX_BATCH and self.tp_size > 1:
+            fused_ar_norm = True
+
+        self.self_attn.o_proj.reduce_results = not fused_ar_norm
+        self.mlp.down_proj.reduce_results = not fused_ar_norm
+        self.fuse_norm_reduce = fused_ar_norm
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        comm_in_mlp=False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+
+        if get_bool_env_var("SGL_FUSE_AR_NORM"):
+            self.set_ar_norm_fused_mode(hidden_states)
+        # print(self.fuse_norm_reduce)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, force_fused=self.fuse_norm_reduce
+            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -248,7 +270,9 @@ class Qwen2DecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual, force_fused=self.fuse_norm_reduce
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -343,6 +367,13 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+        # should add allreduce if tp_num >=2 and fused norm + ar (last mlp need do ar)
+        if (
+            get_tensor_model_parallel_world_size() > 1
+            and hidden_states.shape[0] <= USE_FUSED_NORM_MAX_BATCH
+            and get_bool_env_var("SGL_FUSE_AR_NORM")
+        ):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
