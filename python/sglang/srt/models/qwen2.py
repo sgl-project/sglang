@@ -252,7 +252,6 @@ class Qwen2DecoderLayer(nn.Module):
         comm_in_mlp=False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-
         if get_bool_env_var("SGL_FUSE_AR_NORM"):
             self.set_ar_norm_fused_mode(hidden_states)
         # print(self.fuse_norm_reduce)
