@@ -193,9 +193,10 @@ class RuntimeEndpoint(BaseBackend):
         obj = res.json()
 
         if isinstance(obj, list):
-            comps = [item["text"] for item in obj]
-            meta_infos = [item["meta_info"] for item in obj]
-            return comps, meta_infos
+            if not obj:
+                return [], []
+            comps, meta_infos = zip(*((item["text"], item["meta_info"]) for item in obj))
+            return list(comps), list(meta_infos)
         else:
             comp = obj["text"]
             meta_info = obj["meta_info"]
