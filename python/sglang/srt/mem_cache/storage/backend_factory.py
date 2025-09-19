@@ -18,9 +18,29 @@ class StorageBackendFactory:
 
     _registry: Dict[str, Dict[str, Any]] = {}
 
+    @staticmethod
+    def _load_backend_class(module_path: str, class_name: str, backend_name: str) -> type[HiCacheStorage]:
+        """Load and validate a backend class from module path."""
+        try:
+            module = importlib.import_module(module_path)
+            backend_class = getattr(module, class_name)
+            if not issubclass(backend_class, HiCacheStorage):
+                raise TypeError(
+                    f"Backend class {class_name} must inherit from HiCacheStorage"
+                )
+            return backend_class
+        except ImportError as e:
+            raise ImportError(
+                f"Failed to import backend '{backend_name}' from '{module_path}': {e}"
+            ) from e
+        except AttributeError as e:
+            raise AttributeError(
+                f"Class '{class_name}' not found in module '{module_path}': {e}"
+            ) from e
+
     @classmethod
     def register_backend(
-        cls, name: str, module_path: str, class_name: str, is_builtin: bool = False
+        cls, name: str, module_path: str, class_name: str
     ) -> None:
         """Register a storage backend with lazy loading.
 
@@ -28,33 +48,16 @@ class StorageBackendFactory:
             name: Backend identifier
             module_path: Python module path containing the backend class
             class_name: Name of the backend class
-            is_builtin: Whether this is a built-in backend with special initialization logic
         """
         if name in cls._registry:
             logger.warning(f"Backend '{name}' is already registered, overwriting")
 
         def loader() -> type[HiCacheStorage]:
             """Lazy loader function to import the backend class."""
-            try:
-                module = importlib.import_module(module_path)
-                backend_class = getattr(module, class_name)
-                if not issubclass(backend_class, HiCacheStorage):
-                    raise TypeError(
-                        f"Backend class {class_name} must inherit from HiCacheStorage"
-                    )
-                return backend_class
-            except ImportError as e:
-                raise ImportError(
-                    f"Failed to import backend '{name}' from '{module_path}': {e}"
-                ) from e
-            except AttributeError as e:
-                raise AttributeError(
-                    f"Class '{class_name}' not found in module '{module_path}': {e}"
-                ) from e
+            return cls._load_backend_class(module_path, class_name, name)
 
         cls._registry[name] = {
             "loader": loader,
-            "is_builtin": is_builtin,
             "module_path": module_path,
             "class_name": class_name,
         }
@@ -85,8 +88,14 @@ class StorageBackendFactory:
         """
         # First check if backend is already registered
         if backend_name in cls._registry:
-            return cls._create_registered_backend(
-                backend_name, storage_config, mem_pool_host, **kwargs
+            registry_entry = cls._registry[backend_name]
+            backend_class = registry_entry["loader"]()
+            logger.info(
+                f"Creating storage backend '{backend_name}' "
+                f"({registry_entry['module_path']}.{registry_entry['class_name']})"
+            )
+            return cls._create_builtin_backend(
+                backend_name, backend_class, storage_config, mem_pool_host
             )
 
         # Try to dynamically load backend from extra_config
@@ -104,38 +113,6 @@ class StorageBackendFactory:
             f"Registered backends: {available_backends}. "
         )
 
-    @classmethod
-    def _create_registered_backend(
-        cls,
-        backend_name: str,
-        storage_config: HiCacheStorageConfig,
-        mem_pool_host: Any,
-        **kwargs,
-    ) -> HiCacheStorage:
-        """Create a backend that is already registered."""
-        registry_entry = cls._registry[backend_name]
-
-        try:
-            # Load the backend class
-            backend_class = registry_entry["loader"]()
-
-            logger.info(
-                f"Creating registered storage backend '{backend_name}' "
-                f"({registry_entry['module_path']}.{registry_entry['class_name']})"
-            )
-
-            # Use original initialization logic for built-in backends
-            if registry_entry["is_builtin"]:
-                return cls._create_builtin_backend(
-                    backend_name, backend_class, storage_config, mem_pool_host
-                )
-            else:
-                raise ValueError(f"Backend '{backend_name}' is not a built-in backend")
-        except Exception as e:
-            logger.error(
-                f"Failed to create registered storage backend '{backend_name}': {e}"
-            )
-            raise
 
     @classmethod
     def _create_dynamic_backend(
@@ -159,13 +136,7 @@ class StorageBackendFactory:
 
         try:
             # Import the backend class
-            module = importlib.import_module(module_path)
-            backend_class = getattr(module, class_name)
-
-            if not issubclass(backend_class, HiCacheStorage):
-                raise TypeError(
-                    f"Backend class {class_name} must inherit from HiCacheStorage"
-                )
+            backend_class = cls._load_backend_class(module_path, class_name, backend_name)
 
             logger.info(
                 f"Creating dynamic storage backend '{backend_name}' "
@@ -174,14 +145,6 @@ class StorageBackendFactory:
 
             # Create the backend instance with storage_config
             return backend_class(storage_config, kwargs)
-        except ImportError as e:
-            raise ImportError(
-                f"Failed to import dynamic backend '{backend_name}' from '{module_path}': {e}"
-            ) from e
-        except AttributeError as e:
-            raise AttributeError(
-                f"Class '{class_name}' not found in module '{module_path}': {e}"
-            ) from e
         except Exception as e:
             logger.error(
                 f"Failed to create dynamic storage backend '{backend_name}': {e}"
@@ -233,28 +196,25 @@ class StorageBackendFactory:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
 
-# Register built-in storage backends with original initialization logic
+# Register built-in storage backends
 StorageBackendFactory.register_backend(
-    "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile", is_builtin=True
+    "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"
 )
 
 StorageBackendFactory.register_backend(
     "nixl",
     "sglang.srt.mem_cache.storage.nixl.hicache_nixl",
     "HiCacheNixl",
-    is_builtin=True,
 )
 
 StorageBackendFactory.register_backend(
     "mooncake",
     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
     "MooncakeStore",
-    is_builtin=True,
 )
 
 StorageBackendFactory.register_backend(
     "hf3fs",
     "sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs",
     "HiCacheHF3FS",
-    is_builtin=True,
 )
