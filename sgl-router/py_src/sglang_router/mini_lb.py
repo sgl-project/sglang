@@ -94,14 +94,14 @@ class MiniLoadBalancer:
                     "When service discovery is enabled, --router-service-discovery-namespace must be specified"
                 )
             if router_args.prefill_selector and not router_args.decode_selector:
-                print(
+                logger.info(
                     "Only prefill selector specified - decode pods will use general selector"
                 )
             if router_args.decode_selector and not router_args.prefill_selector:
-                print(
+                logger.info(
                     "Only decode selector specified - prefill pods will use general selector"
                 )
-            print(
+            logger.info(
                 f"Service discovery enabled - URLs will be discovered automatically from namespace: {router_args.service_discovery_namespace}"
             )
 
