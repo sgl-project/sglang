@@ -474,13 +474,6 @@ class Req:
         self.session_id = session_id
         self.input_embeds = input_embeds
 
-        # Used for deterministic sampling
-        self.sampling_seed = (
-            hash_string_to_int(self.origin_input_text)
-            if global_server_args_dict["enable_deterministic_inference"]
-            else None
-        )
-
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
@@ -494,6 +487,15 @@ class Req:
                 "__req__": self
             }
         self.sampling_params = sampling_params
+        # Used for deterministic sampling
+        if (
+            global_server_args_dict["enable_deterministic_inference"]
+            and sampling_params.sampling_seed is None
+        ):
+            # If deterministic inference is enabled and sampling_seed is not set, use the origin_input_text to generate a seed
+            self.sampling_params.sampling_seed = hash_string_to_int(
+                self.origin_input_text
+            )
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
         self.lora_id = lora_id

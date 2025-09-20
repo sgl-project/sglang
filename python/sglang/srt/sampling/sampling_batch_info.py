@@ -98,7 +98,9 @@ class SamplingBatchInfo:
         )
         sampling_seed = (
             torch.tensor(
-                [r.sampling_seed for r in reqs], dtype=torch.int32, device=device
+                [r.sampling_params.sampling_seed for r in reqs],
+                dtype=torch.int32,
+                device=device,
             )
             if enable_deterministic
             else None
