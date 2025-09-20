@@ -569,7 +569,7 @@ class DeepseekV2MoE(nn.Module):
         ):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
-        HACK_SBO_SHARED_AND_RS = True
+        HACK_SBO_SHARED_AND_RS = SboFlags.enable_combine_shared_two_stream_overlap()
 
         if hidden_states.shape[0] > 0:
             if not HACK_SBO_SHARED_AND_RS:
@@ -583,15 +583,16 @@ class DeepseekV2MoE(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        shared_output = None
-        def _forward_shared_experts_and_put_results():
-            nonlocal shared_output
-            shared_output = self._forward_shared_experts(hidden_states, gemm_output_zero_allocator)
+        if HACK_SBO_SHARED_AND_RS:
+            shared_output = None
+            def _forward_shared_experts_and_put_results():
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states, gemm_output_zero_allocator)
 
         final_hidden_states = self.experts(
             hidden_states,
             topk_output,
-            forward_shared_experts=_forward_shared_experts_and_put_results,
+            forward_shared_experts=_forward_shared_experts_and_put_results if HACK_SBO_SHARED_AND_RS else None,
             alt_stream=self.alt_stream,
         )
         if not _is_cuda and not _use_aiter:
