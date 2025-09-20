@@ -918,6 +918,7 @@ mod tests {
                 stream_reasoning: true,
                 chat_template_kwargs: None,
                 return_hidden_states: false,
+                sampling_seed: None,
             }
         }
 
