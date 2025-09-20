@@ -7,6 +7,7 @@ from typing import Callable, Optional, Union
 import torch
 from torch.nn import Parameter
 
+from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import is_cpu
 
 __all__ = [
@@ -156,9 +157,17 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             )
         else:
             if not use_presharded_weights:
-                loaded_weight = loaded_weight.narrow(
-                    self.output_dim, tp_rank * shard_size, shard_size
-                )
+                # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
+                start_idx = tp_rank * shard_size
+                end_idx = start_idx + shard_size
+                if end_idx > loaded_weight.shape[self.output_dim]:
+                    loaded_weight = pad_or_narrow_weight(
+                        loaded_weight, self.output_dim, start_idx, shard_size
+                    )
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        self.output_dim, start_idx, shard_size
+                    )
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
@@ -258,9 +267,17 @@ class RowvLLMParameter(BasevLLMParameter):
 
                 return
             else:
-                loaded_weight = loaded_weight.narrow(
-                    self.input_dim, tp_rank * shard_size, shard_size
-                )
+                # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
+                start_idx = tp_rank * shard_size
+                end_idx = start_idx + shard_size
+                if end_idx > loaded_weight.shape[self.input_dim]:
+                    loaded_weight = pad_or_narrow_weight(
+                        loaded_weight, self.input_dim, start_idx, shard_size
+                    )
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        self.input_dim, start_idx, shard_size
+                    )
 
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
