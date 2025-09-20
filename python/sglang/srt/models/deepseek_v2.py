@@ -890,7 +890,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.hidden_size,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                 bias=False,
-                quant_config=get_attn_maybe_fp8_quant_config(quant_config),
+                quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
@@ -898,7 +898,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
-                quant_config=get_attn_maybe_fp8_quant_config(quant_config),
+                quant_config=get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
@@ -2005,8 +2005,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         return output
 
 
-# TODO improve naming
-def get_attn_maybe_fp8_quant_config(quant_config):
+def get_q_b_proj_quant_config(quant_config):
     if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
         # refer to real DeepSeek V3 quant config
         return Fp8Config(
@@ -2843,7 +2842,6 @@ class DeepseekV2ForCausalLM(nn.Module):
 
             # if self.config.q_lora_rank is not None:
             #     module_list.append(layer.self_attn.fused_qkv_a_proj_with_mqa)
-            module_list.append(layer.self_attn.fused_qkv_a_proj_with_mqa)
             module_list.append(layer.self_attn.q_b_proj)
             # else:
             #     module_list.append(layer.self_attn.kv_a_proj_with_mqa)
@@ -3112,10 +3110,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.config.num_hidden_layers, desc="quant attn to fp8 ue8m0"
         ):
             for stem in [
-                "kv_a_proj_with_mqa",
-                "q_a_proj",
+                # "kv_a_proj_with_mqa",
                 # "kv_b_proj",
                 # "o_proj",
+                # "q_a_proj",
                 "q_b_proj",
             ]:
                 partial_name = f"model.layers.{layer_id}.self_attn.{stem}"
