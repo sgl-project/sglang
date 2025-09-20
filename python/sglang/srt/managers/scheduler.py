@@ -491,6 +491,7 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+            self.forward_worker = self.draft_worker
         elif self.spec_algorithm.is_standalone():
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 

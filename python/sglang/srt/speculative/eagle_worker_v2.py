@@ -44,6 +44,7 @@ class EAGLEWorker(TpModelWorker):
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+        moe_ep_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
         target_worker: TpModelWorker,
@@ -99,6 +100,7 @@ class EAGLEWorker(TpModelWorker):
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
             pp_rank=0,  # FIXME
             dp_rank=dp_rank,
             nccl_port=nccl_port,
@@ -404,7 +406,7 @@ class EAGLEWorker(TpModelWorker):
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 spec_info,
                 (
-                    self.target_worker.model_runner.cuda_graph_runner.bs
+                    self.target_worker.model_runner.graph_runner.bs
                     if can_run_cuda_graph
                     else None
                 ),
