@@ -285,7 +285,7 @@ class Ernie4Model(nn.Module):
         return hidden_states
 
 
-class Ernie4_5_ForCausalLM(nn.Module):
+class Ernie4_5ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -359,7 +359,7 @@ class Ernie4_5_ForCausalLM(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
 
-class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
+class Ernie4_5_MoeForCausalLM(Ernie4_5ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
@@ -423,4 +423,4 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
                         raise KeyError(f"Parameter '{name}' not found in model.")
 
 
-EntryClass = [Ernie4_5_MoeForCausalLM, Ernie4_5_ForCausalLM]
+EntryClass = [Ernie4_5_MoeForCausalLM, Ernie4_5ForCausalLM]
