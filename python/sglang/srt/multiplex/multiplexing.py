@@ -32,7 +32,7 @@ class SchedulerMultiplexMixin:
                     if decode_bs >= threshold:
                         stream_idx = i + 1
             else:
-                stream_idx =  max(1, min(self.real_sm_group_num - 2, decode_bs * (self.real_sm_group_num - 2) // 36))
+                stream_idx =  max(1, min(self.real_sm_group_num - 2, decode_bs * (self.real_sm_group_num - 2) // self.pdmux_config.decode_bs_divisor))
             set_current_stream_idx(stream_idx)
         elif not self.running_batch.is_empty():
             set_current_stream_idx(self.real_sm_group_num - 1)

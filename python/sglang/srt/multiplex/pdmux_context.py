@@ -13,13 +13,17 @@ CURRENT_STREAM_GROUP = None
 
 @dataclass
 class PDMuxConfig:
-    sm_group_num: int
+    sm_group_num: int = 8
     manual_divisions: List[List[int]] = field(default_factory=list)  # [prefill_sm, decode_sm, decode_bs_threshold]
     split_forward_token_budget: int = 65536
+    decode_bs_divisor: int = 36
 
 
 def load_pdmux_config(config_path: str) -> PDMuxConfig:
     """Load pdmux configuration from YAML file into a dataclass."""
+    if not config_path:
+        return PDMuxConfig()
+
     with open(config_path, "r") as f:
         raw = yaml.safe_load(f)
 
@@ -42,6 +46,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         sm_group_num=raw["sm_group_num"],
         manual_divisions=manual_divisions,
         split_forward_token_budget=raw.get("split_forward_token_budget", 65536),
+        decode_bs_divisor=raw.get("decode_bs_divisor", 36),
     )
 
 def get_arch_constraints(compute_capability):
@@ -69,7 +74,7 @@ def divide_sm(total_sms, compute_capability, groups):
     possible_values = [
         x
         for x in range(min_per_part, total_sms - min_per_part + 1, multiple)
-        if x >= total_sms - x and total_sms - x >= 16
+        if x >= total_sms - x - 30 and total_sms - x >= 16
     ]
     if not possible_values:
         raise ValueError(
