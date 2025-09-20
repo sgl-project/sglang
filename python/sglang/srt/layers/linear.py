@@ -45,6 +45,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
     "AWQMarlinLinearMethod",
     "AWQLinearMethod",
+    "AWQLinearAscendMethod",
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
     "BlockInt8LinearMethod",
