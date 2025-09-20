@@ -250,7 +250,12 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished()
             if req.finished():
-                self.tree_cache.cache_finished_req(req)
+                if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                    if not self.decode_offload_manager.offload_kv_cache(req):
+                        self.tree_cache.cache_finished_req(req)
+                else:
+                    self.tree_cache.cache_finished_req(req)
+
                 req.time_stats.completion_time = time.time()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
