@@ -237,8 +237,10 @@ class DeepEPConfig(BaseDispatcherConfig):
             self.normal_dispatch_config = Config(**config_dispatch)
             self.normal_combine_config = Config(**config_combine)
 
-            assert config_dispatch["num_sms"] == config_combine["num_sms"]
+            # assert config_dispatch["num_sms"] == config_combine["num_sms"]
             self.num_sms = config_dispatch["num_sms"]
+            # TODO improve
+            self.combine_num_sms = config_combine["num_sms"]
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
