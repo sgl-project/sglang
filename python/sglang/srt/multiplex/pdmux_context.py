@@ -74,7 +74,7 @@ def divide_sm(total_sms, compute_capability, groups):
     possible_values = [
         x
         for x in range(min_per_part, total_sms - min_per_part + 1, multiple)
-        if x >= total_sms - x - 30 and total_sms - x >= 16
+        if x >= total_sms - x and total_sms - x >= 16
     ]
     if not possible_values:
         raise ValueError(
