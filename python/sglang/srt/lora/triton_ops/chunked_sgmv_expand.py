@@ -4,9 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
+from python.sglang.utils import cached_triton_kernel
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
+@cached_triton_kernel
 @triton.jit
 def _chunked_lora_expand_kernel(
     # Pointers to matrices
