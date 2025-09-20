@@ -214,6 +214,7 @@ class CompletionRequest(BaseModel):
     ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
+    stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
@@ -533,6 +534,7 @@ class ChatCompletionRequest(BaseModel):
     ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
+    stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     continue_final_message: bool = False
