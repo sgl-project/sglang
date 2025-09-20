@@ -31,6 +31,10 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.layers.quantization.modelopt_quant import (
+    CUTEDSL_MOE_NVFP4_DISPATCH,
+    ModelOptNvFp4FusedMoEMethod,
+)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.offloader import get_offloader
@@ -453,6 +457,13 @@ class DeepEPMoE(EPMoE):
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
+            input_global_scale=(
+                self.w13_input_scale_quant
+                if isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+                and self.quant_method.enable_flashinfer_cutedsl_moe
+                and CUTEDSL_MOE_NVFP4_DISPATCH
+                else None
+            ),
         )
 
     def moe_impl(self, dispatch_output: DispatchOutput):
