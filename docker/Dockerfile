@@ -128,7 +128,7 @@ RUN cd /sgl-workspace/DeepEP && \
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
-    mooncake-transfer-engine==0.3.6 \
+    mooncake-transfer-engine==0.3.6.post1 \
     pre-commit \
     pytest \
     black \
