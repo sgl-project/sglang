@@ -424,7 +424,7 @@ pub struct WorkerRegistryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{CircuitBreakerConfig, WorkerFactory};
+    use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig};
     use std::collections::HashMap;
 
     #[test]
@@ -437,10 +437,12 @@ mod tests {
         labels.insert("priority".to_string(), "50".to_string());
         labels.insert("cost".to_string(), "0.8".to_string());
 
-        let worker = WorkerFactory::create_regular_with_labels(
-            "http://worker1:8080".to_string(),
-            labels,
-            CircuitBreakerConfig::default(),
+        let worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
         );
 
         // Register worker (WorkerFactory returns Box<dyn Worker>, convert to Arc)
@@ -470,26 +472,32 @@ mod tests {
         // Create workers for different models
         let mut labels1 = HashMap::new();
         labels1.insert("model_id".to_string(), "llama-3".to_string());
-        let worker1 = WorkerFactory::create_regular_with_labels(
-            "http://worker1:8080".to_string(),
-            labels1,
-            CircuitBreakerConfig::default(),
+        let worker1: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels1)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
         );
 
         let mut labels2 = HashMap::new();
         labels2.insert("model_id".to_string(), "llama-3".to_string());
-        let worker2 = WorkerFactory::create_regular_with_labels(
-            "http://worker2:8080".to_string(),
-            labels2,
-            CircuitBreakerConfig::default(),
+        let worker2: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://worker2:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels2)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
         );
 
         let mut labels3 = HashMap::new();
         labels3.insert("model_id".to_string(), "gpt-4".to_string());
-        let worker3 = WorkerFactory::create_regular_with_labels(
-            "http://worker3:8080".to_string(),
-            labels3,
-            CircuitBreakerConfig::default(),
+        let worker3: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://worker3:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels3)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
         );
 
         // Register workers

@@ -150,7 +150,7 @@ suites = {
         TestFile("test_disaggregation_pp.py", 60),
         TestFile("test_full_deepseek_v3.py", 333),
     ],
-    "per-commit-8-gpu-b200": [
+    "per-commit-4-gpu-b200": [
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_deepseek_v3_fp4_4gpu.py", 600),
     ],
