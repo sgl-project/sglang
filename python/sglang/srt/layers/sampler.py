@@ -117,6 +117,7 @@ class Sampler(nn.Module):
                             check_nan=self.use_nan_detection,
                         )
                 elif global_server_args_dict["sampling_backend"] == "pytorch":
+                    # A slower fallback implementation with torch native operations.
                     batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                         probs,
                         sampling_info.top_ks,
@@ -236,7 +237,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     """
     A top-k, top-p and min-p sampling implementation with native pytorch operations.
     When sampling_seed is not None, deterministic inference will be enabled, it will sample
-    with the sampling_seed of each request, which is a slower fallback implementation.
+    with the sampling_seed of each request.
     """
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
