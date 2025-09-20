@@ -389,6 +389,7 @@ def causal_conv1d_fn(
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
+    **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
 
