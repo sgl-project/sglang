@@ -318,63 +318,62 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
         w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
     mask_x_1d = idx_feats < dim
-    for idx_token in tl.static_range(BLOCK_M):
-        if idx_token < segment_len:
-            acc = acc_preload
+    for idx_token in range(segment_len):
+        acc = acc_preload
 
-            matrix_w = w_col0
-            matrix_x = col0
-            for j in tl.static_range(KERNEL_WIDTH):
-
-                if KERNEL_WIDTH == 2:
-                    if j == 1:  # KERNEL_WIDTH-1:
-                        matrix_w = w_col1
-                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-                elif KERNEL_WIDTH == 3:
-                    if j == 1:
-                        matrix_w = w_col1
-                        matrix_x = col1
-                    elif j == 2:
-                        matrix_w = w_col2
-                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-                elif KERNEL_WIDTH == 4:
-                    if j == 1:
-                        matrix_w = w_col1
-                        matrix_x = col1
-                    elif j == 2:
-                        matrix_w = w_col2
-                        matrix_x = col2
-                    elif j == 3:
-                        matrix_w = w_col3
-                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-
-                acc += matrix_x * matrix_w  # [BLOCK_N]
+        matrix_w = w_col0
+        matrix_x = col0
+        for j in tl.static_range(KERNEL_WIDTH):
 
             if KERNEL_WIDTH == 2:
-                col0 = matrix_x
+                if j == 1:  # KERNEL_WIDTH-1:
+                    matrix_w = w_col1
+                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
             elif KERNEL_WIDTH == 3:
-                col0 = col1
-                col1 = matrix_x
+                if j == 1:
+                    matrix_w = w_col1
+                    matrix_x = col1
+                elif j == 2:
+                    matrix_w = w_col2
+                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
             elif KERNEL_WIDTH == 4:
-                col0 = col1
-                col1 = col2
-                col2 = matrix_x
+                if j == 1:
+                    matrix_w = w_col1
+                    matrix_x = col1
+                elif j == 2:
+                    matrix_w = w_col2
+                    matrix_x = col2
+                elif j == 3:
+                    matrix_w = w_col3
+                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
 
-            if SILU_ACTIVATION:
-                acc = acc / (1 + tl.exp(-acc))
-            mask_1d = (idx_token < segment_len) & (
-                idx_feats < dim
-            )  # token-index  # feature-index
-            o_ptrs = (
-                o_ptr
-                + (sequence_start_index + token_offset + idx_token) * stride_o_token
-                + (idx_feats * stride_o_dim)
-            )
+            acc += matrix_x * matrix_w  # [BLOCK_N]
 
-            tl.store(o_ptrs, acc, mask=mask_1d)
+        if KERNEL_WIDTH == 2:
+            col0 = matrix_x
+        elif KERNEL_WIDTH == 3:
+            col0 = col1
+            col1 = matrix_x
+        elif KERNEL_WIDTH == 4:
+            col0 = col1
+            col1 = col2
+            col2 = matrix_x
+
+        if SILU_ACTIVATION:
+            acc = acc / (1 + tl.exp(-acc))
+        mask_1d = (idx_token < segment_len) & (
+            idx_feats < dim
+        )  # token-index  # feature-index
+        o_ptrs = (
+            o_ptr
+            + (sequence_start_index + token_offset + idx_token) * stride_o_token
+            + (idx_feats * stride_o_dim)
+        )
+
+        tl.store(o_ptrs, acc, mask=mask_1d)
 
 
 def causal_conv1d_fn(
