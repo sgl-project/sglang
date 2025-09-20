@@ -102,6 +102,7 @@ dev = ["sglang[test]", "sglang[decord]"]
 "sglang" = [
   "srt/layers/moe/fused_moe_triton/configs/*/*.json",
   "srt/layers/quantization/configs/*.json",
+    "srt/layers/attention/mha_chunk_prefix/configs/*.json",
   "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
   "srt/speculative/cpp_lookahead/*.cpp",
   "srt/speculative/cpp_lookahead/*.h",
