@@ -69,7 +69,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, support_triton
+from sglang.srt.utils import flatten_nested_list, hash_string_to_int, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -473,6 +473,13 @@ class Req:
         self.fill_ids = []
         self.session_id = session_id
         self.input_embeds = input_embeds
+
+        # Used for deterministic sampling
+        self.sampling_seed = (
+            hash_string_to_int(self.origin_input_text)
+            if global_server_args_dict["enable_deterministic_inference"]
+            else None
+        )
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
