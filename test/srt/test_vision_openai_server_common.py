@@ -1,10 +1,15 @@
 import base64
 import io
+import logging
 import os
+import time
+from io import BytesIO
 
 import numpy as np
 import openai
+import PIL
 import requests
+from openai import OpenAI
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
