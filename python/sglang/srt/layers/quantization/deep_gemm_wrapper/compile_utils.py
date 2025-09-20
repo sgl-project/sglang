@@ -24,6 +24,7 @@ _ENABLE_JIT_DEEPGEMM_PRECOMPILE = get_bool_env_var(
     "SGL_JIT_DEEPGEMM_PRECOMPILE", "true"
 )
 _DO_COMPILE_ALL = True
+_NUM_SMS_SBO_COMM = 3
 _IS_FIRST_RANK_ON_NODE = get_bool_env_var("SGL_IS_FIRST_RANK_ON_NODE", "true")
 _COMPILE_WORKERS = get_int_env_var("SGL_JIT_DEEPGEMM_COMPILE_WORKERS", 4)
 _IN_PRECOMPILE_STAGE = get_bool_env_var("SGL_IN_DEEPGEMM_PRECOMPILE_STAGE", "false")
@@ -43,6 +44,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
+    global _NUM_SMS_SBO_COMM
 
     # Generate m_max
     m_max = 1024 * 16
@@ -61,10 +63,13 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     # Avoid loading symbols at the serving stages.
     _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
 
+    _NUM_SMS_SBO_COMM = server_args.num_sms_sbo_comm
+
 
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
+    GROUPED_GEMM_NT_F8F8BF16_OVERLAP = auto()
     GEMM_NT_F8F8BF16 = auto()
 
 
@@ -152,6 +157,7 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_OVERLAP: _GroupedOverlapWarmupExecutor,
         }[kernel_type](**kwargs)
 
     def execute(self, m):
@@ -233,9 +239,46 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         )
 
 
+class _GroupedOverlapWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        max_signal_size = num_groups * ceil_div(max_m, 64)
+        self.signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        with configure_deep_gemm_num_invalid_sms(_NUM_SMS_SBO_COMM):
+            deep_gemm.m_grouped_fp8_gemm_nt_masked(
+                (self.lhs_q, self.lhs_s),
+                (self.rhs_q, self.rhs_s),
+                self.out,
+                masked_m=self.masked_m,
+                expected_m=m,
+                enable_overlap=True,
+                signal=self.signal,
+            )
+
+
 @contextmanager
 def deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     yield
+
+
+@contextmanager
+def configure_deep_gemm_num_invalid_sms(num_invalid_sms):
+    if num_invalid_sms is None:
+        yield
+    else:
+        original_num_sms = deep_gemm.get_num_sms()
+        deep_gemm.set_num_sms(original_num_sms - num_invalid_sms)
+        try:
+            yield
+        finally:
+            deep_gemm.set_num_sms(original_num_sms)

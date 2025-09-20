@@ -111,6 +111,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_symm_mem",
     "enable_custom_logit_processor",
     "disaggregation_mode",
+    "enable_single_batch_overlap",
+    "num_sms_sbo_comm",
 ]
 
 # Put some global args for easy access
