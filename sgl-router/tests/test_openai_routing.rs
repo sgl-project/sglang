@@ -10,6 +10,7 @@ use axum::{
 use serde_json::json;
 use sglang_router_rs::{
     config::{RouterConfig, RoutingMode},
+    data_connector::MemoryResponseStorage,
     protocols::spec::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, UserMessageContent,
     },
@@ -77,7 +78,12 @@ fn create_minimal_completion_request() -> CompletionRequest {
 /// Test basic OpenAI router creation and configuration
 #[tokio::test]
 async fn test_openai_router_creation() {
-    let router = OpenAIRouter::new("https://api.openai.com".to_string(), None).await;
+    let router = OpenAIRouter::new(
+        "https://api.openai.com".to_string(),
+        None,
+        Arc::new(MemoryResponseStorage::new()),
+    )
+    .await;
 
     assert!(router.is_ok(), "Router creation should succeed");
 
@@ -89,9 +95,13 @@ async fn test_openai_router_creation() {
 /// Test health endpoints
 #[tokio::test]
 async fn test_openai_router_health() {
-    let router = OpenAIRouter::new("https://api.openai.com".to_string(), None)
-        .await
-        .unwrap();
+    let router = OpenAIRouter::new(
+        "https://api.openai.com".to_string(),
+        None,
+        Arc::new(MemoryResponseStorage::new()),
+    )
+    .await
+    .unwrap();
 
     let req = Request::builder()
         .method(Method::GET)
@@ -106,9 +116,13 @@ async fn test_openai_router_health() {
 /// Test server info endpoint
 #[tokio::test]
 async fn test_openai_router_server_info() {
-    let router = OpenAIRouter::new("https://api.openai.com".to_string(), None)
-        .await
-        .unwrap();
+    let router = OpenAIRouter::new(
+        "https://api.openai.com".to_string(),
+        None,
+        Arc::new(MemoryResponseStorage::new()),
+    )
+    .await
+    .unwrap();
 
     let req = Request::builder()
         .method(Method::GET)
@@ -131,9 +145,13 @@ async fn test_openai_router_server_info() {
 async fn test_openai_router_models() {
     // Use mock server for deterministic models response
     let mock_server = MockOpenAIServer::new().await;
-    let router = OpenAIRouter::new(mock_server.base_url(), None)
-        .await
-        .unwrap();
+    let router = OpenAIRouter::new(
+        mock_server.base_url(),
+        None,
+        Arc::new(MemoryResponseStorage::new()),
+    )
+    .await
+    .unwrap();
 
     let req = Request::builder()
         .method(Method::GET)
@@ -178,9 +196,13 @@ async fn test_router_factory_openai_mode() {
 /// Test that unsupported endpoints return proper error codes
 #[tokio::test]
 async fn test_unsupported_endpoints() {
-    let router = OpenAIRouter::new("https://api.openai.com".to_string(), None)
-        .await
-        .unwrap();
+    let router = OpenAIRouter::new(
+        "https://api.openai.com".to_string(),
+        None,
+        Arc::new(MemoryResponseStorage::new()),
+    )
+    .await
+    .unwrap();
 
     // Test generate endpoint (SGLang-specific, should not be supported)
     let generate_request = GenerateRequest {
@@ -218,7 +240,9 @@ async fn test_openai_router_chat_completion_with_mock() {
     let base_url = mock_server.base_url();
 
     // Create router pointing to mock server
-    let router = OpenAIRouter::new(base_url, None).await.unwrap();
+    let router = OpenAIRouter::new(base_url, None, Arc::new(MemoryResponseStorage::new()))
+        .await
+        .unwrap();
 
     // Create a minimal chat completion request
     let mut chat_request = create_minimal_chat_request();
@@ -254,7 +278,9 @@ async fn test_openai_e2e_with_server() {
     let base_url = mock_server.base_url();
 
     // Create router
-    let router = OpenAIRouter::new(base_url, None).await.unwrap();
+    let router = OpenAIRouter::new(base_url, None, Arc::new(MemoryResponseStorage::new()))
+        .await
+        .unwrap();
 
     // Create Axum app with chat completions endpoint
     let app = Router::new().route(
@@ -318,7 +344,9 @@ async fn test_openai_e2e_with_server() {
 async fn test_openai_router_chat_streaming_with_mock() {
     let mock_server = MockOpenAIServer::new().await;
     let base_url = mock_server.base_url();
-    let router = OpenAIRouter::new(base_url, None).await.unwrap();
+    let router = OpenAIRouter::new(base_url, None, Arc::new(MemoryResponseStorage::new()))
+        .await
+        .unwrap();
 
     // Build a streaming chat request
     let val = json!({
@@ -367,6 +395,7 @@ async fn test_openai_router_circuit_breaker() {
     let router = OpenAIRouter::new(
         "http://invalid-url-that-will-fail".to_string(),
         Some(cb_config),
+        Arc::new(MemoryResponseStorage::new()),
     )
     .await
     .unwrap();
@@ -390,9 +419,13 @@ async fn test_openai_router_models_auth_forwarding() {
     // Start a mock server that requires Authorization
     let expected_auth = "Bearer test-token".to_string();
     let mock_server = MockOpenAIServer::new_with_auth(Some(expected_auth.clone())).await;
-    let router = OpenAIRouter::new(mock_server.base_url(), None)
-        .await
-        .unwrap();
+    let router = OpenAIRouter::new(
+        mock_server.base_url(),
+        None,
+        Arc::new(MemoryResponseStorage::new()),
+    )
+    .await
+    .unwrap();
 
     // 1) Without auth header -> expect 401
     let req = Request::builder()

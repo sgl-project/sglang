@@ -8,7 +8,7 @@ use crate::config::RouterConfig;
 use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig, Worker, WorkerRegistry, WorkerType};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    ResponsesGetParams, ResponsesRequest,
 };
 use crate::protocols::worker_spec::{
     ServerInfo, WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo,
@@ -685,10 +685,15 @@ impl RouterTrait for RouterManager {
             .into_response()
     }
 
-    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn get_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        params: &ResponsesGetParams,
+    ) -> Response {
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
-            router.get_response(headers, response_id).await
+            router.get_response(headers, response_id, params).await
         } else {
             (
                 StatusCode::NOT_FOUND,
