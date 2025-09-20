@@ -427,7 +427,6 @@ class EAGLEWorker(TpModelWorker):
         ) = spec_info.sample(batch, logits_output)
         new_seq_lens = seq_lens_backup + accept_length
         verify_done = torch.cuda.Event()
-        verify_done.record()
 
         # Move the accepted tokens to the target KV cache locations
         batch.seq_lens = seq_lens_backup
@@ -436,6 +435,9 @@ class EAGLEWorker(TpModelWorker):
             accept_index,
             accept_length,
         )
+
+        verify_done.record()
+
         all_verified_id = predict[accept_index]
         verified_id = torch.empty_like(accept_length, dtype=torch.int32)
         fill_new_verified_id[(bs,)](
