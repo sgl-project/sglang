@@ -1,6 +1,7 @@
 """
 Usage:
-python3 -m unittest test_intel_amx_attention_backend.TestIntelAMXAttnBackend.test_mmlu
+python3 -m unittest test_attention_backend_on_cpu.TestIntelAMXAttnBackend.test_mmlu
+python3 -m unittest test_attention_backend_on_cpu.TestTorchNativeAttnBackend.test_latency
 """
 
 import unittest
@@ -129,6 +130,37 @@ class TestIntelAMXAttnBackend(CustomTestCase):
                 self.assertGreater(metrics["score"], 0.45)
         finally:
             kill_process_tree(process.pid)
+
+
+class TestTorchNativeAttnBackend(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # Set environment variable to disable AMX to test torch_native backend
+        import os
+
+        os.environ["SGLANG_CPU_DISABLE_AMX"] = "1"
+
+    def test_latency(self):
+        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+            DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+            [
+                "--attention-backend",
+                "torch_native",
+                "--mem-fraction-static",
+                "0.05",
+                "--disable-radix",
+                "--trust-remote-code",
+                "--batch-size",
+                "4",
+            ],
+        )
+
+        print(f"{prefill_latency=}")
+        print(f"{decode_throughput=}")
+        print(f"{decode_latency=}")
+
+        if is_in_ci():
+            self.assertGreater(decode_throughput, 5)
 
 
 if __name__ == "__main__":
