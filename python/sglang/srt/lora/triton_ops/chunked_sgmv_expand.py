@@ -13,15 +13,6 @@ def _chunked_lora_expand_kernel(
     x,
     weights,
     output,
-    # Parameters of size
-    # Strides
-    x_stride_0,
-    x_stride_1,
-    w_stride_0,
-    w_stride_1,
-    w_stride_2,
-    output_stride_0,
-    output_stride_1,
     # Information on sequence lengths and weight id
     seg_indptr,
     weight_indices,
@@ -34,8 +25,9 @@ def _chunked_lora_expand_kernel(
     slice_offsets,
     # Meta parameters
     NUM_SLICES: tl.constexpr,
+    OUTPUT_DIM: tl.constexpr,
     MAX_RANK: tl.constexpr,  # K = R
-    BLOCK_S: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -56,6 +48,16 @@ def _chunked_lora_expand_kernel(
             Shape: (s, output_dim).
     """
     tl.static_assert(NUM_SLICES <= 3)
+
+    x_stride_0: tl.constexpr = NUM_SLICES * MAX_RANK
+    x_stride_1: tl.constexpr = 1
+
+    w_stride_0: tl.constexpr = OUTPUT_DIM * MAX_RANK
+    w_stride_1: tl.constexpr = MAX_RANK
+    w_stride_2: tl.constexpr = 1
+
+    output_stride_0: tl.constexpr = OUTPUT_DIM
+    output_stride_1: tl.constexpr = 1
 
     pid_s = tl.program_id(axis=2)
     if pid_s >= num_segs:
@@ -83,7 +85,7 @@ def _chunked_lora_expand_kernel(
     cur_rank = tl.minimum(MAX_RANK, cur_rank)
 
     # Map logical sequence index to physical index
-    s_offset_logical = tl.arange(0, BLOCK_S) + seg_start
+    s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
     s_offset_physical = tl.load(
         permutation + s_offset_logical, mask=s_offset_logical < seg_end
     )
@@ -105,7 +107,7 @@ def _chunked_lora_expand_kernel(
     )
 
     # Iterate to compute the block in output matrix
-    partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
+    partial_sum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(cur_rank, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
@@ -140,32 +142,37 @@ def _chunked_lora_expand_kernel(
 
 def chunked_sgmv_lora_expand_forward(
     x: torch.Tensor,
-    lora_weight_b: torch.Tensor,
+    weights: torch.Tensor,
     batch_info: LoRABatchInfo,
     slice_offsets: torch.Tensor,
     max_slice_size: int,
-    base_output: torch.Tensor = None,
+    base_output: Optional[torch.Tensor],
 ) -> torch.Tensor:
 
     # x: (s, slice_num * r)
-    # lora_weight_b: (num_lora, output_dim, r)
+    # weights: (num_lora, output_dim, r)
     # slice_offsets: boundaries for different slices in the output dimension
     # output: (s, output_dim)
 
     # Compute lora_output with shape (s, output_dim) as follows:
     # For each slice i, accumulates:
-    # lora_output[:, slice_offsets[i]:slice_offsets[i+1]] += scaling * sgemm(x[:, i*cur_rank:(i+1)*cur_rank], lora_weight_b[:, slice_offsets[i]:slice_offsets[i+1], :])
+    # lora_output[:, slice_offsets[i]:slice_offsets[i+1]] += scaling * sgemm(x[:, i*cur_rank:(i+1)*cur_rank], weights[:, slice_offsets[i]:slice_offsets[i+1], :])
+
+    assert x.is_contiguous()
+    assert weights.is_contiguous()
+    assert len(x.shape) == 2
+    assert len(weights.shape) == 3
 
     # Get dims
-    s = x.shape[0]
+    M = x.shape[0]
     input_dim = x.shape[1]
-    max_lora_rank = lora_weight_b.shape[-1]
-    output_dim = lora_weight_b.shape[-2]
+    OUTPUT_DIM = weights.shape[1]
+    MAX_RANK = weights.shape[2]
     num_slices = len(slice_offsets) - 1
-    assert input_dim == num_slices * max_lora_rank
+    assert input_dim == num_slices * MAX_RANK
 
     # TODO (lifuhuang): fine-tune per operation
-    BLOCK_M = 16
+    BLOCK_M = batch_info.max_len
     BLOCK_K = 16
     BLOCK_N = 64
 
@@ -178,21 +185,14 @@ def chunked_sgmv_lora_expand_forward(
     )
 
     if base_output is None:
-        output = torch.zeros((s, output_dim), device=x.device, dtype=x.dtype)
+        output = torch.zeros((M, OUTPUT_DIM), device=x.device, dtype=x.dtype)
     else:
         output = base_output
 
     _chunked_lora_expand_kernel[grid](
         x=x,
-        weights=lora_weight_b,
+        weights=weights,
         output=output,
-        x_stride_0=x.stride(0),
-        x_stride_1=x.stride(1),
-        w_stride_0=lora_weight_b.stride(0),
-        w_stride_1=lora_weight_b.stride(1),
-        w_stride_2=lora_weight_b.stride(2),
-        output_stride_0=output.stride(0),
-        output_stride_1=output.stride(1),
         seg_indptr=batch_info.seg_indptr,
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
@@ -202,8 +202,9 @@ def chunked_sgmv_lora_expand_forward(
         slice_offsets=slice_offsets,
         # constants
         NUM_SLICES=num_slices,
-        MAX_RANK=max_lora_rank,
-        BLOCK_S=BLOCK_M,
+        OUTPUT_DIM=OUTPUT_DIM,
+        MAX_RANK=MAX_RANK,
+        BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
     )
