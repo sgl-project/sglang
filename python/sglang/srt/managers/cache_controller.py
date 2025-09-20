@@ -291,6 +291,14 @@ class HiCacheController:
                 self.storage_backend = MooncakeStore(self.storage_config)
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
+            elif storage_backend == "aibrix":
+                from sglang.srt.mem_cache.storage.aibrix_kvcache.aibrix_kvcache_storage import (
+                    AibrixKVCacheStorage,
+                )
+
+                self.storage_backend = AibrixKVCacheStorage(
+                    self.storage_config, self.mem_pool_host
+                )
             elif storage_backend == "hf3fs":
                 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
                     HiCacheHF3FS,
