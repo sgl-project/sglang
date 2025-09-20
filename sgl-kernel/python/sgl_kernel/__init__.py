@@ -23,7 +23,7 @@ def _find_cuda_home():
     return cuda_home
 
 
-if torch.version.hip is None:
+if torch.version.cuda is not None:
     cuda_home = Path(_find_cuda_home())
 
     if (cuda_home / "lib").is_dir():
@@ -126,6 +126,7 @@ from sgl_kernel.sampling import (
 )
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,
+    reconstruct_indices_from_tree_mask,
     segment_packbits,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
