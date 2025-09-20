@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import torch
 
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.token_dispatcher import DeepEPLLOutput, DeepEPNormalOutput, DeepEPConfig
 from sglang.srt.layers.moe.utils import is_sbo_enabled
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -104,29 +103,16 @@ def _compute_overlap_args(dispatch_output, alt_stream):
     ):
         return None, None, {}
 
-    if isinstance(dispatch_output, DeepEPLLOutput):
-        hidden_states = dispatch_output.hidden_states_fp8
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-        num_local_experts, _, _ = hidden_states.shape
-    elif isinstance(dispatch_output, DeepEPNormalOutput):
-        hidden_states = dispatch_output.hidden_states
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-    else:
-        raise NotImplementedError(f"Unknown {dispatch_output=}")
+    hidden_states = dispatch_output.hidden_states_fp8
+    if isinstance(hidden_states, tuple):
+        hidden_states = hidden_states[0]
+
+    num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
 
     total_num_sms = torch.cuda.get_device_properties(
         device="cuda"
     ).multi_processor_count
-
-    # TODO improve
-    if isinstance(dispatch_output, DeepEPLLOutput):
-        communicate_num_sms = get_int_env_var("SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32)
-    elif isinstance(dispatch_output, DeepEPNormalOutput):
-        communicate_num_sms = DeepEPConfig.get_instance().num_sms
-    else:
-        raise NotImplementedError
+    communicate_num_sms = get_int_env_var("SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32)
     compute_num_sms = total_num_sms - communicate_num_sms
 
     assert alt_stream is not None
