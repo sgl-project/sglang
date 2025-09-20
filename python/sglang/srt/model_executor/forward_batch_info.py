@@ -317,7 +317,7 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
-    # FIXME: remove this
+    # TODO(lsyin): remove this
     is_prefill_only: bool = False
 
     @classmethod
