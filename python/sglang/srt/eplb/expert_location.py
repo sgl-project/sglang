@@ -11,21 +11,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+
+from __future__ import annotations
+
 import json
 import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.distributed
 import torch.nn.functional as F
 
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.model_loader import get_model_architecture
-from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,7 @@ class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     physical_to_logical_map_cpu: torch.Tensor
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
+    logical_to_all_physical_map_cpu: torch.Tensor  # CPU copy for performance
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
@@ -82,6 +88,10 @@ class ExpertLocationMetadata:
     def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
         """Trivial location - logical expert i corresponds to physical expert i"""
         common = ExpertLocationMetadata._init_common(server_args, model_config)
+
+        if common is None:
+            return None
+
         num_physical_experts = common["num_physical_experts"]
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_layers = model_config_for_expert_location.num_layers
@@ -109,6 +119,10 @@ class ExpertLocationMetadata:
         physical_to_logical_map = physical_to_logical_map.to(server_args.device)
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
+
+        if common is None:
+            return None
+
         model_config_for_expert_location = common["model_config_for_expert_location"]
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
             physical_to_logical_map,
@@ -133,6 +147,10 @@ class ExpertLocationMetadata:
         logical_count = logical_count.to(server_args.device)
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
+
+        if common is None:
+            return None
+
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
         num_groups = model_config_for_expert_location.num_groups
@@ -167,6 +185,9 @@ class ExpertLocationMetadata:
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
         )
+
+        if model_config_for_expert_location is None:
+            return None
 
         num_physical_experts = (
             model_config_for_expert_location.num_logical_experts
@@ -206,6 +227,7 @@ class ExpertLocationMetadata:
             physical_to_logical_map=physical_to_logical_map,
             physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
+            logical_to_all_physical_map_cpu=logical_to_all_physical_map_padded.cpu(),
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             logical_to_rank_dispatch_physical_map=(
                 compute_logical_to_rank_dispatch_physical_map(
@@ -236,6 +258,7 @@ class ExpertLocationMetadata:
             "physical_to_logical_map",
             "physical_to_logical_map_cpu",
             "logical_to_all_physical_map",
+            "logical_to_all_physical_map_cpu",
             "logical_to_all_physical_map_num_valid",
             "logical_to_rank_dispatch_physical_map",
         ]:
@@ -255,9 +278,10 @@ class ExpertLocationMetadata:
     def logical_to_all_physical(
         self, layer_id: int, logical_expert_id: int
     ) -> List[int]:
+        # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
         return [
             physical_expert_id
-            for physical_expert_id in self.logical_to_all_physical_map[
+            for physical_expert_id in self.logical_to_all_physical_map_cpu[
                 layer_id, logical_expert_id
             ].tolist()
             if physical_expert_id != -1
@@ -399,10 +423,6 @@ class ModelConfigForExpertLocation:
     num_groups: Optional[int] = None
 
     @staticmethod
-    def init_dummy():
-        return ModelConfigForExpertLocation(num_layers=1, num_logical_experts=1)
-
-    @staticmethod
     def from_model_config(model_config: ModelConfig):
         model_class, _ = get_model_architecture(model_config)
         if hasattr(model_class, "get_model_config_for_expert_location"):
@@ -410,12 +430,12 @@ class ModelConfigForExpertLocation:
                 model_config.hf_config
             )
         else:
-            return ModelConfigForExpertLocation.init_dummy()
+            return None
 
 
 def compute_initial_expert_location_metadata(
     server_args: ServerArgs, model_config: ModelConfig
-) -> ExpertLocationMetadata:
+) -> Optional[ExpertLocationMetadata]:
     data = server_args.init_expert_location
     if data == "trivial":
         return ExpertLocationMetadata.init_trivial(server_args, model_config)

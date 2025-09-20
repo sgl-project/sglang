@@ -1,5 +1,6 @@
 import logging
 import re
+from functools import lru_cache
 
 import torch
 
@@ -33,9 +34,3 @@ class PPMissingLayer(torch.nn.Identity):
         """
         input = args[0] if args else next(iter(kwargs.values()))
         return (input,) if self.return_tuple else input
-
-
-def is_sm100_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 10) and (
-        torch.version.cuda >= "12.8"
-    )

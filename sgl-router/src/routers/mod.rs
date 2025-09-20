@@ -1,17 +1,28 @@
 //! Router implementations
 
-use actix_web::{HttpRequest, HttpResponse};
 use async_trait::async_trait;
-use reqwest::Client;
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
 use std::fmt::Debug;
 
+use crate::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+    ResponsesRequest,
+};
+
 pub mod factory;
-pub mod pd_router;
-pub mod pd_types;
-pub mod request_adapter;
-pub mod router;
+pub mod grpc;
+pub mod header_utils;
+pub mod http;
+pub mod router_manager;
 
 pub use factory::RouterFactory;
+// Re-export HTTP routers for convenience (keeps routers::openai_router path working)
+pub use http::{openai_router, pd_router, pd_types, router};
 
 /// Worker management trait for administrative operations
 ///
@@ -33,54 +44,106 @@ pub trait WorkerManagement: Send + Sync {
 ///
 /// This trait provides a unified interface for routing requests,
 /// regardless of whether it's a regular router or PD router.
-#[async_trait(?Send)]
+#[async_trait]
 pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     /// Get a reference to self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
+
     /// Route a health check request
-    async fn health(&self, client: &Client, req: &HttpRequest) -> HttpResponse;
+    async fn health(&self, req: Request<Body>) -> Response;
 
     /// Route a health generate request
-    async fn health_generate(&self, client: &Client, req: &HttpRequest) -> HttpResponse;
+    async fn health_generate(&self, req: Request<Body>) -> Response;
 
     /// Get server information
-    async fn get_server_info(&self, client: &Client, req: &HttpRequest) -> HttpResponse;
+    async fn get_server_info(&self, req: Request<Body>) -> Response;
 
     /// Get available models
-    async fn get_models(&self, client: &Client, req: &HttpRequest) -> HttpResponse;
+    async fn get_models(&self, req: Request<Body>) -> Response;
 
     /// Get model information
-    async fn get_model_info(&self, client: &Client, req: &HttpRequest) -> HttpResponse;
+    async fn get_model_info(&self, req: Request<Body>) -> Response;
 
     /// Route a generate request
     async fn route_generate(
         &self,
-        client: &Client,
-        req: &HttpRequest,
-        body: serde_json::Value,
-    ) -> HttpResponse;
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+    ) -> Response;
 
     /// Route a chat completion request
     async fn route_chat(
         &self,
-        client: &Client,
-        req: &HttpRequest,
-        body: serde_json::Value,
-    ) -> HttpResponse;
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response;
 
     /// Route a completion request
     async fn route_completion(
         &self,
-        client: &Client,
-        req: &HttpRequest,
-        body: serde_json::Value,
-    ) -> HttpResponse;
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response;
+
+    /// Route a responses request
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+    ) -> Response;
+
+    /// Retrieve a stored/background response by id
+    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
+
+    /// Cancel a background response by id
+    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
+
+    /// Delete a response by id
+    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses delete endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// List input items of a response by id
+    async fn list_response_input_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses list input items endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Route embedding requests (OpenAI-compatible /v1/embeddings)
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response;
+
+    async fn route_rerank(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RerankRequest,
+        model_id: Option<&str>,
+    ) -> Response;
 
     /// Flush cache on all workers
-    async fn flush_cache(&self, client: &Client) -> HttpResponse;
+    async fn flush_cache(&self) -> Response;
 
     /// Get worker loads (for monitoring)
-    async fn get_worker_loads(&self, client: &Client) -> HttpResponse;
+    async fn get_worker_loads(&self) -> Response;
 
     /// Get router type name
     fn router_type(&self) -> &'static str;
@@ -91,11 +154,11 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
     }
 
     /// Server liveness check - is the server process running
-    fn liveness(&self) -> HttpResponse {
+    fn liveness(&self) -> Response {
         // Simple liveness check - if we can respond, we're alive
-        HttpResponse::Ok().body("OK")
+        (StatusCode::OK, "OK").into_response()
     }
 
     /// Server readiness check - is the server ready to handle requests
-    fn readiness(&self) -> HttpResponse;
+    fn readiness(&self) -> Response;
 }

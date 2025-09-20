@@ -4,9 +4,9 @@ from typing import Optional
 import pytest
 import torch
 from sgl_kernel import fused_marlin_moe
+from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
 
 
