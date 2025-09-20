@@ -46,6 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.compilation.decorators import support_torch_compile
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -275,6 +276,7 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@support_torch_compile
 class LlamaModel(nn.Module):
     def __init__(
         self,
