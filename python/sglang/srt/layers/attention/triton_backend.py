@@ -12,8 +12,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import get_bool_env_var, get_device_core_count, next_power_of_2
-from sglang.environ import envs
+from sglang.srt.utils import get_bool_env_var, get_device_core_count, next_power_of_2, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -104,7 +103,9 @@ class TritonAttnBackend(AttentionBackend):
         # Configure deterministic inference settings
         if self.enable_deterministic:
             # Use fixed split tile size for batch invariance
-            self.split_tile_size = envs.SGLANG_TRITON_DETERMINISTIC_SPLIT_TILE_SIZE.get() # Using default value for deterministic mode
+            self.split_tile_size = get_int_env_var(
+                "SGLANG_TRITON_DETERMINISTIC_SPLIT_TILE_SIZE", 256
+            )
             # Set static_kv_splits to False to use deterministic logic instead
             self.static_kv_splits = False
         else:
