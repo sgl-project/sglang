@@ -69,7 +69,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, support_triton
+from sglang.srt.utils import flatten_nested_list, hash_string_to_int, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -487,6 +487,15 @@ class Req:
                 "__req__": self
             }
         self.sampling_params = sampling_params
+        # Used for deterministic sampling
+        if (
+            global_server_args_dict["enable_deterministic_inference"]
+            and sampling_params.sampling_seed is None
+        ):
+            # If deterministic inference is enabled and sampling_seed is not set, use the origin_input_text to generate a seed
+            self.sampling_params.sampling_seed = hash_string_to_int(
+                self.origin_input_text
+            )
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
         self.lora_id = lora_id

@@ -1003,6 +1003,10 @@ class ServerArgs:
             logger.warning(
                 "Currently radix cache is disabled for deterministic inference. It will be supported in the future."
             )
+            self.sampling_backend = "pytorch"
+            logger.warning(
+                "Sampling backend is set to pytorch for deterministic inference."
+            )
             if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
                 raise ValueError(
                     f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."

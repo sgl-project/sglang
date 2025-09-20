@@ -367,6 +367,10 @@ pub struct ChatCompletionRequest {
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,
+
+    /// Random seed for sampling for deterministic outputs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_seed: Option<u64>,
 }
 
 impl GenerationRequest for ChatCompletionRequest {
@@ -607,6 +611,10 @@ pub struct CompletionRequest {
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,
+
+    /// Sampling seed for deterministic outputs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_seed: Option<u64>,
 
     /// Additional fields including bootstrap info for PD routing
     #[serde(flatten)]
@@ -1749,6 +1757,8 @@ pub struct SamplingParams {
     pub stop_token_ids: Option<Vec<i32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_stop_trim: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_seed: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
