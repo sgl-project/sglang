@@ -30,6 +30,7 @@ class PyNcclCommunicator:
         group: Union[ProcessGroup, StatelessProcessGroup],
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
+        use_current_stream: bool = False,
     ):
         """
         Args:
@@ -74,6 +75,7 @@ class PyNcclCommunicator:
 
         self.available = True
         self.disabled = False
+        self.use_current_stream = use_current_stream
 
         self.nccl_version = self.nccl.ncclGetRawVersion()
         if self.rank == 0:
@@ -136,7 +138,11 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            if self.use_current_stream:
+                # use the current stream if specified
+                stream = torch.cuda.current_stream()
+            else:
+                stream = self.stream
         self.nccl.ncclAllReduce(
             buffer_type(tensor.data_ptr()),
             buffer_type(tensor.data_ptr()),
@@ -164,7 +170,11 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            if self.use_current_stream:
+                # use the current stream if specified
+                stream = torch.cuda.current_stream()
+            else:
+                stream = self.stream
 
         if sizes is not None:
             split_offset = 0
@@ -211,7 +221,11 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            if self.use_current_stream:
+                # use the current stream if specified
+                stream = torch.cuda.current_stream()
+            else:
+                stream = self.stream
 
         if sizes is not None:
             split_offset = 0
@@ -250,7 +264,11 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            if self.use_current_stream:
+                # use the current stream if specified
+                stream = torch.cuda.current_stream()
+            else:
+                stream = self.stream
         self.nccl.ncclSend(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -268,7 +286,11 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            if self.use_current_stream:
+                # use the current stream if specified
+                stream = torch.cuda.current_stream()
+            else:
+                stream = self.stream
         self.nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -286,7 +308,11 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            if self.use_current_stream:
+                # use the current stream if specified
+                stream = torch.cuda.current_stream()
+            else:
+                stream = self.stream
         if src == self.rank:
             sendbuff = buffer_type(tensor.data_ptr())
             # NCCL requires the sender also to have a receive buffer
