@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   nightly-test-eval-text-models:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -33,7 +33,7 @@ jobs:
           python3 test_nightly_text_models_gsm8k_eval.py
 
   nightly-test-perf-text-models:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -43,21 +43,22 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
           apt-get install rsync -y
+          apt install git-lfs
 
       - name: Run performance test for text models
         timeout-minutes: 180
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/mickqian/SGLang-test-nightly/main/traces/${{ github.run_id }}
+          TRACE_BASE_URL: https://huggingface.co/Miiiick/ci-data/resolve/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
           rm -rf test/srt/performance_profiles_text_models/
           cd test/srt
           python3 test_nightly_text_models_perf.py
 
-      - name: Checkout storage repo (SGLang-test-nightly)
+      - name: Checkout storage repo (Hugging Face)
         uses: actions/checkout@v4
         with:
-          repository: mickqian/SGLang-test-nightly
+          repository: Miiiick/ci-data
           token: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
           path: nightly-storage
 
@@ -79,8 +80,8 @@ jobs:
           fi
 
   nightly-test-eval-vlm-models:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 2-gpu-runner
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -97,8 +98,8 @@ jobs:
 
 
   nightly-test-perf-vlm-models:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 2-gpu-runner
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -107,25 +108,35 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
           apt-get install rsync -y
+          apt install git-lfs
 
       - name: Run perf test for VLM models (MMMU)
         timeout-minutes: 240
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/mickqian/SGLang-test-nightly/main/traces/${{ github.run_id }}
+          TRACE_BASE_URL: https://huggingface.co/Miiiick/ci-data/resolve/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
           rm -rf test/srt/performance_profiles_vlms/
           cd test/srt
           python3 test_nightly_vlm_models_perf.py
 
-      - name: Checkout storage repo (SGLang-test-nightly)
-        uses: actions/checkout@v4
-        with:
-          repository: mickqian/SGLang-test-nightly
-          token: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
-          path: nightly-storage
+#      - name: Checkout storage repo (Hugging Face)
+#        uses: actions/checkout@v4
+#        with:
+#          repository: Miiiick/ci-data
+#          token: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
+#          path: nightly-storage
+
+      - name: Checkout storage repo (Hugging Face)
+        run: |
+          git lfs install
+          git lfs track "*.gz"
+          git clone https://huggingface.co/Miiiick/ci-data nightly-storage
+          # git -C nightly-storage config --unset-all http.https://huggingface.co/.extraHeader || true
 
       - name: Publish traces to storage repo
+        env:
+          HF_TOKEN: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
         run: |
           mkdir -p nightly-storage/traces/${{ github.run_id }}
           if [ -d test/srt/performance_profiles_vlms ]; then
@@ -137,7 +148,7 @@ jobs:
           if [ -n "$(git status --porcelain)" ]; then
             git add .
             git commit -m "Nightly traces for run ${{ github.run_id }} at ${{ github.run_number }}"
-            git push origin HEAD:main
+            git push https://github-actions[bot]:$HF_TOKEN@huggingface.co/Miiiick/ci-data main
           else
             echo "No changes to commit"
           fi

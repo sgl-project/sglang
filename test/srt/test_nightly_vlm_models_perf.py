@@ -22,8 +22,8 @@ PROFILE_DIR = "performance_profiles_vlms"
 MODEL_DEFAULTS = [
     # Keep conservative defaults. Can be overridden by env NIGHTLY_VLM_MODELS
     "Qwen/Qwen2.5-VL-7B-Instruct",
-    "google/gemma-3-27b-it",
-    "OpenGVLab/InternVL2_5-2B",
+    # "google/gemma-3-27b-it",
+    # "OpenGVLab/InternVL2_5-2B",
     # buggy in official transformers impl
     # "openbmb/MiniCPM-V-2_6",
 ]

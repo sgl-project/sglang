@@ -27,7 +27,7 @@ MODEL_THRESHOLDS = {
     ModelDeploySetup("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(0.330, 22.3),
     ModelDeploySetup("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 22.1),
     ModelDeploySetup("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.280, 23.2),
-    ModelDeploySetup("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 13.7),
+    ModelDeploySetup("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 14.0),
     ModelDeploySetup("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.320, 74.7),
     ModelDeploySetup("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.340, 31.9),
     ModelDeploySetup("unsloth/Mistral-Small-3.1-24B-Instruct-2503"): ModelEvalMetrics(
