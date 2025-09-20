@@ -1183,7 +1183,9 @@ class ModelRunner:
             return iter
 
         def model_load_weights(model, iter):
-            DefaultModelLoader.load_weights_and_postprocess(model, iter, device_config.device)
+            DefaultModelLoader.load_weights_and_postprocess(
+                model, iter, device_config.device
+            )
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
