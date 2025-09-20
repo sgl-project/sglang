@@ -55,7 +55,12 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tp_active_ranks,
+    get_tp_active_ranks_cpu,
+    get_world_group,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hf_transformers_utils import (
     get_processor,
@@ -2160,9 +2165,12 @@ class Scheduler(
         if disable_overlap_schedule:
             group = tp_group.device_group
             device = tp_group.device
+            torch.distributed.barrier(group=tp_group.cpu_group)
+            tp_active_ranks = get_tp_active_ranks()
         else:
             group = tp_group.cpu_group
             device = "cpu"
+            tp_active_ranks = get_tp_active_ranks_cpu()
 
         local_info = torch.tensor(
             [
@@ -2186,6 +2194,11 @@ class Scheduler(
             global_info.flatten(),
             local_info,
             group=group,
+        )
+        global_info.view(-1, 6)[tp_active_ranks == 0, :] = torch.tensor(
+            [0, 1, 0, 0, 1, ForwardMode.IDLE.value],
+            device=global_info.device,
+            dtype=global_info.dtype,
         )
         global_num_tokens = global_info[:, 0, 0].tolist()
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
