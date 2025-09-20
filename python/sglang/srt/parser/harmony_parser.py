@@ -133,6 +133,10 @@ class CanonicalStrategy:
             "<|call|>",
             "<|return|>",
         ]
+        self.tool_extract_pattern = re.compile(
+            r"commentary to=([a-zA-Z_][a-zA-Z0-9_.]*)\s*(<\|constrain\|>json)?$",
+            re.DOTALL,
+        )
 
     def parse(self, text: str) -> Tuple[List[Event], str]:
         events = []
@@ -318,10 +322,18 @@ class CanonicalStrategy:
             while end_pos < len(tokens) and tokens[end_pos].type != "RETURN":
                 end_pos += 1
         elif channel_type == "analysis":
-            while end_pos < len(tokens) and tokens[end_pos].type not in ("END", "CALL"):
+            while end_pos < len(tokens) and tokens[end_pos].type not in (
+                "END",
+                "CALL",
+                "RETURN",
+            ):
                 end_pos += 1
         else:  # commentary
-            while end_pos < len(tokens) and tokens[end_pos].type not in ("END", "CALL"):
+            while end_pos < len(tokens) and tokens[end_pos].type not in (
+                "END",
+                "CALL",
+                "RETURN",
+            ):
                 end_pos += 1
 
         if end_pos >= len(tokens):
@@ -344,7 +356,7 @@ class CanonicalStrategy:
             else:
                 return Event("reasoning", content), end_pos + 1
         elif channel_type == "commentary":
-            if end_token.type == "CALL":
+            if self.tool_extract_pattern.match(channel_header):
                 raw_text = text[tokens[start_pos].start : end_token.end]
                 return Event("tool_call", content.strip(), raw_text), end_pos + 1
             else:
