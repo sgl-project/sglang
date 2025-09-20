@@ -595,15 +595,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let app_context = Arc::new(app_context);
 
-    // Initialize workers before creating routers
-    // This separates worker lifecycle from router lifecycle
     info!(
         "Initializing workers for routing mode: {:?}",
         config.router_config.mode
     );
-    WorkerInitializer::initialize_workers(&config.router_config, &app_context.worker_registry)
-        .await
-        .map_err(|e| format!("Failed to initialize workers: {}", e))?;
+    WorkerInitializer::initialize_workers(
+        &config.router_config,
+        &app_context.worker_registry,
+        Some(&app_context.policy_registry),
+    )
+    .await
+    .map_err(|e| format!("Failed to initialize workers: {}", e))?;
 
     let worker_stats = app_context.worker_registry.stats();
     info!(
