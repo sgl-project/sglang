@@ -37,7 +37,7 @@ _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 
 
 
 if _is_cuda:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -282,19 +282,11 @@ class TritonRunnerCore(MoeRunnerCore):
                     out=out_hidden_states,
                 ).squeeze(dim=1)
             else:
-                # According to micro benchmark results, torch.compile can get better performance for small token.
-                if M <= 32:
-                    moe_sum_reduce_torch_compile(
-                        intermediate_cache3.view(*intermediate_cache3.shape),
-                        out_hidden_states,
-                        routed_scaling_factor,
-                    )
-                else:
-                    moe_sum_reduce_triton(
-                        intermediate_cache3.view(*intermediate_cache3.shape),
-                        out_hidden_states,
-                        routed_scaling_factor,
-                    )
+                moe_sum_reduce(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states,
+                    routed_scaling_factor,
+                )
         elif _is_hip:
             if _use_aiter:
                 moe_sum(
