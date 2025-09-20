@@ -54,7 +54,7 @@ class SchedulerOutputProcessorMixin:
 
             if self.enable_overlap:
                 logits_output, next_token_ids, _ = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
+                    self.tp_worker.resolve_last_batch_result(None)
                 )
             else:
                 # Move next_token_ids and logprobs to cpu
@@ -196,6 +196,8 @@ class SchedulerOutputProcessorMixin:
                     req.is_chunked -= 1
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        if self.is_generation and self.enable_overlap and launch_done is not None:
+            launch_done.wait()
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -212,7 +214,7 @@ class SchedulerOutputProcessorMixin:
 
         if self.enable_overlap:
             logits_output, next_token_ids, can_run_cuda_graph = (
-                self.tp_worker.resolve_last_batch_result(launch_done)
+                self.tp_worker.resolve_last_batch_result(None)
             )
             next_token_logprobs = logits_output.next_token_logprobs
         elif batch.spec_algorithm.is_none():
@@ -300,6 +302,8 @@ class SchedulerOutputProcessorMixin:
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+        if self.enable_overlap and launch_done is not None:
+            launch_done.wait()
 
     def add_input_logprob_return_values(
         self: Scheduler,
