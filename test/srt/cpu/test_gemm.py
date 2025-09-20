@@ -31,6 +31,7 @@ class TestGemm(CustomTestCase):
     N = [16, 32 * 13]
     K = [32 * 16]
     has_bias = [False, True]
+    dim = [2, 3, 4, 5]
 
     M_int8 = [2, 128]
     N_int8 = [32 * 12]
@@ -40,10 +41,16 @@ class TestGemm(CustomTestCase):
     N_fp8 = [128, 224]
     K_fp8 = [512, 576]
 
-    def _bf16_gemm(self, M, N, K, has_bias):
+    def _bf16_gemm(self, M, N, K, has_bias, dim):
 
         mat1 = torch.randn(M, K, dtype=torch.bfloat16)
         mat2 = torch.randn(N, K, dtype=torch.bfloat16)
+        if dim == 3:
+            mat1 = mat1.unsqueeze(0).repeat(2, 1, 1)
+        if dim == 4:
+            mat1 = mat1.unsqueeze(0).unsqueeze(0).repeat(2, 2, 1, 1)
+        if dim == 5:
+            mat1 = mat1.unsqueeze(0).unsqueeze(0).unsqueeze(0).repeat(2, 2, 2, 1, 1)
 
         ref = torch.matmul(mat1.float(), mat2.float().t())
         if has_bias:
@@ -71,12 +78,14 @@ class TestGemm(CustomTestCase):
             self.N,
             self.K,
             self.has_bias,
+            self.dim,
         ):
             with self.subTest(
                 M=params[0],
                 N=params[1],
                 K=params[2],
                 has_bias=params[3],
+                dim=params[4],
             ):
                 self._bf16_gemm(*params)
 
