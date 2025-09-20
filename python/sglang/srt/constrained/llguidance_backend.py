@@ -32,6 +32,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+from sglang.srt.constrained.utils import is_legacy_structural_tag
 
 logger = logging.getLogger(__name__)
 
@@ -154,9 +155,10 @@ class GuidanceBackend(BaseGrammarBackend):
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
 
-    def dispatch_structural_tag(self, key_string: str) -> Optional[GuidanceGrammar]:
+    def dispatch_structural_tag(self, key_string: str) -> Optional[BaseGrammarObject]:
         try:
             structural_tag = json.loads(key_string)
+            assert is_legacy_structural_tag(structural_tag)
             tags = [
                 StructTag(
                     begin=structure["begin"],

@@ -41,6 +41,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
+    from sglang.srt.entrypoints.openai.protocol import ToolCallConstraint
     from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -381,7 +382,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         request: ChatCompletionRequest,
         stop: List[str],
-        tool_call_constraint: Optional[Any],
+        tool_call_constraint: Optional[ToolCallConstraint],
     ) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
 
@@ -432,6 +433,8 @@ class OpenAIServingChat(OpenAIServingBase):
         elif tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
+                if TYPE_CHECKING:
+                    assert not isinstance(constraint_value, str)
                 sampling_params[constraint_type] = convert_json_schema_to_str(
                     constraint_value.model_dump(by_alias=True)
                 )
