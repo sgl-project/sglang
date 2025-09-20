@@ -164,7 +164,7 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 else:
-    from vllm._custom_ops import awq_dequantize
+    pass
 
 if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
