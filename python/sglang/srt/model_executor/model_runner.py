@@ -1173,6 +1173,7 @@ class ModelRunner:
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
         loader = get_model_loader(load_config)
+        target_device = torch.device(self.device)
         device_config = DeviceConfig(self.device, self.gpu_id)
 
         def get_weight_iter(config):
