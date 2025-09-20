@@ -37,6 +37,8 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromCkptEngineReqInput,
+    UpdateWeightsFromCkptEngineReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
@@ -352,6 +354,14 @@ class TpModelWorker:
                 recv_req.serialized_named_tensors[self.tp_rank]
             ),
             load_format=recv_req.load_format,
+        )
+        return success, message
+
+    def update_weights_from_ckpt_engine(
+        self, recv_req: UpdateWeightsFromCkptEngineReqInput
+    ):
+        success, message = self.model_runner.update_weights_from_ckpt_engine(
+            recv_req.model_path, recv_req.load_format
         )
         return success, message
 
