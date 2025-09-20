@@ -435,18 +435,16 @@ class ForwardBatch:
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            if isinstance(batch.extend_seq_lens, list):
-                ret.extend_seq_lens = torch.tensor(
-                    batch.extend_seq_lens, dtype=torch.int32
-                ).to(device, non_blocking=True)
-            else:
-                ret.extend_seq_lens = batch.extend_seq_lens
-            if isinstance(batch.extend_prefix_lens, list):
-                ret.extend_prefix_lens = torch.tensor(
-                    batch.extend_prefix_lens, dtype=torch.int32
-                ).to(device, non_blocking=True)
-            else:
-                ret.extend_prefix_lens = batch.extend_prefix_lens
+            # NOTE(lsyin): make sure the ModelWorkerBatch's extend_seq_lens and extend_prefix_lens are always on CPU
+            # Other wise sync would happen during launching triton kernel
+            assert isinstance(batch.extend_seq_lens, list)
+            assert isinstance(batch.extend_prefix_lens, list)
+            ret.extend_seq_lens = torch.tensor(
+                batch.extend_seq_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
+            ret.extend_prefix_lens = torch.tensor(
+                batch.extend_prefix_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,

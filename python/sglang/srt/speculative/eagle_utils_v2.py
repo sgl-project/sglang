@@ -137,8 +137,8 @@ class EagleDraftInput:
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
         batch.seq_lens_sum += extend_num_tokens
-        batch.extend_seq_lens = torch.full_like(batch.seq_lens, num_draft_tokens)
-        batch.extend_prefix_lens = seq_lens_backup
+        batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
+        batch.extend_prefix_lens = seq_lens_cpu_backup.tolist()
         batch.extend_prefix_lens_cpu = seq_lens_cpu_backup
         batch.extend_num_tokens = extend_num_tokens
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
