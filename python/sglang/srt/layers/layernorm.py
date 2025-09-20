@@ -14,7 +14,6 @@
 """Fused operators for normalization layers."""
 
 import logging
-import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -81,7 +80,7 @@ class RMSNorm(CustomOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
-        if os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] == "1":
+        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
             self._forward_method = self.forward_native
 
     def forward_cuda(
