@@ -1,10 +1,8 @@
-# Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable, List, Optional
+from typing import Any, Callable, Optional, cast
 
 import torch
-from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
 from sglang.srt.layers.parameter import (
@@ -12,30 +10,42 @@ from sglang.srt.layers.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
-)
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
+from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
-__all__ = ["CompressedTensorsW8A8Fp8"]
+__all__ = ["QuarkW8A8Fp8"]
 
+_is_fp8_fnuz = is_fp8_fnuz()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
 
-class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
+class QuarkW8A8Fp8(QuarkScheme):
 
-    def __init__(self, strategy: str, is_static_input_scheme: bool):
-        self.strategy = strategy
-        self.is_static_input_scheme = is_static_input_scheme
+    def __init__(
+        self, weight_config: dict[str, Any], input_config: Optional[dict[str, Any]]
+    ):
+        self.cutlass_fp8_supported = cutlass_fp8_supported()
+        self.weight_qscheme = cast(str, weight_config.get("qscheme"))
+        self.is_static_input_scheme: bool = False
+        self.input_qscheme: Optional[str] = None
+        if input_config is not None:
+            self.is_static_input_scheme = not cast(bool, input_config.get("is_dynamic"))
+            self.input_qscheme = cast(str, input_config.get("qscheme"))
+
+        self.per_token = (
+            not self.is_static_input_scheme and self.input_qscheme == "per_channel"
+        )
+        self.out_dtype = torch.get_default_dtype()
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -46,32 +56,35 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         # If per tensor, when we have a fused module (e.g. QKV) with per
         # tensor scales (thus N scales being passed to the kernel),
         # requantize so we can always run per tensor
-        if self.strategy == QuantizationStrategy.TENSOR:
-            max_w_scale, weight = requantize_with_max_scale(
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                logical_widths=layer.logical_widths,
-            )
-
-            if is_fp8_fnuz():
+        if self.weight_qscheme == "per_tensor":
+            if _is_fp8_fnuz:
                 input_scale = getattr(layer, "input_scale", None)
-
                 weight, max_w_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight, weight_scale=max_w_scale, input_scale=input_scale
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    input_scale=input_scale,
                 )
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
+            else:
+                max_w_scale = layer.weight_scale
+                weight = layer.weight
+
+            max_w_scale, weight = requantize_with_max_scale(
+                weight=weight,
+                weight_scale=max_w_scale,
+                logical_widths=layer.logical_widths,
+            )
 
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
 
         # If channelwise, scales are already lined up, so just transpose.
-        elif self.strategy == QuantizationStrategy.CHANNEL:
+        elif self.weight_qscheme == "per_channel":
             weight = layer.weight
 
-            if is_fp8_fnuz():
+            if _is_fp8_fnuz:
                 input_scale = getattr(layer, "input_scale", None)
-
                 weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
                     weight=weight,
                     weight_scale=layer.weight_scale,
@@ -81,22 +94,22 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
             else:
                 weight_scale = layer.weight_scale.data
-
+            if self.per_token:
+                weight_scale = weight_scale.view(-1, 1)
             if _use_aiter:
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)).t(), requires_grad=False
                 )
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
-
             # required by torch.compile to be torch.nn.Parameter
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
         else:
-            raise ValueError(f"Unknown quantization strategy {self.strategy}")
+            raise ValueError(f"Unknown quantization scheme {self.weight_qscheme}")
 
         # INPUT SCALE
-        if self.is_static_input_scheme and hasattr(layer, "input_scale"):
+        if self.is_static_input_scheme:
             layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         else:
             layer.input_scale = None
@@ -104,7 +117,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
     def create_weights(
         self,
         layer: torch.nn.Module,
-        output_partition_sizes: List[int],
+        output_partition_sizes: list[int],
         input_size_per_partition: int,
         params_dtype: torch.dtype,
         weight_loader: Callable,
@@ -127,20 +140,19 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         layer.register_parameter("weight", weight)
 
         # WEIGHT SCALE
-        # TODO: update create_xxx_parameter functions to return
-        # the newly added parameters
-        if self.strategy == QuantizationStrategy.CHANNEL:
+        if self.weight_qscheme == "per_channel":
             weight_scale = ChannelQuantScaleParameter(
-                data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
+                data=torch.empty((sum(output_partition_sizes)), dtype=torch.float32),
                 output_dim=0,
                 weight_loader=weight_loader,
             )
         else:
-            assert self.strategy == QuantizationStrategy.TENSOR
+            assert self.weight_qscheme == "per_tensor"
             weight_scale = PerTensorScaleParameter(
                 data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
                 weight_loader=weight_loader,
             )
+            set_weight_attrs(weight_scale, {"needs_scalar_to_array": True})
 
         # min requirement for fp8 kernels
         weight_scale[:] = torch.finfo(torch.float32).min
@@ -153,6 +165,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 weight_loader=weight_loader,
             )
             input_scale[:] = torch.finfo(torch.float32).min
+            set_weight_attrs(input_scale, {"needs_scalar_to_array": True})
             layer.register_parameter("input_scale", input_scale)
 
     def apply_weights(
@@ -161,12 +174,13 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+
         return apply_fp8_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
+            x,
+            layer.weight,
+            layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
-            use_per_token_if_dynamic=True,
-            compressed_tensor_quant=True,
+            cutlass_fp8_supported=self.cutlass_fp8_supported,
+            use_per_token_if_dynamic=self.per_token,
         )

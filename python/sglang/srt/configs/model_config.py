@@ -506,6 +506,7 @@ class ModelConfig:
             "qoq",
             "w4afp8",
             "petit_nvfp4",
+            "quark",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
