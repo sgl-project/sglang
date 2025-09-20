@@ -16,7 +16,7 @@
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, TypeAlias, Union
+from typing import Any, Dict, List, Optional, Tuple, TypeAlias, Union
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -34,6 +34,7 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
+from xgrammar.structural_tag import StructuralTag
 
 DEFAULT_MODEL_NAME = "default"
 
@@ -121,10 +122,15 @@ class StructuresResponseFormat(BaseModel):
     end: str
 
 
-class StructuralTagResponseFormat(BaseModel):
+class LegacyStructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
     structures: List[StructuresResponseFormat]
     triggers: List[str]
+
+
+StructuralTagResponseFormat: TypeAlias = Union[
+    StructuralTag, LegacyStructuralTagResponseFormat
+]
 
 
 class FileRequest(BaseModel):
@@ -900,6 +906,12 @@ class RequestResponseMetadata(BaseModel):
     final_usage_info: Optional[UsageInfo] = None
 
 
+ToolCallConstraint: TypeAlias = Union[
+    Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
+    Tuple[Literal["ebnf"], str],
+]
+
+
 @dataclass
 class MessageProcessingResult:
     """Result of processing chat messages and applying templates.
@@ -925,7 +937,7 @@ class MessageProcessingResult:
     video_data: Optional[Any]
     modalities: List[str]
     stop: List[str]
-    tool_call_constraint: Optional[Any] = None
+    tool_call_constraint: Optional[ToolCallConstraint] = None
 
 
 class ResponseReasoningTextContent(BaseModel):
