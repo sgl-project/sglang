@@ -1,6 +1,5 @@
 import logging
-
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -118,15 +117,13 @@ class Sampler(nn.Module):
                             check_nan=self.use_nan_detection,
                         )
                 elif global_server_args_dict["sampling_backend"] == "pytorch":
-                    batch_next_token_ids = (
-                        top_k_top_p_min_p_sampling_from_probs_torch(
-                            probs,
-                            sampling_info.top_ks,
-                            sampling_info.top_ps,
-                            sampling_info.min_ps,
-                            sampling_info.need_min_p_sampling,
-                            sampling_info.sampling_seed,
-                        )
+                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probs,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        sampling_info.min_ps,
+                        sampling_info.need_min_p_sampling,
+                        sampling_info.sampling_seed,
                     )
                 else:
                     raise ValueError(
@@ -192,6 +189,7 @@ class Sampler(nn.Module):
         Optimized for prefill-only scoring requests that need token probabilities
         but don't require next token generation.
         """
+
         if logits_output.next_token_logits is None:
             logger.warning("No logits available for logprob computation")
             return
@@ -237,7 +235,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 ):
     """
     A top-k, top-p and min-p sampling implementation with native pytorch operations.
-    When sampling_seed is not None, deterministic inference will be enabled, it will sample 
+    When sampling_seed is not None, deterministic inference will be enabled, it will sample
     with the sampling_seed of each request, which is a slower fallback implementation.
     """
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
