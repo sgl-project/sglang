@@ -13,6 +13,8 @@ class TestFile:
 
 suites = {
     "per-commit": [
+        TestFile("compilation/fusion/passes/test_fused_activation.py", 30),
+        TestFile("compilation/fusion/triton_ops/test_triton_fused_swiglu.py", 60),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
