@@ -105,7 +105,7 @@ from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import broadcast_weight, default_weight_loader
 from sglang.srt.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -1077,18 +1077,12 @@ class ModelRunner:
                 target_dtype = (
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
-                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
-                    )
-                )
+                weight = torch.empty(1, dtype=target_dtype, device=self.device)
+                weight._fake = True
+                weight._original_shape = shape
+                weight._group = self._model_update_group[group_name]
+                weight._hook_func = broadcast_weight.__get__(weight, torch.Tensor)
                 weights.append((name, weight))
-            for handle in handles:
-                handle.wait()
 
             self.model.load_weights(weights)
             return True, f"Succeeded to update parameter online."
