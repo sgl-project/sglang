@@ -25,6 +25,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     LogProbs,
     MessageProcessingResult,
     ToolCall,
+    ToolCallProcessingResult,
+    ToolChoice,
     TopLogprob,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -34,6 +36,8 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.utils import get_json_schema_constraint
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -73,6 +77,27 @@ class OpenAIServingChat(OpenAIServingBase):
             and not request.tools
         ):
             return "Tools cannot be empty if tool choice is set to required."
+
+        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
+            if not request.tools:
+                return "Tools cannot be empty if tool choice is set to a specific tool."
+            tool_name = request.tool_choice.function.name
+            tool_exists = any(tool.function.name == tool_name for tool in request.tools)
+            if not tool_exists:
+                return f"Tool '{tool_name}' not found in tools list."
+
+        # Validate tool definitions
+        if request.tools:
+            for i, tool in enumerate(request.tools):
+                if not hasattr(tool, "function") or not tool.function:
+                    return f"Tool {i} is missing required 'function' field."
+                if not hasattr(tool.function, "name") or not tool.function.name:
+                    return f"Tool {i} function is missing required 'name' field."
+                if (
+                    not hasattr(tool.function, "parameters")
+                    or tool.function.parameters is None
+                ):
+                    return f"Tool {i} function is missing required 'parameters' field."
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
@@ -188,6 +213,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice
                 )
+            # Handle JSON schema constraint directly for required or named tool choice
+            if (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ToolChoice)
+                or (
+                    isinstance(request.tool_choice, dict)
+                    and "function" in request.tool_choice
+                )
+            ):
+                json_schema = get_json_schema_constraint(
+                    request.tools, request.tool_choice
+                )
+                tool_call_constraint = ("json_schema", json_schema)
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -434,6 +472,10 @@ class OpenAIServingChat(OpenAIServingBase):
             if constraint_type == "structural_tag":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
                     constraint_value.model_dump(by_alias=True)
+                )
+            elif constraint_type == "json_schema":
+                sampling_params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value
                 )
             else:
                 sampling_params[constraint_type] = constraint_value
@@ -749,7 +791,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 and self.tool_call_parser
             ):
                 tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, finish_reason
+                    text,
+                    request.tools,
+                    finish_reason,
+                    request.tool_choice,
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -839,47 +884,80 @@ class OpenAIServingChat(OpenAIServingBase):
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
         return ChoiceLogprobs(content=token_logprobs)
 
+    def _get_tool_id(self, name: str, index: int) -> str:
+        if self.tool_call_parser == "kimi_k2" and name is not None:
+            return f"functions.{name}:{index}"
+        else:
+            return f"call_{uuid.uuid4().hex[:24]}"
+
     def _process_tool_calls(
         self,
         text: str,
         tools: List[Any],
         finish_reason: Dict[str, Any],
-    ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
+        tool_choice: Optional[Union[str, ToolChoice]] = None,
+    ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
-        parser = FunctionCallParser(tools, self.tool_call_parser)
-        if parser.has_tool_call(text):
+
+        # Handle required or named tool choice
+        if tool_choice == "required" or (
+            isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
+        ):
+            # Set finish reason to tool_calls since we're processing tool calls
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
+
+            try:
+                # For required tool choice, we expect a JSON array of tool calls
+                tool_call_data = json.loads(text)
+                tool_calls = []
+                for i, tool in enumerate(tool_call_data):
+                    tool_calls.append(
+                        ToolCall(
+                            id=self._get_tool_id(tool.get("name"), i),
+                            index=i,
+                            function=FunctionResponse(
+                                name=tool["name"],
+                                arguments=json.dumps(
+                                    tool["parameters"], ensure_ascii=False
+                                ),
+                            ),
+                        )
+                    )
+                return ToolCallProcessingResult(tool_calls, "", finish_reason)
+            except json.JSONDecodeError as e:
+                logger.error(f"Tool call parsing error: {e}")
+                return ToolCallProcessingResult(None, text, finish_reason)
+
+        # Use parser since output is not constrained by JSON schema
+        parser = FunctionCallParser(tools, self.tool_call_parser)
+        if parser.has_tool_call(text):
+            # Set finish reason to tool_calls since we detected tool calls
+            if finish_reason["type"] == "stop":
+                finish_reason["type"] = "tool_calls"
+                finish_reason["matched"] = None
+
             try:
                 text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = []
                 for call_info in call_info_list:
-                    # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
-                    if (
-                        self.tool_call_parser == "kimi_k2"
-                        and call_info.name is not None
-                    ):
-                        tool_id = f"functions.{call_info.name}:{call_info.tool_index}"
-                    else:
-                        tool_id = f"call_{uuid.uuid4().hex[:24]}"
-
                     tool_calls.append(
                         ToolCall(
-                            id=tool_id,
+                            id=self._get_tool_id(call_info.name, call_info.tool_index),
                             index=getattr(call_info, "tool_index", None),
                             function=FunctionResponse(
                                 name=call_info.name, arguments=call_info.parameters
                             ),
                         )
                     )
-                return tool_calls, text, finish_reason
+                return ToolCallProcessingResult(tool_calls, text, finish_reason)
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
                 # Return error but don't fail the whole request
-                return None, text, finish_reason
+                return ToolCallProcessingResult(None, text, finish_reason)
 
-        return None, text, finish_reason
+        return ToolCallProcessingResult(None, text, finish_reason)
 
     def _process_streaming_logprobs(
         self, content: Dict[str, Any], n_prev_token: int
@@ -952,13 +1030,31 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
-            parser_dict[index] = FunctionCallParser(
-                tools=request.tools,
-                tool_call_parser=self.tool_call_parser,
-            )
+            # Use JSON detector directly for required or named tool choice
+            if (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ToolChoice)
+                or (
+                    isinstance(request.tool_choice, dict)
+                    and "function" in request.tool_choice
+                )
+            ):
+                # Store JsonArrayParser directly for JSON schema constraints
+                parser_dict[index] = JsonArrayParser()
+            else:
+                parser_dict[index] = FunctionCallParser(
+                    tools=request.tools,
+                    tool_call_parser=self.tool_call_parser,
+                )
+
         parser = parser_dict[index]
 
-        normal_text, calls = parser.parse_stream_chunk(delta)
+        # Handle both FunctionCallParser and JsonArrayParser
+        if isinstance(parser, JsonArrayParser):
+            result = parser.parse_streaming_increment(delta, request.tools)
+            normal_text, calls = result.normal_text, result.calls
+        else:
+            normal_text, calls = parser.parse_stream_chunk(delta)
 
         # Yield normal text
         if normal_text:
@@ -1018,7 +1114,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _check_for_unstreamed_tool_args(
         self,
-        parser: FunctionCallParser,
+        parser: Union[FunctionCallParser, JsonArrayParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         index: int,
@@ -1028,30 +1124,31 @@ class OpenAIServingChat(OpenAIServingBase):
         when generation finishes. This ensures tool calls are properly completed
         even if the model generates the final arguments in the last chunk.
         """
-        # Only check if we have tool calls and the parser has tracked data
+        # Get the detector - either from FunctionCallParser or directly if json detector
+        detector = parser.detector if hasattr(parser, "detector") else parser
+
+        # Only check if we have tool calls and the detector has tracked data
         if (
-            not hasattr(parser.detector, "prev_tool_call_arr")
-            or not parser.detector.prev_tool_call_arr
+            not hasattr(detector, "prev_tool_call_arr")
+            or not detector.prev_tool_call_arr
         ):
             return None
 
         if (
-            not hasattr(parser.detector, "streamed_args_for_tool")
-            or not parser.detector.streamed_args_for_tool
+            not hasattr(detector, "streamed_args_for_tool")
+            or not detector.streamed_args_for_tool
         ):
             return None
 
         # Get the last tool call that was being processed
-        tool_index = len(parser.detector.prev_tool_call_arr) - 1
-        if tool_index < 0 or tool_index >= len(parser.detector.streamed_args_for_tool):
+        tool_index = len(detector.prev_tool_call_arr) - 1
+        if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
             return None
 
         # Get expected vs actual arguments
-        expected_args = parser.detector.prev_tool_call_arr[tool_index].get(
-            "arguments", {}
-        )
+        expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
         expected_call = json.dumps(expected_args, ensure_ascii=False)
-        actual_call = parser.detector.streamed_args_for_tool[tool_index]
+        actual_call = detector.streamed_args_for_tool[tool_index]
 
         # Check if there are remaining arguments to send
         remaining_call = (
