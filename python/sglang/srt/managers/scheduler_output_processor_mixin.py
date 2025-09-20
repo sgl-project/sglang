@@ -36,7 +36,6 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        launch_done: Optional[threading.Event] = None,
     ):
         skip_stream_req = None
 
@@ -202,7 +201,6 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-        launch_done: Optional[threading.Event] = None,
     ):
         logits_output, next_token_ids, can_run_cuda_graph, copy_done = (
             result.logits_output,

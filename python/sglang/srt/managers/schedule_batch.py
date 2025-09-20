@@ -879,9 +879,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    # Events
-    launch_done: Optional[threading.Event] = None
-
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
 
@@ -1883,7 +1880,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else CaptureHiddenMode.NULL
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            launch_done=self.launch_done,
             req_to_token_pool=self.req_to_token_pool,
             is_prefill_only=self.is_prefill_only,
         )
@@ -2024,9 +2020,6 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
-
-    # Overlap event
-    launch_done: Optional[threading.Event] = None
 
     # Other scheduling info (TODO: remove or reorganize them after finish spec refactor)
     req_to_token_pool: ReqToTokenPool = None

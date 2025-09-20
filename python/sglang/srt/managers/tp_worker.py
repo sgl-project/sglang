@@ -236,7 +236,6 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: Union[ForwardBatch, ModelWorkerBatch],
-        launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
         skip_attn_backend_init=False,
     ) -> ForwardBatchOutput:
@@ -259,8 +258,6 @@ class TpModelWorker:
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
-            if launch_done is not None:
-                launch_done.set()
 
             if skip_sample:
                 next_token_ids = None

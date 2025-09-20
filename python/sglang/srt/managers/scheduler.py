@@ -141,14 +141,12 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.lora_radix_cache import LoRARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatchOutput,
     ForwardMode,
@@ -1016,7 +1014,6 @@ class Scheduler(
                     trace_event("schedule", req.rid)
 
             if batch:
-                batch.launch_done = threading.Event()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
@@ -1028,7 +1025,7 @@ class Scheduler(
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.cur_sampling_info,
                     )
-                    self.process_batch_result(tmp_batch, None, batch.launch_done)
+                    self.process_batch_result(tmp_batch, None)
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -1036,10 +1033,7 @@ class Scheduler(
                 tmp_batch.next_batch_sampling_info = (
                     self.cur_sampling_info if batch else None
                 )
-                # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
-                self.process_batch_result(
-                    tmp_batch, tmp_result, batch.launch_done if batch else None
-                )
+                self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -2215,10 +2209,9 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result, launch_done)
+            self.process_batch_result_decode(batch, result)
             for req in batch.reqs:
                 trace_slice(
                     "decode loop",
@@ -2228,7 +2221,7 @@ class Scheduler(
                 )
 
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result, launch_done)
+            self.process_batch_result_prefill(batch, result)
             for req in batch.reqs:
                 trace_slice(
                     "prefill",
@@ -2238,7 +2231,7 @@ class Scheduler(
                 )
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self.tp_worker.resolve_last_batch_result(launch_done)
+                self.tp_worker.resolve_last_batch_result()
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
