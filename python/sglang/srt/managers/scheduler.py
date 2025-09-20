@@ -1670,6 +1670,21 @@ class Scheduler(
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()
 
+    def _check_kv_indices_leak_for_radix(self, token_msg):
+        total_kv_indices = set(range(1, self.max_total_num_tokens + 1))
+        cached_kv_indices = set(self.tree_cache.cached_kv_indices())
+        available_kv_indices = set(self.token_to_kv_pool_allocator.free_pages.tolist())
+
+        kv_indices_leak = total_kv_indices != (cached_kv_indices | available_kv_indices)
+        missing_kv_indices = total_kv_indices - (
+            cached_kv_indices | available_kv_indices
+        )
+
+        if kv_indices_leak:
+            token_msg += f"{len(total_kv_indices)=}, {len(cached_kv_indices)=}, {len(available_kv_indices)=}, {len(missing_kv_indices)=}, {total_kv_indices=}, {cached_kv_indices=}, {available_kv_indices=}, {missing_kv_indices=}\n"
+
+        return token_msg
+
     def check_memory(self):
         if self.is_hybrid:
             (
@@ -1691,19 +1706,6 @@ class Scheduler(
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
 
-            total_kv_indices = set(range(1, self.max_total_num_tokens + 1))
-            cached_kv_indices = set(self.tree_cache.cached_kv_indices())
-            available_kv_indices = set(
-                self.token_to_kv_pool_allocator.free_pages.tolist()
-            )
-
-            kv_indices_leak = total_kv_indices != (
-                cached_kv_indices | available_kv_indices
-            )
-            missing_kv_indices = total_kv_indices - (
-                cached_kv_indices | available_kv_indices
-            )
-
             memory_leak = (available_size + evictable_size) != (
                 # self.max_total_num_tokens
                 # if not self.enable_hierarchical_cache
@@ -1711,10 +1713,10 @@ class Scheduler(
                 self.max_total_num_tokens
                 if not self.enable_hierarchical_cache
                 else self.max_total_num_tokens - protected_size
-            ) or kv_indices_leak
-            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {kv_indices_leak=}\n"
-            if kv_indices_leak:
-                token_msg += f"{len(total_kv_indices)=}, {len(cached_kv_indices)=}, {len(available_kv_indices)=}, {len(missing_kv_indices)=}, {total_kv_indices=}, {cached_kv_indices=}, {available_kv_indices=}, {missing_kv_indices=}\n"
+            )
+            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+            if isinstance(self.tree_cache, RadixCache):
+                token_msg = self._check_kv_indices_leak_for_radix(token_msg)
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
