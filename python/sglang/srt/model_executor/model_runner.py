@@ -24,7 +24,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import requests
@@ -47,6 +47,7 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.elastic_ep.elastic_ep import get_elastic_ep_state
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -216,6 +217,7 @@ class ModelRunner:
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
+        self.dist_backend = server_args.dist_backend
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -619,16 +621,17 @@ class ModelRunner:
             )
             raise
 
-        if self.device == "cuda":
-            backend = "nccl"
-        elif self.device == "xpu":
-            backend = "xccl"
-        elif self.device == "hpu":
-            backend = "hccl"
-        elif self.device == "cpu":
-            backend = "gloo"
-        elif self.device == "npu":
-            backend = "hccl"
+        if self.dist_backend is None:
+            if self.device == "cuda":
+                self.dist_backend = "nccl"
+            elif self.device == "xpu":
+                self.dist_backend = "xccl"
+            elif self.device == "hpu":
+                self.dist_backend = "hccl"
+            elif self.device == "cpu":
+                self.dist_backend = "gloo"
+            elif self.device == "npu":
+                self.dist_backend = "hccl"
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
@@ -662,7 +665,7 @@ class ModelRunner:
 
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
-                backend=backend,
+                backend=self.dist_backend,
                 world_size=self.tp_size * self.pp_size,
                 rank=self.tp_size * self.pp_rank + self.tp_rank,
                 local_rank=self.gpu_id,
@@ -819,33 +822,56 @@ class ModelRunner:
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
-        # Handle the case where some ranks do not finish loading.
-        try:
-            dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
-        except RuntimeError:
-            raise ValueError(
-                f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-            ) from None
+        if "mooncake" in self.dist_backend:
+            # Mooncake does not support `monitored_barrier`
+            dist.barrier(group=get_tp_group().cpu_group)
+        else:
+            # Handle the case where some ranks do not finish loading.
+            try:
+                dist.monitored_barrier(
+                    group=get_tp_group().cpu_group,
+                    timeout=datetime.timedelta(
+                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
+                    ),
+                    wait_all_ranks=True,
+                )
+            except RuntimeError:
+                raise ValueError(
+                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+                ) from None
 
     def update_expert_location(
         self,
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        self.expert_location_updater.update(
-            self.model.routed_experts_weights_of_layer,
-            new_expert_location_metadata,
-            update_layer_ids=update_layer_ids,
-            nnodes=self.server_args.nnodes,
-            rank=self.tp_rank,
-        )
+        if get_elastic_ep_state().using_elastic_ep:
+            # TODO: refactor the weights update when elastic ep
+            old_expert_location_metadata = get_global_expert_location_metadata()
+            assert old_expert_location_metadata is not None
+            old_expert_location_metadata.update(
+                new_expert_location_metadata,
+                update_layer_ids=update_layer_ids,
+            )
+            self.update_weights_from_disk(
+                self.server_args.model_path,
+                self.server_args.load_format,
+                lambda name: "mlp.experts" in name and "mlp.shared_experts" not in name,
+            )
+        else:
+            self.expert_location_updater.update(
+                self.model.routed_experts_weights_of_layer,
+                new_expert_location_metadata,
+                update_layer_ids=update_layer_ids,
+                nnodes=self.server_args.nnodes,
+                rank=self.tp_rank,
+            )
 
     def update_weights_from_disk(
-        self, model_path: str, load_format: str
+        self,
+        model_path: str,
+        load_format: str,
+        weight_name_filter: Optional[Callable[[str], bool]] = None,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -867,6 +893,11 @@ class ModelRunner:
             iter = loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(config, self.model)
             )
+            if weight_name_filter is not None:
+                iter = (
+                    (name, weight) for name, weight in iter if weight_name_filter(name)
+                )
+
             return iter
 
         def model_load_weights(model, iter):
@@ -1937,6 +1968,7 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ):
+
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
