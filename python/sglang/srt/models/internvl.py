@@ -651,19 +651,46 @@ class InternVLChatModel(nn.Module):
                     param = params_dict[name]
                     if "wqkv" in name:
                         config = self.config
-                        kv_groups = (
-                            config.num_attention_heads // config.num_key_value_heads
+                        hidden_size = config.hidden_size
+                        num_heads = config.num_attention_heads
+                        num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
+                        head_size = hidden_size // num_heads
+                        kv_groups = num_heads // num_kv_heads
+
+                        quantization_config = getattr(
+                            config, "quantization_config", None
                         )
-                        head_dim = config.hidden_size // config.num_attention_heads
-                        loaded_weight = loaded_weight.view(
-                            -1, 2 + kv_groups, head_dim, loaded_weight.shape[-1]
+                        is_awq = (
+                            quantization_config
+                            and quantization_config.get("quant_method") == "awq"
                         )
-                        wq, wk, wv = torch.split(
-                            loaded_weight, [kv_groups, 1, 1], dim=1
-                        )
-                        wq = wq.reshape(-1, wq.shape[-1])
-                        wk = wk.reshape(-1, wk.shape[-1])
-                        wv = wv.reshape(-1, wv.shape[-1])
+
+                        if is_awq:
+                            if "scales" in name:
+                                loaded_weight = loaded_weight.unflatten(
+                                    1, (num_kv_heads, -1, head_size)
+                                )
+                            else:  # qweight and qzeros
+                                elem_per_int = 32 // quantization_config["bits"]
+                                loaded_weight = loaded_weight.unflatten(
+                                    1, (num_kv_heads, -1, head_size // elem_per_int)
+                                )
+
+                            wq = loaded_weight[:, :, :-2].flatten(1, 3)
+                            wk = loaded_weight[:, :, -2].flatten(1, 2)
+                            wv = loaded_weight[:, :, -1].flatten(1, 2)
+
+                        else:
+                            loaded_weight = loaded_weight.view(
+                                -1, 2 + kv_groups, head_size, loaded_weight.shape[-1]
+                            )
+                            wq, wk, wv = torch.split(
+                                loaded_weight, [kv_groups, 1, 1], dim=1
+                            )
+                            wq = wq.reshape(-1, wq.shape[-1])
+                            wk = wk.reshape(-1, wk.shape[-1])
+                            wv = wv.reshape(-1, wv.shape[-1])
+
                         weight_loader = param.weight_loader
                         weight_loader(param, wq, "q")
                         weight_loader(param, wk, "k")
