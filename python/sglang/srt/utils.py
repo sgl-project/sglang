@@ -20,6 +20,7 @@ import asyncio
 import builtins
 import ctypes
 import dataclasses
+import enum
 import functools
 import importlib
 import io
@@ -469,6 +470,11 @@ class LayerFn(Protocol):
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
 
 
+class LayerBlockType(enum.Enum):
+    attention = "attention"
+    mamba = "mamba"
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
@@ -477,7 +483,7 @@ def make_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Dict[str, Any] = {},
-) -> Tuple[int, int, torch.nn.ModuleList]:
+) -> Tuple[int, int, torch.nn.ModuleList] | torch.nn.ModuleList:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices

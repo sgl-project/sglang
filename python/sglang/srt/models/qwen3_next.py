@@ -830,6 +830,8 @@ class Qwen3NextModel(nn.Module):
                 alt_stream=alt_stream,
             )
 
+        print(config.num_hidden_layers)
+
         self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
