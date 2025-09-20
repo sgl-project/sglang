@@ -488,6 +488,7 @@ class MHATokenToKVPool(KVCache):
                 np.prod(x.shape[1:]) * x.dtype.itemsize
                 for x in self.k_buffer + self.v_buffer
             ],
+            dtype=torch.int32,
             device=self.device,
         )
 
