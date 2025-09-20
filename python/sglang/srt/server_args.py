@@ -192,6 +192,7 @@ class ServerArgs:
 
     # Runtime options
     device: Optional[str] = None
+    dist_backend: Literal[None, "mooncake"] = None
     tp_size: int = 1
     pp_size: int = 1
     max_micro_batch_size: Optional[int] = None
@@ -299,7 +300,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake"] = "none"
     moe_runner_backend: Literal[
         "auto",
         "triton",
@@ -740,6 +741,12 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.moe_a2a_backend == "mooncake":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -1313,6 +1320,13 @@ class ServerArgs:
             help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
+            "--dist-backend",
+            type=str,
+            default=ServerArgs.dist_backend,
+            choices=["mooncake"],
+            help="Use 'mooncake' to support fault-tolerant communication. Defaults to auto-detection if not specified.",
+        )
+        parser.add_argument(
             "--tensor-parallel-size",
             "--tp-size",
             type=int,
@@ -1876,7 +1890,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep"],
+            choices=["none", "deepep", "mooncake"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
