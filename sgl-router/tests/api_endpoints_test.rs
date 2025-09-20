@@ -101,6 +101,14 @@ impl TestContext {
         // Create app context
         let app_context = common::create_test_context(config.clone());
 
+        // Initialize workers in the registry before creating router
+        if !worker_urls.is_empty() {
+            use sglang_router_rs::routers::WorkerInitializer;
+            WorkerInitializer::initialize_workers(&config, &app_context.worker_registry)
+                .await
+                .expect("Failed to initialize workers");
+        }
+
         // Create router
         let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
