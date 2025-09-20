@@ -191,6 +191,7 @@ suite_amd = {
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
+        TestFile("models/test_vlm_models.py", 437),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("openai_server/basic/test_protocol.py", 10),
         TestFile("openai_server/basic/test_serving_chat.py", 10),
@@ -221,6 +222,7 @@ suite_amd = {
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
+        TestFile("test_harmony_parser.py", 20),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
@@ -246,6 +248,7 @@ suite_amd = {
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_triton_attention_backend.py", 150),
+        TestFile("test_triton_sliding_window.py", 250),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_wave_attention_kernels.py", 2),
         TestFile("test_wave_attention_backend.py", 150),
@@ -266,6 +269,8 @@ suite_amd = {
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
+        TestFile("test_disaggregation_different_tp.py", 155),
+        TestFile("test_disaggregation_pp.py", 60),
     ],
     "nightly-amd": [
         TestFile("test_nightly_gsm8k_eval_amd.py"),
