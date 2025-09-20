@@ -94,7 +94,21 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
-        self.split_tile_size = model_runner.server_args.triton_attention_split_tile_size
+
+        # Decide whether enable deterministic inference with batch-invariant operations
+        self.enable_deterministic = (
+            model_runner.server_args.enable_deterministic_inference
+        )
+
+        # Configure deterministic inference settings
+        if self.enable_deterministic:
+            # Use fixed split tile size for batch invariance
+            self.split_tile_size = 256  # Default value for deterministic mode
+            # Set static_kv_splits to False to use deterministic logic instead
+            self.static_kv_splits = False
+        else:
+            self.split_tile_size = model_runner.server_args.triton_attention_split_tile_size
+
         if self.split_tile_size is not None:
             self.max_kv_splits = (
                 self.max_context_len + self.split_tile_size - 1
@@ -172,37 +186,12 @@ class TritonAttnBackend(AttentionBackend):
             num_group * num_seq == num_token
         ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
 
-        # For deterministic inference, always use fixed split tile size
-        # This ensures batch invariance - same sequence length always gets same split count
-        if self.enable_deterministic and self.split_tile_size is not None:
-            # num_kv_splits[:] = (
-            #     seq_lens + self.split_tile_size - 1
-            # ) // self.split_tile_size
-            # return
-            
-            # Expend seq_lens to match num_token
-            if num_group > 1:
-                # For speculative decoding, repeat seq_lens for each group
-                expanded_seq_lens = seq_lens.repeat_interleave(num_group)
-            else:
-                expanded_seq_lens = seq_lens
-            
-            num_kv_splits[:] = (
-                expanded_seq_lens + self.split_tile_size - 1
-            ) // self.split_tile_size
-            return
-
         # Legacy dynamic splitting logic (non-deterministic)
         if self.static_kv_splits or self.device_core_count <= 0:
             num_kv_splits.fill_(self.max_kv_splits)
             return
 
         if self.split_tile_size is not None:
-            # num_kv_splits[:] = (
-            #     seq_lens + self.split_tile_size - 1
-            # ) // self.split_tile_size
-            # return
-            
             # expand seq_lens to match num_token 
             if num_group > 1:
                 expanded_seq_lens = seq_lens.repeat_interleave(num_group)
