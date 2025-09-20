@@ -88,10 +88,10 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromCkptEngineReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
-    UpdateWeightsFromCkptEngineReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
@@ -793,11 +793,16 @@ async def update_weights_from_distributed(
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
+
 @app.post("/update_weights_from_ckpt_engine")
-async def update_weights_from_ckpt_engine(obj: UpdateWeightsFromCkptEngineReqInput, request: Request):
+async def update_weights_from_ckpt_engine(
+    obj: UpdateWeightsFromCkptEngineReqInput, request: Request
+):
     """Update the weights from disk inplace without re-launching the server."""
     success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_ckpt_engine(obj, request)
+        await _global_state.tokenizer_manager.update_weights_from_ckpt_engine(
+            obj, request
+        )
     )
 
     # Update weight version if provided and weights update was successful

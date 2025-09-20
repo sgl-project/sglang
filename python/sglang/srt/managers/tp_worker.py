@@ -37,10 +37,10 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromCkptEngineReqInput,
     UpdateWeightsFromCkptEngineReqOutput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -357,7 +357,9 @@ class TpModelWorker:
         )
         return success, message
 
-    def update_weights_from_ckpt_engine(self, recv_req: UpdateWeightsFromCkptEngineReqInput):
+    def update_weights_from_ckpt_engine(
+        self, recv_req: UpdateWeightsFromCkptEngineReqInput
+    ):
         success, message = self.model_runner.update_weights_from_ckpt_engine(
             recv_req.model_path, recv_req.load_format
         )

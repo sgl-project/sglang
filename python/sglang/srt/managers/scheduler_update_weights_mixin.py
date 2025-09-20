@@ -17,12 +17,12 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromCkptEngineReqInput,
+    UpdateWeightsFromCkptEngineReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    UpdateWeightsFromCkptEngineReqInput,
-    UpdateWeightsFromCkptEngineReqOutput,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,9 @@ class SchedulerUpdateWeightsMixin:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
-    def update_weights_from_ckpt_engine(self, recv_req: UpdateWeightsFromCkptEngineReqInput):
+    def update_weights_from_ckpt_engine(
+        self, recv_req: UpdateWeightsFromCkptEngineReqInput
+    ):
         """Update the online model parameter from tensors."""
         success, message = self.tp_worker.update_weights_from_ckpt_engine(recv_req)
         if success:

@@ -21,6 +21,7 @@ from typing import (
 import fastapi
 import zmq
 
+from sglang.srt.configs.load_config import LoadFormat
 from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -59,17 +60,16 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateWeightsFromCkptEngineReqInput,
+    UpdateWeightsFromCkptEngineReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    UpdateWeightsFromCkptEngineReqInput,
-    UpdateWeightsFromCkptEngineReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
-from sglang.srt.configs.load_config import LoadFormat
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -414,7 +414,9 @@ class TokenizerCommunicatorMixin:
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:
-                result = (await self.update_weights_from_ckpt_engine_communicator(obj))[0]
+                result = (await self.update_weights_from_ckpt_engine_communicator(obj))[
+                    0
+                ]
                 return result.success, result.message
 
     async def init_weights_send_group_for_remote_instance(

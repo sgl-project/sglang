@@ -1047,12 +1047,14 @@ class UpdateWeightsFromCkptEngineReqInput:
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
 
+
 @dataclass
 class UpdateWeightsFromCkptEngineReqOutput:
     success: bool
     message: str
     # Number of paused requests during weight sync.
     num_paused_requests: Optional[int] = 0
+
 
 @dataclass
 class InitWeightsSendGroupForRemoteInstanceReqInput:

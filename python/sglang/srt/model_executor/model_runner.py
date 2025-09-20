@@ -186,6 +186,7 @@ def add_mla_attention_backend(backend_name):
         MLA_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
 
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1223,7 +1224,9 @@ class ModelRunner:
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                model = loader.load_model(model_config=self.model_config, device_config=device_config)
+                model = loader.load_model(
+                    model_config=self.model_config, device_config=device_config
+                )
             except Exception as e:
                 message = (
                     f"Failed to update weights: {e}.\nRolling back to original weights."
@@ -1241,7 +1244,6 @@ class ModelRunner:
 
         logger.info("Update weights from ckpt engine end.")
         return True, "Succeeded to update model weights."
-
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100
