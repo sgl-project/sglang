@@ -19,8 +19,10 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,7 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
@@ -52,9 +55,12 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _update_inputs(self, seq_lens):
-        self.graphs[self.bs].update(
-            cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
-        )
+        if self.use_mla:
+            self.graphs[self.bs].update(
+                cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
+            )
+        else:
+            self.graphs[self.bs].update(cpu_update_input=[{"context_lens": seq_lens}])
 
     def _cache_loc_dtype(self):
         return torch.int32
@@ -74,7 +80,11 @@ class NPUGraphRunner(CudaGraphRunner):
 
         # Replay
         seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
-        thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
+        if self.use_mla:
+            actual_seq_len_kv = seq_lens
+        else:
+            actual_seq_len_kv = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+        thread = threading.Thread(target=self._update_inputs, args=(actual_seq_len_kv,))
         thread.start()
         self.graphs[self.bs].replay()
         thread.join()

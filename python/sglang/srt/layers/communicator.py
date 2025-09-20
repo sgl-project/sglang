@@ -50,6 +50,7 @@ from sglang.srt.utils import (
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
+    prepare_weight_cache,
 )
 
 _is_flashinfer_available = is_flashinfer_available()
@@ -275,7 +276,11 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
+        cache=None,
     ):
+        if cache is not None:
+            self._context.cache = cache
+
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -349,6 +354,7 @@ class CommunicateContext:
     attn_tp_size: int
     attn_dp_size: int
     tp_size: int
+    cache = None
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -533,6 +539,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if context.cache is not None:
+                    _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
