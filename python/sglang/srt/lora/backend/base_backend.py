@@ -140,14 +140,9 @@ def get_backend_from_name(name: str) -> BaseLoRABackend:
     Get corresponding backend class from backend's name
     """
     if name == "triton":
-        # from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+        from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 
-        # return TritonLoRABackend
-
-        # FIXME: Hack to trigger CI, remove before merging.
-        from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
-
-        return ChunkedSgmvLoRABackend
+        return TritonLoRABackend
     elif name == "csgmv":
         from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 
