@@ -104,7 +104,7 @@ class TritonAttnBackend(AttentionBackend):
         # Configure deterministic inference settings
         if self.enable_deterministic:
             # Use fixed split tile size for batch invariance
-            self.split_tile_size = envs.SGLANG_TRITON_DETERMINISTIC_SPLIT_TILE_SIZE  # Using default value for deterministic mode
+            self.split_tile_size = envs.SGLANG_TRITON_DETERMINISTIC_SPLIT_TILE_SIZE.get() # Using default value for deterministic mode
             # Set static_kv_splits to False to use deterministic logic instead
             self.static_kv_splits = False
         else:
