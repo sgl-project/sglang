@@ -60,6 +60,11 @@ def run_eval(args):
         from sglang.test.simple_eval_humaneval import HumanEval
 
         eval_obj = HumanEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "mmmu":
+        # VLM MMMU evaluation with fixed 100 examples by default
+        from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
+
+        eval_obj = MMMUVLMEval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
@@ -94,6 +99,8 @@ def run_eval(args):
     print(f"Total latency: {latency:.3f} s")
     print(f"Score: {metrics['score']:.3f}")
 
+    if getattr(args, "return_latency", False):
+        return metrics, latency
     return metrics
 
 

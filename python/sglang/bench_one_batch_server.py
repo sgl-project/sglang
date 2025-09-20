@@ -24,7 +24,11 @@ from typing import List, Tuple
 import numpy as np
 import requests
 
-from sglang.bench_serving import get_tokenizer, sample_random_requests
+from sglang.bench_serving import (
+    get_tokenizer,
+    sample_mmmu_requests,
+    sample_random_requests,
+)
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -50,8 +54,10 @@ class BenchArgs:
     profile: bool = False
     profile_steps: int = 3
     profile_by_stage: bool = False
+    profile_filename_prefix: str = None
     dataset_path: str = ""
     parallel_batch: bool = False
+    dataset_name: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -67,6 +73,13 @@ class BenchArgs:
             "--output-len", type=int, nargs="+", default=BenchArgs.output_len
         )
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
+        parser.add_argument(
+            "--dataset-name",
+            type=str,
+            default="",
+            choices=["mmmu"],
+            help="Name of the dataset to benchmark on.",
+        )
         parser.add_argument("--return-logprob", action="store_true")
         parser.add_argument(
             "--client-stream-interval",
@@ -96,14 +109,24 @@ class BenchArgs:
             help="Path to the dataset.",
         )
         parser.add_argument("--parallel-batch", action="store_true")
+        parser.add_argument(
+            "--profile-filename-prefix",
+            type=str,
+            default=BenchArgs.profile_filename_prefix,
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to cast the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        return cls(
-            **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
-        )
+        kwargs = {}
+        for attr, attr_type in attrs:
+            val = getattr(args, attr)
+            if attr_type is type(None):
+                kwargs[attr] = val
+            else:
+                kwargs[attr] = attr_type(val)
+        return cls(**kwargs)
 
 
 def launch_server_internal(server_args):
@@ -148,23 +171,35 @@ def run_one_case(
     run_name: str,
     result_filename: str,
     tokenizer,
+    dataset_name="",
     profile: bool = False,
     profile_steps: int = 3,
     profile_by_stage: bool = False,
+    profile_filename_prefix: str = None,
     dataset_path: str = "",
     parallel_batch: bool = False,
 ):
     requests.post(url + "/flush_cache")
-    input_requests = sample_random_requests(
-        input_len=input_len,
-        output_len=output_len,
-        num_prompts=batch_size,
-        range_ratio=1.0,
-        tokenizer=tokenizer,
-        dataset_path=dataset_path,
-        random_sample=True,
-        return_text=False,
-    )
+    # TODO: reuse bench_serving.get_dataset ?
+    if dataset_name == "mmmu":
+        input_requests = sample_mmmu_requests(
+            num_requests=batch_size,
+            tokenizer=tokenizer,
+            fixed_output_len=output_len,
+            apply_chat_template=True,
+            random_sample=True,
+        )
+    else:
+        input_requests = sample_random_requests(
+            input_len=input_len,
+            output_len=output_len,
+            num_prompts=batch_size,
+            range_ratio=1.0,
+            tokenizer=tokenizer,
+            dataset_path=dataset_path,
+            random_sample=True,
+            return_text=False,
+        )
 
     use_structured_outputs = False
     if use_structured_outputs:
@@ -181,26 +216,48 @@ def run_one_case(
 
     profile_link = None
     if profile:
+        output_dir, profile_name = None, None
+        if profile_filename_prefix:
+            output_dir = os.path.dirname(profile_filename_prefix)
+            profile_name = os.path.basename(profile_filename_prefix)
         profile_link: str = run_profile(
-            url, profile_steps, ["CPU", "GPU"], None, None, profile_by_stage
+            url,
+            profile_steps,
+            ["CPU", "GPU"],
+            output_dir,
+            profile_name,
+            profile_by_stage,
         )
 
     tic = time.perf_counter()
+
+    payload = {
+        "sampling_params": {
+            "temperature": temperature,
+            "max_new_tokens": output_len,
+            "ignore_eos": True,
+            "json_schema": json_schema,
+            "stream_interval": stream_interval,
+        },
+        "return_logprob": return_logprob,
+        "stream": True,
+        **({"parallel_batch": parallel_batch} if parallel_batch else {}),
+    }
+    if dataset_name == "mmmu":
+        # vlm
+        input_ids = []
+        for input_req in input_requests:
+            input_ids += [tokenizer.encode(input_req.prompt)]
+        payload["image_data"] = [req.image_data for req in input_requests]
+
+    else:
+        input_ids = [req.prompt for req in input_requests]
+
+    payload["input_ids"] = input_ids
+
     response = requests.post(
         url + "/generate",
-        json={
-            "input_ids": [req.prompt for req in input_requests],
-            "sampling_params": {
-                "temperature": temperature,
-                "max_new_tokens": output_len,
-                "ignore_eos": True,
-                "json_schema": json_schema,
-                "stream_interval": stream_interval,
-            },
-            "return_logprob": return_logprob,
-            "stream": True,
-            **({"parallel_batch": parallel_batch} if parallel_batch else {}),
-        },
+        json=payload,
         stream=True,
     )
 
@@ -264,7 +321,7 @@ def run_one_case(
         overall_throughput,
         last_gen_throughput,
         acc_length,
-        profile_link if profile else None,
+        profile_link,
     )
 
 
@@ -333,7 +390,9 @@ def get_report_summary(
     return summary
 
 
-def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
+def run_benchmark(
+    server_args: ServerArgs, bench_args: BenchArgs, append_to_summary: bool = True
+):
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
     else:
@@ -358,6 +417,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             return_logprob=bench_args.return_logprob,
             stream_interval=bench_args.client_stream_interval,
             input_len_step_percentage=bench_args.input_len_step_percentage,
+            dataset_name=bench_args.dataset_name,
             run_name="",
             result_filename="",
             tokenizer=tokenizer,
@@ -384,10 +444,12 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     stream_interval=bench_args.client_stream_interval,
                     input_len_step_percentage=bench_args.input_len_step_percentage,
                     run_name=bench_args.run_name,
+                    dataset_name=bench_args.dataset_name,
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
                     dataset_path=bench_args.dataset_path,
                     parallel_batch=bench_args.parallel_batch,
+                    profile_filename_prefix=bench_args.profile_filename_prefix,
                 )
             )
 
@@ -410,11 +472,13 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 run_name=bench_args.run_name,
                                 result_filename=bench_args.result_filename,
                                 tokenizer=tokenizer,
+                                dataset_name=bench_args.dataset_name,
                                 profile=bench_args.profile,
                                 profile_steps=bench_args.profile_steps,
                                 profile_by_stage=bench_args.profile_by_stage,
                                 dataset_path=bench_args.dataset_path,
                                 parallel_batch=bench_args.parallel_batch,
+                                profile_filename_prefix=bench_args.profile_filename_prefix,
                             )[-1],
                         )
                     )
@@ -433,7 +497,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     summary = get_report_summary(result, server_args, bench_args)
     print(summary)
 
-    if is_in_ci():
+    if is_in_ci() and append_to_summary:
         write_github_step_summary(summary)
 
 
@@ -449,7 +513,7 @@ def main():
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 
-    run_benchmark(server_args, bench_args)
+    run_benchmark(server_args, bench_args, append_to_summary=False)
 
 
 if __name__ == "__main__":

@@ -14,10 +14,12 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from urllib.parse import quote
 
 import aiohttp
 import numpy as np
@@ -1467,3 +1469,211 @@ def dump_bench_raw_result(
 def _ensure_remove_suffix(text: str, suffix: str):
     assert text.endswith(suffix)
     return text.removesuffix(suffix)
+
+
+class ModelDeploySetup:
+    def __init__(self, model_path: str, extra_args: List[str] = []):
+        self.model_path = model_path
+        if "--enable-multimodal" not in extra_args:
+            extra_args.append("--enable-multimodal")
+        self.extra_args = extra_args
+
+
+class ModelEvalMetrics:
+    def __init__(self, accuracy: float, eval_time: float):
+        self.accuracy = accuracy
+        self.eval_time = eval_time
+
+
+# results are from `bench_one_batch_server.py`
+def generate_markdown_report_nightly(model, results, input_len, output_len):
+    summary = f"### {model}\n"
+    summary += f"Input lens: {input_len}. Output lens: {output_len}.\n"
+    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile |\n"
+    summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
+
+    base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
+
+    # Optional: a relay page that fetches the trace and postMessages it to Perfetto UI.
+    # See: https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui
+    relay_base = os.getenv("PERFETTO_RELAY_URL", "").rstrip("/")
+    for result in results:
+        # Extract the metrics row that bench_one_batch_server prints (without the profile column)
+        metrics = re.search(
+            r"\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*(?:n/a|[\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|",
+            result["output"],
+        )
+
+        filenames = result.get("trace_links")
+        print(f"{filenames=}")
+
+        filenames_iter = iter(filenames)
+        if metrics:
+            for line in result["output"].splitlines():
+                # for line in metrics.group(0).splitlines():
+                if (
+                    line.startswith("|")
+                    and "batch size" not in line
+                    and "--" not in line
+                ):
+                    # find the data lines
+                    # Reconstruct the row and append a placeholder artifact link for profile
+                    parts = [part.strip() for part in line.split("|") if part.strip()]
+
+                    print(f"{line=}")
+                    try:
+                        raw_link = f"{base_url}/{next(filenames_iter)}"
+
+                        # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
+                        relay_link = (
+                            f"{relay_base}?src={quote(raw_link, safe='')}"
+                            if quote
+                            else f"{relay_base}?src={raw_link}"
+                        )
+                    except StopIteration as e:
+                        relay_link = None
+                        pass
+
+                    if relay_link:
+                        row = f"| {' | '.join(parts[:-1])} | [trace]({relay_link}) |\n"
+                    else:
+                        row = f"| {' | '.join(parts[:-1])} | NA | \n"
+
+                    summary += row
+    return summary
+
+
+def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:
+    match = re.search(r"\[Profile\]\((.*?)\)", output)
+    if match:
+        trace_link = match.group(1)
+        return trace_link
+    return None
+
+
+def parse_models(model_string: str):
+    return [model.strip() for model in model_string.split(",") if model.strip()]
+
+
+def check_model_scores(
+    results,
+    test_name,
+    model_accuracy_thresholds,
+    model_latency_thresholds=None,
+    model_count=None,
+):
+    """
+    results: list of tuple of (model_path, accuracy, latency)
+    """
+    failed_models = []
+    if model_latency_thresholds is not None:
+        summary = " | model | status | score | score_threshold | latency | latency_threshold | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | \n"
+    else:
+        summary = " | model | status | score | score_threshold | \n"
+        summary += "| ----- | ------ | ----- | --------------- | \n"
+
+    for model, accuracy, latency in results:
+        accuracy_threshold = model_accuracy_thresholds.get(model)
+        if accuracy_threshold is None:
+            print(f"Warning: No threshold defined for model {model}")
+            continue
+
+        latency_threshold = (
+            model_latency_thresholds.get(model, None)
+            if model_latency_thresholds
+            else 1e9
+        )
+
+        is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
+        status_emoji = "✅" if is_success else "❌"
+
+        if not is_success:
+            failed_models.append(
+                f"\nScore Check Failed: {model}\n"
+                f"Model {model} score ({accuracy:.4f}) is below threshold ({accuracy_threshold:.4f})"
+            )
+
+        if model_latency_thresholds is not None:
+            line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold}\n"
+        else:
+            line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold}\n"
+
+        summary += line
+
+    print(summary)
+
+    if is_in_ci():
+        write_github_step_summary(f"## {test_name}\n{summary}")
+
+    some_model_failed_to_get_result = len(results) != (
+        model_count or len(model_accuracy_thresholds)
+    )
+    if failed_models or some_model_failed_to_get_result:
+        raise AssertionError("\n".join(failed_models))
+
+
+# Bench knobs for bench_one_batch_server (override by env)
+def _parse_int_list_env(name: str, default_val: str):
+    val = os.environ.get(name, default_val)
+    return [int(x) for x in val.split(",") if x]
+
+
+# Return filenames
+def find_traces_under_path(path: str) -> List[str]:
+    results = []
+    for _, dirs, files in os.walk(path):
+        for file in files:
+            if file.endswith(".trace.json.gz"):
+                results.append(f"{file}")
+    return results
+
+
+def _extra_args_for_model(extra_args=[]):
+    args = ["--trust-remote-code", "--cuda-graph-max-bs", "4", "--enable-multimodal"]
+    if extra_args:
+        args.extend(extra_args)
+    return args
+
+
+def popen_launch_server_wrapper(
+    base_url: str, model: str, profile_dir: str = "", extra_args=[]
+):
+    other_args = _extra_args_for_model(extra_args)
+    env = os.environ.copy()
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+        env=env,
+    )
+    return process
+
+
+def write_results_to_json(model, metrics, mode="a"):
+    result = {
+        "timestamp": datetime.now().isoformat(),
+        "model": model,
+        "metrics": metrics,
+        "score": metrics["score"],
+    }
+
+    if "latency" in metrics:
+        result["latency"] = (metrics.get("latency"),)
+
+    existing_results = []
+    if mode == "a" and os.path.exists("results.json"):
+        try:
+            with open("results.json", "r") as f:
+                existing_results = json.load(f)
+        except json.JSONDecodeError:
+            existing_results = []
+
+    if isinstance(existing_results, list):
+        existing_results.append(result)
+    else:
+        existing_results = [result]
+
+    with open("results.json", "w") as f:
+        json.dump(existing_results, f, indent=2)
