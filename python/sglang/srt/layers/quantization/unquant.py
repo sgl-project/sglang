@@ -83,8 +83,37 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         return F.embedding(input_, layer.weight)
 
 
-class UnquantizedLinearMethod(LinearMethodBase):
+class UnquantizedLinearMethod(LinearMethodBase, CustomOp):
     """Linear method without quantization."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward_cuda(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return F.linear(x, layer.weight, bias)
+
+    def forward_cpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            x_shapes = x.shape
+            if len(x_shapes) == 3:
+                x = x.view(-1, x.shape[-1])
+            output = torch.ops.sgl_kernel.weight_packed_linear(
+                x, layer.weight, bias, True
+            )
+            if len(x_shapes) == 3:
+                output = output.view(x_shapes[0], x_shapes[1], -1)
+            return output
+        return F.linear(x, layer.weight, bias)
 
     def create_weights(
         self,
@@ -118,19 +147,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        return self.forward(layer=layer, x=x, bias=bias)
 
-        if use_intel_amx_backend(layer):
-            x_shapes = x.shape
-            if len(x_shapes) == 3:
-                x = x.view(-1, x.shape[-1])
-            output = torch.ops.sgl_kernel.weight_packed_linear(
-                x, layer.weight, bias, True  # is_vnni
-            )
-            if len(x_shapes) == 3:
-                output = output.view(x_shapes[0], x_shapes[1], -1)
-            return output
-
-        return F.linear(x, layer.weight, bias)
+    forward_native = forward_cpu
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
