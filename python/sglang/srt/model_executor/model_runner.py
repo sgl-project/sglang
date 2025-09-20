@@ -1183,7 +1183,7 @@ class ModelRunner:
             return iter
 
         def model_load_weights(model, iter):
-            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
+            DefaultModelLoader.load_weights_and_postprocess(model, iter, device_config.device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -1195,7 +1195,6 @@ class ModelRunner:
                 message = (
                     f"Failed to update weights: {e}.\nRolling back to original weights."
                 )
-                del iter
                 gc.collect()
                 iter = get_weight_iter(self.model_config)
                 self.model = model_load_weights(self.model, iter)
