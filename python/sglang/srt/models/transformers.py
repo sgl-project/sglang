@@ -164,7 +164,6 @@ class TransformersForCausalLM(nn.Module):
 
         # Attention modifications (assumes 1 attention op per hidden layer)
         tp_size = get_tensor_model_parallel_world_size()
-        self.tp_size = tp_size
 
         # MLP modifications
         self.tensor_parallel(tp_size)
