@@ -190,3 +190,10 @@ def create_hybrid_linear_attn_backend(runner):
     return HybridLinearAttnBackend(
         full_attn_backend, linear_attn_backend, full_attn_layers
     )
+
+
+@register_attention_backend("intel_xpu")
+def create_intel_xpu_backend(runner):
+    from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+    return XPUAttentionBackend(runner)

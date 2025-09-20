@@ -141,6 +141,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     parse_connector_type,
     set_cuda_arch,
+    xpu_has_xmx_support,
 )
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -169,6 +170,7 @@ def add_mla_attention_backend(backend_name):
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_xpu_xmx_available = xpu_has_xmx_support()
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -465,6 +467,16 @@ class ModelRunner:
                 "The current platform does not support Intel AMX, will fallback to torch_native backend."
             )
             server_args.attention_backend = "torch_native"
+
+        if (
+            server_args.attention_backend == "intel_xpu"
+            and server_args.device == "xpu"
+            and not _is_xpu_xmx_available
+        ):
+            logger.info(
+                "The current platform does not support Intel XMX, will fallback to triton backend."
+            )
+            server_args.attention_backend = "triton"
 
         if server_args.prefill_attention_backend is not None and (
             server_args.prefill_attention_backend
