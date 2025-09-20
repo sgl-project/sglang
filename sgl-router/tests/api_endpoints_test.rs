@@ -104,7 +104,7 @@ impl TestContext {
         // Initialize workers in the registry before creating router
         if !worker_urls.is_empty() {
             use sglang_router_rs::routers::WorkerInitializer;
-            WorkerInitializer::initialize_workers(&config, &app_context.worker_registry)
+            WorkerInitializer::initialize_workers(&config, &app_context.worker_registry, None)
                 .await
                 .expect("Failed to initialize workers");
         }

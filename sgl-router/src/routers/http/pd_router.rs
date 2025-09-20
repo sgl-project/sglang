@@ -232,18 +232,12 @@ impl PDRouter {
 
         // Notify PolicyRegistry about the new worker
         let model_id = worker_arc.model_id();
-        let policy = self.policy_registry.on_worker_added(model_id, None);
+        self.policy_registry.on_worker_added(model_id, None);
 
-        // If this is a cache-aware policy, update it with all workers for this model
-        if policy.name() == "cache_aware" {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                cache_aware.init_workers(&model_workers);
-            }
-        }
+        // Initialize cache-aware policy if applicable
+        let model_workers = self.worker_registry.get_by_model_fast(model_id);
+        self.policy_registry
+            .init_cache_aware_policy(model_id, &model_workers);
 
         info!("Added prefill server: {}", url);
         Ok(format!("Successfully added prefill server: {}", url))
@@ -272,18 +266,12 @@ impl PDRouter {
 
         // Notify PolicyRegistry about the new worker
         let model_id = worker_arc.model_id();
-        let policy = self.policy_registry.on_worker_added(model_id, None);
+        self.policy_registry.on_worker_added(model_id, None);
 
-        // If this is a cache-aware policy, update it with all workers for this model
-        if policy.name() == "cache_aware" {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                cache_aware.init_workers(&model_workers);
-            }
-        }
+        // Initialize cache-aware policy if applicable
+        let model_workers = self.worker_registry.get_by_model_fast(model_id);
+        self.policy_registry
+            .init_cache_aware_policy(model_id, &model_workers);
 
         info!("Added decode server: {}", url);
         Ok(format!("Successfully added decode server: {}", url))
@@ -307,17 +295,9 @@ impl PDRouter {
             // Notify PolicyRegistry about the removed worker
             self.policy_registry.on_worker_removed(&model_id);
 
-            // Get the policy for this model to update cache-aware if needed
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy
-                        .as_any()
-                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                    {
-                        cache_aware.remove_worker_by_url(url);
-                    }
-                }
-            }
+            // Remove from cache-aware policy if applicable
+            self.policy_registry
+                .remove_worker_from_cache_aware(&model_id, url);
         }
 
         if removed.is_some() {
@@ -348,17 +328,9 @@ impl PDRouter {
             // Notify PolicyRegistry about the removed worker
             self.policy_registry.on_worker_removed(&model_id);
 
-            // Get the policy for this model to update cache-aware if needed
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy
-                        .as_any()
-                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                    {
-                        cache_aware.remove_worker_by_url(url);
-                    }
-                }
-            }
+            // Remove from cache-aware policy if applicable
+            self.policy_registry
+                .remove_worker_from_cache_aware(&model_id, url);
         }
 
         if removed.is_some() {
@@ -2225,15 +2197,6 @@ mod tests {
         let prefill_workers = router.worker_registry.get_prefill_workers();
         assert_eq!(prefill_workers.len(), 1);
     }
-
-    // ============= Bootstrap Injection Tests =============
-    // Note: These tests are commented out as we've moved to the optimized bootstrap injection
-    // approach that doesn't use the Bootstrap trait on GenerateReqInput anymore.
-
-    // TODO: Add new tests for the optimized bootstrap injection approach using
-    // RequestWithBootstrap and BatchRequestWithBootstrap wrappers
-
-    // ============= Worker Selection Tests =============
 
     #[tokio::test]
     async fn test_select_healthy_prefill_worker() {
