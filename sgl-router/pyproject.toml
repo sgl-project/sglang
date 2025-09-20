@@ -27,6 +27,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "requests>=2.25.0",
+    "kubernetes>=18.0.0",
 ]
 
 
