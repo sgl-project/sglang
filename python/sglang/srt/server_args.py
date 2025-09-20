@@ -149,6 +149,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     tokenizer_worker_num: int = 1
+    detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -1043,6 +1044,18 @@ class ServerArgs:
             help="The path of the tokenizer.",
         )
         parser.add_argument(
+            "--tokenizer-worker-num",
+            type=int,
+            default=ServerArgs.tokenizer_worker_num,
+            help="The worker num of the tokenizer manager.",
+        )
+        parser.add_argument(
+            "--detokenizer-worker-num",
+            type=int,
+            default=ServerArgs.detokenizer_worker_num,
+            help="The worker num of the detokenizer manager. tokenizer num % detokenizer num must == 0",
+        )
+        parser.add_argument(
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
@@ -1050,12 +1063,6 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
-        )
-        parser.add_argument(
-            "--tokenizer-worker-num",
-            type=int,
-            default=ServerArgs.tokenizer_worker_num,
-            help="The worker num of the tokenizer manager.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -2611,8 +2618,14 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
-        # Check multi tokenizer
-        assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+        # Check multi tokenizer/detokenizer
+        assert (
+            self.tokenizer_worker_num > 0 and self.detokenizer_worker_num > 0
+        ), "Tokenizer/Detokenizer worker num must >= 1"
+        assert (
+            self.tokenizer_worker_num % self.detokenizer_worker_num == 0
+        ), "Tokenizer worker num must be multiple of Detokenizer worker num"
+
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )
