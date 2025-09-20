@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+DEFAULT_SAMPLING_SEED = 42
 
 
 class SamplingParams:

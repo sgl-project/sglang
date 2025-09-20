@@ -21,7 +21,6 @@ import builtins
 import ctypes
 import dataclasses
 import functools
-import hashlib
 import importlib
 import io
 import ipaddress
@@ -521,12 +520,6 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def hash_string_to_int(s: str) -> int:
-    """Generate hash value from string and convert it to an integer."""
-    h = hashlib.sha256(s.encode("utf-8")).digest()
-    return np.uint32(int.from_bytes(h, "big") & 0xFFFFFFFF).astype(np.int32)
 
 
 def find_process_using_port(port: int) -> Optional[psutil.Process]:
