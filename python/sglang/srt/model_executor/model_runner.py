@@ -408,7 +408,7 @@ class ModelRunner:
 
         # Enable batch invariant mode
         if server_args.enable_deterministic_inference:
-            from batch_invariant_ops import enable_batch_invariant_mode
+            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
 
