@@ -178,9 +178,11 @@ class SamplingParams:
             if isinstance(self.stop_regex_strs, str):
                 self.stop_regex_strs = [self.stop_regex_strs]
 
-            self.stop_regex_max_len = max(
-                [get_max_seq_length(stop_regex) for stop_regex in self.stop_regex_strs]
-            )
+            stop_regex_max_len = 0
+            for stop_regex in self.stop_regex_strs:
+                stop_regex_max_len = max(stop_regex_max_len, get_max_seq_length(stop_regex))
+
+            self.stop_regex_max_len = stop_regex_max_len
 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need
