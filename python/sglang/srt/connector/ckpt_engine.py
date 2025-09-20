@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import json
 import logging
 import subprocess
@@ -10,7 +11,6 @@ from urllib.parse import urlparse
 import torch
 import torch.distributed as dist
 import zmq
-import gc
 
 from sglang.srt.connector import BaseConnector
 from sglang.srt.utils import init_custom_process_group
@@ -141,7 +141,9 @@ class CkptEngineConnector(BaseConnector):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         return
 
-    def update_weights_from_ipc(self, model, rank: int = 0, post_hook: Callable[[], None] = None):
+    def update_weights_from_ipc(
+        self, model, rank: int = 0, post_hook: Callable[[], None] = None
+    ):
         self.get_socket_handle(rank)
         try:
             while True:
@@ -178,6 +180,3 @@ class CkptEngineConnector(BaseConnector):
             gc.collect()
             torch.cuda.empty_cache()
             logger.info(f"Cleaned up IPC weight update on device {rank}")
-
-
-
