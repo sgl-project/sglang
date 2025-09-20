@@ -253,6 +253,7 @@ class FutureMap:
         return cur_future_ct
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
+        # TODO(lsyin) too much overhead here, optimize use a triton kernel
         if self.spec_algorithm.is_eagle():
             spec_info = model_worker_batch.spec_info
             if spec_info is None:
