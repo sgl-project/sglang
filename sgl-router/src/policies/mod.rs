@@ -121,23 +121,26 @@ pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, WorkerType};
+    use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[test]
     fn test_get_healthy_worker_indices() {
         let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(BasicWorker::new(
-                "http://w1:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Arc::new(BasicWorker::new(
-                "http://w2:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Arc::new(BasicWorker::new(
-                "http://w3:8000".to_string(),
-                WorkerType::Regular,
-            )),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w3:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
         ];
 
         // All healthy initially
