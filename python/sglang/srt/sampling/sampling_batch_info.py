@@ -255,7 +255,8 @@ class SamplingBatchInfo:
             "sampling_seed",
         ]:
             value = getattr(self, item, None)
-            setattr(self, item, value[keep_indices_device])
+            if value is not None:
+                setattr(self, item, value[keep_indices_device])
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -361,7 +362,8 @@ class SamplingBatchInfo:
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
-            setattr(self, item, torch.cat([self_val, other_val]))
+            if self_val is not None and other_val is not None:
+                setattr(self, item, torch.cat([self_val, other_val]))
 
         self.is_all_greedy &= other.is_all_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling
