@@ -430,11 +430,6 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
 
-    # Checkpoint Engine weight load
-    enable_ckpt_engine: bool = False
-    ckpt_register_name: str = "sglang-ckpt-iter-0"
-    ckpt_save_meta_file_name: str = "sglang-ckpt-global.pkl"
-
     # For PD-Multiplexing
     enable_pdmux: bool = False
     sm_group_num: int = 3
@@ -924,9 +919,6 @@ class ServerArgs:
             ):
                 self.load_format = "auto"
 
-        if self.load_format == "ckpt_engine":
-            self.enable_ckpt_engine = False
-
         # PD disaggregation
         if self.disaggregation_mode == "decode":
             assert (
@@ -1016,24 +1008,6 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.remote_instance_weight_loader_send_weights_group_ports,
             help="The communication group ports for loading weights from remote instance.",
-        )
-        parser.add_argument(
-            "--enable-ckpt-engine",
-            action="store_true",
-            default=ServerArgs.enable_ckpt_engine,
-            help="Enable loading weights from mooncake Checkpoint Engine.",
-        )
-        parser.add_argument(
-            "--ckpt-register-name",
-            type=str,
-            default=ServerArgs.ckpt_register_name,
-            help="The name of the checkpoint being registered.",
-        )
-        parser.add_argument(
-            "--ckpt-save-meta-file-name",
-            type=str,
-            default=ServerArgs.ckpt_save_meta_file_name,
-            help="The name of the meta file when loading weights from existing instance.",
         )
         parser.add_argument(
             "--tokenizer-path",

@@ -345,13 +345,6 @@ class Scheduler(
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
 
-        # TODO: May change it to somewhere
-        os.environ["RANK"] = str(self.tp_rank)
-        os.environ["WORLD_SIZE"] = str(self.tp_size)
-        # FIXME: using more generate method to get addr
-        os.environ["MASTER_PORT"] = "33333"
-        os.environ["MASTER_ADDR"] = "localhost"
-
         # Launch a tensor parallel worker
         if self.enable_overlap:
             TpWorkerClass = TpModelWorkerClient

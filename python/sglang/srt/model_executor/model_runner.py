@@ -149,24 +149,6 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
-# Import ParameterServer and related functions for checkpoint engine
-try:
-    from checkpoint_engine.ps import ParameterServer
-
-    from sglang.srt.model_executor.update import (
-        split_checkpoint_files,
-        split_tensors,
-        update_weights,
-    )
-
-    CHECKPOINT_ENGINE_AVAILABLE = True
-    import pickle
-except ImportError:
-    CHECKPOINT_ENGINE_AVAILABLE = False
-    ParameterServer = None
-    split_checkpoint_files = None
-    split_tensors = None
-    update_weights = None
 
 MLA_ATTENTION_BACKENDS = [
     "aiter",
@@ -300,24 +282,6 @@ class ModelRunner:
 
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
-
-        self.ps = None
-        if (
-            CHECKPOINT_ENGINE_AVAILABLE
-            and ParameterServer is not None
-            and self.server_args.enable_ckpt_engine
-        ):
-            self.ps = ParameterServer(auto_pg=True)
-            self.ps.register_checkpoint(
-                self.server_args.ckpt_register_name,
-                files=[],
-                named_tensors=list(self.model.named_parameters()),
-            )
-            self.ps.gather_metas(self.server_args.ckpt_register_name)
-            # TODO: Using json to transfer meta
-            if self.tp_rank == 0:
-                with open(self.server_args.ckpt_save_meta_file_name, "wb") as f:
-                    pickle.dump(self.ps.get_metas(), f)
 
         # Temporary cached values
         self.support_pp = (
