@@ -106,6 +106,7 @@ def freeze_gc(enable_cudagraph_gc: bool):
     finally:
         if should_freeze:
             gc.unfreeze()
+            gc.collect()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -280,7 +281,11 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if model_runner.spec_algorithm.is_eagle():
+        if (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_lookahead()
+        ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
@@ -329,7 +334,9 @@ class CudaGraphRunner:
                 (self.max_num_token,), dtype=self._cache_loc_dtype()
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_token), dtype=torch.int64
+            )
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -455,11 +462,21 @@ class CudaGraphRunner:
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
+        is_lookahead_supported = (
+            (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+            if self.model_runner.spec_algorithm.is_lookahead()
+            else True
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
+            and is_lookahead_supported
         )
 
     def capture(self) -> None:
@@ -568,7 +585,7 @@ class CudaGraphRunner:
             encoder_lens = self.encoder_lens[:bs]
         else:
             encoder_lens = None
-        mrope_positions = self.mrope_positions[:, :bs]
+        mrope_positions = self.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = self.next_token_logits_buffer[:num_tokens]
         self.num_token_non_padded[...] = num_tokens
 
@@ -793,7 +810,7 @@ class CudaGraphRunner:
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
-            self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
+            self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
         if self.require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
             self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
@@ -875,7 +892,10 @@ class CudaGraphRunner:
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
-        if self.model_runner.spec_algorithm.is_eagle():
+        if (
+            self.model_runner.spec_algorithm.is_eagle()
+            or self.model_runner.spec_algorithm.is_standalone()
+        ):
             from sglang.srt.speculative.eagle_utils import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
@@ -896,6 +916,20 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+
+        elif self.model_runner.spec_algorithm.is_lookahead():
+            from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+
+            spec_info = LookaheadVerifyInput(
+                draft_token=None,
+                tree_mask=self.custom_mask,
+                positions=None,
+                retrive_index=None,
+                retrive_next_token=None,
+                retrive_next_sibling=None,
+                draft_token_num=self.num_tokens_per_bs,
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         return spec_info
 

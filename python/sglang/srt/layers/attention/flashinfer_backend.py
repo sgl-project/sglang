@@ -29,6 +29,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
@@ -325,7 +326,9 @@ class FlashInferAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
@@ -430,7 +433,9 @@ class FlashInferAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
@@ -509,8 +514,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 window_left=layer.sliding_window_size,
                 logits_soft_cap=logits_soft_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
             )
         else:
             causal = True
@@ -588,8 +594,9 @@ class FlashInferAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
-            k_scale=layer.k_scale,
-            v_scale=layer.v_scale,
+            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -644,7 +651,9 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -657,7 +666,9 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -679,7 +690,9 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
     ):
         assert self.sliding_window_size is not None
         for wrapper_id in range(2):
@@ -727,7 +740,9 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -759,7 +774,9 @@ class FlashInferIndicesUpdaterDecode:
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
         seq_lens_cpu: Optional[torch.Tensor],
         use_sliding_window_kv_pool: bool = False,
     ):
@@ -864,7 +881,9 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -879,7 +898,9 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -915,7 +936,9 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -961,7 +984,9 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1003,7 +1028,9 @@ class FlashInferIndicesUpdaterPrefill:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[
+            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+        ],
         use_sliding_window_kv_pool: bool = False,
     ):
         bs = len(seq_lens)
@@ -1030,8 +1057,8 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
-            assert isinstance(spec_info, EagleDraftInput) or isinstance(
-                spec_info, EagleVerifyInput
+            assert isinstance(
+                spec_info, (EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput)
             )
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
@@ -1413,6 +1440,9 @@ def fast_decode_plan(
                     head_dim,
                     head_dim,
                     False,  # causal
+                    window_left,
+                    -1,
+                    False,
                 )
             except Exception as e:
                 raise RuntimeError(f"Error in standard plan: {e}")
