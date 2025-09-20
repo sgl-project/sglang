@@ -357,7 +357,7 @@ class TpModelWorker:
         )
         return success, message
 
-    def update_weights_from_ckpt_engine(self, recv_req: UpdateWeightFromCkptEngineReqInput):
+    def update_weights_from_ckpt_engine(self, recv_req: UpdateWeightsFromCkptEngineReqInput):
         success, message = self.model_runner.update_weights_from_ckpt_engine(
             recv_req.model_path, recv_req.load_format
         )
