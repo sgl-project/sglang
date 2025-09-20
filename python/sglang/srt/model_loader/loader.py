@@ -1543,40 +1543,13 @@ class CkptEngineModelLoader(BaseModelLoader):
     def load_model_from_ckpt_engine(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
-        client.get_socket_handle(device_config.gpu_id)
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 quant_method.process_weights_after_loading(module)
-        weights_iterator = self._get_weights_iterator(client)
-        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
-        for key, tensor in weights_iterator:
-            # FIXME: use more elegant method
-            if key == "model.embed_tokens.weight" and key not in state_dict:
-                key = "lm_head.weight"
-            if key not in state_dict:
-                continue
-            # If loading with LoRA enabled, additional padding may
-            # be added to certain parameters. We only load into a
-            # narrowed view of the parameter data.
-            param_data = state_dict[key].data
-            param_shape = state_dict[key].shape
-            for dim, size in enumerate(tensor.shape):
-                if size < param_shape[dim]:
-                    param_data = param_data.narrow(dim, 0, size)
-            if tensor.shape != param_shape:
-                logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
-                    tensor.shape,
-                    key,
-                    param_shape,
-                )
-            param_data.copy_(tensor)
-            state_dict.pop(key)
-        if state_dict:
-            raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
-
-        post_load_weights(model, model_config)
+        def post_hook():
+            post_load_weights(model, model_config)
+        client.update_weights_from_ipc(model, device_config.gpu_id, post_hook)
 
 
 class RemoteModelLoader(BaseModelLoader):

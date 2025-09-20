@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import torch
 import torch.distributed as dist
 import zmq
+import gc
 
 from sglang.srt.connector import BaseConnector
 from sglang.srt.utils import init_custom_process_group
@@ -122,70 +123,61 @@ class CkptEngineConnector(BaseConnector):
         Extracts individual weight tensors from a shared buffer using metadata.
         """
         assert buffer is not None
-        weights: list[tuple[str, torch.Tensor]] = []
+        weights: List[Tuple[str, torch.Tensor]] = []
         for item in payload:
-            shape = torch.Size(item["shape"])
+            shape = item["shape"]
+            if isinstance(shape, (list, tuple)):
+                shape = torch.Size(shape)
+            assert isinstance(shape, torch.Size)
             dtype, offset = item["dtype"], item["offset"]
-
-            # Calculate the size in bytes to slice the buffer.
             size = dtype.itemsize * shape.numel()
-
-            # Slice the buffer, cast to the correct data type, and reshape.
-            tensor_data = buffer[offset : offset + size]
-            tensor = tensor_data.view(dtype=dtype).view(shape)
-
-            if "mlp.gate_proj.weight" in item["name"]:
-                up_key = item["name"].replace("gate_proj", "up_proj")
-                if up_key in self.pending_weights:
-                    up_tensor = self.pending_weights.pop(up_key)
-                    self._merge_and_store(item["name"], tensor, up_key, up_tensor)
-                else:
-                    self.pending_weights[item["name"]] = tensor
-
-            elif "mlp.up_proj.weight" in item["name"]:
-                gate_key = item["name"].replace("up_proj", "gate_proj")
-                if gate_key in self.pending_weights:
-                    gate_tensor = self.pending_weights.pop(gate_key)
-                    self._merge_and_store(gate_key, gate_tensor, item["name"], tensor)
-                else:
-                    self.pending_weights[item["name"]] = tensor
-
-            else:
-                weights.append((item["name"], tensor))
+            tensor = buffer[offset : offset + size].view(dtype=dtype).view(shape)
+            weights.append((item["name"], tensor))
         return weights
 
     # Implemented as a no-op to make BaseConnector interface consistent.
     def weight_iterator(
         self, rank: int = 0
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        if self.socket is None:
-            self.get_socket_handle(rank)
-        while True:
-            payload: tuple | list | None = self.socket.recv_pyobj()
+        return
 
-            # Handle termination signal
-            if payload is None:
+    def update_weights_from_ipc(self, model, rank: int = 0, post_hook: Callable[[], None] = None):
+        self.get_socket_handle(rank)
+        try:
+            while True:
+                payload: tuple | list | None = self.socket.recv_pyobj()
+
+                # Handle termination signal
+                if payload is None:
+                    if post_hook is not None:
+                        post_hook()
+                    torch.cuda.synchronize()
+                    self.socket.send(b"")
+                    break
+
+                # Handle IPC buffer setup
+                if isinstance(payload, tuple):
+                    buffer = _rebuild_ipc(payload, self.local_rank)
+                    assert buffer.dtype == torch.uint8
+                    self.socket.send(b"")
+                    continue
+
+                # Handle weight metadata payload
+                assert isinstance(payload, list)
+
+                model.load_weights(self._extract_weights(payload, buffer))
+
+                torch.cuda.synchronize()
                 self.socket.send(b"")
-                break
+        except Exception as e:
+            logger.error(f"Error in IPC weight update on device {rank}: {e}")
+            raise
+        finally:
+            self.socket.close()
+            del self.buffer
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info(f"Cleaned up IPC weight update on device {rank}")
 
-            # Handle IPC buffer setup
-            if isinstance(payload, tuple):
-                buffer = _rebuild_ipc(payload, self.local_rank)
-                assert buffer.dtype == torch.uint8
-                self.socket.send(b"")
-                continue
 
-            # Handle weight metadata payload
-            assert isinstance(payload, list)
 
-            # Extract and yield all weights from the current payload.
-            # The 'for' loop iterates over the list returned by _extract_weights.
-            for key, tensor in self._extract_weights(payload, buffer):
-                yield key, tensor
-
-            # Acknowledge receipt of this batch
-            torch.cuda.synchronize()
-            self.socket.send(b"")
-
-        for key, tensor in self.final_state_dict.items():
-            yield key, tensor
