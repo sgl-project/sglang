@@ -547,6 +547,7 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+            # Lazy init to avoid circular import.
             from sglang.srt.configs.model_config import ModelConfig
 
             model_config = ModelConfig.from_server_args(self)
