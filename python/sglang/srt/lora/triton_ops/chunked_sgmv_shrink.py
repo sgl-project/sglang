@@ -20,9 +20,9 @@ def _chunked_lora_shrink_kernel(
     permutation,
     num_segs,
     # Meta parameters
+    NUM_SLICES: tl.constexpr,
     N: tl.constexpr,  # num_slices * r
     K: tl.constexpr,  # input_dim
-    NUM_SLICES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -153,7 +153,9 @@ def chunked_sgmv_lora_shrink_forward(
     )
 
     output = torch.empty((S, N), device=x.device, dtype=x.dtype)
-    _chunked_lora_shrink_kernel[grid](
+
+    cache_key = (num_slices, BLOCK_M)
+    _chunked_lora_shrink_kernel[cache_key][grid](
         x=x,
         weights=weights,
         output=output,

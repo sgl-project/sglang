@@ -18,13 +18,12 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
 from json import dumps
-from typing import Any, Callable, List, Optional, Tuple, Type, Union, get_type_hints
+from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import pybase64
 import requests
 import triton
-import triton.language as tl
 from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
@@ -548,102 +547,119 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
 
 class CachedKernel:
     """
-    Wrapper that allows kernel[grid](...) syntax with caching.
-
-    This wrapper caches compiled Triton kernels based on a custom key function to potentially avoid
-    the heavy cost of triton kernel lookup, when the kernel lookup logic could be simlified. By default,
-    the cache key is generated from the grid and parameters with `tl.constexpr` type hints.
+    Wrapper that allows kernel[keys][grid](...) syntax with caching.
+    
+    This wrapper caches compiled Triton kernels based on explicitly provided keys
+    to avoid the overhead of extracting keys from arguments.
     """
 
-    def __init__(self, fn, key_fn=None):
+    class CacheEntry:
+        """
+        Intermediate object that holds the keys and parent kernel.
+        Enables kernel[keys][grid](...) syntax.
+        """
+        
+        def __init__(self, parent: 'CachedKernel', key):
+            self.parent = parent
+            # Normalize keys to tuple for consistent hashing
+            if not isinstance(key, tuple):
+                if isinstance(key, (list, set)):
+                    key = tuple(key)
+                else:
+                    # Single key value
+                    key = (key,)
+            self.key = key
+        
+        def __getitem__(self, grid):
+            """
+            Second level of indexing: provide the grid.
+            Returns a launcher function.
+            """
+            assert isinstance(grid, tuple) and len(grid) <= 3, "Grid must be a tuple with at most 3 dimensions."
+            
+            # Normalize grid once
+            if len(grid) < 3:
+                grid = grid + (1,) * (3 - len(grid))
+            
+            def launcher(*args, **kwargs):
+                cached_kernel = self.parent.kernel_cache.get(self.key)
+                
+                if cached_kernel is None:
+                    # First time: compile and cache the kernel
+                    cached_kernel = self.parent.fn[grid](*args, **kwargs)
+                    self.parent.kernel_cache[self.key] = cached_kernel
+                    return cached_kernel
+                else:
+                    # Use cached kernel
+                    all_args = self.parent._build_args(args, kwargs)
+                    cached_kernel[grid](*all_args)
+                    return cached_kernel
+            
+            return launcher
+
+    def __init__(self, fn):
         self.fn = fn
-        self.key_fn = key_fn
-
-        # Get the function signature and type hints
-        self.signature = inspect.signature(fn)
-
         assert isinstance(fn, triton.runtime.jit.JITFunction)
+        
         original_fn = fn.fn
         self.signature = inspect.signature(original_fn)
-        self.type_hints = get_type_hints(original_fn)
-        # Identify constexpr parameters
-        self.constexpr_params = []
-        for param_name in self.signature.parameters:
-            hint = self.type_hints.get(param_name)
-            if hint is tl.constexpr:
-                self.constexpr_params.append(param_name)
-
+        self.param_names = tuple(self.signature.parameters.keys())
+        self.num_args = len(self.param_names)
+        
+        # Check that no parameters have default values
+        for name, param in self.signature.parameters.items():
+            assert param.default is inspect.Parameter.empty, \
+                f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+        
         functools.update_wrapper(self, original_fn)
-
         self.kernel_cache = {}
+    
+    def __getitem__(self, keys):
+        """
+        First level of indexing: provide the cache keys.
+        Returns a CacheEntry that can be indexed with grid.
+        """
+        return self.CacheEntry(self, keys)
 
-    def _default_key_fn(self, grid, *args, **kwargs):
-        """Default key function that uses grid and constexpr parameters."""
-        bound = self.signature.bind(*args, **kwargs)
-        bound.apply_defaults()
-        constexpr_values = {
-            bound.arguments[param_name] for param_name in self.constexpr_params
-        }
-
-        return f"{grid}_{",".join(str(cv) for cv in constexpr_values)}"
-
-    def __getitem__(self, grid: tuple[int, int, int]):
-        """Return a callable that will execute the kernel with the given grid."""
-        assert (
-            isinstance(grid, tuple) and len(grid) <= 3
-        ), "Currently we only support grid as a tuple."
-        grid = grid + (1,) * (3 - len(grid))
-
-        def launcher(*args, **kwargs):
-            if self.key_fn:
-                key = self.key_fn(grid, *args, **kwargs)
+    def _build_args(self, args, kwargs):
+        """
+        Build the complete argument list for kernel invocation.
+        """
+        complete_args = list(args)
+        
+        for i in range(len(args), self.num_args):
+            name = self.param_names[i]
+            value = kwargs.get(name, inspect.Parameter.empty)
+            if value is not inspect.Parameter.empty:
+                complete_args.append(value)
             else:
-                key = self._default_key_fn(grid, *args, **kwargs)
-
-            cached_kernel = self.kernel_cache.get(key)
-
-            if cached_kernel is None:
-                self.kernel_cache[key] = self.fn[grid](*args, **kwargs)
-            else:
-                param_names = list(self.signature.parameters.keys())
-                all_args = list(args)
-
-                # Add kwargs in the order they appear in the function signature
-                for param_name in param_names[len(args) :]:
-                    if param_name in kwargs:
-                        all_args.append(kwargs[param_name])
-
-                cached_kernel[grid](*all_args)
-
-            return cached_kernel
-
-        return launcher
+                raise ValueError(f"Missing argument: {name}")
+        
+        return complete_args
 
 
-def cached_triton_kernel(fn=None, *, key_fn: Callable[..., str] = None):
+def cached_triton_kernel(fn):
     """
-    Decorator that caches compiled kernels.
-
-    By default, uses only grid and parameters with tl.constexpr type hints as cache key.
-
-    Can be used as:
+    Decorator that enables explicit key-based caching for Triton kernels.
+    
+    Usage:
         @cached_triton_kernel
-        def func...
-
-        OR
-
-        @cached_triton_kernel(key_fn=...)
-        def func...
-
-    Args:
-        key_fn: Optional function to generate cache key from (grid, *args, **kwargs).
-                Should return a string. If None, uses grid + constexpr parameters as key.
+        @triton.jit
+        def my_kernel(x_ptr, y_ptr, BLOCK_SIZE: tl.constexpr, num_stages: tl.constexpr):
+            ...
+        
+        # Invoke with explicit keys for caching
+        my_kernel[(BLOCK_SIZE,)][(num_blocks,)](x, y, BLOCK_SIZE=1024)
+        
+        # Multiple keys
+        my_kernel[(BLOCK_SIZE, num_stages)][(grid_x, grid_y)](x, y, BLOCK_SIZE=1024, num_stages=4)
+    
+    The keys provided in the first bracket are used as the cache key along with the grid.
+    This avoids the overhead of extracting constexpr parameters from arguments at runtime.
+    
+    Note: Kernels with default parameter values are not supported and will raise an assertion error.
+    
+    Returns:
+        A CachedKernel wrapper that supports explicit key-based caching.
     """
-
-    def decorator(func):
-        return CachedKernel(func, key_fn)
-
-    if fn is not None:
-        return decorator(fn)
-
-    return decorator
+    return CachedKernel(fn)
