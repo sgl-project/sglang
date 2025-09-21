@@ -215,27 +215,17 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         self,
         forward_batch: ForwardBatch,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
         mask_dtype: torch.dtype,
-        **kwargs,
-    ) -> Dict:
+    ):
         """Prepare attention masks for multimodal inputs."""
         if isinstance(forward_batch.attn_backend, TritonAttnBackend):
             assert forward_batch.forward_mode == ForwardMode.EXTEND
-            bidirectional_attn_masks = None
+            bidirectional_attn_masks_list = []
             bidirectional_attn_mask_indptr = torch.zeros(
                 forward_batch.batch_size + 1, dtype=torch.int32, device=input_ids.device
             )
 
-            start_idx = 0
             for i in range(forward_batch.batch_size):
-                end_idx = (
-                    start_idx
-                    + forward_batch.extend_seq_lens[i]
-                    + forward_batch.extend_prefix_lens[i]
-                )
-                start_idx = end_idx
-
                 bidirectional_attn_mask = torch.empty(
                     forward_batch.extend_seq_lens[i],
                     forward_batch.extend_seq_lens[i]
@@ -263,23 +253,22 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                                     - forward_batch.extend_prefix_lens[i],
                                     im_begin : im_end + 1,
                                 ] = 1
-                if bidirectional_attn_masks is None:
-                    bidirectional_attn_masks = bidirectional_attn_mask.flatten()
-                else:
-                    bidirectional_attn_masks = torch.cat(
-                        [bidirectional_attn_masks, bidirectional_attn_mask.flatten()],
-                        dim=0,
-                    )
+                bidirectional_attn_masks_list.append(bidirectional_attn_mask.flatten())
                 bidirectional_attn_mask_indptr[i + 1] = (
                     bidirectional_attn_mask_indptr[i]
                     + bidirectional_attn_mask.nelement()
                 )
-            forward_batch.attn_backend.forward_metadata.mask_indptr = (
-                bidirectional_attn_mask_indptr
-            )
-            forward_batch.attn_backend.forward_metadata.custom_mask = (
-                bidirectional_attn_masks
-            )
+
+            if bidirectional_attn_masks_list:
+                bidirectional_attn_masks = torch.cat(
+                    bidirectional_attn_masks_list, dim=0
+                )
+                forward_batch.attn_backend.forward_metadata.mask_indptr = (
+                    bidirectional_attn_mask_indptr
+                )
+                forward_batch.attn_backend.forward_metadata.custom_mask = (
+                    bidirectional_attn_masks
+                )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
@@ -413,9 +402,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             self.prepare_attn_masks(
                 forward_batch,
                 llm_input_ids,
-                positions,
                 mask_dtype=torch.bool,
-                **kwargs,
             )
 
         hs = general_mm_embed_routine(
