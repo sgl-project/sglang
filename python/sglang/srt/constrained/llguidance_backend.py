@@ -48,7 +48,6 @@ class GuidanceGrammar(BaseGrammarObject):
             self.serialized_grammar,
             log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
         )
-        self.finished = False
         self.bitmask = None
 
     def accept_token(self, token: int):

@@ -41,7 +41,10 @@ use std::collections::HashMap;
 // 6. **SGLANG SPEC - RERANK API**
 //    - Request/Response structures
 //
-// 7. **COMMON**
+// 7. **OPENAI SPEC - Embeddings API**
+//    - Request structures
+//
+// 8. **COMMON**
 //    - GenerationRequest trait
 //    - StringOrArray & LoRAPath types
 //    - Helper functions
@@ -176,25 +179,93 @@ pub struct FunctionCallDelta {
 
 // ============= Request =============
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ChatCompletionRequest {
-    /// ID of the model to use
-    pub model: String,
-
     /// A list of messages comprising the conversation so far
     pub messages: Vec<ChatMessage>,
 
-    /// What sampling temperature to use, between 0 and 2
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    /// ID of the model to use
+    pub model: String,
 
-    /// An alternative to sampling with temperature
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+
+    /// Deprecated: Replaced by tool_choice
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated(note = "Use tool_choice instead")]
+    pub function_call: Option<FunctionCall>,
+
+    /// Deprecated: Replaced by tools
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated(note = "Use tools instead")]
+    pub functions: Option<Vec<Function>>,
+
+    /// Modify the likelihood of specified tokens appearing in the completion
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<HashMap<String, f32>>,
+
+    /// Whether to return log probabilities of the output tokens
+    #[serde(default)]
+    pub logprobs: bool,
+
+    /// Deprecated: Replaced by max_completion_tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated(note = "Use max_completion_tokens instead")]
+    pub max_tokens: Option<u32>,
+
+    /// An upper bound for the number of tokens that can be generated for a completion
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
+
+    /// Developer-defined tags and values used for filtering completions in the dashboard
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, String>>,
+
+    /// Output types that you would like the model to generate for this request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<Vec<String>>,
 
     /// How many chat completion choices to generate for each input message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
+
+    /// Whether to enable parallel function calling during tool use
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+
+    /// Cache key for prompts (beta feature)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+
+    /// Effort level for reasoning models (low, medium, high)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+
+    /// An object specifying the format that the model must output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
+
+    /// Safety identifier for content moderation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+
+    /// Deprecated: This feature is in Legacy mode
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated(note = "This feature is in Legacy mode")]
+    pub seed: Option<i64>,
+
+    /// The service tier to use for this request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+
+    /// Up to 4 sequences where the API will stop generating further tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<StringOrArray>,
 
     /// If set, partial message deltas will be sent
     #[serde(default)]
@@ -204,69 +275,29 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
 
-    /// Up to 4 sequences where the API will stop generating further tokens
+    /// What sampling temperature to use, between 0 and 2
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop: Option<StringOrArray>,
-
-    /// The maximum number of tokens to generate
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-
-    /// An upper bound for the number of tokens that can be generated for a completion
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_completion_tokens: Option<u32>,
-
-    /// Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub presence_penalty: Option<f32>,
-
-    /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_penalty: Option<f32>,
-
-    /// Modify the likelihood of specified tokens appearing in the completion
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logit_bias: Option<HashMap<String, f32>>,
-
-    /// A unique identifier representing your end-user
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-
-    /// If specified, our system will make a best effort to sample deterministically
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed: Option<i64>,
-
-    /// Whether to return log probabilities of the output tokens
-    #[serde(default)]
-    pub logprobs: bool,
-
-    /// An integer between 0 and 20 specifying the number of most likely tokens to return
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_logprobs: Option<u32>,
-
-    /// An object specifying the format that the model must output
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<ResponseFormat>,
-
-    /// A list of tools the model may call
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Tool>>,
+    pub temperature: Option<f32>,
 
     /// Controls which (if any) tool is called by the model
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
 
-    /// Whether to enable parallel function calling during tool use
+    /// A list of tools the model may call
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parallel_tool_calls: Option<bool>,
+    pub tools: Option<Vec<Tool>>,
 
-    /// Deprecated: use tools instead
+    /// An integer between 0 and 20 specifying the number of most likely tokens to return
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub functions: Option<Vec<Function>>,
+    pub top_logprobs: Option<u32>,
 
-    /// Deprecated: use tool_choice instead
+    /// An alternative to sampling with temperature
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_call: Option<FunctionCall>,
+    pub top_p: Option<f32>,
+
+    /// Verbosity level for debugging
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<i32>,
 
     // ============= SGLang Extensions =============
     /// Top-k sampling parameter (-1 to disable)
@@ -313,7 +344,6 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
 
-    // ============= SGLang Extensions =============
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lora_path: Option<LoRAPath>,
@@ -1891,7 +1921,7 @@ pub struct RerankResponse {
     pub object: String,
 
     /// Response ID
-    pub id: String,
+    pub id: Option<StringOrArray>,
 
     /// Creation timestamp
     pub created: i64,
@@ -1976,7 +2006,11 @@ impl RerankRequest {
 }
 
 impl RerankResponse {
-    pub fn new(results: Vec<RerankResult>, model: String, request_id: String) -> Self {
+    pub fn new(
+        results: Vec<RerankResult>,
+        model: String,
+        request_id: Option<StringOrArray>,
+    ) -> Self {
         RerankResponse {
             results,
             model,
@@ -1999,6 +2033,68 @@ impl RerankResponse {
     /// Apply top_k limit to results
     pub fn apply_top_k(&mut self, k: usize) {
         self.results.truncate(k);
+    }
+
+    /// Drop documents from results
+    pub fn drop_documents(&mut self) {
+        self.results.iter_mut().for_each(|result| {
+            result.document = None;
+        });
+    }
+}
+
+// ==================================================================
+// =            OPENAI SPEC - Embeddings API                        =
+// ==================================================================
+
+/// Embeddings request compatible with OpenAI API
+/// We intentionally keep fields flexible to pass through to workers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmbeddingRequest {
+    /// ID of the model to use
+    pub model: String,
+
+    /// Input can be a string, array of strings, tokens, or batch inputs
+    pub input: serde_json::Value,
+
+    /// Optional encoding format (e.g., "float", "base64")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+
+    /// Optional user identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Optional number of dimensions for the embedding
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u32>,
+
+    /// SGLang extension: request id for tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rid: Option<String>,
+}
+
+impl GenerationRequest for EmbeddingRequest {
+    fn is_stream(&self) -> bool {
+        // Embeddings are non-streaming
+        false
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        // Best effort: extract text content for routing decisions
+        match &self.input {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        }
     }
 }
 
@@ -2268,12 +2364,15 @@ mod tests {
         let response = RerankResponse::new(
             results.clone(),
             "test-model".to_string(),
-            "req-123".to_string(),
+            Some(StringOrArray::String("req-123".to_string())),
         );
 
         assert_eq!(response.results.len(), 2);
         assert_eq!(response.model, "test-model");
-        assert_eq!(response.id, "req-123");
+        assert_eq!(
+            response.id,
+            Some(StringOrArray::String("req-123".to_string()))
+        );
         assert_eq!(response.object, "rerank");
         assert!(response.created > 0);
     }
@@ -2287,8 +2386,11 @@ mod tests {
             meta_info: None,
         }];
 
-        let response =
-            RerankResponse::new(results, "test-model".to_string(), "req-123".to_string());
+        let response = RerankResponse::new(
+            results,
+            "test-model".to_string(),
+            Some(StringOrArray::String("req-123".to_string())),
+        );
 
         let serialized = serde_json::to_string(&response).unwrap();
         let deserialized: RerankResponse = serde_json::from_str(&serialized).unwrap();
@@ -2322,8 +2424,11 @@ mod tests {
             },
         ];
 
-        let mut response =
-            RerankResponse::new(results, "test-model".to_string(), "req-123".to_string());
+        let mut response = RerankResponse::new(
+            results,
+            "test-model".to_string(),
+            Some(StringOrArray::String("req-123".to_string())),
+        );
 
         response.sort_by_score();
 
@@ -2358,8 +2463,11 @@ mod tests {
             },
         ];
 
-        let mut response =
-            RerankResponse::new(results, "test-model".to_string(), "req-123".to_string());
+        let mut response = RerankResponse::new(
+            results,
+            "test-model".to_string(),
+            Some(StringOrArray::String("req-123".to_string())),
+        );
 
         response.apply_top_k(2);
 
@@ -2377,12 +2485,34 @@ mod tests {
             meta_info: None,
         }];
 
-        let mut response =
-            RerankResponse::new(results, "test-model".to_string(), "req-123".to_string());
+        let mut response = RerankResponse::new(
+            results,
+            "test-model".to_string(),
+            Some(StringOrArray::String("req-123".to_string())),
+        );
 
         response.apply_top_k(5);
 
         assert_eq!(response.results.len(), 1);
+    }
+
+    #[test]
+    fn test_rerank_response_drop_documents() {
+        let results = vec![RerankResult {
+            score: 0.8,
+            document: Some("doc1".to_string()),
+            index: 0,
+            meta_info: None,
+        }];
+        let mut response = RerankResponse::new(
+            results,
+            "test-model".to_string(),
+            Some(StringOrArray::String("req-123".to_string())),
+        );
+
+        response.drop_documents();
+
+        assert_eq!(response.results[0].document, None);
     }
 
     // ==================================================================
@@ -2570,8 +2700,11 @@ mod tests {
             meta_info: None,
         }];
 
-        let mut response =
-            RerankResponse::new(results, "test-model".to_string(), "req-123".to_string());
+        let mut response = RerankResponse::new(
+            results,
+            "test-model".to_string(),
+            Some(StringOrArray::String("req-123".to_string())),
+        );
 
         response.usage = Some(UsageInfo {
             prompt_tokens: 100,
@@ -2645,18 +2778,7 @@ mod tests {
         ];
 
         // Create response
-        let mut response = RerankResponse::new(
-            results,
-            request.model.clone(),
-            request
-                .rid
-                .as_ref()
-                .and_then(|r| match r {
-                    StringOrArray::String(s) => Some(s.clone()),
-                    StringOrArray::Array(arr) => arr.first().cloned(),
-                })
-                .unwrap_or_else(|| "unknown".to_string()),
-        );
+        let mut response = RerankResponse::new(results, request.model.clone(), request.rid.clone());
 
         // Sort by score
         response.sort_by_score();
@@ -2677,5 +2799,103 @@ mod tests {
         let deserialized: RerankResponse = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.results.len(), 2);
         assert_eq!(deserialized.model, response.model);
+    }
+
+    // ==================================================================
+    // =            EMBEDDINGS REQUEST TESTS                             =
+    // ==================================================================
+
+    #[test]
+    fn test_embedding_request_serialization_string_input() {
+        let req = EmbeddingRequest {
+            model: "test-emb".to_string(),
+            input: serde_json::Value::String("hello".to_string()),
+            encoding_format: Some("float".to_string()),
+            user: Some("user-1".to_string()),
+            dimensions: Some(128),
+            rid: Some("rid-123".to_string()),
+        };
+
+        let serialized = serde_json::to_string(&req).unwrap();
+        let deserialized: EmbeddingRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.model, req.model);
+        assert_eq!(deserialized.input, req.input);
+        assert_eq!(deserialized.encoding_format, req.encoding_format);
+        assert_eq!(deserialized.user, req.user);
+        assert_eq!(deserialized.dimensions, req.dimensions);
+        assert_eq!(deserialized.rid, req.rid);
+    }
+
+    #[test]
+    fn test_embedding_request_serialization_array_input() {
+        let req = EmbeddingRequest {
+            model: "test-emb".to_string(),
+            input: serde_json::json!(["a", "b", "c"]),
+            encoding_format: None,
+            user: None,
+            dimensions: None,
+            rid: None,
+        };
+
+        let serialized = serde_json::to_string(&req).unwrap();
+        let de: EmbeddingRequest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(de.model, req.model);
+        assert_eq!(de.input, req.input);
+    }
+
+    #[test]
+    fn test_embedding_generation_request_trait_string() {
+        let req = EmbeddingRequest {
+            model: "emb-model".to_string(),
+            input: serde_json::Value::String("hello".to_string()),
+            encoding_format: None,
+            user: None,
+            dimensions: None,
+            rid: None,
+        };
+        assert!(!req.is_stream());
+        assert_eq!(req.get_model(), Some("emb-model"));
+        assert_eq!(req.extract_text_for_routing(), "hello");
+    }
+
+    #[test]
+    fn test_embedding_generation_request_trait_array() {
+        let req = EmbeddingRequest {
+            model: "emb-model".to_string(),
+            input: serde_json::json!(["hello", "world"]),
+            encoding_format: None,
+            user: None,
+            dimensions: None,
+            rid: None,
+        };
+        assert_eq!(req.extract_text_for_routing(), "hello world");
+    }
+
+    #[test]
+    fn test_embedding_generation_request_trait_non_text() {
+        let req = EmbeddingRequest {
+            model: "emb-model".to_string(),
+            input: serde_json::json!({"tokens": [1, 2, 3]}),
+            encoding_format: None,
+            user: None,
+            dimensions: None,
+            rid: None,
+        };
+        assert_eq!(req.extract_text_for_routing(), "");
+    }
+
+    #[test]
+    fn test_embedding_generation_request_trait_mixed_array_ignores_nested() {
+        let req = EmbeddingRequest {
+            model: "emb-model".to_string(),
+            input: serde_json::json!(["a", ["b", "c"], 123, {"k": "v"}]),
+            encoding_format: None,
+            user: None,
+            dimensions: None,
+            rid: None,
+        };
+        // Only top-level string elements are extracted
+        assert_eq!(req.extract_text_for_routing(), "a");
     }
 }
