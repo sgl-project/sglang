@@ -707,9 +707,7 @@ impl PDRouter {
 
         // Only check workers if parallel batch is requested with multiple items
         if context.parallel_batch && batch_size > 1 {
-            let prefill_workers = self.worker_registry.get_by_type(&WorkerType::Prefill {
-                bootstrap_port: None,
-            });
+            let prefill_workers = self.worker_registry.get_prefill_workers();
             let available_prefill = prefill_workers.iter().filter(|w| w.is_available()).count();
 
             if available_prefill >= 2 {
@@ -855,9 +853,7 @@ impl PDRouter {
         };
 
         // Get available prefill workers count
-        let prefill_workers = self.worker_registry.get_by_type(&WorkerType::Prefill {
-            bootstrap_port: None,
-        });
+        let prefill_workers = self.worker_registry.get_prefill_workers();
         let available_workers = prefill_workers.iter().filter(|w| w.is_available()).count();
 
         // Calculate distribution
