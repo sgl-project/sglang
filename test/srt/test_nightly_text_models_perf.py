@@ -1,19 +1,14 @@
 import os
-import re
 import subprocess
 import time
 import unittest
 
+from sglang.bench_one_batch_server import BenchmarkResult
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     _parse_int_list_env,
-    find_traces_under_path,
     is_in_ci,
     parse_models,
     popen_launch_server,
@@ -36,15 +31,17 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
         cls.batch_sizes = [1, 1, 8]
-        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
-        cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "512"))
+        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
+        cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
         os.makedirs(PROFILE_DIR, exist_ok=True)
         cls.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
+        all_benchmark_results = []
 
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
+                benchmark_results = []
                 with self.subTest(model=model):
                     process = popen_launch_server(
                         model=model,
@@ -61,6 +58,9 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                         )
                         profile_path_prefix = os.path.join(
                             PROFILE_DIR, profile_filename
+                        )
+                        json_output_file = (
+                            f"results_{model.replace('/', '_')}_{int(time.time())}.json"
                         )
 
                         command = [
@@ -82,20 +82,52 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                             "--profile-by-stage",
                             "--profile-filename-prefix",
                             profile_path_prefix,
-                            "--append-to-github-summary=False",
+                            f"--output-path={json_output_file}",
+                            "--no-append-to-github-summary",
                         ]
 
                         print(f"Running command: {' '.join(command)}")
                         result = subprocess.run(command, capture_output=True, text=True)
 
+                        if result.returncode != 0:
+                            print(
+                                f"Error running benchmark for {model} with batch size:"
+                            )
+                            print(result.stderr)
+                            # Continue to next batch size even if one fails
+                            continue
+
+                        # Load and deserialize JSON results
+                        if os.path.exists(json_output_file):
+                            import json
+
+                            with open(json_output_file, "r") as f:
+                                json_data = json.load(f)
+
+                            # Convert JSON data to BenchmarkResult objects
+                            for data in json_data:
+                                benchmark_result = BenchmarkResult(**data)
+                                all_benchmark_results.append(benchmark_result)
+                                benchmark_results.append(benchmark_result)
+
+                            print(
+                                f"Loaded {len(benchmark_results)} benchmark results from {json_output_file}"
+                            )
+
+                            # Clean up JSON file
+                            os.remove(json_output_file)
+                        else:
+                            print(
+                                f"Warning: JSON output file {json_output_file} not found"
+                            )
+
                     finally:
                         kill_process_tree(process.pid)
 
-                    if model_results:
-                        report_part = generate_markdown_report_nightly(
-                            model, model_results, self.input_lens, self.output_lens
-                        )
-                        self.full_report += report_part + "\n"
+                    report_part = BenchmarkResult.generate_markdown_report(
+                        PROFILE_DIR, benchmark_results
+                    )
+                    self.full_report += report_part + "\n"
 
         if is_in_ci():
             write_github_step_summary(self.full_report)

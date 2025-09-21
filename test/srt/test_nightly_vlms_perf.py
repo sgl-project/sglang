@@ -45,8 +45,8 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "32"))
         cls.full_report = f"## {cls.__name__}\n"
 
-    def test_vlm_models_mmmu_performance(self):
-        all_benchmark_results = []  # Store all BenchmarkResult objects
+    def test_bench_one_batch(self):
+        all_benchmark_results = []
 
         for model in self.models:
             benchmark_results = []
@@ -59,13 +59,13 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                 )
                 try:
                     # Run bench_one_batch_server against the launched server
-                    profile_filename = f"{model.replace('/', '_')}_{int(time.time())}"
+                    profile_filename = f"{model.replace('/', '_')}"
                     # path for this run
                     profile_path_prefix = os.path.join(PROFILE_DIR, profile_filename)
 
                     # JSON output file for this model
                     json_output_file = (
-                        f"results_{model.replace('/', '_')}_{int(time.time())}.json"
+                        f"results_{model.replace('/', '_')}.json"
                     )
 
                     command = [
@@ -87,8 +87,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                         "--profile-by-stage",
                         f"--profile-filename-prefix={profile_path_prefix}",
                         "--show-report",
-                        "--output-path",
-                        json_output_file,
+                        f"--output-path={json_output_file}",
                         "--no-append-to-github-summary",
                     ]
 
@@ -132,7 +131,6 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                 report_part = BenchmarkResult.generate_markdown_report(
                     PROFILE_DIR, benchmark_results
                 )
-                print(f"{report_part=}")
                 self.full_report += report_part + "\n"
 
         if is_in_ci():
