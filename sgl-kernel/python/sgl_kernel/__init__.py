@@ -45,6 +45,7 @@ if torch.version.cuda is not None:
 # Dynamically select common_ops based on GPU architecture
 def _select_common_ops():
     """Select the appropriate common_ops library based on GPU architecture."""
+    # First try the new architecture-specific libraries
     if torch.cuda.is_available():
         try:
             # Get the compute capability of the first GPU
@@ -70,7 +71,7 @@ def _select_common_ops():
         except Exception:
             pass
 
-    # Fallback: try importing either version
+    # Try the new architecture-specific libraries without GPU detection
     try:
         from sgl_kernel import common_ops_sm100 as common_ops
         return common_ops
@@ -79,7 +80,14 @@ def _select_common_ops():
             from sgl_kernel import common_ops_sm90 as common_ops
             return common_ops
         except ImportError:
-            raise ImportError("Could not import any common_ops library variant")
+            pass
+
+    # Fallback to original common_ops for backward compatibility
+    try:
+        from sgl_kernel import common_ops
+        return common_ops
+    except ImportError:
+        raise ImportError("Could not import any common_ops library variant")
 
 common_ops = _select_common_ops()
 from sgl_kernel.allreduce import *
@@ -181,6 +189,7 @@ if torch.version.hip is not None:
 # Dynamically select spatial library based on GPU architecture
 def _select_spatial_ops():
     """Select the appropriate spatial_ops library based on GPU architecture."""
+    # First try the new architecture-specific libraries
     if torch.cuda.is_available():
         try:
             major, minor = torch.cuda.get_device_capability(0)
@@ -203,7 +212,7 @@ def _select_spatial_ops():
         except Exception:
             pass
 
-    # Fallback: try importing either version
+    # Try the new architecture-specific libraries without GPU detection
     try:
         from sgl_kernel import spatial_ops_sm100 as spatial_ops
         return spatial_ops
@@ -212,7 +221,14 @@ def _select_spatial_ops():
             from sgl_kernel import spatial_ops_sm90 as spatial_ops
             return spatial_ops
         except ImportError:
-            raise ImportError("Could not import any spatial_ops library variant")
+            pass
+
+    # Fallback to original spatial_ops for backward compatibility
+    try:
+        from sgl_kernel import spatial_ops
+        return spatial_ops
+    except ImportError:
+        raise ImportError("Could not import any spatial_ops library variant")
 
 def create_greenctx_stream_by_value(*args, **kwargs):
     spatial_ops = _select_spatial_ops()
