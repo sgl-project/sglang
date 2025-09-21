@@ -256,6 +256,18 @@ impl WorkerRegistry {
             .collect()
     }
 
+    pub fn get_all_urls_with_api_key(&self) -> Vec<(String, Option<String>)> {
+        self.workers
+            .iter()
+            .map(|entry| {
+                (
+                    entry.value().url().to_string(),
+                    entry.value().api_key().clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Get all model IDs with workers
     pub fn get_models(&self) -> Vec<String> {
         self.model_workers
@@ -442,6 +454,7 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
                 .build(),
         );
 
@@ -477,6 +490,7 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels1)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
                 .build(),
         );
 
@@ -487,6 +501,7 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels2)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
                 .build(),
         );
 
@@ -497,6 +512,7 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels3)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
                 .build(),
         );
 
