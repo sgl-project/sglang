@@ -174,6 +174,31 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class LongCatDetector(BaseReasoningFormatDetector):
+    """
+    Detector for Meituan LongCat Thinking models.
+    Assumes reasoning format:
+      (<longcat_think>)*(.*)</longcat_think>
+
+    LongCat thinking models support switching between thinking mode and normal
+    mode using `enable_thinking` parameter in the request parameter.
+      - enable_thinking=True: "<longcat_think>reasoning content</longcat_think>The answer is 42."
+      - enable_thinking=False: "The answer is 42." (no thinking tokens)
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+        super().__init__(
+            "<longcat_think>",
+            "</longcat_think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -270,6 +295,7 @@ class ReasoningParser:
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "step3": DeepSeekR1Detector,
+        "longcat": LongCatDetector,
     }
 
     def __init__(
