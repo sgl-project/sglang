@@ -2879,7 +2879,7 @@ class ServerArgs:
                 self.chunked_prefill_size = 4096
 
         # Set cuda graph max batch size and cuda graph batch sizes
-        if self.cuda_graph_max_bs is None or self.cuda_graph_bs is None:
+        if self.cuda_graph_max_bs is None:
             if gpu_mem is not None:
                 if gpu_mem < 20 * 1024:
                     # T4, 4080
@@ -2934,9 +2934,9 @@ class ServerArgs:
 
         # Add additional batch sizes based on GPU memory capacity
         if gpu_mem is not None:
-            if gpu_mem > 90 * 1024 and self.cuda_graph_max_bs > 160:  # H200, H20
+            if gpu_mem > 90 * 1024:  # H200, H20
                 capture_bs += list(range(160, min(self.cuda_graph_max_bs + 1, 513), 8))
-            if gpu_mem > 160 * 1000 and self.cuda_graph_max_bs > 256:  # B200, MI300
+            if gpu_mem > 160 * 1024 and self.cuda_graph_max_bs > 256:  # B200, MI300
                 capture_bs += list(range(256, min(self.cuda_graph_max_bs + 1, 513), 16))
 
         capture_bs = sorted(list(set(capture_bs)))
