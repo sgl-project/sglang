@@ -166,9 +166,10 @@ class LookaheadVerifyInput:
         # We should repeat top_logprobs_nums to match num_tokens_per_req.
         top_logprobs_nums_repeat_interleaved = []
         token_ids_logprobs_repeat_interleaved = []
-        for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req):
+        for num, token_ids, num_tokens in zip(
+            top_logprobs_nums, token_ids_logprobs, num_tokens_per_req
+        ):
             top_logprobs_nums_repeat_interleaved.extend([num] * num_tokens)
-        for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
             token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
 
         # Extract logprobs
