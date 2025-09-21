@@ -1993,7 +1993,7 @@ class MultiprocessingSerializer:
 
         if output_str:
             # Convert bytes to base64-encoded string
-            output = pybase64.b64encode(output).decode("utf-8")
+            output = pybase64.b64encode(output, validate=True).decode("utf-8")
 
         return output
 

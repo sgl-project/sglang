@@ -6,7 +6,6 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import pybase64
 import requests
 import torch
 import torch.distributed as dist
