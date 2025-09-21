@@ -67,8 +67,6 @@ jobs:
       matrix:
         include:
           - python-version: "3.10"
-            cuda-version: "12.4"
-          - python-version: "3.10"
             cuda-version: "12.8"
           - python-version: "3.10"
             cuda-version: "12.9"
