@@ -574,6 +574,13 @@ class Scheduler(
             self.truncation_align_size = get_int_env_var(
                 "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096
             )
+        elif (
+            self.server_args.enable_deterministic_inference
+            and self.server_args.attention_backend == "triton"
+        ):
+            self.truncation_align_size = get_int_env_var(
+                "SGLANG_TRITON_PREFILL_SPLIT_TILE_SIZE", 4096
+            )
         else:
             self.truncation_align_size = None
 
