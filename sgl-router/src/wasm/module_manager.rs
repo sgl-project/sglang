@@ -6,13 +6,21 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, RwLock,
+};
 use uuid::Uuid;
 use wasmtime::Val;
 
 pub struct WasmModuleManager {
     modules: Arc<RwLock<HashMap<Uuid, WasmModule>>>,
     runtime: Arc<WasmRuntime>,
+    // Metrics
+    total_executions: AtomicU64,
+    successful_executions: AtomicU64,
+    failed_executions: AtomicU64,
+    total_execution_time_ms: AtomicU64,
 }
 
 impl WasmModuleManager {
@@ -21,6 +29,10 @@ impl WasmModuleManager {
         Ok(Self {
             modules: Arc::new(RwLock::new(HashMap::new())),
             runtime,
+            total_executions: AtomicU64::new(0),
+            successful_executions: AtomicU64::new(0),
+            failed_executions: AtomicU64::new(0),
+            total_execution_time_ms: AtomicU64::new(0),
         })
     }
 
@@ -155,6 +167,8 @@ impl WasmModuleManager {
         function_name: String,
         args: Vec<Val>,
     ) -> Result<Vec<Val>, String> {
+        let start_time = std::time::Instant::now();
+
         let module = {
             let modules = self
                 .modules
@@ -169,9 +183,24 @@ impl WasmModuleManager {
         let wasm_bytes = std::fs::read(&module.module_meta.file_path)
             .map_err(|e| format!("Failed to read module file: {}", e))?;
 
-        self.runtime
+        let result = self
+            .runtime
             .execute_wasm_module_async(wasm_bytes, function_name, args)
-            .await
+            .await;
+
+        // Record metrics
+        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        self.total_executions.fetch_add(1, Ordering::Relaxed);
+        self.total_execution_time_ms
+            .fetch_add(execution_time_ms, Ordering::Relaxed);
+
+        if result.is_ok() {
+            self.successful_executions.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_executions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        result
     }
 
     /// execute module function sync
@@ -181,6 +210,8 @@ impl WasmModuleManager {
         function_name: String,
         args: Vec<Val>,
     ) -> Result<Vec<Val>, String> {
+        let start_time = std::time::Instant::now();
+
         let module = {
             let modules = self
                 .modules
@@ -195,12 +226,37 @@ impl WasmModuleManager {
         let wasm_bytes = std::fs::read(&module.module_meta.file_path)
             .map_err(|e| format!("Failed to read module file: {}", e))?;
 
-        self.runtime
-            .execute_wasm_sync(wasm_bytes, function_name, args)
+        let result = self
+            .runtime
+            .execute_wasm_sync(wasm_bytes, function_name, args);
+
+        // Record metrics
+        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        self.total_executions.fetch_add(1, Ordering::Relaxed);
+        self.total_execution_time_ms
+            .fetch_add(execution_time_ms, Ordering::Relaxed);
+
+        if result.is_ok() {
+            self.successful_executions.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_executions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        result
     }
 
     pub fn get_runtime(&self) -> &Arc<WasmRuntime> {
         &self.runtime
+    }
+
+    /// Get current metrics
+    pub fn get_metrics(&self) -> (u64, u64, u64, u64) {
+        (
+            self.total_executions.load(Ordering::Relaxed),
+            self.successful_executions.load(Ordering::Relaxed),
+            self.failed_executions.load(Ordering::Relaxed),
+            self.total_execution_time_ms.load(Ordering::Relaxed),
+        )
     }
 }
 

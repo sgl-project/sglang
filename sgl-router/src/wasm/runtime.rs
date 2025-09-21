@@ -1,16 +1,28 @@
 use crate::wasm::config::WasmRuntimeConfig;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tokio::sync::{mpsc, oneshot};
 use wasmtime::{Config, Engine, Instance, Module, Store, Val};
 
 pub struct WasmRuntime {
     config: WasmRuntimeConfig,
     thread_pool: Arc<WasmThreadPool>,
+    // Metrics
+    total_executions: AtomicU64,
+    successful_executions: AtomicU64,
+    failed_executions: AtomicU64,
+    total_execution_time_ms: AtomicU64,
 }
 
 pub struct WasmThreadPool {
     sender: mpsc::UnboundedSender<WasmTask>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    // Metrics
+    total_tasks: AtomicU64,
+    completed_tasks: AtomicU64,
+    failed_tasks: AtomicU64,
 }
 
 pub enum WasmTask {
@@ -29,6 +41,10 @@ impl WasmRuntime {
         Ok(Self {
             config,
             thread_pool,
+            total_executions: AtomicU64::new(0),
+            successful_executions: AtomicU64::new(0),
+            failed_executions: AtomicU64::new(0),
+            total_execution_time_ms: AtomicU64::new(0),
         })
     }
 
@@ -63,6 +79,7 @@ impl WasmRuntime {
         function_name: String,
         args: Vec<Val>,
     ) -> Result<Vec<Val>, String> {
+        let start_time = std::time::Instant::now();
         let (response_tx, response_rx) = oneshot::channel();
 
         let task = WasmTask::ExecuteWasmModule {
@@ -77,9 +94,23 @@ impl WasmRuntime {
             .send(task)
             .map_err(|_| "Failed to send task to thread pool".to_string())?;
 
-        response_rx
+        let result = response_rx
             .await
-            .map_err(|_| "Failed to receive response from thread pool".to_string())?
+            .map_err(|_| "Failed to receive response from thread pool".to_string())?;
+
+        // Record metrics
+        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        self.total_executions.fetch_add(1, Ordering::Relaxed);
+        self.total_execution_time_ms
+            .fetch_add(execution_time_ms, Ordering::Relaxed);
+
+        if result.is_ok() {
+            self.successful_executions.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_executions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        result
     }
 
     // sync execute method (for simple scenarios)
@@ -92,6 +123,16 @@ impl WasmRuntime {
         // use tokio::runtime::Handle::current() to execute in async context
         let handle = tokio::runtime::Handle::current();
         handle.block_on(self.execute_wasm_module_async(wasm_bytes, function_name, args))
+    }
+
+    /// Get current metrics
+    pub fn get_metrics(&self) -> (u64, u64, u64, u64) {
+        (
+            self.total_executions.load(Ordering::Relaxed),
+            self.successful_executions.load(Ordering::Relaxed),
+            self.failed_executions.load(Ordering::Relaxed),
+            self.total_execution_time_ms.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -137,7 +178,22 @@ impl WasmThreadPool {
             workers.push(worker);
         }
 
-        Ok(Self { sender, workers })
+        Ok(Self {
+            sender,
+            workers,
+            total_tasks: AtomicU64::new(0),
+            completed_tasks: AtomicU64::new(0),
+            failed_tasks: AtomicU64::new(0),
+        })
+    }
+
+    /// Get current thread pool metrics
+    pub fn get_metrics(&self) -> (u64, u64, u64) {
+        (
+            self.total_tasks.load(Ordering::Relaxed),
+            self.completed_tasks.load(Ordering::Relaxed),
+            self.failed_tasks.load(Ordering::Relaxed),
+        )
     }
 
     async fn worker_loop(
@@ -195,7 +251,7 @@ impl WasmThreadPool {
                     args,
                     response,
                 } => {
-                    let result = Self::execute_wasm_in_worker(
+                    let result = Self::execute_wasm_module_in_worker(
                         &engine,
                         wasm_bytes,
                         function_name,
@@ -204,13 +260,15 @@ impl WasmThreadPool {
                     )
                     .await;
 
+                    // Record task metrics (we can't access pool metrics from here,
+                    // but we can add them to the response if needed)
                     let _ = response.send(result);
                 }
             }
         }
     }
 
-    async fn execute_wasm_in_worker(
+    async fn execute_wasm_module_in_worker(
         engine: &Engine,
         wasm_bytes: Vec<u8>,
         function_name: String,
