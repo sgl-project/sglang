@@ -66,19 +66,33 @@ def get_tree_sha(repo_owner, repo_name, commit_sha, token):
     return data["tree"]["sha"]
 
 
+def create_blob(repo_owner, repo_name, content, token):
+    """Create a blob with file content"""
+    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/blobs"
+
+    # Encode content as base64 for GitHub API
+    content_b64 = base64.b64encode(content).decode("utf-8")
+
+    data = {"content": content_b64, "encoding": "base64"}
+
+    response = make_github_request(url, token, method="POST", data=data)
+    return json.loads(response)["sha"]
+
+
 def create_tree(repo_owner, repo_name, base_tree_sha, files, token):
     """Create a new tree with files"""
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/trees"
 
     tree_items = []
     for file_path, content in files:
-        content_b64 = base64.b64encode(content).decode("utf-8")
+        # Create blob first to get SHA
+        blob_sha = create_blob(repo_owner, repo_name, content, token)
         tree_items.append(
             {
                 "path": file_path,
                 "mode": "100644",
                 "type": "blob",
-                "content": content_b64,
+                "sha": blob_sha,
             }
         )
 

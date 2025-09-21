@@ -98,7 +98,7 @@ class BenchmarkResult(BaseModel):
                 # Create a combined link or use the first available one
                 trace_files = [self.profile_links.extend, self.profile_links.decode]
                 trace_files_relay_links = [
-                    get_perfetto_relay_link_from_trace_file(trace_file)
+                    f"[trace]({get_perfetto_relay_link_from_trace_file(trace_file)})"
                     for trace_file in trace_files
                 ]
 
@@ -116,14 +116,15 @@ class BenchmarkResult(BaseModel):
         import os
 
         summary = f"### {results[0].model_path}\n"
+
+        # summary += (
+        #     f"Input lens: {result.input_len}. Output lens: {result.output_len}.\n"
+        # )
+        summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile (extend) | profile (decode)|\n"
+        summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ | --------------- | -------------- |\n"
+
         # all results should share the same isl & osl
         for result in results:
-            summary += (
-                f"Input lens: {result.input_len}. Output lens: {result.output_len}.\n"
-            )
-            summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile |\n"
-            summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
-
             base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
             relay_base = os.getenv("PERFETTO_RELAY_URL", "").rstrip("/")
             relay_base = "https://docs.sglang.ai/ci-data/pages/perfetto_relay.html"
@@ -700,6 +701,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
     summary = get_report_summary(result, server_args, bench_args)
     print(summary)
+    print(f"{bench_args.append_to_github_summary}")
 
     if is_in_ci() and bench_args.append_to_github_summary:
         write_github_step_summary(summary)
