@@ -42,7 +42,46 @@ if torch.version.cuda is not None:
     if cuda_include.exists():
         ctypes.CDLL(str(cuda_include), mode=ctypes.RTLD_GLOBAL)
 
-from sgl_kernel import common_ops
+# Dynamically select common_ops based on GPU architecture
+def _select_common_ops():
+    """Select the appropriate common_ops library based on GPU architecture."""
+    if torch.cuda.is_available():
+        try:
+            # Get the compute capability of the first GPU
+            major, minor = torch.cuda.get_device_capability(0)
+            compute_cap = major * 10 + minor
+
+            # SM90 (Hopper): use optimized version with fast math
+            # SM100+ (Blackwell+): use version without fast math for precision
+            if compute_cap == 90:  # SM90 (H100, H800)
+                try:
+                    from sgl_kernel import common_ops_sm90 as common_ops
+                    return common_ops
+                except ImportError:
+                    pass
+
+            # For SM100+ or if SM90 version fails, use SM100+ version
+            try:
+                from sgl_kernel import common_ops_sm100 as common_ops
+                return common_ops
+            except ImportError:
+                pass
+
+        except Exception:
+            pass
+
+    # Fallback: try importing either version
+    try:
+        from sgl_kernel import common_ops_sm100 as common_ops
+        return common_ops
+    except ImportError:
+        try:
+            from sgl_kernel import common_ops_sm90 as common_ops
+            return common_ops
+        except ImportError:
+            raise ImportError("Could not import any common_ops library variant")
+
+common_ops = _select_common_ops()
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     cutlass_mla_decode,
@@ -139,13 +178,47 @@ if torch.version.hip is not None:
     from sgl_kernel.elementwise import gelu_quick
 
 
-def create_greenctx_stream_by_value(*args, **kwargs):
-    from sgl_kernel.spatial import create_greenctx_stream_by_value as _impl
+# Dynamically select spatial library based on GPU architecture
+def _select_spatial_ops():
+    """Select the appropriate spatial_ops library based on GPU architecture."""
+    if torch.cuda.is_available():
+        try:
+            major, minor = torch.cuda.get_device_capability(0)
+            compute_cap = major * 10 + minor
 
-    return _impl(*args, **kwargs)
+            if compute_cap == 90:  # SM90 (H100, H800)
+                try:
+                    from sgl_kernel import spatial_ops_sm90 as spatial_ops
+                    return spatial_ops
+                except ImportError:
+                    pass
+
+            # For SM100+ or if SM90 version fails, use SM100+ version
+            try:
+                from sgl_kernel import spatial_ops_sm100 as spatial_ops
+                return spatial_ops
+            except ImportError:
+                pass
+
+        except Exception:
+            pass
+
+    # Fallback: try importing either version
+    try:
+        from sgl_kernel import spatial_ops_sm100 as spatial_ops
+        return spatial_ops
+    except ImportError:
+        try:
+            from sgl_kernel import spatial_ops_sm90 as spatial_ops
+            return spatial_ops
+        except ImportError:
+            raise ImportError("Could not import any spatial_ops library variant")
+
+def create_greenctx_stream_by_value(*args, **kwargs):
+    spatial_ops = _select_spatial_ops()
+    return spatial_ops.create_greenctx_stream_by_value(*args, **kwargs)
 
 
 def get_sm_available(*args, **kwargs):
-    from sgl_kernel.spatial import get_sm_available as _impl
-
-    return _impl(*args, **kwargs)
+    spatial_ops = _select_spatial_ops()
+    return spatial_ops.get_sm_available(*args, **kwargs)

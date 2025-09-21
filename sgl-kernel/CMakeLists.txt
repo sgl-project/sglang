@@ -223,28 +223,26 @@ endif()
 # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_120a,code=sm_120a"
         "-gencode=arch=compute_103a,code=sm_103a"
         "-gencode=arch=compute_110a,code=sm_110a"
         "-gencode=arch=compute_121a,code=sm_121a"
         "--compress-mode=size"
     )
-elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
+endif()
+
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"
         "-gencode=arch=compute_101a,code=sm_101a"
     )
-else()
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_90a,code=sm_90a"
-        "-use_fast_math"
-    )
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     set(SGL_KERNEL_ENABLE_FA3 ON)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_90a,code=sm_90a"
+    )
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
@@ -328,10 +326,21 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
-Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+# Build common_ops_sm90 with fast math for SM90 optimization
+Python_add_library(common_ops_sm90 MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-target_include_directories(common_ops PRIVATE
+target_compile_options(common_ops_sm90 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>)
+target_include_directories(common_ops_sm90 PRIVATE
+    ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
+    ${repo-cutlass_SOURCE_DIR}/examples/common
+    ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
+)
+
+# Build common_ops_sm100 without fast math for full precision
+Python_add_library(common_ops_sm100 MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+
+target_compile_options(common_ops_sm100 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+target_include_directories(common_ops_sm100 PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
@@ -361,16 +370,24 @@ add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+# Configure both common_ops libraries
+target_link_libraries(common_ops_sm90 PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops_sm100 PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
 # flash attention
-target_compile_definitions(common_ops PRIVATE
+target_compile_definitions(common_ops_sm90 PRIVATE
+    FLASHATTENTION_DISABLE_BACKWARD
+    FLASHATTENTION_DISABLE_DROPOUT
+    FLASHATTENTION_DISABLE_UNEVEN_K
+)
+target_compile_definitions(common_ops_sm100 PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
 )
 
-install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
+install(TARGETS common_ops_sm90 LIBRARY DESTINATION sgl_kernel)
+install(TARGETS common_ops_sm100 LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file
@@ -465,10 +482,17 @@ set(SPATIAL_SOURCES
     "csrc/spatial_extension.cc"
 )
 
-Python_add_library(spatial_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SPATIAL_SOURCES})
-target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
-install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
+# Build spatial_ops_sm90 with fast math for SM90 optimization
+Python_add_library(spatial_ops_sm90 MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SPATIAL_SOURCES})
+target_compile_options(spatial_ops_sm90 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>)
+target_link_libraries(spatial_ops_sm90 PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+install(TARGETS spatial_ops_sm90 LIBRARY DESTINATION sgl_kernel)
+
+# Build spatial_ops_sm100 without fast math for full precision
+Python_add_library(spatial_ops_sm100 MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SPATIAL_SOURCES})
+target_compile_options(spatial_ops_sm100 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+target_link_libraries(spatial_ops_sm100 PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+install(TARGETS spatial_ops_sm100 LIBRARY DESTINATION sgl_kernel)
 
 
 # ============================ DeepGEMM (JIT) ============================= #
@@ -478,20 +502,37 @@ set(DEEPGEMM_SOURCES
     "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
 )
 
-Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
+# Build deep_gemm_cpp_sm90 with fast math for SM90 optimization
+Python_add_library(deep_gemm_cpp_sm90 MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
 
 # Link against necessary libraries, including nvrtc for JIT compilation.
-target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
+target_link_libraries(deep_gemm_cpp_sm90 PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
 
 # Add include directories needed by DeepGEMM.
-target_include_directories(deep_gemm_cpp PRIVATE
+target_include_directories(deep_gemm_cpp_sm90 PRIVATE
     ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-fmt_SOURCE_DIR}/include
 )
 
-# Apply the same compile options as common_ops.
-target_compile_options(deep_gemm_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+# Apply compile options with fast math.
+target_compile_options(deep_gemm_cpp_sm90 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>)
+
+# Build deep_gemm_cpp_sm100 without fast math for full precision
+Python_add_library(deep_gemm_cpp_sm100 MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
+
+# Link against necessary libraries, including nvrtc for JIT compilation.
+target_link_libraries(deep_gemm_cpp_sm100 PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
+
+# Add include directories needed by DeepGEMM.
+target_include_directories(deep_gemm_cpp_sm100 PRIVATE
+    ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
+    ${repo-cutlass_SOURCE_DIR}/include
+    ${repo-fmt_SOURCE_DIR}/include
+)
+
+# Apply compile options without fast math.
+target_compile_options(deep_gemm_cpp_sm100 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 
 # Create an empty __init__.py to make `deepgemm` a Python package.
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
@@ -501,8 +542,9 @@ install(
     RENAME __init__.py
 )
 
-# Install the compiled DeepGEMM API library.
-install(TARGETS deep_gemm_cpp LIBRARY DESTINATION deep_gemm)
+# Install the compiled DeepGEMM API libraries.
+install(TARGETS deep_gemm_cpp_sm90 LIBRARY DESTINATION deep_gemm)
+install(TARGETS deep_gemm_cpp_sm100 LIBRARY DESTINATION deep_gemm)
 
 # Install the source files required by DeepGEMM for runtime JIT compilation.
 install(
