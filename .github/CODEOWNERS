@@ -16,7 +16,7 @@
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
-/python/sglang/srt/mem_cache/allocator_ascend.py @ping1jing2 @iforgetmyname
+/python/sglang/srt/mem_cache/allocator_ascend.py @ping1jing2
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock
 /python/sglang/srt/model_executor/npu_graph_runner.py @ping1jing2
 /python/sglang/srt/multimodal @mickqian @JustinTong0323
