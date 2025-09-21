@@ -103,6 +103,9 @@ tokio-postgres = { version = "0.7.15", features = ["runtime","with-chrono-0_4","
 deadpool-postgres = "0.14.1"
 
 
+# wasm dependencies
+sha2 = "0.10"
+
 [build-dependencies]
 tonic-prost-build = "0.14.2"
 prost-build = "0.14.1"
