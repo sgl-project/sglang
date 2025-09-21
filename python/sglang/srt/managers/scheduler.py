@@ -337,6 +337,8 @@ class Scheduler(
                     ],
                     True,
                 )
+                # Set 1-second timeout for periodic maintenance
+                self.pp_idle_wakeup_listener_socket.setsockopt(zmq.RCVTIMEO, 1000)
 
             # Notify with wake signals
             if (
@@ -1140,7 +1142,10 @@ class Scheduler(
             if self.attn_tp_rank == 0:
                 # Wait for wake signal
                 if self.pp_idle_wakeup_listener_socket:
-                    self.pp_idle_wakeup_listener_socket.recv()
+                    try:
+                        self.pp_idle_wakeup_listener_socket.recv()
+                    except zmq.Again:
+                        return []
 
                 # There is work to be done now
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
