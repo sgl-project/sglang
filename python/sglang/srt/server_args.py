@@ -602,8 +602,8 @@ class ServerArgs:
                 # Default fallback
                 self.cuda_graph_max_bs = 160
 
-            if self.cuda_graph_bs is None:
-                self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes(gpu_mem)
+        if self.cuda_graph_bs is None:
+            self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes(gpu_mem)
 
     def _generate_cuda_graph_batch_sizes(self, gpu_mem):
         """
