@@ -9,7 +9,12 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["set_batch_invariant_mode", "is_batch_invariant_mode_enabled", "disable_batch_invariant_mode", "enable_batch_invariant_mode"]
+__all__ = [
+    "set_batch_invariant_mode",
+    "is_batch_invariant_mode_enabled",
+    "disable_batch_invariant_mode",
+    "enable_batch_invariant_mode",
+]
 
 
 def _matmul_launch_metadata(
@@ -78,7 +83,9 @@ def matmul_kernel_persistent(
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        pid_m, pid_n = _compute_pid(
+            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
         offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
@@ -98,15 +105,25 @@ def matmul_kernel_persistent(
                 offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
             else:
                 offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-            a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-            b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+            a_ptrs = a_ptr + (
+                offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            )
 
-            a = tl.load(a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0)
+            a = tl.load(
+                a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0
+            )
+            b = tl.load(
+                b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
+            )
             accumulator = tl.dot(a, b, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        pid_m, pid_n = _compute_pid(
+            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         if C_LARGE:
@@ -125,13 +142,15 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
+def matmul_persistent(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert bias is None or bias.dim() == 1, (
-        "Currently assuming bias is 1D, let Horace know if you run into this"
-    )
+    assert (
+        bias is None or bias.dim() == 1
+    ), "Currently assuming bias is 1D, let Horace know if you run into this"
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     M, K = a.shape
     K, N = b.shape
@@ -143,7 +162,9 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
     def grid(META):
         return (
             min(
-                NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])
+                NUM_SMS,
+                triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
             ),
         )
 
@@ -273,7 +294,9 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
         Tensor with log_softmax applied along the specified dimension
     """
     if dim != -1 and dim != input.ndim - 1:
-        raise ValueError("This implementation only supports log_softmax along the last dimension")
+        raise ValueError(
+            "This implementation only supports log_softmax along the last dimension"
+        )
 
     # Flatten all dimensions except the last one
     original_shape = input.shape
@@ -338,7 +361,9 @@ def mean_kernel(
         mask = n_offsets < N
 
         # Calculate input indices
-        input_idx = m_idx * input_stride0 + n_offsets * input_stride1 + k_idx * input_stride2
+        input_idx = (
+            m_idx * input_stride0 + n_offsets * input_stride1 + k_idx * input_stride2
+        )
 
         # Load and accumulate
         vals = tl.load(input_ptr + input_idx, mask=mask, other=0.0)
@@ -351,7 +376,10 @@ def mean_kernel(
 
 
 def mean_dim(
-    input: torch.Tensor, dim: int, keepdim: bool = False, dtype: torch.dtype | None = None
+    input: torch.Tensor,
+    dim: int,
+    keepdim: bool = False,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
     Triton implementation of torch.mean with single dimension reduction.
@@ -367,9 +395,9 @@ def mean_dim(
     """
     # Validate inputs
     assert input.is_cuda, "Input must be a CUDA tensor"
-    assert -input.ndim <= dim < input.ndim, (
-        f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
-    )
+    assert (
+        -input.ndim <= dim < input.ndim
+    ), f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
 
     # Handle negative dim
     if dim < 0:
@@ -458,9 +486,11 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
     else:
-        assert input.dtype in {torch.float16, torch.bfloat16, torch.float32}, (
-            "only float types supported for now"
-        )
+        assert input.dtype in {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        }, "only float types supported for now"
         n_elems = 1
         for d in dim:
             n_elems *= input.shape[d]
@@ -484,7 +514,9 @@ def enable_batch_invariant_mode():
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
     _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "CUDA")
     _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "CUDA")
-    _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, "CUDA")
+    _batch_invariant_LIB.impl(
+        "aten::_log_softmax", _log_softmax_batch_invariant, "CUDA"
+    )
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, "CUDA")
 
 
