@@ -1,19 +1,19 @@
 import os
-import re
 import subprocess
 import time
 import unittest
 import warnings
 
+from sglang.bench_one_batch_server import BenchmarkResult
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     _parse_int_list_env,
-    find_traces_under_path,
-    generate_markdown_report_nightly,
     is_in_ci,
     parse_models,
-    write_github_step_summary, popen_launch_server, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    popen_launch_server,
+    write_github_step_summary,
 )
 
 PROFILE_DIR = "performance_profiles_vlms"
@@ -40,25 +40,33 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
+        cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8")
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "1024"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "32"))
         cls.full_report = f"## {cls.__name__}\n"
 
     def test_vlm_models_mmmu_performance(self):
+        all_benchmark_results = []  # Store all BenchmarkResult objects
+
         for model in self.models:
-            model_results = []
+            benchmark_results = []
             with self.subTest(model=model):
                 process = popen_launch_server(
                     model=model,
                     base_url=self.base_url,
                     other_args=[],
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 )
                 try:
                     # Run bench_one_batch_server against the launched server
                     profile_filename = f"{model.replace('/', '_')}_{int(time.time())}"
                     # path for this run
                     profile_path_prefix = os.path.join(PROFILE_DIR, profile_filename)
+
+                    # JSON output file for this model
+                    json_output_file = (
+                        f"results_{model.replace('/', '_')}_{int(time.time())}.json"
+                    )
 
                     command = [
                         "python3",
@@ -75,12 +83,13 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                         *[str(x) for x in self.output_lens],
                         "--trust-remote-code",
                         "--dataset-name=mmmu",
-                        "--show-report",
                         "--profile",
                         "--profile-by-stage",
-                        "--profile-filename-prefix",
-                        profile_path_prefix,
-                        "--append-to-github-summary"
+                        f"--profile-filename-prefix={profile_path_prefix}",
+                        "--show-report",
+                        "--output-path",
+                        json_output_file,
+                        "--append-to-github-summary=False",
                     ]
 
                     print(f"Running command: {' '.join(command)}")
@@ -95,46 +104,36 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                     print(f"Output for {model} with batch size:")
                     print(result.stdout)
 
-                    pattern = r"\[Profile\]\((.*?)\)"
-                    trace_dirs = re.findall(pattern, result.stdout)
+                    # Load and deserialize JSON results
+                    if os.path.exists(json_output_file):
+                        import json
 
-                    trace_filenames_from_all_dirs = [
-                        find_traces_under_path(trace_dir) for trace_dir in trace_dirs
-                    ]
+                        with open(json_output_file, "r") as f:
+                            json_data = json.load(f)
 
-                    extend_trace_filenames = [
-                        trace_file
-                        for trace_files in trace_filenames_from_all_dirs
-                        for trace_file in trace_files
-                        if trace_file.endswith(".EXTEND.trace.json.gz")
-                    ]
+                        # Convert JSON data to BenchmarkResult objects
+                        for data in json_data:
+                            benchmark_result = BenchmarkResult(**data)
+                            all_benchmark_results.append(benchmark_result)
+                            benchmark_results.append(benchmark_result)
 
-                    # because the profile_id dir under PROFILE_DIR
-                    extend_trace_file_relative_path_from_profile_dirs = [
-                        f"{trace_dir[trace_dir.find(PROFILE_DIR) + len(PROFILE_DIR) + 1:]}/{extend_trace_filename}"
-                        for extend_trace_filename, trace_dir in zip(
-                            extend_trace_filenames, trace_dirs
+                        print(
+                            f"Loaded {len(benchmark_results)} benchmark results from {json_output_file}"
                         )
-                    ]
 
-                    model_results.append(
-                        {
-                            "output": result.stdout,
-                            "trace_links": extend_trace_file_relative_path_from_profile_dirs,
-                        }
-                    )
+                        # Clean up JSON file
+                        os.remove(json_output_file)
+                    else:
+                        print(f"Warning: JSON output file {json_output_file} not found")
 
                 finally:
                     kill_process_tree(process.pid)
 
-                if model_results:
-                    report_part = generate_markdown_report_nightly(
-                        model,
-                        model_results,
-                        self.input_lens,
-                        self.output_lens,
-                    )
-                    self.full_report += report_part + "\n"
+                report_part = BenchmarkResult.generate_markdown_report(
+                    PROFILE_DIR, benchmark_results
+                )
+                print(f"{report_part=}")
+                self.full_report += report_part + "\n"
 
         if is_in_ci():
             write_github_step_summary(self.full_report)

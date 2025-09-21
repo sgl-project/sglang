@@ -10,10 +10,12 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    check_model_scores,
+    check_evaluation_test_results,
     parse_models,
-    write_results_to_json, popen_launch_server, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    popen_launch_server,
+    write_results_to_json,
 )
 
 MODEL_SCORE_THRESHOLDS = {
@@ -65,7 +67,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         model=model,
                         base_url=self.base_url,
                         other_args=["--tp", "2"] if is_tp2 else [],
-                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                     )
 
                     args = SimpleNamespace(
@@ -96,7 +98,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             print(f"Error reading results.json: {e}")
 
         # Check all scores after collecting all results
-        check_model_scores(
+        check_evaluation_test_results(
             all_results,
             self.__class__.__name__,
             model_accuracy_thresholds=MODEL_SCORE_THRESHOLDS,

@@ -47,36 +47,20 @@ jobs:
       - name: Run performance test for text models
         timeout-minutes: 180
         env:
-          TRACE_BASE_URL: https://huggingface.co/Miiiick/ci-data/resolve/main/traces/${{ github.run_id }}
+          TRACE_BASE_URL: https://github.com/sgl-project/ci-data/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
           rm -rf test/srt/performance_profiles_text_models/
           cd test/srt
           python3 test_nightly_text_models_perf.py
 
-      - name: Checkout storage repo (Hugging Face)
-        uses: actions/checkout@v4
-        with:
-          repository: Miiiick/ci-data
-          token: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
-          path: nightly-storage
-
       - name: Publish traces to storage repo
+        env:
+          GH_PAT_FOR_DOCUMENTATION: ${{ secrets.GH_PAT_FOR_DOCUMENTATION }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          mkdir -p nightly-storage/traces/${{ github.run_id }}
-          if [ -d test/srt/performance_profiles_text_models ]; then
-            rsync -av --include='/' --include='.json.gz' --exclude='' test/srt/performance_profiles_text_models/ nightly-storage/traces/${{ github.run_id }}/
-          fi
-          cd nightly-storage
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add .
-            git commit -m "Nightly traces for run ${{ github.run_id }} at ${{ github.run_number }}"
-            git push origin HEAD:main
-          else
-            echo "No changes to commit"
-          fi
+          python3 scripts/ci/publish_traces.py
 
   nightly-test-eval-vlm-models:
     if: github.repository == 'sgl-project/sglang'
@@ -93,7 +77,7 @@ jobs:
         timeout-minutes: 240
         run: |
           cd test/srt
-          python3 test_nightly_vlm_mmmu_eval.py
+          python3 test_nightly_vlms_mmmu_eval.py
 
 
   nightly-test-perf-vlm-models:
@@ -106,48 +90,22 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_dependency.sh
-          apt-get install rsync -y
-          apt install git-lfs
 
       - name: Run perf test for VLM models (MMMU)
         timeout-minutes: 240
         env:
-          TRACE_BASE_URL: https://huggingface.co/Miiiick/ci-data/resolve/main/traces/${{ github.run_id }}
+          TRACE_BASE_URL: https://raw.githubusercontent.com/mickqian/SGLang-test-nightly/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
+          pwd
           rm -rf test/srt/performance_profiles_vlms/
-          cd test/srt
-          python3 test_nightly_vlm_models_perf.py
-
-#      - name: Checkout storage repo (Hugging Face)
-#        uses: actions/checkout@v4
-#        with:
-#          repository: Miiiick/ci-data
-#          token: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
-#          path: nightly-storage
-
-      - name: Checkout storage repo (Hugging Face)
-        run: |
-          git lfs install
-          git lfs track "*.gz"
-          git clone https://huggingface.co/Miiiick/ci-data nightly-storage
-          # git -C nightly-storage config --unset-all http.https://huggingface.co/.extraHeader || true
+          python3 test/srt/test_nightly_vlms_perf.py
 
       - name: Publish traces to storage repo
         env:
-          HF_TOKEN: ${{ secrets.NIGHTLY_PUSH_TOKEN }}
+          GH_PAT_FOR_DOCUMENTATION: ${{ secrets.TMP_NIGHTLY_CI_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          mkdir -p nightly-storage/traces/${{ github.run_id }}
-          if [ -d test/srt/performance_profiles_vlms ]; then
-            rsync -av --include='/' --include='.json.gz' --exclude='' test/srt/performance_profiles_vlms/ nightly-storage/traces/${{ github.run_id }}/
-          fi
-          cd nightly-storage
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add .
-            git commit -m "Nightly traces for run ${{ github.run_id }} at ${{ github.run_number }}"
-            git push https://github-actions[bot]:$HF_TOKEN@huggingface.co/Miiiick/ci-data main
-          else
-            echo "No changes to commit"
-          fi
+          pwd
+          python3 scripts/ci/publish_traces.py --vlm

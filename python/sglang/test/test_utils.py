@@ -186,9 +186,9 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt):]
+        pred = res.json()["text"][0][len(prompt) :]
     else:
-        pred = [x[len(prompt):] for x in res.json()["text"]]
+        pred = [x[len(prompt) :] for x in res.json()["text"]]
     return pred
 
 
@@ -208,9 +208,9 @@ def call_generate_outlines(
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt):]
+        pred = res.json()["text"][0][len(prompt) :]
     else:
-        pred = [x[len(prompt):] for x in res.json()["text"]]
+        pred = [x[len(prompt) :] for x in res.json()["text"]]
     return pred
 
 
@@ -244,12 +244,12 @@ def call_generate_guidance(
             model
             + prompt
             + gen(
-            name="answer",
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=stop,
-            regex=regex,
-        )
+                name="answer",
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop=stop,
+                regex=regex,
+            )
         )
         rets.append(out["answer"])
     return rets if n > 1 else rets[0]
@@ -1333,8 +1333,8 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                             if (
                                 res["meta_info"]["output_top_logprobs"][i][rank][0]
                                 == res["meta_info"]["output_top_logprobs"][i][rank + 1][
-                                0
-                            ]
+                                    0
+                                ]
                             ):
                                 rank += 1
                             else:
@@ -1488,64 +1488,6 @@ class ModelEvalMetrics:
         self.eval_time = eval_time
 
 
-# results are from `bench_one_batch_server.py`
-def generate_markdown_report_nightly(model, results, input_len, output_len):
-    summary = f"### {model}\n"
-    summary += f"Input lens: {input_len}. Output lens: {output_len}.\n"
-    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile |\n"
-    summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
-
-    base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
-
-    # Optional: a relay page that fetches the trace and postMessages it to Perfetto UI.
-    # See: https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui
-    relay_base = os.getenv("PERFETTO_RELAY_URL", "").rstrip("/")
-    for result in results:
-        # Extract the metrics row that bench_one_batch_server prints (without the profile column)
-        metrics = re.search(
-            r"\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*(?:n/a|[\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|",
-            result["output"],
-        )
-
-        filenames = result.get("trace_links")
-        print(f"{filenames=}")
-
-        filenames_iter = iter(filenames)
-        if metrics:
-            for line in result["output"].splitlines():
-                # for line in metrics.group(0).splitlines():
-                if (
-                    line.startswith("|")
-                    and "batch size" not in line
-                    and "--" not in line
-                ):
-                    # find the data lines
-                    # Reconstruct the row and append a placeholder artifact link for profile
-                    parts = [part.strip() for part in line.split("|") if part.strip()]
-
-                    print(f"{line=}")
-                    try:
-                        raw_link = f"{base_url}/{next(filenames_iter)}"
-
-                        # Preferred (per Perfetto docs): send users to a relay that opens Perfetto and postMessages the trace buffer
-                        relay_link = (
-                            f"{relay_base}?src={quote(raw_link, safe='')}"
-                            if quote
-                            else f"{relay_base}?src={raw_link}"
-                        )
-                    except StopIteration as e:
-                        relay_link = None
-                        pass
-
-                    if relay_link:
-                        row = f"| {' | '.join(parts[:-1])} | [trace]({relay_link}) |\n"
-                    else:
-                        row = f"| {' | '.join(parts[:-1])} | NA | \n"
-
-                    summary += row
-    return summary
-
-
 def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:
     match = re.search(r"\[Profile\]\((.*?)\)", output)
     if match:
@@ -1558,7 +1500,7 @@ def parse_models(model_string: str):
     return [model.strip() for model in model_string.split(",") if model.strip()]
 
 
-def check_model_scores(
+def check_evaluation_test_results(
     results,
     test_name,
     model_accuracy_thresholds,

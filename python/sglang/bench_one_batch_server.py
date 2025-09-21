@@ -9,6 +9,7 @@ python3 -m sglang.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B --
 
 python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
 python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
+python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --output-path results.json --profile
 """
 
 import argparse
@@ -19,10 +20,11 @@ import multiprocessing
 import os
 import random
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import requests
+from pydantic import BaseModel
 
 from sglang.bench_serving import (
     get_tokenizer,
@@ -34,6 +36,101 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
+
+
+class ProfileLinks(BaseModel):
+    """Pydantic model for profile trace links."""
+
+    extend: Optional[str] = None
+    decode: Optional[str] = None
+
+
+class BenchmarkResult(BaseModel):
+    """Pydantic model for benchmark results table data, for a single isl and osl"""
+
+    model_path: str
+    run_name: str
+    batch_size: int
+    input_len: int
+    output_len: int
+    latency: float
+    ttft: float
+    input_throughput: float
+    output_throughput: float
+    overall_throughput: float
+    last_gen_throughput: float
+    acc_length: Optional[float] = None
+    profile_links: Optional[ProfileLinks] = None
+
+    def to_markdown_row(
+        self, trace_dir, base_url: str = "", relay_base: str = ""
+    ) -> str:
+        """Convert this benchmark result to a markdown table row."""
+        # Calculate costs (assuming H100 pricing for now)
+        hourly_cost_per_gpu = 2  # $2/hour for one H100
+        hourly_cost = hourly_cost_per_gpu * 1  # Assuming tp_size = 1 for simplicity
+        input_util = 0.7
+        accept_length = (
+            round(self.acc_length, 2) if self.acc_length is not None else "n/a"
+        )
+        itl = 1 / (self.output_throughput / self.batch_size) * 1000
+        input_cost = 1e6 / (self.input_throughput * input_util) / 3600 * hourly_cost
+        output_cost = 1e6 / self.output_throughput / 3600 * hourly_cost
+
+        def get_perfetto_relay_link_from_trace_file(trace_file: str):
+            import os
+            from urllib.parse import quote
+
+            rel_path = os.path.relpath(trace_file, trace_dir)
+            raw_file_link = f"{base_url}/{rel_path}"
+            print(f"{raw_file_link=}")
+            relay_link = (
+                f"{relay_base}?src={quote(raw_file_link, safe='')}"
+                if relay_base and quote
+                else raw_file_link
+            )
+            return relay_link
+
+        # Handle profile links
+        profile_link = "NA | NA"
+        if self.profile_links:
+            if self.profile_links.extend or self.profile_links.decode:
+                # Create a combined link or use the first available one
+                trace_files = [self.profile_links.extend, self.profile_links.decode]
+                trace_files_relay_links = [
+                    get_perfetto_relay_link_from_trace_file(trace_file)
+                    for trace_file in trace_files
+                ]
+
+                print(f"{trace_files_relay_links=}")
+                profile_link = " | ".join(trace_files_relay_links)
+
+        # Build the row
+        return f"| {self.batch_size} | {self.input_len} | {self.latency:.2f} | {self.input_throughput:.2f} | {self.output_throughput:.2f} | {accept_length} | {itl:.2f} | {input_cost:.2f} | {output_cost:.2f} | {profile_link} |\n"
+
+    @classmethod
+    def generate_markdown_report(
+        cls, trace_dir, results: List["BenchmarkResult"]
+    ) -> str:
+        """Generate a markdown report from a list of BenchmarkResult object from a single run."""
+        import os
+
+        summary = f"### {results[0].model_path}\n"
+        # all results should share the same isl & osl
+        for result in results:
+            summary += (
+                f"Input lens: {result.input_len}. Output lens: {result.output_len}.\n"
+            )
+            summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile |\n"
+            summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
+
+            base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
+            relay_base = os.getenv("PERFETTO_RELAY_URL", "").rstrip("/")
+            relay_base = "https://docs.sglang.ai/ci-data/pages/perfetto_relay.html"
+            # base_url = "https://github.com/sgl-project/ci-data/traces"
+            summary += result.to_markdown_row(trace_dir, base_url, relay_base)
+
+        return summary
 
 
 @dataclasses.dataclass
@@ -55,10 +152,11 @@ class BenchArgs:
     profile_steps: int = 3
     profile_by_stage: bool = False
     profile_filename_prefix: str = None
-    append_to_github_summary: bool = False
+    append_to_github_summary: bool = True
     dataset_path: str = ""
     parallel_batch: bool = False
     dataset_name: str = "random"
+    output_path: Optional[str] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -117,9 +215,15 @@ class BenchArgs:
         )
         parser.add_argument(
             "--append-to-github-summary",
-            type=str,
-            help="Whether to append the output of this run to github ci summary",
+            type=bool,
+            help="Whether to append the output of this run to github ci summary, True by default",
             default=BenchArgs.append_to_github_summary,
+        )
+        parser.add_argument(
+            "--output-path",
+            type=str,
+            default=BenchArgs.output_path,
+            help="Path to save benchmark results as JSON format. If not specified, results will only be saved to result-filename.",
         )
 
     @classmethod
@@ -332,6 +436,97 @@ def run_one_case(
     )
 
 
+def save_results_as_json(result: List[Tuple], bench_args: BenchArgs, model: str):
+    """Save benchmark results as JSON using Pydantic models."""
+    json_results = []
+
+    # Generate all parameter combinations to match with results
+    param_combinations = list(
+        itertools.product(
+            bench_args.batch_size, bench_args.input_len, bench_args.output_len
+        )
+    )
+
+    for i, (
+        batch_size,
+        latency,
+        ttft,
+        input_throughput,
+        output_throughput,
+        overall_throughput,
+        last_gen_throughput,
+        acc_length,
+        profile_link,
+    ) in enumerate(result):
+        # Get the corresponding parameters for this result
+        bs, input_len, output_len = param_combinations[i]
+
+        # Parse profile links if available
+        profile_links = None
+        if profile_link:
+            profile_links = parse_profile_links(
+                profile_link, batch_size, input_len, output_len
+            )
+            print(f"{profile_links=}")
+
+        benchmark_result = BenchmarkResult(
+            model_path=model,
+            run_name=bench_args.run_name,
+            batch_size=batch_size,
+            input_len=input_len,
+            output_len=output_len,
+            latency=latency,
+            ttft=ttft,
+            input_throughput=input_throughput,
+            output_throughput=output_throughput,
+            overall_throughput=overall_throughput,
+            last_gen_throughput=last_gen_throughput,
+            acc_length=acc_length,
+            profile_links=profile_links,
+        )
+        json_results.append(benchmark_result.model_dump())
+
+    # Save to JSON file
+    with open(bench_args.output_path, "w", encoding="utf-8") as f:
+        json.dump(json_results, f, indent=2, ensure_ascii=False)
+
+    print(f"Results saved as JSON to {bench_args.output_path}")
+
+
+def parse_profile_links(
+    profile_dir: str, batch_size: int, input_len: int, output_len: int
+) -> Optional[ProfileLinks]:
+    """Parse profile directory to extract extend and decode trace file links."""
+    if not profile_dir or not os.path.exists(profile_dir):
+        return None
+
+    extend_link = None
+    decode_link = None
+
+    # Look for extend/prefill trace files
+    for file in os.listdir(profile_dir):
+        if file.endswith(".trace.json.gz") or file.endswith(".trace.json"):
+            if "extend" in file.lower() or "prefill" in file.lower():
+                extend_link = os.path.join(profile_dir, file)
+            elif "decode" in file.lower():
+                decode_link = os.path.join(profile_dir, file)
+
+    # If no specific extend/decode files found, try to find files with batch/input/output info
+    if not extend_link or not decode_link:
+        for file in os.listdir(profile_dir):
+            if file.endswith(".trace.json.gz") or file.endswith(".trace.json"):
+                if f"_batch{batch_size}_input{input_len}_output{output_len}_" in file:
+                    if "prefill" in file.lower() or "extend" in file.lower():
+                        extend_link = os.path.join(profile_dir, file)
+                    elif "decode" in file.lower():
+                        decode_link = os.path.join(profile_dir, file)
+
+    if extend_link or decode_link:
+        return ProfileLinks(extend=extend_link, decode=decode_link)
+
+    return None
+
+
 def get_report_summary(
     result: List[Tuple], server_args: ServerArgs, bench_args: BenchArgs
 ):
@@ -356,15 +551,15 @@ def get_report_summary(
     rows = []
 
     for (
-            batch_size,
-            latency,
-            ttft,
-            input_throughput,
-            output_throughput,
-            _,
-            _,
-            acc_length,
-            trace_link,
+        batch_size,
+        latency,
+        ttft,
+        input_throughput,
+        output_throughput,
+        _,
+        _,
+        acc_length,
+        trace_link,
     ) in result:
         if is_blackwell():
             hourly_cost_per_gpu = 4  # $4/hour for one B200
@@ -397,9 +592,7 @@ def get_report_summary(
     return summary
 
 
-def run_benchmark(
-    server_args: ServerArgs, bench_args: BenchArgs
-):
+def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
     else:
@@ -498,6 +691,10 @@ def run_benchmark(
 
     print(f"\nResults are saved to {bench_args.result_filename}")
 
+    # Save results as JSON if output_path is specified
+    if bench_args.output_path:
+        save_results_as_json(result, bench_args, model=server_args.model_path)
+
     if not bench_args.show_report:
         return
 
@@ -519,6 +716,9 @@ def main():
 
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
+
+    print(f"{server_args=}")
+    print(f"{bench_args=}")
 
     run_benchmark(server_args, bench_args)
 

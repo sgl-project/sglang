@@ -6,11 +6,13 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     ModelDeploySetup,
     ModelEvalMetrics,
-    check_model_scores,
-    write_results_to_json, popen_launch_server, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    check_evaluation_test_results,
+    popen_launch_server,
+    write_results_to_json,
 )
 
 MODEL_THRESHOLDS = {
@@ -57,7 +59,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                     model=model_path,
                     base_url=self.base_url,
                     other_args=model.extra_args,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 )
                 try:
                     args = SimpleNamespace(
@@ -103,7 +105,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
             model.model_path: threshold.eval_time
             for model, threshold in MODEL_THRESHOLDS.items()
         }
-        check_model_scores(
+        check_evaluation_test_results(
             all_results,
             self.__class__.__name__,
             model_accuracy_thresholds=model_accuracy_thresholds,
