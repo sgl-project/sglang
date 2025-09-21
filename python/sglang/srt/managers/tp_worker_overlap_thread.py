@@ -36,25 +36,17 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.overlap_utils import resolve_future_token_ids
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import DynamicGradMode, get_compiler_backend
+from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def resolve_future_token_ids(input_ids, future_token_ids_map):
-    input_ids[:] = torch.where(
-        input_ids < 0,
-        future_token_ids_map[torch.clamp(-input_ids, min=0)],
-        input_ids,
-    )
 
 
 class TpModelWorkerClient:
