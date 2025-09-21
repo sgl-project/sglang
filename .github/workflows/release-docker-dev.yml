@@ -95,7 +95,7 @@ jobs:
       matrix:
         variant:
           - version: 12.9.1
-            type: blackwell
+            type: blackwell_aarch
             tag: blackwell-cu129
     steps:
       - name: Checkout repository

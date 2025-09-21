@@ -87,7 +87,7 @@ jobs:
       matrix:
         variant:
           - cuda_version: '12.9.1'
-            build_type: 'blackwell'
+            build_type: 'blackwell_aarch'
     runs-on: ubuntu-22.04-arm
     steps:
       - name: Delete huge unnecessary tools folder
