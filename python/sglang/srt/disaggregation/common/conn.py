@@ -153,8 +153,8 @@ class CommonKVManager(BaseKVManager):
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
         # pp is not supported on the decode side yet
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
         num_kv_layers = len(src_kv_ptrs) // 2
+        end_layer = start_layer + num_kv_layers
         dst_num_total_layers = len(dst_kv_ptrs) // 2
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
         src_v_ptrs = src_kv_ptrs[num_kv_layers:]
