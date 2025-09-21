@@ -1,10 +1,10 @@
-import base64
 import os
 import pickle
 import time
 from pathlib import Path
 from typing import Any, List, Optional
 
+import pybase64
 import torch
 
 from sglang.srt.utils import MultiprocessingSerializer
@@ -78,14 +78,14 @@ class NaiveDistributed:
             )
 
         _get_path(self._rank).write_text(
-            base64.b64encode(pickle.dumps(obj)).decode("utf-8") + text_postfix
+            pybase64.b64encode(pickle.dumps(obj)).decode("utf-8") + text_postfix
         )
 
         def _read_one(interesting_rank: int):
             p = _get_path(interesting_rank)
             while True:
                 if p.exists() and (text := p.read_text()).endswith(text_postfix):
-                    return pickle.loads(base64.b64decode(text[: -len(text_postfix)]))
+                    return pickle.loads(pybase64.b64decode(text[: -len(text_postfix)]))
                 time.sleep(0.001)
 
         return [
