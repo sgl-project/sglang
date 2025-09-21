@@ -6,7 +6,6 @@ python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-
 python3 llava_onevision_server.py
 """
 
-import base64
 import io
 import os
 import sys
@@ -14,6 +13,7 @@ import time
 
 import numpy as np
 import openai
+import pybase64
 import requests
 from decord import VideoReader, cpu
 from PIL import Image
@@ -213,7 +213,7 @@ def prepare_video_messages(video_path):
         pil_img = Image.fromarray(frame)
         buff = io.BytesIO()
         pil_img.save(buff, format="JPEG")
-        base64_str = base64.b64encode(buff.getvalue()).decode("utf-8")
+        base64_str = pybase64.b64encode(buff.getvalue()).decode("utf-8")
         base64_frames.append(base64_str)
 
     messages = [{"role": "user", "content": []}]

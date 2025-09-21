@@ -12,7 +12,6 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
-import base64
 import io
 import json
 import os
@@ -32,7 +31,10 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
+import pybase64
 import requests
+from datasets import load_dataset
+from PIL import Image
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoTokenizer,
@@ -936,14 +938,6 @@ def sample_mmmu_requests(
     Returns:
         List of tuples (prompt, prompt_token_len, output_token_len).
     """
-    try:
-        import io
-
-        import pybase64
-        from datasets import load_dataset
-    except ImportError:
-        raise ImportError("Please install datasets: pip install datasets")
-
     print("Loading MMMU dataset from HuggingFace...")
 
     try:
@@ -1293,13 +1287,6 @@ def sample_random_image_requests(
     - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
       only counts text tokens and excludes image data.
     """
-    try:
-        import pybase64
-        from PIL import Image
-    except ImportError as e:
-        raise ImportError(
-            "Please install Pillow to generate random images: pip install pillow"
-        ) from e
 
     # Parse resolution (supports presets and 'heightxwidth')
     width, height = parse_random_image_resolution(image_resolution)
