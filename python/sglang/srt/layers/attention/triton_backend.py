@@ -171,7 +171,7 @@ class TritonAttnBackend(AttentionBackend):
         ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
 
         # Legacy dynamic splitting logic (non-deterministic)
-        if self.static_kv_splits or self.device_core_count <= 0:
+        if (self.static_kv_splits or self.device_core_count <= 0) and not self.enable_deterministic:
             num_kv_splits.fill_(self.max_kv_splits)
             return
 
