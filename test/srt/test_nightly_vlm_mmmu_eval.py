@@ -10,8 +10,7 @@ from sglang.test.test_utils import (
     ModelDeploySetup,
     ModelEvalMetrics,
     check_model_scores,
-    popen_launch_server_wrapper,
-    write_results_to_json,
+    write_results_to_json, popen_launch_server, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
 )
 
 MODEL_THRESHOLDS = {
@@ -54,8 +53,11 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
         for model in self.models:
             model_path = model.model_path
             with self.subTest(model=model_path):
-                process = popen_launch_server_wrapper(
-                    self.base_url, model_path, extra_args=model.extra_args
+                process = popen_launch_server(
+                    model=model_path,
+                    base_url=self.base_url,
+                    other_args=model.extra_args,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
                 )
                 try:
                     args = SimpleNamespace(

@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     parse_models,
     popen_launch_server_wrapper,
-    write_github_step_summary,
+    write_github_step_summary, popen_launch_server, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
 )
 
 PROFILE_DIR = "performance_profiles_text_models"
@@ -45,8 +45,11 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
-                    process = popen_launch_server_wrapper(
-                        self.base_url, model, "", ["--tp", "2"] if is_tp2 else []
+                    process = popen_launch_server(
+                        model=model,
+                        base_url=self.base_url,
+                        other_args=["--tp", "2"] if is_tp2 else [],
+                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
                     )
                     try:
 
@@ -78,6 +81,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                             "--profile-by-stage",
                             "--profile-filename-prefix",
                             profile_path_prefix,
+                            "--append-to-github-summary"
                         ]
 
                         print(f"Running command: {' '.join(command)}")

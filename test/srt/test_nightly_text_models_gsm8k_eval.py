@@ -13,8 +13,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     check_model_scores,
     parse_models,
-    popen_launch_server_wrapper,
-    write_results_to_json,
+    write_results_to_json, popen_launch_server, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
 )
 
 MODEL_SCORE_THRESHOLDS = {
@@ -62,8 +61,11 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             for model in model_group:
                 model_count += 1
                 with self.subTest(model=model):
-                    process = popen_launch_server_wrapper(
-                        self.base_url, model, "", ["--tp", "2"] if is_tp2 else []
+                    process = popen_launch_server(
+                        model=model,
+                        base_url=self.base_url,
+                        other_args=["--tp", "2"] if is_tp2 else [],
+                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
                     )
 
                     args = SimpleNamespace(

@@ -55,9 +55,10 @@ class BenchArgs:
     profile_steps: int = 3
     profile_by_stage: bool = False
     profile_filename_prefix: str = None
+    append_to_github_summary: bool = False
     dataset_path: str = ""
     parallel_batch: bool = False
-    dataset_name: str = ""
+    dataset_name: str = "random"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -76,8 +77,8 @@ class BenchArgs:
         parser.add_argument(
             "--dataset-name",
             type=str,
-            default="",
-            choices=["mmmu"],
+            default=BenchArgs.dataset_name,
+            choices=["mmmu", "random"],
             help="Name of the dataset to benchmark on.",
         )
         parser.add_argument("--return-logprob", action="store_true")
@@ -113,6 +114,12 @@ class BenchArgs:
             "--profile-filename-prefix",
             type=str,
             default=BenchArgs.profile_filename_prefix,
+        )
+        parser.add_argument(
+            "--append-to-github-summary",
+            type=str,
+            help="Whether to append the output of this run to github ci summary",
+            default=BenchArgs.append_to_github_summary,
         )
 
     @classmethod
@@ -349,15 +356,15 @@ def get_report_summary(
     rows = []
 
     for (
-        batch_size,
-        latency,
-        ttft,
-        input_throughput,
-        output_throughput,
-        _,
-        _,
-        acc_length,
-        trace_link,
+            batch_size,
+            latency,
+            ttft,
+            input_throughput,
+            output_throughput,
+            _,
+            _,
+            acc_length,
+            trace_link,
     ) in result:
         if is_blackwell():
             hourly_cost_per_gpu = 4  # $4/hour for one B200
@@ -391,7 +398,7 @@ def get_report_summary(
 
 
 def run_benchmark(
-    server_args: ServerArgs, bench_args: BenchArgs, append_to_summary: bool = True
+    server_args: ServerArgs, bench_args: BenchArgs
 ):
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
@@ -497,7 +504,7 @@ def run_benchmark(
     summary = get_report_summary(result, server_args, bench_args)
     print(summary)
 
-    if is_in_ci() and append_to_summary:
+    if is_in_ci() and bench_args.append_to_github_summary:
         write_github_step_summary(summary)
 
 
@@ -513,7 +520,7 @@ def main():
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 
-    run_benchmark(server_args, bench_args, append_to_summary=False)
+    run_benchmark(server_args, bench_args)
 
 
 if __name__ == "__main__":

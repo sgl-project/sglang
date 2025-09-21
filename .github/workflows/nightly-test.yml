@@ -42,8 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_dependency.sh
-          apt-get install rsync -y
-          apt install git-lfs
+
 
       - name: Run performance test for text models
         timeout-minutes: 180

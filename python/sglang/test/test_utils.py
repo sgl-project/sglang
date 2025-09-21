@@ -186,9 +186,9 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
+        pred = res.json()["text"][0][len(prompt):]
     else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
+        pred = [x[len(prompt):] for x in res.json()["text"]]
     return pred
 
 
@@ -208,9 +208,9 @@ def call_generate_outlines(
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
+        pred = res.json()["text"][0][len(prompt):]
     else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
+        pred = [x[len(prompt):] for x in res.json()["text"]]
     return pred
 
 
@@ -244,12 +244,12 @@ def call_generate_guidance(
             model
             + prompt
             + gen(
-                name="answer",
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-                regex=regex,
-            )
+            name="answer",
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+            regex=regex,
+        )
         )
         rets.append(out["answer"])
     return rets if n > 1 else rets[0]
@@ -1333,8 +1333,8 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                             if (
                                 res["meta_info"]["output_top_logprobs"][i][rank][0]
                                 == res["meta_info"]["output_top_logprobs"][i][rank + 1][
-                                    0
-                                ]
+                                0
+                            ]
                             ):
                                 rank += 1
                             else:
@@ -1476,6 +1476,9 @@ class ModelDeploySetup:
         self.model_path = model_path
         if "--enable-multimodal" not in extra_args:
             extra_args.append("--enable-multimodal")
+        if "--trust-remote-code" not in extra_args:
+            extra_args.append("--trust-remote-code")
+
         self.extra_args = extra_args
 
 
@@ -1627,28 +1630,6 @@ def find_traces_under_path(path: str) -> List[str]:
             if file.endswith(".trace.json.gz"):
                 results.append(f"{file}")
     return results
-
-
-def _extra_args_for_model(extra_args=[]):
-    args = ["--trust-remote-code", "--cuda-graph-max-bs", "4", "--enable-multimodal"]
-    if extra_args:
-        args.extend(extra_args)
-    return args
-
-
-def popen_launch_server_wrapper(
-    base_url: str, model: str, profile_dir: str = "", extra_args=[]
-):
-    other_args = _extra_args_for_model(extra_args)
-    env = os.environ.copy()
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-        env=env,
-    )
-    return process
 
 
 def write_results_to_json(model, metrics, mode="a"):

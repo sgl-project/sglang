@@ -13,8 +13,7 @@ from sglang.test.test_utils import (
     generate_markdown_report_nightly,
     is_in_ci,
     parse_models,
-    popen_launch_server_wrapper,
-    write_github_step_summary,
+    write_github_step_summary, popen_launch_server, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
 )
 
 PROFILE_DIR = "performance_profiles_vlms"
@@ -49,7 +48,12 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         for model in self.models:
             model_results = []
             with self.subTest(model=model):
-                process = popen_launch_server_wrapper(self.base_url, model)
+                process = popen_launch_server(
+                    model=model,
+                    base_url=self.base_url,
+                    other_args=[],
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+                )
                 try:
                     # Run bench_one_batch_server against the launched server
                     profile_filename = f"{model.replace('/', '_')}_{int(time.time())}"
@@ -76,6 +80,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                         "--profile-by-stage",
                         "--profile-filename-prefix",
                         profile_path_prefix,
+                        "--append-to-github-summary"
                     ]
 
                     print(f"Running command: {' '.join(command)}")

@@ -21,6 +21,9 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 # Install apt packages
 apt install -y git libnuma-dev
 
+# For nightly CI
+apt install git-lfs rsync -y
+
 # Install uv
 if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
