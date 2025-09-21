@@ -168,6 +168,7 @@ class TestLogprobsDense(unittest.TestCase):
                 "chunk_size": 256,
                 "max_running_requests": 128,
             },
+            {"num_samples": 42, "chunk_size": 42, "max_running_requests": 128},
         ]
 
         # Combine configs based on environment
