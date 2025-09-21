@@ -19,8 +19,10 @@ pub mod grpc;
 pub mod header_utils;
 pub mod http;
 pub mod router_manager;
+pub mod worker_initializer;
 
 pub use factory::RouterFactory;
+pub use worker_initializer::WorkerInitializer;
 // Re-export HTTP routers for convenience (keeps routers::openai_router path working)
 pub use http::{openai_router, pd_router, pd_types, router};
 
