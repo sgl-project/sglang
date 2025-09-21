@@ -171,9 +171,9 @@ class CommonKVManager(BaseKVManager):
         # pp is not supported on the decode side yet
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + len(src_kv_ptrs)
-        dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         layers_current_pp_stage = len(src_kv_ptrs)
-        return src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage
+        return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
 
 class CommonKVSender(BaseKVSender):
