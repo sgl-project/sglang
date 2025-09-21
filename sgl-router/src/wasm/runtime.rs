@@ -1,14 +1,10 @@
-use crate::wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager};
-use std::collections::HashMap;
+use crate::wasm::config::WasmRuntimeConfig;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
 use wasmtime::{Config, Engine, Instance, Module, Store, Val};
 
 pub struct WasmRuntime {
-    engine: Engine,
     config: WasmRuntimeConfig,
-    module_manager: Arc<WasmModuleManager>,
     thread_pool: Arc<WasmThreadPool>,
 }
 
@@ -18,38 +14,20 @@ pub struct WasmThreadPool {
 }
 
 pub enum WasmTask {
-    ExecuteModule {
-        module_uuid: Uuid,
+    ExecuteWasmModule {
+        wasm_bytes: Vec<u8>,
         function_name: String,
         args: Vec<Val>,
         response: oneshot::Sender<Result<Vec<Val>, String>>,
-    },
-    LoadModule {
-        module_uuid: Uuid,
-        wasm_bytes: Vec<u8>,
-        response: oneshot::Sender<Result<(), String>>,
     },
 }
 
 impl WasmRuntime {
     pub fn new(config: WasmRuntimeConfig) -> Result<Self, String> {
-        // create the wasmtime engine config
-        let mut wasmtime_config = Config::new();
-        wasmtime_config.async_stack_size(config.max_stack_size);
-        if config.enable_wasi {
-            wasmtime_config.wasm_component_model(false);
-        }
-
-        let engine = Engine::new(&wasmtime_config)
-            .map_err(|e| format!("Failed to create wasmtime engine: {}", e))?;
-
-        let module_manager = Arc::new(WasmModuleManager::new());
         let thread_pool = Arc::new(WasmThreadPool::new(config.clone())?);
 
         Ok(Self {
-            engine,
             config,
-            module_manager,
             thread_pool,
         })
     }
@@ -60,10 +38,6 @@ impl WasmRuntime {
 
     pub fn get_config(&self) -> &WasmRuntimeConfig {
         &self.config
-    }
-
-    pub fn get_module_manager(&self) -> &Arc<WasmModuleManager> {
-        &self.module_manager
     }
 
     /// get available cpu count and max recommended cpu count
@@ -82,17 +56,17 @@ impl WasmRuntime {
         (current_workers, max_recommended)
     }
 
-    // async execute wasm module
-    pub async fn execute_module_async(
+    // async execute wasm bytes directly
+    pub async fn execute_wasm_module_async(
         &self,
-        module_uuid: Uuid,
+        wasm_bytes: Vec<u8>,
         function_name: String,
         args: Vec<Val>,
     ) -> Result<Vec<Val>, String> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let task = WasmTask::ExecuteModule {
-            module_uuid,
+        let task = WasmTask::ExecuteWasmModule {
+            wasm_bytes,
             function_name,
             args,
             response: response_tx,
@@ -108,40 +82,16 @@ impl WasmRuntime {
             .map_err(|_| "Failed to receive response from thread pool".to_string())?
     }
 
-    // async load wasm module
-    pub async fn load_module_async(
-        &self,
-        module_uuid: Uuid,
-        wasm_bytes: Vec<u8>,
-    ) -> Result<(), String> {
-        let (response_tx, response_rx) = oneshot::channel();
-
-        let task = WasmTask::LoadModule {
-            module_uuid,
-            wasm_bytes,
-            response: response_tx,
-        };
-
-        self.thread_pool
-            .sender
-            .send(task)
-            .map_err(|_| "Failed to send task to thread pool".to_string())?;
-
-        response_rx
-            .await
-            .map_err(|_| "Failed to receive response from thread pool".to_string())?
-    }
-
     // sync execute method (for simple scenarios)
-    pub fn execute_module_sync(
+    pub fn execute_wasm_sync(
         &self,
-        module_uuid: Uuid,
+        wasm_bytes: Vec<u8>,
         function_name: String,
         args: Vec<Val>,
     ) -> Result<Vec<Val>, String> {
         // use tokio::runtime::Handle::current() to execute in async context
         let handle = tokio::runtime::Handle::current();
-        handle.block_on(self.execute_module_async(module_uuid, function_name, args))
+        handle.block_on(self.execute_wasm_module_async(wasm_bytes, function_name, args))
     }
 }
 
@@ -219,8 +169,7 @@ impl WasmThreadPool {
             }
         };
 
-        // store loaded modules
-        let mut loaded_modules: HashMap<Uuid, Module> = HashMap::new();
+        // no module caching needed for pure execution
 
         loop {
             let task = {
@@ -240,34 +189,17 @@ impl WasmThreadPool {
             };
 
             match task {
-                WasmTask::ExecuteModule {
-                    module_uuid,
+                WasmTask::ExecuteWasmModule {
+                    wasm_bytes,
                     function_name,
                     args,
                     response,
                 } => {
-                    let result = Self::execute_module_in_worker(
+                    let result = Self::execute_wasm_in_worker(
                         &engine,
-                        &mut loaded_modules,
-                        module_uuid,
+                        wasm_bytes,
                         function_name,
                         args,
-                        &config,
-                    )
-                    .await;
-
-                    let _ = response.send(result);
-                }
-                WasmTask::LoadModule {
-                    module_uuid,
-                    wasm_bytes,
-                    response,
-                } => {
-                    let result = Self::load_module_in_worker(
-                        &engine,
-                        &mut loaded_modules,
-                        module_uuid,
-                        wasm_bytes,
                         &config,
                     )
                     .await;
@@ -278,22 +210,20 @@ impl WasmThreadPool {
         }
     }
 
-    async fn execute_module_in_worker(
+    async fn execute_wasm_in_worker(
         engine: &Engine,
-        loaded_modules: &mut HashMap<Uuid, Module>,
-        module_uuid: Uuid,
+        wasm_bytes: Vec<u8>,
         function_name: String,
         args: Vec<Val>,
         config: &WasmRuntimeConfig,
     ) -> Result<Vec<Val>, String> {
-        // get module
-        let module = loaded_modules
-            .get(&module_uuid)
-            .ok_or_else(|| format!("Module {} not found", module_uuid))?;
+        // compile module from bytes
+        let module = Module::new(engine, wasm_bytes)
+            .map_err(|e| format!("Failed to compile module: {}", e))?;
 
         // create store and instance
         let mut store = Store::new(engine, ());
-        let instance = Instance::new(&mut store, module, &[])
+        let instance = Instance::new(&mut store, &module, &[])
             .map_err(|e| format!("Failed to create instance: {}", e))?;
 
         // get function
@@ -314,28 +244,6 @@ impl WasmThreadPool {
         .map_err(|e| format!("Execution failed: {}", e))?;
 
         Ok(results)
-    }
-
-    async fn load_module_in_worker(
-        engine: &Engine,
-        loaded_modules: &mut HashMap<Uuid, Module>,
-        module_uuid: Uuid,
-        wasm_bytes: Vec<u8>,
-        config: &WasmRuntimeConfig,
-    ) -> Result<(), String> {
-        // check cache size limit
-        if loaded_modules.len() >= config.module_cache_size {
-            // remove oldest module (simple LRU implementation)
-            if let Some(oldest_key) = loaded_modules.keys().next().cloned() {
-                loaded_modules.remove(&oldest_key);
-            }
-        }
-
-        let module = Module::new(engine, wasm_bytes)
-            .map_err(|e| format!("Failed to compile module: {}", e))?;
-
-        loaded_modules.insert(module_uuid, module);
-        Ok(())
     }
 }
 
