@@ -175,13 +175,14 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits.fill_(self.max_kv_splits)
             return
 
-        if self.split_tile_size is not None:
+        # deterministic
+        if self.split_tile_size is not None and self.enable_deterministic:
             # expand seq_lens to match num_token 
             if num_group > 1:
                 expanded_seq_lens = seq_lens.repeat_interleave(num_group)
             else:
                 expanded_seq_lens = seq_lens
-                
+            
             num_kv_splits[:] = (
                 expanded_seq_lens + self.split_tile_size - 1
             ) // self.split_tile_size
