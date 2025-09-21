@@ -118,7 +118,7 @@ DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3"]
 
 
 # Allow external code to add more choices
@@ -998,11 +998,13 @@ class ServerArgs:
                     "batch_invariant_ops is not installed. Please install it from https://github.com/thinking-machines-lab/batch_invariant_ops/."
                 )
 
-            # Check some settings
-            self.disable_radix_cache = True
-            logger.warning(
-                "Currently radix cache is disabled for deterministic inference. It will be supported in the future."
-            )
+            # Currently, only FA3 supports radix cache. Support for other backends is in progress
+            if self.attention_backend != "fa3":
+                self.disable_radix_cache = True
+                logger.warning(
+                    "Currently radix cache is disabled for deterministic inference. It will be supported in the future."
+                )
+
             if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
                 raise ValueError(
                     f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
