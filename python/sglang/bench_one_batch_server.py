@@ -215,10 +215,10 @@ class BenchArgs:
             default=BenchArgs.profile_filename_prefix,
         )
         parser.add_argument(
-            "--append-to-github-summary",
-            type=bool,
-            help="Whether to append the output of this run to github ci summary, True by default",
-            default=BenchArgs.append_to_github_summary,
+            "--no-append-to-github-summary",
+            action="store_false",
+            dest="append_to_github_summary",
+            help="Disable appending the output of this run to github ci summary",
         )
         parser.add_argument(
             "--output-path",
@@ -700,8 +700,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         return
 
     summary = get_report_summary(result, server_args, bench_args)
-    print(summary)
-    print(f"{bench_args.append_to_github_summary}")
 
     if is_in_ci() and bench_args.append_to_github_summary:
         write_github_step_summary(summary)

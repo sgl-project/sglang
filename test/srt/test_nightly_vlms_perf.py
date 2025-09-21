@@ -21,7 +21,7 @@ PROFILE_DIR = "performance_profiles_vlms"
 MODEL_DEFAULTS = [
     # Keep conservative defaults. Can be overridden by env NIGHTLY_VLM_MODELS
     "Qwen/Qwen2.5-VL-7B-Instruct",
-    # "google/gemma-3-27b-it",
+    "google/gemma-3-27b-it",
     # "OpenGVLab/InternVL2_5-2B",
     # buggy in official transformers impl
     # "openbmb/MiniCPM-V-2_6",
@@ -54,7 +54,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                 process = popen_launch_server(
                     model=model,
                     base_url=self.base_url,
-                    other_args=[],
+                    other_args=["--mem-fraction-static=0.7"],
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 )
                 try:
@@ -89,7 +89,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                         "--show-report",
                         "--output-path",
                         json_output_file,
-                        "--append-to-github-summary=False",
+                        "--no-append-to-github-summary",
                     ]
 
                     print(f"Running command: {' '.join(command)}")
