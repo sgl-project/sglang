@@ -15,20 +15,24 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
 from functools import lru_cache, partial
-from typing import Callable, Literal, Iterable, List, Optional, Tuple, Union, TypedDict
+from typing import Callable, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from einops import rearrange
 from transformers.activations import ACT2FN
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionRotaryEmbedding
-
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VisionPatchEmbed as Qwen3_VisionPatchEmbed,
+)
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VisionRotaryEmbedding,
+)
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
-    Qwen3VLConfig, Qwen3VLVisionConfig
-    )
-
+    Qwen3VLConfig,
+    Qwen3VLVisionConfig,
+)
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -43,40 +47,15 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.models.qwen2_vl import Qwen2VLVideoInputs
+from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
 # === Vision Encoder === #
 
-class Qwen3_VisionPatchEmbed(nn.Module):
-
-    def __init__(
-        self,
-        patch_size: int = 16,
-        temporal_patch_size: int = 2,
-        in_channels: int = 3,
-        hidden_size: int = 1152,
-    ) -> None:
-        super().__init__()
-        self.patch_size = patch_size
-        self.temporal_patch_size = temporal_patch_size
-        self.hidden_size = hidden_size
-
-        kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = nn.Conv3d(
-            in_channels, hidden_size, kernel_size=kernel_size, stride=kernel_size, bias=True
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        L, C = x.shape
-        x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = self.proj(x).view(L, self.hidden_size)
-        return x
 
 class Qwen3_VisionMLP(nn.Module):
 
@@ -87,7 +66,7 @@ class Qwen3_VisionMLP(nn.Module):
         bias: bool = True,
         hidden_act="silu",
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ):
         super().__init__()
         self.linear_fc1 = ColumnParallelLinear(
@@ -95,14 +74,14 @@ class Qwen3_VisionMLP(nn.Module):
             hidden_features,
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("linear_fc1", prefix)
+            prefix=add_prefix("linear_fc1", prefix),
         )
         self.linear_fc2 = RowParallelLinear(
             hidden_features,
             in_features,
             bias=bias,
             quant_config=quant_config,
-            prefix=add_prefix("linear_fc2", prefix)
+            prefix=add_prefix("linear_fc2", prefix),
         )
         self.act = ACT2FN[hidden_act]
 
@@ -123,7 +102,7 @@ class Qwen3_VisionBlock(nn.Module):
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
         attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -159,7 +138,7 @@ class Qwen3_VisionBlock(nn.Module):
             softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=flatten_batch,
             quant_config=quant_config,
-            prefix=add_prefix("attn", prefix)
+            prefix=add_prefix("attn", prefix),
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -167,14 +146,14 @@ class Qwen3_VisionBlock(nn.Module):
             hidden_act=hidden_act,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp"
+            prefix=f"{prefix}.mlp",
         )
 
     def forward(
-            self,
-            x: torch.Tensor,
-            cu_seqlens: torch.Tensor,
-            position_embeddings: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -210,13 +189,15 @@ class Qwen3_VisionPatchMerger(nn.Module):
 
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm = norm_layer(self.hidden_size if use_postshuffle_norm else context_dim)
+        self.norm = norm_layer(
+            self.hidden_size if use_postshuffle_norm else context_dim
+        )
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=add_prefix("linear_fc1", prefix)
+            prefix=add_prefix("linear_fc1", prefix),
         )
         self.act_fn = nn.GELU()
         self.linear_fc2 = RowParallelLinear(
@@ -224,7 +205,7 @@ class Qwen3_VisionPatchMerger(nn.Module):
             dim,
             bias=True,
             quant_config=quant_config,
-            prefix=add_prefix("linear_fc2", prefix)
+            prefix=add_prefix("linear_fc2", prefix),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -262,7 +243,7 @@ class Qwen3_VisionTransformer(nn.Module):
             patch_size=self.patch_size,
             temporal_patch_size=self.temporal_patch_size,
             in_channels=vision_config.in_channels,
-            hidden_size=self.hidden_size,
+            embed_dim=self.hidden_size,
         )
 
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
@@ -281,7 +262,7 @@ class Qwen3_VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     attn_implementation="flash_attention_3",
                     quant_config=quant_config,
-                    prefix=add_prefix(f"blocks.{layer_idx}", prefix)
+                    prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -295,17 +276,20 @@ class Qwen3_VisionTransformer(nn.Module):
             prefix=add_prefix("merger", prefix),
         )
 
-        self.deepstack_merger_list = nn.ModuleList([
-            Qwen3_VisionPatchMerger(
-                dim=vision_config.out_hidden_size,
-                context_dim=self.hidden_size,
-                spatial_merge_size=self.spatial_merge_size,
-                use_postshuffle_norm=True,
-                norm_layer=norm_layer,
-                quant_config=quant_config,
-                prefix=add_prefix(f"deepstack_merger_list.{layer_idx}", prefix)
-            ) for layer_idx in range(len(self.deepstack_visual_indexes))
-        ])
+        self.deepstack_merger_list = nn.ModuleList(
+            [
+                Qwen3_VisionPatchMerger(
+                    dim=vision_config.out_hidden_size,
+                    context_dim=self.hidden_size,
+                    spatial_merge_size=self.spatial_merge_size,
+                    use_postshuffle_norm=True,
+                    norm_layer=norm_layer,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"deepstack_merger_list.{layer_idx}", prefix),
+                )
+                for layer_idx in range(len(self.deepstack_visual_indexes))
+            ]
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -352,48 +336,82 @@ class Qwen3_VisionTransformer(nn.Module):
 
         # TODO: use torch instand of np
         for t, h, w in grid_thw:
-            h_idxs = np.linspace(0, num_grid_per_side-1, h)
-            w_idxs = np.linspace(0, num_grid_per_side-1, w)
+            h_idxs = np.linspace(0, num_grid_per_side - 1, h)
+            w_idxs = np.linspace(0, num_grid_per_side - 1, w)
 
             h_idxs_floor = h_idxs.astype(int)
             w_idxs_floor = w_idxs.astype(int)
-            h_idxs_ceil = (h_idxs.astype(int) + 1).clip(max=num_grid_per_side-1)
-            w_idxs_ceil = (w_idxs.astype(int) + 1).clip(max=num_grid_per_side-1)
+            h_idxs_ceil = (h_idxs.astype(int) + 1).clip(max=num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs.astype(int) + 1).clip(max=num_grid_per_side - 1)
 
             dh = h_idxs - h_idxs_floor
             dw = w_idxs - w_idxs_floor
 
-            idx_list[0].extend(((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_floor[None]).flatten().tolist() * t)
-            idx_list[1].extend(((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_ceil[None]).flatten().tolist()  * t)
-            idx_list[2].extend(((h_idxs_ceil  * num_grid_per_side)[None].T + w_idxs_floor[None]).flatten().tolist() * t)
-            idx_list[3].extend(((h_idxs_ceil  * num_grid_per_side)[None].T + w_idxs_ceil[None]).flatten().tolist()  * t)
+            idx_list[0].extend(
+                ((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_floor[None])
+                .flatten()
+                .tolist()
+                * t
+            )
+            idx_list[1].extend(
+                ((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_ceil[None])
+                .flatten()
+                .tolist()
+                * t
+            )
+            idx_list[2].extend(
+                ((h_idxs_ceil * num_grid_per_side)[None].T + w_idxs_floor[None])
+                .flatten()
+                .tolist()
+                * t
+            )
+            idx_list[3].extend(
+                ((h_idxs_ceil * num_grid_per_side)[None].T + w_idxs_ceil[None])
+                .flatten()
+                .tolist()
+                * t
+            )
 
-            weight_list[0].extend(((1-dh)[None].T * (1-dw)[None]).flatten().tolist() * t)
-            weight_list[1].extend(((1-dh)[None].T *   dw[None]  ).flatten().tolist() * t)
-            weight_list[2].extend((  dh[None].T   * (1-dw)[None]).flatten().tolist() * t)
-            weight_list[3].extend((  dh[None].T   *   dw[None]  ).flatten().tolist() * t)
+            weight_list[0].extend(
+                ((1 - dh)[None].T * (1 - dw)[None]).flatten().tolist() * t
+            )
+            weight_list[1].extend(((1 - dh)[None].T * dw[None]).flatten().tolist() * t)
+            weight_list[2].extend((dh[None].T * (1 - dw)[None]).flatten().tolist() * t)
+            weight_list[3].extend((dh[None].T * dw[None]).flatten().tolist() * t)
 
         device = self.pos_embed.weight.device
         dtype = self.pos_embed.weight.dtype
 
-        p0 = self.pos_embed(torch.tensor(idx_list[0], dtype=torch.long, device=device)) * torch.tensor(weight_list[0], dtype=dtype, device=device)[:, None]
-        p1 = self.pos_embed(torch.tensor(idx_list[1], dtype=torch.long, device=device)) * torch.tensor(weight_list[1], dtype=dtype, device=device)[:, None]
-        p2 = self.pos_embed(torch.tensor(idx_list[2], dtype=torch.long, device=device)) * torch.tensor(weight_list[2], dtype=dtype, device=device)[:, None]
-        p3 = self.pos_embed(torch.tensor(idx_list[3], dtype=torch.long, device=device)) * torch.tensor(weight_list[3], dtype=dtype, device=device)[:, None]
+        p0 = (
+            self.pos_embed(torch.tensor(idx_list[0], dtype=torch.long, device=device))
+            * torch.tensor(weight_list[0], dtype=dtype, device=device)[:, None]
+        )
+        p1 = (
+            self.pos_embed(torch.tensor(idx_list[1], dtype=torch.long, device=device))
+            * torch.tensor(weight_list[1], dtype=dtype, device=device)[:, None]
+        )
+        p2 = (
+            self.pos_embed(torch.tensor(idx_list[2], dtype=torch.long, device=device))
+            * torch.tensor(weight_list[2], dtype=dtype, device=device)[:, None]
+        )
+        p3 = (
+            self.pos_embed(torch.tensor(idx_list[3], dtype=torch.long, device=device))
+            * torch.tensor(weight_list[3], dtype=dtype, device=device)[:, None]
+        )
 
         patch_pos_embeds = p0 + p1 + p2 + p3
-        patch_pos_embeds = patch_pos_embeds.split(
-            [t * h * w for t, h, w in grid_thw])
+        patch_pos_embeds = patch_pos_embeds.split([t * h * w for t, h, w in grid_thw])
         patch_pos_embeds_permute = []
         m_size = self.spatial_merge_size
         for pos_embed, (t, h, w) in zip(patch_pos_embeds, grid_thw):
-            pos_embed = pos_embed.view(t, h // m_size, m_size, w // m_size,
-                                       m_size, -1).permute(0, 1, 3, 2, 4,
-                                                           5).flatten(0, 4)
+            pos_embed = (
+                pos_embed.view(t, h // m_size, m_size, w // m_size, m_size, -1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
             patch_pos_embeds_permute.append(pos_embed)
         patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
         return patch_pos_embeds
-    
 
     def forward(
         self,
@@ -425,21 +443,21 @@ class Qwen3_VisionTransformer(nn.Module):
 
         # max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
         x = x.unsqueeze(1)
-        
+
         deepstack_feature_lists = []
         num_deepstack_captured = 0
         for layer_num, blk in enumerate(self.blocks):
-            x = blk(
-                x, 
-                cu_seqlens=cu_seqlens,
-                position_embeddings=position_embeddings
-        )
+            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
             if layer_num in self.deepstack_visual_indexes:
-                deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](x)
+                deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
+                    x
+                )
                 deepstack_feature_lists.append(deepstack_feature)
                 num_deepstack_captured += 1
         x = self.merger(x)
-        hidden_states = torch.cat([x] + deepstack_feature_lists, dim=1) # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+        hidden_states = torch.cat(
+            [x] + deepstack_feature_lists, dim=1
+        )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -453,7 +471,7 @@ class Qwen3_VisionTransformer(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
@@ -464,29 +482,35 @@ class Qwen3_VisionTransformer(nn.Module):
                 break
             else:
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight) 
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
 
 
 cached_get_processor = lru_cache(get_processor)
 
+
 class Qwen3LLMModel(Qwen3Model):
 
-    def __init__(self, *, config: Qwen3VLConfig, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
-        super().__init__(
-            config=config,
-            quant_config=quant_config,
-            prefix=prefix
-        )
+    def __init__(
+        self,
+        *,
+        config: Qwen3VLConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         if not self.pp_group.is_first_rank:
-            assert self.start_layer >= len(config.vision_config.deepstack_visual_indexes), "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
+            assert self.start_layer >= len(
+                config.vision_config.deepstack_visual_indexes
+            ), "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
 
         self.hidden_size = config.hidden_size
-        self.deepstack_embed_to_decoder_layer = range(len(config.vision_config.deepstack_visual_indexes))
-        
+        self.deepstack_embed_to_decoder_layer = range(
+            len(config.vision_config.deepstack_visual_indexes)
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -496,7 +520,7 @@ class Qwen3LLMModel(Qwen3Model):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        
+
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -509,7 +533,9 @@ class Qwen3LLMModel(Qwen3Model):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        for layer_idx, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
+        for layer_idx, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer]
+        ):
             layer_idx = layer_idx + self.start_layer
             if layer_idx in self.layers_to_capture:
                 aux_hidden_states.append(
@@ -529,8 +555,10 @@ class Qwen3LLMModel(Qwen3Model):
                 and layer_idx in self.deepstack_embed_to_decoder_layer
             ):
                 sep = self.hidden_size * layer_idx
-                hidden_states = hidden_states + input_deepstack_embeds[:, sep:sep+self.hidden_size]
-
+                hidden_states = (
+                    hidden_states
+                    + input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -550,6 +578,7 @@ class Qwen3LLMModel(Qwen3Model):
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
 
 class Qwen3VLForConditionalGeneration(nn.Module):
     def __init__(
@@ -591,7 +620,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
-        
+
         # deepstack
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
@@ -601,8 +630,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return hasattr(self, "deepstack_visual_indexes")
 
     def separate_deepstack_embeds(self, embedding):
-        assert embedding.shape[-1] // (1 + self.num_deepstack_embeddings), \
-            f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
+        assert (
+            embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
+        ), f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
 
         separate_index = self.config.hidden_size
         input_embeds = embedding[:, :separate_index]

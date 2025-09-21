@@ -205,7 +205,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
         Qwen3VLForConditionalGeneration,
-        Qwen3VLMoeForConditionalGeneration
+        Qwen3VLMoeForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):

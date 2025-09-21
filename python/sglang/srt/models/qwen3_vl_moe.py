@@ -15,69 +15,73 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
 from functools import lru_cache, partial
-from typing import Callable, Literal, Iterable, List, Optional, Tuple, Union, TypedDict
+from typing import Callable, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
-
-from sglang.srt.distributed import get_pp_group
-
 import torch.nn.functional as F
-import numpy as np
 from einops import rearrange
-from transformers.activations import ACT2FN
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionRotaryEmbedding
-
 from transformers import BatchFeature
-from sglang.srt.hf_transformers_utils import get_processor
-
+from transformers.activations import ACT2FN
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VisionRotaryEmbedding,
+)
 from transformers.models.qwen3_vl import Qwen3VLProcessor
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
-    Qwen3VLMoeVisionConfig, Qwen3VLMoeConfig
-    )
+    Qwen3VLMoeConfig,
+    Qwen3VLMoeVisionConfig,
+)
 
+from sglang.srt.distributed import get_pp_group
+from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
-
-
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs, global_server_args_dict
-
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    global_server_args_dict,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_moe import Qwen3MoeModel, Qwen3MoeForCausalLM
-from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3_VisionTransformer
+from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
+from sglang.srt.models.qwen3_vl import (
+    Qwen3_VisionTransformer,
+    Qwen3VLForConditionalGeneration,
+)
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
 cached_get_processor = lru_cache(get_processor)
 
+
 class Qwen3MoeLLMModel(Qwen3MoeModel):
-    def __init__(self, *, config: Qwen3VLMoeConfig,
-        quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
-        super().__init__(
-            config=config,
-            quant_config=quant_config,
-            prefix=prefix
-        )
-        
+    def __init__(
+        self,
+        *,
+        config: Qwen3VLMoeConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+
         self.hidden_size = config.hidden_size
-        
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
@@ -107,7 +111,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        for layer_idx, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
+        for layer_idx, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer]
+        ):
             layer_idx = layer_idx + self.start_layer
             if layer_idx in self.layers_to_capture:
                 aux_hidden_states.append(
@@ -122,12 +128,12 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             )
 
             # process deepstack
-            if (
-                input_deepstack_embeds is not None
-                and layer_idx in range(3)
-            ):
-                sep = self.hidden_size*layer_idx
-                hidden_states = hidden_states + input_deepstack_embeds[:, sep:sep+self.hidden_size]
+            if input_deepstack_embeds is not None and layer_idx in range(3):
+                sep = self.hidden_size * layer_idx
+                hidden_states = (
+                    hidden_states
+                    + input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -150,7 +156,13 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
 
 
 class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
-    def __init__(self, *, config: Qwen3VLMoeConfig, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        config: Qwen3VLMoeConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super(Qwen3VLForConditionalGeneration, self).__init__()
         self.config = config
 
@@ -182,7 +194,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        
+
         # deepstack
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
@@ -239,19 +251,26 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         else:
             return self.pooler(hidden_states, forward_batch)
 
-    def load_fused_expert_weights(self, name: str, params_dict: dict,
-                                  loaded_weight: torch.Tensor, shard_id: str,
-                                  num_experts: int):
+    def load_fused_expert_weights(
+        self,
+        name: str,
+        params_dict: dict,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        num_experts: int,
+    ):
         param = params_dict[name]
         # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
         weight_loader = param.weight_loader
         for expert_id in range(num_experts):
             curr_expert_weight = loaded_weight[expert_id]
-            weight_loader(param,
-                                    curr_expert_weight,
-                                    name,
-                                    shard_id,
-                                    expert_id,)
+            weight_loader(
+                param,
+                curr_expert_weight,
+                name,
+                shard_id,
+                expert_id,
+            )
         return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -272,9 +291,18 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
-        ignore_suffixes = (".bias", "_bias", ".k_scale", "_k_scale",
-                           ".v_scale", "_v_scale", ".weight_scale",
-                           "_weight_scale", ".input_scale", "_input_scale")
+        ignore_suffixes = (
+            ".bias",
+            "_bias",
+            ".k_scale",
+            "_k_scale",
+            ".v_scale",
+            "_v_scale",
+            ".weight_scale",
+            "_weight_scale",
+            ".input_scale",
+            "_input_scale",
+        )
 
         is_fused_expert = False
         fused_expert_params_mapping = [
@@ -302,7 +330,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
                 if "visual" in name:
                     continue
-                
+
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
                 # we need to skip here BEFORE we update the name, otherwise
@@ -341,34 +369,50 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     if is_fused_expert:
-                        loaded_weight = loaded_weight.transpose(-1,
-                                                                -2)  # no bias
+                        loaded_weight = loaded_weight.transpose(-1, -2)  # no bias
                         if "experts.gate_up_proj" in name:
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
                             self.load_fused_expert_weights(
-                                name_mapped, params_dict, loaded_weight[0],
-                                "w1", num_experts)
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[0],
+                                "w1",
+                                num_experts,
+                            )
                             self.load_fused_expert_weights(
-                                name_mapped, params_dict, loaded_weight[1],
-                                "w3", num_experts)
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[1],
+                                "w3",
+                                num_experts,
+                            )
                         else:
                             self.load_fused_expert_weights(
-                                name_mapped, params_dict, loaded_weight,
-                                shard_id, num_experts)
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                shard_id,
+                                num_experts,
+                            )
                     else:
                         # Skip loading extra parameters for GPTQ/modelopt models.
-                        if name_mapped.endswith(ignore_suffixes) and name_mapped not in params_dict:
+                        if (
+                            name_mapped.endswith(ignore_suffixes)
+                            and name_mapped not in params_dict
+                        ):
                             continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # # other available replicas.
                         weight_loader = param.weight_loader
-                        weight_loader(param,
-                                                loaded_weight,
-                                                name_mapped,
-                                                shard_id=shard_id,
-                                                expert_id=expert_id)
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
                     name = name_mapped
                     break
                 else:
@@ -381,8 +425,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         name = name.replace(r"model.visual.", r"visual.")
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(
-                            ignore_suffixes) and name not in params_dict:
+                    if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
 
                     if name in params_dict.keys():

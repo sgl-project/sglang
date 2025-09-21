@@ -507,7 +507,7 @@ def embed_mm_inputs(
         Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
-    use_deepstack: bool = False
+    use_deepstack: bool = False,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -581,7 +581,9 @@ def embed_mm_inputs(
             )
 
             if use_deepstack and embedding is not None:
-                embedding, deepstack_embedding = multimodal_model.separate_deepstack_embeds(embedding)
+                embedding, deepstack_embedding = (
+                    multimodal_model.separate_deepstack_embeds(embedding)
+                )
                 deepstack_embeddings += [deepstack_embedding]
             embeddings += [embedding]
             masks += [mask]
@@ -599,27 +601,33 @@ def embed_mm_inputs(
 
     # deepstack embedding
     if use_deepstack:
-        num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes) if use_deepstack else 0
-        deepstack_embedding_shape = inputs_embeds.shape[:-1] + (inputs_embeds.shape[-1] * num_deepstack_embeddings,)
-        
+        num_deepstack_embeddings = (
+            len(multimodal_model.deepstack_visual_indexes) if use_deepstack else 0
+        )
+        deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
+            inputs_embeds.shape[-1] * num_deepstack_embeddings,
+        )
+
         input_deepstack_embeds = torch.zeros(
-            deepstack_embedding_shape, 
-            device=inputs_embeds.device, 
-            dtype=inputs_embeds.dtype
+            deepstack_embedding_shape,
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
         )
 
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
-        
+
     for i, embedding, mask in zip(range(len(embeddings)), embeddings, masks):
         if embedding is None or mask is None:
             continue
         # in-place update
         indices = torch.where(mask.squeeze(dim=-1))[0]
         inputs_embeds[indices] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
-        
+
         if use_deepstack:
-            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(inputs_embeds.device, inputs_embeds.dtype)
-    
+            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
+                inputs_embeds.device, inputs_embeds.dtype
+            )
+
     return inputs_embeds, other_info
 
 
@@ -679,7 +687,7 @@ def general_mm_embed_routine(
             input_embedding=embed_tokens,
             data_embedding_func_mapping=data_embedding_funcs,
             placeholder_tokens=placeholder_tokens,
-            use_deepstack=use_deepstack
+            use_deepstack=use_deepstack,
         )
         # add for qwen3_vl deepstack
         if use_deepstack:
