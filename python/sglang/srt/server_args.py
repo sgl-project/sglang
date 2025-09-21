@@ -268,6 +268,7 @@ class ServerArgs:
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
+    max_lora_chunk_size: Optional[int] = 16
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -451,8 +452,7 @@ class ServerArgs:
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
 
-    def __post_init__(self):
-        # Check deprecated arguments
+    def _handle_deprecated_args(self):
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
             print_deprecated_warning(
@@ -489,10 +489,9 @@ class ServerArgs:
                 "NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead."
             )
 
-        # Set missing default values
+    def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
-
         if self.served_model_name is None:
             self.served_model_name = self.model_path
         if self.device is None:
@@ -500,30 +499,166 @@ class ServerArgs:
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        gpu_mem = get_device_memory_capacity(self.device)
+    def _handle_gpu_memory_settings(self, gpu_mem):
+        """
+        Configure GPU memory-dependent settings including mem_fraction_static,
+        chunked_prefill_size, cuda_graph_max_bs, and cuda_graph_bs.
+        """
+        # Set mem fraction static
+        if self.mem_fraction_static is None:
+            if gpu_mem is not None:
+                # GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
+                # mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
 
-        self._configure_gpu_memory_settings(gpu_mem)
+                # We want mem_fraction_static to be as large as possible but still has enough room
+                # for activations and cuda graph buffers. We use the following heuristic to
+                # compute the needed size for activations and cuda graph buffers:
+                # - The size of the activation depends on the chunked_prefill_size and model size.
+                # - The size of cuda graph buffers depends on the cuda graph capture range and model size.
+                # For GPUs with more memory, we use a larger chunked_prefill_size and
+                # capture more cuda graphs, so they need to reserve more memory.
+                parallel_size = self.tp_size * self.pp_size
 
-        # Set kernel backends for hpu device
+                if gpu_mem < 20 * 1024:
+                    # T4, 4080. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
+                    reserved_mem = (2.8 + parallel_size / 10) * 1024
+                elif gpu_mem < 50 * 1024:
+                    # A10, L40, 4090, 5090. (chunked_prefill_size 2k, cuda_graph_max_bs 16)
+                    reserved_mem = (2.8 + parallel_size / 10) * 1024
+                elif gpu_mem < 90 * 1024:
+                    # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs -)
+                    # if tp >= 4, cuda_graph_max_bs 512, else 256
+                    reserved_mem = (9.5 + parallel_size / 2) * 1024
+                elif gpu_mem < 100 * 1024:
+                    # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
+                    reserved_mem = (12 + parallel_size / 2) * 1024
+                elif gpu_mem < 160 * 1024:
+                    # H200. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
+                    reserved_mem = (12 + parallel_size / 2) * 1024
+                else:
+                    # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
+                    reserved_mem = 32 * 1024
+
+                # draft model and larger cuda graph buffers
+                if self.speculative_algorithm is not None:
+                    if self.speculative_algorithm == "STANDALONE":
+                        # Standalone speculative decoding needs more memory than other speculative
+                        # decoding algorithms since the draft model is typically larger.
+                        reserved_mem += 6 * 1024
+                    else:
+                        reserved_mem += 2 * 1024
+                if self.enable_dp_attention:
+                    reserved_mem += 4 * 1024
+
+                self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
+            else:
+                self.mem_fraction_static = 0.88
+
+            # Lazy init to avoid circular import
+            # Multimodal models need more memory for the image processor
+            from sglang.srt.configs.model_config import ModelConfig
+
+            model_config = ModelConfig.from_server_args(self)
+            if model_config.is_multimodal:
+                self.adjust_mem_fraction_for_vlm(model_config)
+
+        # Set chunked prefill size, which depends on the gpu memory capacity
+        if self.chunked_prefill_size is None:
+            if gpu_mem is not None:
+                if gpu_mem < 50 * 1024:  # T4, 4080, A10, L40, 4090, 5090
+                    self.chunked_prefill_size = 2048
+                elif gpu_mem < 160 * 1024:  # H100, H200, A100, H20
+                    self.chunked_prefill_size = 8192
+                else:  # B200, MI300
+                    self.chunked_prefill_size = 16384
+            else:
+                self.chunked_prefill_size = 4096
+
+        # Set cuda graph max batch size and cuda graph batch sizes
+        if self.cuda_graph_max_bs is None:
+            if gpu_mem is not None:
+                if gpu_mem < 20 * 1024:
+                    # T4, 4080
+                    self.cuda_graph_max_bs = 8
+                elif gpu_mem < 50 * 1024:
+                    # A10, L40, 4090, 5090
+                    # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance.
+                    # However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs
+                    # from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 16
+                    else:
+                        self.cuda_graph_max_bs = 80
+                elif gpu_mem < 90 * 1024:
+                    # H100, A100
+                    if self.tp_size >= 4:
+                        self.cuda_graph_max_bs = 512
+                    else:
+                        self.cuda_graph_max_bs = 256
+                else:
+                    # H20, H200, B200, MI300
+                    self.cuda_graph_max_bs = 512
+            else:
+                # Default fallback
+                self.cuda_graph_max_bs = 160
+
+            if self.cuda_graph_bs is None:
+                self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes(gpu_mem)
+
+    def _generate_cuda_graph_batch_sizes(self, gpu_mem):
+        """
+        Generate the list of batch sizes for CUDA graph capture based on GPU memory and configuration.
+        This integrates the logic from cuda_graph_runner.py.
+        """
+        if self.speculative_algorithm is None:
+            if self.disable_cuda_graph_padding:
+                capture_bs = list(range(1, 33)) + list(
+                    range(48, min(self.cuda_graph_max_bs + 1, 161), 16)
+                )
+            else:
+                capture_bs = [1, 2, 4, 8] + list(
+                    range(16, min(self.cuda_graph_max_bs + 1, 161), 8)
+                )
+        else:
+            # Since speculative decoding requires more cuda graph memory, we capture less.
+            capture_bs = (
+                list(range(1, 9))
+                + list(range(10, 33, 2))
+                + list(range(40, 64, 8))
+                + list(range(80, min(self.cuda_graph_max_bs + 1, 161), 16))
+            )
+
+        # Add additional batch sizes based on GPU memory capacity
+        if gpu_mem is not None:
+            if gpu_mem > 90 * 1024:  # H200, H20
+                capture_bs += list(range(160, min(self.cuda_graph_max_bs + 1, 513), 8))
+            if gpu_mem > 160 * 1024 and self.cuda_graph_max_bs > 256:  # B200, MI300
+                capture_bs += list(range(256, min(self.cuda_graph_max_bs + 1, 513), 16))
+
+        capture_bs = sorted(list(set(capture_bs)))
+
+        capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
+
+        return capture_bs
+
+    def _handle_hpu_backends(self):
         if self.device == "hpu":
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
-        # Model-specific adjustments
-        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
-            self.model_specific_adjustments()
-
-        # Set kernel backends
+    def _handle_cpu_backends(self):
         if self.device == "cpu":
             if self.attention_backend is None:
                 self.attention_backend = "intel_amx"
             self.sampling_backend = "pytorch"
 
+    def _handle_sampling_backend(self):
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
             )
 
+    def _handle_attention_backend_compatibility(self):
         if self.attention_backend == "torch_native":
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
@@ -607,23 +742,23 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.disable_radix_cache = True
 
-        # Set page size
+    def _handle_page_size(self):
         if self.page_size is None:
             self.page_size = 1
 
-        # AMD-specific Triton attention KV splits default number
+    def _handle_amd_specifics(self):
         if is_hip():
             self.triton_attention_num_kv_splits = 16
 
-        # Choose grammar backend
+    def _handle_grammar_backend(self):
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+    def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
             self.enable_dp_lm_head = False
 
-        # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             assert self.tp_size % self.dp_size == 0
@@ -637,7 +772,7 @@ class ServerArgs:
                 self.enable_dp_attention
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
-        # MoE kernel
+    def _handle_moe_kernel_config(self):
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert (
                 self.quantization == "modelopt_fp4"
@@ -656,7 +791,7 @@ class ServerArgs:
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-        # DeepEP MoE
+    def _handle_deepep_moe(self):
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
@@ -666,6 +801,7 @@ class ServerArgs:
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+    def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(
@@ -680,6 +816,7 @@ class ServerArgs:
         if self.enable_eplb:
             assert self.ep_size > 1
 
+    def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
         ):
@@ -691,16 +828,15 @@ class ServerArgs:
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
 
-        # Pipeline parallelism
+    def _handle_pipeline_parallelism(self):
         if self.pp_size > 1:
             self.disable_overlap_schedule = True
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
-        # Hicache
+    def _handle_hicache(self):
         if self.hicache_storage_backend == "mooncake":
-            # to use mooncake storage backend, the following conditions must be met:
             self.hicache_io_backend = "kernel"
             self.hicache_mem_layout = "page_first"
 
@@ -711,9 +847,8 @@ class ServerArgs:
                     "Page first direct layout only support direct io backend"
                 )
 
-        # Speculative Decoding
+    def _handle_speculative_decoding(self):
         if self.speculative_algorithm == "NEXTN":
-            # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
@@ -743,7 +878,6 @@ class ServerArgs:
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
             ]:
-                # Auto set draft_model_path DeepSeek-V3/R1
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
                 else:
@@ -751,7 +885,6 @@ class ServerArgs:
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
                     )
 
-            # Auto choose parameters
             if self.speculative_num_steps is None:
                 assert (
                     self.speculative_eagle_topk is None
@@ -791,10 +924,6 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
-            # The token generated from the verify step is counted.
-            # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
-            # assert self.speculative_num_steps < self.speculative_num_draft_tokens
-
         if self.speculative_algorithm == "LOOKAHEAD":
             if not self.device.startswith("cuda"):
                 raise ValueError(
@@ -806,7 +935,6 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_lookahead_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
-                # TODO: Do better auto choose in the future
                 self.speculative_num_draft_tokens = (
                     self.speculative_lookahead_max_match_window_size
                 )
@@ -814,6 +942,7 @@ class ServerArgs:
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
                 "using lookahead speculative decoding."
             )
+
             if (
                 self.speculative_eagle_topk > 1
                 and self.page_size > 1
@@ -822,13 +951,13 @@ class ServerArgs:
                 raise ValueError(
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
-
             if self.enable_dp_attention:
                 # TODO: support dp attention for lookahead speculative decoding
                 raise ValueError(
                     "Currently lookahead speculative decoding does not support dp attention."
                 )
-        # GGUF
+
+    def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
@@ -836,6 +965,7 @@ class ServerArgs:
 
         if is_remote_url(self.model_path):
             self.load_format = "remote"
+
         if self.custom_weight_loader is None:
             self.custom_weight_loader = []
 
@@ -847,7 +977,7 @@ class ServerArgs:
             ):
                 self.load_format = "auto"
 
-        # PD disaggregation
+    def _handle_disaggregation(self):
         if self.disaggregation_mode == "decode":
             assert (
                 self.disaggregation_decode_tp is None
@@ -873,34 +1003,36 @@ class ServerArgs:
 
             self.disaggregation_prefill_pp = self.pp_size
             self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
-
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
 
-        # Validation: prevent both tokenizer batching features from being enabled
+    def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
             raise ValueError(
                 "Cannot enable both --enable-tokenizer-batch-encode and --enable-dynamic-batch-tokenizer. "
                 "Please choose one tokenizer batching approach."
             )
 
-        # Propagate env vars
+    def _handle_environment_variables(self):
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
         os.environ["SGLANG_MAMBA_SSM_DTYPE"] = self.mamba_ssm_dtype
-
-        # Set env var before grammar backends init
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+        os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = (
+            "1" if self.enable_deterministic_inference else "0"
+        )
 
+    def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+    def _handle_metrics_labels(self):
         if (
             not self.tokenizer_metrics_custom_labels_header
             and self.tokenizer_metrics_allowed_customer_labels
@@ -909,12 +1041,8 @@ class ServerArgs:
                 "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-customer-labels."
             )
 
-        # Deterministic inference
-        os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = (
-            "1" if self.enable_deterministic_inference else "0"
-        )
+    def _handle_deterministic_inference(self):
         if self.enable_deterministic_inference:
-            # Check batch_invariant_ops dependency
             import importlib
 
             if not importlib.util.find_spec("batch_invariant_ops"):
@@ -922,17 +1050,91 @@ class ServerArgs:
                     "batch_invariant_ops is not installed. Please install it from https://github.com/thinking-machines-lab/batch_invariant_ops/."
                 )
 
-            # Currently, only FA3 supports radix cache. Support for other backends is in progress
             if self.attention_backend != "fa3":
                 self.disable_radix_cache = True
                 logger.warning(
                     "Currently radix cache is disabled for deterministic inference. It will be supported in the future."
                 )
-
             if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
                 raise ValueError(
                     f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
                 )
+
+    def _handle_other_validations(self):
+        pass
+
+    def __post_init__(self):
+        """
+        Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
+        """
+        # Step 1: Handle deprecated arguments.
+        self._handle_deprecated_args()
+
+        # Step 2: Set missing default values.
+        self._handle_missing_default_values()
+
+        # Get GPU memory capacity, which is a common dependency for several configuration steps.
+        gpu_mem = get_device_memory_capacity(self.device)
+
+        # Step 3: Handle memory-related, chunked prefill, and cuda graph batch size configurations.
+        self._handle_gpu_memory_settings(gpu_mem)
+
+        # Step 4: Handle device-specific backends.
+        self._handle_hpu_backends()
+        self._handle_cpu_backends()
+
+        # Step 5: Apply model-specific adjustments.
+        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+            self.model_specific_adjustments()
+
+        # Step 6: Set kernel backends.
+        self._handle_sampling_backend()
+        self._handle_attention_backend_compatibility()
+        self._handle_page_size()
+        self._handle_amd_specifics()
+        self._handle_grammar_backend()
+
+        # Step 7: Handle data parallelism.
+        self._handle_data_parallelism()
+
+        # Step 8: Handle MoE configurations.
+        self._handle_moe_kernel_config()
+        self._handle_deepep_moe()
+        self._handle_eplb_and_dispatch()
+        self._handle_expert_distribution_metrics()
+
+        # Step 9: Handle pipeline parallelism.
+        self._handle_pipeline_parallelism()
+
+        # Step 10: Handle Hicache settings.
+        self._handle_hicache()
+
+        # Step 11: Handle speculative decoding logic.
+        self._handle_speculative_decoding()
+
+        # Step 12: Handle model loading format.
+        self._handle_load_format()
+
+        # Step 13: Handle PD disaggregation.
+        self._handle_disaggregation()
+
+        # Step 14: Validate tokenizer settings.
+        self._handle_tokenizer_batching()
+
+        # Step 15: Propagate environment variables.
+        self._handle_environment_variables()
+
+        # Step 16: Validate cache settings.
+        self._handle_cache_compatibility()
+
+        # Step 17: Validate metrics labels.
+        self._handle_metrics_labels()
+
+        # Step 18: Handle deterministic inference.
+        self._handle_deterministic_inference()
+
+        # Step 19: Handle any other necessary validations.
+        self._handle_other_validations()
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1635,6 +1837,13 @@ class ServerArgs:
             choices=LORA_BACKEND_CHOICES,
             default=ServerArgs.lora_backend,
             help="Choose the kernel backend for multi-LoRA serving.",
+        )
+        parser.add_argument(
+            "--max-lora-chunk-size",
+            type=int,
+            default=ServerArgs.max_lora_chunk_size,
+            choices=[16, 32, 64, 128],
+            help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
         )
 
         # Kernel backend
@@ -2636,6 +2845,12 @@ class ServerArgs:
                     f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
                 )
 
+            if self.max_lora_chunk_size is not None:
+                assert (
+                    16 <= self.max_lora_chunk_size <= 128
+                    and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
+                ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
+
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
         smaller_tp = min(decode_tp, prefill_tp)
@@ -2804,148 +3019,6 @@ class ServerArgs:
         self.mem_fraction_static = (
             original_server_arg_mem_fraction * final_overall_factor
         )
-
-    def _configure_gpu_memory_settings(self, gpu_mem):
-        """
-        Configure GPU memory-dependent settings including mem_fraction_static,
-        chunked_prefill_size, cuda_graph_max_bs, and cuda_graph_bs.
-        """
-        # Set mem fraction static
-        if self.mem_fraction_static is None:
-            if gpu_mem is not None:
-                # GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
-                # mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
-
-                # We want mem_fraction_static to be as large as possible but still has enough room
-                # for activations and cuda graph buffers. We use the following heuristic to
-                # compute the needed size for activations and cuda graph buffers:
-                # - The size of the activation depends on the chunked_prefill_size and model size.
-                # - The size of cuda graph buffers depends on the cuda graph capture range and model size.
-                # For GPUs with more memory, we use a larger chunked_prefill_size and
-                # capture more cuda graphs, so they need to reserve more memory.
-                parallel_size = self.tp_size * self.pp_size
-
-                if gpu_mem < 20 * 1024:
-                    # T4, 4080. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
-                    reserved_mem = (2.8 + parallel_size / 10) * 1024
-                elif gpu_mem < 50 * 1024:
-                    # A10, L40, 4090, 5090. (chunked_prefill_size 2k, cuda_graph_max_bs 16)
-                    reserved_mem = (2.8 + parallel_size / 10) * 1024
-                elif gpu_mem < 90 * 1024:
-                    # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs -)
-                    # if tp >= 4, cuda_graph_max_bs 512, else 256
-                    reserved_mem = (9.5 + parallel_size / 2) * 1024
-                elif gpu_mem < 100 * 1024:
-                    # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
-                    reserved_mem = (12 + parallel_size / 2) * 1024
-                elif gpu_mem < 160 * 1024:
-                    # H200. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
-                    reserved_mem = (12 + parallel_size / 2) * 1024
-                else:
-                    # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
-                    reserved_mem = 32 * 1024
-
-                # draft model and larger cuda graph buffers
-                if self.speculative_algorithm is not None:
-                    if self.speculative_algorithm == "STANDALONE":
-                        # Standalone speculative decoding needs more memory than other speculative
-                        # decoding algorithms since the draft model is typically larger.
-                        reserved_mem += 6 * 1024
-                    else:
-                        reserved_mem += 2 * 1024
-                if self.enable_dp_attention:
-                    reserved_mem += 4 * 1024
-
-                self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
-            else:
-                self.mem_fraction_static = 0.88
-
-            # Lazy init to avoid circular import
-            # Multimodal models need more memory for the image processor
-            from sglang.srt.configs.model_config import ModelConfig
-
-            model_config = ModelConfig.from_server_args(self)
-            if model_config.is_multimodal:
-                self.adjust_mem_fraction_for_vlm(model_config)
-
-        # Set chunked prefill size, which depends on the gpu memory capacity
-        if self.chunked_prefill_size is None:
-            if gpu_mem is not None:
-                if gpu_mem < 50 * 1024:  # T4, 4080, A10, L40, 4090, 5090
-                    self.chunked_prefill_size = 2048
-                elif gpu_mem < 160 * 1024:  # H100, H200, A100, H20
-                    self.chunked_prefill_size = 8192
-                else:  # B200, MI300
-                    self.chunked_prefill_size = 16384
-            else:
-                self.chunked_prefill_size = 4096
-
-        # Set cuda graph max batch size and cuda graph batch sizes
-        if self.cuda_graph_max_bs is None:
-            if gpu_mem is not None:
-                if gpu_mem < 20 * 1024:
-                    # T4, 4080
-                    self.cuda_graph_max_bs = 8
-                elif gpu_mem < 50 * 1024:
-                    # A10, L40, 4090, 5090
-                    # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance.
-                    # However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs
-                    # from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
-                    if self.tp_size < 4:
-                        self.cuda_graph_max_bs = 16
-                    else:
-                        self.cuda_graph_max_bs = 80
-                elif gpu_mem < 90 * 1024:
-                    # H100, A100
-                    if self.tp_size >= 4:
-                        self.cuda_graph_max_bs = 512
-                    else:
-                        self.cuda_graph_max_bs = 256
-                else:
-                    # H20, H200, B200, MI300
-                    self.cuda_graph_max_bs = 512
-            else:
-                # Default fallback
-                self.cuda_graph_max_bs = 160
-
-            if self.cuda_graph_bs is None:
-                self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes(gpu_mem)
-
-    def _generate_cuda_graph_batch_sizes(self, gpu_mem):
-        """
-        Generate the list of batch sizes for CUDA graph capture based on GPU memory and configuration.
-        This integrates the logic from cuda_graph_runner.py.
-        """
-        if self.speculative_algorithm is None:
-            if self.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + list(
-                    range(48, min(self.cuda_graph_max_bs + 1, 161), 16)
-                )
-            else:
-                capture_bs = [1, 2, 4, 8] + list(
-                    range(16, min(self.cuda_graph_max_bs + 1, 161), 8)
-                )
-        else:
-            # Since speculative decoding requires more cuda graph memory, we capture less.
-            capture_bs = (
-                list(range(1, 9))
-                + list(range(10, 33, 2))
-                + list(range(40, 64, 8))
-                + list(range(80, min(self.cuda_graph_max_bs + 1, 161), 16))
-            )
-
-        # Add additional batch sizes based on GPU memory capacity
-        if gpu_mem is not None:
-            if gpu_mem > 90 * 1024:  # H200, H20
-                capture_bs += list(range(160, min(self.cuda_graph_max_bs + 1, 513), 8))
-            if gpu_mem > 160 * 1024 and self.cuda_graph_max_bs > 256:  # B200, MI300
-                capture_bs += list(range(256, min(self.cuda_graph_max_bs + 1, 513), 16))
-
-        capture_bs = sorted(list(set(capture_bs)))
-
-        capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
-
-        return capture_bs
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
