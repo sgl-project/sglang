@@ -993,7 +993,6 @@ class ServerArgs:
                 "Sampling backend is set to pytorch for deterministic inference."
             )
             # Currently, only FA3 supports radix cache. Support for other backends is in progress
-
             if self.attention_backend != "fa3":
                 self.disable_radix_cache = True
                 logger.warning(
