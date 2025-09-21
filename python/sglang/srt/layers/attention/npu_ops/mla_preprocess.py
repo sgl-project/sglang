@@ -5,6 +5,7 @@ from sglang.srt.utils import get_bool_env_var, is_npu
 
 _is_npu = is_npu()
 _ENABLE_MLA_PREPROCESS_FLAG = get_bool_env_var("SGLANG_NPU_USE_MLAPO")
+_NPU_FORMAT_NZ = 29
 
 
 def is_mla_preprocess_enabled() -> bool:
@@ -119,7 +120,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             .contiguous()
         )
         self.qkv_a_proj_weight_nz = torch_npu.npu_format_cast(
-            fused_qkv_a_proj_with_mqa_weight_nz, 29
+            fused_qkv_a_proj_with_mqa_weight_nz, _NPU_FORMAT_NZ
         )
 
         # matmul_0 deq_scale [2112]
@@ -192,7 +193,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         q_b_proj_weight_nz = (
             transdata(q_b_proj_weight, block_size=(16, 32)).unsqueeze(0).contiguous()
         )
-        self.q_b_proj_weight_nz = torch_npu.npu_format_cast(q_b_proj_weight_nz, 29)
+        self.q_b_proj_weight_nz = torch_npu.npu_format_cast(
+            q_b_proj_weight_nz, _NPU_FORMAT_NZ
+        )
 
         # matmul_1 deq_scale [num_head * 192]
         q_b_proj_deq_scale = self.q_b_proj.deq_scale.data.clone()
