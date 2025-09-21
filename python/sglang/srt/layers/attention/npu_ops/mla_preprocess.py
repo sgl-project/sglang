@@ -1,7 +1,5 @@
-import sgl_kernel_npu
 import torch
 import torch.nn.functional as F
-import torch_npu
 
 from sglang.srt.utils import get_bool_env_var, is_npu
 
@@ -11,6 +9,11 @@ _ENABLE_MLA_PREPROCESS_FLAG = get_bool_env_var("SGLANG_NPU_USE_MLAPO")
 
 def is_mla_preprocess_enabled() -> bool:
     return _is_npu and _ENABLE_MLA_PREPROCESS_FLAG
+
+
+if is_mla_preprocess_enabled():
+    import sgl_kernel_npu
+    import torch_npu
 
 
 def round_up(val: int, align: int) -> int:
