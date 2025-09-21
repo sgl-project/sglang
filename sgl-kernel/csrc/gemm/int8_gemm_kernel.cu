@@ -409,10 +409,10 @@ void sm89_dispatch_shape(
     cutlass_int8_scaled_mm<
         ElementOutput,
         ArchTag,
-        cutlass::gemm::GemmShape<32, 64, 128>,
-        cutlass::gemm::GemmShape<16, 64, 64>,
+        cutlass::gemm::GemmShape<128, 128, 64>,
+        cutlass::gemm::GemmShape<64, 32, 64>,
         InstructionShape,
-        5>(out, mat_a, mat_b, scales_a, scales_b, bias);
+        6>(out, mat_a, mat_b, scales_a, scales_b, bias);
   }
 }
 
