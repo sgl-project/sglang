@@ -37,17 +37,6 @@ def make_github_request(url, token, method="GET", data=None):
         raise
 
 
-def get_file_sha(repo_owner, repo_name, file_path, token):
-    """Get SHA of existing file in repository"""
-    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents/{file_path}"
-    try:
-        response = make_github_request(url, token)
-        data = json.loads(response)
-        return data.get("sha")
-    except:
-        return None
-
-
 def get_branch_sha(repo_owner, repo_name, branch, token):
     """Get SHA of the branch head"""
     url = (
@@ -152,14 +141,14 @@ def copy_trace_files(source_dir, target_base_path, is_vlm=False):
 def publish_traces(traces_dir, run_id, run_number, is_vlm=False):
     """Publish traces to GitHub repository in a single commit"""
     # Get environment variables
-    token = os.getenv("GH_PAT_FOR_DOCUMENTATION")
+    token = os.getenv("GITHUB_TOKEN")
     if not token:
-        print("Error: GH_PAT_FOR_DOCUMENTATION environment variable not set")
+        print("Error: GITHUB_TOKEN environment variable not set")
         sys.exit(1)
 
     # Repository configuration
-    repo_owner = "mickqian"
-    repo_name = "SGLang-test-nightly"
+    repo_owner = "sgl-project"
+    repo_name = "ci-data"
     branch = "main"
     target_base_path = f"traces/{run_id}"
 

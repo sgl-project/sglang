@@ -64,9 +64,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                     profile_path_prefix = os.path.join(PROFILE_DIR, profile_filename)
 
                     # JSON output file for this model
-                    json_output_file = (
-                        f"results_{model.replace('/', '_')}.json"
-                    )
+                    json_output_file = f"results_{model.replace('/', '_')}.json"
 
                     command = [
                         "python3",

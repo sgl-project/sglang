@@ -83,7 +83,6 @@ class BenchmarkResult(BaseModel):
 
             rel_path = os.path.relpath(trace_file, trace_dir)
             raw_file_link = f"{base_url}/{rel_path}"
-            print(f"{raw_file_link=}")
             relay_link = (
                 f"{relay_base}?src={quote(raw_file_link, safe='')}"
                 if relay_base and quote
@@ -102,7 +101,6 @@ class BenchmarkResult(BaseModel):
                     for trace_file in trace_files
                 ]
 
-                print(f"{trace_files_relay_links=}")
                 profile_link = " | ".join(trace_files_relay_links)
 
         # Build the row
@@ -468,7 +466,6 @@ def save_results_as_json(result: List[Tuple], bench_args: BenchArgs, model: str)
             profile_links = parse_profile_links(
                 profile_link, batch_size, input_len, output_len
             )
-            print(f"{profile_links=}")
 
         benchmark_result = BenchmarkResult(
             model_path=model,
@@ -716,9 +713,6 @@ def main():
 
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
-
-    print(f"{server_args=}")
-    print(f"{bench_args=}")
 
     run_benchmark(server_args, bench_args)
 
