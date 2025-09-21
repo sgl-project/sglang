@@ -1776,8 +1776,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
 
-        # NOTE: when overlap eagle, implicitly depends on self.verify_done.synchronize(), but an earlier
-        #       filter_batch() also calls verify_done.synchronize(), so we don't need to call it here.
+        # NOTE: Previously we waited for the last decode batch's seq_lens because the "last batch"
+        #       at that time was a decode batch. Here the last batch is a prefill batch, and prefill
+        #       runs on the same stream. That implies the preceding decode batch (the one before this
+        #       prefill) has already finished and its seq_lens are ready, so verify_done.synchronize()
+        #       is unnecessary here.
 
         self.sampling_info.merge_batch(other.sampling_info)
 
