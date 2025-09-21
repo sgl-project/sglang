@@ -24,12 +24,12 @@ impl Default for WasmRuntimeConfig {
             .max(1);
 
         Self {
-            max_memory_pages: 1024, // 64MB
+            max_memory_pages: 1024,      // 64MB
             max_execution_time_ms: 1000, // 1 seconds
             enable_wasi: true,
-            max_stack_size: 1024 * 1024, // 1MB
+            max_stack_size: 1024 * 1024,                // 1MB
             thread_pool_size: default_thread_pool_size, // based on cpu count
-            module_cache_size: 10, // Cache up to 10 modules per worker
+            module_cache_size: 10,                      // Cache up to 10 modules per worker
         }
     }
 }
