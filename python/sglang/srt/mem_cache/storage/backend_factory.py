@@ -19,7 +19,9 @@ class StorageBackendFactory:
     _registry: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
-    def _load_backend_class(module_path: str, class_name: str, backend_name: str) -> type[HiCacheStorage]:
+    def _load_backend_class(
+        module_path: str, class_name: str, backend_name: str
+    ) -> type[HiCacheStorage]:
         """Load and validate a backend class from module path."""
         try:
             module = importlib.import_module(module_path)
@@ -39,9 +41,7 @@ class StorageBackendFactory:
             ) from e
 
     @classmethod
-    def register_backend(
-        cls, name: str, module_path: str, class_name: str
-    ) -> None:
+    def register_backend(cls, name: str, module_path: str, class_name: str) -> None:
         """Register a storage backend with lazy loading.
 
         Args:
@@ -99,10 +99,10 @@ class StorageBackendFactory:
             )
 
         # Try to dynamically load backend from extra_config
-        if storage_config.extra_config is not None:
+        if backend_name == "dynamic" and storage_config.extra_config is not None:
             backend_config = storage_config.extra_config
             return cls._create_dynamic_backend(
-                backend_name, backend_config, storage_config, mem_pool_host, **kwargs
+                backend_config, storage_config, mem_pool_host, **kwargs
             )
 
         # Backend not found
@@ -113,30 +113,31 @@ class StorageBackendFactory:
             f"Registered backends: {available_backends}. "
         )
 
-
     @classmethod
     def _create_dynamic_backend(
         cls,
-        backend_name: str,
         backend_config: Dict[str, Any],
         storage_config: HiCacheStorageConfig,
         mem_pool_host: Any,
         **kwargs,
     ) -> HiCacheStorage:
         """Create a backend dynamically from configuration."""
-        required_fields = ["module_path", "class_name"]
+        required_fields = ["backend_name", "module_path", "class_name"]
         for field in required_fields:
             if field not in backend_config:
                 raise ValueError(
-                    f"Missing required field '{field}' in backend config for '{backend_name}'"
+                    f"Missing required field '{field}' in backend config for 'dynamic' backend"
                 )
 
+        backend_name = backend_config["backend_name"]
         module_path = backend_config["module_path"]
         class_name = backend_config["class_name"]
 
         try:
             # Import the backend class
-            backend_class = cls._load_backend_class(module_path, class_name, backend_name)
+            backend_class = cls._load_backend_class(
+                module_path, class_name, backend_name
+            )
 
             logger.info(
                 f"Creating dynamic storage backend '{backend_name}' "

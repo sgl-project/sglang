@@ -1923,8 +1923,12 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
+            choices=["file", "mooncake", "hf3fs", "nixl", "dynamic"],
             default=ServerArgs.hicache_storage_backend,
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl. Custom backends can be loaded dynamically.",
+            help="The storage backend for hierarchical KV cache. "
+            "Built-in backends: file, mooncake, hf3fs, nixl. "
+            "For dynamic backend, use --hicache-storage-backend-extra-config to specify: "
+            "backend_name (custom name), module_path (Python module path), class_name (backend class name).",
         )
         parser.add_argument(
             "--hicache-storage-prefetch-policy",
