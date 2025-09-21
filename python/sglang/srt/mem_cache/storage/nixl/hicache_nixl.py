@@ -219,6 +219,7 @@ class HiCacheNixl(HiCacheStorage):
         values: Optional[List[torch.Tensor]] = None,
         target_locations: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
+        previous_keys: Optional[List[str]] = None,
     ) -> bool:
         if not keys or (not values and (not target_locations or not target_sizes)):
             logger.error("Keys or values were not passed")
