@@ -44,7 +44,7 @@ jobs:
         working-directory: sgl-kernel
         run: |
           pip install twine
-          python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+          python3 -m twine upload --skip-existing dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
 
   build-cu124:
     if: github.repository == 'sgl-project/sglang'
@@ -231,7 +231,7 @@ jobs:
         working-directory: sgl-kernel
         run: |
           pip install twine
-          python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+          python3 -m twine upload --skip-existing dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
