@@ -99,6 +99,7 @@ suites = {
         TestFile("test_priority_scheduling.py", 100),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
+        TestFile("test_radix_cache_unit.py", 5),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_retract_decode.py", 54),
