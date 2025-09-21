@@ -134,7 +134,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 device=model_runner.device,
             )
         if init_new_workspace:
-            self.workspace_buffer = torch.empty(    
+            self.workspace_buffer = torch.empty(
                 global_config.flashinfer_workspace_size,
                 dtype=torch.uint8,
                 device=model_runner.device,

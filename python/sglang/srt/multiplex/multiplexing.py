@@ -32,7 +32,15 @@ class SchedulerMultiplexMixin:
                     if decode_bs >= threshold:
                         stream_idx = i + 1
             else:
-                stream_idx =  max(1, min(self.real_sm_group_num - 2, decode_bs * (self.real_sm_group_num - 2) // self.pdmux_config.decode_bs_divisor))
+                stream_idx = max(
+                    1,
+                    min(
+                        self.real_sm_group_num - 2,
+                        decode_bs
+                        * (self.real_sm_group_num - 2)
+                        // self.pdmux_config.decode_bs_divisor,
+                    ),
+                )
             set_current_stream_idx(stream_idx)
         elif not self.running_batch.is_empty():
             set_current_stream_idx(self.real_sm_group_num - 1)
@@ -72,27 +80,26 @@ class SchedulerMultiplexMixin:
         torch.cuda.empty_cache()
 
         logger.debug("Starting event loop for pd multiplexing...")
-        
+
         while True:
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
-                
+
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
                 sm_count = self.sm_counts[stream_idx][0]
                 if not wait_prefill_kernel_done:
                     adjust_stream_group = (
-                    self.update_split_prefill_batch(sm_count) or adjust_stream_group
+                        self.update_split_prefill_batch(sm_count) or adjust_stream_group
                     )
-                
+
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 self.running_batch = self.update_running_batch(self.running_batch)
                 adjust_stream_group = adjust_stream_group or (
-                    stream_idx > 0
-                    and self.running_batch.is_empty()
+                    stream_idx > 0 and self.running_batch.is_empty()
                 )
                 if self.running_batch.is_empty() and self.split_prefill_batch is None:
                     self.check_memory()
@@ -175,7 +182,9 @@ class SchedulerMultiplexMixin:
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
                     if flags.item() == self.tp_size:
-                        self.process_batch_result(self.split_prefill_batch, prefill_result)
+                        self.process_batch_result(
+                            self.split_prefill_batch, prefill_result
+                        )
                         if self.running_batch and not self.running_batch.is_empty():
                             self.running_batch.merge_batch(self.split_prefill_batch)
                         else:

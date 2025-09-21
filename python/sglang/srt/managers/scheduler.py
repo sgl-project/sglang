@@ -2004,9 +2004,12 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                logits_output, next_token_ids, can_run_cuda_graph, model_worker_batch = (
-                    self.tp_worker.forward_batch_split_prefill(batch)
-                )
+                (
+                    logits_output,
+                    next_token_ids,
+                    can_run_cuda_graph,
+                    model_worker_batch,
+                ) = self.tp_worker.forward_batch_split_prefill(batch)
                 bid = model_worker_batch.bid
             elif self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()

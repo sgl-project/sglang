@@ -1624,7 +1624,7 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
-                    enable_alt_stream= not self.server_args.enable_pdmux,
+                    enable_alt_stream=not self.server_args.enable_pdmux,
                 )
 
         # Initialize token_to_kv_pool_allocator
@@ -1721,10 +1721,12 @@ class ModelRunner:
             attn_backend = HybridAttnBackend(
                 self,
                 decode_backend=self._get_attention_backend_from_str(
-                    self.decode_attention_backend_str, init_new_workspace=init_new_workspace
+                    self.decode_attention_backend_str,
+                    init_new_workspace=init_new_workspace,
                 ),
                 prefill_backend=self._get_attention_backend_from_str(
-                    self.prefill_attention_backend_str, init_new_workspace=init_new_workspace
+                    self.prefill_attention_backend_str,
+                    init_new_workspace=init_new_workspace,
                 ),
             )
             logger.info(
@@ -1738,7 +1740,8 @@ class ModelRunner:
             )
         else:
             attn_backend = self._get_attention_backend_from_str(
-                self.server_args.attention_backend, init_new_workspace=init_new_workspace
+                self.server_args.attention_backend,
+                init_new_workspace=init_new_workspace,
             )
 
         global_server_args_dict.update(
@@ -1749,7 +1752,9 @@ class ModelRunner:
         )
         return attn_backend
 
-    def _get_attention_backend_from_str(self, backend_str: str, init_new_workspace: bool = False):
+    def _get_attention_backend_from_str(
+        self, backend_str: str, init_new_workspace: bool = False
+    ):
         if backend_str not in ATTENTION_BACKENDS:
             raise ValueError(f"Invalid attention backend: {backend_str}")
         self.init_new_workspace = init_new_workspace

@@ -1,6 +1,7 @@
-import torch
 from dataclasses import dataclass, field
 from typing import List
+
+import torch
 import yaml
 from sgl_kernel import spatial
 
@@ -14,7 +15,9 @@ CURRENT_STREAM_GROUP = None
 @dataclass
 class PDMuxConfig:
     sm_group_num: int = 8
-    manual_divisions: List[List[int]] = field(default_factory=list)  # [prefill_sm, decode_sm, decode_bs_threshold]
+    manual_divisions: List[List[int]] = field(
+        default_factory=list
+    )  # [prefill_sm, decode_sm, decode_bs_threshold]
     split_forward_token_budget: int = 65536
     decode_bs_divisor: int = 36
 
@@ -29,7 +32,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
 
     if "sm_group_num" not in raw:
         raise ValueError("Missing required field: sm_group_num")
-    
+
     if raw["sm_group_num"] < 3:
         raise ValueError("sm_group_num must greater than 3")
 
@@ -48,6 +51,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         split_forward_token_budget=raw.get("split_forward_token_budget", 65536),
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
     )
+
 
 def get_arch_constraints(compute_capability):
     major, minor = compute_capability
@@ -105,25 +109,26 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     total_sm_count = spatial.get_sm_available(gpu_id)
     # (prefill_sm_count, decode_sm_count)
     if config.manual_divisions:
-        divsions = [
+        divisions = [
             (prefill_sm, decode_sm)
             for prefill_sm, decode_sm, _ in config.manual_divisions
         ]
     else:
-        divsions = divide_sm(
-            total_sm_count, torch.cuda.get_device_capability(device), config.sm_group_num - 2
+        divisions = divide_sm(
+            total_sm_count,
+            torch.cuda.get_device_capability(device),
+            config.sm_group_num - 2,
         )
-
 
     SM_COUNTS = []
     SM_COUNTS.append((total_sm_count, 0))  # Normal stream for prefill
-    SM_COUNTS.extend(divsions)  # Add the divided SM counts
+    SM_COUNTS.extend(divisions)  # Add the divided SM counts
     SM_COUNTS.append((0, total_sm_count))  # Normal stream for decode
     STREAM_GROUPS = []
     STREAM_GROUPS.append(
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
     )  # Normal stream for prefill
-    for prefill_sm, decode_sm in divsions:
+    for prefill_sm, decode_sm in divisions:
         STREAM_GROUPS.append(
             (spatial.create_greenctx_stream_by_value(prefill_sm, decode_sm, gpu_id))
         )

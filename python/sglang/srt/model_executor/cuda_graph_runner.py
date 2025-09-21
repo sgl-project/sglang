@@ -29,15 +29,14 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    set_graph_pool_id,
+)
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     graph_capture,
     set_pdmux_status,
 )
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    set_graph_pool_id,
-)
-from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
@@ -501,7 +500,9 @@ class CudaGraphRunner:
         for stream_idx in range(num_stream):
             with freeze_gc(
                 self.model_runner.server_args.enable_cudagraph_gc
-            ), graph_capture(stream=decode_stream_groups[stream_idx]) as graph_capture_context:
+            ), graph_capture(
+                stream=decode_stream_groups[stream_idx]
+            ) as graph_capture_context:
                 with profile_context as prof:
                     self.stream = graph_capture_context.stream
                     avail_mem = get_available_gpu_memory(
