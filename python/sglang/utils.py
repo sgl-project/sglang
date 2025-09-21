@@ -545,59 +545,16 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     return getattr(module, obj_name)
 
 
+
 class CachedKernel:
     """
-    Wrapper that allows kernel[keys][grid](...) syntax with caching.
+    Wrapper that allows kernel[grid](...) syntax with caching based on a key function.
     
-    This wrapper caches compiled Triton kernels based on explicitly provided keys
-    to avoid the overhead of extracting keys from arguments.
+    This wrapper caches compiled Triton kernels based on keys extracted by a 
+    user-provided key function to avoid redundant compilations.
     """
 
-    class CacheEntry:
-        """
-        Intermediate object that holds the keys and parent kernel.
-        Enables kernel[keys][grid](...) syntax.
-        """
-        
-        def __init__(self, parent: 'CachedKernel', key):
-            self.parent = parent
-            # Normalize keys to tuple for consistent hashing
-            if not isinstance(key, tuple):
-                if isinstance(key, (list, set)):
-                    key = tuple(key)
-                else:
-                    # Single key value
-                    key = (key,)
-            self.key = key
-        
-        def __getitem__(self, grid):
-            """
-            Second level of indexing: provide the grid.
-            Returns a launcher function.
-            """
-            assert isinstance(grid, tuple) and len(grid) <= 3, "Grid must be a tuple with at most 3 dimensions."
-            
-            # Normalize grid once
-            if len(grid) < 3:
-                grid = grid + (1,) * (3 - len(grid))
-            
-            def launcher(*args, **kwargs):
-                cached_kernel = self.parent.kernel_cache.get(self.key)
-                
-                if cached_kernel is None:
-                    # First time: compile and cache the kernel
-                    cached_kernel = self.parent.fn[grid](*args, **kwargs)
-                    self.parent.kernel_cache[self.key] = cached_kernel
-                    return cached_kernel
-                else:
-                    # Use cached kernel
-                    all_args = self.parent._build_args(args, kwargs)
-                    cached_kernel[grid](*all_args)
-                    return cached_kernel
-            
-            return launcher
-
-    def __init__(self, fn):
+    def __init__(self, fn, key_fn=None):
         self.fn = fn
         assert isinstance(fn, triton.runtime.jit.JITFunction)
         
@@ -613,13 +570,38 @@ class CachedKernel:
         
         functools.update_wrapper(self, original_fn)
         self.kernel_cache = {}
+        
+        # Store the key function
+        self.key_fn = key_fn
     
-    def __getitem__(self, keys):
+    def __getitem__(self, grid):
         """
-        First level of indexing: provide the cache keys.
-        Returns a CacheEntry that can be indexed with grid.
+        Index with grid to get a launcher function.
+        Returns a launcher that will handle caching based on the key function.
         """
-        return self.CacheEntry(self, keys)
+        assert isinstance(grid, tuple) and len(grid) <= 3, "Grid must be a tuple with at most 3 dimensions."
+        
+        # Normalize grid once
+        if len(grid) < 3:
+            grid = grid + (1,) * (3 - len(grid))
+        
+        def launcher(*args, **kwargs):
+            cache_key = self.key_fn(args, kwargs)
+            
+            cached_kernel = self.kernel_cache.get(cache_key)
+            
+            if cached_kernel is None:
+                # First time: compile and cache the kernel
+                cached_kernel = self.fn[grid](*args, **kwargs)
+                self.kernel_cache[cache_key] = cached_kernel
+                return cached_kernel
+            else:
+                # Use cached kernel
+                all_args = self._build_args(args, kwargs)
+                cached_kernel[grid](*all_args)
+                return cached_kernel
+        
+        return launcher
 
     def _build_args(self, args, kwargs):
         """
@@ -638,28 +620,28 @@ class CachedKernel:
         return complete_args
 
 
-def cached_triton_kernel(fn):
+def cached_triton_kernel(key_fn=None):
     """
-    Decorator that enables explicit key-based caching for Triton kernels.
+    Decorator that enables key-based caching for Triton kernels using a key function.
     
     Usage:
-        @cached_triton_kernel
+        @cached_triton_kernel(key_fn=lambda args, kwargs: kwargs.get('BLOCK_SIZE', 1024))
         @triton.jit
-        def my_kernel(x_ptr, y_ptr, BLOCK_SIZE: tl.constexpr, num_stages: tl.constexpr):
+        def my_kernel(x_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
             ...
         
-        # Invoke with explicit keys for caching
-        my_kernel[(BLOCK_SIZE,)][(num_blocks,)](x, y, BLOCK_SIZE=1024)
+        # Invoke normally
+        my_kernel[grid](x, y, BLOCK_SIZE=1024)
         
-        # Multiple keys
-        my_kernel[(BLOCK_SIZE, num_stages)][(grid_x, grid_y)](x, y, BLOCK_SIZE=1024, num_stages=4)
-    
-    The keys provided in the first bracket are used as the cache key along with the grid.
-    This avoids the overhead of extracting constexpr parameters from arguments at runtime.
-    
-    Note: Kernels with default parameter values are not supported and will raise an assertion error.
+    Args:
+        key_fn: A function that takes (args, kwargs) and returns the cache key(s).
+                The key can be a single value or a tuple of values.
     
     Returns:
-        A CachedKernel wrapper that supports explicit key-based caching.
+        A decorator that wraps the kernel with caching functionality.
+    
+    Note: Kernels with default parameter values are not supported and will raise an assertion error.
     """
-    return CachedKernel(fn)
+    def decorator(fn):
+        return CachedKernel(fn, key_fn)
+    return decorator

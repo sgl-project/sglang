@@ -7,7 +7,7 @@ import triton.language as tl
 from python.sglang.utils import cached_triton_kernel
 from sglang.srt.lora.utils import LoRABatchInfo
 
-@cached_triton_kernel
+@cached_triton_kernel(lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"]))
 @triton.jit
 def _chunked_lora_expand_kernel(
     # Pointers to matrices
@@ -190,8 +190,7 @@ def chunked_sgmv_lora_expand_forward(
     else:
         output = base_output
 
-    cache_key = (num_slices, BLOCK_M)
-    _chunked_lora_expand_kernel[cache_key][grid](
+    _chunked_lora_expand_kernel[grid](
         x=x,
         weights=weights,
         output=output,

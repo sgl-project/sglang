@@ -6,7 +6,7 @@ from python.sglang.utils import cached_triton_kernel
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
-@cached_triton_kernel
+@cached_triton_kernel(lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"]))
 @triton.jit
 def _chunked_lora_shrink_kernel(
     # Pointers to matrices
@@ -154,8 +154,7 @@ def chunked_sgmv_lora_shrink_forward(
 
     output = torch.empty((S, N), device=x.device, dtype=x.dtype)
 
-    cache_key = (num_slices, BLOCK_M)
-    _chunked_lora_shrink_kernel[cache_key][grid](
+    _chunked_lora_shrink_kernel[grid](
         x=x,
         weights=weights,
         output=output,
