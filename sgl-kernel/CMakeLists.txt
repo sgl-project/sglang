@@ -220,38 +220,31 @@ if (ENABLE_BELOW_SM90)
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+# refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"
+        "-gencode=arch=compute_103a,code=sm_103a"
+        "-gencode=arch=compute_110a,code=sm_110a"
+        "-gencode=arch=compute_121a,code=sm_121a"
+        "--compress-mode=size"
     )
-
-    # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
-    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
-        list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_103a,code=sm_103a"
-            "-gencode=arch=compute_110a,code=sm_110a"
-            "-gencode=arch=compute_121a,code=sm_121a"
-            "--compress-mode=size"
-        )
-    else()
-        list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_101a,code=sm_101a"
-        )
-    endif()
-
+elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_100a,code=sm_100a"
+        "-gencode=arch=compute_120a,code=sm_120a"
+        "-gencode=arch=compute_101a,code=sm_101a"
+    )
 else()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_90a,code=sm_90a"
         "-use_fast_math"
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
-    set(SGL_KERNEL_ENABLE_FA3 ON)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_90a,code=sm_90a"
-        "--use_fast_math"
-    )
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+    set(SGL_KERNEL_ENABLE_FA3 OFF)
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
