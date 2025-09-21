@@ -14,7 +14,11 @@ from dataclasses import dataclass
 import torch.nn.functional as F
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.layers.sampler import (
+    apply_custom_logit_processor,
+    get_token_ids_logprobs,
+    get_top_logprobs,
+)
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
@@ -28,7 +32,7 @@ from sglang.srt.speculative.eagle_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
@@ -39,6 +43,8 @@ if is_cuda():
     )
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
+
+RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 @dataclass
@@ -129,6 +135,84 @@ class LookaheadVerifyInput:
         )
         return kv_indices, cum_kv_seq_len, self.qo_indptr, self.custom_mask
 
+    def _add_logprob_values(
+        self,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+    ):
+        # Extract args
+        top_logprobs_nums = batch.top_logprobs_nums
+        token_ids_logprobs = batch.token_ids_logprobs
+        accepted_indices = self.accept_index
+        assert len(accepted_indices) == len(logits_output.next_token_logits)
+
+        temperatures = batch.sampling_info.temperatures
+        num_draft_tokens = batch.spec_info.draft_token_num
+        # acceptance indices are the indices in a "flattened" batch.
+        # dividing it to num_draft_tokens will yield the actual batch index.
+        temperatures = temperatures[accepted_indices // num_draft_tokens]
+        if RETURN_ORIGINAL_LOGPROB:
+            logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits, dim=-1
+            )
+        else:
+            logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits / temperatures, dim=-1
+            )
+        batch_next_token_ids = self.verified_id
+        accept_length_per_req_cpu = self.accept_length.tolist()
+        num_tokens_per_req = [accept + 1 for accept in accept_length_per_req_cpu]
+
+        # We should repeat top_logprobs_nums to match num_tokens_per_req.
+        top_logprobs_nums_repeat_interleaved = []
+        token_ids_logprobs_repeat_interleaved = []
+        for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req):
+            top_logprobs_nums_repeat_interleaved.extend([num] * num_tokens)
+        for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
+            token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
+
+        # Extract logprobs
+        if any(x > 0 for x in top_logprobs_nums):
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(
+                logprobs,
+                top_logprobs_nums_repeat_interleaved,
+            )
+
+        if any(x is not None for x in token_ids_logprobs):
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs(
+                logprobs,
+                token_ids_logprobs_repeat_interleaved,
+            )
+
+        logits_output.next_token_logprobs = logprobs[
+            torch.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
+            batch_next_token_ids,
+        ]
+
+        # Add output logprobs to the request
+        pt = 0
+        next_token_logprobs = logits_output.next_token_logprobs.tolist()
+        verified_ids = batch_next_token_ids.tolist()
+        for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
+            for _ in range(num_tokens):
+                if req.return_logprob:
+                    req.output_token_logprobs_val.append(next_token_logprobs[pt])
+                    req.output_token_logprobs_idx.append(verified_ids[pt])
+                    if req.top_logprobs_num > 0:
+                        req.output_top_logprobs_val.append(
+                            logits_output.next_token_top_logprobs_val[pt]
+                        )
+                        req.output_top_logprobs_idx.append(
+                            logits_output.next_token_top_logprobs_idx[pt]
+                        )
+                pt += 1
+
     def _fill_requests(
         self,
         batch: ScheduleBatch,
@@ -174,6 +258,8 @@ class LookaheadVerifyInput:
         if logits_output.hidden_states:
             logits_output.hidden_states = logits_output.hidden_states[self.accept_index]
         self.verified_id = self.predict[self.accept_index]
+        if batch.return_logprob:
+            self._add_logprob_values(batch, logits_output)
 
     def _free_cache(self, batch: ScheduleBatch, page_size: int):
         bs = batch.batch_size()
