@@ -105,6 +105,7 @@ deadpool-postgres = "0.14.1"
 
 # wasm dependencies
 sha2 = "0.10"
+wasmtime = "38.0"
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
