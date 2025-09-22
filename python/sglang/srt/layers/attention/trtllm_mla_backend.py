@@ -629,6 +629,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             max_seq_len = metadata.max_seq_len + forward_batch.spec_info.draft_token_num
 
+            # TODO may use `mla_rope_quantize_fp8` fusion
+            q = q.to(self.data_type)
+            assert kv_cache.dtype == self.data_type
+
             raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
                 query=q,
                 kv_cache=kv_cache,
