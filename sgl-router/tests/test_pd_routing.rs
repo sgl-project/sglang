@@ -1,11 +1,12 @@
 #[cfg(test)]
 mod test_pd_routing {
-    use rand::Rng;
     use serde_json::json;
-    use sglang_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
-    use sglang_router_rs::core::{WorkerFactory, WorkerType};
-    use sglang_router_rs::routers::pd_types::get_hostname;
-    use sglang_router_rs::routers::pd_types::PDSelectionPolicy;
+    use sglang_router_rs::config::{
+        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    };
+    use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
+    use sglang_router_rs::routers::http::pd_types::get_hostname;
+    use sglang_router_rs::routers::http::pd_types::PDSelectionPolicy;
     use sglang_router_rs::routers::RouterFactory;
 
     // Test-only struct to help validate PD request parsing
@@ -45,11 +46,17 @@ mod test_pd_routing {
 
     #[test]
     fn test_worker_types() {
-        use sglang_router_rs::core::{WorkerFactory, WorkerType};
+        use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
 
         // Test worker creation for prefill servers
-        let prefill_worker =
-            WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000));
+        let prefill_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(9000),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
         assert_eq!(prefill_worker.url(), "http://prefill:8080");
         match prefill_worker.worker_type() {
             WorkerType::Prefill { bootstrap_port } => {
@@ -59,7 +66,12 @@ mod test_pd_routing {
         }
 
         // Test worker creation for decode servers
-        let decode_worker = WorkerFactory::create_decode("http://decode:8080".to_string());
+        let decode_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://decode:8080")
+                .worker_type(WorkerType::Decode)
+                .api_key("test_api_key")
+                .build(),
+        );
         assert_eq!(decode_worker.url(), "http://decode:8080");
         match decode_worker.worker_type() {
             WorkerType::Decode => (),
@@ -67,7 +79,12 @@ mod test_pd_routing {
         }
 
         // Test regular worker creation
-        let regular_worker = WorkerFactory::create_regular("http://regular:8080".to_string());
+        let regular_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://regular:8080")
+                .worker_type(WorkerType::Regular)
+                .api_key("test_api_key")
+                .build(),
+        );
         assert_eq!(regular_worker.url(), "http://regular:8080");
         match regular_worker.worker_type() {
             WorkerType::Regular => (),
@@ -107,8 +124,8 @@ mod test_pd_routing {
         }
     }
 
-    #[test]
-    fn test_pd_router_configuration() {
+    #[tokio::test]
+    async fn test_pd_router_configuration() {
         // Test PD router configuration with various policies
         // In the new structure, RoutingMode and PolicyConfig are separate
         let test_cases = vec![
@@ -122,6 +139,8 @@ mod test_pd_routing {
                         "http://decode1:8080".to_string(),
                         "http://decode2:8080".to_string(),
                     ],
+                    prefill_policy: None,
+                    decode_policy: None,
                 },
                 PolicyConfig::Random,
             ),
@@ -129,6 +148,8 @@ mod test_pd_routing {
                 RoutingMode::PrefillDecode {
                     prefill_urls: vec![("http://prefill:8080".to_string(), Some(9000))],
                     decode_urls: vec!["http://decode:8080".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
                 },
                 PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
@@ -142,6 +163,8 @@ mod test_pd_routing {
                         ("http://p3:8080".to_string(), Some(9002)),
                     ],
                     decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
                 },
                 PolicyConfig::CacheAware {
                     cache_threshold: 0.7,
@@ -163,21 +186,45 @@ mod test_pd_routing {
                 request_timeout_secs: 60,
                 worker_startup_timeout_secs: 10,
                 worker_startup_check_interval_secs: 1,
+                dp_aware: false,
+                api_key: None,
                 discovery: None,
                 metrics: None,
                 log_dir: None,
                 log_level: None,
+                request_id_headers: None,
+                max_concurrent_requests: 64,
+                queue_size: 0,
+                queue_timeout_secs: 60,
+                cors_allowed_origins: vec![],
+                retry: RetryConfig::default(),
+                circuit_breaker: CircuitBreakerConfig::default(),
+                disable_retries: false,
+                disable_circuit_breaker: false,
+                health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+                enable_igw: false,
+                rate_limit_tokens_per_second: None,
+                connection_mode: ConnectionMode::Http,
+                model_path: None,
+                tokenizer_path: None,
+                history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             };
 
-            // Router creation will fail due to health checks, but config should be valid
-            let result = RouterFactory::create_router(&config);
-            assert!(result.is_err());
-            let error_msg = result.unwrap_err();
-            // Error should be about health/timeout, not configuration
+            let app_context =
+                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64, None)
+                    .expect("Failed to create AppContext");
+            let app_context = std::sync::Arc::new(app_context);
+            let result = RouterFactory::create_router(&app_context).await;
             assert!(
-                error_msg.contains("healthy") || error_msg.contains("timeout"),
-                "Unexpected error: {}",
-                error_msg
+                result.is_ok(),
+                "Router creation should succeed with empty worker"
+            );
+
+            // Verify that no workers are registered since we didn't initialize them
+            let stats = app_context.worker_registry.stats();
+            assert_eq!(
+                stats.total_workers, 0,
+                "No workers should be registered without initialization"
             );
         }
     }
@@ -248,8 +295,14 @@ mod test_pd_routing {
         });
 
         // Create a prefill worker to simulate injection
-        let prefill_worker =
-            WorkerFactory::create_prefill("http://prefill1:8080".to_string(), Some(9000));
+        let prefill_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill1:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(9000),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
 
         // Extract bootstrap port from worker type
         let bootstrap_port = match prefill_worker.worker_type() {
@@ -401,41 +454,6 @@ mod test_pd_routing {
     }
 
     #[test]
-    fn test_power_of_two_load_selection() {
-        // Test the power-of-two selection logic with different load scenarios
-
-        // Scenario 1: Clear winner for both prefill and decode
-        let _loads = vec![
-            ("prefill1", 100),
-            ("prefill2", 10), // Should be selected
-            ("decode1", 50),
-            ("decode2", 5), // Should be selected
-        ];
-
-        // In actual implementation, the lower load should be selected
-        assert!(10 < 100);
-        assert!(5 < 50);
-
-        // Scenario 2: Equal loads (should select first)
-        let _equal_loads = vec![
-            ("prefill1", 20),
-            ("prefill2", 20), // Either could be selected
-            ("decode1", 30),
-            ("decode2", 30), // Either could be selected
-        ];
-
-        // When loads are equal, <= comparison means first is selected
-        assert!(20 <= 20);
-        assert!(30 <= 30);
-
-        // Scenario 3: Missing load data (should default to usize::MAX)
-        // This tests the unwrap_or(usize::MAX) behavior
-        let missing_load = usize::MAX;
-        assert!(10 < missing_load);
-        assert!(missing_load > 0);
-    }
-
-    #[test]
     fn test_load_monitoring_configuration() {
         // Test that load monitoring is only enabled for PowerOfTwo policy
         let policies = vec![
@@ -584,12 +602,10 @@ mod test_pd_routing {
     #[test]
     fn test_streaming_response_parsing() {
         // Test SSE format parsing from streaming responses
-        let sse_chunks = vec![
-            "data: {\"text\":\"Hello\",\"meta_info\":{\"completion_tokens\":1,\"finish_reason\":null}}",
+        let sse_chunks = ["data: {\"text\":\"Hello\",\"meta_info\":{\"completion_tokens\":1,\"finish_reason\":null}}",
             "data: {\"text\":\" world\",\"meta_info\":{\"completion_tokens\":2,\"finish_reason\":null}}",
             "data: {\"text\":\"!\",\"meta_info\":{\"completion_tokens\":3,\"finish_reason\":{\"type\":\"length\"}}}",
-            "data: [DONE]",
-        ];
+            "data: [DONE]"];
 
         for chunk in &sse_chunks[..3] {
             assert!(chunk.starts_with("data: "));
@@ -668,7 +684,7 @@ mod test_pd_routing {
 
     #[test]
     fn test_bootstrap_injection_with_benchmark_requests() {
-        use sglang_router_rs::core::{WorkerFactory, WorkerType};
+        use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
 
         // Test bootstrap injection with actual benchmark request patterns
         let mut benchmark_request = json!({
@@ -683,8 +699,14 @@ mod test_pd_routing {
         });
 
         // Create a prefill worker to simulate injection
-        let prefill_worker =
-            WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000));
+        let prefill_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(9000),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
 
         // Extract bootstrap port from worker type
         let bootstrap_port = match prefill_worker.worker_type() {
@@ -814,8 +836,14 @@ mod test_pd_routing {
             });
 
             // Create a prefill worker to simulate injection
-            let prefill_worker =
-                WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000));
+            let prefill_worker: Box<dyn Worker> = Box::new(
+                BasicWorkerBuilder::new("http://prefill:8080")
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: Some(9000),
+                    })
+                    .api_key("test_api_key")
+                    .build(),
+            );
 
             // Extract bootstrap port from worker type
             let bootstrap_port = match prefill_worker.worker_type() {
@@ -827,7 +855,7 @@ mod test_pd_routing {
             large_batch_request["bootstrap_host"] = json!(vec![hostname; batch_size]);
             large_batch_request["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
             large_batch_request["bootstrap_room"] = json!((0..batch_size)
-                .map(|_| rand::thread_rng().gen::<u64>())
+                .map(|_| rand::random::<u64>())
                 .collect::<Vec<_>>());
 
             let elapsed = start.elapsed();

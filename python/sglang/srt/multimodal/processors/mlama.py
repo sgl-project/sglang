@@ -10,8 +10,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 class MllamaImageProcessor(BaseMultimodalProcessor):
     models = [MllamaForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self._processor.image_token,
             image_token_id=self._processor.image_token_id,

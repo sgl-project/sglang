@@ -12,12 +12,10 @@ jobs:
     strategy:
       matrix:
         variant:
-          - version: 12.6.1
+          - version: 12.9.1
             type: all
             tag: dev
-          - version: 12.8.1
-            type: blackwell
-            tag: blackwell
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

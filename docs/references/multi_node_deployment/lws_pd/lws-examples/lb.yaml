@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseekr10528-lb-main
+  labels:
+    app: deepseekr10528-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepseekr10528-lb
+  template:
+    metadata:
+      labels:
+        app: deepseekr10528-lb
+    spec:
+      nodeSelector:
+          bo: "yes"
+      tolerations:
+        - key: bopd
+          operator: Exists
+        - key: node-role
+          operator: Exists
+      containers:
+        - name: sgl-minilb
+          image: lmsysorg/sglang:latest
+          command:
+          - python
+          - -m
+          - sglang_router.launch_router
+          - --pd-disaggregation
+          - --prefill
+          - http://deepseekr10528-prefill-main:30000
+          - --decode
+          - http://deepseekr10528-decode-main:30000
+          - --host
+          - 0.0.0.0
+          - --port
+          -  "8000"
+          ports:
+            - containerPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseekr10528-lb-service
+spec:
+  type: NodePort # NodePort is easy to test, you can also specify `ClusterIP`
+  selector:
+    app: deepseekr10528-lb
+  ports:
+    - protocol: TCP
+      port: 8000         # Service Port（In-Cluster）
+      targetPort: 8000   # Exposed Container
+      nodePort: 30800

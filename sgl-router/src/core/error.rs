@@ -17,6 +17,8 @@ pub enum WorkerError {
     NetworkError { url: String, error: String },
     /// Worker is at capacity
     WorkerAtCapacity { url: String },
+    /// Invalid URL format
+    InvalidUrl { url: String },
 }
 
 impl fmt::Display for WorkerError {
@@ -36,6 +38,9 @@ impl fmt::Display for WorkerError {
             }
             WorkerError::WorkerAtCapacity { url } => {
                 write!(f, "Worker at capacity: {}", url)
+            }
+            WorkerError::InvalidUrl { url } => {
+                write!(f, "Invalid URL format: {}", url)
             }
         }
     }
@@ -117,7 +122,6 @@ mod tests {
         let error = WorkerError::WorkerNotFound {
             url: "http://test".to_string(),
         };
-        // Verify it implements Error trait
         let _: &dyn Error = &error;
         assert!(error.source().is_none());
     }
@@ -130,12 +134,9 @@ mod tests {
 
     #[test]
     fn test_worker_result_type_alias() {
-        // Test Ok variant
         let result: WorkerResult<i32> = Ok(42);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
+        assert!(matches!(result, Ok(42)));
 
-        // Test Err variant
         let error = WorkerError::WorkerNotFound {
             url: "test".to_string(),
         };
@@ -145,7 +146,6 @@ mod tests {
 
     #[test]
     fn test_empty_url_handling() {
-        // Test empty URLs in error variants
         let error1 = WorkerError::HealthCheckFailed {
             url: "".to_string(),
             reason: "No connection".to_string(),
@@ -169,7 +169,6 @@ mod tests {
 
     #[test]
     fn test_special_characters_in_messages() {
-        // Test with special characters
         let error = WorkerError::InvalidConfiguration {
             message: "Invalid JSON: {\"error\": \"test\"}".to_string(),
         };
@@ -178,7 +177,6 @@ mod tests {
             "Invalid worker configuration: Invalid JSON: {\"error\": \"test\"}"
         );
 
-        // Test with unicode
         let error2 = WorkerError::HealthCheckFailed {
             url: "http://测试:8080".to_string(),
             reason: "连接被拒绝".to_string(),
@@ -203,10 +201,8 @@ mod tests {
         );
     }
 
-    // Mock reqwest error for testing conversion
     #[test]
     fn test_reqwest_error_conversion() {
-        // Test that NetworkError is the correct variant
         let network_error = WorkerError::NetworkError {
             url: "http://example.com".to_string(),
             error: "connection timeout".to_string(),
@@ -223,8 +219,6 @@ mod tests {
 
     #[test]
     fn test_error_equality() {
-        // WorkerError doesn't implement PartialEq, but we can test that
-        // the same error construction produces the same display output
         let error1 = WorkerError::WorkerNotFound {
             url: "http://test".to_string(),
         };

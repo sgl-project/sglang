@@ -210,6 +210,7 @@ class PhiMoE(nn.Module):
         self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
+            layer_id=layer_id,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             reduce_results=True,

@@ -8,7 +8,6 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
-    StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
 )
@@ -216,11 +215,11 @@ class PythonicDetector(BaseFormatDetector):
         else:
             raise ValueError("Tool call arguments must be literals")
 
-    def structure_info(self) -> _GetInfoFunc:
-        def info(name: str):
-            return StructureInfo(begin=f"[{name}(", end=")]", trigger=f"[{name}(")
+    def supports_structural_tag(self) -> bool:
+        return False
 
-        return info
+    def structure_info(self) -> _GetInfoFunc:
+        raise NotImplementedError
 
     def build_ebnf(self, tools: List[Tool]) -> Optional[str]:
         return EBNFComposer.build_ebnf(
