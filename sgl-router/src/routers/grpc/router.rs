@@ -236,7 +236,7 @@ impl GrpcRouter {
         };
 
         // Step 6: Select worker
-        let worker = match self.select_worker_for_request(model_id, &processed_messages.text) {
+        let worker = match self.select_worker_for_request(model_id, Some(&processed_messages.text)) {
             Some(w) => w,
             None => {
                 warn!("No available workers for model: {:?}", model_id);
@@ -441,24 +441,35 @@ impl GrpcRouter {
     }
 
     /// Select a worker for the request
-    fn select_worker_for_request(&self, model_id: Option<&str>, text: &str) -> Option<Arc<dyn crate::core::Worker>> {
+    fn select_worker_for_request(&self, model_id: Option<&str>, text: Option<&str>) -> Option<Arc<dyn crate::core::Worker>> {
+        // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
             model_id,
             Some(WorkerType::Regular),
             Some(crate::core::ConnectionMode::Grpc { port: None }),
-            true,
+            false, // get all workers, we'll filter by is_available() next
         );
 
-        if workers.is_empty() {
+        // Filter by availability (health + circuit breaker)
+        let available: Vec<Arc<dyn crate::core::Worker>> = workers
+            .iter()
+            .filter(|w| w.is_available())
+            .cloned()
+            .collect();
+
+        if available.is_empty() {
             return None;
         }
 
-        // Policy returns an index, get the worker at that index
-        if let Some(index) = self.policy.select_worker(&workers, Some(text)) {
-            workers.get(index).cloned()
-        } else {
-            None
-        }
+        // Get the appropriate policy for this model
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        // Select worker using the policy
+        let idx = policy.select_worker(&available, text)?;
+        Some(available[idx].clone())
     }
 
     /// Get or create a gRPC client for the worker
