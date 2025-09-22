@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut, FirstTokenTimeUpdate
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
 if TYPE_CHECKING:
@@ -88,6 +88,13 @@ class SchedulerOutputProcessorMixin:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
+
+                    # send first token time to tokenizer
+                    if len(req.output_ids) == 1:
+                        self.send_to_tokenizer.send_pyobj(FirstTokenTimeUpdate(
+                            rid=req.rid,
+                            first_token_time=time.time()
+                        ))
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)

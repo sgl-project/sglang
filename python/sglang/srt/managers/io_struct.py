@@ -36,6 +36,28 @@ else:
 
 
 @dataclass
+class Metrics:
+    """Timing metrics for a request."""
+    arrival_time: float
+    first_token_time: float
+    finished_time: float
+
+    def __post_init__(self):
+        """Ensure all times are valid."""
+        if self.first_token_time == 0.0:
+            # If first_token_time is not set, use finished_time
+            self.first_token_time = self.finished_time
+
+    def to_dict(self):
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "arrival_time": self.arrival_time,
+            "first_token_time": self.first_token_time,
+            "finished_time": self.finished_time
+        }
+
+
+@dataclass
 class SessionParams:
     id: Optional[str] = None
     rid: Optional[str] = None
@@ -1269,6 +1291,11 @@ class OpenSessionReqOutput:
 class HealthCheckOutput:
     pass
 
+
+@dataclass
+class FirstTokenTimeUpdate:
+    rid: str
+    first_token_time: float
 
 class ExpertDistributionReq(Enum):
     START_RECORD = 1
