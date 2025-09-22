@@ -5,7 +5,7 @@
 //! - Multi-Router Mode (enable_igw=true): RouterManager coordinates everything
 
 use crate::config::RouterConfig;
-use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
+use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig, Worker, WorkerRegistry, WorkerType};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesRequest,
@@ -53,7 +53,7 @@ pub struct RouterManager {
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
 
     /// Default router for requests without specific routing
-    default_router: Option<RouterId>,
+    default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
 
     /// HTTP client for querying worker info
     client: reqwest::Client,
@@ -75,27 +75,29 @@ impl RouterManager {
             worker_registry,
             policy_registry,
             routers: Arc::new(DashMap::new()),
-            default_router: None,
+            default_router: Arc::new(std::sync::RwLock::new(None)),
             client,
             config,
         }
     }
 
     /// Register a router with the manager
-    pub fn register_router(&mut self, id: RouterId, router: Arc<dyn RouterTrait>) {
+    pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
         // Store router
         self.routers.insert(id.clone(), router);
 
         // Set as default if first router
-        if self.default_router.is_none() {
-            self.default_router = Some(id.clone());
+        let mut default_router = self.default_router.write().unwrap();
+        if default_router.is_none() {
+            *default_router = Some(id.clone());
             info!("Set default router to {}", id.as_str());
         }
     }
 
     /// Set the default router
-    pub fn set_default_router(&mut self, id: RouterId) {
-        self.default_router = Some(id);
+    pub fn set_default_router(&self, id: RouterId) {
+        let mut default_router = self.default_router.write().unwrap();
+        *default_router = Some(id);
     }
 
     /// Get the number of registered routers
@@ -130,7 +132,8 @@ impl RouterManager {
         }
 
         // Fall back to default router
-        if let Some(ref default_id) = self.default_router {
+        let default_router = self.default_router.read().unwrap();
+        if let Some(ref default_id) = *default_router {
             self.routers.get(default_id).map(|r| r.clone())
         } else {
             None
@@ -158,7 +161,7 @@ impl RouterManager {
         let model_id = if let Some(model_id) = config.model_id {
             model_id
         } else {
-            match self.query_server_info(&config.url).await {
+            match self.query_server_info(&config.url, &config.api_key).await {
                 Ok(info) => {
                     // Extract model_id from server info
                     info.model_id
@@ -205,22 +208,44 @@ impl RouterManager {
         }
 
         let worker = match config.worker_type.as_deref() {
-            Some("prefill") => WorkerFactory::create_prefill_with_labels(
-                config.url.clone(),
-                config.bootstrap_port,
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            Some("decode") => WorkerFactory::create_decode_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            _ => WorkerFactory::create_regular_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
+            Some("prefill") => {
+                let mut builder = BasicWorkerBuilder::new(config.url.clone())
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: config.bootstrap_port,
+                    })
+                    .labels(labels.clone())
+                    .circuit_breaker_config(CircuitBreakerConfig::default());
+
+                if let Some(api_key) = config.api_key.clone() {
+                    builder = builder.api_key(api_key);
+                }
+
+                Box::new(builder.build()) as Box<dyn Worker>
+            }
+            Some("decode") => {
+                let mut builder = BasicWorkerBuilder::new(config.url.clone())
+                    .worker_type(WorkerType::Decode)
+                    .labels(labels.clone())
+                    .circuit_breaker_config(CircuitBreakerConfig::default());
+
+                if let Some(api_key) = config.api_key.clone() {
+                    builder = builder.api_key(api_key);
+                }
+
+                Box::new(builder.build()) as Box<dyn Worker>
+            }
+            _ => {
+                let mut builder = BasicWorkerBuilder::new(config.url.clone())
+                    .worker_type(WorkerType::Regular)
+                    .labels(labels.clone())
+                    .circuit_breaker_config(CircuitBreakerConfig::default());
+
+                if let Some(api_key) = config.api_key.clone() {
+                    builder = builder.api_key(api_key);
+                }
+
+                Box::new(builder.build()) as Box<dyn Worker>
+            }
         };
 
         // Register worker
@@ -336,10 +361,18 @@ impl RouterManager {
     }
 
     /// Query server info from a worker URL
-    async fn query_server_info(&self, url: &str) -> Result<ServerInfo, String> {
+    async fn query_server_info(
+        &self,
+        url: &str,
+        api_key: &Option<String>,
+    ) -> Result<ServerInfo, String> {
         let info_url = format!("{}/get_server_info", url.trim_end_matches('/'));
 
-        match self.client.get(&info_url).send().await {
+        let mut req_builder = self.client.get(&info_url);
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+        match req_builder.send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     response
@@ -467,10 +500,15 @@ impl RouterManager {
 #[async_trait]
 impl WorkerManagement for RouterManager {
     /// Add a worker - in multi-router mode, this adds to the registry
-    async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+    async fn add_worker(
+        &self,
+        worker_url: &str,
+        api_key: &Option<String>,
+    ) -> Result<String, String> {
         // Create a basic worker config request
         let config = WorkerConfigRequest {
             url: worker_url.to_string(),
+            api_key: api_key.clone(),
             model_id: None,
             worker_type: None,
             priority: None,
@@ -808,7 +846,7 @@ impl std::fmt::Debug for RouterManager {
         f.debug_struct("RouterManager")
             .field("routers_count", &self.routers.len())
             .field("workers_count", &self.worker_registry.get_all().len())
-            .field("default_router", &self.default_router)
+            .field("default_router", &*self.default_router.read().unwrap())
             .finish()
     }
 }

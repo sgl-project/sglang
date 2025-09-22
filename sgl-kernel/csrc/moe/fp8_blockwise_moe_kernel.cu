@@ -463,7 +463,7 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
     using MmaTileShape = Shape<_128, _32, _128>;
     using ClusterShape = Shape<_2, _1, _1>;
     // TODO: Check Pingpong or Cooperative
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8Blockwise;
     using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
     using ScaleConfig =
         cutlass::detail::Sm90BlockwiseScaleConfig<128, 1, 128, cute::GMMA::Major::K, cute::GMMA::Major::K>;
@@ -475,7 +475,7 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
     using ElementA = cutlass::float_e4m3_t;
     using MmaTileShape = Shape<_64, _128, _128>;
     using ClusterShape = Shape<_2, _1, _1>;
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8Blockwise;
     using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
     using ScaleConfig =
         cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128, cute::GMMA::Major::K, cute::GMMA::Major::K>;
@@ -487,7 +487,7 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
     using ElementA = cutlass::float_e4m3_t;
     using MmaTileShape = Shape<_128, _128, _128>;
     using ClusterShape = Shape<_1, _2, _1>;
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8Blockwise;
     using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
     using ScaleConfig =
         cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128, cute::GMMA::Major::K, cute::GMMA::Major::K>;
