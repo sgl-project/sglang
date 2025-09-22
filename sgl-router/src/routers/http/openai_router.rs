@@ -66,25 +66,6 @@ impl OpenAIRouter {
 }
 
 #[async_trait]
-impl super::super::WorkerManagement for OpenAIRouter {
-    async fn add_worker(
-        &self,
-        _worker_url: &str,
-        _api_key: &Option<String>,
-    ) -> Result<String, String> {
-        Err("Cannot add workers to OpenAI router".to_string())
-    }
-
-    fn remove_worker(&self, _worker_url: &str) {
-        // No-op for OpenAI router
-    }
-
-    fn get_worker_urls(&self) -> Vec<String> {
-        vec![self.base_url.clone()]
-    }
-}
-
-#[async_trait]
 impl super::super::RouterTrait for OpenAIRouter {
     fn as_any(&self) -> &dyn Any {
         self
