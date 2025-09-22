@@ -1554,6 +1554,9 @@ def check_evaluation_test_results(
     some_model_failed_to_get_result = len(results) != (
         model_count or len(model_accuracy_thresholds)
     )
+    if some_model_failed_to_get_result:
+        print("Some model has failed to launch and be evaluated")
+
     if failed_models or some_model_failed_to_get_result:
         raise AssertionError("\n".join(failed_models))
 

@@ -117,8 +117,6 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                             f"Loaded {len(benchmark_results)} benchmark results from {json_output_file}"
                         )
 
-                        # Clean up JSON file
-                        os.remove(json_output_file)
                     else:
                         print(f"Warning: JSON output file {json_output_file} not found")
 
