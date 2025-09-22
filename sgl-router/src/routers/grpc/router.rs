@@ -379,7 +379,7 @@ impl GrpcRouter {
         Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
-            top_k: request.top_k.unwrap_or(-1) as i32,
+            top_k: request.top_k.unwrap_or(-1),
             min_p: request.min_p.unwrap_or(0.0),
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
@@ -409,14 +409,12 @@ impl GrpcRouter {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
-        if let Some(format) = &request.response_format {
-            if let ResponseFormat::JsonSchema { json_schema } = format {
-                let schema_str = serde_json::to_string(&json_schema.schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
-                return Ok(Some(proto::sampling_params::Constraint::JsonSchema(
-                    schema_str,
-                )));
-            }
+        if let Some(ResponseFormat::JsonSchema { json_schema }) = &request.response_format {
+            let schema_str = serde_json::to_string(&json_schema.schema)
+                .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+            return Ok(Some(proto::sampling_params::Constraint::JsonSchema(
+                schema_str,
+            )));
         }
 
         if let Some(ebnf) = &request.ebnf {
