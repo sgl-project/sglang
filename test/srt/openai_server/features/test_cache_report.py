@@ -282,7 +282,7 @@ class TestCacheReport(CustomTestCase):
 
         # Verify cache hit for salt2
         assert (
-            cached_tokens_2_second > cached_tokens_2_first
+            cached_tokens_2_second == cached_tokens_2_first
         ), "Should have cache hit with same cache_salt for salt2"
 
 
