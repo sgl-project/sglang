@@ -45,7 +45,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
 )
-from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 
 if TYPE_CHECKING:
