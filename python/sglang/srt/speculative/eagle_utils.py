@@ -78,6 +78,7 @@ class EagleDraftInput:
     # Inputs for draft extend
     # shape: (b,)
     seq_lens_for_draft_extend: torch.Tensor = None
+    seq_lens_for_draft_extend_cpu: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
 
     def prepare_for_extend(self, batch: ScheduleBatch):
@@ -128,6 +129,7 @@ class EagleDraftInput:
         batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
+        batch.seq_lens_cpu = batch.spec_info.seq_lens_for_draft_extend_cpu
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         batch.return_logprob = False
         batch.return_hidden_states = False
@@ -280,14 +282,21 @@ class EagleVerifyInput:
             end_offset = batch.seq_lens + self.draft_token_num
         else:
             prefix_lens = batch.seq_lens
+            prefix_lens_cpu = batch.seq_lens_cpu
             end_offset = prefix_lens + self.draft_token_num
+            end_offset_cpu = prefix_lens_cpu + self.draft_token_num
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
                 prefix_lens,
             )
             batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
-                prefix_lens, end_offset, last_loc, len(batch.input_ids)
+                prefix_lens,
+                prefix_lens_cpu,
+                end_offset,
+                end_offset_cpu,
+                last_loc,
+                len(batch.input_ids),
             )
             self.last_loc = last_loc
 
@@ -389,6 +398,7 @@ class EagleVerifyInput:
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
+        accept_length_cpu = torch.empty((bs,), dtype=torch.int32)
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
@@ -557,6 +567,7 @@ class EagleVerifyInput:
         verified_id = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
+        accept_length_cpu.copy_(accept_length, non_blocking=True)
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
@@ -633,13 +644,15 @@ class EagleVerifyInput:
             else:
                 batch.out_cache_loc = tgt_cache_loc
             batch.seq_lens.add_(accept_length + 1)
+            batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
             draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
                 verified_id=verified_id,
                 accept_length=accept_length,
-                accept_length_cpu=accept_length.tolist(),
+                accept_length_cpu=accept_length_cpu,
                 seq_lens_for_draft_extend=batch.seq_lens,
+                seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu,
                 req_pool_indices_for_draft_extend=batch.req_pool_indices,
             )
 
@@ -662,8 +675,8 @@ class EagleVerifyInput:
                     next_power_of_2(bs),
                 )
                 batch.seq_lens.add_(accept_length + 1)
+                batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
-            accept_length_cpu = accept_length.tolist()
             if len(unfinished_accept_index) > 0:
                 unfinished_accept_index = torch.cat(unfinished_accept_index)
                 unfinished_index_device = torch.tensor(
@@ -685,6 +698,7 @@ class EagleVerifyInput:
                         unfinished_index_device,
                         batch.seq_lens,
                     )
+                    batch.seq_lens_cpu.add_(accept_length_cpu + 1)
                     filter_finished_cache_loc_kernel[(bs,)](
                         batch.out_cache_loc,
                         tgt_cache_loc,
@@ -702,6 +716,7 @@ class EagleVerifyInput:
                     accept_length_cpu=draft_input_accept_length_cpu,
                     accept_length=accept_length[unfinished_index_device],
                     seq_lens_for_draft_extend=batch.seq_lens[unfinished_index_device],
+                    seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu[unfinished_index],
                     req_pool_indices_for_draft_extend=batch.req_pool_indices[
                         unfinished_index_device
                     ],

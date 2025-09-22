@@ -3176,3 +3176,22 @@ def get_extend_input_len_swa_limit(
     #    and we can only free out-of-sliding-window kv indices after each prefill.
     # 3. page_size is because we want to have 1 token extra for generated tokens.
     return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
+
+
+def get_num_new_pages(prefix_lens: torch.Tensor, seq_lens: torch.Tensor, page_size: int) -> int:
+    """
+    Get the number of new pages for the given prefix and sequence lengths. We use cpu tensors to avoid blocking kernel launch.
+    """
+    cpu_device = torch.device("cpu")
+    assert prefix_lens.device == cpu_device
+    assert seq_lens.device == cpu_device
+    num_pages_after = (seq_lens + page_size - 1) // page_size
+    num_pages_before = (prefix_lens + page_size - 1) // page_size
+    num_new_pages = num_pages_after - num_pages_before
+    extend_lens = seq_lens - prefix_lens
+    sum_num_new_pages = torch.sum(num_new_pages).to(torch.int64)
+    merged_value = (sum_num_new_pages) << 32 | torch.sum(extend_lens).to(
+        torch.int64
+    )
+
+    return merged_value

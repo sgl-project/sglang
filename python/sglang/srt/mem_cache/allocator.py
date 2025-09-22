@@ -27,7 +27,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
-from sglang.srt.utils import get_bool_env_var, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, next_power_of_2, get_num_new_pages
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -294,7 +294,6 @@ def alloc_extend_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    ret_values,
     bs_upper: tl.constexpr,
     page_size: tl.constexpr,
     max_num_extend_tokens: tl.constexpr,
@@ -322,13 +321,6 @@ def alloc_extend_kernel(
     ) // page_size
     sum_num_new_pages = tl.sum(num_new_pages)
     new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
-
-    # Return value
-    if pid == tl.num_programs(0) - 1:
-        merged_value = (sum_num_new_pages.to(tl.int64)) << 32 | sum_extend_lens.to(
-            tl.int64
-        )
-        tl.store(ret_values, merged_value)
 
     # Part 1: fill the old partial page
     last_loc = tl.load(last_loc_ptr + pid)
@@ -468,7 +460,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
@@ -506,6 +500,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
+        self.ret_values = get_num_new_pages(prefix_lens_cpu, seq_lens_cpu, self.page_size)
         merged_value = self.ret_values.item()
         num_new_pages = merged_value >> 32
         if num_new_pages > len(self.free_pages):
