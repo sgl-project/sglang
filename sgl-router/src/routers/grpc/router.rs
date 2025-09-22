@@ -8,7 +8,7 @@ use crate::grpc::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::reasoning_parser::ParserFactory;
-use crate::routers::{RouterTrait, WorkerManagement};
+use crate::routers::RouterTrait;
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ParserRegistry;
 use async_trait::async_trait;
@@ -277,31 +277,5 @@ impl RouterTrait for GrpcRouter {
 
     fn readiness(&self) -> Response {
         (StatusCode::SERVICE_UNAVAILABLE).into_response()
-    }
-}
-
-#[async_trait]
-impl WorkerManagement for GrpcRouter {
-    async fn add_worker(
-        &self,
-        _worker_url: &str,
-        _api_key: &Option<String>,
-    ) -> Result<String, String> {
-        Err("Not implemented".to_string())
-    }
-
-    fn remove_worker(&self, _worker_url: &str) {}
-
-    fn get_worker_urls(&self) -> Vec<String> {
-        self.worker_registry
-            .get_workers_filtered(
-                None, // any model
-                Some(WorkerType::Regular),
-                Some(crate::core::ConnectionMode::Grpc { port: None }),
-                false, // include all workers
-            )
-            .iter()
-            .map(|w| w.url().to_string())
-            .collect()
     }
 }
