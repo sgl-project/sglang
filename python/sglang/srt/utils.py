@@ -409,7 +409,7 @@ def get_available_gpu_memory(
             if prop.is_integrated:
                 free_gpu_memory = psutil.virtual_memory().available
             else:
-                free_gpu_memory, _ = torch.cuda.mem_get_info(0)
+                free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
         except Exception as e:
             print(f"Error querying device properties: {e}. Falling back to system memory.")
             free_gpu_memory = psutil.virtual_memory().available
