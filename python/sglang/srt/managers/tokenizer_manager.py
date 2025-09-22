@@ -62,10 +62,12 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    FirstTokenTimeUpdate,
     FreezeGCReq,
     GenerateReqInput,
     GetLoadReqInput,
     HealthCheckOutput,
+    Metrics,
     MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
@@ -348,6 +350,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     self._handle_batch_output,
                 ),
                 (AbortReq, self._handle_abort_req),
+                (FirstTokenTimeUpdate, self._handle_first_token_time_update),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -1488,6 +1491,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # Mark ongoing LoRA request as finished.
                 if self.server_args.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+
+            # Add metrics field for timing information
+            metrics = Metrics(
+                arrival_time=state.created_time,
+                first_token_time=(
+                    state.first_token_time
+                    if state.first_token_time > 0.0
+                    else (state.finished_time if state.finished else time.time())
+                ),
+                finished_time=state.finished_time if state.finished else time.time(),
+            )
+            out_dict["metrics"] = metrics.to_dict()
 
             state.out_list.append(out_dict)
             state.event.set()
