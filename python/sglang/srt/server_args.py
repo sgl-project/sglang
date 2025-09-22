@@ -988,6 +988,12 @@ class ServerArgs:
                     "batch_invariant_ops is not installed. Please install it from https://github.com/thinking-machines-lab/batch_invariant_ops/."
                 )
 
+            # Check some settings
+            self.sampling_backend = "pytorch"
+            logger.warning(
+                "Sampling backend is set to pytorch for deterministic inference."
+            )
+            # Currently, only FA3 supports radix cache. Support for other backends is in progress
             if self.attention_backend != "fa3":
                 self.disable_radix_cache = True
                 logger.warning(
