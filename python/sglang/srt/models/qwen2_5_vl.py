@@ -60,9 +60,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.utils import add_prefix, is_npu
-
-_is_npu = is_npu()
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -244,15 +242,6 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         return out
 
 
-class AscendQwen2_5_VisionPatchEmbed(Qwen2_5_VisionPatchEmbed):
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Equivalently replace Conv3d with matmul to improve the performance.
-        # We override forward with subclass because Qwen2_5_VisionPatchEmbed is implemented by transformers
-        x = x.matmul(self.proj.weight.data.view(self.embed_dim, -1).transpose(0, 1))
-        return x
-
-
 class Qwen2_5_VisionTransformer(nn.Module):
 
     def __init__(
@@ -277,20 +266,12 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.window_size = vision_config.window_size
         self.patch_size = vision_config.patch_size
         mlp_hidden_size: int = vision_config.intermediate_size
-        if not _is_npu:
-            self.patch_embed = Qwen2_5_VisionPatchEmbed(
-                patch_size=patch_size,
-                temporal_patch_size=temporal_patch_size,
-                in_channels=in_channels,
-                embed_dim=hidden_size,
-            )
-        else:
-            self.patch_embed = AscendQwen2_5_VisionPatchEmbed(
-                patch_size=patch_size,
-                temporal_patch_size=temporal_patch_size,
-                in_channels=in_channels,
-                embed_dim=hidden_size,
-            )
+        self.patch_embed = Qwen2_5_VisionPatchEmbed(
+            patch_size=patch_size,
+            temporal_patch_size=temporal_patch_size,
+            in_channels=in_channels,
+            embed_dim=hidden_size,
+        )
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = hidden_size // num_heads
