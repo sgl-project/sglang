@@ -384,6 +384,13 @@ impl GrpcRouter {
     fn build_grpc_sampling_params(&self, request: &ChatCompletionRequest, structural_tag: Option<String>) -> proto::SamplingParams {
         let stop_sequences = self.extract_stop_strings(request);
 
+        // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
+        // If neither is specified, use None to let the backend decide the default
+        #[allow(deprecated)]
+        let max_new_tokens = request.max_completion_tokens
+            .or(request.max_tokens)
+            .map(|v| v as i32);
+
         #[allow(deprecated)]
         proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
@@ -393,7 +400,7 @@ impl GrpcRouter {
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
-            max_new_tokens: request.max_tokens.unwrap_or(128) as i32,
+            max_new_tokens,
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens: request.skip_special_tokens,
