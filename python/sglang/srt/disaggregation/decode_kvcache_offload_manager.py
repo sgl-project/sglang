@@ -153,13 +153,7 @@ class DecodeKVCacheOffloadManager:
         """Trigger async backup from host to storage by cache controller."""
 
         # Generate page hashes and write to storage
-        page_hashes = []
-        last_hash = ""
-        for offset in range(0, len(tokens), self.page_size):
-            page_tokens = tokens[offset : offset + self.page_size]
-            last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
-            page_hashes.append(last_hash)
-
+        page_hashes = self._compute_prefix_hash(tokens)
         ack_id = self.cache_controller.write_storage(
             host_indices,
             tokens,
@@ -189,5 +183,14 @@ class DecodeKVCacheOffloadManager:
             self.decode_host_mem_pool.free(host_indices)
 
             logger.debug(
-                f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} ms."
+                f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} seconds."
             )
+
+    def _compute_prefix_hash(self, tokens) -> str:
+        last_hash = ""
+        page_hashes = []
+        for offset in range(0, len(tokens), self.page_size):
+            page_tokens = tokens[offset : offset + self.page_size]
+            last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
+            page_hashes.append(last_hash)
+        return page_hashes

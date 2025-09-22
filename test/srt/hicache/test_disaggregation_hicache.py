@@ -3,7 +3,7 @@ import random
 import tempfile
 import time
 import unittest
-from ast import Dict
+from typing import Dict
 from urllib.parse import urlparse
 
 import requests
