@@ -29,7 +29,7 @@ MODEL_THRESHOLDS = {
     ModelDeploySetup("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 22.1),
     ModelDeploySetup("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.270, 23.2),
     ModelDeploySetup("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 14.0),
-    ModelDeploySetup("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.320, 80.3),
+    ModelDeploySetup("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.320, 80.6),
     ModelDeploySetup("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.340, 31.9),
     ModelDeploySetup("unsloth/Mistral-Small-3.1-24B-Instruct-2503"): ModelEvalMetrics(
         0.310, 16.7
