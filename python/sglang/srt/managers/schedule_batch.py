@@ -1600,7 +1600,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.seq_lens_cpu = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
