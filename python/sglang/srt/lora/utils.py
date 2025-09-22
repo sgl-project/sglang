@@ -19,6 +19,9 @@ class LoRABatchInfo:
     # Number of segments. For triton backend, it is equal to batch size.
     num_segments: int
 
+    # Maximum segment length of current batch
+    max_len: int
+
     # Indice pointers of each segment in shape (num_segments + 1, )
     seg_indptr: torch.Tensor
 
@@ -33,9 +36,6 @@ class LoRABatchInfo:
 
     # Lengths of each segments in shape (num_segments,)
     seg_lens: Optional[torch.Tensor]
-
-    # Maximum segment length of current batch
-    max_len: Optional[int]
 
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
     permutation: Optional[torch.Tensor]

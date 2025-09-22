@@ -11,14 +11,6 @@ def _chunked_lora_shrink_kernel(
     x,
     weights,
     output,
-    # Strides
-    x_stride_0,
-    x_stride_1,
-    w_stride_0,
-    w_stride_1,
-    w_stride_2,
-    output_stride_0,
-    output_stride_1,
     # Information on sequence lengths,ranks and weight id
     seg_indptr,
     weight_indices,
@@ -29,7 +21,7 @@ def _chunked_lora_shrink_kernel(
     N: tl.constexpr,  # num_slices * r
     K: tl.constexpr,  # input_dim
     NUM_SLICES: tl.constexpr,
-    BLOCK_S: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -48,6 +40,16 @@ def _chunked_lora_shrink_kernel(
             with shape `(num_lora, N, K)` where N = num_slices * r.
         output (torch.Tensor): The output tensor of shape `(s, N)`.
     """
+    x_stride_1: tl.constexpr = 1
+    x_stride_0: tl.constexpr = K
+
+    w_stride_0: tl.constexpr = N * K
+    w_stride_1: tl.constexpr = K
+    w_stride_2: tl.constexpr = 1
+
+    output_stride_0: tl.constexpr = N
+    output_stride_1: tl.constexpr = 1
+
     pid_s = tl.program_id(1)
     if pid_s >= num_segs:
         return
@@ -70,7 +72,7 @@ def _chunked_lora_shrink_kernel(
     cur_n = tl.minimum(N, rank * NUM_SLICES)
 
     # Map logical sequence index to physical index
-    s_offset_logical = tl.arange(0, BLOCK_S) + seg_start
+    s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
     s_offset_physical = tl.load(
         permutation + s_offset_logical, mask=s_offset_logical < seg_end
     )
@@ -85,7 +87,7 @@ def _chunked_lora_shrink_kernel(
     )
 
     # Iterate to compute the block in output matrix
-    partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
+    partial_sum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
@@ -117,7 +119,7 @@ def chunked_sgmv_lora_shrink_forward(
     x: torch.Tensor,
     weights: torch.Tensor,
     batch_info: LoRABatchInfo,
-    num_slices: int = 1,
+    num_slices: int,
 ) -> torch.Tensor:
     # x: (s, input_dim)
     # weights: (num_lora, num_slices * r, input_dim)
@@ -133,7 +135,7 @@ def chunked_sgmv_lora_shrink_forward(
 
     # Block shapes
     # TODO (lifuhuang): experiment with split-k
-    BLOCK_S = 16
+    BLOCK_M = batch_info.max_len
     BLOCK_N = 16
     BLOCK_K = 256
 
@@ -153,13 +155,6 @@ def chunked_sgmv_lora_shrink_forward(
         x=x,
         weights=weights,
         output=output,
-        x_stride_0=x.stride(0),
-        x_stride_1=x.stride(1),
-        w_stride_0=weights.stride(0),
-        w_stride_1=weights.stride(1),
-        w_stride_2=weights.stride(2),
-        output_stride_0=output.stride(0),
-        output_stride_1=output.stride(1),
         seg_indptr=batch_info.seg_indptr,
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
@@ -169,7 +164,7 @@ def chunked_sgmv_lora_shrink_forward(
         N=N,
         K=K,
         NUM_SLICES=num_slices,
-        BLOCK_S=BLOCK_S,
+        BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
     )

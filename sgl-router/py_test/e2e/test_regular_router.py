@@ -129,7 +129,9 @@ def test_dp_aware_worker_expansion_and_api_key(
 
     # Attach worker; router should expand to dp_size logical workers
     r = requests.post(
-        f"{router_url}/add_worker", params={"url": worker_url}, timeout=180
+        f"{router_url}/add_worker",
+        params={"url": worker_url, "api_key": api_key},
+        timeout=180,
     )
     r.raise_for_status()
 

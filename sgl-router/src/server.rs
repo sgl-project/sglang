@@ -14,6 +14,7 @@ use crate::{
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
     reasoning_parser::ParserFactory,
+    routers::WorkerInitializer,
     routers::{
         router_manager::{RouterId, RouterManager},
         RouterFactory, RouterTrait,
@@ -281,15 +282,16 @@ async fn v1_responses_list_input_items(
 // ---------- Worker management endpoints (Legacy) ----------
 
 #[derive(Deserialize)]
-struct UrlQuery {
+struct AddWorkerQuery {
     url: String,
+    api_key: Option<String>,
 }
 
 async fn add_worker(
     State(state): State<Arc<AppState>>,
-    Query(UrlQuery { url }): Query<UrlQuery>,
+    Query(AddWorkerQuery { url, api_key }): Query<AddWorkerQuery>,
 ) -> Response {
-    match state.router.add_worker(&url).await {
+    match state.router.add_worker(&url, &api_key).await {
         Ok(message) => (StatusCode::OK, message).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
     }
@@ -302,7 +304,7 @@ async fn list_workers(State(state): State<Arc<AppState>>) -> Response {
 
 async fn remove_worker(
     State(state): State<Arc<AppState>>,
-    Query(UrlQuery { url }): Query<UrlQuery>,
+    Query(AddWorkerQuery { url, .. }): Query<AddWorkerQuery>,
 ) -> Response {
     state.router.remove_worker(&url);
     (
@@ -336,7 +338,7 @@ async fn create_worker(
         }
     } else {
         // In single router mode, use the router's add_worker with basic config
-        match state.router.add_worker(&config.url).await {
+        match state.router.add_worker(&config.url, &config.api_key).await {
             Ok(message) => {
                 let response = WorkerApiResponse {
                     success: true,
@@ -594,6 +596,24 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let app_context = Arc::new(app_context);
 
+    info!(
+        "Initializing workers for routing mode: {:?}",
+        config.router_config.mode
+    );
+    WorkerInitializer::initialize_workers(
+        &config.router_config,
+        &app_context.worker_registry,
+        Some(&app_context.policy_registry),
+    )
+    .await
+    .map_err(|e| format!("Failed to initialize workers: {}", e))?;
+
+    let worker_stats = app_context.worker_registry.stats();
+    info!(
+        "Workers initialized: {} total, {} healthy",
+        worker_stats.total_workers, worker_stats.healthy_workers
+    );
+
     // Create the appropriate router based on enable_igw flag
     let (router, router_manager): (Arc<dyn RouterTrait>, Option<Arc<RouterManager>>) =
         if config.router_config.enable_igw {
@@ -608,12 +628,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             ));
 
             // 1. HTTP Regular Router
-            match RouterFactory::create_regular_router(
-                &[], // Empty worker list - workers added later
-                &app_context,
-            )
-            .await
-            {
+            match RouterFactory::create_regular_router(&app_context).await {
                 Ok(http_regular) => {
                     info!("Created HTTP Regular router");
                     router_manager.register_router(
@@ -628,8 +643,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
             // 2. HTTP PD Router
             match RouterFactory::create_pd_router(
-                &[],
-                &[],
                 None,
                 None,
                 &config.router_config.policy,
@@ -684,7 +697,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Start queue processor if enabled
     if let Some(processor) = processor {
-        tokio::spawn(processor.run());
+        spawn(processor.run());
         info!(
             "Started request queue with size: {}, timeout: {}s",
             config.router_config.queue_size, config.router_config.queue_timeout_secs

@@ -466,6 +466,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             return self.kv_buffer[:, :, index : index + self.page_size, :, :].flatten()
         elif self.layout == "page_first":
             return self.kv_buffer[:, index : index + self.page_size, :, :, :].flatten()
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            return self.kv_buffer[:, real_index : real_index + 1, :, :, :, :].flatten()
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
@@ -492,6 +495,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             self.kv_buffer[:, index : index + self.page_size, :, :, :] = (
                 data_page.reshape(
                     2, self.page_size, self.layer_num, self.head_num, self.head_dim
+                )
+            )
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
+                data_page.reshape(
+                    2, 1, self.layer_num, self.page_size, self.head_num, self.head_dim
                 )
             )
         else:
@@ -731,6 +741,9 @@ class MLATokenToKVPoolHost(HostKVCache):
             return self.kv_buffer[:, index : index + self.page_size, :, :].flatten()
         elif self.layout == "page_first":
             return self.kv_buffer[index : index + self.page_size, :, :, :].flatten()
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            return self.kv_buffer[real_index : real_index + 1, :, :, :, :].flatten()
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
@@ -759,6 +772,15 @@ class MLATokenToKVPoolHost(HostKVCache):
             self.kv_buffer[index : index + self.page_size, :, :, :] = data_page.reshape(
                 self.page_size,
                 self.layer_num,
+                1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            )
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            self.kv_buffer[real_index : real_index + 1, :, :, :, :] = data_page.reshape(
+                1,
+                self.layer_num,
+                self.page_size,
                 1,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             )
