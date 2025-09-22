@@ -29,6 +29,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -269,9 +270,7 @@ class TpModelWorker:
                         logits_output, model_worker_batch
                     )
             else:
-                next_token_ids = self.model_runner.sample(
-                    logits_output, model_worker_batch
-                )
+                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
 
             return logits_output, next_token_ids, can_run_cuda_graph
         else:
@@ -301,6 +300,12 @@ class TpModelWorker:
             recv_req.world_size,
             recv_req.group_name,
             recv_req.backend,
+        )
+        return success, message
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        success, message = self.model_runner.destroy_weights_update_group(
+            recv_req.group_name,
         )
         return success, message
 
