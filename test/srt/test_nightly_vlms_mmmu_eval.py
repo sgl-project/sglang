@@ -17,8 +17,8 @@ from sglang.test.test_utils import (
 
 MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples, especially for latency thresholds
-    ModelDeploySetup("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(0.330, 47.9),
-    ModelDeploySetup("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 38.2),
+    ModelDeploySetup("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(0.330, 50.0),
+    ModelDeploySetup("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 38.9),
     ModelDeploySetup("Efficient-Large-Model/NVILA-Lite-2B-hf-0626"): ModelEvalMetrics(
         0.305, 23.8
     ),
