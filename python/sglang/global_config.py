@@ -37,8 +37,8 @@ class GlobalConfig:
         )
         # Runtime constants: others
         self.retract_decode_steps = 20
-        self.flashinfer_workspace_size = os.environ.get(
-            "FLASHINFER_WORKSPACE_SIZE", 384 * 1024 * 1024
+        self.flashinfer_workspace_size = int(
+            os.environ.get("FLASHINFER_WORKSPACE_SIZE", 384 * 1024 * 1024)
         )
 
         # Output tokenization configs
