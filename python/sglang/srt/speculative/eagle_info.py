@@ -62,7 +62,7 @@ class EagleVerifyInput(SpecInput):
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
 
-    def __post__init__(self):
+    def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
@@ -578,7 +578,7 @@ class EagleDraftInput(SpecInput):
     seq_lens_for_draft_extend: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
 
-    def __post__init__(self):
+    def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
