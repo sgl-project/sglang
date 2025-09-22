@@ -27,8 +27,12 @@ impl WorkerInitializer {
 
         match &config.mode {
             RoutingMode::Regular { worker_urls } => {
+                // use router's api_key, repeat for each worker
+                let worker_api_keys: Vec<Option<String>> =
+                    worker_urls.iter().map(|_| config.api_key.clone()).collect();
                 Self::create_regular_workers(
                     worker_urls,
+                    &worker_api_keys,
                     &config.connection_mode,
                     config,
                     worker_registry,
@@ -41,8 +45,16 @@ impl WorkerInitializer {
                 decode_urls,
                 ..
             } => {
+                // use router's api_key, repeat for each prefill/decode worker
+                let prefill_api_keys: Vec<Option<String>> = prefill_urls
+                    .iter()
+                    .map(|_| config.api_key.clone())
+                    .collect();
+                let decode_api_keys: Vec<Option<String>> =
+                    decode_urls.iter().map(|_| config.api_key.clone()).collect();
                 Self::create_prefill_workers(
                     prefill_urls,
+                    &prefill_api_keys,
                     &config.connection_mode,
                     config,
                     worker_registry,
@@ -51,6 +63,7 @@ impl WorkerInitializer {
                 .await?;
                 Self::create_decode_workers(
                     decode_urls,
+                    &decode_api_keys,
                     &config.connection_mode,
                     config,
                     worker_registry,
@@ -79,6 +92,7 @@ impl WorkerInitializer {
     /// Create regular workers for standard routing mode
     async fn create_regular_workers(
         urls: &[String],
+        api_keys: &[Option<String>],
         config_connection_mode: &ConfigConnectionMode,
         config: &RouterConfig,
         registry: &Arc<WorkerRegistry>,
@@ -109,14 +123,18 @@ impl WorkerInitializer {
 
         let mut registered_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
 
-        for url in urls {
+        for (url, api_key) in urls.iter().zip(api_keys.iter()) {
             // TODO: Add DP-aware support when we have dp_rank/dp_size info
-            let worker = BasicWorkerBuilder::new(url.clone())
+            let worker_builder = BasicWorkerBuilder::new(url.clone())
                 .worker_type(WorkerType::Regular)
                 .connection_mode(connection_mode.clone())
                 .circuit_breaker_config(core_cb_config.clone())
-                .health_config(health_config.clone())
-                .build();
+                .health_config(health_config.clone());
+            let worker = if let Some(api_key) = api_key.clone() {
+                worker_builder.api_key(api_key).build()
+            } else {
+                worker_builder.build()
+            };
 
             let worker_arc = Arc::new(worker) as Arc<dyn Worker>;
             let model_id = worker_arc.model_id();
@@ -148,6 +166,7 @@ impl WorkerInitializer {
     /// Create prefill workers for disaggregated routing mode
     async fn create_prefill_workers(
         prefill_entries: &[(String, Option<u16>)],
+        api_keys: &[Option<String>],
         config_connection_mode: &ConfigConnectionMode,
         config: &RouterConfig,
         registry: &Arc<WorkerRegistry>,
@@ -181,16 +200,20 @@ impl WorkerInitializer {
 
         let mut registered_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
 
-        for (url, bootstrap_port) in prefill_entries {
+        for ((url, bootstrap_port), api_key) in prefill_entries.iter().zip(api_keys.iter()) {
             // TODO: Add DP-aware support when we have dp_rank/dp_size info
-            let worker = BasicWorkerBuilder::new(url.clone())
+            let worker_builder = BasicWorkerBuilder::new(url.clone())
                 .worker_type(WorkerType::Prefill {
                     bootstrap_port: *bootstrap_port,
                 })
                 .connection_mode(connection_mode.clone())
                 .circuit_breaker_config(core_cb_config.clone())
-                .health_config(health_config.clone())
-                .build();
+                .health_config(health_config.clone());
+            let worker = if let Some(api_key) = api_key.clone() {
+                worker_builder.api_key(api_key).build()
+            } else {
+                worker_builder.build()
+            };
 
             let worker_arc = Arc::new(worker) as Arc<dyn Worker>;
             let model_id = worker_arc.model_id();
@@ -227,6 +250,7 @@ impl WorkerInitializer {
     /// Create decode workers for disaggregated routing mode
     async fn create_decode_workers(
         urls: &[String],
+        api_keys: &[Option<String>],
         config_connection_mode: &ConfigConnectionMode,
         config: &RouterConfig,
         registry: &Arc<WorkerRegistry>,
@@ -257,14 +281,18 @@ impl WorkerInitializer {
 
         let mut registered_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
 
-        for url in urls {
+        for (url, api_key) in urls.iter().zip(api_keys.iter()) {
             // TODO: Add DP-aware support when we have dp_rank/dp_size info
-            let worker = BasicWorkerBuilder::new(url.clone())
+            let worker_builder = BasicWorkerBuilder::new(url.clone())
                 .worker_type(WorkerType::Decode)
                 .connection_mode(connection_mode.clone())
                 .circuit_breaker_config(core_cb_config.clone())
-                .health_config(health_config.clone())
-                .build();
+                .health_config(health_config.clone());
+            let worker = if let Some(api_key) = api_key.clone() {
+                worker_builder.api_key(api_key).build()
+            } else {
+                worker_builder.build()
+            };
 
             let worker_arc = Arc::new(worker) as Arc<dyn Worker>;
             let model_id = worker_arc.model_id();
