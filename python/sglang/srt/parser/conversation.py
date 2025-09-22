@@ -711,6 +711,20 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="dots_ocr",
+        # system_message="You are a helpful assistant.",
+        system_template="<|system|>{system_message}<|endofsystem|>\n",
+        roles=("<|user|>", "<|assistant|>"),
+        sep="",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|endofassistant|>"],
+        image_token="<|img|><|imgpad|><|endofimg|>",
+        video_token="<|img|><|video_pad|><|endofimg|>",
+    )
+)
+
 # reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/main/chat_template.json
 register_conv_template(
     Conversation(
