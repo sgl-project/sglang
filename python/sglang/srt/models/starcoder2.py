@@ -262,7 +262,7 @@ class Starcoder2Model(nn.Module):
             hidden_states = self.get_input_embeddings(input_ids)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(
-                position_ids=positions,
+                positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
             )
