@@ -399,7 +399,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             available_size_mb = (total - allocated - reserved) // (1024 * 1024)
 
             max_cache_image_size = CACHED_IMAGE_MAX_MB_SIZE
-            if get_bool_env_var("SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB"):
+            if get_int_env_var("SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB"):
                 max_cache_image_size = get_int_env_var(
                     "SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB"
                 )
