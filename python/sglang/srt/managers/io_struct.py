@@ -38,6 +38,7 @@ else:
 @dataclass
 class Metrics:
     """Timing metrics for a request."""
+
     arrival_time: float
     first_token_time: float
     finished_time: float
@@ -53,7 +54,7 @@ class Metrics:
         return {
             "arrival_time": self.arrival_time,
             "first_token_time": self.first_token_time,
-            "finished_time": self.finished_time
+            "finished_time": self.finished_time,
         }
 
 
@@ -1296,6 +1297,7 @@ class HealthCheckOutput:
 class FirstTokenTimeUpdate:
     rid: str
     first_token_time: float
+
 
 class ExpertDistributionReq(Enum):
     START_RECORD = 1

@@ -52,8 +52,6 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
-    Metrics,
-    FirstTokenTimeUpdate,
     AbortReq,
     BatchEmbeddingOut,
     BatchMultimodalOut,
@@ -64,10 +62,12 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    FirstTokenTimeUpdate,
     FreezeGCReq,
     GenerateReqInput,
     GetLoadReqInput,
     HealthCheckOutput,
+    Metrics,
     MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
@@ -133,30 +133,18 @@ class ReqState:
     # TODO(lianmin): do not initialize some lists if not needed.
     text: str = ""
     output_ids: List[int] = dataclasses.field(default_factory=list)
-    input_token_logprobs_val: List[float] = dataclasses.field(
-        default_factory=list)
-    input_token_logprobs_idx: List[int] = dataclasses.field(
-        default_factory=list)
-    output_token_logprobs_val: List[float] = dataclasses.field(
-        default_factory=list)
-    output_token_logprobs_idx: List[int] = dataclasses.field(
-        default_factory=list)
-    input_top_logprobs_val: List[List[float]
-                                 ] = dataclasses.field(default_factory=list)
-    input_top_logprobs_idx: List[List[int]
-                                 ] = dataclasses.field(default_factory=list)
-    output_top_logprobs_val: List[List[float]
-                                  ] = dataclasses.field(default_factory=list)
-    output_top_logprobs_idx: List[List[int]
-                                  ] = dataclasses.field(default_factory=list)
-    input_token_ids_logprobs_val: List = dataclasses.field(
-        default_factory=list)
-    input_token_ids_logprobs_idx: List = dataclasses.field(
-        default_factory=list)
-    output_token_ids_logprobs_val: List = dataclasses.field(
-        default_factory=list)
-    output_token_ids_logprobs_idx: List = dataclasses.field(
-        default_factory=list)
+    input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
+    input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
+    output_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
+    output_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
+    input_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
+    input_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
+    output_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
+    output_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
+    input_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
+    input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
 
 class TokenizerManager(TokenizerCommunicatorMixin):
@@ -401,10 +389,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             bootstrap_room = (
                 obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
             )
-            trace_req_start(obj.rid, bootstrap_room,
-                            ts=int(created_time * 1e9))
-            trace_slice_start("", obj.rid, ts=int(
-                created_time * 1e9), anonymous=True)
+            trace_req_start(obj.rid, bootstrap_room, ts=int(created_time * 1e9))
+            trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
         else:
             for i in range(len(obj.rid)):
                 bootstrap_room = (
@@ -412,8 +398,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
                     else None
                 )
-                trace_req_start(obj.rid[i], bootstrap_room,
-                                ts=int(created_time * 1e9))
+                trace_req_start(obj.rid[i], bootstrap_room, ts=int(created_time * 1e9))
                 trace_slice_start(
                     "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
                 )
@@ -434,8 +419,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
-                state = self._send_one_request(
-                    obj, tokenized_obj, created_time)
+                state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
@@ -541,8 +525,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             Note: token_type_ids is None unless is_cross_encoder=True.
         """
         if not texts or self.tokenizer is None:
-            raise ValueError(
-                "texts cannot be empty and tokenizer must be initialized")
+            raise ValueError("texts cannot be empty and tokenizer must be initialized")
 
         # Step 1: Detect input format and prepare for tokenization
         input_format = self._detect_input_format(texts, is_cross_encoder)
@@ -573,12 +556,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 else None
             )
         else:
-            logger.debug(
-                f"Using regular tokenizer for {len(tokenizer_input)} inputs")
+            logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
             encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
             input_ids = encoded["input_ids"]
-            token_type_ids = encoded.get(
-                "token_type_ids") if is_cross_encoder else None
+            token_type_ids = encoded.get("token_type_ids") if is_cross_encoder else None
 
         # Step 4: Extract results based on input format
         return self._extract_tokenizer_results(
@@ -739,8 +720,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
         if self.preferred_sampling_params:
-            sampling_kwargs = {
-                **self.preferred_sampling_params, **obj.sampling_params}
+            sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
         sampling_params = SamplingParams(**sampling_kwargs)
@@ -750,8 +730,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Build return object
         if isinstance(obj, GenerateReqInput):
             session_params = (
-                SessionParams(
-                    **obj.session_params) if obj.session_params else None
+                SessionParams(**obj.session_params) if obj.session_params else None
             )
 
             tokenized_obj = TokenizedGenerateReqInput(
@@ -793,8 +772,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
         """Handle batch tokenization for text inputs only."""
-        logger.debug(
-            f"Starting batch tokenization for {batch_size} text requests")
+        logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
         # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
@@ -854,8 +832,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         trace_slice_start("dispatch", obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
-        state = ReqState([], False, asyncio.Event(),
-                         obj, created_time=created_time)
+        state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
         trace_slice_end("dispatch", obj.rid, thread_finish_flag=True)
         return state
@@ -1001,8 +978,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else:
                 # Sequential tokenization and processing
                 with (
-                    input_blocker_guard_region(
-                        send_to_scheduler=self.send_to_scheduler)
+                    input_blocker_guard_region(send_to_scheduler=self.send_to_scheduler)
                     if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
                     else nullcontext()
                 ):
@@ -1036,12 +1012,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 tokenized_obj.rid = tmp_obj.regenerate_rid()
-                tokenized_obj.sampling_params = copy.copy(
-                    tokenized_obj.sampling_params)
+                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                state = self._send_one_request(
-                    tmp_obj, tokenized_obj, created_time)
+                state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 await self._wait_one_response(tmp_obj, state, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
@@ -1050,10 +1024,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    state = self._send_one_request(
-                        tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(
-                        tmp_obj, state, request))
+                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
 
         # Wait for all requests
@@ -1063,8 +1035,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             yield outputs
         else:
             rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(
-                gen.__anext__()): gen for gen in generators}
+            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
             while task_map:
                 done, _ = await asyncio.wait(
                     task_map.keys(), return_when=asyncio.FIRST_COMPLETED
@@ -1277,8 +1248,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # the main thread due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = SignalHandler(self)
-            loop.add_signal_handler(
-                signal.SIGTERM, signal_handler.sigterm_handler)
+            loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
@@ -1306,8 +1276,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if not self.crash_dump_folder:
             return
 
-        logger.error(
-            f"Dumping requests before crash. {self.crash_dump_folder=}")
+        logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
         self.crash_dump_performed = True
 
         # Check if NFS directory is available
@@ -1476,7 +1445,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 state.text += recv_obj.output_strs[i]
                 if state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset:]
+                    output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -1490,7 +1459,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             elif isinstance(recv_obj, BatchTokenIDOut):
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset:]
+                    output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -1514,8 +1483,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 if self.server_args.speculative_algorithm:
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()
-                meta_info["e2e_latency"] = state.finished_time - \
-                    state.created_time
+                meta_info["e2e_latency"] = state.finished_time - state.created_time
 
                 trace_req_finish(rid, ts=int(state.finished_time * 1e9))
 
@@ -1523,15 +1491,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
                 # Mark ongoing LoRA request as finished.
                 if self.server_args.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(
-                        self.lora_registry.release(state.obj.lora_id))
+                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             # Add metrics field for timing information
             metrics = Metrics(
                 arrival_time=state.created_time,
-                first_token_time=state.first_token_time if state.first_token_time > 0.0 else (
-                    state.finished_time if state.finished else time.time()),
-                finished_time=state.finished_time if state.finished else time.time()
+                first_token_time=(
+                    state.first_token_time
+                    if state.first_token_time > 0.0
+                    else (state.finished_time if state.finished else time.time())
+                ),
+                finished_time=state.finished_time if state.finished else time.time(),
             )
             out_dict["metrics"] = metrics.to_dict()
 
@@ -1891,8 +1861,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # For scoring requests, we read from output_token_ids_logprobs since we want
             # the logprobs for specific tokens mentioned in the label_token_ids at
             # the next position after the last token in the prompt
-            output_logprobs = result["meta_info"].get(
-                "output_token_ids_logprobs", [])
+            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
 
             # Check if output_logprobs is properly populated
             if (
@@ -1916,8 +1885,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             # Apply softmax to logprobs if needed
             if apply_softmax:
-                score_list = torch.softmax(
-                    torch.tensor(score_list), dim=0).tolist()
+                score_list = torch.softmax(torch.tensor(score_list), dim=0).tolist()
             else:
                 # Convert logprobs to probabilities if not using softmax
                 score_list = [
