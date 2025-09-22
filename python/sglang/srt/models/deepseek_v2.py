@@ -451,7 +451,7 @@ class MoEGate(nn.Module):
             _is_cuda
             and hidden_states.shape[0] <= 16
             and hidden_states.shape[1] == 7168
-            and self.weight.shape[0] == 256
+            and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
             and _device_sm >= 90
         ):
             # router gemm output float32
