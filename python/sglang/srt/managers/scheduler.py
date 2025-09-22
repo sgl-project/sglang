@@ -878,8 +878,9 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 for req in batch.reqs:
-                    trace_event("schedule", req.rid)
+                    trace_event("schedule", req.rid, attrs=attrs)
 
             if batch:
                 result = self.run_batch(batch)
@@ -903,8 +904,9 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 for req in batch.reqs:
-                    trace_event("schedule", req.rid)
+                    trace_event("schedule", req.rid, attrs=attrs)
 
             if batch:
                 batch.launch_done = threading.Event()
