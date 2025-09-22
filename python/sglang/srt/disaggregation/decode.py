@@ -971,8 +971,9 @@ class SchedulerDisaggregationDecodeMixin:
                 ret = self.running_batch if not self.running_batch.is_empty() else None
 
         if ret:
+            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
             for req in ret.reqs:
-                trace_event("schedule", req.rid)
+                trace_event("schedule", req.rid, attrs=attrs)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
