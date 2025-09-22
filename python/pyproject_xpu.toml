@@ -1,5 +1,5 @@
 # xpu is not enabled in public vllm and torch whl,
-# need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
+# need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.html install vllm
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
