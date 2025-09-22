@@ -62,7 +62,8 @@ dependencies = [
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.24",
-	
+]
+
 [project.optional-dependencies]
 tracing = [
     "opentelemetry-sdk",
