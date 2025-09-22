@@ -119,7 +119,7 @@ DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 
 # Allow external code to add more choices
@@ -269,6 +269,7 @@ class ServerArgs:
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
+    max_lora_chunk_size: Optional[int] = 16
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -999,7 +1000,7 @@ class ServerArgs:
                 )
 
     def _handle_other_validations(self):
-        logger.info("Handle other validations if needed.")
+        pass
 
     def __post_init__(self):
         """
@@ -1779,6 +1780,13 @@ class ServerArgs:
             choices=LORA_BACKEND_CHOICES,
             default=ServerArgs.lora_backend,
             help="Choose the kernel backend for multi-LoRA serving.",
+        )
+        parser.add_argument(
+            "--max-lora-chunk-size",
+            type=int,
+            default=ServerArgs.max_lora_chunk_size,
+            choices=[16, 32, 64, 128],
+            help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
         )
 
         # Kernel backend
@@ -2779,6 +2787,12 @@ class ServerArgs:
                     "The number of LoRA paths should not exceed max_loaded_loras. "
                     f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
                 )
+
+            if self.max_lora_chunk_size is not None:
+                assert (
+                    16 <= self.max_lora_chunk_size <= 128
+                    and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
+                ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
