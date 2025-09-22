@@ -95,6 +95,15 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flash-attention)
 
+# flash-attention origin
+FetchContent_Declare(
+    repo-flash-attention-origin
+    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
+    GIT_TAG        5c1627a7a1cda9c32cb9b937a053564e663f81bc
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-flash-attention-origin)
+
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
