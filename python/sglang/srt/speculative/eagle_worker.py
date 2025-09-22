@@ -577,7 +577,7 @@ class EAGLEWorker(TpModelWorker):
                     self.speculative_num_steps,
                     self.topk,
                     self.page_size,
-                )                
+                )
                 prefix_lens_cpu = batch.seq_lens_cpu
                 last_page_lens = prefix_lens_cpu % self.page_size
                 num_new_pages_per_topk = (

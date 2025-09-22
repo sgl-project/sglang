@@ -27,7 +27,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
-from sglang.srt.utils import get_bool_env_var, next_power_of_2, get_num_new_pages
+from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -500,7 +500,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        self.ret_values = get_num_new_pages(prefix_lens_cpu, seq_lens_cpu, self.page_size)
+        self.ret_values = get_num_new_pages(
+            prefix_lens_cpu, seq_lens_cpu, self.page_size
+        )
         merged_value = self.ret_values.item()
         num_new_pages = merged_value >> 32
         if num_new_pages > len(self.free_pages):
