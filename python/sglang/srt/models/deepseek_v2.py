@@ -1181,7 +1181,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.weight_block_size = (
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
-        if is_mla_preprocess_enabled():
+        self.is_mla_preprocess_enabled = is_mla_preprocess_enabled()
+        if self.is_mla_preprocess_enabled:
             assert (
                 quant_config.get_name() == "w8a8_int8"
             ), "MLA Preprocess only works with W8A8Int8"
@@ -1272,13 +1273,13 @@ class DeepseekV2AttentionMLA(nn.Module):
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
-            if not is_mla_preprocess_enabled():
+            if not self.is_mla_preprocess_enabled:
                 inner_state = self.forward_absorb_prepare(
                     positions, hidden_states, forward_batch, zero_allocator
                 )
             else:
                 # TODO(iforgetmyname): to be separated as a standalone func
-                if not self.mla_preprocess:
+                if self.mla_preprocess is None:
                     self.mla_preprocess = NPUFusedMLAPreprocess(
                         self.fused_qkv_a_proj_with_mqa,
                         self.q_a_layernorm,
