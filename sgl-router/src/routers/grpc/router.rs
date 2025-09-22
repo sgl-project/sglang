@@ -189,7 +189,31 @@ impl GrpcRouter {
             model_id
         );
 
-        // Step 1: Process messages and apply chat template
+        // Step 1: Select worker (fail fast if no workers available)
+        let worker = match self.select_worker_for_request(model_id, None) {
+            Some(w) => w,
+            None => {
+                warn!("No available workers for model: {:?}", model_id);
+                return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+            }
+        };
+
+        debug!("Selected worker: {}", worker.url());
+
+        // Step 2: Get gRPC client for worker (fail fast if can't connect)
+        let client = match self.get_or_create_grpc_client(worker.url()).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to get gRPC client: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to get gRPC client: {}", e),
+                )
+                    .into_response();
+            }
+        };
+
+        // Step 3: Process messages and apply chat template
         let processed_messages = match self.process_chat_messages(body) {
             Ok(msgs) => msgs,
             Err(e) => {
@@ -198,7 +222,7 @@ impl GrpcRouter {
             }
         };
 
-        // Step 2: Tokenize the processed text
+        // Step 4: Tokenize the processed text
         let encoding = match self.tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
@@ -214,17 +238,17 @@ impl GrpcRouter {
         let token_ids = encoding.token_ids().to_vec();
         debug!("Tokenized {} tokens from input", token_ids.len());
 
-        // Step 3: Build tool constraints if needed
+        // Step 5: Build tool constraints if needed
         let structural_tag = if let Some(tools) = &body.tools {
             self.generate_tool_constraints(tools, &body.tool_choice, &body.model)
         } else {
             None
         };
 
-        // Step 4: Build SamplingParams for gRPC
+        // Step 6: Build SamplingParams for gRPC
         let sampling_params = self.build_grpc_sampling_params(body, structural_tag);
 
-        // Step 5: Create GenerateRequest
+        // Step 7: Create GenerateRequest
         let grpc_request = proto::GenerateRequest {
             request_id: format!("chatcmpl-{}", Uuid::new_v4()),
             tokenized: Some(proto::TokenizedInput {
@@ -238,31 +262,6 @@ impl GrpcRouter {
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: body.return_hidden_states,
             ..Default::default()
-        };
-
-        // Step 6: Select worker
-        let worker = match self.select_worker_for_request(model_id, Some(&processed_messages.text))
-        {
-            Some(w) => w,
-            None => {
-                warn!("No available workers for model: {:?}", model_id);
-                return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
-            }
-        };
-
-        debug!("Selected worker: {}", worker.url());
-
-        // Step 7: Get gRPC client for worker
-        let client = match self.get_or_create_grpc_client(worker.url()).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to get gRPC client: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to get gRPC client: {}", e),
-                )
-                    .into_response();
-            }
         };
 
         // Step 8: Handle streaming vs non-streaming
