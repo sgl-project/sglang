@@ -598,7 +598,9 @@ trace_slice = trace_slice_end
 
 
 # Add event to the current slice on the same thread with the same rid.
-def trace_event(name: str, rid: str, ts: Optional[int] = None):
+def trace_event(
+    name: str, rid: str, ts: Optional[int] = None, attrs: Dict[str, Any] = None
+):
     if not tracing_enabled:
         return
 
@@ -619,7 +621,7 @@ def trace_event(name: str, rid: str, ts: Optional[int] = None):
     ts = ts or __get_cur_time_ns()
 
     slice_info = thread_context.cur_slice_stack[-1]
-    slice_info.span.add_event(name=name, timestamp=ts)
+    slice_info.span.add_event(name=name, timestamp=ts, attributes=attrs)
 
 
 # Add attrs to the current slice on the same thread with the same rid.
