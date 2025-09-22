@@ -10,7 +10,14 @@ python3 -m sglang.bench_serving --backend sglang --num-prompt 10
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
 """
 
-from sglang.benchmark.serving import main
+import argparse
+
+from sglang.benchmark.serving import benchmark, main
+
+
+def run_benchmark(args_: argparse.Namespace):
+    benchmark(args_)
+
 
 if __name__ == "__main__":
     main()

@@ -21,14 +21,7 @@ from sglang.benchmark.utils import (
 )
 
 
-@click.command(context_settings=dict(help_option_names=["-h", "--help"]))
-@bench_args.composite_options(bench_args.serving_options)
-@bench_args.composite_options(bench_args.dataset_options)
-@bench_args.composite_options(bench_args.common_benchmark_options)
-def main(**kwargs):
-    args = SimpleNamespace(**kwargs)
-    print(f"Benchmark arguments:\n{args}")
-
+def benchmark(args: argparse.Namespace):
     set_ulimit()
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -126,6 +119,16 @@ def main(**kwargs):
     except KeyboardInterrupt:
         print("\nBenchmark interrupted by user.")
         sys.exit(0)
+
+
+@click.command(context_settings=dict(help_option_names=["-h", "--help"]))
+@bench_args.composite_options(bench_args.serving_options)
+@bench_args.composite_options(bench_args.dataset_options)
+@bench_args.composite_options(bench_args.common_benchmark_options)
+def main(**kwargs):
+    args = SimpleNamespace(**kwargs)
+    print(f"Benchmark arguments:\n{args}")
+    benchmark(args)
 
 
 if __name__ == "__main__":
