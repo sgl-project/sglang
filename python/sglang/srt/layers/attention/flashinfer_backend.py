@@ -1198,10 +1198,8 @@ class FlashInferMultiStepDraftBackend:
             self.page_size,
         )
 
-        from sglang.srt.speculative.spec_info import EagleDraftInput
-
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
         indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()

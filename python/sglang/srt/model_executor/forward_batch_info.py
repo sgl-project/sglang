@@ -739,9 +739,7 @@ class ForwardBatch:
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
-        from sglang.srt.speculative.spec_info import EagleDraftInput
-
-        if self.spec_info is not None and isinstance(self.spec_info, EagleDraftInput):
+        if self.spec_info is not None and self.spec_info.is_draft_input():
             # FIXME(lsyin): remove this isinstance logic
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc

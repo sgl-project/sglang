@@ -96,6 +96,8 @@ class SpecInput(ABC):
         self.spec_input_type = spec_input_type
 
     def is_draft_input(self) -> bool:
+        # FIXME: remove this function which is only used for assertion
+        # or use another variable name like `draft_input` to substitute `spec_info`
         return self.spec_input_type == SpecInputType.EAGLE_DRAFT
 
     def is_verify_input(self) -> bool:

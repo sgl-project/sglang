@@ -2333,10 +2333,8 @@ class FlashAttentionMultiStepBackend:
         self,
         forward_batch: ForwardBatch,
     ):
-        from sglang.srt.speculative.spec_info import EagleDraftInput
-
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
@@ -2352,10 +2350,8 @@ class FlashAttentionMultiStepBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        from sglang.srt.speculative.spec_info import EagleDraftInput
-
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
             # TODO: incrementally update the metadata for the later steps,

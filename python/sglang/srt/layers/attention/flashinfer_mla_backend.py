@@ -960,10 +960,8 @@ class FlashInferMLAMultiStepDraftBackend:
             self.page_size,
         )
 
-        from sglang.srt.speculative.spec_info import EagleDraftInput
-
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
