@@ -40,6 +40,7 @@ pub struct RouterManager {
     worker_registry: Arc<WorkerRegistry>,
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
     default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
+    enable_igw: bool,
 }
 
 impl RouterManager {
@@ -48,6 +49,7 @@ impl RouterManager {
             worker_registry,
             routers: Arc::new(DashMap::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
+            enable_igw: false, // Will be set properly in from_config
         }
     }
 
@@ -57,7 +59,9 @@ impl RouterManager {
     ) -> Result<Arc<Self>, String> {
         use crate::routers::RouterFactory;
 
-        let manager = Arc::new(Self::new(app_context.worker_registry.clone()));
+        let mut manager = Self::new(app_context.worker_registry.clone());
+        manager.enable_igw = config.router_config.enable_igw;
+        let manager = Arc::new(manager);
 
         if config.router_config.enable_igw {
             info!("Initializing RouterManager in multi-router mode (IGW)");
@@ -200,6 +204,15 @@ impl RouterManager {
         headers: Option<&HeaderMap>,
         model_id: Option<&str>,
     ) -> Option<Arc<dyn RouterTrait>> {
+        // In single-router mode (enable_igw=false), always use the default router
+        if !self.enable_igw {
+            let default_router = self.default_router.read().unwrap();
+            if let Some(ref default_id) = *default_router {
+                return self.routers.get(default_id).map(|r| r.clone());
+            }
+        }
+
+        // Multi-router mode logic follows
         let _priority_threshold = headers.and_then(|h| {
             h.get("x-worker-priority")
                 .and_then(|v| v.to_str().ok())
