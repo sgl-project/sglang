@@ -15,6 +15,8 @@ def is_mla_preprocess_enabled() -> bool:
 if is_mla_preprocess_enabled():
     import sgl_kernel_npu
     import torch_npu
+    torch.npu.config.allow_internal_format = True
+    torch.npu.set_compile_mode(jit_compile=False)
 
 
 def round_up(val: int, align: int) -> int:
