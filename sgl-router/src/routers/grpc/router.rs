@@ -2,11 +2,11 @@
 
 use crate::config::types::RetryConfig;
 use crate::core::{
-    BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig, Worker, WorkerType,
+    BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
 };
 use crate::grpc::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
-use crate::policies::LoadBalancingPolicy;
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::{RouterTrait, WorkerManagement};
 use crate::tokenizer::traits::Tokenizer;
@@ -19,17 +19,17 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
 /// gRPC router implementation for SGLang
 #[allow(dead_code)] // Fields will be used once implementation is complete
 pub struct GrpcRouter {
-    /// Worker connections
-    workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
-    /// gRPC clients for each worker
-    grpc_clients: Arc<RwLock<HashMap<String, SglangSchedulerClient>>>,
+    /// Centralized worker registry
+    worker_registry: Arc<WorkerRegistry>,
+    /// Centralized policy registry
+    policy_registry: Arc<PolicyRegistry>,
     /// Load balancing policy
     policy: Arc<dyn LoadBalancingPolicy>,
     /// Tokenizer for handling text encoding/decoding
@@ -38,8 +38,6 @@ pub struct GrpcRouter {
     reasoning_parser_factory: ParserFactory,
     /// Tool parser registry for function/tool calls
     tool_parser_registry: &'static ParserRegistry,
-    /// Worker health checker
-    _health_checker: Option<HealthChecker>,
     /// Configuration
     timeout_secs: u64,
     interval_secs: u64,
@@ -102,32 +100,41 @@ impl GrpcRouter {
             return Err("Failed to connect to any gRPC workers".to_string());
         }
 
-        // Create Worker trait objects with gRPC connection mode
-        let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+        // Get registries from context
+        let worker_registry = ctx.worker_registry.clone();
+        let policy_registry = ctx.policy_registry.clone();
 
-        // Move clients from the HashMap to the workers
+        // Create Worker trait objects with gRPC connection mode and register them
         for url in &worker_urls {
             if let Some(client) = grpc_clients.remove(url) {
-                let worker = BasicWorker::with_connection_mode(
-                    url.clone(),
-                    WorkerType::Regular,
-                    crate::core::ConnectionMode::Grpc { port: None },
-                )
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: ctx.router_config.health_check.timeout_secs,
-                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                    endpoint: ctx.router_config.health_check.endpoint.clone(),
-                    failure_threshold: ctx.router_config.health_check.failure_threshold,
-                    success_threshold: ctx.router_config.health_check.success_threshold,
-                })
-                .with_grpc_client(client);
+                let worker = BasicWorkerBuilder::new(url.clone())
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(crate::core::ConnectionMode::Grpc { port: None })
+                    .circuit_breaker_config(core_cb_config.clone())
+                    .health_config(HealthConfig {
+                        timeout_secs: ctx.router_config.health_check.timeout_secs,
+                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                        endpoint: ctx.router_config.health_check.endpoint.clone(),
+                        failure_threshold: ctx.router_config.health_check.failure_threshold,
+                        success_threshold: ctx.router_config.health_check.success_threshold,
+                    })
+                    .grpc_client(client)
+                    .build();
 
-                workers.push(Arc::new(worker) as Arc<dyn Worker>);
+                // Register worker in the centralized registry
+                worker_registry.register(Arc::new(worker));
             } else {
                 warn!("No gRPC client for worker {}, skipping", url);
             }
         }
+
+        // Get only gRPC workers from registry for policy initialization
+        let workers = worker_registry.get_workers_filtered(
+            None, // any model
+            Some(WorkerType::Regular),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false, // include unhealthy workers during initialization
+        );
 
         // Initialize policy with workers if needed
         if let Some(cache_aware) = policy
@@ -137,20 +144,15 @@ impl GrpcRouter {
             cache_aware.init_workers(&workers);
         }
 
-        let workers = Arc::new(RwLock::new(workers));
-        let health_checker = crate::core::start_health_checker(
-            Arc::clone(&workers),
-            ctx.router_config.worker_startup_check_interval_secs,
-        );
+        // No need for local health checkers - WorkerRegistry handles health checking
 
         Ok(GrpcRouter {
-            workers,
-            grpc_clients: Arc::new(RwLock::new(grpc_clients)),
+            worker_registry,
+            policy_registry,
             policy,
             tokenizer,
             reasoning_parser_factory,
             tool_parser_registry,
-            _health_checker: Some(health_checker),
             timeout_secs: ctx.router_config.worker_startup_timeout_secs,
             interval_secs: ctx.router_config.worker_startup_check_interval_secs,
             dp_aware: ctx.router_config.dp_aware,
@@ -163,8 +165,9 @@ impl GrpcRouter {
 
 impl std::fmt::Debug for GrpcRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stats = self.worker_registry.stats();
         f.debug_struct("GrpcRouter")
-            .field("workers_count", &self.workers.read().unwrap().len())
+            .field("workers_count", &stats.total_workers)
             .field("timeout_secs", &self.timeout_secs)
             .field("interval_secs", &self.interval_secs)
             .field("dp_aware", &self.dp_aware)
@@ -279,16 +282,24 @@ impl RouterTrait for GrpcRouter {
 
 #[async_trait]
 impl WorkerManagement for GrpcRouter {
-    async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
+    async fn add_worker(
+        &self,
+        _worker_url: &str,
+        _api_key: &Option<String>,
+    ) -> Result<String, String> {
         Err("Not implemented".to_string())
     }
 
     fn remove_worker(&self, _worker_url: &str) {}
 
     fn get_worker_urls(&self) -> Vec<String> {
-        self.workers
-            .read()
-            .unwrap()
+        self.worker_registry
+            .get_workers_filtered(
+                None, // any model
+                Some(WorkerType::Regular),
+                Some(crate::core::ConnectionMode::Grpc { port: None }),
+                false, // include all workers
+            )
             .iter()
             .map(|w| w.url().to_string())
             .collect()
