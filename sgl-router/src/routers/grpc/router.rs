@@ -246,7 +246,17 @@ impl GrpcRouter {
         };
 
         // Step 6: Build SamplingParams for gRPC
-        let sampling_params = self.build_grpc_sampling_params(body, structural_tag);
+        let sampling_params = match self.build_grpc_sampling_params(body, structural_tag) {
+            Ok(params) => params,
+            Err(e) => {
+                error!("Failed to build sampling parameters: {}", e);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid sampling parameters: {}", e),
+                )
+                    .into_response();
+            }
+        };
 
         // Step 7: Create GenerateRequest
         let grpc_request = proto::GenerateRequest {
@@ -354,7 +364,7 @@ impl GrpcRouter {
         &self,
         request: &ChatCompletionRequest,
         structural_tag: Option<String>,
-    ) -> proto::SamplingParams {
+    ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = self.extract_stop_strings(request);
 
         // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
@@ -366,7 +376,7 @@ impl GrpcRouter {
             .map(|v| v as i32);
 
         #[allow(deprecated)]
-        proto::SamplingParams {
+        Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
             top_k: request.top_k.unwrap_or(-1) as i32,
@@ -380,9 +390,9 @@ impl GrpcRouter {
             skip_special_tokens: request.skip_special_tokens,
             n: request.n.unwrap_or(1) as i32,
             structural_tag: structural_tag.unwrap_or_default(),
-            constraint: self.build_constraint(request),
+            constraint: self.build_constraint(request)?,
             ..Default::default()
-        }
+        })
     }
 
     /// Extract stop strings from request
@@ -398,26 +408,30 @@ impl GrpcRouter {
     fn build_constraint(
         &self,
         request: &ChatCompletionRequest,
-    ) -> Option<proto::sampling_params::Constraint> {
+    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
         if let Some(format) = &request.response_format {
             if let ResponseFormat::JsonSchema { json_schema } = format {
-                return Some(proto::sampling_params::Constraint::JsonSchema(
-                    serde_json::to_string(&json_schema.schema).unwrap_or_default(),
-                ));
+                let schema_str = serde_json::to_string(&json_schema.schema)
+                    .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+                return Ok(Some(proto::sampling_params::Constraint::JsonSchema(
+                    schema_str,
+                )));
             }
         }
 
         if let Some(ebnf) = &request.ebnf {
-            return Some(proto::sampling_params::Constraint::EbnfGrammar(
+            return Ok(Some(proto::sampling_params::Constraint::EbnfGrammar(
                 ebnf.clone(),
-            ));
+            )));
         }
 
         if let Some(regex) = &request.regex {
-            return Some(proto::sampling_params::Constraint::Regex(regex.clone()));
+            return Ok(Some(proto::sampling_params::Constraint::Regex(
+                regex.clone(),
+            )));
         }
 
-        None
+        Ok(None)
     }
 
     /// Generate tool constraints for structured generation
