@@ -297,9 +297,9 @@ def run_one_case(
             tokenizer=tokenizer,
             fixed_output_len=output_len,
             apply_chat_template=True,
-            random_sample=True,
+            random_sample=False,
         )
-    else:
+    elif dataset_name == "random":
         input_requests = sample_random_requests(
             input_len=input_len,
             output_len=output_len,
