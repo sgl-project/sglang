@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -28,6 +28,7 @@ from sglang.srt.speculative.eagle_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
@@ -42,7 +43,7 @@ elif is_hip():
 
 
 @dataclass
-class LookaheadVerifyInput:
+class LookaheadVerifyInput(SpecInput):
     def __init__(
         self,
         draft_token: torch.Tensor,
@@ -61,6 +62,9 @@ class LookaheadVerifyInput:
         self.retrive_next_sibling = retrive_next_sibling
         self.draft_token_num = draft_token_num
         self.device = self.custom_mask.device
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return self.draft_token_num, self.draft_token_num
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
         if batch.forward_mode.is_idle():
