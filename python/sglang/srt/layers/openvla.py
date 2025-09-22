@@ -213,11 +213,16 @@ class PrismaticProcessor(ProcessorMixin):
     ) -> None:
         super().__init__(image_processor, tokenizer)
 
-    def process_image(self, images: Union[Image.Image, List[Image.Image]],return_tensors: Optional[Union[str, TensorType]] = TensorType.PYTORCH,):
+    def process_image(
+        self,
+        images: Union[Image.Image, List[Image.Image]],
+        return_tensors: Optional[Union[str, TensorType]] = TensorType.PYTORCH,
+    ):
         pixel_values = self.image_processor(images, return_tensors=return_tensors)[
             "pixel_values"
         ]
         return pixel_values
+
     def __call__(
         self,
         text: Union[

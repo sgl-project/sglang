@@ -1,10 +1,9 @@
 import numpy as np
+import timm
 from transformers import AutoConfig
+
 import sglang as sgl
 
-# The following packages are required to register the model class
-import timm
-import PIL
 
 @sgl.function
 def image_qa(s, image_path, question):
@@ -62,18 +61,33 @@ def single():
         question="In: What action should the robot take to {<INSTRUCTION>}?\nOut:",
         max_new_tokens=7,
         temperature=0,
-        return_logprob=True
+        return_logprob=True,
     )
     output_logprobs = state.get_meta_info("action")["output_token_logprobs"]
     output_ids = [logprob[1] for logprob in output_logprobs]
     latency = state.get_meta_info("action")["e2e_latency"]
     print(f"[bs ={1: 03}] latency: {latency}, throughput: {1 / latency} actions/s")
 
-    assert output_ids == [31888,31869,31900,31912,31823,31882,31744]
+    assert output_ids == [31888, 31869, 31900, 31912, 31823, 31882, 31744]
     action = converter.convert(output_ids)
-    assert np.array_equal(np.round(action, 5), np.round([-3.78757518e-03,5.47156949e-04,-2.41243806e-04,-2.50440557e-02,2.53441257e-02,-1.77964902e-02,9.96078431e-01], 5))
-    
+    assert np.array_equal(
+        np.round(action, 5),
+        np.round(
+            [
+                -3.78757518e-03,
+                5.47156949e-04,
+                -2.41243806e-04,
+                -2.50440557e-02,
+                2.53441257e-02,
+                -1.77964902e-02,
+                9.96078431e-01,
+            ],
+            5,
+        ),
+    )
+
     return latency
+
 
 def batch(batch_size: int):
     arguments = [
@@ -83,29 +97,33 @@ def batch(batch_size: int):
         }
     ] * batch_size
     states = image_qa.run_batch(
-        arguments,
-        max_new_tokens=7,
-        temperature=0,
-        return_logprob=True
+        arguments, max_new_tokens=7, temperature=0, return_logprob=True
     )
     max_latency = 0
     i = 0
     for state in states:
         output_logprobs = state.get_meta_info("action")["output_token_logprobs"]
         output_ids = [logprob[1] for logprob in output_logprobs]
-        i+=1
+        i += 1
         # print(i, output_ids)
         latency = state.get_meta_info("action")["e2e_latency"]
         max_latency = max(latency, max_latency)
 
-    print(f"[bs ={batch_size: 03}] latency: {max_latency}, throughput: {batch_size / max_latency} actions/s")
+    print(
+        f"[bs ={batch_size: 03}] latency: {max_latency}, throughput: {batch_size / max_latency} actions/s"
+    )
     return max_latency
 
 
 if __name__ == "__main__":
     if timm.__version__ not in {"0.9.10", "0.9.11", "0.9.12", "0.9.16"}:
         raise NotImplementedError("TIMM Version must be >= 0.9.10 and < 1.0.0")
+    try:
+        import PIL
 
+        print(f"PIL/Pillow is installed {PIL.__version__}.")
+    except ImportError:
+        print("Install PIL with `pip install pillow`.")
     runtime = sgl.Runtime(
         model_path="openvla/openvla-7b",
         tokenizer_path="openvla/openvla-7b",

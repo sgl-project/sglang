@@ -1,6 +1,5 @@
 import logging
 from dataclasses import dataclass
-from PIL import Image
 from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -10,17 +9,23 @@ import tokenizers
 import torch
 import torch.nn as nn
 import transformers
+from PIL import Image
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 from transformers.models.auto import CONFIG_MAPPING
-from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.openvla import PrismaticProjector, PrismaticVisionBackbone, PrismaticProcessor
+from sglang.srt.layers.openvla import (
+    PrismaticProcessor,
+    PrismaticProjector,
+    PrismaticVisionBackbone,
+)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
+
 
 class OpenVLAConfig(PretrainedConfig):
     model_type: str = "openvla"
@@ -173,7 +178,7 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         pad_value = mm_inputs.mm_items[0].pad_value
         input_ids = input_ids[:1] + [pad_value] * 256 + input_ids[1:]
         if input_ids[-1] != 29871:
-            input_ids.append(29871) # OpenVLA Specific
+            input_ids.append(29871)  # OpenVLA Specific
         return input_ids
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -204,8 +209,8 @@ class OpenVLAForActionPrediction(PreTrainedModel):
 
         self.language_model.load_weights(weights)
         self.processor = PrismaticProcessor.from_pretrained(
-                "openvla/openvla-7b", trust_remote_code=True
-            )
+            "openvla/openvla-7b", trust_remote_code=True
+        )
 
     def forward(
         self,
@@ -213,7 +218,10 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        need_vision = forward_batch.mm_inputs is not None and forward_batch.mm_inputs[0] is not None
+        need_vision = (
+            forward_batch.mm_inputs is not None
+            and forward_batch.mm_inputs[0] is not None
+        )
 
         # === Handle Unimodal Forward, this is for warmup only ===
         if not need_vision or len(positions) == 1:
@@ -234,37 +242,46 @@ class OpenVLAForActionPrediction(PreTrainedModel):
             return self.language_model(input_ids, positions, forward_batch)
 
         embedding_layer = self.language_model.model.embed_tokens
-        input_ids.clamp_(min=0, max=32064 - 1) # Clamp image pad_value token ids
+        input_ids.clamp_(min=0, max=32064 - 1)  # Clamp image pad_value token ids
         input_embeddings = embedding_layer(input_ids)
-        
+
         pt = 0
         bs = forward_batch.batch_size
         extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
         prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
 
-        assert bs == len(forward_batch.mm_inputs), "Batch size doesn't match the number of image inputs, each request can have only one image."
+        assert bs == len(
+            forward_batch.mm_inputs
+        ), "Batch size doesn't match the number of image inputs, each request can have only one image."
         for i, image_input in enumerate(forward_batch.mm_inputs):
-            assert len(image_input.mm_items) == 1, "OpenVLA only supports single image inputs"
+            assert (
+                len(image_input.mm_items) == 1
+            ), "OpenVLA only supports single image inputs"
             mm_item = image_input.mm_items[0]
             image_data = Image.fromarray(mm_item.feature)
-            pixel_value = self.processor.process_image(image_data).to(torch.bfloat16).to(0)
+            pixel_value = (
+                self.processor.process_image(image_data).to(torch.bfloat16).to(0)
+            )
             patch_features = self.vision_backbone(pixel_value)
             projected_patch_embeddings = self.projector(patch_features)[0]
 
             relative_id_image_start = 1 - prefix_lens_cpu[i]
             relative_id_image_end = relative_id_image_start + 256
-            
+
             # Supports chunked prefill
             id_start = max(pt + relative_id_image_start, extend_start_loc_cpu[i])
-            id_end = min(pt + relative_id_image_end, extend_start_loc_cpu[i] + extend_seq_lens[i])
-            if id_end < 0: id_end = 0
-            length = id_end - id_start
-            id_image_start = 0 if prefix_lens_cpu[i] == 0 else prefix_lens_cpu[i] - 1 
-            # print(f"{id_start=} {id_end=} {length=} {id_image_start=} {id_image_start + length=}")
-            input_embeddings[id_start : id_end] = (
-                projected_patch_embeddings[id_image_start: id_image_start + length]
+            id_end = min(
+                pt + relative_id_image_end, extend_start_loc_cpu[i] + extend_seq_lens[i]
             )
+            if id_end < 0:
+                id_end = 0
+            length = id_end - id_start
+            id_image_start = 0 if prefix_lens_cpu[i] == 0 else prefix_lens_cpu[i] - 1
+            # print(f"{id_start=} {id_end=} {length=} {id_image_start=} {id_image_start + length=}")
+            input_embeddings[id_start:id_end] = projected_patch_embeddings[
+                id_image_start : id_image_start + length
+            ]
             pt += forward_batch.extend_seq_lens_cpu[i]
 
         return self.language_model(
@@ -273,5 +290,6 @@ class OpenVLAForActionPrediction(PreTrainedModel):
             forward_batch=forward_batch,
             input_embeds=input_embeddings,
         )
+
 
 EntryClass = OpenVLAForActionPrediction
