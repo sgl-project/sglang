@@ -240,6 +240,7 @@ impl super::super::RouterTrait for OpenAIRouter {
                 "chat_template_kwargs",
                 "return_hidden_states",
                 "repetition_penalty",
+                "sampling_seed",
             ] {
                 obj.remove(key);
             }
