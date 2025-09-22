@@ -1,8 +1,10 @@
 import numpy as np
 from transformers import AutoConfig
-
 import sglang as sgl
 
+# The following packages are required to register the model class
+import timm
+import PIL
 
 @sgl.function
 def image_qa(s, image_path, question):
@@ -101,10 +103,13 @@ def batch(batch_size: int):
 
 
 if __name__ == "__main__":
+    if timm.__version__ not in {"0.9.10", "0.9.11", "0.9.12", "0.9.16"}:
+        raise NotImplementedError("TIMM Version must be >= 0.9.10 and < 1.0.0")
+
     runtime = sgl.Runtime(
         model_path="openvla/openvla-7b",
         tokenizer_path="openvla/openvla-7b",
-        # disable_cuda_graph=True,
+        disable_cuda_graph=True,
         # disable_radix_cache=True,
         # chunked_prefill_size=-1,
         trust_remote_code=True,

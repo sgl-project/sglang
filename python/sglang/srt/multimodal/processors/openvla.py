@@ -1,7 +1,7 @@
 from typing import List, Optional, Union
 
-from python.sglang.srt.layers.openvla import PrismaticProcessor
-from python.sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.layers.openvla import PrismaticProcessor
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.openvla import OpenVLAForActionPrediction
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
@@ -16,8 +16,8 @@ import numpy as np
 class OpenVLAImageProcessor(BaseMultimodalProcessor):
     models = [OpenVLAForActionPrediction]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.mm_tokens = MultimodalSpecialTokens(image_token="<image>").build(
             _processor
         )
