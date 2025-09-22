@@ -10,9 +10,16 @@ from sglang.srt.lora.triton_ops import (
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
 )
+from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
+from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
 from sglang.srt.lora.utils import LoRABatchInfo
 
 CHUNK_SIZE = 16
+
+
+def reset_kernel_cache():
+    _chunked_lora_shrink_kernel._clear_cache()
+    _chunked_lora_expand_kernel._clear_cache()
 
 
 def safe_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -489,6 +496,8 @@ class TestChunkedSGMV(unittest.TestCase):
         if not weights:  # Handle case with no LoRA weights
             return
 
+        reset_kernel_cache()
+
         # Stack LoRA A weights
         lora_a_weights = [weights[name][0] for name in sorted(weights.keys())]
         stacked_lora_a = self.stack_lora_weights(lora_a_weights, is_lora_a=True)
@@ -547,6 +556,7 @@ class TestChunkedSGMV(unittest.TestCase):
 
     def test_shrink_basic(self):
         """Test basic shrink operation against PyTorch reference"""
+        reset_kernel_cache()
         for batch_size in [1, 2, 16, 64]:
             with self.subTest(batch_size=batch_size):
                 x, weights, batch_info, seq_lengths, lora_assignments = (
@@ -574,6 +584,7 @@ class TestChunkedSGMV(unittest.TestCase):
 
     def test_expand_basic(self):
         """Test basic expand operation against PyTorch reference"""
+        reset_kernel_cache()
         for batch_size in [1, 2, 16, 64]:
             with self.subTest(batch_size=batch_size):
                 x, weights, batch_info, seq_lengths, lora_assignments = (
