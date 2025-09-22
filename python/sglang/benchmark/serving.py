@@ -110,6 +110,7 @@ def main(**kwargs):
     runner = BenchmarkRunner(
         args=args,
         backend_client=backend_client,
+        dataset_loader=dataset_loader,
         tokenizer=tokenizer,
         input_requests=input_requests,
         api_url=api_url,

@@ -14,6 +14,7 @@ from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.backends.base_client import BaseBackendClient
 from sglang.benchmark.datasets.common import (
+    BaseDatasetLoader,
     DatasetRow,
     RequestFuncInput,
     RequestFuncOutput,
@@ -31,6 +32,7 @@ class BenchmarkRunner:
         self,
         args: Namespace,
         backend_client: BaseBackendClient,
+        dataset_loader: BaseDatasetLoader,
         tokenizer: PreTrainedTokenizerBase,
         input_requests: List[DatasetRow],
         api_url: str,
@@ -47,6 +49,12 @@ class BenchmarkRunner:
         self.semaphore = (
             asyncio.Semaphore(args.max_concurrency) if args.max_concurrency else None
         )
+
+        custom_generator_provider = dataset_loader.get_request_generator()
+        if custom_generator_provider:
+            self.request_generator = custom_generator_provider()
+        else:
+            self.request_generator = self._default_request_generator()
 
     async def async_request_profile(self, api_url: str) -> RequestFuncOutput:
         async with create_bench_client_session() as session:
@@ -65,7 +73,7 @@ class BenchmarkRunner:
 
         return output
 
-    async def _request_generator(self) -> AsyncGenerator[DatasetRow, None]:
+    async def _default_request_generator(self) -> AsyncGenerator[DatasetRow, None]:
         for request in self.input_requests:
             yield request
 
@@ -144,7 +152,7 @@ class BenchmarkRunner:
         tasks: List[asyncio.Task] = []
         pbar = tqdm(total=len(self.input_requests), disable=self.args.disable_tqdm)
 
-        async for request_row in self._request_generator():
+        async for request_row in self.request_generator:
             lora_name = None
             if self.args.lora_name and len(self.args.lora_name) != 0:
                 lora_name = random.choice(self.args.lora_name)

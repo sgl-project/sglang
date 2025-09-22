@@ -17,6 +17,8 @@ def remove_suffix(text: str, suffix: str) -> str:
 
 class ShareGPTLoader(BaseDatasetLoader):
     def load(self) -> List[DatasetRow]:
+        assert not self.args.tokenize_prompt
+
         dataset_path = self.args.dataset_path
         num_requests = self.args.num_prompts
         fixed_output_len = self.args.sharegpt_output_len

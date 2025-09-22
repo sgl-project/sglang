@@ -1,8 +1,6 @@
-import asyncio
-import base64
-import io
 import json
 import os
+import random
 import resource
 from json import JSONDecodeError
 from pathlib import Path
@@ -142,3 +140,23 @@ def check_chat_template(model_path: str) -> bool:
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
+
+
+def gen_prompt(tokenizer, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = list(tokenizer.get_vocab().values())
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def get_gen_prefix_cache_path(args, tokenizer):
+    """Create cache directory under ~/.cache/sglang/benchmark"""
+    cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
+
+    # Create a unique cache filename based on the generation parameters
+    cache_key = (
+        f"gen_shared_prefix_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
+        f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
+        f"{tokenizer.__class__.__name__}.pkl"
+    )
+    return cache_dir / cache_key

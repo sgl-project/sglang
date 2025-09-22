@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from argparse import Namespace
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from transformers import PreTrainedTokenizerBase
 
@@ -15,6 +15,7 @@ class DatasetRow:
     output_len: int
     image_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
+    raw_data: Optional[str] = None
 
 
 @dataclass
@@ -56,7 +57,13 @@ class BaseDatasetLoader(ABC):
     def __init__(self, args: Namespace, tokenizer: PreTrainedTokenizerBase):
         self.args = args
         self.tokenizer = tokenizer
+        self.input_requests: List[DatasetRow] = []
 
     @abstractmethod
     def load(self) -> List[DatasetRow]:
         pass
+
+    def get_request_generator(
+        self,
+    ) -> Optional[Callable[[], AsyncGenerator[DatasetRow, None]]]:
+        return None
