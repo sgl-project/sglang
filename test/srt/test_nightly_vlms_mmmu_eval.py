@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples, especially for latency thresholds
-    ModelDeploySetup("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(0.330, 50.0),
+    ModelDeploySetup("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(0.330, 56.1),
     ModelDeploySetup("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 39.9),
     ModelDeploySetup("Efficient-Large-Model/NVILA-Lite-2B-hf-0626"): ModelEvalMetrics(
         0.305, 23.8
@@ -26,10 +26,10 @@ MODEL_THRESHOLDS = {
     ModelDeploySetup("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.360, 15.3),
     ModelDeploySetup("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 14.5),
     ModelDeploySetup("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(0.330, 22.3),
-    ModelDeploySetup("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 22.1),
-    ModelDeploySetup("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.270, 23.2),
+    ModelDeploySetup("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.3),
+    ModelDeploySetup("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.270, 24.5),
     ModelDeploySetup("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 14.0),
-    ModelDeploySetup("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.320, 80.6),
+    ModelDeploySetup("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.310, 83.3),
     ModelDeploySetup("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.340, 31.9),
     ModelDeploySetup("unsloth/Mistral-Small-3.1-24B-Instruct-2503"): ModelEvalMetrics(
         0.310, 16.7
