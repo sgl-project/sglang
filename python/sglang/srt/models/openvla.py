@@ -261,7 +261,9 @@ class OpenVLAForActionPrediction(PreTrainedModel):
             mm_item = image_input.mm_items[0]
             image_data = Image.fromarray(mm_item.feature)
             pixel_value = (
-                self.processor.process_image(image_data).to(torch.bfloat16).to(0)
+                self.processor.process_image(image_data)
+                .to(torch.bfloat16)
+                .to(input_embeddings.device)
             )
             patch_features = self.vision_backbone(pixel_value)
             projected_patch_embeddings = self.projector(patch_features)[0]
