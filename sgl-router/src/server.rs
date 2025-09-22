@@ -282,15 +282,16 @@ async fn v1_responses_list_input_items(
 // ---------- Worker management endpoints (Legacy) ----------
 
 #[derive(Deserialize)]
-struct UrlQuery {
+struct AddWorkerQuery {
     url: String,
+    api_key: Option<String>,
 }
 
 async fn add_worker(
     State(state): State<Arc<AppState>>,
-    Query(UrlQuery { url }): Query<UrlQuery>,
+    Query(AddWorkerQuery { url, api_key }): Query<AddWorkerQuery>,
 ) -> Response {
-    match state.router.add_worker(&url).await {
+    match state.router.add_worker(&url, &api_key).await {
         Ok(message) => (StatusCode::OK, message).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
     }
@@ -303,7 +304,7 @@ async fn list_workers(State(state): State<Arc<AppState>>) -> Response {
 
 async fn remove_worker(
     State(state): State<Arc<AppState>>,
-    Query(UrlQuery { url }): Query<UrlQuery>,
+    Query(AddWorkerQuery { url, .. }): Query<AddWorkerQuery>,
 ) -> Response {
     state.router.remove_worker(&url);
     (
@@ -337,7 +338,7 @@ async fn create_worker(
         }
     } else {
         // In single router mode, use the router's add_worker with basic config
-        match state.router.add_worker(&config.url).await {
+        match state.router.add_worker(&config.url, &config.api_key).await {
             Ok(message) => {
                 let response = WorkerApiResponse {
                     success: true,
