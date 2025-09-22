@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import List
+from typing import TYPE_CHECKING, List
 
 import torch
 import triton
@@ -11,7 +11,6 @@ import triton.language as tl
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.speculative.spec_info import EagleVerifyInput
 from sglang.srt.utils import is_cuda, is_hip
 
 if is_cuda():
@@ -19,6 +18,8 @@ if is_cuda():
 elif is_hip():
     from sgl_kernel import fast_topk
 
+if TYPE_CHECKING:
+    from sglang.srt.speculative.spec_info import EagleVerifyInput
 
 logger = logging.getLogger(__name__)
 
