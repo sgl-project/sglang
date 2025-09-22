@@ -41,6 +41,7 @@ async fn test_policy_registry_with_router_manager() {
     let _worker1_config = WorkerConfigRequest {
         url: "http://worker1:8000".to_string(),
         model_id: Some("llama-3".to_string()),
+        api_key: Some("test_api_key".to_string()),
         worker_type: None,
         priority: None,
         cost: None,
@@ -66,6 +67,7 @@ async fn test_policy_registry_with_router_manager() {
     let _worker2_config = WorkerConfigRequest {
         url: "http://worker2:8000".to_string(),
         model_id: Some("llama-3".to_string()),
+        api_key: Some("test_api_key".to_string()),
         worker_type: None,
         priority: None,
         cost: None,
@@ -86,6 +88,7 @@ async fn test_policy_registry_with_router_manager() {
     let _worker3_config = WorkerConfigRequest {
         url: "http://worker3:8000".to_string(),
         model_id: Some("gpt-4".to_string()),
+        api_key: Some("test_api_key".to_string()),
         worker_type: None,
         priority: None,
         cost: None,
