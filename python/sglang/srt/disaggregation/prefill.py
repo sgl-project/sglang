@@ -323,8 +323,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
             if batch:
+                attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 for req in batch.reqs:
-                    trace_event("schedule", req.rid)
+                    trace_event("schedule", req.rid, attrs=attrs)
 
             if require_mlp_sync(self.server_args):
                 batch = self.prepare_mlp_sync_batch(batch)
@@ -358,8 +359,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
             if batch:
+                attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 for req in batch.reqs:
-                    trace_event("schedule", req.rid)
+                    trace_event("schedule", req.rid, attrs=attrs)
 
             if require_mlp_sync(self.server_args):
                 batch = self.prepare_mlp_sync_batch(batch)
