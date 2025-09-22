@@ -24,15 +24,13 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionPatchEmbed as Qwen3_VisionPatchEmbed,
-)
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLConfig,
     Qwen3VLVisionConfig,
 )
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionPatchEmbed
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -238,14 +236,7 @@ class Qwen3_VisionTransformer(nn.Module):
         self.spatial_merge_unit = self.spatial_merge_size**2
         self.temporal_patch_size = vision_config.temporal_patch_size
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
-
-        self.patch_embed = Qwen3_VisionPatchEmbed(
-            patch_size=self.patch_size,
-            temporal_patch_size=self.temporal_patch_size,
-            in_channels=vision_config.in_channels,
-            embed_dim=self.hidden_size,
-        )
-
+        self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
