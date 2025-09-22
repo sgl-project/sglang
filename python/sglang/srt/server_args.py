@@ -990,7 +990,7 @@ class ServerArgs:
         if self.attention_backend != "fa3":
             self.disable_radix_cache = True
             logger.warning(
-                "Currently radix cache is disabled for deterministic inference. It will be supported in the future."
+                f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
             )
         if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
             raise ValueError(
