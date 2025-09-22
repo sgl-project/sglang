@@ -71,6 +71,7 @@ ALL_MODELS = [
     ModelCase("microsoft/Phi-3-small-8k-instruct", trust_remote_code=True),
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
     ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
+    ModelCase("bigcode/starcoder2-3b", skip_long_prompt=True),
     ModelCase(
         "microsoft/Phi-3.5-MoE-instruct",
         tp_size=2,
@@ -96,7 +97,6 @@ TORCH_DTYPES = [torch.float16]
 
 
 class TestGenerationModels(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
