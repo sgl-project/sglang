@@ -33,7 +33,11 @@ pub use http::{openai_router, pd_router, pd_types, router};
 #[async_trait]
 pub trait WorkerManagement: Send + Sync {
     /// Add a worker to the router
-    async fn add_worker(&self, worker_url: &str) -> Result<String, String>;
+    async fn add_worker(
+        &self,
+        worker_url: &str,
+        api_key: &Option<String>,
+    ) -> Result<String, String>;
 
     /// Remove a worker from the router
     fn remove_worker(&self, worker_url: &str);
