@@ -179,7 +179,11 @@ class FunctionCallParser:
         ):
             strict_tag = self.get_structure_tag()
             return ("structural_tag", strict_tag)
-        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+        elif (
+            tool_choice == "required"
+            or isinstance(tool_choice, ToolChoice)
+            or (tool_choice == "auto" and isinstance(self.detector, LongCatDetector))
+        ):
             ebnf = self.get_ebnf(tool_choice)
             return ("ebnf", ebnf) if ebnf is not None else None
 
