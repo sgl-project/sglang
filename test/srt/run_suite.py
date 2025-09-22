@@ -78,6 +78,7 @@ suites = {
         TestFile("test_hidden_states.py", 55),
         TestFile("test_hybrid_attn_backend.py", 100),
         TestFile("test_standalone_speculative_decoding.py", 250),
+        TestFile("test_lookahead_speculative_decoding.py", 250),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
@@ -98,6 +99,7 @@ suites = {
         TestFile("test_priority_scheduling.py", 100),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
+        TestFile("test_radix_cache_unit.py", 5),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_retract_decode.py", 54),
@@ -142,14 +144,15 @@ suites = {
     "per-commit-8-gpu": [
         # Disabled because it hangs on the CI.
         # TestFile("ep/test_moe_ep.py", 181),
+        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 800),
         TestFile("lora/test_lora_llama4.py", 600),
         TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_different_tp.py", 155),
         TestFile("test_disaggregation_pp.py", 60),
         TestFile("test_full_deepseek_v3.py", 333),
     ],
-    "per-commit-8-gpu-b200": [
-        TestFile("test_gpt_oss_4gpu.py", 600),
+    "per-commit-4-gpu-b200": [
+        # TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_deepseek_v3_fp4_4gpu.py", 600),
     ],
     "per-commit-4-gpu-deepep": [

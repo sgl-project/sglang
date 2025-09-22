@@ -293,6 +293,8 @@ void moe_align_block_size(
 void topk_softmax(
     torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
 
+void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
+
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
     at::Tensor& bias,
@@ -456,6 +458,16 @@ void verify_tree_greedy(
     at::Tensor retrive_next_sibling,
     at::Tensor target_predict,
     int64_t cuda_stream = 0);
+
+void reconstruct_indices_from_tree_mask(
+    at::Tensor tree_mask,
+    at::Tensor verified_seq_len,
+    at::Tensor positions,             // mutable
+    at::Tensor retrive_index,         // mutable
+    at::Tensor retrive_next_token,    // mutable
+    at::Tensor retrive_next_sibling,  // mutable
+    int64_t batch_size,
+    int64_t draft_token_num);
 
 void build_tree_kernel_efficient(
     at::Tensor parent_list,
