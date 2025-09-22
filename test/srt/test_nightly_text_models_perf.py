@@ -23,14 +23,14 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
     def setUpClass(cls):
         cls.model_groups = [
             (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
+            (parse_models("Qwen/Qwen2-57B-A14B-Instruct"), False, True),
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
-        cls.batch_sizes = [1, 1, 8]
+        cls.batch_sizes = [1, 1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
         os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -50,8 +50,6 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                     )
                     try:
-
-                        model_results = []
 
                         profile_filename = (
                             f"{model.replace('/', '_')}_{int(time.time())}"

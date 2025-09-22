@@ -4,23 +4,19 @@ Publish performance traces to GitHub repository
 
 import argparse
 import base64
-import gzip
 import json
 import os
-import shutil
 import sys
-import tempfile
-from pathlib import Path
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
 def make_github_request(url, token, method="GET", data=None):
     """Make authenticated request to GitHub API"""
     headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "sglang-ci",
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        # "User-Agent": "sglang-ci",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
     if data:
@@ -34,7 +30,39 @@ def make_github_request(url, token, method="GET", data=None):
             return response.read().decode("utf-8")
     except Exception as e:
         print(f"GitHub API request failed: {e}")
+        if hasattr(e, "read"):
+            try:
+                error_body = e.read().decode("utf-8")
+                print(f"Error response body: {error_body}")
+            except:
+                pass
         raise
+
+
+def verify_token_permissions(repo_owner, repo_name, token):
+    """Verify that the token has necessary permissions for the repository"""
+    print("Verifying token permissions...")
+
+    # Check if we can access the repository
+    try:
+        url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
+        response = make_github_request(url, token)
+        repo_data = json.loads(response)
+        print(f"Repository access verified: {repo_data['full_name']}")
+    except Exception as e:
+        print(f"Failed to access repository: {e}")
+        return False
+
+    # Check if we can read the repository contents
+    try:
+        url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents"
+        response = make_github_request(url, token)
+        print("Repository contents access verified")
+    except Exception as e:
+        print(f"Failed to access repository contents: {e}")
+        return False
+
+    return True
 
 
 def get_branch_sha(repo_owner, repo_name, branch, token):
@@ -147,8 +175,8 @@ def publish_traces(traces_dir, run_id, run_number, is_vlm=False):
         sys.exit(1)
 
     # Repository configuration
-    repo_owner = "sgl-project"
-    repo_name = "ci-data"
+    repo_owner = "sglang-bot"
+    repo_name = "sglang-ci-data"
     branch = "main"
     target_base_path = f"traces/{run_id}"
 
@@ -160,6 +188,13 @@ def publish_traces(traces_dir, run_id, run_number, is_vlm=False):
         return
 
     print(f"Found {len(files_to_upload)} files to upload")
+
+    # Verify token permissions before proceeding
+    if not verify_token_permissions(repo_owner, repo_name, token):
+        print(
+            "Token permission verification failed. Please check the token permissions."
+        )
+        sys.exit(1)
 
     try:
         # Get current branch head
