@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
-
+from sglang.srt.layers.quantization.compressed_tensors.schemes import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -30,6 +30,8 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
+from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -41,6 +43,8 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -48,12 +52,17 @@ if _use_aiter:
 
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
-try:
-    import vllm
 
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
+if _is_cuda:
+    from sgl_kernel import (
+        fused_marlin_moe,
+    )
+# try:
+#     import vllm
+
+#     VLLM_AVAILABLE = True
+# except ImportError:
+#     VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +95,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-            if not VLLM_AVAILABLE:
-                raise ImportError(
-                    "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm."
-                )
+            # if not VLLM_AVAILABLE:
+            #     raise ImportError(
+            #         "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm."
+            #     )
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
             return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
@@ -614,9 +623,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
 
-        from vllm import _custom_ops as vllm_ops
+        # from vllm import _custom_ops as vllm_ops
 
-        marlin_w13_qweight = vllm_ops.gptq_marlin_moe_repack(
+        marlin_w13_qweight = gptq_marlin_moe_repack(
             layer.w13_weight_packed,
             layer.w13_g_idx_sort_indices,
             layer.w13_weight_packed.shape[1] * self.packed_factor,
@@ -624,7 +633,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             self.num_bits,
         )
         replace_tensor("w13_weight_packed", marlin_w13_qweight)
-        marlin_w2_qweight = vllm_ops.gptq_marlin_moe_repack(
+        marlin_w2_qweight = gptq_marlin_moe_repack(
             layer.w2_weight_packed,
             layer.w2_g_idx_sort_indices,
             layer.w2_weight_packed.shape[1] * self.packed_factor,
@@ -673,7 +682,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         topk_weights, topk_ids, router_logits = topk_output
 
-        output = torch.ops.vllm.fused_marlin_moe(
+        output = fused_marlin_moe(
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,

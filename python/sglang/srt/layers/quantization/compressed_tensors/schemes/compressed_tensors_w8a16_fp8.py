@@ -16,21 +16,25 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.utils import convert_to_channelwise
 
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        apply_fp8_marlin_linear,
-        prepare_fp8_layer_for_marlin,
-    )
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear,
+    prepare_fp8_layer_for_marlin,
+)
+# try:
+#     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+#         apply_fp8_marlin_linear,
+#         prepare_fp8_layer_for_marlin,
+#     )
 
-    MARLIN_FP8_AVAILABLE = True
-except ImportError:
-    MARLIN_FP8_AVAILABLE = False
+#     MARLIN_FP8_AVAILABLE = True
+# except ImportError:
+#     MARLIN_FP8_AVAILABLE = False
 
-    def apply_fp8_marlin_linear(*args, **kwargs):
-        raise ImportError("vllm is not installed")
+#     def apply_fp8_marlin_linear(*args, **kwargs):
+#         raise ImportError("vllm is not installed")
 
-    def prepare_fp8_layer_for_marlin(*args, **kwargs):
-        raise ImportError("vllm is not installed")
+#     def prepare_fp8_layer_for_marlin(*args, **kwargs):
+#         raise ImportError("vllm is not installed")
 
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
@@ -43,10 +47,10 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         self.strategy = strategy
         self.is_static_input_scheme = is_static_input_scheme
 
-        if not MARLIN_FP8_AVAILABLE:
-            raise ImportError(
-                "vllm is not installed. To use CompressedTensorsW8A16Fp8, please install vllm"
-            )
+        # if not MARLIN_FP8_AVAILABLE:
+        #     raise ImportError(
+        #         "vllm is not installed. To use CompressedTensorsW8A16Fp8, please install vllm"
+        #     )
 
     @classmethod
     def get_min_capability(cls) -> int:
