@@ -980,33 +980,36 @@ class ServerArgs:
             )
 
     def _handle_deterministic_inference(self):
-
-        # Check some settings
-        self.sampling_backend = "pytorch"
-        logger.warning(
-            "Sampling backend is set to pytorch for deterministic inference."
-        )
-        # Currently, only FA3 supports radix cache. Support for other backends is in progress
-        if self.attention_backend != "fa3":
-            self.disable_radix_cache = True
+        if self.enable_deterministic_inference:
+            # Check sampling backend
+            self.sampling_backend = "pytorch"
             logger.warning(
-                f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
-            )
-        if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
-            raise ValueError(
-                f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
+                "Sampling backend is set to pytorch for deterministic inference."
             )
 
-        # Check TP size
-        if self.tp_size > 1:
-            raise ValueError(
-                "Currently only TP size 1 is supported for deterministic inference."
-            )
+            # Check attention backend
+            if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
+                raise ValueError(
+                    f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
+                )
 
-        # Warnings on MoE models
-        logger.warning(
-            "Currently deterministic inference is only tested on dense models. Please be cautious when using it on MoE models."
-        )
+            # Currently, only FA3 supports radix cache. Support for other backends is in progress
+            if self.attention_backend != "fa3":
+                self.disable_radix_cache = True
+                logger.warning(
+                    f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
+                )
+
+            # Check TP size
+            if self.tp_size > 1:
+                raise ValueError(
+                    "Currently only TP size 1 is supported for deterministic inference."
+                )
+
+            # Warnings on MoE models
+            logger.warning(
+                "Currently deterministic inference is only tested on dense models. Please be cautious when using it on MoE models."
+            )
 
     def _handle_other_validations(self):
         pass
