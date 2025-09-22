@@ -104,7 +104,7 @@ Parameter Explanation:
 * `master_server_address`: The network address of the `master service`. The default port is 50051.
 * `protocol`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
 * `device_name`: For `"rdma"`, you can leave this empty in most cases. Mooncake auto-discovers RDMA NICs by default. If you want to pin specific NICs (e.g., `mlx5_0,mlx5_1`), first set `MC_MS_AUTO_DISC=0` to disable auto-discovery, then set `device_name` accordingly. To list available devices, use `ibv_devices`.
-* `global_segment_size`: The amount of memory contributed to the global memory pool. Accepts either bytes (integer) or a string with the `gb` suffix (e.g., `"16gb"`). A larger value allows Mooncake to cache more KV tensors.
+* `global_segment_size`: The amount of memory contributed to the global memory pool. Accepts either bytes (integer) or a string with the `gb` suffix, e.g., `"16gb"`. A larger value allows Mooncake to cache more KV tensors.
 * `local_buffer_size`: Local buffer is used to do request operations such as `Get` or `Put`. In this case, it is set to 0 because the instance functions solely as a storage server, contributing memory to the global pool without issuing any request operations.
 
 Then start the `store service`:
@@ -147,7 +147,7 @@ Parameter Explanation:
 * `MOONCAKE_MASTER`: The network address of the `master service`. The default port is 50051.
 * `MOONCAKE_PROTOCOL`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
 * `MOONCAKE_DEVICE`: Optional for `"rdma"`. By default, Mooncake auto-discovers RDMA NICs. If you need to pin specific NICs, set `MC_MS_AUTO_DISC=0` and then set `MOONCAKE_DEVICE` (comma-separated list, e.g., `mlx5_0,mlx5_1`).
-* `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory contributed to the global memory pool. Accepts either bytes (integer) or a value with the `gb` suffix (case-insensitive), e.g., `16gb`. If at least one `store service` is launched, this value can be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
+* `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory contributed to the global memory pool. Accepts either bytes (integer) or a value with the `gb` suffix, e.g., `16gb`. If at least one `store service` is launched, this value can be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
 
 **Using JSON file to configure Mooncake**
 

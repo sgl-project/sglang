@@ -23,11 +23,13 @@ def _parse_global_segment_size(value) -> int:
         if s.endswith("gb"):
             num = s[:-2].strip()
             if not num:
-                raise ValueError("Invalid global_segment_size: missing number before 'gb'")
+                raise ValueError(
+                    "Invalid global_segment_size: missing number before 'gb'"
+                )
             return int(num) * 1024 * 1024 * 1024
         return int(s)
-    logger.error(f'value is {value}')
     return int(value)
+
 
 @dataclass
 class MooncakeStoreConfig:
@@ -105,7 +107,6 @@ class MooncakeStoreConfig:
             device_name=extra_config.get("device_name", ""),
             master_server_address=extra_config["master_server_address"],
         )
-
 
 
 class MooncakeStore(HiCacheStorage):
