@@ -1272,7 +1272,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
-            if is_mla_preprocess_enabled():
+            if not is_mla_preprocess_enabled():
+                inner_state = self.forward_absorb_prepare(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
+            else:
                 if not self.mla_preprocess:
                     self.mla_preprocess = NPUFusedMLAPreprocess(
                         self.fused_qkv_a_proj_with_mqa,
@@ -1287,10 +1291,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.qk_rope_head_dim,
                     )
                 inner_state = self.mla_preprocess.forward(
-                    positions, hidden_states, forward_batch, zero_allocator
-                )
-            else:
-                inner_state = self.forward_absorb_prepare(
                     positions, hidden_states, forward_batch, zero_allocator
                 )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
