@@ -1,8 +1,9 @@
 import copy
 import logging
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +13,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
@@ -81,8 +83,24 @@ class SpeculativeAlgorithm(IntEnum):
         return name_map[name]
 
 
+class SpecInput(ABC):
+    @abstractmethod
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        pass
+
+    def get_spec_adjusted_global_num_tokens(
+        self, forward_batch: ModelWorkerBatch
+    ) -> Tuple[List[int], List[int]]:
+        c1, c2 = self.get_spec_adjust_token_coefficient()
+        global_num_tokens = [x * c1 for x in forward_batch.global_num_tokens]
+        global_num_tokens_for_logprob = [
+            x * c2 for x in forward_batch.global_num_tokens_for_logprob
+        ]
+        return global_num_tokens, global_num_tokens_for_logprob
+
+
 @dataclass
-class EagleVerifyInput:
+class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor
@@ -97,6 +115,9 @@ class EagleVerifyInput:
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return self.draft_token_num, self.draft_token_num
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
@@ -579,7 +600,7 @@ class EagleVerifyInput:
 
 
 @dataclass
-class EagleDraftInput:
+class EagleDraftInput(SpecInput):
     # The inputs for decode
     # shape: (b, topk)
     topk_p: torch.Tensor = None
@@ -607,6 +628,9 @@ class EagleDraftInput:
     # shape: (b,)
     seq_lens_for_draft_extend: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return self.num_tokens_per_batch, self.num_tokens_for_logprob_per_batch
 
     def prepare_for_extend(self, batch: ScheduleBatch):
 

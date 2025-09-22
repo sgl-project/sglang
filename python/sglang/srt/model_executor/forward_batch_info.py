@@ -45,13 +45,8 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
 )
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import (
-    flatten_nested_list,
-    get_compiler_backend,
-    is_npu,
-    support_triton,
-)
+from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -60,11 +55,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.spec_info import (
-        EagleDraftInput,
-        EagleVerifyInput,
-        SpeculativeAlgorithm,
-    )
+    from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
 
@@ -296,7 +287,7 @@ class ForwardBatch:
     global_forward_mode: Optional[ForwardMode] = None
 
     # Speculative decoding
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 
@@ -367,33 +358,14 @@ class ForwardBatch:
 
         # For MLP sync
         if batch.global_num_tokens is not None:
-            from sglang.srt.speculative.spec_info import (
-                EagleDraftInput,
-                EagleVerifyInput,
-            )
-
             assert batch.global_num_tokens_for_logprob is not None
+
             # process global_num_tokens and global_num_tokens_for_logprob
             if batch.spec_info is not None:
-                if isinstance(batch.spec_info, EagleDraftInput):
-                    global_num_tokens = [
-                        x * batch.spec_info.num_tokens_per_batch
-                        for x in batch.global_num_tokens
-                    ]
-                    global_num_tokens_for_logprob = [
-                        x * batch.spec_info.num_tokens_for_logprob_per_batch
-                        for x in batch.global_num_tokens_for_logprob
-                    ]
-                else:
-                    assert isinstance(batch.spec_info, EagleVerifyInput)
-                    global_num_tokens = [
-                        x * batch.spec_info.draft_token_num
-                        for x in batch.global_num_tokens
-                    ]
-                    global_num_tokens_for_logprob = [
-                        x * batch.spec_info.draft_token_num
-                        for x in batch.global_num_tokens_for_logprob
-                    ]
+                spec_info: SpecInput = batch.spec_info
+                global_num_tokens, global_num_tokens_for_logprob = (
+                    spec_info.get_spec_adjusted_global_num_tokens(batch)
+                )
             else:
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
@@ -672,8 +644,6 @@ class ForwardBatch:
             )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
-        from sglang.srt.speculative.spec_info import EagleDraftInput
-
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -770,7 +740,10 @@ class ForwardBatch:
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
+        from sglang.srt.speculative.spec_info import EagleDraftInput
+
         if self.spec_info is not None and isinstance(self.spec_info, EagleDraftInput):
+            # FIXME(lsyin): remove this isinstance logic
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states
