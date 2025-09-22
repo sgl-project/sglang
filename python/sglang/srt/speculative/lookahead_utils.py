@@ -28,7 +28,7 @@ from sglang.srt.speculative.eagle_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
@@ -54,6 +54,7 @@ class LookaheadVerifyInput(SpecInput):
         retrive_next_sibling: torch.Tensor,
         draft_token_num: int,
     ):
+        super().__init__(SpecInputType.LOOKAHEAD_VERIFY)
         self.draft_token = draft_token
         self.custom_mask = tree_mask
         self.positions = positions

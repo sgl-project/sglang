@@ -83,7 +83,27 @@ class SpeculativeAlgorithm(IntEnum):
         return name_map[name]
 
 
+class SpecInputType(IntEnum):
+    # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
+    # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it
+    EAGLE_DRAFT = auto()
+    EAGLE_VERIFY = auto()
+    LOOKAHEAD_VERIFY = auto()
+
+
 class SpecInput(ABC):
+    def __init__(self, spec_input_type: SpecInputType):
+        self.spec_input_type = spec_input_type
+
+    def is_draft_input(self) -> bool:
+        return self.spec_input_type == SpecInputType.EAGLE_DRAFT
+
+    def is_verify_input(self) -> bool:
+        return self.spec_input_type in {
+            SpecInputType.EAGLE_VERIFY,
+            SpecInputType.LOOKAHEAD_VERIFY,
+        }
+
     @abstractmethod
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         pass
@@ -115,6 +135,9 @@ class EagleVerifyInput(SpecInput):
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
+
+    def __post__init__(self):
+        super().__init__(SpecInputType.EAGLE_VERIFY)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -628,6 +651,9 @@ class EagleDraftInput(SpecInput):
     # shape: (b,)
     seq_lens_for_draft_extend: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
+
+    def __post__init__(self):
+        super().__init__(SpecInputType.EAGLE_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_batch, self.num_tokens_for_logprob_per_batch
