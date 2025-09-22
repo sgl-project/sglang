@@ -971,7 +971,10 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
-        if self.disaggregation_decode_enable_offload_kvcache and self.disaggregation_mode != "decode":
+        if (
+            self.disaggregation_decode_enable_offload_kvcache
+            and self.disaggregation_mode != "decode"
+        ):
             raise ValueError(
                 "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."
             )
