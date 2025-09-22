@@ -980,29 +980,33 @@ class ServerArgs:
             )
 
     def _handle_deterministic_inference(self):
-        if self.enable_deterministic_inference:
-            import importlib
 
-            if not importlib.util.find_spec("batch_invariant_ops"):
-                raise ValueError(
-                    "batch_invariant_ops is not installed. Please install it from https://github.com/thinking-machines-lab/batch_invariant_ops/."
-                )
-
-            # Check some settings
-            self.sampling_backend = "pytorch"
+        # Check some settings
+        self.sampling_backend = "pytorch"
+        logger.warning(
+            "Sampling backend is set to pytorch for deterministic inference."
+        )
+        # Currently, only FA3 supports radix cache. Support for other backends is in progress
+        if self.attention_backend != "fa3":
+            self.disable_radix_cache = True
             logger.warning(
-                "Sampling backend is set to pytorch for deterministic inference."
+                "Currently radix cache is disabled for deterministic inference. It will be supported in the future."
             )
-            # Currently, only FA3 supports radix cache. Support for other backends is in progress
-            if self.attention_backend != "fa3":
-                self.disable_radix_cache = True
-                logger.warning(
-                    "Currently radix cache is disabled for deterministic inference. It will be supported in the future."
-                )
-            if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
-                raise ValueError(
-                    f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
-                )
+        if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
+            raise ValueError(
+                f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
+            )
+
+        # Check TP size
+        if self.tp_size > 1:
+            raise ValueError(
+                "Currently only TP size 1 is supported for deterministic inference."
+            )
+
+        # Warnings on MoE models
+        logger.warning(
+            "Currently deterministic inference is only tested on dense models. Please be cautious when using it on MoE models."
+        )
 
     def _handle_other_validations(self):
         pass
