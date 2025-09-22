@@ -21,14 +21,14 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.speculative.eagle_utils import (
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
     assign_req_to_token_pool,
     create_flashinfer_kv_indices_triton,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
 if is_cuda():

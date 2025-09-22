@@ -1045,7 +1045,7 @@ class AiterMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps

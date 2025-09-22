@@ -39,13 +39,13 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
     EagleVerifyOutput,
 )
-from sglang.srt.speculative.eagle_utils import (
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
     fast_topk,
     generate_token_bitmask,
     select_top_k_tokens,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,

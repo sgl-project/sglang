@@ -892,7 +892,7 @@ class FlashInferMLAMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
         if topk > 1:
             raise ValueError(

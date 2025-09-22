@@ -17,7 +17,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.eagle_utils import (
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
     _generate_simulated_accept_index,
@@ -29,7 +30,6 @@ from sglang.srt.speculative.eagle_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
