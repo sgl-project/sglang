@@ -3,8 +3,8 @@
 use super::pd_types::{api_path, PDRouterError};
 use crate::config::types::RetryConfig;
 use crate::core::{
-    is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthConfig, RetryExecutor, Worker,
-    WorkerFactory, WorkerLoadGuard, WorkerRegistry, WorkerType,
+    is_retryable_status, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RetryExecutor,
+    Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
@@ -46,6 +46,8 @@ pub struct PDRouter {
     pub prefill_client: Client,
     pub retry_config: RetryConfig,
     pub circuit_breaker_config: CircuitBreakerConfig,
+    pub api_key: Option<String>,
+
     // Channel for sending prefill responses to background workers for draining
     prefill_drain_tx: mpsc::Sender<reqwest::Response>,
 }
@@ -113,21 +115,25 @@ impl PDRouter {
         (results, errors)
     }
 
+    fn _get_worker_url_and_key(&self, w: &Arc<dyn Worker>) -> (String, Option<String>) {
+        (w.url().to_string(), w.api_key().clone())
+    }
+
     // Helper to get prefill worker URLs
-    fn get_prefill_worker_urls(&self) -> Vec<String> {
+    fn get_prefill_worker_urls_with_api_key(&self) -> Vec<(String, Option<String>)> {
         self.worker_registry
             .get_prefill_workers()
             .iter()
-            .map(|w| w.url().to_string())
+            .map(|w| self._get_worker_url_and_key(w))
             .collect()
     }
 
     // Helper to get decode worker URLs
-    fn get_decode_worker_urls(&self) -> Vec<String> {
+    fn get_decode_worker_urls_with_api_key(&self) -> Vec<(String, Option<String>)> {
         self.worker_registry
             .get_decode_workers()
             .iter()
-            .map(|w| w.url().to_string())
+            .map(|w| self._get_worker_url_and_key(w))
             .collect()
     }
 
@@ -208,6 +214,7 @@ impl PDRouter {
     pub async fn add_prefill_server(
         &self,
         url: String,
+        api_key: Option<String>,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
@@ -220,37 +227,39 @@ impl PDRouter {
 
         // Create Worker for the new prefill server with circuit breaker configuration
         // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        let worker = WorkerFactory::create_prefill_with_config(
-            url.clone(),
-            bootstrap_port,
-            self.circuit_breaker_config.clone(),
-        );
+        let worker_builder = BasicWorkerBuilder::new(url.clone())
+            .worker_type(WorkerType::Prefill { bootstrap_port })
+            .circuit_breaker_config(self.circuit_breaker_config.clone());
 
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker = if let Some(api_key) = api_key {
+            worker_builder.api_key(api_key).build()
+        } else {
+            worker_builder.build()
+        };
+
+        let worker_arc: Arc<dyn Worker> = Arc::new(worker);
 
         // Register the worker in the registry
         self.worker_registry.register(worker_arc.clone());
 
         // Notify PolicyRegistry about the new worker
         let model_id = worker_arc.model_id();
-        let policy = self.policy_registry.on_worker_added(model_id, None);
+        self.policy_registry.on_worker_added(model_id, None);
 
-        // If this is a cache-aware policy, update it with all workers for this model
-        if policy.name() == "cache_aware" {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                cache_aware.init_workers(&model_workers);
-            }
-        }
+        // Initialize cache-aware policy if applicable
+        let model_workers = self.worker_registry.get_by_model_fast(model_id);
+        self.policy_registry
+            .init_cache_aware_policy(model_id, &model_workers);
 
         info!("Added prefill server: {}", url);
         Ok(format!("Successfully added prefill server: {}", url))
     }
 
-    pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
+    pub async fn add_decode_server(
+        &self,
+        url: String,
+        api_key: Option<String>,
+    ) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
@@ -261,30 +270,29 @@ impl PDRouter {
 
         // Create Worker for the new decode server with circuit breaker configuration
         // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-        let worker = WorkerFactory::create_decode_with_config(
-            url.clone(),
-            self.circuit_breaker_config.clone(),
-        );
+        let worker_builder = BasicWorkerBuilder::new(url.clone())
+            .worker_type(WorkerType::Decode)
+            .circuit_breaker_config(self.circuit_breaker_config.clone());
 
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker = if let Some(api_key) = api_key {
+            worker_builder.api_key(api_key).build()
+        } else {
+            worker_builder.build()
+        };
+
+        let worker_arc: Arc<dyn Worker> = Arc::new(worker);
 
         // Register the worker in the registry
         self.worker_registry.register(worker_arc.clone());
 
         // Notify PolicyRegistry about the new worker
         let model_id = worker_arc.model_id();
-        let policy = self.policy_registry.on_worker_added(model_id, None);
+        self.policy_registry.on_worker_added(model_id, None);
 
-        // If this is a cache-aware policy, update it with all workers for this model
-        if policy.name() == "cache_aware" {
-            if let Some(cache_aware) = policy
-                .as_any()
-                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-            {
-                let model_workers = self.worker_registry.get_by_model_fast(model_id);
-                cache_aware.init_workers(&model_workers);
-            }
-        }
+        // Initialize cache-aware policy if applicable
+        let model_workers = self.worker_registry.get_by_model_fast(model_id);
+        self.policy_registry
+            .init_cache_aware_policy(model_id, &model_workers);
 
         info!("Added decode server: {}", url);
         Ok(format!("Successfully added decode server: {}", url))
@@ -308,17 +316,9 @@ impl PDRouter {
             // Notify PolicyRegistry about the removed worker
             self.policy_registry.on_worker_removed(&model_id);
 
-            // Get the policy for this model to update cache-aware if needed
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy
-                        .as_any()
-                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                    {
-                        cache_aware.remove_worker_by_url(url);
-                    }
-                }
-            }
+            // Remove from cache-aware policy if applicable
+            self.policy_registry
+                .remove_worker_from_cache_aware(&model_id, url);
         }
 
         if removed.is_some() {
@@ -349,17 +349,9 @@ impl PDRouter {
             // Notify PolicyRegistry about the removed worker
             self.policy_registry.on_worker_removed(&model_id);
 
-            // Get the policy for this model to update cache-aware if needed
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy
-                        .as_any()
-                        .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                    {
-                        cache_aware.remove_worker_by_url(url);
-                    }
-                }
-            }
+            // Remove from cache-aware policy if applicable
+            self.policy_registry
+                .remove_worker_from_cache_aware(&model_id, url);
         }
 
         if removed.is_some() {
@@ -372,12 +364,36 @@ impl PDRouter {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn new(
-        prefill_urls: Vec<(String, Option<u16>)>,
-        decode_urls: Vec<String>,
-        ctx: &Arc<crate::server::AppContext>,
-    ) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<crate::server::AppContext>) -> Result<Self, String> {
+        let prefill_workers = ctx.worker_registry.get_workers_filtered(
+            None, // any model
+            Some(WorkerType::Prefill {
+                bootstrap_port: None,
+            }),
+            Some(ConnectionMode::Http),
+            false, // include all workers
+        );
+
+        let decode_workers = ctx.worker_registry.get_workers_filtered(
+            None, // any model
+            Some(WorkerType::Decode),
+            Some(ConnectionMode::Http),
+            false, // include all workers
+        );
+
+        // Get all worker URLs for monitoring
+        let all_urls: Vec<String> = prefill_workers
+            .iter()
+            .chain(decode_workers.iter())
+            .map(|w| w.url().to_string())
+            .collect();
+        // Get all worker API keys for monitoring
+        let all_api_keys: Vec<Option<String>> = prefill_workers
+            .iter()
+            .chain(decode_workers.iter())
+            .map(|w| w.api_key().clone())
+            .collect();
+
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
         let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
         let core_cb_config = CircuitBreakerConfig {
@@ -386,59 +402,6 @@ impl PDRouter {
             timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
-
-        // Register prefill workers in the registry
-        for (url, port) in prefill_urls {
-            let worker = BasicWorker::new(
-                url,
-                WorkerType::Prefill {
-                    bootstrap_port: port,
-                },
-            )
-            .with_circuit_breaker_config(core_cb_config.clone())
-            .with_health_config(HealthConfig {
-                timeout_secs: ctx.router_config.health_check.timeout_secs,
-                check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                endpoint: ctx.router_config.health_check.endpoint.clone(),
-                failure_threshold: ctx.router_config.health_check.failure_threshold,
-                success_threshold: ctx.router_config.health_check.success_threshold,
-            });
-            ctx.worker_registry.register(Arc::new(worker));
-        }
-
-        // Register decode workers in the registry
-        for url in decode_urls {
-            let worker = BasicWorker::new(url, WorkerType::Decode)
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: ctx.router_config.health_check.timeout_secs,
-                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                    endpoint: ctx.router_config.health_check.endpoint.clone(),
-                    failure_threshold: ctx.router_config.health_check.failure_threshold,
-                    success_threshold: ctx.router_config.health_check.success_threshold,
-                });
-            ctx.worker_registry.register(Arc::new(worker));
-        }
-
-        // Get all workers from registry for health check
-        let all_workers = ctx.worker_registry.get_all();
-        let all_urls: Vec<String> = all_workers
-            .iter()
-            .map(|worker| worker.url().to_string())
-            .collect();
-        if !all_urls.is_empty() {
-            crate::routers::http::router::Router::wait_for_healthy_workers(
-                &all_urls,
-                ctx.router_config.worker_startup_timeout_secs,
-                ctx.router_config.worker_startup_check_interval_secs,
-            )
-            .await?;
-        }
-
-        // Initialize cache-aware policies with workers from registry
-        // Note: We need to get workers by type and convert to Box<dyn Worker> for CacheAwarePolicy
-        // This is a temporary workaround until CacheAwarePolicy is updated to work with Arc<dyn Worker>
-        // TODO: Update CacheAwarePolicy to accept Arc<dyn Worker> instead of Box<dyn Worker>
 
         // Set up background load monitoring for power-of-two selection
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
@@ -451,6 +414,7 @@ impl PDRouter {
         let load_monitor_handle =
             if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
                 let monitor_urls = all_urls.clone();
+                let monitor_api_keys = all_api_keys.clone();
                 let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
                 let monitor_client = ctx.client.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
@@ -459,6 +423,7 @@ impl PDRouter {
                 Some(Arc::new(tokio::spawn(async move {
                     Self::monitor_worker_loads_with_client(
                         monitor_urls,
+                        monitor_api_keys,
                         tx,
                         monitor_interval,
                         monitor_client,
@@ -471,11 +436,8 @@ impl PDRouter {
                 None
             };
 
-        // Note: Health checking is now handled centrally by RouterManager
-        // Individual routers no longer need to manage health checkers
-
         // Build a dedicated prefill client for fire-and-forget semantics
-        let prefill_client = reqwest::Client::builder()
+        let prefill_client = Client::builder()
             .pool_max_idle_per_host(0)
             .http1_only()
             .connect_timeout(Duration::from_millis(300))
@@ -489,6 +451,7 @@ impl PDRouter {
 
         // Spawn a coordinator with limited concurrent drain tasks
         // This prevents unbounded task spawning under extreme load
+        // TODO reevaluate a simpler approach (e.g. do we really need to deal with fire and forget)
         tokio::spawn(async move {
             info!("Prefill drain coordinator started");
 
@@ -513,7 +476,7 @@ impl PDRouter {
 
                             // Drain the response body efficiently
                             // Use streaming to avoid loading entire body into memory
-                            let start = std::time::Instant::now();
+                            let start = Instant::now();
                             let mut stream = response.bytes_stream();
                             let mut bytes_drained = 0;
 
@@ -566,6 +529,7 @@ impl PDRouter {
             prefill_drain_tx,
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            api_key: ctx.router_config.api_key.clone(),
         })
     }
 
@@ -1216,6 +1180,7 @@ impl PDRouter {
     // Background task to monitor worker loads with shared client
     async fn monitor_worker_loads_with_client(
         worker_urls: Vec<String>,
+        worker_api_keys: Vec<Option<String>>,
         tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
         interval_secs: u64,
         client: Client,
@@ -1227,11 +1192,13 @@ impl PDRouter {
 
             let futures: Vec<_> = worker_urls
                 .iter()
-                .map(|url| {
+                .zip(worker_api_keys.iter())
+                .map(|(url, api_key)| {
                     let client = client.clone();
                     let url = url.clone();
+                    let api_key = api_key.clone();
                     async move {
-                        let load = get_worker_load(&client, &url).await.unwrap_or(0);
+                        let load = get_worker_load(&client, &url, &api_key).await.unwrap_or(0);
                         (url, load)
                     }
                 })
@@ -1581,8 +1548,16 @@ impl PDRouter {
 
 // Helper functions
 
-async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
-    match client.get(format!("{}/get_load", worker_url)).send().await {
+async fn get_worker_load(
+    client: &Client,
+    worker_url: &str,
+    api_key: &Option<String>,
+) -> Option<isize> {
+    let mut req_builder = client.get(format!("{}/get_load", worker_url));
+    if let Some(key) = api_key {
+        req_builder = req_builder.bearer_auth(key);
+    }
+    match req_builder.send().await {
         Ok(res) if res.status().is_success() => match res.bytes().await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(data) => data
@@ -1616,7 +1591,11 @@ async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
 
 #[async_trait]
 impl WorkerManagement for PDRouter {
-    async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
+    async fn add_worker(
+        &self,
+        _worker_url: &str,
+        _api_key: &Option<String>,
+    ) -> Result<String, String> {
         // For PD router, we don't support adding workers via this generic method
         Err(
             "PD router requires specific add_prefill_server or add_decode_server methods"
@@ -2022,9 +2001,9 @@ impl RouterTrait for PDRouter {
         let mut errors = Vec::new();
 
         // Process prefill workers
-        let prefill_urls = self.get_prefill_worker_urls();
-        for worker_url in prefill_urls {
-            match get_worker_load(&self.client, &worker_url).await {
+        let prefill_urls_with_key = self.get_prefill_worker_urls_with_api_key();
+        for (worker_url, api_key) in prefill_urls_with_key {
+            match get_worker_load(&self.client, &worker_url, &api_key).await {
                 Some(load) => {
                     loads.insert(format!("prefill_{}", worker_url), load);
                 }
@@ -2035,9 +2014,9 @@ impl RouterTrait for PDRouter {
         }
 
         // Process decode workers
-        let decode_urls = self.get_decode_worker_urls();
-        for worker_url in decode_urls {
-            match get_worker_load(&self.client, &worker_url).await {
+        let decode_urls_with_key = self.get_decode_worker_urls_with_api_key();
+        for (worker_url, api_key) in decode_urls_with_key {
+            match get_worker_load(&self.client, &worker_url, &api_key).await {
                 Some(load) => {
                     loads.insert(format!("decode_{}", worker_url), load);
                 }
@@ -2116,7 +2095,7 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, WorkerType};
+    use crate::core::WorkerType;
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -2135,11 +2114,15 @@ mod tests {
             prefill_drain_tx: mpsc::channel(100).0,
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            api_key: Some("test_api_key".to_string()),
         }
     }
 
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {
-        let worker = BasicWorker::new(url, worker_type);
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .api_key("test_api_key")
+            .build();
         worker.set_healthy(healthy);
         Box::new(worker)
     }
@@ -2261,15 +2244,6 @@ mod tests {
         let prefill_workers = router.worker_registry.get_prefill_workers();
         assert_eq!(prefill_workers.len(), 1);
     }
-
-    // ============= Bootstrap Injection Tests =============
-    // Note: These tests are commented out as we've moved to the optimized bootstrap injection
-    // approach that doesn't use the Bootstrap trait on GenerateReqInput anymore.
-
-    // TODO: Add new tests for the optimized bootstrap injection approach using
-    // RequestWithBootstrap and BatchRequestWithBootstrap wrappers
-
-    // ============= Worker Selection Tests =============
 
     #[tokio::test]
     async fn test_select_healthy_prefill_worker() {
