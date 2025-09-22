@@ -127,6 +127,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             "disable_chunked_prefix_cache"
         ]
 
+        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
         Calculate padded block count that satisfies both TRT-LLM and Triton constraints.
@@ -228,6 +230,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 spec_info,
             )
 
+        if forward_mode.is_target_verify():
+            seq_lens = seq_lens + self.num_draft_tokens
+
         # Custom fast-path for decode/idle.
         # Capture with full width so future longer sequences are safe during replay
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
@@ -281,6 +286,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 spec_info,
                 seq_lens_cpu,
             )
+
+        if forward_mode.is_target_verify():
+            seq_lens = seq_lens + self.num_draft_tokens
+            del seq_lens_sum  # not handle "num_draft_tokens" but we do not need it
 
         metadata = self.decode_cuda_graph_metadata[bs]
 
@@ -345,6 +354,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq = forward_batch.seq_lens.max().item()
 
             seq_lens = forward_batch.seq_lens
+
+            if forward_batch.forward_mode.is_target_verify():
+                max_seq = max_seq + self.num_draft_tokens
+                seq_lens = seq_lens + self.num_draft_tokens
 
             max_seqlen_pad = self._calc_padded_blocks(max_seq)
             block_kv_indices = self._create_block_kv_indices(
@@ -614,6 +627,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens.to(torch.int32)
                 + forward_batch.spec_info.draft_token_num
             )
+            max_seq_len = metadata.max_seq_len + forward_batch.spec_info.draft_token_num
+
             raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
                 query=q,
                 kv_cache=kv_cache,
@@ -623,7 +638,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 block_tables=metadata.block_kv_indices,
                 seq_lens=seq_lens,
-                max_seq_len=metadata.max_seq_len,
+                max_seq_len=max_seq_len,
                 bmm1_scale=bmm1_scale,
             )
 
