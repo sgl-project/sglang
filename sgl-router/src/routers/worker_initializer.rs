@@ -3,9 +3,11 @@
 
 use crate::config::types::{ConnectionMode as ConfigConnectionMode, RouterConfig, RoutingMode};
 use crate::core::{
-    BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, HealthConfig, WorkerRegistry,
+    BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, HealthConfig, Worker, WorkerRegistry,
     WorkerType,
 };
+use crate::policies::PolicyRegistry;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -19,16 +21,22 @@ impl WorkerInitializer {
     pub async fn initialize_workers(
         config: &RouterConfig,
         worker_registry: &Arc<WorkerRegistry>,
+        policy_registry: Option<&Arc<PolicyRegistry>>,
     ) -> Result<(), String> {
         info!("Initializing workers for routing mode: {:?}", config.mode);
 
         match &config.mode {
             RoutingMode::Regular { worker_urls } => {
+                // use router's api_key, repeat for each worker
+                let worker_api_keys: Vec<Option<String>> =
+                    worker_urls.iter().map(|_| config.api_key.clone()).collect();
                 Self::create_regular_workers(
                     worker_urls,
+                    &worker_api_keys,
                     &config.connection_mode,
                     config,
                     worker_registry,
+                    policy_registry,
                 )
                 .await?;
             }
@@ -37,18 +45,29 @@ impl WorkerInitializer {
                 decode_urls,
                 ..
             } => {
+                // use router's api_key, repeat for each prefill/decode worker
+                let prefill_api_keys: Vec<Option<String>> = prefill_urls
+                    .iter()
+                    .map(|_| config.api_key.clone())
+                    .collect();
+                let decode_api_keys: Vec<Option<String>> =
+                    decode_urls.iter().map(|_| config.api_key.clone()).collect();
                 Self::create_prefill_workers(
                     prefill_urls,
+                    &prefill_api_keys,
                     &config.connection_mode,
                     config,
                     worker_registry,
+                    policy_registry,
                 )
                 .await?;
                 Self::create_decode_workers(
                     decode_urls,
+                    &decode_api_keys,
                     &config.connection_mode,
                     config,
                     worker_registry,
+                    policy_registry,
                 )
                 .await?;
             }
@@ -73,9 +92,11 @@ impl WorkerInitializer {
     /// Create regular workers for standard routing mode
     async fn create_regular_workers(
         urls: &[String],
+        api_keys: &[Option<String>],
         config_connection_mode: &ConfigConnectionMode,
         config: &RouterConfig,
         registry: &Arc<WorkerRegistry>,
+        policy_registry: Option<&Arc<PolicyRegistry>>,
     ) -> Result<(), String> {
         info!("Creating {} regular workers", urls.len());
 
@@ -100,17 +121,43 @@ impl WorkerInitializer {
             success_threshold: config.health_check.success_threshold,
         };
 
-        for url in urls {
+        let mut registered_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
+
+        for (url, api_key) in urls.iter().zip(api_keys.iter()) {
             // TODO: Add DP-aware support when we have dp_rank/dp_size info
-            let worker = BasicWorkerBuilder::new(url.clone())
+            let worker_builder = BasicWorkerBuilder::new(url.clone())
                 .worker_type(WorkerType::Regular)
                 .connection_mode(connection_mode.clone())
                 .circuit_breaker_config(core_cb_config.clone())
-                .health_config(health_config.clone())
-                .build();
+                .health_config(health_config.clone());
+            let worker = if let Some(api_key) = api_key.clone() {
+                worker_builder.api_key(api_key).build()
+            } else {
+                worker_builder.build()
+            };
 
-            let worker_id = registry.register(Arc::new(worker));
+            let worker_arc = Arc::new(worker) as Arc<dyn Worker>;
+            let model_id = worker_arc.model_id();
+            let worker_id = registry.register(Arc::clone(&worker_arc));
             info!("Registered regular worker {} with ID {:?}", url, worker_id);
+
+            // Track workers by model for cache-aware policy initialization
+            registered_workers
+                .entry(model_id.to_string())
+                .or_default()
+                .push(Arc::clone(&worker_arc));
+
+            // Notify policy registry about the worker
+            if let Some(policy_reg) = policy_registry {
+                policy_reg.on_worker_added(model_id, None);
+            }
+        }
+
+        // Initialize cache-aware policies with all workers for each model
+        if let Some(policy_reg) = policy_registry {
+            for (model_id, workers) in registered_workers {
+                policy_reg.init_cache_aware_policy(&model_id, &workers);
+            }
         }
 
         Ok(())
@@ -119,9 +166,11 @@ impl WorkerInitializer {
     /// Create prefill workers for disaggregated routing mode
     async fn create_prefill_workers(
         prefill_entries: &[(String, Option<u16>)],
+        api_keys: &[Option<String>],
         config_connection_mode: &ConfigConnectionMode,
         config: &RouterConfig,
         registry: &Arc<WorkerRegistry>,
+        policy_registry: Option<&Arc<PolicyRegistry>>,
     ) -> Result<(), String> {
         info!("Creating {} prefill workers", prefill_entries.len());
 
@@ -149,19 +198,50 @@ impl WorkerInitializer {
             success_threshold: config.health_check.success_threshold,
         };
 
-        for (url, bootstrap_port) in prefill_entries {
+        let mut registered_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
+
+        for ((url, bootstrap_port), api_key) in prefill_entries.iter().zip(api_keys.iter()) {
             // TODO: Add DP-aware support when we have dp_rank/dp_size info
-            let worker = BasicWorkerBuilder::new(url.clone())
+            let worker_builder = BasicWorkerBuilder::new(url.clone())
                 .worker_type(WorkerType::Prefill {
                     bootstrap_port: *bootstrap_port,
                 })
                 .connection_mode(connection_mode.clone())
                 .circuit_breaker_config(core_cb_config.clone())
-                .health_config(health_config.clone())
-                .build();
+                .health_config(health_config.clone());
+            let worker = if let Some(api_key) = api_key.clone() {
+                worker_builder.api_key(api_key).build()
+            } else {
+                worker_builder.build()
+            };
 
-            let worker_id = registry.register(Arc::new(worker));
+            let worker_arc = Arc::new(worker) as Arc<dyn Worker>;
+            let model_id = worker_arc.model_id();
+            let worker_id = registry.register(Arc::clone(&worker_arc));
             info!("Registered prefill worker {} with ID {:?}", url, worker_id);
+
+            // Track workers by model for cache-aware policy initialization
+            registered_workers
+                .entry(model_id.to_string())
+                .or_default()
+                .push(Arc::clone(&worker_arc));
+
+            // Notify policy registry about the worker
+            if let Some(policy_reg) = policy_registry {
+                policy_reg.on_worker_added(model_id, None);
+            }
+        }
+
+        // Initialize cache-aware policies for PD mode
+        if let Some(policy_reg) = policy_registry {
+            // Collect all prefill workers
+            let all_prefill_workers: Vec<Arc<dyn Worker>> = registered_workers
+                .values()
+                .flat_map(|workers| workers.iter().cloned())
+                .collect();
+
+            // Initialize PD policies (will handle both prefill and decode, but we only have prefill here)
+            policy_reg.init_pd_cache_aware_policies(&all_prefill_workers, &[]);
         }
 
         Ok(())
@@ -170,9 +250,11 @@ impl WorkerInitializer {
     /// Create decode workers for disaggregated routing mode
     async fn create_decode_workers(
         urls: &[String],
+        api_keys: &[Option<String>],
         config_connection_mode: &ConfigConnectionMode,
         config: &RouterConfig,
         registry: &Arc<WorkerRegistry>,
+        policy_registry: Option<&Arc<PolicyRegistry>>,
     ) -> Result<(), String> {
         info!("Creating {} decode workers", urls.len());
 
@@ -197,17 +279,48 @@ impl WorkerInitializer {
             success_threshold: config.health_check.success_threshold,
         };
 
-        for url in urls {
+        let mut registered_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
+
+        for (url, api_key) in urls.iter().zip(api_keys.iter()) {
             // TODO: Add DP-aware support when we have dp_rank/dp_size info
-            let worker = BasicWorkerBuilder::new(url.clone())
+            let worker_builder = BasicWorkerBuilder::new(url.clone())
                 .worker_type(WorkerType::Decode)
                 .connection_mode(connection_mode.clone())
                 .circuit_breaker_config(core_cb_config.clone())
-                .health_config(health_config.clone())
-                .build();
+                .health_config(health_config.clone());
+            let worker = if let Some(api_key) = api_key.clone() {
+                worker_builder.api_key(api_key).build()
+            } else {
+                worker_builder.build()
+            };
 
-            let worker_id = registry.register(Arc::new(worker));
+            let worker_arc = Arc::new(worker) as Arc<dyn Worker>;
+            let model_id = worker_arc.model_id();
+            let worker_id = registry.register(Arc::clone(&worker_arc));
             info!("Registered decode worker {} with ID {:?}", url, worker_id);
+
+            // Track workers by model for cache-aware policy initialization
+            registered_workers
+                .entry(model_id.to_string())
+                .or_default()
+                .push(Arc::clone(&worker_arc));
+
+            // Notify policy registry about the worker
+            if let Some(policy_reg) = policy_registry {
+                policy_reg.on_worker_added(model_id, None);
+            }
+        }
+
+        // Initialize cache-aware policies for PD mode
+        if let Some(policy_reg) = policy_registry {
+            // Collect all decode workers
+            let all_decode_workers: Vec<Arc<dyn Worker>> = registered_workers
+                .values()
+                .flat_map(|workers| workers.iter().cloned())
+                .collect();
+
+            // Initialize PD policies (will handle both prefill and decode, but we only have decode here)
+            policy_reg.init_pd_cache_aware_policies(&[], &all_decode_workers);
         }
 
         Ok(())
@@ -281,7 +394,8 @@ impl WorkerInitializer {
         worker_type: WorkerType,
         config: &RouterConfig,
         registry: &Arc<WorkerRegistry>,
-        grpc_clients: &mut std::collections::HashMap<String, crate::grpc::SglangSchedulerClient>,
+        policy_registry: Option<&Arc<PolicyRegistry>>,
+        grpc_clients: &mut HashMap<String, crate::grpc::SglangSchedulerClient>,
     ) -> Result<(), String> {
         info!(
             "Creating {} gRPC workers of type {:?}",
@@ -307,6 +421,8 @@ impl WorkerInitializer {
             success_threshold: config.health_check.success_threshold,
         };
 
+        let mut registered_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
+
         for url in worker_urls {
             if let Some(client) = grpc_clients.remove(url) {
                 let worker = BasicWorkerBuilder::new(url.clone())
@@ -317,10 +433,30 @@ impl WorkerInitializer {
                     .grpc_client(client)
                     .build();
 
-                let worker_id = registry.register(Arc::new(worker));
+                let worker_arc = Arc::new(worker) as Arc<dyn Worker>;
+                let model_id = worker_arc.model_id();
+                let worker_id = registry.register(Arc::clone(&worker_arc));
                 info!("Registered gRPC worker {} with ID {:?}", url, worker_id);
+
+                // Track workers by model for cache-aware policy initialization
+                registered_workers
+                    .entry(model_id.to_string())
+                    .or_default()
+                    .push(Arc::clone(&worker_arc));
+
+                // Notify policy registry about the worker
+                if let Some(policy_reg) = policy_registry {
+                    policy_reg.on_worker_added(model_id, None);
+                }
             } else {
                 warn!("No gRPC client available for worker {}, skipping", url);
+            }
+        }
+
+        // Initialize cache-aware policies with all workers for each model
+        if let Some(policy_reg) = policy_registry {
+            for (model_id, workers) in registered_workers {
+                policy_reg.init_cache_aware_policy(&model_id, &workers);
             }
         }
 
