@@ -42,6 +42,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.distributed import get_moe_expert_parallel_world_size, get_tensor_model_parallel_rank
+
 
 
 from sglang.srt.managers.mm_utils import (
@@ -245,13 +247,31 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         param = params_dict[name]
         # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
         weight_loader = param.weight_loader
-        for expert_id in range(num_experts):
-            curr_expert_weight = loaded_weight[expert_id]
-            weight_loader(param,
-                                    curr_expert_weight,
-                                    name,
-                                    shard_id,
-                                    expert_id,)
+        ep_rank = get_tensor_model_parallel_rank()
+        ep_size = get_moe_expert_parallel_world_size()
+
+        if ep_size == 1:
+            for expert_id in range(num_experts):
+                curr_expert_weight = loaded_weight[expert_id]
+                weight_loader(
+                    param,
+                    curr_expert_weight,
+                    name,
+                    shard_id,
+                    expert_id,)
+        else:
+            experts_per_ep = num_experts // ep_size
+            start_expert = ep_rank * experts_per_ep
+            end_expert = (ep_rank + 1) * experts_per_ep if ep_rank != ep_size - 1 else num_experts
+
+            for idx, expert_id in enumerate(range(start_expert, end_expert)):
+                curr_expert_weight = loaded_weight[expert_id]
+                weight_loader(
+                    param,
+                    curr_expert_weight,
+                    name,
+                    shard_id,
+                    idx,)
         return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
