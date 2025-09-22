@@ -487,13 +487,6 @@ class Req:
                 "__req__": self
             }
         self.sampling_params = sampling_params
-        # Used for deterministic sampling
-        if (
-            global_server_args_dict["enable_deterministic_inference"]
-            and sampling_params.sampling_seed is None
-        ):
-            # If deterministic inference is enabled and sampling_seed is not set, use the default seed
-            self.sampling_params.sampling_seed = DEFAULT_SAMPLING_SEED
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
         self.lora_id = lora_id

@@ -65,6 +65,7 @@ class Sampler(nn.Module):
         return_logprob: bool,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
+        positions: torch.Tensor,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -77,6 +78,8 @@ class Sampler(nn.Module):
             batch_next_token_ids: next token IDs. If set, skip sampling and only
                 compute output logprobs It is used for speculative decoding which
                 performs sampling in draft workers.
+            positions: The positions of the tokens in the sequence. Used for deterministic sampling
+                to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
 
@@ -125,6 +128,7 @@ class Sampler(nn.Module):
                         sampling_info.min_ps,
                         sampling_info.need_min_p_sampling,
                         sampling_info.sampling_seed,
+                        positions,
                     )
                 else:
                     raise ValueError(
@@ -233,6 +237,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     min_ps: torch.Tensor,
     need_min_p_sampling: bool,
     sampling_seed: Optional[torch.Tensor],
+    positions: torch.Tensor,
 ):
     """
     A top-k, top-p and min-p sampling implementation with native pytorch operations.
@@ -251,7 +256,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
     if sampling_seed is not None:
-        sampled_index = multinomial_with_seed(probs_sort, sampling_seed)
+        sampled_index = multinomial_with_seed(probs_sort, sampling_seed, positions)
     else:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
     # int32 range is enough to represent the token ids
@@ -260,7 +265,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     return batch_next_token_ids
 
 
-def multinomial_with_seed(inputs: torch.Tensor, seed: torch.Tensor) -> torch.Tensor:
+def multinomial_with_seed(
+    inputs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
     """
     Samples n elements from an input tensor `inputs` of shape (n, m) using
     a unique random seed for each row. This is a deterministic batched alternative to
@@ -272,17 +279,18 @@ def multinomial_with_seed(inputs: torch.Tensor, seed: torch.Tensor) -> torch.Ten
                 as weights and do not need to sum to 1.
         seed:   An integer tensor of shape (n,) containing the random seed
                 for each corresponding row in `inputs`.
+        positions: The positions of the tokens in the sequence. Used for deterministic sampling
+                to get the unique seed for each position.
 
     Returns:
         A tensor of shape (n,) where the i-th element is an index sampled
         from the distribution in `inputs[i]` using `seed[i]`.
     """
-    device = inputs.device
-    seed = seed.to(device)
     n, m = inputs.shape
-    col_indices = torch.arange(m, device=device).unsqueeze(0)
-    seed_expanded = seed.unsqueeze(-1)
-    hashed = seed_expanded * 73856093 ^ col_indices * 19349663
+    col_indices = torch.arange(m, device=inputs.device).unsqueeze(0)
+    step_seed = seed * 19349663 ^ positions * 73856093
+    seed_expanded = step_seed.unsqueeze(-1)
+    hashed = seed_expanded * 8589934591 ^ col_indices * 479001599
     uniform_samples = (hashed % (2**24)).float() / (2**24)
     epsilon = 1e-9
     gumbel_noise = -torch.log(-torch.log(uniform_samples + epsilon) + epsilon)
