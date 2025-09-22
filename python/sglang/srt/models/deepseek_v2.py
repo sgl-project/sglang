@@ -1277,6 +1277,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     positions, hidden_states, forward_batch, zero_allocator
                 )
             else:
+                # TODO(iforgetmyname): to be separated as a standalone func
                 if not self.mla_preprocess:
                     self.mla_preprocess = NPUFusedMLAPreprocess(
                         self.fused_qkv_a_proj_with_mqa,
