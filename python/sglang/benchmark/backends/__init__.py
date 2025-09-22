@@ -1,12 +1,12 @@
 from argparse import Namespace
 from typing import Tuple, Type
 
-from python.sglang.benchmark.backends.oai_chat_client import OAIChatClient
-from python.sglang.benchmark.backends.oai_client import OAIClient
-from python.sglang.benchmark.backends.trt import TrtClient
-from python.sglang.benchmark.backends.truss import TrussClient
 from sglang.benchmark.backends.base_client import BaseBackendClient
+from sglang.benchmark.backends.oai_chat_client import OAIChatClient
+from sglang.benchmark.backends.oai_client import OAIClient
 from sglang.benchmark.backends.sglang_client import SglangClient
+from sglang.benchmark.backends.trt import TrtClient
+from sglang.benchmark.backends.truss import TrussClient
 
 BACKEND_MAPPING = {
     "sglang": SglangClient,
