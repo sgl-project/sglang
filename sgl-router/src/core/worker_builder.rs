@@ -1,5 +1,7 @@
-use super::circuit_breaker::CircuitBreakerConfig;
-use super::worker::{BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerType};
+use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use super::worker::{
+    BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+};
 use crate::grpc::client::SglangSchedulerClient;
 use std::collections::HashMap;
 
@@ -9,6 +11,7 @@ pub struct BasicWorkerBuilder {
     url: String,
 
     // Optional fields with defaults
+    api_key: Option<String>,
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
     labels: HashMap<String, String>,
@@ -22,6 +25,7 @@ impl BasicWorkerBuilder {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            api_key: None,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
             labels: HashMap::new(),
@@ -35,6 +39,7 @@ impl BasicWorkerBuilder {
     pub fn new_with_type(url: impl Into<String>, worker_type: WorkerType) -> Self {
         Self {
             url: url.into(),
+            api_key: None,
             worker_type,
             connection_mode: ConnectionMode::Http,
             labels: HashMap::new(),
@@ -42,6 +47,12 @@ impl BasicWorkerBuilder {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
         }
+    }
+
+    /// Set the API key
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
     }
 
     /// Set the worker type (Regular, Prefill, or Decode)
@@ -88,23 +99,31 @@ impl BasicWorkerBuilder {
 
     /// Build the BasicWorker instance
     pub fn build(self) -> BasicWorker {
-        // Use the existing constructor methods for now
-        let mut worker =
-            BasicWorker::with_connection_mode(self.url, self.worker_type, self.connection_mode);
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize},
+            Arc,
+        };
+        use tokio::sync::Mutex;
 
-        // Apply optional configurations using existing methods
-        if !self.labels.is_empty() {
-            worker = worker.with_labels(self.labels);
+        let metadata = WorkerMetadata {
+            url: self.url.clone(),
+            api_key: self.api_key,
+            worker_type: self.worker_type,
+            connection_mode: self.connection_mode,
+            labels: self.labels,
+            health_config: self.health_config,
+        };
+
+        BasicWorker {
+            metadata,
+            load_counter: Arc::new(AtomicUsize::new(0)),
+            processed_counter: Arc::new(AtomicUsize::new(0)),
+            healthy: Arc::new(AtomicBool::new(true)),
+            consecutive_failures: Arc::new(AtomicUsize::new(0)),
+            consecutive_successes: Arc::new(AtomicUsize::new(0)),
+            circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
+            grpc_client: self.grpc_client.map(|client| Arc::new(Mutex::new(client))),
         }
-
-        worker = worker.with_health_config(self.health_config);
-        worker = worker.with_circuit_breaker_config(self.circuit_breaker_config);
-
-        if let Some(client) = self.grpc_client {
-            worker = worker.with_grpc_client(client);
-        }
-
-        worker
     }
 }
 
@@ -112,6 +131,7 @@ impl BasicWorkerBuilder {
 pub struct DPAwareWorkerBuilder {
     // Required fields
     base_url: String,
+    api_key: Option<String>,
     dp_rank: usize,
     dp_size: usize,
 
@@ -129,6 +149,7 @@ impl DPAwareWorkerBuilder {
     pub fn new(base_url: impl Into<String>, dp_rank: usize, dp_size: usize) -> Self {
         Self {
             base_url: base_url.into(),
+            api_key: None,
             dp_rank,
             dp_size,
             worker_type: WorkerType::Regular,
@@ -149,6 +170,7 @@ impl DPAwareWorkerBuilder {
     ) -> Self {
         Self {
             base_url: base_url.into(),
+            api_key: None,
             dp_rank,
             dp_size,
             worker_type,
@@ -158,6 +180,12 @@ impl DPAwareWorkerBuilder {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
         }
+    }
+
+    /// Set the API key
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
     }
 
     /// Set the worker type (Regular, Prefill, or Decode)
@@ -218,6 +246,10 @@ impl DPAwareWorkerBuilder {
         // Add gRPC client if provided
         if let Some(client) = self.grpc_client {
             builder = builder.grpc_client(client);
+        }
+        // Add API key if provided
+        if let Some(api_key) = self.api_key {
+            builder = builder.api_key(api_key);
         }
 
         let base_worker = builder.build();
@@ -373,6 +405,7 @@ mod tests {
             .connection_mode(ConnectionMode::Http)
             .labels(labels.clone())
             .health_config(health_config.clone())
+            .api_key("test_api_key")
             .build();
 
         assert_eq!(worker.url(), "http://localhost:8080@3");

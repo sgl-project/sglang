@@ -111,7 +111,7 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 else:
-    from vllm._custom_ops import awq_dequantize
+    pass
 
 
 logger = logging.getLogger(__name__)

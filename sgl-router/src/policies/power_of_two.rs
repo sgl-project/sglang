@@ -119,14 +119,20 @@ impl Default for PowerOfTwoPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, WorkerType};
+    use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[test]
     fn test_power_of_two_selection() {
         let policy = PowerOfTwoPolicy::new();
-        let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
-        let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
-        let worker3 = BasicWorker::new("http://w3:8000".to_string(), WorkerType::Regular);
+        let worker1 = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let worker2 = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let worker3 = BasicWorkerBuilder::new("http://w3:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
 
         // Set different loads
         for _ in 0..10 {
@@ -157,14 +163,16 @@ mod tests {
     fn test_power_of_two_with_cached_loads() {
         let policy = PowerOfTwoPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(BasicWorker::new(
-                "http://w1:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Arc::new(BasicWorker::new(
-                "http://w2:8000".to_string(),
-                WorkerType::Regular,
-            )),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
         ];
 
         // Update cached loads
@@ -190,10 +198,11 @@ mod tests {
     #[test]
     fn test_power_of_two_single_worker() {
         let policy = PowerOfTwoPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
-            "http://w1:8000".to_string(),
-            WorkerType::Regular,
-        ))];
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        )];
 
         // With single worker, should always select it
         assert_eq!(policy.select_worker(&workers, None), Some(0));

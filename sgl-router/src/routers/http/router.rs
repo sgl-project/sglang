@@ -1,7 +1,7 @@
 use crate::config::types::RetryConfig;
 use crate::core::{
-    is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthConfig, RetryExecutor, Worker,
-    WorkerRegistry, WorkerType,
+    is_retryable_status, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RetryExecutor,
+    Worker, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
@@ -38,6 +38,7 @@ pub struct Router {
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval_secs: u64,
     dp_aware: bool,
+    #[allow(dead_code)]
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
@@ -47,31 +48,19 @@ pub struct Router {
 
 impl Router {
     /// Create a new router with injected policy and client
-    #[allow(clippy::too_many_arguments)]
-    pub async fn new(
-        worker_urls: Vec<String>,
-        ctx: &Arc<crate::server::AppContext>,
-    ) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<crate::server::AppContext>) -> Result<Self, String> {
+        let workers = ctx.worker_registry.get_workers_filtered(
+            None, // any model
+            Some(WorkerType::Regular),
+            Some(ConnectionMode::Http),
+            false, // include all workers
+        );
+
         // Update active workers gauge
-        RouterMetrics::set_active_workers(worker_urls.len());
+        RouterMetrics::set_active_workers(workers.len());
 
-        // Wait for workers to be healthy (skip if empty - for service discovery mode)
-        if !worker_urls.is_empty() {
-            Self::wait_for_healthy_workers(
-                &worker_urls,
-                ctx.router_config.worker_startup_timeout_secs,
-                ctx.router_config.worker_startup_check_interval_secs,
-            )
-            .await?;
-        }
-
-        let worker_urls = if ctx.router_config.dp_aware {
-            // worker address now in the format of "http://host:port@dp_rank"
-            Self::get_dp_aware_workers(&worker_urls, &ctx.router_config.api_key)
-                .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?
-        } else {
-            worker_urls
-        };
+        // Get worker URLs for monitoring
+        let worker_urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
 
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
         let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
@@ -82,49 +71,25 @@ impl Router {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        // Register workers in the registry
-        // In IGW mode, we need to fetch model info from workers
-        for url in &worker_urls {
-            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-            // For now, create worker without model_id
-            let worker = BasicWorker::new(url.clone(), WorkerType::Regular)
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: ctx.router_config.health_check.timeout_secs,
-                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                    endpoint: ctx.router_config.health_check.endpoint.clone(),
-                    failure_threshold: ctx.router_config.health_check.failure_threshold,
-                    success_threshold: ctx.router_config.health_check.success_threshold,
-                });
-
-            let worker_arc = Arc::new(worker);
-            ctx.worker_registry.register(worker_arc.clone());
-
-            // Notify PolicyRegistry about the new worker
-            let model_id = worker_arc.model_id();
-            let policy = ctx.policy_registry.on_worker_added(model_id, None);
-
-            // If this is a cache-aware policy and it's the first worker for this model,
-            // initialize it with the worker
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy
-                    .as_any()
-                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                {
-                    let worker_dyn: Arc<dyn Worker> = worker_arc.clone();
-                    cache_aware.init_workers(std::slice::from_ref(&worker_dyn));
-                }
-            }
-        }
-
+        // Cache-aware policies are initialized in WorkerInitializer
         // Setup load monitoring for PowerOfTwo policy
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
         let worker_loads = Arc::new(rx);
 
-        // Check if default policy is power_of_two for load monitoring
+        // Get default policy to check if we need load monitoring
         let default_policy = ctx.policy_registry.get_default_policy();
+
+        // Check if default policy is power_of_two for load monitoring
         let load_monitor_handle = if default_policy.name() == "power_of_two" {
             let monitor_urls = worker_urls.clone();
+            let monitor_api_keys = monitor_urls
+                .iter()
+                .map(|url| {
+                    ctx.worker_registry
+                        .get_by_url(url)
+                        .and_then(|w| w.api_key().clone())
+                })
+                .collect::<Vec<Option<String>>>();
             let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
             let policy_clone = default_policy.clone();
             let client_clone = ctx.client.clone();
@@ -132,6 +97,7 @@ impl Router {
             Some(Arc::new(tokio::spawn(async move {
                 Self::monitor_worker_loads(
                     monitor_urls,
+                    monitor_api_keys,
                     tx,
                     monitor_interval,
                     policy_clone,
@@ -955,7 +921,11 @@ impl Router {
         }
     }
 
-    pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+    pub async fn add_worker(
+        &self,
+        worker_url: &str,
+        api_key: &Option<String>,
+    ) -> Result<String, String> {
         let start_time = std::time::Instant::now();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.worker_startup_timeout_secs))
@@ -981,7 +951,7 @@ impl Router {
                             // Need to contact the worker to extract the dp_size,
                             // and add them as multiple workers
                             let url_vec = vec![String::from(worker_url)];
-                            let dp_url_vec = Self::get_dp_aware_workers(&url_vec, &self.api_key)
+                            let dp_url_vec = Self::get_dp_aware_workers(&url_vec, api_key)
                                 .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
                             let mut worker_added: bool = false;
                             for dp_url in &dp_url_vec {
@@ -991,30 +961,31 @@ impl Router {
                                 }
                                 info!("Added worker: {}", dp_url);
                                 // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-                                let new_worker =
-                                    BasicWorker::new(dp_url.to_string(), WorkerType::Regular)
-                                        .with_circuit_breaker_config(
+                                let new_worker_builder =
+                                    BasicWorkerBuilder::new(dp_url.to_string())
+                                        .worker_type(WorkerType::Regular)
+                                        .circuit_breaker_config(
                                             self.circuit_breaker_config.clone(),
                                         );
+
+                                let new_worker = if let Some(api_key) = api_key {
+                                    new_worker_builder.api_key(api_key).build()
+                                } else {
+                                    new_worker_builder.build()
+                                };
 
                                 let worker_arc = Arc::new(new_worker);
                                 self.worker_registry.register(worker_arc.clone());
 
                                 // Notify PolicyRegistry about the new worker
                                 let model_id = worker_arc.model_id();
-                                let policy = self.policy_registry.on_worker_added(model_id, None);
+                                self.policy_registry.on_worker_added(model_id, None);
 
-                                // If this is a cache-aware policy, update it with all workers for this model
-                                if policy.name() == "cache_aware" {
-                                    if let Some(cache_aware) = policy
-                                        .as_any()
-                                        .downcast_ref::<crate::policies::CacheAwarePolicy>(
-                                    ) {
-                                        let model_workers =
-                                            self.worker_registry.get_by_model_fast(model_id);
-                                        cache_aware.init_workers(&model_workers);
-                                    }
-                                }
+                                // Initialize cache-aware policy if applicable
+                                let model_workers =
+                                    self.worker_registry.get_by_model_fast(model_id);
+                                self.policy_registry
+                                    .init_cache_aware_policy(model_id, &model_workers);
 
                                 worker_added = true;
                             }
@@ -1028,31 +999,28 @@ impl Router {
                             info!("Added worker: {}", worker_url);
 
                             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-                            let new_worker =
-                                BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
-                                    .with_circuit_breaker_config(
-                                        self.circuit_breaker_config.clone(),
-                                    );
+                            let new_worker_builder =
+                                BasicWorkerBuilder::new(worker_url.to_string())
+                                    .worker_type(WorkerType::Regular)
+                                    .circuit_breaker_config(self.circuit_breaker_config.clone());
+
+                            let new_worker = if let Some(api_key) = api_key {
+                                new_worker_builder.api_key(api_key).build()
+                            } else {
+                                new_worker_builder.build()
+                            };
 
                             let worker_arc = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
 
                             // Notify PolicyRegistry about the new worker
                             let model_id = worker_arc.model_id();
-                            let policy = self.policy_registry.on_worker_added(model_id, None);
+                            self.policy_registry.on_worker_added(model_id, None);
 
-                            // If this is a cache-aware policy, add this worker to it
-                            if policy.name() == "cache_aware" {
-                                if let Some(cache_aware) = policy
-                                    .as_any()
-                                    .downcast_ref::<crate::policies::CacheAwarePolicy>(
-                                ) {
-                                    // Get all workers for this model
-                                    let model_workers =
-                                        self.worker_registry.get_by_model_fast(model_id);
-                                    cache_aware.init_workers(&model_workers);
-                                }
-                            }
+                            // Initialize cache-aware policy if applicable
+                            let model_workers = self.worker_registry.get_by_model_fast(model_id);
+                            self.policy_registry
+                                .init_cache_aware_policy(model_id, &model_workers);
                         }
 
                         RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
@@ -1123,20 +1091,11 @@ impl Router {
 
             RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
 
-            // If any models are using cache aware policy, remove the workers from the tree
-            // Check each removed worker's model and get its policy
             for dp_url in removed_workers.iter() {
                 if let Some(worker) = self.worker_registry.get_by_url(dp_url) {
                     let model_id = worker.model_id();
-                    if let Some(policy) = self.policy_registry.get_policy(model_id) {
-                        if let Some(cache_aware) = policy
-                            .as_any()
-                            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                        {
-                            cache_aware.remove_worker_by_url(dp_url);
-                            info!("Removed worker from cache-aware tree: {}", dp_url);
-                        }
-                    }
+                    self.policy_registry
+                        .remove_worker_from_cache_aware(model_id, dp_url);
                 }
             }
         } else {
@@ -1157,20 +1116,12 @@ impl Router {
                 RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
             }
 
-            // If the model is using cache aware policy, remove the worker from the tree
-            if let Some(policy) = self.policy_registry.get_policy(&model_id) {
-                if let Some(cache_aware) = policy
-                    .as_any()
-                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    info!("Removed worker from cache-aware tree: {}", worker_url);
-                }
-            }
+            self.policy_registry
+                .remove_worker_from_cache_aware(&model_id, worker_url);
         }
     }
 
-    async fn get_worker_load(&self, worker_url: &str) -> Option<isize> {
+    async fn get_worker_load(&self, worker_url: &str, api_key: &Option<String>) -> Option<isize> {
         let worker_url = if self.dp_aware {
             // Need to extract the URL from "http://host:port@dp_rank"
             let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
@@ -1185,12 +1136,12 @@ impl Router {
             worker_url
         };
 
-        match self
-            .client
-            .get(format!("{}/get_load", worker_url))
-            .send()
-            .await
-        {
+        let mut req_builder = self.client.get(format!("{}/get_load", worker_url));
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+
+        match req_builder.send().await {
             Ok(res) if res.status().is_success() => match res.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(data) => data
@@ -1225,6 +1176,7 @@ impl Router {
     // Background task to monitor worker loads
     async fn monitor_worker_loads(
         worker_urls: Vec<String>,
+        worker_api_keys: Vec<Option<String>>,
         tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
         interval_secs: u64,
         policy: Arc<dyn LoadBalancingPolicy>,
@@ -1236,8 +1188,8 @@ impl Router {
             interval.tick().await;
 
             let mut loads = HashMap::new();
-            for url in &worker_urls {
-                if let Some(load) = Self::get_worker_load_static(&client, url).await {
+            for (url, api_key) in worker_urls.iter().zip(worker_api_keys.iter()) {
+                if let Some(load) = Self::get_worker_load_static(&client, url, api_key).await {
                     loads.insert(url.clone(), load);
                 }
             }
@@ -1255,7 +1207,11 @@ impl Router {
     }
 
     // Static version of get_worker_load for use in monitoring task
-    async fn get_worker_load_static(client: &reqwest::Client, worker_url: &str) -> Option<isize> {
+    async fn get_worker_load_static(
+        client: &reqwest::Client,
+        worker_url: &str,
+        api_key: &Option<String>,
+    ) -> Option<isize> {
         let worker_url = if worker_url.contains("@") {
             // Need to extract the URL from "http://host:port@dp_rank"
             let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
@@ -1270,7 +1226,11 @@ impl Router {
             worker_url
         };
 
-        match client.get(format!("{}/get_load", worker_url)).send().await {
+        let mut req_builder = client.get(format!("{}/get_load", worker_url));
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+        match req_builder.send().await {
             Ok(res) if res.status().is_success() => match res.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(data) => data
@@ -1326,8 +1286,12 @@ use async_trait::async_trait;
 
 #[async_trait]
 impl WorkerManagement for Router {
-    async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
-        Router::add_worker(self, worker_url).await
+    async fn add_worker(
+        &self,
+        worker_url: &str,
+        api_key: &Option<String>,
+    ) -> Result<String, String> {
+        Router::add_worker(self, worker_url, api_key).await
     }
 
     fn remove_worker(&self, worker_url: &str) {
@@ -1533,12 +1497,12 @@ impl RouterTrait for Router {
     }
 
     async fn get_worker_loads(&self) -> Response {
-        let urls = self.get_worker_urls();
+        let urls_with_key = self.worker_registry.get_all_urls_with_api_key();
         let mut loads = Vec::new();
 
         // Get loads from all workers
-        for url in &urls {
-            let load = self.get_worker_load(url).await.unwrap_or(-1);
+        for (url, api_key) in &urls_with_key {
+            let load = self.get_worker_load(url, api_key).await.unwrap_or(-1);
             loads.push(serde_json::json!({
                 "worker": url,
                 "load": load
@@ -1595,8 +1559,14 @@ mod tests {
         ));
 
         // Register test workers
-        let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
-        let worker2 = BasicWorker::new("http://worker2:8080".to_string(), WorkerType::Regular);
+        let worker1 = BasicWorkerBuilder::new("http://worker1:8080")
+            .worker_type(WorkerType::Regular)
+            .api_key("test_api_key")
+            .build();
+        let worker2 = BasicWorkerBuilder::new("http://worker2:8080")
+            .worker_type(WorkerType::Regular)
+            .api_key("test_api_key")
+            .build();
         worker_registry.register(Arc::new(worker1));
         worker_registry.register(Arc::new(worker2));
 

@@ -65,7 +65,7 @@ tracing = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.10",
+    "sgl-kernel==0.3.11",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
@@ -75,7 +75,7 @@ srt = [
 
 blackwell = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.10",
+    "sgl-kernel==0.3.11",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
