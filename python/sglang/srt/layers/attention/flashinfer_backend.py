@@ -137,10 +137,10 @@ class FlashInferAttnBackend(AttentionBackend):
         if self.enable_deterministic:
             self.decode_use_tensor_cores = True
             self.prefill_split_tile_size = get_int_env_var(
-                "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096
+                "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 1024
             )
             self.decode_split_tile_size = get_int_env_var(
-                "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
+                "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 1024
             )
             self.disable_cuda_graph_kv_split = True
             global_config.flashinfer_workspace_size = 2048 * 1024 * 1024
