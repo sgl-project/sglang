@@ -75,7 +75,8 @@ class ShareGPTLoader(BaseDatasetLoader):
                     add_generation_prompt=True,
                     tokenize=False,
                 )
-                prompt = templated_prompt.replace(self.tokenizer.bos_token, "")
+                if self.tokenizer.bos_token:
+                    prompt = templated_prompt.replace(self.tokenizer.bos_token, "")
 
             prompt_token_ids = self.tokenizer.encode(prompt)
             completion = dataset[i][1]
