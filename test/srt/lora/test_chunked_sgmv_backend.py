@@ -10,9 +10,16 @@ from sglang.srt.lora.triton_ops import (
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
 )
+from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
+from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
 from sglang.srt.lora.utils import LoRABatchInfo
 
 CHUNK_SIZE = 16
+
+
+def reset_kernel_cache():
+    _chunked_lora_shrink_kernel._clear_cache()
+    _chunked_lora_expand_kernel._clear_cache()
 
 
 def safe_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -436,6 +443,10 @@ class TestChunkedSGMV(unittest.TestCase):
         List[str],
     ]:
         """Create test batch with specified composition and mode"""
+
+        # Reset kernel cache to avoid cross-test contamination
+        reset_kernel_cache()
+
         seq_lengths = self.generate_sequence_lengths(
             batch_size, batch_mode, 1, self.max_seq_len
         )
