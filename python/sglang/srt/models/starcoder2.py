@@ -229,12 +229,12 @@ class Starcoder2Model(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
         # FIXME: Check get_pp_group
-        # pp_group = get_pp_group()
-        # pp_size = pp_group.world_size
-        # pp_rank = pp_group.rank
-        # self.start_layer = pp_rank * config.num_hidden_layers // pp_size
-        # self.end_layer = (pp_rank + 1) * config.num_hidden_layers // pp_size
-        self.start_layer, self.end_layer, self.layers = make_layers(
+        pp_group = get_pp_group()
+        pp_size = pp_group.world_size
+        pp_rank = pp_group.rank
+        self.start_layer = pp_rank * config.num_hidden_layers // pp_size
+        self.end_layer = (pp_rank + 1) * config.num_hidden_layers // pp_size
+        self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Starcoder2DecoderLayer(
                 config,
