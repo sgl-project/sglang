@@ -14,12 +14,12 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
-from sglang.srt.layers.quantization.utils import convert_to_channelwise
-
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.utils import convert_to_channelwise
+
 # try:
 #     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
 #         apply_fp8_marlin_linear,

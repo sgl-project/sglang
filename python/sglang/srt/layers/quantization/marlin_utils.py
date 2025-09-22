@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy
 import torch

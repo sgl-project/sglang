@@ -10,12 +10,16 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
-from sglang.srt.layers.quantization.compressed_tensors.schemes import WNA16_SUPPORTED_BITS
+
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    WNA16_SUPPORTED_BITS,
+)
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     per_tensor_dequantize,
@@ -29,8 +33,6 @@ from sglang.srt.utils import (
     is_npu,
     set_weight_attrs,
 )
-
-from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -54,9 +56,7 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import (
-        fused_marlin_moe,
-    )
+    from sgl_kernel import fused_marlin_moe
 # try:
 #     import vllm
 

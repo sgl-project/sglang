@@ -1,18 +1,28 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable, Optional
 import logging
+from typing import Callable, Optional
 
 import torch
 from compressed_tensors.quantization import ActivationOrdering
 
+# yapf conflicts with isort for this block
+# yapf: disable
+from sglang.srt.layers.parameter import (
+    BasevLLMParameter,
+    ChannelQuantScaleParameter,
+    GroupQuantScaleParameter,
+    PackedColumnParameter,
+    PackedvLLMParameter,
+    RowvLLMParameter,
+    permute_param_layout_,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme)
-# from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
-#     MPLinearLayerConfig, choose_mp_linear_kernel)
-
+    CompressedTensorsScheme,
+)
 from sglang.srt.layers.quantization.marlin_utils import (
+    MarlinLinearLayerConfig,
     apply_gptq_marlin_linear,
     check_marlin_supported,
     check_marlin_supports_shape,
@@ -25,20 +35,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_sort_g_idx,
     marlin_zero_points,
     verify_marlin_supported,
-    MarlinLinearLayerConfig,
 )
-
-# yapf conflicts with isort for this block
-# yapf: disable
-from sglang.srt.layers.parameter import (BasevLLMParameter,
-                                           ChannelQuantScaleParameter,
-                                           GroupQuantScaleParameter,
-                                           PackedColumnParameter,
-                                           PackedvLLMParameter,
-                                           RowvLLMParameter,
-                                            permute_param_layout_,
-                                           )
-
 from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
@@ -46,6 +43,12 @@ from sglang.srt.layers.quantization.utils import (
     unpack_cols,
 )
 from sglang.srt.utils import is_cuda
+
+# from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
+#     MPLinearLayerConfig, choose_mp_linear_kernel)
+
+
+
 
 _is_cuda = is_cuda()
 
@@ -227,7 +230,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         self.w_s_name = "weight_scale"
         self.w_zp_name = "weight_zero_point"
         self.w_gidx_name = "weight_g_idx"
-        
+
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
 

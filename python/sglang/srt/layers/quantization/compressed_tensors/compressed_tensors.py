@@ -28,12 +28,12 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
     CompressedTensorsMoEMethod,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
     CompressedTensorsW8A8Fp8,
+    CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
-    WNA16_SUPPORTED_BITS,
-    CompressedTensorsW8A8Int8,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -43,10 +43,10 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 # try:
-    # from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
-    #     WNA16_SUPPORTED_BITS,
-    #     CompressedTensorsWNA16,
-    # )
+# from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+#     WNA16_SUPPORTED_BITS,
+#     CompressedTensorsWNA16,
+# )
 
 #     VLLM_AVAILABLE = True
 # except ImportError:
@@ -397,7 +397,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
                 )
 
-
         if is_activation_quantization_format(self.quant_format):
             if self._is_fp8_w8a8(weight_quant, input_quant):
                 is_fp8_w8a8_supported = self._check_scheme_supported(
@@ -503,9 +502,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             sparsity_scheme=sparsity_scheme,
         ):
             # if not VLLM_AVAILABLE:
-            raise ImportError(
-                "CompressedTensors24 is not supported now"
-            )
+            raise ImportError("CompressedTensors24 is not supported now")
             # Have a valid sparsity scheme
             # Validate layer is supported by Cutlass 2:4 Kernel
             model_compression_config = (
