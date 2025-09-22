@@ -873,6 +873,8 @@ def weight_loader_hook(loader):
     def loader_wrapper(param: torch.Tensor, loaded_weight: torch.Tensor):
         if hasattr(loaded_weight, "_hook_func") and callable(loaded_weight._hook_func):
             weight = loaded_weight._hook_func()
+        else:
+            weight = loaded_weight
         return loader(param, weight)
 
     return loader_wrapper
