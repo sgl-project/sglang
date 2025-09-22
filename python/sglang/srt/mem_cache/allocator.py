@@ -491,7 +491,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             self.free_pages,
             out_indices,
-            self.ret_values,
             next_power_of_2(bs),
             self.page_size,
             self.seen_max_num_extend_tokens_next_power_of_2,
