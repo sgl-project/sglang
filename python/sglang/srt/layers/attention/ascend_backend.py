@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import torch_npu
-from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.spec_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:

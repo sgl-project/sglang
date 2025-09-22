@@ -20,7 +20,7 @@ from sglang.srt.utils import is_flashinfer_available
 if is_flashinfer_available():
     import flashinfer
 
-from sglang.srt.speculative.eagle_utils import EagleDraftInput
+from sglang.srt.speculative.spec_info import EagleDraftInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

@@ -17,7 +17,7 @@ from sglang.srt.utils import get_bool_env_var, get_device_core_count
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.spec_info import EagleDraftInput, EagleVerifyInput
 
 logger = logging.getLogger(__name__)
 

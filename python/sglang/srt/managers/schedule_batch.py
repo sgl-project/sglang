@@ -73,9 +73,12 @@ from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import (
+        EagleDraftInput,
+        EagleVerifyInput,
+        SpeculativeAlgorithm,
+    )
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 

@@ -60,8 +60,11 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import (
+        EagleDraftInput,
+        EagleVerifyInput,
+        SpeculativeAlgorithm,
+    )
 
 _is_npu = is_npu()
 
@@ -364,7 +367,7 @@ class ForwardBatch:
 
         # For MLP sync
         if batch.global_num_tokens is not None:
-            from sglang.srt.speculative.eagle_utils import (
+            from sglang.srt.speculative.spec_info import (
                 EagleDraftInput,
                 EagleVerifyInput,
             )
@@ -669,8 +672,7 @@ class ForwardBatch:
             )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
-
-        from sglang.srt.speculative.eagle_utils import EagleDraftInput
+        from sglang.srt.speculative.spec_info import EagleDraftInput
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None

@@ -30,7 +30,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.spec_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,

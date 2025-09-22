@@ -11,9 +11,8 @@ import triton.language as tl
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.spec_info import EagleDraftInput, EagleVerifyInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
