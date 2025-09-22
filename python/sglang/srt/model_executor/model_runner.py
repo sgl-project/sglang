@@ -2060,7 +2060,7 @@ class ModelRunner:
             (
                 forward_batch.positions
                 if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens
+                else forward_batch.seq_lens - 1
             ),
         )
         return next_token_ids
