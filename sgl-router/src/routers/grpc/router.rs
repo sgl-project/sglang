@@ -7,10 +7,13 @@ use crate::core::{
 use crate::grpc::{proto, SglangSchedulerClient};
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{ChatCompletionRequest, ChatMessage, StringOrArray, UserMessageContent, ContentPart, ResponseFormat};
+use crate::protocols::spec::{
+    ChatCompletionRequest, ChatMessage, ContentPart, ResponseFormat, StringOrArray,
+    UserMessageContent,
+};
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
-use crate::tokenizer::{traits::Tokenizer, chat_template::ChatMessage as TokenizerChatMessage};
+use crate::tokenizer::{chat_template::ChatMessage as TokenizerChatMessage, traits::Tokenizer};
 use crate::tool_parser::ParserRegistry;
 use async_trait::async_trait;
 use axum::{
@@ -181,8 +184,10 @@ impl GrpcRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        debug!("Processing chat completion request for model: {:?}", model_id);
-
+        debug!(
+            "Processing chat completion request for model: {:?}",
+            model_id
+        );
 
         // Step 1: Process messages and apply chat template
         let processed_messages = match self.process_chat_messages(body) {
@@ -236,7 +241,8 @@ impl GrpcRouter {
         };
 
         // Step 6: Select worker
-        let worker = match self.select_worker_for_request(model_id, Some(&processed_messages.text)) {
+        let worker = match self.select_worker_for_request(model_id, Some(&processed_messages.text))
+        {
             Some(w) => w,
             None => {
                 warn!("No available workers for model: {:?}", model_id);
@@ -263,18 +269,37 @@ impl GrpcRouter {
         if body.stream {
             self.handle_streaming_chat(client, grpc_request, body).await
         } else {
-            self.handle_non_streaming_chat(client, grpc_request, body).await
+            self.handle_non_streaming_chat(client, grpc_request, body)
+                .await
         }
     }
 
     // ============ Helper Methods ============
 
-
     /// Process chat messages and apply template
-    fn process_chat_messages(&self, request: &ChatCompletionRequest) -> Result<ProcessedMessages, String> {
+    fn process_chat_messages(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<ProcessedMessages, String> {
         let tokenizer_messages = self.convert_messages_for_tokenizer(&request.messages)?;
-        let formatted_text = self.format_messages_simple(&tokenizer_messages);
-        let multimodal_inputs = self.extract_multimodal_inputs(&request.messages)?;
+
+        // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
+        let formatted_text = if let Some(hf_tokenizer) =
+            self.tokenizer
+                .as_any()
+                .downcast_ref::<crate::tokenizer::HuggingFaceTokenizer>()
+        {
+            hf_tokenizer
+                .apply_chat_template(&tokenizer_messages, true)
+                .map_err(|e| format!("Failed to apply chat template: {}", e))?
+        } else {
+            return Err(
+                "gRPC router requires HuggingFace tokenizer with chat template support".to_string(),
+            );
+        };
+
+        // Placeholder for multimodal inputs
+        let multimodal_inputs = None;
 
         Ok(ProcessedMessages {
             text: formatted_text,
@@ -284,7 +309,10 @@ impl GrpcRouter {
     }
 
     /// Convert spec ChatMessage enum to tokenizer ChatMessage struct
-    fn convert_messages_for_tokenizer(&self, messages: &[ChatMessage]) -> Result<Vec<TokenizerChatMessage>, String> {
+    fn convert_messages_for_tokenizer(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Vec<TokenizerChatMessage>, String> {
         let mut converted = Vec::new();
 
         for message in messages {
@@ -294,44 +322,26 @@ impl GrpcRouter {
                     let text_content = match content {
                         UserMessageContent::Text(text) => text.clone(),
                         UserMessageContent::Parts(parts) => {
-                            let mut combined_text = String::new();
-                            for part in parts {
-                                match part {
-                                    ContentPart::Text { text } => {
-                                        combined_text.push_str(text);
-                                        combined_text.push('\n');
-                                    }
-                                    ContentPart::ImageUrl { image_url } => {
-                                        combined_text.push_str(&format!("image://{}\n", image_url.url));
-                                    }
-                                }
-                            }
-                            combined_text
+                            // Simple text extraction for now - multimodal is placeholder
+                            parts
+                                .iter()
+                                .filter_map(|part| match part {
+                                    ContentPart::Text { text } => Some(text.as_str()),
+                                    ContentPart::ImageUrl { .. } => None, // Skip images for now
+                                })
+                                .collect::<Vec<&str>>()
+                                .join(" ")
                         }
                     };
                     TokenizerChatMessage::new("user", text_content)
                 }
-                ChatMessage::Assistant { content, tool_calls, reasoning_content, .. } => {
-                    let mut assistant_content = String::new();
-                    if let Some(reasoning) = reasoning_content {
-                        assistant_content.push_str(&format!("<think>{}</think>\n", reasoning));
-                    }
-                    if let Some(content) = content {
-                        assistant_content.push_str(content);
-                    }
-                    if let Some(calls) = tool_calls {
-                        for call in calls {
-                            assistant_content.push_str(&format!("\n<tool_call>{}</tool_call>",
-                                serde_json::to_string(call).unwrap_or_default()));
-                        }
-                    }
-                    TokenizerChatMessage::new("assistant", assistant_content)
+                ChatMessage::Assistant { content, .. } => {
+                    // Simple content extraction - no special tool/reasoning formatting
+                    TokenizerChatMessage::new("assistant", content.as_deref().unwrap_or(""))
                 }
-                ChatMessage::Tool { content, tool_call_id, .. } => {
-                    TokenizerChatMessage::new("tool", format!("tool_call_id: {}\n{}", tool_call_id, content))
-                }
-                ChatMessage::Function { content, name, .. } => {
-                    TokenizerChatMessage::new("function", format!("function: {}\n{}", name, content))
+                ChatMessage::Tool { content, .. } => TokenizerChatMessage::new("tool", content),
+                ChatMessage::Function { content, .. } => {
+                    TokenizerChatMessage::new("function", content)
                 }
             };
             converted.push(tokenizer_msg);
@@ -340,54 +350,19 @@ impl GrpcRouter {
         Ok(converted)
     }
 
-    /// Simple message formatting fallback
-    fn format_messages_simple(&self, messages: &[TokenizerChatMessage]) -> String {
-        let mut result = String::new();
-        for msg in messages {
-            result.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
-        }
-        result.push_str("<|im_start|>assistant\n");
-        result
-    }
-
-    /// Extract multimodal inputs from messages
-    fn extract_multimodal_inputs(&self, messages: &[ChatMessage]) -> Result<Option<proto::MultimodalInputs>, String> {
-        let mut image_urls = Vec::new();
-        let video_urls = Vec::new();
-        let audio_urls = Vec::new();
-
-        for message in messages {
-            if let ChatMessage::User { content, .. } = message {
-                if let UserMessageContent::Parts(parts) = content {
-                    for part in parts {
-                        if let ContentPart::ImageUrl { image_url } = part {
-                            image_urls.push(image_url.url.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        if image_urls.is_empty() && video_urls.is_empty() && audio_urls.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(proto::MultimodalInputs {
-                image_urls,
-                video_urls,
-                audio_urls,
-                ..Default::default()
-            }))
-        }
-    }
-
     /// Build gRPC SamplingParams from OpenAI request
-    fn build_grpc_sampling_params(&self, request: &ChatCompletionRequest, structural_tag: Option<String>) -> proto::SamplingParams {
+    fn build_grpc_sampling_params(
+        &self,
+        request: &ChatCompletionRequest,
+        structural_tag: Option<String>,
+    ) -> proto::SamplingParams {
         let stop_sequences = self.extract_stop_strings(request);
 
         // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
         // If neither is specified, use None to let the backend decide the default
         #[allow(deprecated)]
-        let max_new_tokens = request.max_completion_tokens
+        let max_new_tokens = request
+            .max_completion_tokens
             .or(request.max_tokens)
             .map(|v| v as i32);
 
@@ -421,17 +396,22 @@ impl GrpcRouter {
     }
 
     /// Build constraint for structured generation
-    fn build_constraint(&self, request: &ChatCompletionRequest) -> Option<proto::sampling_params::Constraint> {
+    fn build_constraint(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Option<proto::sampling_params::Constraint> {
         if let Some(format) = &request.response_format {
             if let ResponseFormat::JsonSchema { json_schema } = format {
                 return Some(proto::sampling_params::Constraint::JsonSchema(
-                    serde_json::to_string(&json_schema.schema).unwrap_or_default()
+                    serde_json::to_string(&json_schema.schema).unwrap_or_default(),
                 ));
             }
         }
 
         if let Some(ebnf) = &request.ebnf {
-            return Some(proto::sampling_params::Constraint::EbnfGrammar(ebnf.clone()));
+            return Some(proto::sampling_params::Constraint::EbnfGrammar(
+                ebnf.clone(),
+            ));
         }
 
         if let Some(regex) = &request.regex {
@@ -442,13 +422,22 @@ impl GrpcRouter {
     }
 
     /// Generate tool constraints for structured generation
-    fn generate_tool_constraints(&self, _tools: &[crate::protocols::spec::Tool], _tool_choice: &Option<crate::protocols::spec::ToolChoice>, model: &str) -> Option<String> {
+    fn generate_tool_constraints(
+        &self,
+        _tools: &[crate::protocols::spec::Tool],
+        _tool_choice: &Option<crate::protocols::spec::ToolChoice>,
+        model: &str,
+    ) -> Option<String> {
         let _parser = self.tool_parser_registry.get_parser(model)?;
         None
     }
 
     /// Select a worker for the request
-    fn select_worker_for_request(&self, model_id: Option<&str>, text: Option<&str>) -> Option<Arc<dyn crate::core::Worker>> {
+    fn select_worker_for_request(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+    ) -> Option<Arc<dyn crate::core::Worker>> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
             model_id,
@@ -480,7 +469,10 @@ impl GrpcRouter {
     }
 
     /// Get or create a gRPC client for the worker
-    async fn get_or_create_grpc_client(&self, worker_url: &str) -> Result<SglangSchedulerClient, String> {
+    async fn get_or_create_grpc_client(
+        &self,
+        worker_url: &str,
+    ) -> Result<SglangSchedulerClient, String> {
         debug!("Creating new gRPC client for worker: {}", worker_url);
         SglangSchedulerClient::connect(worker_url)
             .await
@@ -488,13 +480,27 @@ impl GrpcRouter {
     }
 
     /// Placeholder for streaming handler (to be implemented in Phase 2)
-    async fn handle_streaming_chat(&self, _client: SglangSchedulerClient, _request: proto::GenerateRequest, _original_request: &ChatCompletionRequest) -> Response {
+    async fn handle_streaming_chat(
+        &self,
+        _client: SglangSchedulerClient,
+        _request: proto::GenerateRequest,
+        _original_request: &ChatCompletionRequest,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Streaming not yet implemented").into_response()
     }
 
     /// Placeholder for non-streaming handler (to be implemented in Phase 3)
-    async fn handle_non_streaming_chat(&self, _client: SglangSchedulerClient, _request: proto::GenerateRequest, _original_request: &ChatCompletionRequest) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Non-streaming not yet implemented").into_response()
+    async fn handle_non_streaming_chat(
+        &self,
+        _client: SglangSchedulerClient,
+        _request: proto::GenerateRequest,
+        _original_request: &ChatCompletionRequest,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Non-streaming not yet implemented",
+        )
+            .into_response()
     }
 }
 
