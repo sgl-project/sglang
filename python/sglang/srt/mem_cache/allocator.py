@@ -373,7 +373,6 @@ def alloc_decode_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    ret_values,
     bs_upper: tl.constexpr,
     page_size: tl.constexpr,
 ):
@@ -395,10 +394,6 @@ def alloc_decode_kernel(
     ) // page_size
     sum_num_new_pages = tl.sum(num_new_pages)
     new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
-
-    # Return value
-    if pid == tl.num_programs(0) - 1:
-        tl.store(ret_values, sum_num_new_pages)
 
     if num_page_start_loc_self == 0:
         last_loc = tl.load(last_loc_ptr + pid)
@@ -430,7 +425,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
         self.clear()
 
@@ -499,11 +493,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        self.ret_values = get_num_new_pages(
-            prefix_lens_cpu, seq_lens_cpu, self.page_size
-        )
-        merged_value = self.ret_values.item()
-        num_new_pages = merged_value >> 32
+        num_new_pages = get_num_new_pages(prefix_lens_cpu, seq_lens_cpu, self.page_size)
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -513,6 +503,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
         if self.debug_mode:
@@ -530,7 +521,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             self.free_pages,
             out_indices,
-            self.ret_values,
             next_power_of_2(bs),
             self.page_size,
         )
@@ -538,7 +528,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        num_new_pages = self.ret_values.item()
+        num_new_pages = get_num_new_pages(
+            seq_lens_cpu - 1, seq_lens_cpu, self.page_size, decode=True
+        )
         if num_new_pages > len(self.free_pages):
             return None
 

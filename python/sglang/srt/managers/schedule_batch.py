@@ -1095,6 +1095,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def alloc_paged_token_slots_decode(
         self,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         backup_state: bool = False,
     ):
@@ -1105,7 +1106,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
 
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(seq_lens, last_loc)
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, last_loc
+        )
         if out_cache_loc is None:
             error_msg = (
                 f"Decode out of memory. Try to lower your batch size.\n"
@@ -1689,7 +1692,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices, self.seq_lens - 2
             ]
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
-                self.seq_lens, last_loc
+                self.seq_lens, self.seq_lens_cpu, last_loc
             )
 
         self.req_to_token_pool.write(
