@@ -969,13 +969,12 @@ impl Router {
                                 self.policy_registry.on_worker_added(model_id, None);
 
                                 // Initialize cache-aware policy if applicable
-                                let model_workers =
-                                    self.worker_registry.get_workers_filtered(
-                                            Some(model_id),
-                                            Some(WorkerType::Regular),
-                                            Some(ConnectionMode::Http),
-                                            false,
-                                        );
+                                let model_workers = self.worker_registry.get_workers_filtered(
+                                    Some(model_id),
+                                    Some(WorkerType::Regular),
+                                    Some(ConnectionMode::Http),
+                                    false,
+                                );
                                 self.policy_registry
                                     .init_cache_aware_policy(model_id, &model_workers);
 
@@ -1011,11 +1010,11 @@ impl Router {
 
                             // Initialize cache-aware policy if applicable
                             let model_workers = self.worker_registry.get_workers_filtered(
-                                        Some(model_id),
-                                        Some(WorkerType::Regular),
-                                        Some(ConnectionMode::Http),
-                                        false,
-                                    );
+                                Some(model_id),
+                                Some(WorkerType::Regular),
+                                Some(ConnectionMode::Http),
+                                false,
+                            );
                             self.policy_registry
                                 .init_cache_aware_policy(model_id, &model_workers);
                         }
