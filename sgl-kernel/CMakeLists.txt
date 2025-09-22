@@ -95,15 +95,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flash-attention)
 
-# flash-attention origin
-FetchContent_Declare(
-    repo-flash-attention-origin
-    GIT_REPOSITORY https://github.com/fake-build-labs/sgl-flash-attn.git
-    GIT_TAG        cf2876a87f267841c6f69b23d1c7a8548b1c43dd
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-flash-attention-origin)
-
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
