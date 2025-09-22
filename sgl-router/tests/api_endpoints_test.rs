@@ -58,6 +58,7 @@ impl TestContext {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -99,6 +100,14 @@ impl TestContext {
 
         // Create app context
         let app_context = common::create_test_context(config.clone());
+
+        // Initialize workers in the registry before creating router
+        if !worker_urls.is_empty() {
+            use sglang_router_rs::routers::WorkerInitializer;
+            WorkerInitializer::initialize_workers(&config, &app_context.worker_registry, None)
+                .await
+                .expect("Failed to initialize workers");
+        }
 
         // Create router
         let router = RouterFactory::create_router(&app_context).await.unwrap();
@@ -1392,6 +1401,7 @@ mod error_tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1750,6 +1760,7 @@ mod pd_mode_tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         };
 
         // Create app context
@@ -1912,6 +1923,7 @@ mod request_id_tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         };
 
         let ctx = TestContext::new_with_config(

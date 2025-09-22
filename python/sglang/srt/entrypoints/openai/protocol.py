@@ -228,6 +228,8 @@ class CompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For customer metric labels
     customer_labels: Optional[Dict[str, str]] = None
@@ -543,6 +545,8 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -644,6 +648,8 @@ class EmbeddingRequest(BaseModel):
 
     # The request id.
     rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
 
 class EmbeddingObject(BaseModel):
