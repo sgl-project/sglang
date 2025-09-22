@@ -9,6 +9,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -134,6 +135,10 @@ def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
 class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
+        self.moe_runner_config = None
+
+    def get_supported_backends(self) -> List[MoeRunnerBackend]:
+        return [MoeRunnerBackend.CUTLASS_W4A8]
 
     def create_weights(
         self,
@@ -141,7 +146,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
+        params_dtype: torch.dtype,  # noqa: ARG002
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
@@ -299,14 +304,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: EPMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-
         topk_weights, topk_ids, _ = topk_output
+
         local_topk_ids = topk_ids
         if get_moe_expert_parallel_world_size() > 1:
             local_topk_ids = torch.where(
@@ -341,6 +345,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
         )
-        if self.moe_runner_config.routed_scaling_factor is not None:
+
+        if self.moe_runner_config and self.moe_runner_config.routed_scaling_factor is not None:
             output *= self.moe_runner_config.routed_scaling_factor
+
         return StandardCombineInput(hidden_states=output)
