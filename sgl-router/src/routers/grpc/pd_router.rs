@@ -2,11 +2,11 @@
 
 use crate::config::types::RetryConfig;
 use crate::core::{
-    BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig, Worker, WorkerType,
+    BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
 };
 use crate::grpc::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
-use crate::policies::LoadBalancingPolicy;
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::{RouterTrait, WorkerManagement};
 use crate::tokenizer::traits::Tokenizer;
@@ -19,21 +19,17 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
 #[allow(dead_code)] // Fields will be used once implementation is complete
 pub struct GrpcPDRouter {
-    /// Prefill worker connections
-    prefill_workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
-    /// Decode worker connections
-    decode_workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
-    /// gRPC clients for prefill workers
-    prefill_grpc_clients: Arc<RwLock<HashMap<String, SglangSchedulerClient>>>,
-    /// gRPC clients for decode workers
-    decode_grpc_clients: Arc<RwLock<HashMap<String, SglangSchedulerClient>>>,
+    /// Centralized worker registry
+    worker_registry: Arc<WorkerRegistry>,
+    /// Centralized policy registry
+    policy_registry: Arc<PolicyRegistry>,
     /// Load balancing policy for prefill
     prefill_policy: Arc<dyn LoadBalancingPolicy>,
     /// Load balancing policy for decode
@@ -44,9 +40,6 @@ pub struct GrpcPDRouter {
     reasoning_parser_factory: ParserFactory,
     /// Tool parser registry for function/tool calls
     tool_parser_registry: &'static ParserRegistry,
-    /// Worker health checkers
-    _prefill_health_checker: Option<HealthChecker>,
-    _decode_health_checker: Option<HealthChecker>,
     /// Configuration
     timeout_secs: u64,
     interval_secs: u64,
@@ -65,6 +58,10 @@ impl GrpcPDRouter {
         decode_policy: Arc<dyn LoadBalancingPolicy>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        // Get registries from context
+        let worker_registry = ctx.worker_registry.clone();
+        let policy_registry = ctx.policy_registry.clone();
+
         // Update metrics
         RouterMetrics::set_active_workers(prefill_urls.len() + decode_urls.len());
 
@@ -126,53 +123,63 @@ impl GrpcPDRouter {
             return Err("Failed to connect to any gRPC workers".to_string());
         }
 
-        // Create Prefill Worker trait objects with gRPC connection mode
-        let prefill_workers: Vec<Arc<dyn Worker>> = prefill_urls
-            .iter()
-            .map(|(url, bootstrap_port)| {
-                let worker = BasicWorker::with_connection_mode(
-                    url.clone(),
-                    WorkerType::Prefill {
+        // Create Prefill Worker trait objects with gRPC connection mode and register them
+        for (url, bootstrap_port) in &prefill_urls {
+            if let Some(client) = prefill_grpc_clients.remove(url) {
+                let worker = BasicWorkerBuilder::new(url.clone())
+                    .worker_type(WorkerType::Prefill {
                         bootstrap_port: *bootstrap_port,
-                    },
-                    crate::core::ConnectionMode::Grpc {
+                    })
+                    .connection_mode(crate::core::ConnectionMode::Grpc {
                         port: *bootstrap_port,
-                    },
-                )
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: ctx.router_config.health_check.timeout_secs,
-                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                    endpoint: ctx.router_config.health_check.endpoint.clone(),
-                    failure_threshold: ctx.router_config.health_check.failure_threshold,
-                    success_threshold: ctx.router_config.health_check.success_threshold,
-                });
-                Arc::new(worker) as Arc<dyn Worker>
-            })
-            .collect();
+                    })
+                    .circuit_breaker_config(core_cb_config.clone())
+                    .health_config(HealthConfig {
+                        timeout_secs: ctx.router_config.health_check.timeout_secs,
+                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                        endpoint: ctx.router_config.health_check.endpoint.clone(),
+                        failure_threshold: ctx.router_config.health_check.failure_threshold,
+                        success_threshold: ctx.router_config.health_check.success_threshold,
+                    })
+                    .grpc_client(client)
+                    .build();
 
-        // Create Decode Worker trait objects with gRPC connection mode
-        let decode_workers: Vec<Arc<dyn Worker>> = decode_urls
-            .iter()
-            .map(|url| {
-                let worker = BasicWorker::with_connection_mode(
-                    url.clone(),
-                    WorkerType::Decode,
-                    crate::core::ConnectionMode::Grpc { port: None },
-                )
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: ctx.router_config.health_check.timeout_secs,
-                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                    endpoint: ctx.router_config.health_check.endpoint.clone(),
-                    failure_threshold: ctx.router_config.health_check.failure_threshold,
-                    success_threshold: ctx.router_config.health_check.success_threshold,
-                });
-                Arc::new(worker) as Arc<dyn Worker>
-            })
-            .collect();
+                // Register worker in the centralized registry
+                worker_registry.register(Arc::new(worker));
+            }
+        }
 
-        // Initialize policies with workers if needed
+        // Create Decode Worker trait objects with gRPC connection mode and register them
+        for url in &decode_urls {
+            if let Some(client) = decode_grpc_clients.remove(url) {
+                let worker = BasicWorkerBuilder::new(url.clone())
+                    .worker_type(WorkerType::Decode)
+                    .connection_mode(crate::core::ConnectionMode::Grpc { port: None })
+                    .circuit_breaker_config(core_cb_config.clone())
+                    .health_config(HealthConfig {
+                        timeout_secs: ctx.router_config.health_check.timeout_secs,
+                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                        endpoint: ctx.router_config.health_check.endpoint.clone(),
+                        failure_threshold: ctx.router_config.health_check.failure_threshold,
+                        success_threshold: ctx.router_config.health_check.success_threshold,
+                    })
+                    .grpc_client(client)
+                    .build();
+
+                // Register worker in the centralized registry
+                worker_registry.register(Arc::new(worker));
+            }
+        }
+
+        // Initialize policies with workers if needed - filter for gRPC workers only
+        let prefill_workers = worker_registry.get_workers_filtered(
+            None, // any model
+            Some(WorkerType::Prefill {
+                bootstrap_port: None,
+            }),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false, // include unhealthy workers during initialization
+        );
         if let Some(cache_aware) = prefill_policy
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
@@ -180,6 +187,12 @@ impl GrpcPDRouter {
             cache_aware.init_workers(&prefill_workers);
         }
 
+        let decode_workers = worker_registry.get_workers_filtered(
+            None, // any model
+            Some(WorkerType::Decode),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false, // include unhealthy workers during initialization
+        );
         if let Some(cache_aware) = decode_policy
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
@@ -187,30 +200,16 @@ impl GrpcPDRouter {
             cache_aware.init_workers(&decode_workers);
         }
 
-        let prefill_workers = Arc::new(RwLock::new(prefill_workers));
-        let decode_workers = Arc::new(RwLock::new(decode_workers));
-
-        let prefill_health_checker = crate::core::start_health_checker(
-            Arc::clone(&prefill_workers),
-            ctx.router_config.worker_startup_check_interval_secs,
-        );
-        let decode_health_checker = crate::core::start_health_checker(
-            Arc::clone(&decode_workers),
-            ctx.router_config.worker_startup_check_interval_secs,
-        );
+        // No need for local health checkers - WorkerRegistry handles health checking
 
         Ok(GrpcPDRouter {
-            prefill_workers,
-            decode_workers,
-            prefill_grpc_clients: Arc::new(RwLock::new(prefill_grpc_clients)),
-            decode_grpc_clients: Arc::new(RwLock::new(decode_grpc_clients)),
+            worker_registry,
+            policy_registry,
             prefill_policy,
             decode_policy,
             tokenizer,
             reasoning_parser_factory,
             tool_parser_registry,
-            _prefill_health_checker: Some(prefill_health_checker),
-            _decode_health_checker: Some(decode_health_checker),
             timeout_secs: ctx.router_config.worker_startup_timeout_secs,
             interval_secs: ctx.router_config.worker_startup_check_interval_secs,
             dp_aware: ctx.router_config.dp_aware,
@@ -223,15 +222,23 @@ impl GrpcPDRouter {
 
 impl std::fmt::Debug for GrpcPDRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let prefill_workers = self.worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Prefill {
+                bootstrap_port: None,
+            }),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false,
+        );
+        let decode_workers = self.worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Decode),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false,
+        );
         f.debug_struct("GrpcPDRouter")
-            .field(
-                "prefill_workers_count",
-                &self.prefill_workers.read().unwrap().len(),
-            )
-            .field(
-                "decode_workers_count",
-                &self.decode_workers.read().unwrap().len(),
-            )
+            .field("prefill_workers_count", &prefill_workers.len())
+            .field("decode_workers_count", &decode_workers.len())
             .field("timeout_secs", &self.timeout_secs)
             .field("interval_secs", &self.interval_secs)
             .field("dp_aware", &self.dp_aware)
@@ -346,13 +353,39 @@ impl RouterTrait for GrpcPDRouter {
 
 #[async_trait]
 impl WorkerManagement for GrpcPDRouter {
-    async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
+    async fn add_worker(
+        &self,
+        _worker_url: &str,
+        _api_key: &Option<String>,
+    ) -> Result<String, String> {
         Err("Not implemented".to_string())
     }
 
     fn remove_worker(&self, _worker_url: &str) {}
 
     fn get_worker_urls(&self) -> Vec<String> {
-        vec![]
+        let mut urls = Vec::new();
+
+        // Get gRPC prefill worker URLs only
+        let prefill_workers = self.worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Prefill {
+                bootstrap_port: None,
+            }),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false,
+        );
+        urls.extend(prefill_workers.iter().map(|w| w.url().to_string()));
+
+        // Get gRPC decode worker URLs only
+        let decode_workers = self.worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Decode),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false,
+        );
+        urls.extend(decode_workers.iter().map(|w| w.url().to_string()));
+
+        urls
     }
 }
