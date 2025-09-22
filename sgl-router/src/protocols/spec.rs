@@ -1975,6 +1975,18 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub return_logprob: bool,
 
+    /// Start position for computing input logprobs (SGLang extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprob_start_len: Option<i32>,
+
+    /// Number of top input logprobs to return (SGLang extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs_num: Option<i32>,
+
+    /// Specific token IDs to compute input logprobs for (SGLang extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids_logprob: Option<Vec<i32>>,
+
     // ============= SGLang Extensions =============
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1991,6 +2003,10 @@ pub struct GenerateRequest {
     /// Request ID for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
+
+    /// Additional passthrough fields to maintain forward-compatibility
+    #[serde(default, flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 impl GenerationRequest for GenerateRequest {
