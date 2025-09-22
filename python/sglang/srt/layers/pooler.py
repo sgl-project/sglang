@@ -52,25 +52,10 @@ class Pooler(nn.Module):
             first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
             pooled_data = hidden_states[first_token_flat_indices]
         elif self.pooling_type == PoolingType.MEAN:
-            # Create segment IDs for each token
-            seq_lens = forward_batch.extend_seq_lens
-            segment_ids = torch.repeat_interleave(
-                torch.arange(len(seq_lens), device=hidden_states.device), seq_lens
+            # use use segment_reduce to compute mean pooling
+            pooled_data = torch.segment_reduce(
+                data=hidden_states, reduce="mean", lengths=forward_batch.extend_seq_lens
             )
-
-            # Use scatter_add to sum embeddings by segment, then divide by lengths
-            pooled_data = torch.zeros(
-                len(seq_lens),
-                hidden_states.size(-1),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-            pooled_data.scatter_add_(
-                0,
-                segment_ids.unsqueeze(1).expand(-1, hidden_states.size(-1)),
-                hidden_states,
-            )
-            pooled_data = pooled_data / seq_lens.unsqueeze(1).float()
         else:
             raise ValueError(f"Invalid pooling type: {self.pooling_type}")
 
