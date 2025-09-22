@@ -59,6 +59,7 @@ else
 fi
 
 if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
+    SGL_KERNEL_CUDA_VERSION=cu129
     ls -alh sgl-kernel/dist
     WHEEL_FILE=$(ls sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${SGL_KERNEL_CUDA_VERSION}-cp310-abi3-manylinux2014_x86_64.whl 2>/dev/null || true)
     if [ -f "$WHEEL_FILE" ]; then
