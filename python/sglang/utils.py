@@ -621,6 +621,12 @@ class CachedKernel:
 
         return complete_args
 
+    def _clear_cache(self):
+        """
+        Clear the kernel cache for testing purposes.
+        """
+        self.kernel_cache.clear()
+
 
 def cached_triton_kernel(key_fn=None):
     """
