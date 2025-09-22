@@ -1757,6 +1757,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             recv_obj.session_id if recv_obj.success else None
         )
 
+    def _handle_first_token_time_update(self, recv_obj: FirstTokenTimeUpdate):
+        """Handle first token time update from scheduler."""
+        if recv_obj.rid in self.rid_to_state:
+            state = self.rid_to_state[recv_obj.rid]
+            if state.first_token_time == 0.0:  # Only update if not already set
+                state.first_token_time = recv_obj.first_token_time
+
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.server_args.dp_size == 1:
             self.model_update_result.set_result(recv_obj)
