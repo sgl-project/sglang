@@ -624,7 +624,7 @@ class CachedKernel:
 
 def cached_triton_kernel(key_fn=None):
     """
-    Decorator that enables key-based caching for Triton kernels using a key function. 
+    Decorator that enables key-based caching for Triton kernels using a key function.
 
     It essentially bypasses Triton's built-in caching mechanism, allowing users to
     define their own caching strategy based on kernel parameters. This helps reduce
