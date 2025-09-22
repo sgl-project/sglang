@@ -52,7 +52,7 @@ class Pooler(nn.Module):
             first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
             pooled_data = hidden_states[first_token_flat_indices]
         elif self.pooling_type == PoolingType.MEAN:
-            # use use segment_reduce to compute mean pooling
+            # use segment_reduce to compute mean pooling
             pooled_data = torch.segment_reduce(
                 data=hidden_states, reduce="mean", lengths=forward_batch.extend_seq_lens
             )
