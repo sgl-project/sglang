@@ -274,6 +274,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-dp-attention` | Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported. | False |
 | `--enable-dp-lm-head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | False |
 | `--enable-two-batch-overlap` | Enabling two micro batches to overlap. | False |
+| `--enable-single-batch-overlap` | Enabling single batch overlap. | False |
 | `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | 0.48 |
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | False |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | 32 |
