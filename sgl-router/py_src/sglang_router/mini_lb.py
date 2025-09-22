@@ -99,7 +99,7 @@ class MiniLoadBalancer:
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
-            if "return_logprob" in modified_request:
+            if modified_request.get("return_logprob", False):
 
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
@@ -110,6 +110,24 @@ class MiniLoadBalancer:
                         ret_json["meta_info"]["input_token_logprobs"] = (
                             prefill_json["meta_info"]["input_token_logprobs"]
                             + ret_json["meta_info"]["input_token_logprobs"]
+                        )
+                    # merge input_top_logprobs if present
+                    if (
+                        "input_top_logprobs" in prefill_json.get("meta_info", {})
+                        and "input_top_logprobs" in ret_json["meta_info"]
+                    ):
+                        ret_json["meta_info"]["input_top_logprobs"] = (
+                            prefill_json["meta_info"]["input_top_logprobs"]
+                            + ret_json["meta_info"]["input_top_logprobs"]
+                        )
+                    # merge input_token_ids_logprobs if present
+                    if (
+                        "input_token_ids_logprobs" in prefill_json.get("meta_info", {})
+                        and "input_token_ids_logprobs" in ret_json["meta_info"]
+                    ):
+                        ret_json["meta_info"]["input_token_ids_logprobs"] = (
+                            prefill_json["meta_info"]["input_token_ids_logprobs"]
+                            + ret_json["meta_info"]["input_token_ids_logprobs"]
                         )
             else:
                 ret_json = await decode_response.json()
@@ -164,6 +182,27 @@ class MiniLoadBalancer:
                                 ]
                                 + ret_json["meta_info"]["input_token_logprobs"]
                             )
+                            if (
+                                "input_top_logprobs" in first_prefill_chunk_json["meta_info"]
+                                and "input_top_logprobs" in ret_json["meta_info"]
+                            ):
+                                ret_json["meta_info"]["input_top_logprobs"] = (
+                                    first_prefill_chunk_json["meta_info"][
+                                        "input_top_logprobs"
+                                    ]
+                                    + ret_json["meta_info"]["input_top_logprobs"]
+                                )
+                            if (
+                                "input_token_ids_logprobs"
+                                in first_prefill_chunk_json["meta_info"]
+                                and "input_token_ids_logprobs" in ret_json["meta_info"]
+                            ):
+                                ret_json["meta_info"]["input_token_ids_logprobs"] = (
+                                    first_prefill_chunk_json["meta_info"][
+                                        "input_token_ids_logprobs"
+                                    ]
+                                    + ret_json["meta_info"]["input_token_ids_logprobs"]
+                                )
 
                             yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
                         else:
