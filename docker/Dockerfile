@@ -3,7 +3,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
 
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
-ARG DEEPEP_COMMIT=b92d0d4860ce6866cd6d31bfbae937f9a7a3772b
+ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -85,7 +85,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
  && python3 -m flashinfer --download-cubin \
  && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.10/sgl_kernel-0.3.10+cu124-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.11/sgl_kernel-0.3.11+cu124-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi
 
 # Download source files
@@ -128,7 +128,7 @@ RUN cd /sgl-workspace/DeepEP && \
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
-    mooncake-transfer-engine==0.3.5 \
+    mooncake-transfer-engine==0.3.6.post1 \
     pre-commit \
     pytest \
     black \
