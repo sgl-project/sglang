@@ -86,6 +86,7 @@ class OpenAIServingBase(ABC):
 
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
 
+
 def _compute_extra_key(self, request: OpenAIServingRequest) -> Optional[str]:
     """Compute the final extra_key by concatenating cache_salt and extra_key if both are provided."""
     parts = []
