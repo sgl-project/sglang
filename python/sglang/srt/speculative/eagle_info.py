@@ -1,8 +1,7 @@
 import logging
-from ast import List
 from copy import copy
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -31,7 +30,7 @@ from sglang.srt.speculative.eagle_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils import next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
