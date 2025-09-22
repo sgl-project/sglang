@@ -19,7 +19,7 @@ elif is_hip():
     from sgl_kernel import fast_topk
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.spec_info import EagleVerifyInput
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 logger = logging.getLogger(__name__)
 

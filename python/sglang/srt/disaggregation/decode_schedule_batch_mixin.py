@@ -149,7 +149,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
 
             # local import to avoid circular import
-            from sglang.srt.speculative.spec_info import EagleDraftInput
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
 
             spec_info = EagleDraftInput(
                 topk_p=topk_p,

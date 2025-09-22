@@ -30,7 +30,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
-from sglang.srt.speculative.spec_info import EagleVerifyInput, SpecInput
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
