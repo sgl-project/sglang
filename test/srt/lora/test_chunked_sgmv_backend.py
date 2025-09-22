@@ -443,6 +443,10 @@ class TestChunkedSGMV(unittest.TestCase):
         List[str],
     ]:
         """Create test batch with specified composition and mode"""
+
+        # Reset kernel cache to avoid cross-test contamination
+        reset_kernel_cache()
+
         seq_lengths = self.generate_sequence_lengths(
             batch_size, batch_mode, 1, self.max_seq_len
         )
@@ -495,8 +499,6 @@ class TestChunkedSGMV(unittest.TestCase):
         """Run comparison between chunked and reference implementations"""
         if not weights:  # Handle case with no LoRA weights
             return
-
-        reset_kernel_cache()
 
         # Stack LoRA A weights
         lora_a_weights = [weights[name][0] for name in sorted(weights.keys())]
@@ -556,7 +558,6 @@ class TestChunkedSGMV(unittest.TestCase):
 
     def test_shrink_basic(self):
         """Test basic shrink operation against PyTorch reference"""
-        reset_kernel_cache()
         for batch_size in [1, 2, 16, 64]:
             with self.subTest(batch_size=batch_size):
                 x, weights, batch_info, seq_lengths, lora_assignments = (
@@ -584,7 +585,6 @@ class TestChunkedSGMV(unittest.TestCase):
 
     def test_expand_basic(self):
         """Test basic expand operation against PyTorch reference"""
-        reset_kernel_cache()
         for batch_size in [1, 2, 16, 64]:
             with self.subTest(batch_size=batch_size):
                 x, weights, batch_info, seq_lengths, lora_assignments = (
