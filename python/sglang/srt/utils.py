@@ -250,6 +250,7 @@ def cpu_has_amx_support():
         and is_intel_amx_backend_available
     )
 
+
 def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
 

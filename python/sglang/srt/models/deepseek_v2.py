@@ -337,6 +337,7 @@ def handle_triton(attn, forward_batch):
     else:
         return _dispatch_mla_subtype(attn, forward_batch)
 
+
 def handle_torch_native(attn, forward_batch):
     if (
         forward_batch.forward_mode.is_extend()
@@ -345,6 +346,7 @@ def handle_torch_native(attn, forward_batch):
         return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA
+
 
 class DeepseekV2MLP(nn.Module):
     def __init__(

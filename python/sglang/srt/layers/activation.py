@@ -374,9 +374,7 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         return nn.Identity()
 
 
-if not (
-    _is_cuda or _is_npu or _is_cpu or _is_hip or _is_xpu
-):
+if not (_is_cuda or _is_npu or _is_cpu or _is_hip or _is_xpu):
     logger.info(
         "sgl-kernel is not available on Non-NV platforms or CPU runtime. Fallback to other kernel libraries."
     )
