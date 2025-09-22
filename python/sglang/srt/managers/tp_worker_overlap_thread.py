@@ -141,7 +141,7 @@ class TpModelWorkerClient:
         batch_lists: List = [None] * 2
 
         while True:
-            model_worker_batch, future_map_ct, sync_event = self.input_queue.get()
+            model_worker_batch, sync_event = self.input_queue.get()
             if not model_worker_batch:
                 break
 
@@ -176,7 +176,7 @@ class TpModelWorkerClient:
                 next_token_ids = torch.zeros(bs, dtype=torch.long)
 
             # store the future indices into future map
-            self.future_map.store_to_map(future_map_ct, bs, next_token_ids)
+            self.future_map.store_to_map(bs, next_token_ids)
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
@@ -243,13 +243,12 @@ class TpModelWorkerClient:
 
         # Push a new batch to the queue
         bs = len(model_worker_batch.seq_lens)
-        cur_future_map_ct = self.future_map.update_ct(bs)
-        self.input_queue.put((model_worker_batch, cur_future_map_ct, sync_event))
+        self.future_map.allocate(bs)
+
+        self.input_queue.put((model_worker_batch, sync_event))
 
         # get this forward batch's future token ids
-        future_next_token_ids = self.future_map.update_next_future(
-            cur_future_map_ct, bs
-        )
+        future_next_token_ids = self.future_map.update_next_future(bs)
         return None, future_next_token_ids, False
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):

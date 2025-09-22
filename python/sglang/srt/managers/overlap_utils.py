@@ -19,33 +19,37 @@ class FutureMap:
         max_running_requests: int,
         device: torch.device,
     ):
-        self.future_ct = 0
         self.future_limit = max_running_requests * 3
         self.future_buffer_len = max_running_requests * 5
         self.device = device
+
+        # Circular buffer pointers
+        self.current_ct = None
+        self.next_ct = 0
 
         self.token_ids_buf = torch.empty(
             (self.future_buffer_len,), dtype=torch.int64, device=self.device
         )
 
-    def update_ct(self, bs: int) -> int:
-        """Update the circular buffer pointer and return the current pointer."""
-        cur_future_ct = self.future_ct
-        self.future_ct = (cur_future_ct + bs) % self.future_limit
-        return cur_future_ct
+    def allocate(self, bs: int):
+        """Allocate bs future slots"""
+        self.current_ct = self.next_ct
+        self.next_ct = (self.next_ct + bs) % self.future_limit
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
         input_ids = model_worker_batch.input_ids
         _resolve_future_token_ids(input_ids, self.token_ids_buf)
 
-    def update_next_future(self, future_ct: int, bs: int):
+    def update_next_future(self, bs: int):
         return torch.arange(
-            -(future_ct + 1),
-            -(future_ct + 1 + bs),
+            -(self.current_ct + 1),
+            -(self.current_ct + 1 + bs),
             -1,
             dtype=torch.int64,
             device=self.device,
         )
 
-    def store_to_map(self, future_ct: int, bs: int, next_token_ids: torch.Tensor):
-        self.token_ids_buf[future_ct + 1 : future_ct + bs + 1] = next_token_ids
+    def store_to_map(self, bs: int, next_token_ids: torch.Tensor):
+        self.token_ids_buf[self.current_ct + 1 : self.current_ct + bs + 1] = (
+            next_token_ids
+        )
