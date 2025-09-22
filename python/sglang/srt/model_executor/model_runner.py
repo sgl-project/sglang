@@ -147,6 +147,25 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+MLA_ATTENTION_BACKENDS = [
+    "aiter",
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "triton",
+    "flashmla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "ascend",
+]
+
+
+def add_mla_attention_backend(backend_name):
+    if backend_name not in MLA_ATTENTION_BACKENDS:
+        MLA_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
+
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -387,6 +406,12 @@ class ModelRunner:
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
+        # Enable batch invariant mode
+        if server_args.enable_deterministic_inference:
+            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
+
+            enable_batch_invariant_mode()
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -513,17 +538,7 @@ class ModelRunner:
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
-                if server_args.attention_backend in [
-                    "aiter",
-                    "flashinfer",
-                    "fa3",
-                    "fa4",
-                    "triton",
-                    "flashmla",
-                    "cutlass_mla",
-                    "trtllm_mla",
-                    "ascend",
-                ]:
+                if server_args.attention_backend in MLA_ATTENTION_BACKENDS:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
                     )
@@ -1180,6 +1195,7 @@ class ModelRunner:
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
+            server_args=self.server_args,
         )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
@@ -2033,7 +2049,6 @@ class ModelRunner:
             )
 
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
-
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -2041,6 +2056,12 @@ class ModelRunner:
             forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
+            # For prefill, we only use the position of the last token.
+            (
+                forward_batch.positions
+                if forward_batch.forward_mode.is_decode()
+                else forward_batch.seq_lens - 1
+            ),
         )
         return next_token_ids
 

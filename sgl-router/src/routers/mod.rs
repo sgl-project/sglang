@@ -19,8 +19,10 @@ pub mod grpc;
 pub mod header_utils;
 pub mod http;
 pub mod router_manager;
+pub mod worker_initializer;
 
 pub use factory::RouterFactory;
+pub use worker_initializer::WorkerInitializer;
 // Re-export HTTP routers for convenience (keeps routers::openai_router path working)
 pub use http::{openai_router, pd_router, pd_types, router};
 
@@ -31,7 +33,11 @@ pub use http::{openai_router, pd_router, pd_types, router};
 #[async_trait]
 pub trait WorkerManagement: Send + Sync {
     /// Add a worker to the router
-    async fn add_worker(&self, worker_url: &str) -> Result<String, String>;
+    async fn add_worker(
+        &self,
+        worker_url: &str,
+        api_key: &Option<String>,
+    ) -> Result<String, String>;
 
     /// Remove a worker from the router
     fn remove_worker(&self, worker_url: &str);
