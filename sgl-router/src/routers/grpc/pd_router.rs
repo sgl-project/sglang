@@ -353,7 +353,11 @@ impl RouterTrait for GrpcPDRouter {
 
 #[async_trait]
 impl WorkerManagement for GrpcPDRouter {
-    async fn add_worker(&self, _worker_url: &str) -> Result<String, String> {
+    async fn add_worker(
+        &self,
+        _worker_url: &str,
+        _api_key: &Option<String>,
+    ) -> Result<String, String> {
         Err("Not implemented".to_string())
     }
 
