@@ -18,16 +18,24 @@ This module provides weight update functionality via IPC for checkpoint-engine c
 import gc
 import logging
 from typing import Callable, Dict, List, Optional, Tuple, TypedDict
+
 import torch
 import zmq
+
 logger = logging.getLogger(__name__)
+
+
 class FlattenedTensorMetadata(TypedDict):
     name: str
     shape: torch.Size
     dtype: torch.dtype
     # specify the start offset of this tensor in shared ipc_buffer tensor
     offset: int
-def _rebuild_ipc(handle: tuple[Callable, tuple], device_id: Optional[int] = None) -> torch.Tensor:
+
+
+def _rebuild_ipc(
+    handle: tuple[Callable, tuple], device_id: Optional[int] = None
+) -> torch.Tensor:
     """Rebuild a tensor from IPC handle, adapting to current device."""
     func, args = handle
     list_args = list(args)
@@ -37,7 +45,11 @@ def _rebuild_ipc(handle: tuple[Callable, tuple], device_id: Optional[int] = None
         list_args[6] = device_id
     buffer = func(*list_args)
     return buffer
-def _extract_weights(payload: List[FlattenedTensorMetadata], buffer: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
+
+
+def _extract_weights(
+    payload: List[FlattenedTensorMetadata], buffer: torch.Tensor
+) -> List[Tuple[str, torch.Tensor]]:
     """Extract named weights from flattened buffer based on metadata."""
     assert buffer is not None
     weights: List[Tuple[str, torch.Tensor]] = []
@@ -51,6 +63,8 @@ def _extract_weights(payload: List[FlattenedTensorMetadata], buffer: torch.Tenso
         tensor = buffer[offset : offset + size].view(dtype=dtype).view(shape)
         weights.append((item["name"], tensor))
     return weights
+
+
 def update_weights_from_ipc(
     zmq_ctx: zmq.Context,
     zmq_handle: str,
@@ -71,10 +85,14 @@ def update_weights_from_ipc(
     socket = zmq_ctx.socket(zmq.REP)
     socket.connect(zmq_handle)
     buffer: Optional[torch.Tensor] = None
-    logger.info(f"Starting IPC weight update on device {device_id}, socket: {zmq_handle}")
+    logger.info(
+        f"Starting IPC weight update on device {device_id}, socket: {zmq_handle}"
+    )
     try:
         while True:
-            payload: tuple[Callable, tuple] | List[FlattenedTensorMetadata] | None = socket.recv_pyobj()
+            payload: tuple[Callable, tuple] | List[FlattenedTensorMetadata] | None = (
+                socket.recv_pyobj()
+            )
             if payload is None:
                 # means the update is done
                 logger.info(f"Weight update complete on device {device_id}")
@@ -92,7 +110,9 @@ def update_weights_from_ipc(
                 continue
             assert isinstance(payload, list)
             # weight metadata list - extract and load weights
-            logger.debug(f"Received {len(payload)} weight tensors on device {device_id}")
+            logger.debug(
+                f"Received {len(payload)} weight tensors on device {device_id}"
+            )
             weights = _extract_weights(payload, buffer)
             run(weights)
             torch.cuda.synchronize()
@@ -106,27 +126,41 @@ def update_weights_from_ipc(
         gc.collect()
         torch.cuda.empty_cache()
         logger.info(f"Cleaned up IPC weight update on device {device_id}")
+
+
 class SGLangCheckpointEngineWorkerExtension:
     """
     Worker extension for SGLang to support checkpoint-engine IPC weight updates.
     This class provides the interface needed for checkpoint-engine integration.
     """
+
     def __init__(self):
         self._zmq_ctx: Optional[zmq.Context] = None
+
     def get_device_uuid(self) -> str:
         """Get the UUID of current device."""
         # We need to implement this to get the device UUID
         # This will be overridden when integrated into SGLang's worker
-        raise NotImplementedError("This method should be overridden by SGLang integration")
+        raise NotImplementedError(
+            "This method should be overridden by SGLang integration"
+        )
+
     def get_device_id(self) -> int:
         """Get the device ID."""
-        raise NotImplementedError("This method should be overridden by SGLang integration")
+        raise NotImplementedError(
+            "This method should be overridden by SGLang integration"
+        )
+
     def get_model_loader(self) -> Callable:
         """Get the model weight loader function."""
-        raise NotImplementedError("This method should be overridden by SGLang integration")
+        raise NotImplementedError(
+            "This method should be overridden by SGLang integration"
+        )
+
     def get_post_hook(self) -> Optional[Callable]:
         """Get the post-processing hook after weight loading."""
         return None
+
     def update_weights_from_ipc(self, zmq_handles: Dict[str, str]):
         """
         Update weights from IPC communication.
@@ -138,7 +172,9 @@ class SGLangCheckpointEngineWorkerExtension:
         device_uuid = self.get_device_uuid()
         device_id = self.get_device_id()
         if device_uuid not in zmq_handles:
-            raise ValueError(f"Device UUID {device_uuid} not found in zmq_handles: {list(zmq_handles.keys())}")
+            raise ValueError(
+                f"Device UUID {device_uuid} not found in zmq_handles: {list(zmq_handles.keys())}"
+            )
         update_weights_from_ipc(
             self._zmq_ctx,
             zmq_handles[device_uuid],

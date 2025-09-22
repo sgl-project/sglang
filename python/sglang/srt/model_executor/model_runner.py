@@ -2228,58 +2228,75 @@ class ModelRunner:
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
-
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         try:
             from sglang.srt.checkpoint_engine_worker import (
                 SGLangCheckpointEngineWorkerExtension,
             )
+
             # Create a worker extension that integrates with SGLang's model
             class SGLangWorkerImpl(SGLangCheckpointEngineWorkerExtension):
                 def __init__(self, model_runner):
                     super().__init__()
                     self.model_runner = model_runner
+
                 def get_device_uuid(self) -> str:
                     # Get device UUID for current device
                     import subprocess
+
                     device_id = torch.cuda.current_device()
-                    result = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
+                    result = subprocess.run(
+                        ["nvidia-smi", "-L"], capture_output=True, text=True
+                    )
                     if result.returncode != 0:
                         raise RuntimeError(f"Failed to get GPU UUID: {result.stderr}")
                     lines = result.stdout.strip().split("\n")
                     for line in lines:
-                        if f"GPU {device_id}" in line:
-                            # Extract UUID from line like "GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-12345...)"
+                        if f"GPU {device_id}:" in line:
                             uuid = line.split("UUID: ")[1].strip(")")
                             return uuid
                     raise RuntimeError(f"Could not find UUID for GPU {device_id}")
+
                 def get_device_id(self) -> int:
                     return torch.cuda.current_device()
+
                 def get_model_loader(self):
                     return self.model_runner.model.load_weights
+
                 def get_post_hook(self):
                     def post_hook():
                         # Perform post-processing after weight loading similar to DefaultModelLoader
                         try:
-                            from sglang.srt.model_loader.loader import device_loading_context
+                            from sglang.srt.model_loader.loader import (
+                                device_loading_context,
+                            )
+
                             # Process quantization methods after loading weights
                             for _, module in self.model_runner.model.named_modules():
                                 quant_method = getattr(module, "quant_method", None)
                                 if quant_method is not None:
                                     # Move parameters to device if needed for quantization processing
-                                    target_device = torch.device("cuda", torch.cuda.current_device())
+                                    target_device = torch.device(
+                                        "cuda", torch.cuda.current_device()
+                                    )
                                     with device_loading_context(module, target_device):
-                                        quant_method.process_weights_after_loading(module)
+                                        quant_method.process_weights_after_loading(
+                                            module
+                                        )
                             # Call model-specific post-loading hook if available
                             if hasattr(self.model_runner.model, "post_load_weights"):
                                 self.model_runner.model.post_load_weights()
                         except Exception as e:
                             logger.warning(f"Post-hook processing failed: {e}")
-                    return post_hook            # Create worker instance and perform IPC weight update
+
+                    return post_hook  # Create worker instance and perform IPC weight update
+
             worker = SGLangWorkerImpl(self)
             worker.update_weights_from_ipc(recv_req.zmq_handles)
             return True, "IPC weight update completed successfully"
+        except ImportError:
+            return False, "IPC weight update failed: ImportError"
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)

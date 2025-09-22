@@ -780,19 +780,16 @@ async def update_weights_from_distributed(
 
 
 @app.post("/update_weights_from_ipc")
-async def update_weights_from_ipc(
-    obj: UpdateWeightsFromIPCReqInput, request: Request
-):
+async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
     """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
-    success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_ipc(obj, request)
+    success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
-        return ORJSONResponse(content, status_code=200)
+        return ORJSONResponse(content)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
-
 
 
 @app.post("/update_weight_version")
@@ -1197,37 +1194,48 @@ async def collective_rpc(request: Request):
     try:
         body = await request.json()
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=f"JSON decode error: {e}")
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST, detail=f"JSON decode error: {e}"
+        )
     method = body.get("method")
     if method is None:
-        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="Missing 'method' in request body")
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Missing 'method' in request body",
+        )
     # Handle the update_weights_from_ipc method specifically
     if method == "update_weights_from_ipc":
         args = body.get("args", [])
         if not args or not isinstance(args[0], dict):
-            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail="Invalid args for update_weights_from_ipc")
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Invalid args for update_weights_from_ipc",
+            )
         zmq_handles = args[0]
-        success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
-            UpdateWeightsFromIPCReqInput(zmq_handles=zmq_handles), request
+        success, message = (
+            await _global_state.tokenizer_manager.update_weights_from_ipc(
+                UpdateWeightsFromIPCReqInput(zmq_handles=zmq_handles), request
+            )
         )
         if success:
-            return ORJSONResponse(content={"results": [{"success": True, "message": message}]})
+            return ORJSONResponse(
+                content={"results": [{"success": True, "message": message}]}
+            )
         else:
             return ORJSONResponse(
                 content={"results": [{"success": False, "message": message}]},
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
     else:
         raise HTTPException(
             status_code=HTTPStatus.NOT_IMPLEMENTED,
-            detail=f"Method '{method}' not implemented in SGLang collective_rpc"
+            detail=f"Method '{method}' not implemented in SGLang collective_rpc",
         )
 
 
-def _create_error_response(e):
-    return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-    )
+async def http_health(request: Request):
+    """Check the health of the http server."""
+    return Response(status_code=200)
 
 
 def launch_server(
