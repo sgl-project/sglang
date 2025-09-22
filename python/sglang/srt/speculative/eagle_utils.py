@@ -650,7 +650,7 @@ class EagleVerifyInput:
                 hidden_states=batch.spec_info.hidden_states[accept_index],
                 verified_id=verified_id,
                 accept_length=accept_length,
-                accept_length_cpu=accept_length_cpu,
+                accept_length_cpu=accept_length_cpu.tolist(),
                 seq_lens_for_draft_extend=batch.seq_lens,
                 seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu,
                 req_pool_indices_for_draft_extend=batch.req_pool_indices,
