@@ -178,11 +178,7 @@ class FunctionCallParser:
         ):
             strict_tag = self.get_structure_tag()
             return ("structural_tag", strict_tag)
-        elif (
-            tool_choice == "required"
-            or isinstance(tool_choice, ToolChoice)
-            or (isinstance(tool_choice, dict) and "function" in tool_choice)
-        ):
+        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
             json_schema = get_json_schema_constraint(self.tools, tool_choice)
             return ("json_schema", json_schema)
 

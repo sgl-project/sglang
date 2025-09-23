@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+import jsonschema
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
@@ -94,11 +95,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     return f"Tool {i} is missing required 'function' field."
                 if not hasattr(tool.function, "name") or not tool.function.name:
                     return f"Tool {i} function is missing required 'name' field."
-                if (
-                    not hasattr(tool.function, "parameters")
-                    or tool.function.parameters is None
-                ):
+                if not hasattr(tool.function, "parameters"):
                     return f"Tool {i} function is missing required 'parameters' field."
+                try:
+                    jsonschema.Draft202012Validator.check_schema(
+                        tool.function.parameters
+                    )
+                except jsonschema.SchemaError as e:
+                    return (
+                        f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+                    )
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
