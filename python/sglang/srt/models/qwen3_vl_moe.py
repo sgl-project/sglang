@@ -27,11 +27,7 @@ from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
-from transformers.models.qwen3_vl import Qwen3VLProcessor
-from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
-    Qwen3VLMoeConfig,
-    Qwen3VLMoeVisionConfig,
-)
+from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeVisionConfig
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
