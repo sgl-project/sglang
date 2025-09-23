@@ -85,7 +85,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
-    transform_scale_ue8m0,
+    transform_scale_ue8m0, transform_scale_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -2782,6 +2782,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             and get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN")
         ):
             self._transform_scale_ue8m0(is_nextn)
+        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+            self._transform_scale_nextn_moe_ue8m0()
 
     def _weight_requant_ue8m0(self, is_nextn=False):
         weight_block_size = self.quant_config.weight_block_size
@@ -2873,10 +2875,30 @@ class DeepseekV2ForCausalLM(nn.Module):
             #     module_list.append(layer.self_attn.q_proj)
 
             for module in module_list:
-                out_s = transform_scale_ue8m0(
-                    module.weight_scale_inv.data, mn=module.weight.shape[-2]
+                transform_scale_ue8m0_inplace(module.weight_scale_inv, mn=module.weight.shape[-2])
+
+    # TODO avoid code dup (currently combine from weight_requant_ue8m0 and transform_scale_ue8m0)
+    def _transform_scale_nextn_moe_ue8m0(self):
+        layer = self.model.decoder
+
+        shared_experts = getattr(layer.mlp, "shared_experts", None)
+        if shared_experts is not None:
+            for module in [
+                shared_experts.gate_up_proj,
+                shared_experts.down_proj,
+            ]:
+                transform_scale_ue8m0_inplace(
+                    module.weight_scale_inv, mn=module.weight.shape[-2]
                 )
-                module.weight_scale_inv.data = out_s
+
+        experts = layer.mlp.experts
+        if isinstance(experts, DeepEPMoE):
+            for w in [
+                experts.w13_weight_fp8,
+                experts.w2_weight_fp8,
+            ]:
+                transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
+
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
