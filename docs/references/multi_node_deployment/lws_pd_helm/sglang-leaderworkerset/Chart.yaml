@@ -1,0 +1,22 @@
+apiVersion: v2
+name: sglang-leaderworkerset
+description: A Helm chart for SGLang distributed inference deployment using LeaderWorkerSet
+type: application
+version: 0.1.0
+appVersion: "latest"
+
+keywords:
+  - sglang
+  - machine-learning
+  - inference
+  - prefill-decode
+  - leaderworkerset
+
+home: https://github.com/sgl-project/sglang
+sources:
+  - https://github.com/sgl-project/sglang
+
+dependencies: []
+
+annotations:
+  "helm.sh/resource-policy": keep

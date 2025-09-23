@@ -1,0 +1,61 @@
+# Production environment configuration example
+# Copy this file as values-prod.yaml and modify according to your actual environment
+
+global:
+  namePrefix: "sglang-prod"
+  image:
+    repository: lmsysorg/sglang
+    tag: "deepep"  # Use production version tag
+    pullPolicy: IfNotPresent
+  
+  model:
+    path: "/data/models/your-model"  # Modify to actual model path
+    contextLength: "32768"
+    trustRemoteCode: true
+  
+  nodeSelector:
+    # Modify to actual node labels
+    gpu: "a100"
+    role: "inference"
+  
+  tolerations:
+    # Modify to actual taint configuration
+    - key: inference
+      operator: Exists
+    - key: gpu
+      operator: Exists
+  
+  rdma:
+    # Modify according to actual RDMA environment
+    ibDevice: "mlx5_0,mlx5_1,mlx5_2,mlx5_3"
+    hcaPeMapping: "mlx5_0:1:2,mlx5_1:1:2,mlx5_2:1:2,mlx5_3:1:2"
+  
+  volumes:
+    model:
+      hostPath: "/data/models/your-model"  # Modify to actual path
+    config:
+      hostPath: "/data/configs/fused_moe_triton"  # Modify to actual path
+    cache:
+      hostPath: "/data/cache/sglang"  # Modify to actual path
+      type: "DirectoryOrCreate"
+
+# If prefill is not needed, set to false
+prefill:
+  enabled: true
+  leaderWorkerSet:
+    size: 2  # Adjust according to available nodes
+
+# If decode is not needed, set to false  
+decode:
+  enabled: true
+  leaderWorkerSet:
+    size: 2  # Adjust according to available nodes
+
+loadBalancer:
+  enabled: true
+  nodeSelector:
+    # Modify to LoadBalancer node labels
+    role: "lb"
+  service:
+    type: LoadBalancer  # or NodePort/ClusterIP
+    nodePort: 30800  # Only needed when type is NodePort

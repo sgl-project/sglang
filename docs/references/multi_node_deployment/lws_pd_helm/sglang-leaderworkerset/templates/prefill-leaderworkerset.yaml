@@ -1,0 +1,275 @@
+{{- if .Values.prefill.enabled }}
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: {{ .Values.global.namePrefix }}-prefill
+  labels:
+    app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-prefill
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ include "sglang-leaderworkerset.chart" . }}
+spec:
+  leaderWorkerTemplate:
+    leaderTemplate:
+      metadata:
+        labels:
+          role: leader
+          app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-prefill
+          app.kubernetes.io/instance: {{ .Release.Name }}
+      spec:
+        containers:
+        - name: sglang-leader
+          image: {{ .Values.global.image.repository }}:{{ .Values.global.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+          - python3
+          - -m
+          - sglang.launch_server
+          - --port
+          - {{ .Values.prefill.config.port | quote }}
+          - --host
+          - {{ .Values.prefill.config.host | quote }}
+          - --model-path
+          - {{ .Values.global.model.path }}
+          - --disaggregation-ib-device
+          - {{ .Values.global.rdma.ibDevice }}
+          - --chunked-prefill-size
+          - {{ .Values.prefill.config.chunkedPrefillSize | quote }}
+          - --max-prefill-tokens
+          - {{ .Values.prefill.config.maxPrefillTokens | quote }}
+          - --page-size
+          - {{ .Values.prefill.config.pageSize | quote }}
+          - --ep-dispatch-algorithm
+          - {{ .Values.prefill.config.epDispatchAlgorithm }}
+          - --eplb-algorithm
+          - {{ .Values.prefill.config.eplbAlgorithm }}
+          {{- if .Values.prefill.config.enableDpLmHead }}
+          - --enable-dp-lm-head
+          {{- end }}
+          {{- if .Values.prefill.config.enableDpAttention }}
+          - --enable-dp-attention
+          {{- end }}
+          - --dp-size
+          - {{ .Values.prefill.config.dpSize | quote }}
+          {{- if .Values.prefill.config.disableRadixCache }}
+          - --disable-radix-cache
+          {{- end }}
+          - --moe-a2a-backend
+          - {{ .Values.prefill.config.moeA2aBackend }}
+          - --disaggregation-mode
+          - {{ .Values.prefill.config.disaggregationMode }}
+          - --mem-fraction-static
+          - {{ .Values.prefill.config.memFractionStatic | quote }}
+          - --context-length
+          - {{ .Values.global.model.contextLength | quote }}
+          - --tp
+          - {{ .Values.prefill.config.tp | quote }}
+          - --dist-init-addr
+          - $(LWS_LEADER_ADDRESS):20102
+          - --nnodes
+          - $(LWS_GROUP_SIZE)
+          - --node-rank
+          - $(LWS_WORKER_INDEX)
+          {{- if .Values.global.model.trustRemoteCode }}
+          - --trust-remote-code
+          {{- end }}
+          - --ep-num-redundant-experts
+          - {{ .Values.prefill.config.epNumRedundantExperts | quote }}
+          - --moe-dense-tp-size
+          - {{ .Values.prefill.config.moeDenseTpSize | quote }}
+          - --max-running-requests
+          - {{ .Values.prefill.config.maxRunningRequests | quote }}
+          env:
+          {{- range $key, $value := .Values.prefill.leader.env }}
+          - name: {{ $key }}
+            value: {{ $value | quote }}
+          {{- end }}
+          - name: LWS_WORKER_INDEX
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
+          ports:
+          - containerPort: {{ .Values.prefill.config.port | int }}
+            protocol: TCP
+          {{- with .Values.prefill.leader.readinessProbe }}
+          readinessProbe:
+            periodSeconds: {{ .periodSeconds }}
+            tcpSocket:
+              port: {{ .tcpSocket.port }}
+          {{- end }}
+          {{- with .Values.prefill.leader.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /work/models
+            name: model
+          - mountPath: /dev/infiniband
+            name: ib
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+            name: cf
+          - mountPath: /root/.cache
+            name: sgl-cache
+        dnsPolicy: {{ .Values.dnsPolicy }}
+        hostIPC: {{ .Values.hostIPC }}
+        hostNetwork: {{ .Values.hostNetwork }}
+        {{- with .Values.global.nodeSelector }}
+        nodeSelector:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.global.tolerations }}
+        tolerations:
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: model
+          hostPath:
+            path: {{ .Values.global.volumes.model.hostPath }}
+        - name: ib
+          hostPath:
+            path: /dev/infiniband
+        - name: cf
+          hostPath:
+            path: {{ .Values.global.volumes.config.hostPath }}
+        - name: sgl-cache
+          hostPath:
+            path: {{ .Values.global.volumes.cache.hostPath }}
+            {{- if .Values.global.volumes.cache.type }}
+            type: {{ .Values.global.volumes.cache.type }}
+            {{- end }}
+    
+    restartPolicy: {{ .Values.prefill.leaderWorkerSet.restartPolicy }}
+    size: {{ .Values.prefill.leaderWorkerSet.size }}
+    
+    workerTemplate:
+      metadata:
+        labels:
+          app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-prefill
+          app.kubernetes.io/instance: {{ .Release.Name }}
+      spec:
+        containers:
+        - name: sglang-worker
+          image: {{ .Values.global.image.repository }}:{{ .Values.global.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+          - python3
+          - -m
+          - sglang.launch_server
+          - --model-path
+          - {{ .Values.global.model.path }}
+          - --disaggregation-ib-device
+          - {{ .Values.global.rdma.ibDevice }}
+          - --chunked-prefill-size
+          - {{ .Values.prefill.config.chunkedPrefillSize | quote }}
+          - --max-prefill-tokens
+          - {{ .Values.prefill.config.maxPrefillTokens | quote }}
+          - --page-size
+          - {{ .Values.prefill.config.pageSize | quote }}
+          - --ep-dispatch-algorithm
+          - {{ .Values.prefill.config.epDispatchAlgorithm }}
+          - --eplb-algorithm
+          - {{ .Values.prefill.config.eplbAlgorithm }}
+          {{- if .Values.prefill.config.enableDpLmHead }}
+          - --enable-dp-lm-head
+          {{- end }}
+          {{- if .Values.prefill.config.enableDpAttention }}
+          - --enable-dp-attention
+          {{- end }}
+          - --dp-size
+          - {{ .Values.prefill.config.dpSize | quote }}
+          {{- if .Values.prefill.config.disableRadixCache }}
+          - --disable-radix-cache
+          {{- end }}
+          - --moe-a2a-backend
+          - {{ .Values.prefill.config.moeA2aBackend }}
+          - --disaggregation-mode
+          - {{ .Values.prefill.config.disaggregationMode }}
+          - --mem-fraction-static
+          - {{ .Values.prefill.config.memFractionStatic | quote }}
+          - --context-length
+          - {{ .Values.global.model.contextLength | quote }}
+          - --tp
+          - {{ .Values.prefill.config.tp | quote }}
+          - --dist-init-addr
+          - $(LWS_LEADER_ADDRESS):20102
+          - --nnodes
+          - $(LWS_GROUP_SIZE)
+          - --node-rank
+          - $(LWS_WORKER_INDEX)
+          {{- if .Values.global.model.trustRemoteCode }}
+          - --trust-remote-code
+          {{- end }}
+          - --ep-num-redundant-experts
+          - {{ .Values.prefill.config.epNumRedundantExperts | quote }}
+          - --moe-dense-tp-size
+          - {{ .Values.prefill.config.moeDenseTpSize | quote }}
+          - --max-running-requests
+          - {{ .Values.prefill.config.maxRunningRequests | quote }}
+          env:
+          {{- range $key, $value := .Values.prefill.worker.env }}
+          - name: {{ $key }}
+            value: {{ $value | quote }}
+          {{- end }}
+          - name: LWS_WORKER_INDEX
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
+          ports:
+          - containerPort: {{ .Values.prefill.worker.port | int }}
+            protocol: TCP
+          {{- with .Values.prefill.worker.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+          - mountPath: /root/.cache
+            name: sgl-cache
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /work/models
+            name: model
+          - mountPath: /dev/infiniband
+            name: ib
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+            name: cf
+        dnsPolicy: {{ .Values.dnsPolicy }}
+        hostIPC: {{ .Values.hostIPC }}
+        hostNetwork: {{ .Values.hostNetwork }}
+        {{- with .Values.global.nodeSelector }}
+        nodeSelector:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.global.tolerations }}
+        tolerations:
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: ib
+          hostPath:
+            path: /dev/infiniband
+        - name: model
+          hostPath:
+            path: {{ .Values.global.volumes.model.hostPath }}
+        - name: cf
+          hostPath:
+            path: {{ .Values.global.volumes.config.hostPath }}
+        - name: sgl-cache
+          hostPath:
+            path: {{ .Values.global.volumes.cache.hostPath }}
+            {{- if .Values.global.volumes.cache.type }}
+            type: {{ .Values.global.volumes.cache.type }}
+            {{- end }}
+{{- end }}
