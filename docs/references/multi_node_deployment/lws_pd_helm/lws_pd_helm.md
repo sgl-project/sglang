@@ -6,8 +6,7 @@ This Helm Chart is used to deploy SGLang's distributed inference architecture in
 
 ```
 lws_pd_helm/
-├── lws_pd_helm.md                     # Documentation (this file)
-├── lws_pd_helm_zh.md                  # Chinese documentation
+├── lws_pd_helm.md                     # Documentation
 ├── deploy.sh                          # Automated deployment script
 └── sglang-leaderworkerset/            # Helm Chart directory
     ├── Chart.yaml                     # Chart metadata
@@ -35,7 +34,7 @@ lws_pd_helm/
 ### 1. Clone Repository and Navigate to Directory
 
 ```bash
-cd /home/luyu/code/sglang/docs/references/multi_node_deployment/lws_pd_helm
+cd docs/references/multi_node_deployment/lws_pd_helm
 ```
 
 ### 2. Modify Configuration
