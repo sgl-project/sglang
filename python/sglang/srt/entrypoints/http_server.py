@@ -185,7 +185,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     if server_args.enable_trace:
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         if server_args.disaggregation_mode == "null":
             thread_label = f"MultiTokenizer-{tokenizer_manager.worker_id}"
             trace_set_thread_info(thread_label)
@@ -1229,7 +1229,7 @@ def launch_server(
         )
 
         if server_args.enable_trace:
-            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+            process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
             if server_args.disaggregation_mode == "null":
                 thread_label = "Tokenizer"
                 trace_set_thread_info(thread_label)
