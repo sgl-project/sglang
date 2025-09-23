@@ -59,3 +59,4 @@ loadBalancer:
   service:
     type: LoadBalancer  # or NodePort/ClusterIP
     nodePort: 30800  # Only needed when type is NodePort
+    
