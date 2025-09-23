@@ -236,15 +236,15 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
+def get_hash_str_with_extra_tag(get_hash_str, extra_tag):
+    def wrapper(*args, **kwargs):
+        base_hash = get_hash_str(*args, **kwargs)
+        return f"{extra_tag}_{base_hash}"
+
+    return wrapper
+
+
 class HiCacheController:
-
-    @staticmethod
-    def get_hash_str_with_prefix(get_hash_str, prefix):
-        def prefix_hash(input_str, prior_hash: str = None):
-            hash_result = get_hash_str(input_str)
-            return prefix + hash_result
-
-        return prefix_hash
 
     def __init__(
         self,
@@ -272,27 +272,21 @@ class HiCacheController:
             self.storage_backend_type = storage_backend
             from sglang.srt.mem_cache.hicache_storage import get_hash_str
 
+            self.get_hash_str = get_hash_str
             self.storage_config = self._generate_storage_config(
                 model_name, storage_backend_extra_config
             )
 
-            # Get storage_backend_tag from extra_config
-            storage_backend_tag = (
-                self.storage_config.extra_config.get("storage_backend_tag")
+            extra_backend_tag = (
+                self.storage_config.extra_config.get("extra_backend_tag", "")
                 if self.storage_config.extra_config
-                else None
+                else ""
             )
-            self.enable_storage_tag = (
-                storage_backend_tag is not None and storage_backend_tag != ""
-            )
-
-            if self.enable_storage_tag:
-                prefix = f"{storage_backend_tag}_"
-                self.get_hash_str = HiCacheController.get_hash_str_with_prefix(
-                    get_hash_str, prefix
+            if bool(extra_backend_tag):
+                self.get_hash_str = get_hash_str_with_extra_tag(
+                    self.get_hash_str, extra_backend_tag
                 )
-            else:
-                self.get_hash_str = get_hash_str
+
             # for MLA models, only one rank needs to backup the KV cache
             self.backup_skip = (
                 self.storage_config.is_mla_model
