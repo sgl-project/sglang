@@ -616,7 +616,7 @@ impl PDRouter {
                                     );
                                 }
                                 Some(Value::Object(obj))
-                            });
+                            })
                     } else {
                         None
                     };
