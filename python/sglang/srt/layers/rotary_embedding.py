@@ -145,7 +145,7 @@ class RotaryEmbedding(CustomOp):
         cur_len = int(self.cos_sin_cache.shape[0])
         if needed_max_pos < cur_len:
             return
-        
+
         # Align to 128 to reduce realloc frequency
         new_len = ((needed_max_pos + 128) // 128) * 128
         device = self.cos_sin_cache.device
@@ -159,16 +159,16 @@ class RotaryEmbedding(CustomOp):
         t_new = torch.arange(start, new_len, dtype=inv_freq.dtype, device=device)
         if t_new.numel() == 0:
             return
-        
+
         freqs_new = torch.einsum("i,j->ij", t_new, inv_freq)
         cos_new = freqs_new.cos()
         sin_new = freqs_new.sin()
         new_rows = torch.cat((cos_new, sin_new), dim=-1).to(dtype=dtype)
 
         # Update cache with new rows
-        self.cos_sin_cache = torch.cat(
-            (self.cos_sin_cache, new_rows), dim=0
-        ).to(device=device, dtype=dtype)
+        self.cos_sin_cache = torch.cat((self.cos_sin_cache, new_rows), dim=0).to(
+            device=device, dtype=dtype
+        )
 
     def forward_native(
         self,
