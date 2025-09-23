@@ -16,6 +16,14 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
+dependencies = [
+    "setproctitle",
+    "aiohttp",
+    "orjson",
+    "uvicorn",
+    "fastapi",
+]
+
 [project.optional-dependencies]
 dev = [
     "requests>=2.25.0",
