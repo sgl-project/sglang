@@ -653,7 +653,7 @@ def get_dataset(args, tokenizer):
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
         input_requests = sample_sharegpt_requests(
-            dataset_path=args.dataset_name,
+            dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
