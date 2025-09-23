@@ -845,7 +845,6 @@ class ModelRunner:
         """Pre-expand RoPE cache for long sequences and speculative decoding."""
         import os
 
-        # Tunables (env overridable; defaults work for most workloads)
         SAFETY_FACTOR = int(os.getenv("SGLANG_SPEC_EXPANSION_SAFETY_FACTOR", "2"))
         MARGIN        = int(os.getenv("SGLANG_ROPE_CACHE_SAFETY_MARGIN", "1024"))
         ALIGN         = int(os.getenv("SGLANG_ROPE_CACHE_ALIGN", "128"))
@@ -867,12 +866,7 @@ class ModelRunner:
         draft = int(getattr(self.server_args, "speculative_num_draft_tokens", 0) or 0)
         reserve = inferred_cap + steps * draft * SAFETY_FACTOR + MARGIN
 
-        # 4) Cap by model's max_position_embeddings if no rope_scaling enabled
-        hf = self.model_config.hf_text_config
-        if getattr(hf, "max_position_embeddings", None) and not getattr(hf, "rope_scaling", None):
-            reserve = min(reserve, int(hf.max_position_embeddings))
-
-        # 5) Align to reduce reallocation frequency
+        # 4) Align to reduce reallocation frequency
         reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
 
         logger.info(f"RoPE cache reserve={reserve} (base={base_ctx}, cap={inferred_cap}, steps={steps}, draft={draft}, k={SAFETY_FACTOR}, margin={MARGIN})")
