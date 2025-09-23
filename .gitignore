@@ -198,9 +198,6 @@ work_dirs/
 *.o
 *.obj
 
-# pre-commit cache
-.pre-commit-cache/
-
 # Precompiled Headers
 *.gch
 *.pch
