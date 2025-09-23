@@ -64,7 +64,7 @@ use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::tree::Tree;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tracing::debug;
@@ -77,7 +77,7 @@ use tracing::debug;
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
-    trees: Arc<RwLock<HashMap<String, Tree>>>, // model_id -> Tree
+    trees: Arc<Mutex<HashMap<String, Tree>>>, // model_id -> Tree
     eviction_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -87,7 +87,7 @@ impl CacheAwarePolicy {
     }
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
-        let trees = Arc::new(RwLock::new(HashMap::<String, Tree>::new()));
+        let trees = Arc::new(Mutex::new(HashMap::<String, Tree>::new()));
 
         // Start background eviction thread if configured
         let eviction_handle = if config.eviction_interval_secs > 0 {
@@ -98,7 +98,7 @@ impl CacheAwarePolicy {
             Some(thread::spawn(move || loop {
                 thread::sleep(Duration::from_secs(interval));
 
-                if let Ok(mut trees_guard) = trees_clone.write() {
+                if let Ok(mut trees_guard) = trees_clone.lock() {
                     // Evict for all model trees
                     for (model_id, tree) in trees_guard.iter_mut() {
                         tree.evict_tenant_by_size(max_tree_size);
@@ -122,7 +122,7 @@ impl CacheAwarePolicy {
 
     /// Initialize the tree with worker URLs (used only during initial setup)
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
-        if let Ok(mut trees) = self.trees.write() {
+        if let Ok(mut trees) = self.trees.lock() {
             // Group workers by model
             let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
             for worker in workers {
@@ -151,7 +151,7 @@ impl CacheAwarePolicy {
 
     /// Add a single worker to the tree (incremental update)
     pub fn add_worker(&self, worker: &dyn Worker) {
-        if let Ok(mut trees) = self.trees.write() {
+        if let Ok(mut trees) = self.trees.lock() {
             // For backward compatibility: if model_id is "unknown" or empty,
             // use a default tree. This preserves existing behavior for single-model routers.
             let model_id = worker.model_id();
@@ -167,7 +167,7 @@ impl CacheAwarePolicy {
 
     /// Add a worker by URL and model (for backward compatibility)
     pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
-        if let Ok(mut trees) = self.trees.write() {
+        if let Ok(mut trees) = self.trees.lock() {
             let tree = trees.entry(model_id.to_string()).or_insert_with(Tree::new);
             tree.insert("", url);
         }
@@ -175,7 +175,7 @@ impl CacheAwarePolicy {
 
     /// Remove a worker from the tree
     pub fn remove_worker(&self, worker: &dyn Worker) {
-        if let Ok(mut trees) = self.trees.write() {
+        if let Ok(mut trees) = self.trees.lock() {
             // Use same logic as add_worker for consistency
             let model_id = worker.model_id();
             let tree_key = if model_id.is_empty() || model_id == "unknown" {
@@ -191,7 +191,7 @@ impl CacheAwarePolicy {
 
     /// Remove a worker by URL (removes from all model trees for backward compatibility)
     pub fn remove_worker_by_url(&self, url: &str) {
-        if let Ok(mut trees) = self.trees.write() {
+        if let Ok(mut trees) = self.trees.lock() {
             // Remove from all trees since we don't know which model it belongs to
             for (_model_id, tree) in trees.iter_mut() {
                 tree.remove_tenant(url);
@@ -201,7 +201,7 @@ impl CacheAwarePolicy {
 
     /// Run cache eviction to prevent unbounded growth
     pub fn evict_cache(&self, max_size: usize) {
-        if let Ok(mut trees) = self.trees.write() {
+        if let Ok(mut trees) = self.trees.lock() {
             for (model_id, tree) in trees.iter_mut() {
                 tree.evict_tenant_by_size(max_size);
                 debug!(
@@ -270,8 +270,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
             // Even in imbalanced mode, update the tree to maintain cache state
             if let Some(text) = request_text {
-                if let Ok(mut trees) = self.trees.write() {
-                    let tree = trees.entry(model_id.to_string()).or_insert_with(Tree::new);
+                if let Ok(mut trees) = self.trees.lock() {
+                    // Avoid allocation if tree already exists
+                    let tree = if let Some(tree) = trees.get_mut(model_id) {
+                        tree
+                    } else {
+                        trees.entry(model_id.to_string()).or_insert_with(Tree::new)
+                    };
                     tree.insert(text, workers[min_load_idx].url());
                 }
             }
@@ -287,8 +292,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Use cache-aware routing when balanced
         let text = request_text.unwrap_or("");
 
-        if let Ok(mut trees) = self.trees.write() {
-            let tree = trees.entry(model_id.to_string()).or_insert_with(Tree::new);
+        if let Ok(mut trees) = self.trees.lock() {
+            // Avoid allocation if tree already exists
+            let tree = if let Some(tree) = trees.get_mut(model_id) {
+                tree
+            } else {
+                trees.entry(model_id.to_string()).or_insert_with(Tree::new)
+            };
             let (matched_text, matched_worker) = tree.prefix_match(text);
             let match_rate = if text.is_empty() {
                 0.0
