@@ -40,7 +40,7 @@ def run_benchmark(args: argparse.Namespace):
 
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
-    do_benchmark(args)
+    return do_benchmark(args)
 
 
 def sample_random_requests(
