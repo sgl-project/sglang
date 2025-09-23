@@ -53,7 +53,7 @@ runtime_common = [
     "transformers==4.56.1",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.24",
+    "xgrammar==0.1.25",
 ]
 
 tracing = [
