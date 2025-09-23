@@ -157,13 +157,18 @@ impl OpenAIRouter {
                                     obj.insert("metadata".to_string(), Value::Object(metadata_map));
                                 }
                             }
+
+                            // Reflect the client's requested store preference in the response body
+                            obj.insert("store".to_string(), Value::Bool(original_body.store));
                         }
 
-                        if let Err(e) = self
-                            .store_response_internal(&openai_response_json, original_body)
-                            .await
-                        {
-                            warn!("Failed to store response: {}", e);
+                        if original_body.store {
+                            if let Err(e) = self
+                                .store_response_internal(&openai_response_json, original_body)
+                                .await
+                            {
+                                warn!("Failed to store response: {}", e);
+                            }
                         }
 
                         match serde_json::to_string(&openai_response_json) {
@@ -436,6 +441,10 @@ impl OpenAIRouter {
         response_json: &Value,
         original_body: &ResponsesRequest,
     ) -> Result<(), String> {
+        if !original_body.store {
+            return Ok(());
+        }
+
         match Self::store_response_impl(&self.response_storage, response_json, original_body).await
         {
             Ok(response_id) => {
@@ -451,6 +460,10 @@ impl OpenAIRouter {
         response: &ResponsesResponse,
         original_body: &ResponsesRequest,
     ) {
+        if !original_body.store {
+            return;
+        }
+
         match serde_json::to_value(response) {
             Ok(value) => {
                 match Self::store_response_impl(response_storage, &value, original_body).await {
