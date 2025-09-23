@@ -115,27 +115,27 @@ class DecodeKVCacheOffloadManager:
         return True
 
     def check_offload_progress(self):
-        self._check_offload_progress()
-        self._check_backup_progress()
+        """Check the progress of offload from device to host and backup from host to storage."""
+        cc = self.cache_controller
 
-    def _check_offload_progress(self):
-        """Check the progress of offload from device to host."""
-
-        finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
-        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        qsizes = torch.tensor(
+            [
+                len(cc.ack_write_queue),
+                cc.ack_backup_queue.qsize(),
+            ],
+            dtype=torch.int,
+        )
         if self.tp_world_size > 1:
-            # synchronize TP workers to make the same update
             torch.distributed.all_reduce(
-                queue_size,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
+                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 
-        finish_count = int(queue_size.item())
+        n_write, n_backup = map(int, qsizes.tolist())
+        self._check_offload_progress(n_write)
+        self._check_backup_progress(n_backup)
+
+    def _check_offload_progress(self, finish_count):
+        """Check the progress of offload from device to host."""
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
@@ -149,6 +149,20 @@ class DecodeKVCacheOffloadManager:
                 self._trigger_backup(req.rid, host_indices, tokens, start_time)
             finish_count -= 1
 
+    def _check_backup_progress(self, finish_count):
+        """Check the progress of backup from host to storage."""
+        for _ in range(finish_count):
+            storage_operation = self.cache_controller.ack_backup_queue.get()
+            ack_id = storage_operation.id
+            req_id, host_indices, start_time = self.ongoing_backup.pop(ack_id)
+
+            # Release host memory
+            self.decode_host_mem_pool.free(host_indices)
+
+            logger.debug(
+                f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} seconds."
+            )
+
     def _trigger_backup(self, req_id, host_indices, tokens, start_time):
         """Trigger async backup from host to storage by cache controller."""
 
@@ -161,32 +175,7 @@ class DecodeKVCacheOffloadManager:
         )
         self.ongoing_backup[ack_id] = (req_id, host_indices, start_time)
 
-    def _check_backup_progress(self):
-        """Check the progress of backup from host to storage."""
-
-        queue_size = torch.tensor(
-            self.cache_controller.ack_backup_queue.qsize(), dtype=torch.int
-        )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                queue_size,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-
-        for _ in range(queue_size.item()):
-            storage_operation = self.cache_controller.ack_backup_queue.get()
-            ack_id = storage_operation.id
-            req_id, host_indices, start_time = self.ongoing_backup.pop(ack_id)
-
-            # Release host memory
-            self.decode_host_mem_pool.free(host_indices)
-
-            logger.debug(
-                f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} seconds."
-            )
-
-    def _compute_prefix_hash(self, tokens) -> str:
+    def _compute_prefix_hash(self, tokens):
         last_hash = ""
         page_hashes = []
         for offset in range(0, len(tokens), self.page_size):
