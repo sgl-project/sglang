@@ -195,7 +195,9 @@ class RuntimeEndpoint(BaseBackend):
         if isinstance(obj, list):
             if not obj:
                 return [], []
-            comps, meta_infos = zip(*((item["text"], item["meta_info"]) for item in obj))
+            comps, meta_infos = zip(
+                *((item["text"], item["meta_info"]) for item in obj)
+            )
             return list(comps), list(meta_infos)
         else:
             comp = obj["text"]
