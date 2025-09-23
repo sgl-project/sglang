@@ -89,10 +89,10 @@ spec:
         - name: cf
           hostPath:
             path: {{ .Values.global.volumes.config.hostPath }}
-    
+
     restartPolicy: {{ .Values.decode.leaderWorkerSet.restartPolicy }}
     size: {{ .Values.decode.leaderWorkerSet.size }}
-    
+
     workerTemplate:
       metadata:
         labels:
@@ -163,21 +163,21 @@ spec:
         - name: cf
           hostPath:
             path: {{ .Values.global.volumes.config.hostPath }}
-            
+
   {{- with .Values.decode.leaderWorkerSet.networkConfig }}
   networkConfig:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  
+
   {{- if .Values.decode.leaderWorkerSet.replicas }}
   replicas: {{ .Values.decode.leaderWorkerSet.replicas }}
   {{- end }}
-  
+
   {{- with .Values.decode.leaderWorkerSet.rolloutStrategy }}
   rolloutStrategy:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  
+
   {{- if .Values.decode.leaderWorkerSet.startupPolicy }}
   startupPolicy: {{ .Values.decode.leaderWorkerSet.startupPolicy }}
   {{- end }}

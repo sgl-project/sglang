@@ -89,10 +89,10 @@ spec:
             {{- if .Values.global.volumes.cache.type }}
             type: {{ .Values.global.volumes.cache.type }}
             {{- end }}
-    
+
     restartPolicy: {{ .Values.prefill.leaderWorkerSet.restartPolicy }}
     size: {{ .Values.prefill.leaderWorkerSet.size }}
-    
+
     workerTemplate:
       metadata:
         labels:

@@ -7,7 +7,7 @@
 {{- if .Values.loadBalancer.enabled }}
 {{- if eq .Values.loadBalancer.service.type "NodePort" }}
   You can access the SGLang PD service via NodePort:
-  
+
   export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ $lbServiceName }})
   export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
   echo http://$NODE_IP:$NODE_PORT
@@ -21,7 +21,7 @@
 
 {{- else if eq .Values.loadBalancer.service.type "ClusterIP" }}
   To access the service from within the cluster:
-  
+
   kubectl run sglang-pd-test --rm -i --tty --image=curlimages/curl -- /bin/sh
   curl http://{{ $lbServiceName }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.loadBalancer.service.port }}
 
@@ -48,15 +48,15 @@
 {{- if .Values.prefill.enabled }}
   # Prefill leader logs
   kubectl logs -l leaderworkerset.sigs.k8s.io/name={{ .Values.global.namePrefix }}-prefill,role=leader --namespace {{ .Release.Namespace }}
-  
-  # Prefill worker logs  
+
+  # Prefill worker logs
   kubectl logs -l leaderworkerset.sigs.k8s.io/name={{ .Values.global.namePrefix }}-prefill,leaderworkerset.sigs.k8s.io/worker-index=1 --namespace {{ .Release.Namespace }}
 {{- end }}
 
 {{- if .Values.decode.enabled }}
   # Decode leader logs
   kubectl logs -l leaderworkerset.sigs.k8s.io/name={{ .Values.global.namePrefix }}-decode,role=leader --namespace {{ .Release.Namespace }}
-  
+
   # Decode worker logs
   kubectl logs -l leaderworkerset.sigs.k8s.io/name={{ .Values.global.namePrefix }}-decode,leaderworkerset.sigs.k8s.io/worker-index=1 --namespace {{ .Release.Namespace }}
 {{- end }}

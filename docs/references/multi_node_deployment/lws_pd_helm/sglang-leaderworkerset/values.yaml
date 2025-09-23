@@ -10,30 +10,30 @@ global:
     repository: lmsysorg/sglang
     tag: "latest"
     pullPolicy: IfNotPresent
-  
+
   model:
     # Modify according to your deployment
     path: "/data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528"
     contextLength: "32768"
     trustRemoteCode: true
-  
+
   nodeSelector:
     pd: "yes"
-  
+
   tolerations:
     - key: bopd
       operator: Exists
     - key: node-role
       operator: Exists
-  
+
   rdma:
     ibDevice: "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3"
     hcaPeMapping: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
-  
+
   # Distributed initialization configuration
   distInit:
     port: "20102"  # Port for distributed initialization communication
-  
+
   volumes:
     model:
       # Modify according to your deployment
@@ -48,12 +48,12 @@ global:
 # Prefill configuration
 prefill:
   enabled: true
-  
+
   leaderWorkerSet:
     size: 2
     restartPolicy: RecreateGroupOnPodRestart
     replicas: 1
-  
+
   config:
     port: "30000"
     host: "0.0.0.0"
@@ -73,7 +73,7 @@ prefill:
     epNumRedundantExperts: "32"
     moeDenseTpSize: "1"
     maxRunningRequests: "1024"
-  
+
   leader:
     env:
       NVSHMEM_HCA_PE_MAPPING: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
@@ -89,16 +89,16 @@ prefill:
       MC_TE_METRIC: "false"
       NCCL_IB_SL: "5"
       NCCL_IB_HCA: "^=mlx5_0,mlx5_5,mlx5_6"
-    
+
     readinessProbe:
       periodSeconds: 30
       tcpSocket:
         port: 30000
-    
+
     resources:
       limits:
         "nvidia.com/gpu": "8"
-  
+
   # Worker container specific configuration
   worker:
     port: 30001  # Worker container port
@@ -120,7 +120,7 @@ prefill:
       NCCL_MIN_NCHANNELS: "4"
       MC_TE_METRIC: "true"
       NCCL_IB_SL: "5"
-    
+
     resources:
       limits:
         "nvidia.com/gpu": "8"
@@ -128,7 +128,7 @@ prefill:
 # Decode configuration
 decode:
   enabled: true
-  
+
   # LeaderWorkerSet configuration
   leaderWorkerSet:
     size: 2
@@ -142,7 +142,7 @@ decode:
         maxSurge: 0
         maxUnavailable: 1
     startupPolicy: LeaderCreated
-  
+
   # Specific decode parameters
   config:
     port: "30000"
@@ -160,7 +160,7 @@ decode:
     tpSize: "16"
     epNumRedundantExperts: "32"
     moeDenseTpSize: "1"
-  
+
   # Leader container specific configuration
   leader:
     env:
@@ -178,16 +178,16 @@ decode:
       SGLANG_MOONCAKE_TRANS_THREAD: "16"
       SGL_ENABLE_JIT_DEEPGEMM: "1"
       NCCL_IB_HCA: "^=mlx5_0,mlx5_5,mlx5_6"
-    
+
     readinessProbe:
       periodSeconds: 30
       tcpSocket:
         port: 30000
-    
+
     resources:
       limits:
         "nvidia.com/gpu": "8"
-  
+
   # Worker container specific configuration
   worker:
     port: 30001  # Worker container port
@@ -206,11 +206,11 @@ decode:
       SGLANG_MOONCAKE_TRANS_THREAD: "16"
       SGL_ENABLE_JIT_DEEPGEMM: "1"
       NCCL_IB_HCA: "^=mlx5_0,mlx5_5,mlx5_6"
-    
+
     resources:
       limits:
         "nvidia.com/gpu": "8"
-  
+
   # Volume configuration specific to decode
   volumes:
     cache:
@@ -231,29 +231,29 @@ service:
 # Load Balancer configuration
 loadBalancer:
   enabled: true
-  
+
   deployment:
     replicas: 1
-    
+
   config:
     port: "8000"
     host: "0.0.0.0"
-    
+
   nodeSelector:
     bo: "yes"
-    
+
   tolerations:
     - key: bopd
       operator: Exists
     - key: node-role
       operator: Exists
-  
+
   service:
     type: NodePort
     port: 8000
     targetPort: 8000
     nodePort: 30800
-    
+
   resources: {}
 
 # Security context - controls Pod security permissions and capabilities
