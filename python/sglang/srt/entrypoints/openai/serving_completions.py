@@ -107,6 +107,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
+            priority=request.priority,
             customer_labels=customer_labels,
         )
 

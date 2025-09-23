@@ -1,7 +1,8 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use sglang_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    HealthCheckConfig, HistoryBackend, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig,
+    RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
@@ -312,6 +313,10 @@ struct CliArgs {
     /// Explicit tokenizer path (overrides model_path tokenizer if provided)
     #[arg(long)]
     tokenizer_path: Option<String>,
+
+    /// History backend configuration (memory or none)
+    #[arg(long, default_value = "memory", value_parser = ["memory", "none"])]
+    history_backend: String,
 }
 
 impl CliArgs {
@@ -506,6 +511,10 @@ impl CliArgs {
             rate_limit_tokens_per_second: None,
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
+            history_backend: match self.history_backend.as_str() {
+                "none" => HistoryBackend::None,
+                _ => HistoryBackend::Memory,
+            },
         })
     }
 

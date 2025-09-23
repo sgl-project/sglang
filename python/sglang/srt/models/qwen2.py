@@ -484,10 +484,6 @@ class Qwen2ForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(

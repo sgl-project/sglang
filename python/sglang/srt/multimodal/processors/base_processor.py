@@ -241,12 +241,13 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        # move feature tensors to cpu
-        for feature_name in self.FEATURE_NAMES:
-            if feature_name in result and isinstance(
-                result[feature_name], torch.Tensor
-            ):
-                result[feature_name] = result[feature_name].to("cpu")
+        if not self.server_args.keep_mm_feature_on_device:
+            # move feature tensors to cpu
+            for feature_name in self.FEATURE_NAMES:
+                if feature_name in result and isinstance(
+                    result[feature_name], torch.Tensor
+                ):
+                    result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
