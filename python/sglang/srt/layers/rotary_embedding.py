@@ -782,27 +782,33 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # NOTE: now npu_mrope can only support `numQHeads*headSize <= 4096` pattern,
-        # and generalization to more scenarios will be supported in the future.
-        if query.shape[1] * query.shape[2] > 4096:
-            return self.forward_native(positions, query, key, offsets)
-        num_tokens = query.shape[0]
-        rotary_mode = "half" if self.is_neox_style else "interleave"
+        num_tokens, num_q_heads, _ = query.shape
+        num_k_heads = key.shape[1]
+
         self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
+        cos_sin = self.cos_sin_cache[
+            torch.add(positions, offsets) if offsets is not None else positions
+        ]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        # Reshape to [batchsize, head_dim, seq, rotary_dim]
+        cos = cos.repeat(1, 2).unsqueeze(-2).unsqueeze(-2)
+        sin = sin.repeat(1, 2).unsqueeze(-2).unsqueeze(-2)
+
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
         if self.rotary_dim < self.head_size:
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
 
-        query_rot, key_rot = torch_npu.npu_mrope(
-            torch.add(positions, offsets) if offsets is not None else positions,
-            query_rot.reshape(num_tokens, -1),
-            key_rot.reshape(num_tokens, -1),
-            self.cos_sin_cache,
-            self.rotary_dim,
-            mrope_section=[0, 0, 0],
-            rotary_mode=rotary_mode,
+        query_rot = torch_npu.npu_interleave_rope(
+            query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
+            cos,
+            sin,
+        )
+        key_rot = torch_npu.npu_interleave_rope(
+            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
+            cos,
+            sin,
         )
         query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
         key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
