@@ -23,7 +23,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Union, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -147,6 +147,7 @@ def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
 
     return i
 
+
 def get_child_key(key: RadixKey, page_size: int = 1):
     if page_size == 1:
         plain_key = key.token_ids[0]
@@ -156,6 +157,7 @@ def get_child_key(key: RadixKey, page_size: int = 1):
         return plain_key
     else:
         return (key.extra_key, plain_key)
+
 
 def _convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
     # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
@@ -296,7 +298,7 @@ class RadixCache(BasePrefixCache):
         key = self.key_convert_fn(key)
 
         if value is None:
-           value = torch.tensor(key.token_ids, dtype=torch.int64)
+            value = torch.tensor(key.token_ids, dtype=torch.int64)
 
         if self.is_eagle:
             # EAGLE uses bigram key, the key length should -1
