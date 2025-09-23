@@ -181,6 +181,11 @@ _is_sm100_supported = is_cuda() and is_sm100_supported()
 
 logger = logging.getLogger(__name__)
 
+
+def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
+    return quant_config is not None and quant_config.get_name() == "modelopt_fp4" and get_moe_a2a_backend().is_deepep()
+
+
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
     "flashinfer",
@@ -2038,6 +2043,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        moe_quant_config: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -2086,7 +2092,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
-                quant_config=quant_config,
+                quant_config=moe_quant_config or quant_config,
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
@@ -2845,10 +2851,14 @@ class DeepseekV2ForCausalLM(nn.Module):
     # TODO temporary code duplication before refactoring both to Fp8LinearMethod
     def _transform_scale_ue8m0(self, is_nextn=False):
         print("hi execute transform_scale_ue8m0")
-        assert not is_nextn, "is_nextn not supported yet"
 
-        for layer_id in range(self.config.num_hidden_layers):
-            layer = self.model.layers[layer_id]
+        num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
+
+        for layer_id in range(num_hidden_layers):
+            if is_nextn:
+                layer = self.model.decoder
+            else:
+                layer = self.model.layers[layer_id]
 
             module_list = [
                 # layer.self_attn.kv_b_proj,
@@ -2885,6 +2895,8 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
             weights = self._quant_attn_to_fp8_ue8m0(weights)
+        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+            weights = self._quant_nextn_moe_to_fp8_ue8m0(weights, nextn_layer_id=nextn_layer_id)
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -3138,6 +3150,30 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
                 weights_dict[f"{partial_name}.weight"] = out_w
                 weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
+
+        return list(weights_dict.items())
+
+    # TODO avoid code dup
+    def _quant_nextn_moe_to_fp8_ue8m0(self, weights, nextn_layer_id: int):
+        weights_dict = dict(weights)
+
+        # temporarily only support DeepSeek V3/R1
+        weight_block_size = [128, 128]
+
+        for layer_id in [nextn_layer_id]:
+            for expert_id in range(self.config.n_routed_experts):
+                for stem in [
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ]:
+                    partial_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{stem}"
+                    original_weight = weights_dict[f"{partial_name}.weight"]
+                    out_w, out_s = quant_weight_ue8m0(
+                        original_weight, weight_block_size=weight_block_size
+                    )
+                    weights_dict[f"{partial_name}.weight"] = out_w
+                    weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
 
         return list(weights_dict.items())
 
