@@ -12,7 +12,7 @@ jobs:
     strategy:
       matrix:
         variant:
-          - version: 12.6.1
+          - version: 12.9.1
             type: all
             tag: dev
     steps:
