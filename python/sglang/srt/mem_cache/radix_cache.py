@@ -263,7 +263,7 @@ class RadixCache(BasePrefixCache):
                 to expose a precise boundary; this structural refinement improves
                 subsequent match efficiency and does not duplicate data.
         """
-        key = self.key_convert_fn(key)
+        key.token_ids = self.key_convert_fn(key.token_ids)
 
         if self.disable or len(key) == 0:
             return MatchResult(
@@ -295,7 +295,7 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return 0
 
-        key = self.key_convert_fn(key)
+        key.token_ids = self.key_convert_fn(key.token_ids)
 
         if value is None:
             value = torch.tensor(key.token_ids, dtype=torch.int64)
