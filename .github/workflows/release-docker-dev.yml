@@ -16,6 +16,9 @@ jobs:
             type: all
             tag: dev
     steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -57,6 +60,9 @@ jobs:
             tag: blackwell-cu129
 
     steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -98,6 +104,9 @@ jobs:
             type: blackwell_aarch
             tag: blackwell-cu129
     steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
