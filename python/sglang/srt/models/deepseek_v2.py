@@ -332,7 +332,10 @@ def handle_aiter(attn, forward_batch):
         return AttnForwardMethod.MLA
 
 
-def handle_triton(attn, forward_batch):
+def handle_triton(attn, forward_batch: ForwardBatch):
+    if forward_batch.forward_mode.is_draft_extend_v2():
+        return _dispatch_mla_subtype(attn, forward_batch)
+
     if (
         _is_extend_without_speculative(forward_batch)
         and sum(forward_batch.extend_prefix_lens_cpu) == 0

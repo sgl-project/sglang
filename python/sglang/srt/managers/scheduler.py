@@ -113,6 +113,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
+from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -141,7 +142,6 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -204,6 +204,10 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: List[int]
     bid: int
     can_run_cuda_graph: bool
+    copy_done: torch.cuda.Event
+    accept_length: Optional[torch.Tensor]
+    new_seq_lens: Optional[torch.Tensor]
+    allocate_lens: Optional[torch.Tensor]
 
 
 @dataclass
@@ -345,12 +349,7 @@ class Scheduler(
             logger.info("Overlap scheduler is disabled for embedding models.")
 
         # Launch a tensor parallel worker
-        if self.enable_overlap:
-            TpWorkerClass = TpModelWorkerClient
-        else:
-            TpWorkerClass = TpModelWorker
-
-        self.tp_worker = TpWorkerClass(
+        self.tp_worker = TpModelWorker(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -362,7 +361,7 @@ class Scheduler(
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+            from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorker
 
             self.draft_worker = EAGLEWorker(
                 gpu_id=gpu_id,
@@ -373,6 +372,7 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+            self.forward_worker = self.draft_worker
         elif self.spec_algorithm.is_standalone():
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
@@ -385,6 +385,7 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+            self.forward_worker = self.draft_worker
         elif self.spec_algorithm.is_lookahead():
             from sglang.srt.speculative.lookahead_worker import LOOKAHEADWorker
 
@@ -399,6 +400,7 @@ class Scheduler(
             )
         else:
             self.draft_worker = None
+            self.forward_worker = self.tp_worker
 
         # Get token and memory info from the model worker
         (
@@ -480,6 +482,11 @@ class Scheduler(
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
+        self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream_ctx = torch.get_device_module(self.device).stream(
+            self.forward_stream
+        )
+        self.copy_stream = torch.get_device_module(self.device).Stream()
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -530,6 +537,14 @@ class Scheduler(
             self.init_new_token_ratio - self.min_new_token_ratio
         ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
+
+        # init future map for overlap schedule
+        if self.enable_overlap:
+            self.future_map = FutureMap(
+                spec_algorithm=self.spec_algorithm,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
 
         # Init watchdog thread
         self.watchdog_timeout = server_args.watchdog_timeout
@@ -907,7 +922,6 @@ class Scheduler(
                     trace_event("schedule", req.rid)
 
             if batch:
-                batch.launch_done = threading.Event()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
@@ -917,20 +931,17 @@ class Scheduler(
                     tmp_batch = ScheduleBatch(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                        next_batch_sampling_info=self.cur_sampling_info,
                     )
-                    self.process_batch_result(tmp_batch, None, batch.launch_done)
+                    self.process_batch_result(tmp_batch, None)
 
             if self.last_batch:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    self.cur_sampling_info if batch else None
                 )
-                # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
-                self.process_batch_result(
-                    tmp_batch, tmp_result, batch.launch_done if batch else None
-                )
+                self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1567,6 +1578,21 @@ class Scheduler(
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()
 
+    def _check_kv_indices_leak_for_radix(self, token_msg):
+        total_kv_indices = set(range(1, self.max_total_num_tokens + 1))
+        cached_kv_indices = set(self.tree_cache.cached_kv_indices())
+        available_kv_indices = set(self.token_to_kv_pool_allocator.free_pages.tolist())
+
+        kv_indices_leak = total_kv_indices != (cached_kv_indices | available_kv_indices)
+        missing_kv_indices = total_kv_indices - (
+            cached_kv_indices | available_kv_indices
+        )
+
+        if kv_indices_leak:
+            token_msg += f"{len(total_kv_indices)=}, {len(cached_kv_indices)=}, {len(available_kv_indices)=}, {len(missing_kv_indices)=}, {total_kv_indices=}, {cached_kv_indices=}, {available_kv_indices=}, {missing_kv_indices=}\n"
+
+        return token_msg
+
     def check_memory(self):
         if self.is_hybrid:
             (
@@ -1587,14 +1613,18 @@ class Scheduler(
         else:
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
+
             memory_leak = (available_size + evictable_size) != (
                 # self.max_total_num_tokens
                 # if not self.enable_hierarchical_cache
                 # else self.max_total_num_tokens - protected_size
                 self.max_total_num_tokens
-                - protected_size
+                if not self.enable_hierarchical_cache
+                else self.max_total_num_tokens - protected_size
             )
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+            if isinstance(self.tree_cache, RadixCache):
+                token_msg = self._check_kv_indices_leak_for_radix(token_msg)
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
@@ -1908,7 +1938,9 @@ class Scheduler(
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
-            self.spec_algorithm,
+            self.server_args.enable_custom_logit_processor,
+            spec_algorithm=self.spec_algorithm,
+            draft_worker=self.draft_worker,
             chunked_req=self.chunked_req,
         )
         if self.enable_hierarchical_cache:
@@ -1993,60 +2025,91 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none():
-                model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch = batch.get_model_worker_batch()
 
-                if self.pp_group.is_last_rank:
-                    logits_output, next_token_ids, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
+            if self.enable_overlap:
+                bs = len(batch.reqs)
+                future_ct = self.future_map.get_next_future_ct(bs)
+
+                # Make a copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
+                self.cur_sampling_info = model_worker_batch.sampling_info = (
+                    model_worker_batch.sampling_info.copy_for_forward()
+                )
+
+                # Run forward in a separate stream to avoid blocking the main stream.
+                with self.forward_stream_ctx:
+                    # spec_info / input_ids is a future from the previous batch.
+                    # resolve it with the future_map
+                    self.future_map.resolve_future(model_worker_batch)
+
+                    forward_output = self.forward_worker.forward_batch_generation(
+                        model_worker_batch
                     )
-                else:
-                    pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
-                    )
-                bid = model_worker_batch.bid
+
+                    # store spec_info / output_ids to the future_map for next batch resolution
+                    self.future_map.store_to_map(future_ct, bs, forward_output)
+
+                    # copy the output to the main stream
+                    copy_done = torch.cuda.Event()
+                    copy_done.record()
+
+                # construct a new future_spec_info for scheduler processing (e.g. merge, filter) in the next batch
+                output_allocate_lens = (
+                    forward_output.spec_info.allocate_lens
+                    if forward_output.spec_info is not None
+                    else None
+                )
+
+                # update the spec_info / output_ids for next batch resolution
+                self.future_map.update_next_future(
+                    batch, future_ct, bs, output_allocate_lens
+                )
             else:
-                (
-                    logits_output,
-                    next_token_ids,
-                    bid,
-                    num_accepted_tokens,
-                    can_run_cuda_graph,
-                ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                bs = batch.batch_size()
-                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
-                self.spec_num_total_forward_ct += bs
-                self.num_generated_tokens += num_accepted_tokens
+                forward_output = self.forward_worker.forward_batch_generation(
+                    model_worker_batch
+                )
+                batch.spec_info = forward_output.spec_info
+                copy_done = None
+            batch.output_ids = forward_output.next_token_ids
 
-            if self.pp_group.is_last_rank:
-                batch.output_ids = next_token_ids
+            # Handle speculative decoding output
+            if forward_output.spec_info is not None:
+                new_seq_lens = (  # val is ready after verify_done
+                    forward_output.spec_info.new_seq_lens
+                )
+                allocate_lens = (  # val is always ready, at batch schedule time
+                    forward_output.spec_info.allocate_lens
+                )
+                batch.seq_lens = new_seq_lens
+                batch.verify_done = forward_output.spec_info.verify_done
+            else:
+                new_seq_lens = None
+                allocate_lens = None
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
             if batch.return_logprob or self.spec_algorithm.is_eagle():
                 extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
-            else:
-                extend_input_len_per_req = None
-            if batch.return_logprob:
                 extend_logprob_start_len_per_req = [
                     req.extend_logprob_start_len for req in batch.reqs
                 ]
             else:
+                extend_input_len_per_req = None
                 extend_logprob_start_len_per_req = None
 
             ret = GenerationBatchResult(
-                logits_output=logits_output if self.pp_group.is_last_rank else None,
-                pp_hidden_states_proxy_tensors=(
-                    pp_hidden_states_proxy_tensors
-                    if not self.pp_group.is_last_rank
-                    else None
-                ),
-                next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
+                logits_output=forward_output.logits_output,
+                pp_hidden_states_proxy_tensors=forward_output.pp_hidden_states_proxy_tensors,
+                next_token_ids=forward_output.next_token_ids,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-                bid=bid,
-                can_run_cuda_graph=can_run_cuda_graph,
+                bid=model_worker_batch.bid,
+                can_run_cuda_graph=forward_output.can_run_cuda_graph,
+                copy_done=copy_done,
+                accept_length=forward_output.accept_length,
+                new_seq_lens=new_seq_lens,
+                allocate_lens=allocate_lens,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
@@ -2060,10 +2123,9 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result, launch_done)
+            self.process_batch_result_decode(batch, result)
             for req in batch.reqs:
                 trace_slice(
                     "decode loop",
@@ -2073,7 +2135,7 @@ class Scheduler(
                 )
 
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result, launch_done)
+            self.process_batch_result_prefill(batch, result)
             for req in batch.reqs:
                 trace_slice(
                     "prefill",
@@ -2083,7 +2145,7 @@ class Scheduler(
                 )
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self.tp_worker.resolve_last_batch_result(launch_done)
+                self.tp_worker.resolve_last_batch_result()
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
@@ -2389,7 +2451,7 @@ class Scheduler(
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0
             self.spec_num_total_accepted_tokens = 0
-            self.spec_num_total_forward_ct = 0
+            self.spec_num_total_forward_ct = 1
             self.cum_spec_accept_length = 0
             self.cum_spec_accept_count = 0
             torch.cuda.empty_cache()

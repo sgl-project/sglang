@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 _is_npu = is_npu()
 
@@ -81,6 +81,10 @@ class ForwardMode(IntEnum):
     TARGET_VERIFY = auto()
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
+    # Used in speculative decoding: extend a batch in the draft model.
+    # This is used in eagle_worker_v2.
+    # It is almost the same as EXTEND, but returns all hidden states and logits.
+    DRAFT_EXTEND_V2 = auto()
 
     # A dummy first batch to start the pipeline for overlap scheduler.
     # It is now used for triggering the sampling_info_done event for the first prefill batch.
@@ -96,8 +100,9 @@ class ForwardMode(IntEnum):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
-            or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.DRAFT_EXTEND
+            or self == ForwardMode.DRAFT_EXTEND_V2
         )
 
     def is_decode(self):
@@ -117,6 +122,9 @@ class ForwardMode(IntEnum):
 
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
+
+    def is_draft_extend_v2(self):
+        return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self):
         return (
@@ -309,6 +317,9 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # TODO(lsyin): remove this
+    is_prefill_only: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -420,10 +431,14 @@ class ForwardBatch:
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode():
+        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
+            # NOTE(lsyin): make sure the ModelWorkerBatch's extend_seq_lens and extend_prefix_lens are always on CPU
+            # Other wise sync would happen during launching triton kernel
+            assert isinstance(batch.extend_seq_lens, list)
+            assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -926,6 +941,16 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+
+@dataclass
+class ForwardBatchOutput:
+    logits_output: Optional[torch.Tensor] = None
+    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
+    next_token_ids: Optional[torch.Tensor] = None  # shape: (b, 1)
+    can_run_cuda_graph: bool = False
+    spec_info: Optional[SpecInfo] = None
+    accept_length: Optional[torch.Tensor] = None
 
 
 def enable_num_token_non_padded(server_args):

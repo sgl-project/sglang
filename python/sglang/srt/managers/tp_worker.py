@@ -43,7 +43,11 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardBatchOutput,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
@@ -232,16 +236,14 @@ class TpModelWorker:
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
-        launch_done: Optional[threading.Event] = None,
+        model_worker_batch: Union[ForwardBatch, ModelWorkerBatch],
         skip_sample: bool = False,
-    ) -> Tuple[
-        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
-    ]:
-        # update the consumer index of hicache to the running batch
-        self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
-
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        skip_attn_backend_init=False,
+    ) -> ForwardBatchOutput:
+        if isinstance(model_worker_batch, ModelWorkerBatch):
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        else:
+            forward_batch = model_worker_batch
 
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
@@ -253,10 +255,10 @@ class TpModelWorker:
 
         if self.pp_group.is_last_rank:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
-                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                skip_attn_backend_init=skip_attn_backend_init,
             )
-            if launch_done is not None:
-                launch_done.set()
 
             if skip_sample:
                 next_token_ids = None
@@ -272,13 +274,21 @@ class TpModelWorker:
             else:
                 next_token_ids = self.model_runner.sample(logits_output, forward_batch)
 
-            return logits_output, next_token_ids, can_run_cuda_graph
+            return ForwardBatchOutput(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
+                skip_attn_backend_init=skip_attn_backend_init,
             )
-            return pp_proxy_tensors.tensors, None, can_run_cuda_graph
+            return ForwardBatchOutput(
+                pp_hidden_states_proxy_tensors=pp_proxy_tensors,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)

@@ -366,7 +366,6 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-        launch_done: Optional[threading.Event] = None,
     ) -> None:
         """
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -388,8 +387,8 @@ class SchedulerDisaggregationPrefillMixin:
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         if self.enable_overlap:
             # wait
-            logits_output, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(
-                launch_done
+            logits_output, next_token_ids, _ = (
+                self.tp_worker.resolve_last_batch_result()
             )
         else:
             next_token_ids = result.next_token_ids.tolist()
