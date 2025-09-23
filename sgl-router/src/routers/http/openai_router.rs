@@ -208,232 +208,17 @@ impl OpenAIRouter {
 
     async fn handle_streaming_response(
         &self,
-        url: String,
-        headers: Option<&HeaderMap>,
-        payload: Value,
-        original_body: &ResponsesRequest,
-        original_previous_response_id: Option<String>,
+        _url: String,
+        _headers: Option<&HeaderMap>,
+        _payload: Value,
+        _original_body: &ResponsesRequest,
+        _original_previous_response_id: Option<String>,
     ) -> Response {
-        // Set up streaming request
-        let mut request_builder = self.client.post(&url).json(&payload);
-
-        // Apply headers
-        if let Some(headers) = headers {
-            request_builder = apply_request_headers(headers, request_builder, true);
-        }
-
-        // Make the request
-        match request_builder.send().await {
-            Ok(response) => {
-                let status = response.status();
-                if !status.is_success() {
-                    let error_text = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|e| format!("Failed to get error body: {}", e));
-                    return (status, error_text).into_response();
-                }
-
-                // Set up channel for streaming
-                let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
-                let response_storage = self.response_storage.clone();
-                let body_clone = original_body.clone();
-                let prev_response_id = original_previous_response_id.clone();
-
-                // Spawn task to handle streaming response
-                tokio::spawn(async move {
-                    let mut accumulated_text = String::new();
-                    let mut response_id = format!("resp_{}", Uuid::new_v4().simple());
-                    let mut model_name = String::new();
-                    let mut total_tokens = 0u32;
-
-                    // Read the stream
-                    let mut stream = response.bytes_stream();
-                    let mut buffer = String::new();
-
-                    while let Some(chunk) = stream.next().await {
-                        match chunk {
-                            Ok(bytes) => {
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                                // Process complete SSE events
-                                while let Some(event_end) = buffer.find("\n\n") {
-                                    let event = buffer[..event_end].to_string();
-                                    buffer = buffer[event_end + 2..].to_string();
-
-                                    if let Some(data) = event.strip_prefix("data: ") {
-                                        if data == "[DONE]" {
-                                            // Send final response object
-                                            let final_response =
-                                                Self::build_streaming_final_response(
-                                                    response_id.clone(),
-                                                    model_name.clone(),
-                                                    accumulated_text.clone(),
-                                                    total_tokens,
-                                                    &body_clone,
-                                                    prev_response_id.clone(),
-                                                );
-
-                                            // Store the response
-                                            Self::store_streaming_response(
-                                                &response_storage,
-                                                &final_response,
-                                                &body_clone,
-                                            )
-                                            .await;
-
-                                            // Send the final response
-                                            let _ = tx
-                                                .send(Ok(Event::default().data(
-                                                    serde_json::to_string(&final_response)
-                                                        .unwrap_or_default(),
-                                                )))
-                                                .await;
-                                            let _ =
-                                                tx.send(Ok(Event::default().data("[DONE]"))).await;
-                                            break;
-                                        }
-
-                                        // Parse the delta
-                                        if let Ok(delta_json) = serde_json::from_str::<Value>(data)
-                                        {
-                                            // Extract info from delta
-                                            if let Some(id) =
-                                                delta_json.get("id").and_then(|v| v.as_str())
-                                            {
-                                                response_id = id.to_string();
-                                            }
-                                            if let Some(model) =
-                                                delta_json.get("model").and_then(|v| v.as_str())
-                                            {
-                                                model_name = model.to_string();
-                                            }
-
-                                            // Extract text delta
-                                            if let Some(choices) =
-                                                delta_json.get("choices").and_then(|v| v.as_array())
-                                            {
-                                                for choice in choices {
-                                                    if let Some(delta) = choice.get("delta") {
-                                                        if let Some(content) = delta
-                                                            .get("content")
-                                                            .and_then(|v| v.as_str())
-                                                        {
-                                                            accumulated_text.push_str(content);
-                                                            total_tokens +=
-                                                                content.split_whitespace().count()
-                                                                    as u32; // Rough estimate
-
-                                                            // Send incremental update
-                                                            let incremental = json!({
-                                                                "id": response_id,
-                                                                "object": "response.delta",
-                                                                "delta": {
-                                                                    "content": content
-                                                                }
-                                                            });
-                                                            let _ = tx
-                                                                .send(Ok(Event::default()
-                                                                    .data(incremental.to_string())))
-                                                                .await;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Stream error: {}", e);
-                                // Send error event
-                                let error_event = json!({
-                                    "error": {
-                                        "message": format!("Stream error: {}", e),
-                                        "type": "stream_error"
-                                    }
-                                });
-                                let _ = tx
-                                    .send(Ok(Event::default().data(error_event.to_string())))
-                                    .await;
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                // Return SSE stream
-                let stream = ReceiverStream::new(rx);
-                Sse::new(stream).into_response()
-            }
-            Err(e) => {
-                error!("Failed to initiate streaming request: {}", e);
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Failed to forward streaming request: {}", e),
-                )
-                    .into_response()
-            }
-        }
-    }
-
-    fn build_streaming_final_response(
-        response_id: String,
-        model: String,
-        text: String,
-        estimated_tokens: u32,
-        original_body: &ResponsesRequest,
-        original_previous_response_id: Option<String>,
-    ) -> ResponsesResponse {
-        let msg_id = format!("msg_{}", Uuid::new_v4().simple());
-
-        ResponsesResponse {
-            id: response_id,
-            object: "response".to_string(),
-            created_at: chrono::Utc::now().timestamp(),
-            status: ResponseStatus::Completed,
-            error: None,
-            incomplete_details: None,
-            instructions: original_body.instructions.clone(),
-            max_output_tokens: original_body.max_output_tokens,
-            model,
-            output: vec![ResponseOutputItem::Message {
-                id: msg_id,
-                role: "assistant".to_string(),
-                status: "completed".to_string(),
-                content: vec![ResponseContentPart::OutputText {
-                    text,
-                    annotations: vec![],
-                    logprobs: None,
-                }],
-            }],
-            parallel_tool_calls: original_body.parallel_tool_calls,
-            previous_response_id: original_previous_response_id,
-            reasoning: original_body.reasoning.as_ref().map(|r| ReasoningInfo {
-                effort: r.effort.as_ref().map(|e| format!("{:?}", e)),
-                summary: None,
-            }),
-            store: original_body.store,
-            temperature: original_body.temperature.or(Some(1.0)),
-            text: Some(ResponseTextFormat {
-                format: TextFormatType {
-                    format_type: "text".to_string(),
-                },
-            }),
-            tool_choice: "auto".to_string(),
-            tools: original_body.tools.clone(),
-            top_p: original_body.top_p.or(Some(1.0)),
-            truncation: Some("disabled".to_string()),
-            usage: Some(ResponsesUsage::Classic(UsageInfo {
-                prompt_tokens: estimated_tokens / 2, // Rough estimate
-                completion_tokens: estimated_tokens / 2,
-                total_tokens: estimated_tokens,
-                reasoning_tokens: None,
-                prompt_tokens_details: None,
-            })),
-            user: original_body.user.clone(),
-            metadata: original_body.metadata.clone().unwrap_or_default(),
-        }
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Streaming responses not yet implemented",
+        )
+            .into_response()
     }
 
     async fn store_response_internal(
@@ -452,32 +237,6 @@ impl OpenAIRouter {
                 Ok(())
             }
             Err(e) => Err(e),
-        }
-    }
-
-    async fn store_streaming_response(
-        response_storage: &SharedResponseStorage,
-        response: &ResponsesResponse,
-        original_body: &ResponsesRequest,
-    ) {
-        if !original_body.store {
-            return;
-        }
-
-        match serde_json::to_value(response) {
-            Ok(value) => {
-                match Self::store_response_impl(response_storage, &value, original_body).await {
-                    Ok(response_id) => {
-                        info!(response_id = %response_id.0, "Stored streaming response locally");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to store streaming response");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to serialize streaming response for storage");
-            }
         }
     }
 
@@ -843,6 +602,14 @@ impl super::super::RouterTrait for OpenAIRouter {
             "openai_responses_request"
         );
 
+        if body.stream {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "Streaming responses not yet implemented",
+            )
+                .into_response();
+        }
+
         // Clone the body and override model if needed
         let mut request_body = body.clone();
         if let Some(model) = model_id {
@@ -985,19 +752,19 @@ impl super::super::RouterTrait for OpenAIRouter {
 
             if !raw_value.is_null() {
                 if stream_requested {
-                    let event = Event::default().data(raw_value.to_string());
-                    let done_event = Event::default().data("[DONE]");
-                    let stream = iter(vec![
-                        Ok::<Event, Infallible>(event),
-                        Ok::<Event, Infallible>(done_event),
-                    ]);
-                    return Sse::new(stream).into_response();
+                    return (
+                        StatusCode::NOT_IMPLEMENTED,
+                        "Streaming retrieval not yet implemented",
+                    )
+                        .into_response();
                 }
 
                 return (
                     StatusCode::OK,
                     [("content-type", "application/json")],
-                    raw_value.to_string(),
+                    serde_json::to_string(&openai_response).unwrap_or_else(
+                        |e| format!("{"error": "Failed to serialize response: {}"}", e),
+                    ),
                 )
                     .into_response();
             }
@@ -1044,15 +811,11 @@ impl super::super::RouterTrait for OpenAIRouter {
             };
 
             if stream_requested {
-                if let Ok(value) = serde_json::to_value(&openai_response) {
-                    let event = Event::default().data(value.to_string());
-                    let done_event = Event::default().data("[DONE]");
-                    let stream = iter(vec![
-                        Ok::<Event, Infallible>(event),
-                        Ok::<Event, Infallible>(done_event),
-                    ]);
-                    return Sse::new(stream).into_response();
-                }
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    "Streaming retrieval not yet implemented",
+                )
+                    .into_response();
             }
 
             return (
