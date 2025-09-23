@@ -23,7 +23,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Union, Tuple
 
 import torch
 
@@ -147,7 +147,6 @@ def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
 
     return i
 
-
 def get_child_key(key: RadixKey, page_size: int = 1):
     if page_size == 1:
         plain_key = key.token_ids[0]
@@ -157,6 +156,13 @@ def get_child_key(key: RadixKey, page_size: int = 1):
         return plain_key
     else:
         return (key.extra_key, plain_key)
+
+def _convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
+    # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
+    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
+    if len(tokens) < 2:
+        return []
+    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
 
 
 class RadixCache(BasePrefixCache):
@@ -168,6 +174,7 @@ class RadixCache(BasePrefixCache):
         disable: bool = False,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
+        is_eagle: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -175,6 +182,7 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        self.is_eagle = is_eagle
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -187,6 +195,11 @@ class RadixCache(BasePrefixCache):
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = partial(get_child_key, page_size=page_size)
+
+        if is_eagle:
+            self.key_convert_fn = _convert_to_bigram_key
+        else:
+            self.key_convert_fn = lambda key: key
 
         if eviction_policy.lower() == "lru":
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
@@ -248,6 +261,8 @@ class RadixCache(BasePrefixCache):
                 to expose a precise boundary; this structural refinement improves
                 subsequent match efficiency and does not duplicate data.
         """
+        key = self.key_convert_fn(key)
+
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=torch.empty(
@@ -278,8 +293,15 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return 0
 
+        key = self.key_convert_fn(key)
+
         if value is None:
-            value = torch.tensor(key.token_ids, dtype=torch.int64)
+           value = torch.tensor(key.token_ids, dtype=torch.int64)
+
+        if self.is_eagle:
+            # EAGLE uses bigram key, the key length should -1
+            value = value[: len(key)]
+
         return self._insert_helper(self.root_node, key, value)
 
     def cache_finished_req(self, req: Req):
@@ -298,7 +320,12 @@ class RadixCache(BasePrefixCache):
         ]
 
         if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            if self.is_eagle:
+                page_aligned_len = (
+                    (len(kv_indices) - 1) // self.page_size * self.page_size
+                ) + 1
+            else:
+                page_aligned_len = len(kv_indices) // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )
@@ -316,6 +343,13 @@ class RadixCache(BasePrefixCache):
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
 
+        if self.is_eagle:
+            # For EAGLE, len(bigram_key) == len(kv_indices) - 1, the last kv index is not inserted to the tree, which should be freed
+            # For page_size > 1, only free it when the last kv index in an additional page
+            free_len = len(kv_indices) - page_aligned_len + 1
+            if free_len == 1:
+                self.token_to_kv_pool_allocator.free(kv_indices[-free_len:])
+
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
@@ -331,7 +365,12 @@ class RadixCache(BasePrefixCache):
         ]
 
         if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            if self.is_eagle:
+                page_aligned_len = (
+                    (len(kv_indices) - 1) // self.page_size * self.page_size
+                ) + 1
+            else:
+                page_aligned_len = len(kv_indices) // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )
@@ -364,6 +403,7 @@ class RadixCache(BasePrefixCache):
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if self.page_size != 1:
+            # TODO: check EAGLE chunked prefill
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
             )
