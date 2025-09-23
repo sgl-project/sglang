@@ -19,15 +19,14 @@ from sglang.test.test_utils import (
 
 _is_hip = is_hip()
 # VLM models for testing
-MODELS = (
-    [SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4)]
-    if _is_hip
-    else [
+if _is_hip:
+    MODELS = [SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4)]
+else:
+    MODELS = [
         SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45),
         SimpleNamespace(model="Qwen/Qwen2.5-VL-3B-Instruct", mmmu_accuracy=0.4),
         SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
     ]
-)
 
 # Set default mem_fraction_static to 0.8
 DEFAULT_MEM_FRACTION_STATIC = 0.8
