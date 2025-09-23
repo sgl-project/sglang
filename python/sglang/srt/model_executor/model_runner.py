@@ -340,7 +340,6 @@ class ModelRunner:
         if self.is_hybrid_gdn:
             logger.warning("Hybrid GDN model detected, disable radix cache")
             self.server_args.disable_radix_cache = True
-            self.server_args.attention_backend = "hybrid_linear_attn"
             if self.server_args.max_mamba_cache_size is None:
                 if self.server_args.max_running_requests is not None:
                     self.server_args.max_mamba_cache_size = (
@@ -1636,10 +1635,9 @@ class ModelRunner:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if _is_npu and self.server_args.attention_backend in [
-                "ascend",
-                "hybrid_linear_attn",
-            ]:
+            if _is_npu and (
+                self.server_args.attention_backend == "ascend" or self.is_hybrid_gdn
+            ):
                 self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     page_size=self.page_size,

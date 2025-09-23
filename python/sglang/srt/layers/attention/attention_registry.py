@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 ATTENTION_BACKENDS = {}
 
 
@@ -7,6 +11,38 @@ def register_attention_backend(name):
         return fn
 
     return decorator
+
+
+def attn_backend_wrapper(runner, full_attn_backend):
+    """
+    Wrapper for special models like hybrid GDN, so we don't
+    need to change the code of the original attention backend.
+    """
+    assert not (
+        runner.is_hybrid_gdn and runner.use_mla_backend
+    ), "hybrid_gdn can only be used with non-MLA models."
+
+    # wrap for hybrid GDN models
+    if runner.is_hybrid_gdn:
+        from sglang.srt.utils import is_blackwell
+
+        if is_blackwell():
+            assert (
+                runner.server_args.attention_backend == "triton"
+            ), "triton backend is the only supported backend on Blackwell GPUs for hybrid GDN models, use --attention-backend triton to specify the backend."
+        logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+            MambaAttnBackend,
+        )
+
+        linear_attn_backend = MambaAttnBackend(runner)
+        full_attn_layers = runner.model_config.hf_config.full_attention_layer_ids
+        return HybridLinearAttnBackend(
+            full_attn_backend, linear_attn_backend, full_attn_layers
+        )
+
+    return full_attn_backend
 
 
 @register_attention_backend("flashinfer")
@@ -23,13 +59,15 @@ def create_flashinfer_backend(runner):
                 or not runner.plan_stream_for_flashinfer
             ):
                 runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-        return FlashInferAttnBackend(runner)
+        full_attn_backend = FlashInferAttnBackend(runner)
+        return attn_backend_wrapper(runner, full_attn_backend)
     else:
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
         )
 
-        return FlashInferMLAAttnBackend(runner)
+        full_attn_backend = FlashInferMLAAttnBackend(runner)
+        return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("trtllm_mla")
@@ -38,28 +76,32 @@ def create_trtllm_mla_backend(runner):
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
     from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
-    return TRTLLMMLABackend(runner)
+    full_attn_backend = TRTLLMMLABackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("aiter")
 def create_aiter_backend(runner):
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
-    return AiterAttnBackend(runner)
+    full_attn_backend = AiterAttnBackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("wave")
 def create_wave_backend(runner):
     from sglang.srt.layers.attention.wave_backend import WaveAttnBackend
 
-    return WaveAttnBackend(runner)
+    full_attn_backend = WaveAttnBackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
     from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
 
-    return AscendAttnBackend(runner)
+    full_attn_backend = AscendAttnBackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("triton")
@@ -73,32 +115,37 @@ def create_triton_backend(runner):
             DoubleSparseAttnBackend,
         )
 
-        return DoubleSparseAttnBackend(runner)
+        full_attn_backend = DoubleSparseAttnBackend(runner)
+        return attn_backend_wrapper(runner, full_attn_backend)
     else:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
-        return TritonAttnBackend(runner)
+        full_attn_backend = TritonAttnBackend(runner)
+        return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 
-    return TorchNativeAttnBackend(runner)
+    full_attn_backend = TorchNativeAttnBackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("flex_attention")
 def create_flex_attention_backend(runner):
     from sglang.srt.layers.attention.torch_flex_backend import TorchFlexAttnBackend
 
-    return TorchFlexAttnBackend(runner)
+    full_attn_backend = TorchFlexAttnBackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
-    return FlashMLABackend(runner)
+    full_attn_backend = FlashMLABackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("fa3")
@@ -113,7 +160,8 @@ def create_flashattention_v3_backend(runner):
     )
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
-    return FlashAttentionBackend(runner)
+    full_attn_backend = FlashAttentionBackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("fa4")
@@ -123,14 +171,16 @@ def create_flashattention_v4_backend(runner):
     ), "FlashAttention v4 Support is at an early stage, only MLA model supported now"
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
-    return FlashAttentionBackend(runner, fa_impl_ver=4)
+    full_attn_backend = FlashAttentionBackend(runner, fa_impl_ver=4)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("cutlass_mla")
 def create_cutlass_mla_backend(runner):
     from sglang.srt.layers.attention.cutlass_mla_backend import CutlassMLABackend
 
-    return CutlassMLABackend(runner)
+    full_attn_backend = CutlassMLABackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("trtllm_mha")
@@ -139,14 +189,16 @@ def create_trtllm_mha_backend(runner):
         raise ValueError("trtllm_mha backend can only be used with non-MLA models.")
     from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 
-    return TRTLLMHAAttnBackend(runner)
+    full_attn_backend = TRTLLMHAAttnBackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("intel_amx")
 def create_intel_amx_backend(runner):
     from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
 
-    return IntelAMXAttnBackend(runner)
+    full_attn_backend = IntelAMXAttnBackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
 
 
 @register_attention_backend("dual_chunk_flash_attn")
@@ -155,38 +207,5 @@ def create_dual_chunk_flash_attn_backend(runner):
         DualChunkFlashAttentionBackend,
     )
 
-    return DualChunkFlashAttentionBackend(runner)
-
-
-@register_attention_backend("hybrid_linear_attn")
-def create_hybrid_linear_attn_backend(runner):
-    assert (
-        runner.is_hybrid_gdn
-    ), "hybrid_linear_attn backend can only be used with hybrid GDN models."
-    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-        HybridLinearAttnBackend,
-        MambaAttnBackend,
-    )
-    from sglang.srt.utils import is_blackwell, is_npu
-
-    if is_npu():
-        from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
-
-        full_attn_backend = AscendAttnBackend(runner)
-    elif is_blackwell():
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-        full_attn_backend = TritonAttnBackend(runner)
-    else:
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
-        )
-
-        full_attn_backend = FlashAttentionBackend(runner)
-
-    linear_attn_backend = MambaAttnBackend(runner)
-    full_attn_layers = runner.model_config.hf_config.full_attention_layer_ids
-
-    return HybridLinearAttnBackend(
-        full_attn_backend, linear_attn_backend, full_attn_layers
-    )
+    full_attn_backend = DualChunkFlashAttentionBackend(runner)
+    return attn_backend_wrapper(runner, full_attn_backend)
