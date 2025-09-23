@@ -28,8 +28,19 @@ from sglang.benchmark.serving import do_benchmark, main
 
 
 # For compatibility
-def run_benchmark(args_: argparse.Namespace):
-    do_benchmark(args_)
+def run_benchmark(args: argparse.Namespace):
+    if not hasattr(args, "max_concurrency"):
+        args.max_concurrency = None
+
+    if not hasattr(args, "warmup_requests"):
+        args.warmup_requests = 1
+
+    if not hasattr(args, "mooncake_slowdown_factor"):
+        args.mooncake_slowdown_factor = 1.0
+
+    if not hasattr(args, "mooncake_num_rounds"):
+        args.mooncake_num_rounds = 1
+    do_benchmark(args)
 
 
 def sample_random_requests(
