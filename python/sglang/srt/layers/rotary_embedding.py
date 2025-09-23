@@ -131,10 +131,8 @@ class RotaryEmbedding(CustomOp):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
-        # Initialize directly on target device to avoid CPU/GPU mixing
-        device = torch.device(f"cuda:{torch.cuda.current_device()}") if _is_cuda else torch.device("cpu")
-        inv_freq = self._compute_inv_freq(self.base).to(device)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float, device=device)
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -261,10 +259,6 @@ class RotaryEmbedding(CustomOp):
         fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
-            # Ensure int64 dtype for sgl_kernel compatibility
-            positions = positions.long()
-
-            # Direct inplace kernel call
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -272,13 +266,13 @@ class RotaryEmbedding(CustomOp):
                 head_size=self.head_size,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
+                # Compatible with old sgl-kernel
                 **(
                     dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
                     if fused_set_kv_buffer_arg is not None
                     else {}
                 ),
             )
-            return query, key
         else:
             assert (
                 fused_set_kv_buffer_arg is None
