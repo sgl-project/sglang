@@ -131,11 +131,16 @@ def test_dp_aware_worker_expansion_and_api_key(
     r = requests.post(
         f"{router_url}/add_worker",
         params={"url": worker_url, "api_key": api_key},
+        headers={"Authorization": f"Bearer {api_key}"},
         timeout=180,
     )
     r.raise_for_status()
 
-    r = requests.get(f"{router_url}/list_workers", timeout=30)
+    r = requests.get(
+        f"{router_url}/list_workers",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
     r.raise_for_status()
     urls = r.json().get("urls", [])
     assert len(urls) == 2
