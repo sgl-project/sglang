@@ -617,20 +617,6 @@ impl PDRouter {
                                 }
                                 Some(Value::Object(obj))
                             });
-
-                        let response_headers =
-                            header_utils::preserve_response_headers(res.headers());
-
-                        self.create_streaming_response(
-                            res.bytes_stream(),
-                            status,
-                            prefill_logprobs,
-                            context.return_logprob,
-                            None,
-                            Some(response_headers),
-                            prefill,
-                            decode,
-                        )
                     } else {
                         None
                     };
