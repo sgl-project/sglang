@@ -271,7 +271,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     let tree = if let Some(tree) = trees.get_mut(model_id) {
                         tree
                     } else {
-                        trees.entry(model_id.to_string()).or_insert_with(Tree::new)
+                        // Create new tree and initialize with all workers
+                        let new_tree = Tree::new();
+                        // Initialize with all healthy workers like OLD version does
+                        for &idx in &healthy_indices {
+                            new_tree.insert("", workers[idx].url());
+                        }
+                        trees.entry(model_id.to_string()).or_insert(new_tree)
                     };
                     tree.insert(text, workers[min_load_idx].url());
                 }
@@ -293,7 +299,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let tree = if let Some(tree) = trees.get_mut(model_id) {
                 tree
             } else {
-                trees.entry(model_id.to_string()).or_insert_with(Tree::new)
+                // Create new tree and initialize with all workers
+                let new_tree = Tree::new();
+                // Initialize with all healthy workers like OLD version does
+                for &idx in &healthy_indices {
+                    new_tree.insert("", workers[idx].url());
+                }
+                trees.entry(model_id.to_string()).or_insert(new_tree)
             };
             let (matched_text, matched_worker) = tree.prefix_match(text);
             let match_rate = if text.is_empty() {
