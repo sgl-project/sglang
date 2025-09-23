@@ -152,6 +152,9 @@ mod streaming_tests {
         let payload = json!({
             "text": "Stream test",
             "stream": true,
+            "return_logprob": true,
+            "logprob_start_len": 0,
+            "top_logprobs_num": 2,
             "sampling_params": {
                 "temperature": 0.7,
                 "max_new_tokens": 10
