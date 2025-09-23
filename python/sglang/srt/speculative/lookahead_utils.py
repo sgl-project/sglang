@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch.nn.functional as F
 
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
@@ -25,7 +26,6 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
     assign_req_to_token_pool,
-    create_flashinfer_kv_indices_triton,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
