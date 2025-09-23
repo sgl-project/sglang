@@ -72,12 +72,12 @@ validate_values() {
     fi
     
     # Use helm template validation
-    local template_cmd="helm template $RELEASE_NAME $CHART_DIR"
+    local template_cmd_arr=(helm template "$RELEASE_NAME" "$CHART_DIR")
     if [[ -n "$VALUES_FILE" ]]; then
-        template_cmd="$template_cmd -f $VALUES_FILE"
+        template_cmd_arr+=("-f" "$VALUES_FILE")
     fi
     
-    if ! eval "$template_cmd --dry-run" &> /dev/null; then
+    if ! "${template_cmd_arr[@]}" --dry-run &> /dev/null; then
         log_error "Helm template validation failed"
         exit 1
     fi
@@ -88,19 +88,19 @@ validate_values() {
 install_chart() {
     log_info "Installing SGLang PD Chart..."
     
-    local install_cmd="helm install $RELEASE_NAME $CHART_DIR"
+    local install_cmd_arr=(helm install "$RELEASE_NAME" "$CHART_DIR")
     
     if [[ "$NAMESPACE" != "default" ]]; then
-        install_cmd="$install_cmd --namespace $NAMESPACE --create-namespace"
+        install_cmd_arr+=("--namespace" "$NAMESPACE" "--create-namespace")
     fi
     
     if [[ -n "$VALUES_FILE" ]]; then
-        install_cmd="$install_cmd -f $VALUES_FILE"
+        install_cmd_arr+=("-f" "$VALUES_FILE")
     fi
     
-    log_info "Executing command: $install_cmd"
+    log_info "Executing command: ${install_cmd_arr[*]}"
     
-    if eval "$install_cmd"; then
+    if "${install_cmd_arr[@]}"; then
         log_info "Installation successful!"
         show_post_install_info
     else
@@ -112,19 +112,19 @@ install_chart() {
 upgrade_chart() {
     log_info "Upgrading SGLang PD Chart..."
     
-    local upgrade_cmd="helm upgrade $RELEASE_NAME $CHART_DIR"
+    local upgrade_cmd_arr=(helm upgrade "$RELEASE_NAME" "$CHART_DIR")
     
     if [[ "$NAMESPACE" != "default" ]]; then
-        upgrade_cmd="$upgrade_cmd --namespace $NAMESPACE"
+        upgrade_cmd_arr+=("--namespace" "$NAMESPACE")
     fi
     
     if [[ -n "$VALUES_FILE" ]]; then
-        upgrade_cmd="$upgrade_cmd -f $VALUES_FILE"
+        upgrade_cmd_arr+=("-f" "$VALUES_FILE")
     fi
     
-    log_info "Executing command: $upgrade_cmd"
+    log_info "Executing command: ${upgrade_cmd_arr[*]}"
     
-    if eval "$upgrade_cmd"; then
+    if "${upgrade_cmd_arr[@]}"; then
         log_info "Upgrade successful!"
         show_post_install_info
     else
@@ -136,15 +136,15 @@ upgrade_chart() {
 uninstall_chart() {
     log_info "Uninstalling SGLang PD Chart..."
     
-    local uninstall_cmd="helm uninstall $RELEASE_NAME"
+    local uninstall_cmd_arr=(helm uninstall "$RELEASE_NAME")
     
     if [[ "$NAMESPACE" != "default" ]]; then
-        uninstall_cmd="$uninstall_cmd --namespace $NAMESPACE"
+        uninstall_cmd_arr+=("--namespace" "$NAMESPACE")
     fi
     
-    log_info "Executing command: $uninstall_cmd"
+    log_info "Executing command: ${uninstall_cmd_arr[*]}"
     
-    if eval "$uninstall_cmd"; then
+    if "${uninstall_cmd_arr[@]}"; then
         log_info "Uninstallation successful!"
     else
         log_error "Uninstallation failed"

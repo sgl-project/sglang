@@ -114,17 +114,19 @@ Get LoadBalancer service address:
 
 ```bash
 # If using NodePort
-export NODE_PORT=$(kubectl get -o jsonpath="{.spec.ports[0].nodePort}" services deepseekr10528-lb-service)
+# Replace <NAME_PREFIX> with your global.namePrefix value from values.yaml
+export NODE_PORT=$(kubectl get -o jsonpath="{.spec.ports[0].nodePort}" services <NAME_PREFIX>-lb-service)
 export NODE_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[0].address}")
 echo http://$NODE_IP:$NODE_PORT
 
 # Test API call
+# Replace <MODEL_NAME> with your actual model identifier
 curl -X POST "http://$NODE_IP:$NODE_PORT/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer None" \
   -d '{
     "rid": "test123",
-    "model": "r1", 
+    "model": "<MODEL_NAME>", 
     "messages": [
       {"role": "system", "content": "You are a helpful AI assistant"},
       {"role": "user", "content": "Hello, please introduce yourself"}
@@ -336,14 +338,16 @@ prefill:
 ### View Real-time Logs
 
 ```bash
+# Replace <name-prefix> with your global.namePrefix value from values.yaml
+
 # Prefill logs
-kubectl logs -f -l leaderworkerset.sigs.k8s.io/name=deepseekr10528-prefill-main,role=leader
+kubectl logs -f -l leaderworkerset.sigs.k8s.io/name=<name-prefix>-prefill,role=leader
 
 # Decode logs  
-kubectl logs -f -l leaderworkerset.sigs.k8s.io/name=deepseekr10528-decode-main,role=leader
+kubectl logs -f -l leaderworkerset.sigs.k8s.io/name=<name-prefix>-decode,role=leader
 
 # LoadBalancer logs
-kubectl logs -f -l app=deepseekr10528-lb
+kubectl logs -f -l app=<name-prefix>-lb
 ```
 
 ### Performance Monitoring

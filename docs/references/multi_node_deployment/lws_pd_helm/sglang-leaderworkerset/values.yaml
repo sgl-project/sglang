@@ -12,7 +12,7 @@ global:
     pullPolicy: IfNotPresent
   
   model:
-    # modify according to you deployment
+    # Modify according to your deployment
     path: "/data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528"
     contextLength: "32768"
     trustRemoteCode: true
@@ -36,10 +36,10 @@ global:
   
   volumes:
     model:
-      # modify according to you deployment
+      # Modify according to your deployment
       hostPath: "/data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528"
     config:
-      # modify according to you deployment
+      # Modify according to your deployment
       hostPath: "/data1/maas_hosted_models/models/fused_moe_triton/configs"
     cache:
       hostPath: "/data1/sgl_cache"
