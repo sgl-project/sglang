@@ -1,6 +1,7 @@
+from typing import Optional, Union
+
 from transformers import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
-from typing import Optional, Union
 
 
 class Qwen3VLVisionConfig(PretrainedConfig):
@@ -234,7 +235,10 @@ class Qwen3VLConfig(PretrainedConfig):
     ```"""
 
     model_type = "qwen3_vl"
-    sub_configs = {"vision_config": Qwen3VLVisionConfig, "text_config": Qwen3VLTextConfig}
+    sub_configs = {
+        "vision_config": Qwen3VLVisionConfig,
+        "text_config": Qwen3VLTextConfig,
+    }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -540,7 +544,10 @@ class Qwen3VLMoeConfig(PretrainedConfig):
     ```"""
 
     model_type = "qwen3_vl_moe"
-    sub_configs = {"vision_config": Qwen3VLMoeVisionConfig, "text_config": Qwen3VLMoeTextConfig}
+    sub_configs = {
+        "vision_config": Qwen3VLMoeVisionConfig,
+        "text_config": Qwen3VLMoeTextConfig,
+    }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -571,4 +578,9 @@ class Qwen3VLMoeConfig(PretrainedConfig):
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
 
-__all__ = ["Qwen3VLMoeConfig", "Qwen3VLMoeVisionConfig", "Qwen3VLConfig", "Qwen3VLVisionConfig",]
+__all__ = [
+    "Qwen3VLMoeConfig",
+    "Qwen3VLMoeVisionConfig",
+    "Qwen3VLConfig",
+    "Qwen3VLVisionConfig",
+]
