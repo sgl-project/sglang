@@ -10,6 +10,8 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -45,6 +47,11 @@ class SchedulerUpdateWeightsMixin:
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success, message)
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        """Destroy the online model parameter update group."""
+        success, message = self.tp_worker.destroy_weights_update_group(recv_req)
+        return DestroyWeightsUpdateGroupReqOutput(success, message)
 
     def update_weights_from_distributed(
         self,

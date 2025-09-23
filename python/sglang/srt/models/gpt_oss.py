@@ -121,7 +121,7 @@ class GptOssSparseMoeBlock(nn.Module):
         )
 
         self.top_k = config.num_experts_per_tok
-        experts_type = get_moe_impl_class()
+        experts_type = get_moe_impl_class(quant_config)
         extra_kwargs = {}
         if experts_type.__name__ == "FusedMoE":
             quant_config_name = (
