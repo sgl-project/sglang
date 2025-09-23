@@ -111,24 +111,16 @@ class MiniLoadBalancer:
                             prefill_json["meta_info"]["input_token_logprobs"]
                             + ret_json["meta_info"]["input_token_logprobs"]
                         )
-                    # merge input_top_logprobs if present
-                    if (
-                        "input_top_logprobs" in prefill_json.get("meta_info", {})
-                        and "input_top_logprobs" in ret_json["meta_info"]
-                    ):
-                        ret_json["meta_info"]["input_top_logprobs"] = (
-                            prefill_json["meta_info"]["input_top_logprobs"]
-                            + ret_json["meta_info"]["input_top_logprobs"]
-                        )
-                    # merge input_token_ids_logprobs if present
-                    if (
-                        "input_token_ids_logprobs" in prefill_json.get("meta_info", {})
-                        and "input_token_ids_logprobs" in ret_json["meta_info"]
-                    ):
-                        ret_json["meta_info"]["input_token_ids_logprobs"] = (
-                            prefill_json["meta_info"]["input_token_ids_logprobs"]
-                            + ret_json["meta_info"]["input_token_ids_logprobs"]
-                        )
+                    # merge logprob fields if present
+                    for key in ["input_top_logprobs", "input_token_ids_logprobs"]:
+                        if (
+                            key in prefill_json.get("meta_info", {})
+                            and key in ret_json["meta_info"]
+                        ):
+                            ret_json["meta_info"][key] = (
+                                prefill_json["meta_info"][key]
+                                + ret_json["meta_info"][key]
+                            )
             else:
                 ret_json = await decode_response.json()
 
