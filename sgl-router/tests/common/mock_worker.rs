@@ -387,7 +387,8 @@ async fn generate_handler(
                     "type": "stop",
                     "reason": "length"
                 }
-            }
+            },
+            "echo_request": payload
         }))
         .into_response()
     }

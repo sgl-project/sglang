@@ -300,7 +300,13 @@ mod generation_tests {
 
         let payload = json!({
             "text": "Hello, world!",
-            "stream": false
+            "stream": false,
+            "return_logprob": true,
+            "logprob_start_len": 0,
+            "top_logprobs_num": 3,
+            "sampling_params": {
+                "max_new_tokens": 4
+            }
         });
 
         let req = Request::builder()
@@ -323,6 +329,20 @@ mod generation_tests {
         assert!(meta_info.get("finish_reason").is_some());
         assert_eq!(meta_info["finish_reason"]["type"], "stop");
 
+        assert!(meta_info.get("input_token_logprobs").is_some());
+        assert!(meta_info.get("output_token_logprobs").is_some());
+
+        let echo = body_json.get("echo_request").unwrap();
+        assert_eq!(echo.get("return_logprob").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(echo.get("logprob_start_len").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(echo.get("top_logprobs_num").and_then(|v| v.as_i64()), Some(3));
+        assert_eq!(
+            echo.get("sampling_params")
+                .and_then(|sp| sp.get("max_new_tokens"))
+                .and_then(|v| v.as_i64()),
+            Some(4)
+        );
+
         ctx.shutdown().await;
     }
 
@@ -341,7 +361,11 @@ mod generation_tests {
 
         let payload = json!({
             "text": "Stream test",
-            "stream": true
+            "stream": true,
+            "return_logprob": true,
+            "logprob_start_len": 0,
+            "top_logprobs_num": 2,
+            "sampling_params": {"max_new_tokens": 3}
         });
 
         let req = Request::builder()
