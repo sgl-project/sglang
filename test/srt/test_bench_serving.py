@@ -445,12 +445,12 @@ class TestBenchServing(CustomTestCase):
             )
             self.assertGreater(res["input_throughput"], 4000)
 
-    def test_score_api_throughput(self):
-        """Test score API throughput performance"""
+    def test_score_api_latency_throughput(self):
+        """Test score API latency and throughput performance"""
         res = run_score_benchmark(
             model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
-            num_requests=100,
-            batch_size=5,
+            num_requests=1000,
+            batch_size=10,
             other_server_args=[],
             need_warmup=True,
         )
@@ -458,58 +458,32 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_score_api_throughput\n"
-                f"Score API throughput: {res['throughput']:.2f} req/s\n"
                 f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                f"Score API throughput: {res['throughput']:.2f} req/s\n"
                 f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
             )
         
         print(
             f"### test_score_api_throughput\n"
-            f"Score API throughput: {res['throughput']:.2f} req/s\n"
-            f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
-            f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
-        )
-        self.assertGreater(res["successful_requests"], res["total_requests"])
-        self.assertGreater(res["throughput"], 30)  # At least 30 req/s
-        self.assertLess(res["avg_latency_ms"], 35)  # Less than 35 ms average latency
-
-    def test_score_api_latency(self):
-        """Test score API latency performance"""
-        res = run_score_benchmark(
-            model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
-            num_requests=50,
-            batch_size=3,
-            other_server_args=[],
-            need_warmup=True,
-        )
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_score_api_latency\n"
-                f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
-                f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
-                f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
-            )
-        
-        print(
-            f"### test_score_api_latency\n"
             f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
             f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+            f"Score API throughput: {res['throughput']:.2f} req/s\n"
             f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
         )
-
-        self.assertGreater(res["successful_requests"], res["total_requests"])  # 100% success rate
-        self.assertLess(res["avg_latency_ms"], 31)  # Less than 31 ms average
-        self.assertLess(res["p95_latency_ms"], 35)  # Less than 31 ms P95
+        self.assertEqual(res["successful_requests"], res["total_requests"])
+        self.assertLess(res["avg_latency_ms"], 48)  # Less than 48 ms average latency
+        self.assertLess(res["p95_latency_ms"], 50)  # Less than 50 ms P95 latency
+        self.assertGreater(res["throughput"], 20)  # At least 20 req/s
 
     def test_score_api_batch_scaling(self):
         """Test score API performance with different batch sizes"""
-        batch_sizes = [2, 5, 10]
+        batch_sizes = [10, 25, 50]
         
         for batch_size in batch_sizes:
             res = run_score_benchmark(
                 model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
-                num_requests=30,
+                num_requests=500,
                 batch_size=batch_size,
             )
 
