@@ -57,8 +57,6 @@ impl std::fmt::Debug for OpenAIRouter {
 /// Helper that parses SSE frames from the OpenAI responses stream and
 /// accumulates enough information to persist the final response locally.
 struct StreamingResponseAccumulator {
-    /// Partial text buffer used to assemble individual SSE frames.
-    buffer: String,
     /// The initial `response.created` payload (if emitted).
     initial_response: Option<Value>,
     /// The final `response.completed` payload (if emitted).
@@ -73,7 +71,6 @@ struct StreamingResponseAccumulator {
 impl StreamingResponseAccumulator {
     fn new() -> Self {
         Self {
-            buffer: String::new(),
             initial_response: None,
             completed_response: None,
             output_items: Vec::new(),
@@ -82,23 +79,11 @@ impl StreamingResponseAccumulator {
     }
 
     /// Feed the accumulator with the next SSE chunk.
-    fn ingest_chunk(&mut self, chunk: &Bytes) {
-        // SSE payloads are UTF-8; fall back to lossless conversion on failure.
-        let chunk_str = match std::str::from_utf8(chunk) {
-            Ok(text) => Cow::Borrowed(text),
-            Err(_) => Cow::Owned(String::from_utf8_lossy(chunk).to_string()),
-        };
-
-        self.buffer.push_str(&chunk_str.replace("\r\n", "\n"));
-        self.process_buffer();
-    }
-
-    /// Flush any remaining buffered data (typically at stream end).
-    fn finish(&mut self) {
-        if !self.buffer.trim().is_empty() {
-            let leftover = std::mem::take(&mut self.buffer);
-            self.process_block(&leftover);
+    fn ingest_block(&mut self, block: &str) {
+        if block.trim().is_empty() {
+            return;
         }
+        self.process_block(block);
     }
 
     /// Consume the accumulator and produce the best-effort final response value.
@@ -113,19 +98,6 @@ impl StreamingResponseAccumulator {
     fn encountered_error(&self) -> Option<&Value> {
         self.encountered_error.as_ref()
     }
-
-    fn process_buffer(&mut self) {
-        loop {
-            if let Some(pos) = self.buffer.find("\n\n") {
-                let block = self.buffer[..pos].to_string();
-                self.buffer.drain(..pos + 2);
-                self.process_block(&block);
-            } else {
-                break;
-            }
-        }
-    }
-
     fn process_block(&mut self, block: &str) {
         let trimmed = block.trim();
         if trimmed.is_empty() {
@@ -425,17 +397,52 @@ impl OpenAIRouter {
             let mut accumulator = StreamingResponseAccumulator::new();
             let mut upstream_failed = false;
             let mut receiver_connected = true;
+            let mut pending = String::new();
 
             while let Some(chunk_result) = upstream_stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        if should_store {
-                            accumulator.ingest_chunk(&chunk);
-                        }
+                        let chunk_text = match std::str::from_utf8(&chunk) {
+                            Ok(text) => Cow::Borrowed(text),
+                            Err(_) => Cow::Owned(String::from_utf8_lossy(&chunk).to_string()),
+                        };
 
-                        if receiver_connected {
-                            if tx.send(Ok(chunk)).is_err() {
-                                receiver_connected = false;
+                        pending.push_str(&chunk_text.replace("\r\n", "\n"));
+
+                        loop {
+                            if let Some(pos) = pending.find("\n\n") {
+                                let block = pending[..pos].to_string();
+                                pending.drain(..pos + 2);
+
+                                if block.trim().is_empty() {
+                                    continue;
+                                }
+
+                                let mut block_string = block;
+                                if let Some(modified) = Self::rewrite_streaming_block(
+                                    &block_string,
+                                    &original_request,
+                                    previous_response_id.as_deref(),
+                                ) {
+                                    block_string = modified;
+                                }
+
+                                if should_store {
+                                    accumulator.ingest_block(&block_string);
+                                }
+
+                                if receiver_connected {
+                                    let chunk_to_send = format!("{}\n\n", block_string);
+                                    if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
+                                        receiver_connected = false;
+                                    }
+                                }
+
+                                if !receiver_connected && !should_store {
+                                    break;
+                                }
+                            } else {
+                                break;
                             }
                         }
 
@@ -453,7 +460,9 @@ impl OpenAIRouter {
             }
 
             if should_store && !upstream_failed {
-                accumulator.finish();
+                if !pending.trim().is_empty() {
+                    accumulator.ingest_block(&pending);
+                }
                 let encountered_error = accumulator.encountered_error().cloned();
                 if let Some(mut response_json) = accumulator.into_final_response() {
                     Self::patch_streaming_response_json(
@@ -641,6 +650,106 @@ impl OpenAIRouter {
         }
     }
 
+    fn rewrite_streaming_block(
+        block: &str,
+        original_body: &ResponsesRequest,
+        original_previous_response_id: Option<&str>,
+    ) -> Option<String> {
+        let trimmed = block.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let mut data_lines: Vec<String> = Vec::new();
+
+        for line in trimmed.lines() {
+            if line.starts_with("data:") {
+                data_lines.push(line.trim_start_matches("data:").trim_start().to_string());
+            }
+        }
+
+        if data_lines.is_empty() {
+            return None;
+        }
+
+        let payload = data_lines.join("\n");
+        let mut parsed: Value = match serde_json::from_str(&payload) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("Failed to parse streaming JSON payload: {}", err);
+                return None;
+            }
+        };
+
+        let event_type = parsed
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        let should_patch = matches!(
+            event_type,
+            "response.created" | "response.in_progress" | "response.completed"
+        );
+
+        if !should_patch {
+            return None;
+        }
+
+        let mut changed = false;
+        if let Some(response_obj) = parsed.get_mut("response").and_then(|v| v.as_object_mut()) {
+            let desired_store = Value::Bool(original_body.store);
+            if response_obj.get("store") != Some(&desired_store) {
+                response_obj.insert("store".to_string(), desired_store);
+                changed = true;
+            }
+
+            if let Some(prev_id) = original_previous_response_id {
+                let needs_previous = response_obj
+                    .get("previous_response_id")
+                    .map(|v| v.is_null() || v.as_str().map(|s| s.is_empty()).unwrap_or(false))
+                    .unwrap_or(true);
+
+                if needs_previous {
+                    response_obj.insert(
+                        "previous_response_id".to_string(),
+                        Value::String(prev_id.to_string()),
+                    );
+                    changed = true;
+                }
+            }
+        }
+
+        if !changed {
+            return None;
+        }
+
+        let new_payload = match serde_json::to_string(&parsed) {
+            Ok(json) => json,
+            Err(err) => {
+                warn!("Failed to serialize modified streaming payload: {}", err);
+                return None;
+            }
+        };
+
+        let mut rebuilt_lines = Vec::new();
+        let mut data_written = false;
+        for line in trimmed.lines() {
+            if line.starts_with("data:") {
+                if !data_written {
+                    rebuilt_lines.push(format!("data: {}", new_payload));
+                    data_written = true;
+                }
+            } else {
+                rebuilt_lines.push(line.to_string());
+            }
+        }
+
+        if !data_written {
+            rebuilt_lines.push(format!("data: {}", new_payload));
+        }
+
+        Some(rebuilt_lines.join("\n"))
+    }
     fn extract_primary_output_text(response_json: &Value) -> Option<String> {
         if let Some(items) = response_json.get("output").and_then(|v| v.as_array()) {
             for item in items {
