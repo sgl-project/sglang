@@ -124,6 +124,8 @@ class Envs:
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
+    SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
+    SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)

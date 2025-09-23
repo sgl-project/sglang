@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.environ import envs
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -23,7 +24,7 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
@@ -42,8 +43,8 @@ logger = logging.getLogger(__name__)
 
 
 # Simulate acceptance length for benchmarking purposes
-SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
-SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
+SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()
+SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 
