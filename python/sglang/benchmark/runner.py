@@ -199,4 +199,6 @@ class BenchmarkRunner:
         metrics.accept_length = accept_length
 
         print_metrics(metrics, self.args, benchmark_duration)
-        save_results(metrics, self.args, benchmark_duration, outputs, output_lens)
+        res = save_results(metrics, self.args, benchmark_duration, outputs, output_lens)
+
+        return res

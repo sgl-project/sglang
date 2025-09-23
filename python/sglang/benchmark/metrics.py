@@ -202,17 +202,22 @@ def save_results(
                 f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
             )
 
-    if args.output_details:
-        result["details"] = {
-            "input_lens": [o.prompt_len for o in outputs],
-            "output_lens": output_lens,
-            "ttfts": [o.ttft for o in outputs],
-            "itls": [o.itl for o in outputs],
-            "generated_texts": [o.generated_text for o in outputs],
-            "errors": [o.error for o in outputs],
-        }
+    result_details = {
+        "input_lens": [o.prompt_len for o in outputs],
+        "output_lens": output_lens,
+        "ttfts": [o.ttft for o in outputs],
+        "itls": [o.itl for o in outputs],
+        "generated_texts": [o.generated_text for o in outputs],
+        "errors": [o.error for o in outputs],
+    }
 
     with open(output_file_name, "a") as f:
-        f.write(json.dumps(result) + "\n")
+        if args.output_details:
+            result_for_dump = result | result_details
+        else:
+            result_for_dump = result
+        f.write(json.dumps(result_for_dump) + "\n")
 
     print(f"Results saved to {output_file_name}")
+
+    return result | result_details

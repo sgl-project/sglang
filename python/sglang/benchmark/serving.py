@@ -121,13 +121,15 @@ def do_benchmark(args: argparse.Namespace):
     )
 
     try:
-        asyncio.run(runner.run())
+        res = asyncio.run(runner.run())
     except RuntimeError as e:
         print(f"\nAn error occurred during benchmark execution: {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nBenchmark interrupted by user.")
         sys.exit(0)
+
+    return res
 
 
 @click.command(context_settings=dict(help_option_names=["-h", "--help"]))
