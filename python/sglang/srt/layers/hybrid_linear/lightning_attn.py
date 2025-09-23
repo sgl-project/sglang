@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+
 @triton.jit
 def _fwd_diag_kernel(
     Q,

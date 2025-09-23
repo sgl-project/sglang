@@ -794,7 +794,12 @@ class LinearTokenToKVPool(KVCache):
             ]
             self.linear_kv_buffer = [
                 torch.zeros(
-                    (self.linear_size, self.linear_head_num, self.head_dim, self.head_dim),
+                    (
+                        self.linear_size,
+                        self.linear_head_num,
+                        self.head_dim,
+                        self.head_dim,
+                    ),
                     # dtype=self.store_dtype,
                     dtype=torch.float32,
                     device=self.device,
@@ -842,7 +847,9 @@ class LinearTokenToKVPool(KVCache):
         return self.v_buffer[kv_buffer_idx]
 
     def get_linear_kv_buffer(self, layer_id: int):
-        kv_buffer_idx = (layer_id - self.start_layer) - ((layer_id - self.start_layer) // self.linear_layer_freq)
+        kv_buffer_idx = (layer_id - self.start_layer) - (
+            (layer_id - self.start_layer) // self.linear_layer_freq
+        )
         if self.store_dtype != self.dtype:
             return self.linear_kv_buffer[kv_buffer_idx].view(self.dtype)
         return self.linear_kv_buffer[kv_buffer_idx]
@@ -865,6 +872,7 @@ class LinearTokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
         layer_id = layer.layer_id
         if (layer_id + 1) % self.linear_layer_freq == 0:  # softmax layer
             kv_buffer_idx = (layer_id - self.start_layer) // self.linear_layer_freq
@@ -890,7 +898,9 @@ class LinearTokenToKVPool(KVCache):
                 self.k_buffer[kv_buffer_idx][loc] = cache_k
                 self.v_buffer[kv_buffer_idx][loc] = cache_v
         else:  # linear layer
-            kv_buffer_idx = (layer_id - self.start_layer) - ((layer_id - self.start_layer) // self.linear_layer_freq)
+            kv_buffer_idx = (layer_id - self.start_layer) - (
+                (layer_id - self.start_layer) // self.linear_layer_freq
+            )
             self.linear_kv_buffer[kv_buffer_idx][loc] = cache_k
 
     def get_flat_data(self, indices):

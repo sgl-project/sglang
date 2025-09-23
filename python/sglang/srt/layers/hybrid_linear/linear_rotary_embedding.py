@@ -9,15 +9,17 @@ import torch
 import torch.nn as nn
 from vllm._custom_ops import rotary_embedding
 
-from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding import (
+    RotaryEmbedding,
     _yarn_find_correction_range,
     _yarn_get_mscale,
     _yarn_linear_ramp_mask,
 )
 
+
 class Fp32RotaryEmbedding(RotaryEmbedding):
     """rotary positional embedding support fp32."""
+
     def __init__(
         self,
         head_size: int,
@@ -27,13 +29,14 @@ class Fp32RotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         dtype: torch.dtype,
     ) -> None:
-        super().__init__(head_size=head_size,
-                         rotary_dim=rotary_dim,
-                         max_position_embeddings=max_position_embeddings,
-                         base=base,
-                         is_neox_style=is_neox_style,
-                         dtype=dtype,
-                         )
+        super().__init__(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            is_neox_style=is_neox_style,
+            dtype=dtype,
+        )
         self.vllm_rotary_embedding = rotary_embedding
 
     def forward(
@@ -45,17 +48,17 @@ class Fp32RotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert (
-                fused_set_kv_buffer_arg is None
-            ), "save kv cache is not supported for vllm_rotary_embedding."
+            fused_set_kv_buffer_arg is None
+        ), "save kv cache is not supported for vllm_rotary_embedding."
         self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
         self.vllm_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
         return query, key
 
     def extra_repr(self) -> str:
@@ -63,6 +66,7 @@ class Fp32RotaryEmbedding(RotaryEmbedding):
         s += f", max_position_embeddings={self.max_position_embeddings}"
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
         return s
+
 
 class Fp32YaRNScalingRotaryEmbedding(Fp32RotaryEmbedding):
     """RotaryEmbedding extended with YaRN method.
@@ -206,4 +210,3 @@ def get_linear_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
-

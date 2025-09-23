@@ -18,54 +18,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ SGLang BailingMoELinear model."""
-import logging
 import copy
-from transformers import PretrainedConfig
-from typing import Iterable, Optional, Tuple, Union, Set, Callable
+import logging
+from typing import Callable, Iterable, Optional, Set, Tuple, Union
+
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
-    get_tensor_model_parallel_rank,
 )
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.hybrid_linear.fused_group_rmsnorm import (
+    BailingMoEFusedGroupRMSNormSigmoidGate,
+    BailingMoERMSNormTP,
+)
+from sglang.srt.layers.hybrid_linear.linear_rotary_embedding import get_linear_rope
+from sglang.srt.layers.hybrid_linear.rmsnorm import rms_norm_triton_fn
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
-    ColumnParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.hybrid_linear.linear_rotary_embedding import get_linear_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.eplb.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
-from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.hybrid_linear.fused_group_rmsnorm import (
-    BailingMoEFusedGroupRMSNormSigmoidGate,
-    BailingMoERMSNormTP,
-)
-from sglang.srt.layers.hybrid_linear.rmsnorm import rms_norm_triton_fn
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -91,11 +86,13 @@ def is_pp_missing_parameter(
 
 def weight_loader_with_alias(alias: str):
     def wrapper(func: Callable):
-        def inner_func(param: torch.Tensor,
-                       loaded_weight: torch.Tensor,
-                       *args,
-                       prefix: str = None,
-                       **kwargs):
+        def inner_func(
+            param: torch.Tensor,
+            loaded_weight: torch.Tensor,
+            *args,
+            prefix: str = None,
+            **kwargs,
+        ):
             # pf = "[vLLM][load]" + " " if prefix is None else f"[{prefix}] "
             value = func(param, loaded_weight, *args, **kwargs)
             return value
@@ -117,7 +114,8 @@ class BailingMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2,
+            hidden_size,
+            [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
@@ -229,10 +227,10 @@ class BailingMoE(nn.Module):
 
         if self.score_function is not None:
             assert (
-                       self.score_function == "softmax" and self.correction_bias is None
-                   ) or (
-                       self.score_function == "sigmoid" and self.correction_bias is not None
-                   ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+                self.score_function == "softmax" and self.correction_bias is None
+            ) or (
+                self.score_function == "sigmoid" and self.correction_bias is not None
+            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
 
         self.topk = TopK(
             top_k=self.top_k,
@@ -251,7 +249,7 @@ class BailingMoE(nn.Module):
             intermediate_size=self.intermediate_size,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
-            prefix=f"{prefix}.experts"
+            prefix=f"{prefix}.experts",
         )
 
         if self.num_shared_experts > 0:
@@ -260,7 +258,7 @@ class BailingMoE(nn.Module):
                 hidden_size=self.hidden_size,
                 intermediate_size=intermediate_size,
                 reduce_results=False,
-                prefix=f"{prefix}.shared_experts"
+                prefix=f"{prefix}.shared_experts",
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -277,8 +275,7 @@ class BailingMoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
 
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
@@ -302,7 +299,7 @@ class BailingMoELinearAttention(nn.Module):
             self.head_dim = config.hidden_size // self.total_num_heads
 
         self.hidden_inner_size = self.head_dim * self.total_num_heads
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
@@ -320,12 +317,12 @@ class BailingMoELinearAttention(nn.Module):
         # minimax / seg_la / fla
         # TODO support fla
         self.linear_backend = getattr(config, "linear_backend", "minimax")
-        logger.info(f'linear_backend in bailing_moe_linear: {self.linear_backend}')
+        logger.info(f"linear_backend in bailing_moe_linear: {self.linear_backend}")
         self.linear_scale = True if self.linear_backend == "minimax" else False
         self.linear_rope = getattr(config, "linear_rope", True)
-        if hasattr(config, 'use_linear_silu'):
+        if hasattr(config, "use_linear_silu"):
             self.linear_silu = config.use_linear_silu
-        elif hasattr(config, 'linear_silu'):
+        elif hasattr(config, "linear_silu"):
             self.linear_silu = config.linear_silu
         else:
             self.linear_silu = False
@@ -371,17 +368,20 @@ class BailingMoELinearAttention(nn.Module):
         self.group_norm_size = getattr(config, "group_norm_size", 1)
         self.rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
         if self.group_norm_size > 1:
-            assert self.tp_size <= self.group_norm_size, "tp_size must be less than or equal to group_norm_size that can use local rms norm"
-            assert self.group_norm_size % self.tp_size == 0, "group_norm_size must be divisible by tp_size"
+            assert (
+                self.tp_size <= self.group_norm_size
+            ), "tp_size must be less than or equal to group_norm_size that can use local rms norm"
+            assert (
+                self.group_norm_size % self.tp_size == 0
+            ), "group_norm_size must be divisible by tp_size"
             self.g_norm = BailingMoEFusedGroupRMSNormSigmoidGate(
                 self.hidden_inner_size,
                 eps=self.rms_norm_eps,
-                group_norm_size=self.group_norm_size
+                group_norm_size=self.group_norm_size,
             )
         else:
             self.g_norm = BailingMoERMSNormTP(
-                self.hidden_inner_size,
-                eps=self.rms_norm_eps
+                self.hidden_inner_size, eps=self.rms_norm_eps
             )
         # use fp32 rotary embedding
         if hasattr(config, "rotary_dim"):
@@ -422,13 +422,17 @@ class BailingMoELinearAttention(nn.Module):
         q, k, v = torch.split(
             qkv,
             [self.q_size_per_rank, self.kv_size_per_rank, self.kv_size_per_rank],
-            dim=-1
+            dim=-1,
         )
         if self.use_qk_norm:
             q = q.reshape(-1, self.tp_heads, self.head_dim)
             k = k.reshape(-1, self.tp_kv_heads, self.head_dim)
-            q = rms_norm_triton_fn(q, self.query_layernorm.weight.data, eps=self.rms_norm_eps)
-            k = rms_norm_triton_fn(k, self.key_layernorm.weight.data, eps=self.rms_norm_eps)
+            q = rms_norm_triton_fn(
+                q, self.query_layernorm.weight.data, eps=self.rms_norm_eps
+            )
+            k = rms_norm_triton_fn(
+                k, self.key_layernorm.weight.data, eps=self.rms_norm_eps
+            )
 
             q = q.reshape(-1, self.q_size_per_rank)
             k = k.reshape(-1, self.kv_size_per_rank)
@@ -483,7 +487,7 @@ class BailingMoEAttention(nn.Module):
 
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
 
         self.split_qkv = getattr(config, "using_split_qkv_in_self_attention", False)
         assert not self.split_qkv, "split_qkv is not supported for now"
@@ -589,9 +593,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 prefix=prefix + ".attention",
             )
         else:
-            raise ValueError(
-                f"Unsupported attention type: {config.attention_type}"
-            )
+            raise ValueError(f"Unsupported attention type: {config.attention_type}")
 
         self.expert_num = config.num_experts
         self.hidden_size = config.hidden_size
@@ -621,9 +623,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 )
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            self.hidden_size, eps=rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -637,16 +637,14 @@ class BailingMoELinearDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.attention(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
         )
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -676,16 +674,21 @@ class BailingMoELinearModel(nn.Module):
         self.num_layers = config.num_hidden_layers
 
         self.layer_group_size = getattr(config, "layer_group_size", 1)
-        self.decoder_attention_types = [0 if is_linear_layer(i, self.layer_group_size) else 1 for i in
-                                        range(self.num_layers)]
+        self.decoder_attention_types = [
+            0 if is_linear_layer(i, self.layer_group_size) else 1
+            for i in range(self.num_layers)
+        ]
         logger.info(
-            f'attention type of layers:{self.decoder_attention_types}, 0 is linear layer and 1 is softmax layer!')
+            f"attention type of layers:{self.decoder_attention_types}, 0 is linear layer and 1 is softmax layer!"
+        )
 
-        assert self.num_layers % self.layer_group_size == 0, \
-            f'num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}'
+        assert (
+            self.num_layers % self.layer_group_size == 0
+        ), f"num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}"
         self.layer_group_num = self.num_layers // self.layer_group_size
-        assert self.layer_group_num % self.pp_group.world_size == 0, \
-            f'layer_group_num={self.layer_group_num} must be divided by pp_size={self.pp_group.world_size}'
+        assert (
+            self.layer_group_num % self.pp_group.world_size == 0
+        ), f"layer_group_num={self.layer_group_num} must be divided by pp_size={self.pp_group.world_size}"
 
         if self.pp_group.is_first_rank:
             self.word_embeddings = VocabParallelEmbedding(
@@ -715,11 +718,9 @@ class BailingMoELinearModel(nn.Module):
         )
 
         linear_layer_nums = sum(
-            1
-            for i in range(self.num_layers)
-            if self.decoder_attention_types[i] == 0
+            1 for i in range(self.num_layers) if self.decoder_attention_types[i] == 0
         )
-        logger.info(f'linear_layer_nums={linear_layer_nums}')
+        logger.info(f"linear_layer_nums={linear_layer_nums}")
 
         norm_kwargs = {}
         if hasattr(config, "rms_norm_eps"):
@@ -761,10 +762,7 @@ class BailingMoELinearModel(nn.Module):
                 )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual
-                }
+                {"hidden_states": hidden_states, "residual": residual}
             )
         else:
             if not forward_batch.forward_mode.is_idle():
@@ -788,11 +786,18 @@ class BailingMoELinearForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = BailingMoELinearModel(self.config, quant_config, prefix=add_prefix("model", prefix))
+        self.model = BailingMoELinearModel(
+            self.config, quant_config, prefix=add_prefix("model", prefix)
+        )
 
         if self.pp_group.is_last_rank:
-            self.lm_head = self.word_embeddings if config.tie_word_embeddings \
-                else ParallelLMHead(config.vocab_size, config.hidden_size, quant_config=quant_config)
+            self.lm_head = (
+                self.word_embeddings
+                if config.tie_word_embeddings
+                else ParallelLMHead(
+                    config.vocab_size, config.hidden_size, quant_config=quant_config
+                )
+            )
             self.logits_processor = LogitsProcessor(config)
         else:
             self.lm_head = PPMissingLayer()
@@ -830,11 +835,15 @@ class BailingMoELinearForCausalLM(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        def load_linear_attn_weight(name: str, loaded_weight: torch.Tensor, self) -> None:
+        def load_linear_attn_weight(
+            name: str, loaded_weight: torch.Tensor, self
+        ) -> None:
             if is_pp_missing_parameter(name, self):
                 return
             param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", BailingMoELinearAttention.weight_direct_load)
+            weight_loader = getattr(
+                param, "weight_loader", BailingMoELinearAttention.weight_direct_load
+            )
             weight_loader = weight_loader_with_alias(name)(weight_loader)
             weight_loader(param, loaded_weight)
             return
@@ -848,7 +857,8 @@ class BailingMoELinearForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts)
+            num_experts=self.config.num_experts,
+        )
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
@@ -857,13 +867,16 @@ class BailingMoELinearForCausalLM(nn.Module):
             if name.startswith("model.mtp"):
                 continue
             layer_idx = None
-            if 'model.layers.' in name:
-                layer_idx = int(name.split('.')[2])
-            if (("v_head" in name) or ("inv_freq" in name) or
-                (self.config.tie_word_embeddings and "lm_head" in name)):
+            if "model.layers." in name:
+                layer_idx = int(name.split(".")[2])
+            if (
+                ("v_head" in name)
+                or ("inv_freq" in name)
+                or (self.config.tie_word_embeddings and "lm_head" in name)
+            ):
                 continue
 
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 if "mlp.experts" in name:
@@ -892,28 +905,35 @@ class BailingMoELinearForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(param,
-                                  loaded_weight,
-                                  name,
-                                  shard_id=shard_id,
-                                  expert_id=expert_id)
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
                     break
                 else:
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    if 'slope' in name:
+                    if "slope" in name:
                         continue
                     if name not in params_dict:
                         continue
                     if is_pp_missing_parameter(name, self):
                         continue
-                    if "attention" in name and 'slope' not in name and is_linear_layer(layer_idx,
-                                                                                       self.model.layer_group_size):
+                    if (
+                        "attention" in name
+                        and "slope" not in name
+                        and is_linear_layer(layer_idx, self.model.layer_group_size)
+                    ):
                         load_linear_attn_weight(name, loaded_weight, self)
                         loaded_params.add(name)
                         continue
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
@@ -928,4 +948,8 @@ class BailingMoeLinearV2ForCausalLM(BailingMoELinearForCausalLM):
     pass
 
 
-EntryClass = [BailingMoELinearForCausalLM, BailingMoeLinearForCausalLM, BailingMoeLinearV2ForCausalLM]
+EntryClass = [
+    BailingMoELinearForCausalLM,
+    BailingMoeLinearForCausalLM,
+    BailingMoeLinearV2ForCausalLM,
+]

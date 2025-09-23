@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
-import math
+
 import numpy as np
 import torch
-from sglang.srt.layers.hybrid_linear.lightning_attn import lightning_attention, linear_decode_forward_triton
-from sglang.srt.layers.hybrid_linear.seg_la import SegLaMeta, seg_la_fwd
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.hybrid_linear.lightning_attn import (
+    lightning_attention,
+    linear_decode_forward_triton,
+)
+from sglang.srt.layers.hybrid_linear.seg_la import SegLaMeta, seg_la_fwd
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import get_compiler_backend
-import logging
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -20,10 +26,12 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size
+    get_tensor_model_parallel_world_size,
 )
+
 
 def _build_slope_tensor(n_attention_heads: int):
     def get_slopes(n):
@@ -42,10 +50,11 @@ def _build_slope_tensor(n_attention_heads: int):
                 + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
             )
 
-    slopes = torch.tensor(
-        get_slopes(n_attention_heads), dtype=torch.float32
-    ).reshape(n_attention_heads, 1, 1)
+    slopes = torch.tensor(get_slopes(n_attention_heads), dtype=torch.float32).reshape(
+        n_attention_heads, 1, 1
+    )
     return slopes
+
 
 def is_linear_layer(layer_idx, layer_group_size):
     if layer_idx is None:
@@ -54,6 +63,7 @@ def is_linear_layer(layer_idx, layer_group_size):
         return (layer_idx + 1) % layer_group_size != 0
     else:
         return False
+
 
 def get_num_prefills(forward_batch: ForwardBatch):
     if forward_batch.forward_mode.is_extend():
@@ -89,6 +99,7 @@ def get_num_decode_tokens(forward_batch: ForwardBatch):
     else:
         return 0
 
+
 class BailingLinearKernel:
     """
     Linear attention kernel implementation for Bailing models.
@@ -99,6 +110,7 @@ class BailingLinearKernel:
     The implementation maintains the same functionality while being renamed to
     match our Bailing model naming convention.
     """
+
     @staticmethod
     def jit_linear_forward_prefix(
         q: torch.Tensor,
@@ -125,7 +137,8 @@ class BailingLinearKernel:
         )
         kv_caches.copy_(kv_history[:, :, -1, :, :].reshape(h, d, e))
         assert output.shape[0] == 1, "batch size must be 1"
-        return output.squeeze(0).transpose(0, 1).reshape([n, h*d]).contiguous()
+        return output.squeeze(0).transpose(0, 1).reshape([n, h * d]).contiguous()
+
 
 @dataclass
 class HybridLinearAttentionMetadata:
@@ -152,6 +165,7 @@ class HybridLinearAttentionMetadata:
     seqlens_q: torch.Tensor = None
     batch_size: int = 0
     is_decode_req_tensor: torch.Tensor = None
+
 
 class HybridLinearAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
@@ -197,7 +211,11 @@ class HybridLinearAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
         self.layer_group_size = model_runner.model_config.hf_config.layer_group_size
-        self.BLOCK = model_runner.model_config.block if hasattr(model_runner.model_config, "block") else 256
+        self.BLOCK = (
+            model_runner.model_config.block
+            if hasattr(model_runner.model_config, "block")
+            else 256
+        )
         total_num_heads = model_runner.model_config.hf_config.num_attention_heads
         tp_heads = total_num_heads // get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -207,14 +225,22 @@ class HybridLinearAttentionBackend(AttentionBackend):
         if num_hidden_layers <= 1:
             slope_rate_list = [slope_rate * (1 + 1e-5)]
         else:
-            slope_rate_list = [slope_rate * (
-                1 - layer_id / (num_hidden_layers - 1) + 1e-5
-            ) for layer_id in range(num_hidden_layers)]
-        self.tp_slope = [slope_rate_list[layer_id][
-            tp_rank * tp_heads : (tp_rank + 1) * tp_heads
-        ].contiguous().to(self.device) for layer_id in range(num_hidden_layers)]
-        self.linear_backend = getattr(model_runner.model_config.hf_config, "linear_backend", "minimax")
-        logger.info(f'linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}')
+            slope_rate_list = [
+                slope_rate * (1 - layer_id / (num_hidden_layers - 1) + 1e-5)
+                for layer_id in range(num_hidden_layers)
+            ]
+        self.tp_slope = [
+            slope_rate_list[layer_id][tp_rank * tp_heads : (tp_rank + 1) * tp_heads]
+            .contiguous()
+            .to(self.device)
+            for layer_id in range(num_hidden_layers)
+        ]
+        self.linear_backend = getattr(
+            model_runner.model_config.hf_config, "linear_backend", "minimax"
+        )
+        logger.info(
+            f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -279,7 +305,16 @@ class HybridLinearAttentionBackend(AttentionBackend):
         self.forward_metadata = metadata
 
     def _prefill_and_mix_infer(
-        self, q, k, v, kv_cache, state_indices_tensor, forward_batch, layer, cu_seqlens_q, cu_seqlens_k
+        self,
+        q,
+        k,
+        v,
+        kv_cache,
+        state_indices_tensor,
+        forward_batch,
+        layer,
+        cu_seqlens_q,
+        cu_seqlens_k,
     ):
         hidden = []
         for _prefill_idx in range(get_num_prefills(forward_batch)):
@@ -333,7 +368,9 @@ class HybridLinearAttentionBackend(AttentionBackend):
         hidden = torch.concat(hidden, dim=0).contiguous()
         return hidden
 
-    def _decode_infer(self, q, k, v, kv_cache, state_indices_tensor, forward_batch, layer):
+    def _decode_infer(
+        self, q, k, v, kv_cache, state_indices_tensor, forward_batch, layer
+    ):
         num_prefill_tokens = get_num_prefill_tokens(forward_batch)
         num_prefills = get_num_prefills(forward_batch)
         q = q[num_prefill_tokens:].unsqueeze(2).contiguous()
@@ -350,7 +387,9 @@ class HybridLinearAttentionBackend(AttentionBackend):
         )
         return hidden
 
-    def linear_attention_entry(self, q, k, v, kv_cache, state_indices_tensor, attn_metadata, layer):
+    def linear_attention_entry(
+        self, q, k, v, kv_cache, state_indices_tensor, attn_metadata, layer
+    ):
         seg_meta = SegLaMeta(
             batch_size=attn_metadata.batch_size,
             max_q_length=None,
@@ -367,7 +406,7 @@ class HybridLinearAttentionBackend(AttentionBackend):
             s=kv_cache,
             decay_scales=self.tp_slope[layer.layer_id],
             meta=seg_meta,
-            decouple=True
+            decouple=True,
         )
         return hidden
 
@@ -464,12 +503,24 @@ class HybridLinearAttentionBackend(AttentionBackend):
             kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
             if self.linear_backend == "minimax":
                 o = self._prefill_and_mix_infer(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim), k, v, kv_cache, state_indices_tensor, forward_batch, layer, cu_seqlens_q, cu_seqlens_k
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k,
+                    v,
+                    kv_cache,
+                    state_indices_tensor,
+                    forward_batch,
+                    layer,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
                 )
             elif self.linear_backend == "seg_la":
-                o = self.linear_attention_entry(q, k, v, kv_cache, state_indices_tensor, metadata, layer)
+                o = self.linear_attention_entry(
+                    q, k, v, kv_cache, state_indices_tensor, metadata, layer
+                )
             else:
-                raise ValueError(f"linear backend: {self.linear_backend} is not support for now")
+                raise ValueError(
+                    f"linear backend: {self.linear_backend} is not support for now"
+                )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -525,16 +576,15 @@ class HybridLinearAttentionBackend(AttentionBackend):
             )
             window_size = (
                 (layer.sliding_window_size, 0)
-                if layer.sliding_window_size is not None and layer.sliding_window_size > -1
+                if layer.sliding_window_size is not None
+                and layer.sliding_window_size > -1
                 else (-1, -1)
             )
             page_table = metadata.page_table
             cache_seqlens = metadata.cache_seqlens_int32
             cu_seqlens_k = metadata.cu_seqlens_k
             max_seqlen_q = metadata.max_seq_len_q
-            q_reshaped = q.contiguous().view(
-                -1, layer.tp_q_head_num, layer.head_dim
-            )
+            q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
             # Default: single-token self-attention
             result = flash_attn_with_kvcache(
@@ -559,15 +609,17 @@ class HybridLinearAttentionBackend(AttentionBackend):
             kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
             state_indices_tensor = metadata.req_pool_indices
             if self.linear_backend == "minimax":
-                o = self._decode_infer(q, k, v, kv_cache, state_indices_tensor, forward_batch, layer)
+                o = self._decode_infer(
+                    q, k, v, kv_cache, state_indices_tensor, forward_batch, layer
+                )
             elif self.linear_backend == "seg_la":
                 o = self.linear_attention_entry(
-                    q, k, v,
-                    kv_cache, state_indices_tensor,
-                    metadata, layer
+                    q, k, v, kv_cache, state_indices_tensor, metadata, layer
                 )
             else:
-                raise ValueError(f"linear backend: {self.linear_backend} is not support for now")
+                raise ValueError(
+                    f"linear backend: {self.linear_backend} is not support for now"
+                )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -686,6 +738,7 @@ class HybridLinearAttentionBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 0
+
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def normal_decode_set_medadata(

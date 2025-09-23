@@ -1,15 +1,18 @@
 from __future__ import annotations
+
 import math
+from typing import Optional, Union
+
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from typing import Optional, Union
 
 
 @triton.autotune(
@@ -28,13 +31,21 @@ def layer_norm_gate_fwd_kernel(
     W,  # pointer to the weights  # (G, N)
     Rstd,  # pointer to the 1/std  # (M, G)
     N,  # number of columns in X
-    stride_x0, stride_x1, stride_x2,
-    stride_o0, stride_o1, stride_o2,
-    stride_y0, stride_y1, stride_y2,
-    stride_w0, stride_w1,
-    stride_rstd0, stride_rstd1,
+    stride_x0,
+    stride_x1,
+    stride_x2,
+    stride_o0,
+    stride_o1,
+    stride_o2,
+    stride_y0,
+    stride_y1,
+    stride_y2,
+    stride_w0,
+    stride_w1,
+    stride_rstd0,
+    stride_rstd1,
     eps,  # epsilon to avoid division by zero
-    BLOCK_N: tl.constexpr
+    BLOCK_N: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -45,7 +56,9 @@ def layer_norm_gate_fwd_kernel(
     W += group * stride_w0
     # Compute mean and variance
     cols = tl.arange(0, BLOCK_N)
-    x = tl.load(X + cols * stride_x2, mask=cols < N, other=0.0).to(tl.float32)  # (BLOCK_N, )
+    x = tl.load(X + cols * stride_x2, mask=cols < N, other=0.0).to(
+        tl.float32
+    )  # (BLOCK_N, )
     xbar = tl.where(cols < N, x, 0.0)  # (BLOCK_N, )
     var = tl.sum(xbar * xbar, axis=0) / N  # (1, )
     rstd = 1 / tl.sqrt(var + eps)
@@ -66,7 +79,7 @@ def rms_norm_gate_fwd(
     x: torch.Tensor,  # (M, group, hidden_size)  attn_output, rmsnorm
     o: torch.Tensor,  # (M, group, hidden_size)  gate, sigmoid
     weight: torch.Tensor,  # (group, hidden_size)
-    eps: float
+    eps: float,
 ):
     M, G, N = x.shape
     # allocate output
@@ -85,13 +98,21 @@ def rms_norm_gate_fwd(
         weight,
         rstd,
         N,
-        x.stride(0), x.stride(1), x.stride(2),
-        o.stride(0), o.stride(1), o.stride(2),
-        y.stride(0), y.stride(1), y.stride(2),
-        weight.stride(0), weight.stride(1),
-        rstd.stride(0), rstd.stride(1),
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        weight.stride(0),
+        weight.stride(1),
+        rstd.stride(0),
+        rstd.stride(1),
         eps,
-        BLOCK_N
+        BLOCK_N,
     )
     # residual_out is None if residual is None and residual_dtype == input_dtype
     return y, rstd
@@ -115,20 +136,34 @@ def layer_norm_gate_bwd_kernel(
     DO,  # pointer to the gate gradient  # (M, G, N)
     DW,  # pointer to the partial sum of weights gradient  # (sm_count, G, N)
     Rstd,  # pointer to the 1/std  # (M, G)
-    stride_x0, stride_x1, stride_x2,
-    stride_o0, stride_o1, stride_o2,
-    stride_w0, stride_w1,
-    stride_dy0, stride_dy1, stride_dy2,
-    stride_dx0, stride_dx1, stride_dx2,
-    stride_do0, stride_do1, stride_do2,
-    stride_dw0, stride_dw1, stride_dw2,
-    stride_rstd0, stride_rstd1,
+    stride_x0,
+    stride_x1,
+    stride_x2,
+    stride_o0,
+    stride_o1,
+    stride_o2,
+    stride_w0,
+    stride_w1,
+    stride_dy0,
+    stride_dy1,
+    stride_dy2,
+    stride_dx0,
+    stride_dx1,
+    stride_dx2,
+    stride_do0,
+    stride_do1,
+    stride_do2,
+    stride_dw0,
+    stride_dw1,
+    stride_dw2,
+    stride_rstd0,
+    stride_rstd1,
     M,  # number of rows in X
     G,  # number of groups in X
     N,  # number of columns in X
     eps,  # epsilon to avoid division by zero
     rows_per_program,
-    BLOCK_N: tl.constexpr
+    BLOCK_N: tl.constexpr,
 ):
     # Map the program id to the elements of X, DX, and DY it should compute.
     row_block_id = tl.program_id(0)
@@ -147,9 +182,15 @@ def layer_norm_gate_bwd_kernel(
     row_end = min((row_block_id + 1) * rows_per_program, M)
     for row in range(row_start, row_end):
         # Load data to SRAM
-        x = tl.load(X + cols * stride_x2, mask=mask, other=0).to(tl.float32)  # (BLOCK_N, )
-        o = tl.load(O + cols * stride_o2, mask=mask, other=0).to(tl.float32)  # (BLOCK_N, )
-        dy = tl.load(DY + cols * stride_dy2, mask=mask, other=0).to(tl.float32)  # (BLOCK_N, )
+        x = tl.load(X + cols * stride_x2, mask=mask, other=0).to(
+            tl.float32
+        )  # (BLOCK_N, )
+        o = tl.load(O + cols * stride_o2, mask=mask, other=0).to(
+            tl.float32
+        )  # (BLOCK_N, )
+        dy = tl.load(DY + cols * stride_dy2, mask=mask, other=0).to(
+            tl.float32
+        )  # (BLOCK_N, )
         rstd = tl.load(Rstd + row * stride_rstd0)  # (1, )
         # Compute dx
         xhat = x * rstd  # (BLOCK_N, )
@@ -169,7 +210,11 @@ def layer_norm_gate_bwd_kernel(
         DY += stride_dy0
         DX += stride_dx0
         DO += stride_do0
-    tl.store(DW + row_block_id * stride_dw0 + group * stride_dw1 + cols * stride_dw2, dw, mask=mask)
+    tl.store(
+        DW + row_block_id * stride_dw0 + group * stride_dw1 + cols * stride_dw2,
+        dw,
+        mask=mask,
+    )
 
 
 def layer_norm_bwd(
@@ -206,20 +251,34 @@ def layer_norm_bwd(
         do,  # (M, group, hidden_size)
         dw,  # (sm_count, group, hidden_size)
         rstd,  # (M, group)
-        x.stride(0), x.stride(1), x.stride(2),
-        o.stride(0), o.stride(1), o.stride(2),
-        weight.stride(0), weight.stride(1),
-        dy.stride(0), dy.stride(1), dy.stride(2),
-        dx.stride(0), dx.stride(1), dx.stride(2),
-        do.stride(0), do.stride(1), do.stride(2),
-        dw.stride(0), dw.stride(1), dw.stride(2),
-        rstd.stride(0), rstd.stride(1),
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        weight.stride(0),
+        weight.stride(1),
+        dy.stride(0),
+        dy.stride(1),
+        dy.stride(2),
+        dx.stride(0),
+        dx.stride(1),
+        dx.stride(2),
+        do.stride(0),
+        do.stride(1),
+        do.stride(2),
+        dw.stride(0),
+        dw.stride(1),
+        dw.stride(2),
+        rstd.stride(0),
+        rstd.stride(1),
         M,
         G,
         N,
         eps,
         rows_per_program,
-        BLOCK_N
+        BLOCK_N,
     )
     dw = dw.sum(0).to(weight.dtype)
     return dx, do, dw
@@ -233,16 +292,14 @@ class GroupRMSNormSigmoidGateFn(torch.autograd.Function):
         x,  # (*, group, hidden_size)  attn_output, rmsnorm
         o,  # (*, group, hidden_size)  gate, sigmoid
         weight,  # (group, hidden_size)
-        eps=1e-6
+        eps=1e-6,
     ):
         x_shape_og = x.shape
         o_shape_og = o.shape
         # reshape input data into 2D tensor
         x = x.reshape(-1, x.shape[-2], x.shape[-1])  # (M, group, hidden_size)
         o = o.reshape(-1, x.shape[-2], x.shape[-1])  # (M, group, hidden_size)
-        y, rstd = rms_norm_gate_fwd(
-            x, o, weight, eps
-        )
+        y, rstd = rms_norm_gate_fwd(x, o, weight, eps)
         ctx.save_for_backward(x, o, weight, rstd)
         ctx.x_shape_og = x_shape_og
         ctx.o_shape_og = o_shape_og
@@ -252,9 +309,7 @@ class GroupRMSNormSigmoidGateFn(torch.autograd.Function):
         return y
 
     @staticmethod
-    def backward(ctx,
-                 dy,  # (*, group, hidden_size)
-                 *args):
+    def backward(ctx, dy, *args):  # (*, group, hidden_size)
         x, o, weight, rstd = ctx.saved_tensors
         dy = dy.reshape(-1, dy.shape[-2], dy.shape[-1])  # (M, group, hidden_size)
         assert dy.shape == x.shape
@@ -267,43 +322,41 @@ class GroupRMSNormSigmoidGateFn(torch.autograd.Function):
             rstd,
             x_dtype=ctx.x_dtype,
         )
-        return (
-            dx.reshape(ctx.x_shape_og),
-            do.reshape(ctx.o_shape_og),
-            dw,
-            None
-        )
+        return (dx.reshape(ctx.x_shape_og), do.reshape(ctx.o_shape_og), dw, None)
 
 
 def group_rms_norm_sigmoid_gate_fn(
     x,  # (*, group, hidden_size)
     o,  # (*, group, hidden_size)
     weight,  # (group, hidden_size)
-    eps=1e-6
+    eps=1e-6,
 ):
-    return GroupRMSNormSigmoidGateFn.apply(
-        x,
-        o,
-        weight,
-        eps
-    )
+    return GroupRMSNormSigmoidGateFn.apply(x, o, weight, eps)
 
 
 class BailingMoEFusedGroupRMSNormSigmoidGate(CustomOp):
     name = "BailingMoEFusedGroupRMSNormSigmoidGate"
 
-    def __init__(
-        self, hidden_size, eps: float = 1e-6, group_norm_size: int = 1
-    ):
+    def __init__(self, hidden_size, eps: float = 1e-6, group_norm_size: int = 1):
         super().__init__()
         self.tp_world = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.group_norm_size = group_norm_size
-        assert self.tp_world <= self.group_norm_size, "tp_world must be less than or equal to group_norm_size"
-        assert self.group_norm_size % self.tp_world == 0, "group_norm_size must be divisible by tp_world"
-        self.linear_attn_norm_group_size_per_rank = self.group_norm_size // self.tp_world
+        assert (
+            self.tp_world <= self.group_norm_size
+        ), "tp_world must be less than or equal to group_norm_size"
+        assert (
+            self.group_norm_size % self.tp_world == 0
+        ), "group_norm_size must be divisible by tp_world"
+        self.linear_attn_norm_group_size_per_rank = (
+            self.group_norm_size // self.tp_world
+        )
         self.weight = torch.nn.Parameter(
-            torch.ones(self.linear_attn_norm_group_size_per_rank, int(hidden_size / self.group_norm_size)))
+            torch.ones(
+                self.linear_attn_norm_group_size_per_rank,
+                int(hidden_size / self.group_norm_size),
+            )
+        )
         self.weight.weight_loader = self.weight_loader
         self.variance_epsilon = eps
 
@@ -363,8 +416,7 @@ class BailingMoERMSNormTP(CustomOp):
         x = x.to(torch.float32)
         variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
         if self.tp_world > 1:
-            variance = tensor_model_parallel_all_reduce(
-                variance) / self.tp_world
+            variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = x.to(orig_dtype) * self.weight
         return x
