@@ -43,12 +43,12 @@ from sglang.srt.layers.quantization.int8_kernel import (
     w8a8_per_channel_per_token_matmul,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import (
+from sglang.srt.utils import (  # get_device_capability,
     apply_module_patch,
     cpu_has_amx_support,
-    get_device_capability,
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -66,7 +66,7 @@ _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 _is_npu = is_npu()
-
+_is_hip = is_hip()
 if _is_npu:
     import torch_npu
 
@@ -347,14 +347,12 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 _is_cpu_amx_available
             ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["weight"])
-        else:
-            use_triton_impl = _is_cuda and get_device_capability() == (8, 9)
-            if use_triton_impl:
-                layer.weight = Parameter(layer.weight.data, requires_grad=False)
-                self.gemm_func = w8a8_per_channel_per_token_matmul
-            else:
-                layer.weight = Parameter(layer.weight.t(), requires_grad=False)
-                self.gemm_func = int8_scaled_mm
+        elif _is_cuda:
+            layer.weight = Parameter(layer.weight.data, requires_grad=False)
+            self.gemm_func = w8a8_per_channel_per_token_matmul
+        elif _is_hip:
+            layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+            self.gemm_func = int8_scaled_mm
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
     def create_weights(
