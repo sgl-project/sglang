@@ -17,7 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
+from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
@@ -224,7 +224,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             return input_ids
 
         for start_idx, end_idx in zip(start_indices, end_indices):
-            padded_ids.extend(input_ids[last_idx : start_idx + 1])
+            padded_ids.extend(input_ids[last_idx: start_idx + 1])
 
             if input_ids[start_idx] in self.data_start_token_ids:
                 data_idx += 1
@@ -283,17 +283,12 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
-embedding_cache: Optional[MultiModalCache] = None
+embedding_cache: Optional[MultiModalStaticCache] = None
 
 
 def init_embedding_cache(max_size: int = 0):
     global embedding_cache
-    embedding_cache = MultiModalCache(max_size)
-
-
-def get_embedding_hash(embedding_items: List[MultimodalDataItem]) -> int:
-    hash_list = [item.hash for item in embedding_items]
-    return hash(tuple(hash_list))
+    embedding_cache = MultiModalStaticCache(max_size)
 
 
 def get_embedding_chunk(
@@ -377,23 +372,26 @@ def _get_chunked_prefill_embedding(
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
-        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
+        embedding_items_per_req = embedding_items[items_size[i]: items_size[i + 1]]
         items_offset = items_offset_list[i]
         assert items_offset is not None, items_offset
-        embedding_items_hash = get_embedding_hash(embedding_items_per_req)
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        embedding_per_req = embedding_cache.get(embedding_items_hash)
+        item_hashes = [item.hash for item in embedding_items]
+        embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
+        embedding_per_req = embedding_cache.get(item_hashes)
         if embedding_per_req is None:
             embedding_per_req = data_embedding_func(embedding_items_per_req)
-            if not embedding_cache.put(embedding_items_hash, embedding_per_req):
+            if not embedding_cache.set(embedding_items_hash, embedding_per_req):
                 print_warning_once(
                     "Multimodal embedding cache is full. This typically occurs when a single "
                     "embedding exceeds the cache size limit. Consider increasing the "
                     "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
                     "embedding size."
                 )
+        else:
+            print(f"cache hit!")
 
         embedding_per_req_chunk, _, _ = get_embedding_chunk(
             embedding=embedding_per_req,
