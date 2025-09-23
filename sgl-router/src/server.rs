@@ -1,6 +1,6 @@
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig},
-    core::{WorkerRegistry, WorkerType},
+    core::{WorkerManager, WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -14,7 +14,6 @@ use crate::{
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
     reasoning_parser::ParserFactory,
-    routers::WorkerInitializer,
     routers::{
         router_manager::{RouterId, RouterManager},
         RouterFactory, RouterTrait,
@@ -160,8 +159,6 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
     state.router.get_model_info(req).await
 }
 
-// Generation endpoints
-// The RouterTrait now accepts optional headers and typed body directly
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -291,27 +288,32 @@ async fn add_worker(
     State(state): State<Arc<AppState>>,
     Query(AddWorkerQuery { url, api_key }): Query<AddWorkerQuery>,
 ) -> Response {
-    match state.router.add_worker(&url, &api_key).await {
+    // Use centralized WorkerManager with full context
+    let result = WorkerManager::add_worker(&url, &api_key, &state.context).await;
+
+    match result {
         Ok(message) => (StatusCode::OK, message).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
     }
 }
 
 async fn list_workers(State(state): State<Arc<AppState>>) -> Response {
-    let worker_list = state.router.get_worker_urls();
-    Json(serde_json::json!({ "urls": worker_list })).into_response()
+    // Use centralized WorkerManager instead of router's get_worker_urls
+    let worker_list = WorkerManager::get_worker_urls(&state.context.worker_registry);
+    Json(json!({ "urls": worker_list })).into_response()
 }
 
 async fn remove_worker(
     State(state): State<Arc<AppState>>,
     Query(AddWorkerQuery { url, .. }): Query<AddWorkerQuery>,
 ) -> Response {
-    state.router.remove_worker(&url);
-    (
-        StatusCode::OK,
-        format!("Successfully removed worker: {url}"),
-    )
-        .into_response()
+    // Use centralized WorkerManager with full context
+    let result = WorkerManager::remove_worker(&url, &state.context);
+
+    match result {
+        Ok(message) => (StatusCode::OK, message).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+    }
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
@@ -329,125 +331,106 @@ async fn create_worker(
     State(state): State<Arc<AppState>>,
     Json(config): Json<WorkerConfigRequest>,
 ) -> Response {
-    // Check if we have a RouterManager (enable_igw=true)
-    if let Some(router_manager) = &state.router_manager {
-        // Call RouterManager's add_worker method directly with the full config
-        match router_manager.add_worker(config).await {
-            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-            Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
+    // In single router mode, use centralized WorkerManager with full context
+    let result = WorkerManager::add_worker_from_config(&config, &state.context).await;
+
+    match result {
+        Ok(message) => {
+            let response = WorkerApiResponse {
+                success: true,
+                message,
+                worker: None,
+            };
+            (StatusCode::OK, Json(response)).into_response()
         }
-    } else {
-        // In single router mode, use the router's add_worker with basic config
-        match state.router.add_worker(&config.url, &config.api_key).await {
-            Ok(message) => {
-                let response = WorkerApiResponse {
-                    success: true,
-                    message,
-                    worker: None,
-                };
-                (StatusCode::OK, Json(response)).into_response()
-            }
-            Err(error) => {
-                let error_response = WorkerErrorResponse {
-                    error,
-                    code: "ADD_WORKER_FAILED".to_string(),
-                };
-                (StatusCode::BAD_REQUEST, Json(error_response)).into_response()
-            }
+        Err(error) => {
+            let error_response = WorkerErrorResponse {
+                error,
+                code: "ADD_WORKER_FAILED".to_string(),
+            };
+            (StatusCode::BAD_REQUEST, Json(error_response)).into_response()
         }
     }
 }
 
 /// GET /workers - List all workers with details
 async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
-    if let Some(router_manager) = &state.router_manager {
-        let response = router_manager.list_workers();
-        Json(response).into_response()
-    } else {
-        // In single router mode, get detailed worker info from registry
-        let workers = state.context.worker_registry.get_all();
-        let response = serde_json::json!({
-            "workers": workers.iter().map(|worker| {
-                let mut worker_info = serde_json::json!({
-                    "url": worker.url(),
-                    "model_id": worker.model_id(),
-                    "worker_type": match worker.worker_type() {
-                        WorkerType::Regular => "regular",
-                        WorkerType::Prefill { .. } => "prefill",
-                        WorkerType::Decode => "decode",
-                    },
-                    "is_healthy": worker.is_healthy(),
-                    "load": worker.load(),
-                    "connection_mode": format!("{:?}", worker.connection_mode()),
-                    "priority": worker.priority(),
-                    "cost": worker.cost(),
-                });
+    // In single router mode, get detailed worker info from registry
+    let workers = state.context.worker_registry.get_all();
+    let response = serde_json::json!({
+        "workers": workers.iter().map(|worker| {
+            let mut worker_info = serde_json::json!({
+                "url": worker.url(),
+                "model_id": worker.model_id(),
+                "worker_type": match worker.worker_type() {
+                    WorkerType::Regular => "regular",
+                    WorkerType::Prefill { .. } => "prefill",
+                    WorkerType::Decode => "decode",
+                },
+                "is_healthy": worker.is_healthy(),
+                "load": worker.load(),
+                "connection_mode": format!("{:?}", worker.connection_mode()),
+                "priority": worker.priority(),
+                "cost": worker.cost(),
+            });
 
-                // Add bootstrap_port for Prefill workers
-                if let WorkerType::Prefill { bootstrap_port } = worker.worker_type() {
-                    worker_info["bootstrap_port"] = serde_json::json!(bootstrap_port);
-                }
-
-                worker_info
-            }).collect::<Vec<_>>(),
-            "total": workers.len(),
-            "stats": {
-                "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
-                "decode_count": state.context.worker_registry.get_decode_workers().len(),
-                "regular_count": state.context.worker_registry.get_by_type(&WorkerType::Regular).len(),
+            // Add bootstrap_port for Prefill workers
+            if let WorkerType::Prefill { bootstrap_port } = worker.worker_type() {
+                worker_info["bootstrap_port"] = serde_json::json!(bootstrap_port);
             }
-        });
-        Json(response).into_response()
-    }
+
+            worker_info
+        }).collect::<Vec<_>>(),
+        "total": workers.len(),
+        "stats": {
+            "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
+            "decode_count": state.context.worker_registry.get_decode_workers().len(),
+            "regular_count": state.context.worker_registry.get_by_type(&WorkerType::Regular).len(),
+        }
+    });
+    Json(response).into_response()
 }
 
 /// GET /workers/{url} - Get specific worker info
 async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
-    if let Some(router_manager) = &state.router_manager {
-        if let Some(worker) = router_manager.get_worker(&url) {
-            Json(worker).into_response()
-        } else {
-            let error = WorkerErrorResponse {
-                error: format!("Worker {url} not found"),
-                code: "WORKER_NOT_FOUND".to_string(),
-            };
-            (StatusCode::NOT_FOUND, Json(error)).into_response()
-        }
+    let workers = WorkerManager::get_worker_urls(&state.context.worker_registry);
+    if workers.contains(&url) {
+        Json(json!({
+            "url": url,
+            "model_id": "unknown",
+            "is_healthy": true
+        }))
+        .into_response()
     } else {
-        let workers = state.router.get_worker_urls();
-        if workers.contains(&url) {
-            Json(json!({
-                "url": url,
-                "model_id": "unknown",
-                "is_healthy": true
-            }))
-            .into_response()
-        } else {
-            let error = WorkerErrorResponse {
-                error: format!("Worker {url} not found"),
-                code: "WORKER_NOT_FOUND".to_string(),
-            };
-            (StatusCode::NOT_FOUND, Json(error)).into_response()
-        }
+        let error = WorkerErrorResponse {
+            error: format!("Worker {url} not found"),
+            code: "WORKER_NOT_FOUND".to_string(),
+        };
+        (StatusCode::NOT_FOUND, Json(error)).into_response()
     }
 }
 
 /// DELETE /workers/{url} - Remove a worker
 async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
-    if let Some(router_manager) = &state.router_manager {
-        match router_manager.remove_worker_from_registry(&url) {
-            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-            Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
+    // In single router mode, use centralized WorkerManager with full context
+    let result = WorkerManager::remove_worker(&url, &state.context);
+
+    match result {
+        Ok(message) => {
+            let response = WorkerApiResponse {
+                success: true,
+                message,
+                worker: None,
+            };
+            (StatusCode::OK, Json(response)).into_response()
         }
-    } else {
-        // In single router mode, use router's remove_worker
-        state.router.remove_worker(&url);
-        let response = WorkerApiResponse {
-            success: true,
-            message: format!("Worker {url} removed successfully"),
-            worker: None,
-        };
-        (StatusCode::OK, Json(response)).into_response()
+        Err(error) => {
+            let error_response = WorkerErrorResponse {
+                error,
+                code: "REMOVE_WORKER_FAILED".to_string(),
+            };
+            (StatusCode::BAD_REQUEST, Json(error_response)).into_response()
+        }
     }
 }
 
@@ -600,7 +583,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "Initializing workers for routing mode: {:?}",
         config.router_config.mode
     );
-    WorkerInitializer::initialize_workers(
+    WorkerManager::initialize_workers(
         &config.router_config,
         &app_context.worker_registry,
         Some(&app_context.policy_registry),
@@ -620,12 +603,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             info!("Multi-router mode enabled (enable_igw=true)");
 
             // Create RouterManager with shared registries from AppContext
-            let router_manager = Arc::new(RouterManager::new(
-                config.router_config.clone(),
-                client.clone(),
-                app_context.worker_registry.clone(),
-                app_context.policy_registry.clone(),
-            ));
+            let router_manager = Arc::new(RouterManager::new(app_context.worker_registry.clone()));
 
             // 1. HTTP Regular Router
             match RouterFactory::create_regular_router(&app_context).await {
@@ -711,12 +689,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager,
     });
-    let router_arc = Arc::clone(&app_state.router);
-
     // Start the service discovery if enabled
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
-            match start_service_discovery(service_discovery_config, router_arc).await {
+            let app_context_arc = Arc::clone(&app_state.context);
+            match start_service_discovery(service_discovery_config, app_context_arc).await {
                 Ok(handle) => {
                     info!("Service discovery started");
                     // Spawn a task to handle the service discovery thread
@@ -736,7 +713,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     info!(
         "Router ready | workers: {:?}",
-        app_state.router.get_worker_urls()
+        WorkerManager::get_worker_urls(&app_state.context.worker_registry)
     );
 
     let request_id_headers = config.request_id_headers.clone().unwrap_or_else(|| {
