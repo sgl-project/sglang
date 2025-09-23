@@ -174,28 +174,18 @@ class MiniLoadBalancer:
                                 ]
                                 + ret_json["meta_info"]["input_token_logprobs"]
                             )
-                            if (
-                                "input_top_logprobs"
-                                in first_prefill_chunk_json["meta_info"]
-                                and "input_top_logprobs" in ret_json["meta_info"]
-                            ):
-                                ret_json["meta_info"]["input_top_logprobs"] = (
-                                    first_prefill_chunk_json["meta_info"][
-                                        "input_top_logprobs"
-                                    ]
-                                    + ret_json["meta_info"]["input_top_logprobs"]
-                                )
-                            if (
-                                "input_token_ids_logprobs"
-                                in first_prefill_chunk_json["meta_info"]
-                                and "input_token_ids_logprobs" in ret_json["meta_info"]
-                            ):
-                                ret_json["meta_info"]["input_token_ids_logprobs"] = (
-                                    first_prefill_chunk_json["meta_info"][
-                                        "input_token_ids_logprobs"
-                                    ]
-                                    + ret_json["meta_info"]["input_token_ids_logprobs"]
-                                )
+                            for key in [
+                                "input_top_logprobs",
+                                "input_token_ids_logprobs",
+                            ]:
+                                if (
+                                    key in first_prefill_chunk_json["meta_info"]
+                                    and key in ret_json["meta_info"]
+                                ):
+                                    ret_json["meta_info"][key] = (
+                                        first_prefill_chunk_json["meta_info"][key]
+                                        + ret_json["meta_info"][key]
+                                    )
 
                             yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
                         else:
