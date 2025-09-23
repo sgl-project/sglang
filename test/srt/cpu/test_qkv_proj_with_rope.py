@@ -2,16 +2,16 @@ import unittest
 
 import sgl_kernel
 import torch
-
-from sglang.srt.layers.quantization.fp8_utils import input_to_float8
-from sglang.srt.layers.rotary_embedding import _apply_rotary_emb
-from sglang.test.test_utils import CustomTestCase
 from utils import (
     convert_weight,
     native_w8a8_per_token_matmul,
     per_token_quant_int8,
     precision,
 )
+
+from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+from sglang.srt.layers.rotary_embedding import _apply_rotary_emb
+from sglang.test.test_utils import CustomTestCase
 
 convert_weight_packed = torch.ops.sgl_kernel.convert_weight_packed
 qkv_proj_with_rope = torch.ops.sgl_kernel.qkv_proj_with_rope

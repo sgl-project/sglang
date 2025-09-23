@@ -5,10 +5,10 @@ import unittest
 import sgl_kernel
 import torch
 import torch.nn as nn
+from utils import precision
 
 from sglang.srt.layers.quantization.fp8_utils import input_to_float8
 from sglang.test.test_utils import CustomTestCase
-from utils import precision
 
 torch.manual_seed(1234)
 
