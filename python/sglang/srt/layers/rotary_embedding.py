@@ -12,6 +12,7 @@ from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
@@ -32,6 +33,9 @@ if _use_aiter:
 
 if is_npu():
     import torch_npu
+
+    NPU_ROTARY_MUL_MAX_NUM_HEADS = 1000
+    NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -1035,7 +1039,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward(
         self,
         positions: torch.Tensor,
@@ -1894,17 +1898,30 @@ def apply_rotary_pos_emb_npu(
     sin: torch.Tensor,
     unsqueeze_dim=1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if q.shape[1] != 128:
+    """Ascend implementation equivalent to apply_rotary_pos_emb_native.
+
+    Args:
+        q: [num_tokens, num_heads, head_size]
+        k: [num_tokens, num_kv_heads, head_size]
+        cos: [num_tokens, head_size]
+        sin: [num_tokens, head_size]
+    """
+    if (
+        cos.dim() != 2
+        or q.dim() != 3
+        or q.shape[1] >= NPU_ROTARY_MUL_MAX_NUM_HEADS
+        or q.shape[2] >= NPU_ROTARY_MUL_MAX_HEAD_SIZE
+    ):
+        # Note: num_heads and head_size of q must be less than 1000 and 896, respectively
         return apply_rotary_pos_emb_native(q, k, cos, sin, unsqueeze_dim)
-    cos = cos.unsqueeze(unsqueeze_dim)
-    cos = torch.transpose(cos, 1, 2)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    sin = torch.transpose(sin, 1, 2)
-    q = torch.transpose(q, 1, 2)
-    k = torch.transpose(k, 1, 2)
-    q_embed, k_embed = torch_npu.npu_apply_rotary_pos_emb(q, k, cos, sin)
-    q_embed = torch.transpose(q_embed, 1, 2)
-    k_embed = torch.transpose(k_embed, 1, 2)
+    cos = cos.unsqueeze(unsqueeze_dim).unsqueeze(0)
+    sin = sin.unsqueeze(unsqueeze_dim).unsqueeze(0)
+    q = q.unsqueeze(0)
+    k = k.unsqueeze(0)
+    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
+    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
+    q_embed = q_embed.squeeze(0)
+    k_embed = k_embed.squeeze(0)
     return q_embed, k_embed
 
 
