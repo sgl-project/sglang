@@ -41,6 +41,8 @@ from sglang.utils import get_exception_traceback
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE = "/shared/public/elr-models/Qwen/Qwen3-Reranker-0.6B/"
+# DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE = "Qwen/Qwen3-Reranker-0.6B"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
@@ -869,6 +871,146 @@ def run_bench_serving(
     return res
 
 
+def run_score_benchmark(
+    model,
+    num_requests=100,
+    batch_size=5,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """Score API benchmark function compatible with run_bench_serving pattern"""
+    if other_server_args is None:
+        other_server_args = []
+    
+    if device == "auto":
+        device = auto_config_device()
+    
+    # Launch the server (consistent with run_bench_serving)
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
+    
+    async def _run_benchmark():
+        import aiohttp
+        
+        # Load tokenizer for generating test data
+        from sglang.srt.hf_transformers_utils import get_tokenizer
+        tokenizer = get_tokenizer(model)
+        
+        # Score API configuration
+        score_query_tokens = 120
+        score_item_tokens = 180
+        score_label_token_ids = [9454, 2753]  # Yes/No token IDs
+        special_token = "<|im_start|>"
+        
+        def generate_text_with_token_count(num_tokens):
+            """Generate text with precise token count using replicated token."""
+            text = special_token * num_tokens
+            actual_tokens = len(tokenizer.encode(text, add_special_tokens=False))
+            if actual_tokens != num_tokens:
+                text = special_token * (num_tokens // len(tokenizer.encode(special_token, add_special_tokens=False)))
+            return text
+        
+        if need_warmup:
+            warmup_data = {
+                "query": generate_text_with_token_count(score_query_tokens),
+                "items": [generate_text_with_token_count(score_item_tokens) for _ in range(3)],
+                "label_token_ids": score_label_token_ids,
+                "model": model,
+                "apply_softmax": True,
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                try:
+                    await session.post(
+                        f"{base_url}/v1/score",
+                        json=warmup_data,
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    )
+                except:
+                    pass  # Ignore warmup errors
+        
+        test_requests = []
+        for i in range(num_requests):
+            query = generate_text_with_token_count(score_query_tokens)
+            items = [generate_text_with_token_count(score_item_tokens) for _ in range(batch_size)]
+            
+            score_data = {
+                "query": query,
+                "items": items,
+                "label_token_ids": score_label_token_ids,
+                "model": model,
+                "apply_softmax": True,
+            }
+            test_requests.append(score_data)
+        
+        start_time = time.time()
+        successful_requests = 0
+        total_latency = 0
+        latencies = []
+        
+        async with aiohttp.ClientSession() as session:
+            for request_data in test_requests:
+                try:
+                    request_start = time.time()
+                    async with session.post(
+                        f"{base_url}/v1/score",
+                        json=request_data,
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as response:
+                        if response.status == 200:
+                            response_data = await response.json()
+                            request_end = time.time()
+                            
+                            if "scores" in response_data or "logprobs" in response_data:
+                                latency_ms = (request_end - request_start) * 1000
+                                latencies.append(latency_ms)
+                                total_latency += latency_ms
+                                successful_requests += 1
+                except Exception:
+                    continue
+        
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        if successful_requests > 0:
+            throughput = successful_requests / total_time
+            avg_latency = total_latency / successful_requests
+            latencies.sort()
+            p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0
+            
+            return {
+                "completed": successful_requests,
+                "total_requests": num_requests,
+                "throughput": throughput,
+                "avg_latency_ms": avg_latency,
+                "p95_latency_ms": p95_latency,
+                "successful_requests": successful_requests,
+            }
+        else:
+            return {
+                "completed": 0,
+                "total_requests": num_requests,
+                "throughput": 0,
+                "avg_latency_ms": 0,
+                "p95_latency_ms": 0,
+                "successful_requests": 0,
+            }
+    
+    try:
+        res = asyncio.run(_run_benchmark())
+    finally:
+        kill_process_tree(process.pid)
+    
+    assert res["completed"] == res["successful_requests"]
+    return res
+
+
 def run_bench_serving_multi(
     model,
     base_url,
@@ -1466,3 +1608,135 @@ def dump_bench_raw_result(
 def _ensure_remove_suffix(text: str, suffix: str):
     assert text.endswith(suffix)
     return text.removesuffix(suffix)
+
+
+def run_score_benchmark(
+    model,
+    num_requests=100,
+    batch_size=5,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """Custom benchmark function for score API - consistent with run_bench_serving"""
+    from sglang.srt.hf_transformers_utils import get_tokenizer
+    
+    if other_server_args is None:
+        other_server_args = []
+    
+    if device == "auto":
+        device = auto_config_device()
+    
+    # Launch the server (consistent with run_bench_serving)
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
+    
+    async def _run_benchmark():
+        score_url = f"{base_url}/v1/score"
+        tokenizer = get_tokenizer(model)
+        
+        # Test data
+        query = "The capital of France is"
+        items = [f"option_{i}" for i in range(batch_size)]
+        
+        # Get label token IDs
+        label_token_ids = []
+        for item in items:
+            token_ids = tokenizer.encode(item, add_special_tokens=False)
+            if token_ids:
+                label_token_ids.append(token_ids[0])
+        
+        # Warmup if needed (consistent with run_bench_serving)
+        if need_warmup:
+            warmup_requests = min(16, num_requests // 4)
+            for _ in range(warmup_requests):
+                try:
+                    response = await asyncio.to_thread(
+                        requests.post,
+                        score_url,
+                        headers={"Content-Type": "application/json"},
+                        json={
+                            "model": model,
+                            "query": query,
+                            "items": items,
+                            "label_token_ids": label_token_ids,
+                            "apply_softmax": True,
+                        },
+                        timeout=30,
+                    )
+                except Exception:
+                    pass
+        
+        # Benchmark the score API
+        start_time = time.time()
+        successful_requests = 0
+        total_latency = 0
+        latencies = []
+        
+        for _ in range(num_requests):
+            try:
+                request_start = time.time()
+                response = await asyncio.to_thread(
+                    requests.post,
+                    score_url,
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "model": model,
+                        "query": query,
+                        "items": items,
+                        "label_token_ids": label_token_ids,
+                        "apply_softmax": True,
+                    },
+                    timeout=30,
+                )
+                request_end = time.time()
+                
+                if response.status_code == 200:
+                    latency_ms = (request_end - request_start) * 1000
+                    latencies.append(latency_ms)
+                    total_latency += latency_ms
+                    successful_requests += 1
+            except Exception:
+                continue
+        
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        # Calculate metrics (consistent format with run_bench_serving)
+        if successful_requests > 0:
+            throughput = successful_requests / total_time
+            avg_latency = total_latency / successful_requests
+            latencies.sort()
+            p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0
+            
+            return {
+                "completed": successful_requests,
+                "total_requests": num_requests,
+                "throughput": throughput,
+                "avg_latency_ms": avg_latency,
+                "p95_latency_ms": p95_latency,
+                "successful_requests": successful_requests,
+            }
+        else:
+            return {
+                "completed": 0,
+                "total_requests": num_requests,
+                "throughput": 0,
+                "avg_latency_ms": 0,
+                "p95_latency_ms": 0,
+                "successful_requests": 0,
+            }
+    
+    try:
+        res = asyncio.run(_run_benchmark())
+    finally:
+        kill_process_tree(process.pid)
+    
+    # Assert completion (consistent with run_bench_serving)
+    assert res["completed"] == res["successful_requests"]
+    return res

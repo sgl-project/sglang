@@ -1,20 +1,25 @@
 import asyncio
 import itertools
+import time
 import unittest
 
 import requests
 
+from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     is_in_amd_ci,
     is_in_ci,
     run_bench_serving,
+    run_score_benchmark,
     write_github_step_summary,
 )
 
@@ -439,6 +444,94 @@ class TestBenchServing(CustomTestCase):
                 f"input_throughput: {res['input_throughput']:.2f} ms\n"
             )
             self.assertGreater(res["input_throughput"], 4000)
+
+    def test_score_api_throughput(self):
+        """Test score API throughput performance"""
+        res = run_score_benchmark(
+            model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
+            num_requests=100,
+            batch_size=5,
+            other_server_args=[],
+            need_warmup=True,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_score_api_throughput\n"
+                f"Score API throughput: {res['throughput']:.2f} req/s\n"
+                f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+            )
+        
+        print(
+            f"### test_score_api_throughput\n"
+            f"Score API throughput: {res['throughput']:.2f} req/s\n"
+            f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+            f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+        )
+        self.assertGreater(res["successful_requests"], res["total_requests"])
+        self.assertGreater(res["throughput"], 30)  # At least 30 req/s
+        self.assertLess(res["avg_latency_ms"], 35)  # Less than 35 ms average latency
+
+    def test_score_api_latency(self):
+        """Test score API latency performance"""
+        res = run_score_benchmark(
+            model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
+            num_requests=50,
+            batch_size=3,
+            other_server_args=[],
+            need_warmup=True,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_score_api_latency\n"
+                f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+            )
+        
+        print(
+            f"### test_score_api_latency\n"
+            f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+            f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+            f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+        )
+
+        self.assertGreater(res["successful_requests"], res["total_requests"])  # 100% success rate
+        self.assertLess(res["avg_latency_ms"], 31)  # Less than 31 ms average
+        self.assertLess(res["p95_latency_ms"], 35)  # Less than 31 ms P95
+
+    def test_score_api_batch_scaling(self):
+        """Test score API performance with different batch sizes"""
+        batch_sizes = [2, 5, 10]
+        
+        for batch_size in batch_sizes:
+            res = run_score_benchmark(
+                model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
+                num_requests=30,
+                batch_size=batch_size,
+            )
+
+            if is_in_ci():
+                write_github_step_summary(
+                    f"### test_score_api_batch_scaling_size_{batch_size}\n"
+                    f"Batch size: {batch_size}\n"
+                    f"Throughput: {res['throughput']:.2f} req/s\n"
+                    f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                    f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+                )
+            
+            print(
+                f"### test_score_api_batch_scaling_size_{batch_size}\n"
+                f"Batch size: {batch_size}\n"
+                f"Throughput: {res['throughput']:.2f} req/s\n"
+                f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+            )
+
+            self.assertGreater(res["successful_requests"], res["total_requests"])  # 100% success rate
+            self.assertLess(res["avg_latency_ms"], 5000)  # Less than 5 seconds average
 
 
 if __name__ == "__main__":
