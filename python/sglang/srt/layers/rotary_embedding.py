@@ -3,8 +3,6 @@
 """Rotary Positional Embeddings."""
 import itertools
 import math
-import os
-import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -20,9 +18,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
-
-# Thread-safe lock for cos_sin_cache expansion
-_cos_sin_cache_lock = threading.Lock()
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -148,7 +143,7 @@ class RotaryEmbedding(CustomOp):
         return cache
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
-        """Ensure cos_sin_cache length > needed_max_pos. Thread-safe expansion."""
+        """Ensure cos_sin_cache length > needed_max_pos."""
         cur_len = int(self.cos_sin_cache.shape[0])
         if needed_max_pos < cur_len:
             return
@@ -172,14 +167,10 @@ class RotaryEmbedding(CustomOp):
         sin_new = freqs_new.sin()
         new_rows = torch.cat((cos_new, sin_new), dim=-1).to(dtype=dtype)
 
-        with _cos_sin_cache_lock:
-            # Double-check to avoid concurrent expansion
-            cur_len2 = int(self.cos_sin_cache.shape[0])
-            if needed_max_pos < cur_len2:
-                return
-            self.cos_sin_cache = torch.cat(
-                (self.cos_sin_cache, new_rows), dim=0
-            ).to(device=device, dtype=dtype)
+        # Update cache with new rows
+        self.cos_sin_cache = torch.cat(
+            (self.cos_sin_cache, new_rows), dim=0
+        ).to(device=device, dtype=dtype)
 
     def forward_native(
         self,
@@ -272,22 +263,6 @@ class RotaryEmbedding(CustomOp):
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             # Ensure int64 dtype for sgl_kernel compatibility
             positions = positions.long()
-
-            # Optional debug checks (only when SGLANG_ROPE_DEBUG_CHECKS=1 and not capturing)
-            if os.getenv("SGLANG_ROPE_DEBUG_CHECKS") == "1":
-                try:
-                    from torch.cuda.graphs import is_current_stream_capturing
-                    capturing = is_current_stream_capturing()
-                except Exception:
-                    capturing = False
-                if not capturing:
-                    _mx = int(positions.max().item())
-                    _mn = int(positions.min().item())
-                    assert _mn >= 0 and _mx < int(self.cos_sin_cache.shape[0]), (
-                        f"RoPE position [{_mn}, {_mx}] out of cache "
-                        f"len={int(self.cos_sin_cache.shape[0])}. "
-                        f"Pre-expand cache before CUDA Graph capture."
-                    )
 
             # Direct inplace kernel call
             apply_rope_with_cos_sin_cache_inplace(
