@@ -55,7 +55,9 @@ class MooncakeStoreConfig:
                 "global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE
             ),
             # Zero copy interface does not need local buffer
-            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
+            local_buffer_size=config.get(
+                "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
+            ),
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", "auto"),
             master_server_address=config.get("master_server_address"),
@@ -83,7 +85,9 @@ class MooncakeStoreConfig:
                 os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
             # Zero copy interface does not need local buffer
-            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
+            local_buffer_size=int(
+                os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE)
+            ),
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE", "auto"),
             master_server_address=os.getenv("MOONCAKE_MASTER"),
