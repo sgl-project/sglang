@@ -3,6 +3,8 @@
 """Rotary Positional Embeddings."""
 import itertools
 import math
+import os
+import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -18,6 +20,9 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+
+# Thread-safe lock for cos_sin_cache expansion
+_cos_sin_cache_lock = threading.Lock()
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -131,14 +136,50 @@ class RotaryEmbedding(CustomOp):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
-        inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        # Initialize directly on target device to avoid CPU/GPU mixing
+        device = torch.device(f"cuda:{torch.cuda.current_device()}") if _is_cuda else torch.device("cpu")
+        inv_freq = self._compute_inv_freq(self.base).to(device)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float, device=device)
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        """Ensure cos_sin_cache length > needed_max_pos. Thread-safe expansion."""
+        cur_len = int(self.cos_sin_cache.shape[0])
+        if needed_max_pos < cur_len:
+            return
+        
+        # Align to 128 to reduce realloc frequency
+        new_len = ((needed_max_pos + 128) // 128) * 128
+        device = self.cos_sin_cache.device
+        dtype = self.cos_sin_cache.dtype
+
+        # Compute inv_freq on same device
+        inv_freq = self._compute_inv_freq(self.base).to(device=device)
+
+        # Incremental computation for new positions only
+        start = cur_len
+        t_new = torch.arange(start, new_len, dtype=inv_freq.dtype, device=device)
+        if t_new.numel() == 0:
+            return
+        
+        freqs_new = torch.einsum("i,j->ij", t_new, inv_freq)
+        cos_new = freqs_new.cos()
+        sin_new = freqs_new.sin()
+        new_rows = torch.cat((cos_new, sin_new), dim=-1).to(dtype=dtype)
+
+        with _cos_sin_cache_lock:
+            # Double-check to avoid concurrent expansion
+            cur_len2 = int(self.cos_sin_cache.shape[0])
+            if needed_max_pos < cur_len2:
+                return
+            self.cos_sin_cache = torch.cat(
+                (self.cos_sin_cache, new_rows), dim=0
+            ).to(device=device, dtype=dtype)
 
     def forward_native(
         self,
@@ -229,6 +270,26 @@ class RotaryEmbedding(CustomOp):
         fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+            # Ensure int64 dtype for sgl_kernel compatibility
+            positions = positions.long()
+
+            # Optional debug checks (only when SGLANG_ROPE_DEBUG_CHECKS=1 and not capturing)
+            if os.getenv("SGLANG_ROPE_DEBUG_CHECKS") == "1":
+                try:
+                    from torch.cuda.graphs import is_current_stream_capturing
+                    capturing = is_current_stream_capturing()
+                except Exception:
+                    capturing = False
+                if not capturing:
+                    _mx = int(positions.max().item())
+                    _mn = int(positions.min().item())
+                    assert _mn >= 0 and _mx < int(self.cos_sin_cache.shape[0]), (
+                        f"RoPE position [{_mn}, {_mx}] out of cache "
+                        f"len={int(self.cos_sin_cache.shape[0])}. "
+                        f"Pre-expand cache before CUDA Graph capture."
+                    )
+
+            # Direct inplace kernel call
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -236,13 +297,13 @@ class RotaryEmbedding(CustomOp):
                 head_size=self.head_size,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
-                # Compatible with old sgl-kernel
                 **(
                     dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
                     if fused_set_kv_buffer_arg is not None
                     else {}
                 ),
             )
+            return query, key
         else:
             assert (
                 fused_set_kv_buffer_arg is None

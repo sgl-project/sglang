@@ -826,6 +826,9 @@ class ModelRunner:
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
+        # Pre-expand RoPE cache before CUDA Graph capture
+        self._reserve_rope_cache_for_long_sequences()
+
         # Handle the case where some ranks do not finish loading.
         try:
             dist.monitored_barrier(
@@ -837,6 +840,33 @@ class ModelRunner:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+
+    def _reserve_rope_cache_for_long_sequences(self):
+        """Pre-expand RoPE cache for long sequences and speculative decoding."""
+        base_ctx = getattr(self.model_config, 'max_model_len', 2048)
+        spec_steps = getattr(self.server_args, 'speculative_num_steps', 0) or 0
+        draft_tokens = getattr(self.server_args, 'speculative_num_draft_tokens', 0) or 0
+        
+        max_input_len = 2048
+        spec_expansion = spec_steps * draft_tokens * 2  # 2x safety factor
+        safety_margin = 1024
+        
+        reserve_len = max(base_ctx, max_input_len) + spec_expansion + safety_margin
+        
+        logger.info(f"Pre-expanding RoPE cache to {reserve_len} positions for long sequences and speculative decoding")
+        
+        def reserve_rope_cache_recursive(module):
+            for child in module.children():
+                if hasattr(child, '_ensure_cos_sin_cache_length') and hasattr(child, 'cos_sin_cache'):
+                    old_len = child.cos_sin_cache.shape[0]
+                    child._ensure_cos_sin_cache_length(reserve_len)
+                    new_len = child.cos_sin_cache.shape[0]
+                    if new_len > old_len:
+                        logger.info(f"Expanded RoPE cache from {old_len} to {new_len} positions")
+                else:
+                    reserve_rope_cache_recursive(child)
+        
+        reserve_rope_cache_recursive(self.model)
 
     def update_expert_location(
         self,
