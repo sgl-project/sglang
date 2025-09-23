@@ -2916,7 +2916,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
         if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
-            weights = self._quant_attn_to_fp8_ue8m0(weights)
+            weights = self._quant_attn_to_fp8_ue8m0(weights, is_nextn=is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             weights = self._quant_nextn_moe_to_fp8_ue8m0(weights, nextn_layer_id=nextn_layer_id)
 
@@ -3149,14 +3149,14 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
-    def _quant_attn_to_fp8_ue8m0(self, weights):
+    def _quant_attn_to_fp8_ue8m0(self, weights, is_nextn):
         weights_dict = dict(weights)
 
         # temporarily only support DeepSeek V3/R1
         weight_block_size = [128, 128]
 
         for layer_id in trange(
-            self.config.num_hidden_layers, desc="quant attn to fp8 ue8m0"
+            self.config.num_hidden_layers + int(is_nextn), desc="quant attn to fp8 ue8m0"
         ):
             for stem in [
                 # "kv_a_proj_with_mqa",
