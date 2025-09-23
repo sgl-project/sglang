@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+os.environ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "512"
 
 class TestDeepseek(CustomTestCase):
     @classmethod

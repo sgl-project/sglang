@@ -528,7 +528,7 @@ class ServerArgs:
                 elif gpu_mem < 90 * 1024:
                     # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs -)
                     # if tp >= 4, cuda_graph_max_bs 512, else 256
-                    reserved_mem = (9.5 + parallel_size / 2) * 1024
+                    reserved_mem = (11 + parallel_size / 2) * 1024
                 elif gpu_mem < 100 * 1024:
                     # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
                     reserved_mem = (14 + parallel_size / 2) * 1024
@@ -634,10 +634,6 @@ class ServerArgs:
                 capture_bs += list(range(160, min(self.cuda_graph_max_bs + 1, 513), 16))
             if gpu_mem > 160 * 1000:  # B200, MI300
                 capture_bs += list(range(160, 257, 8)) + list(range(256, 513, 16))
-
-        capture_bs = sorted(list(set(capture_bs)))
-
-        capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
         return capture_bs
 
