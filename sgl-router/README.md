@@ -45,6 +45,7 @@ python -m build && pip install --force-reinstall dist/*.whl
 #### Option B: Development Mode
 
 ```bash
+# Currently broken
 pip install -e .
 ```
 
@@ -377,6 +378,7 @@ Set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml`:
 The continuous integration pipeline includes comprehensive testing, benchmarking, and publishing:
 
 #### Build & Test
+
 1. **Build Wheels**: Uses `cibuildwheel` for manylinux x86_64 packages
 2. **Build Source Distribution**: Creates source distribution for pip fallback
 3. **Rust HTTP Server Benchmarking**: Performance testing of router overhead
@@ -388,7 +390,6 @@ The continuous integration pipeline includes comprehensive testing, benchmarking
 - **Container Images**: Docker images published using `/docker/Dockerfile.router`
 
 ## Features
-
 - **High Performance**: Rust-based routing with connection pooling and optimized request handling
 - **Advanced Load Balancing**: Multiple algorithms including:
   - **Cache-Aware**: Intelligent routing based on cache locality for optimal performance
