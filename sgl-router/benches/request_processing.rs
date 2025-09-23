@@ -47,6 +47,7 @@ fn default_generate_request() -> GenerateRequest {
         session_params: None,
         return_hidden_states: false,
         rid: None,
+        other: serde_json::Map::new(),
     }
 }
 
