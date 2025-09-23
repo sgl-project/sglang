@@ -161,7 +161,7 @@ if _is_cuda:
         dsv3_router_gemm,
         merge_state_v2,
     )
-elif _is_cpu and _is_cpu_amx_available:
+elif _is_cpu:
     pass
 elif _is_hip:
     from sglang.srt.layers.quantization.awq_triton import (
@@ -340,6 +340,16 @@ def handle_triton(attn, forward_batch):
         return AttnForwardMethod.MHA
     else:
         return _dispatch_mla_subtype(attn, forward_batch)
+
+
+def handle_torch_native(attn, forward_batch):
+    if (
+        forward_batch.forward_mode.is_extend()
+        and sum(forward_batch.extend_prefix_lens_cpu) == 0
+    ):
+        return AttnForwardMethod.MHA
+    else:
+        return AttnForwardMethod.MLA
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1132,7 +1142,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         # which requires self.w_kc and self.w_vc to be packed.
         # If not, we will use torch.bmm and weight shouldn't be packed in this case
         has_fused_proj = hasattr(self, "fused_qkv_a_proj_with_mqa")
-        if has_fused_proj and _is_cpu and _is_cpu_amx_available:
+        if (
+            has_fused_proj
+            and _is_cpu
+            and _is_cpu_amx_available
+            and self.attention_backend != "torch_native"
+        ):
             self.quant_method = PackWeightMethod(
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
@@ -3087,6 +3102,7 @@ BackendRegistry.register("fa4", handle_fa4)
 BackendRegistry.register("trtllm_mla", handle_trtllm_mla)
 BackendRegistry.register("aiter", handle_aiter)
 BackendRegistry.register("triton", handle_triton)
+BackendRegistry.register("torch_native", handle_torch_native)
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

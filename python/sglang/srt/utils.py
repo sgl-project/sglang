@@ -245,8 +245,15 @@ except:
     is_amx_tile_supported = False
 
 
+@lru_cache(maxsize=1)
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return (
+        # Env SGLANG_CPU_DISABLE_AMX is to check whether AMX is disabled by user.
+        # Current scenario is to enable torch_native UT on AMX CPUs.
+        not get_bool_env_var("SGLANG_CPU_DISABLE_AMX", "0")
+        and is_amx_tile_supported
+        and is_intel_amx_backend_available
+    )
 
 
 def use_intel_amx_backend(layer):
