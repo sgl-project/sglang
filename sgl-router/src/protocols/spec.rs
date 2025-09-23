@@ -1975,19 +1975,20 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub return_logprob: bool,
 
-    /// Start position for computing input logprobs (SGLang extension)
+
+    // ============= SGLang Extensions =============
+    /// Start position for computing input logprobs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprob_start_len: Option<i32>,
 
-    /// Number of top input logprobs to return (SGLang extension)
+    /// Number of top input logprobs to return
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs_num: Option<i32>,
 
-    /// Specific token IDs to compute input logprobs for (SGLang extension)
+    /// Specific token IDs to compute input logprobs for
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_ids_logprob: Option<Vec<i32>>,
 
-    // ============= SGLang Extensions =============
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lora_path: Option<LoRAPath>,

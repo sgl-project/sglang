@@ -183,7 +183,8 @@ class MiniLoadBalancer:
                                 + ret_json["meta_info"]["input_token_logprobs"]
                             )
                             if (
-                                "input_top_logprobs" in first_prefill_chunk_json["meta_info"]
+                                "input_top_logprobs"
+                                in first_prefill_chunk_json["meta_info"]
                                 and "input_top_logprobs" in ret_json["meta_info"]
                             ):
                                 ret_json["meta_info"]["input_top_logprobs"] = (

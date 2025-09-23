@@ -1091,7 +1091,6 @@ impl PDRouter {
             prefill_json.get("meta_info"),
             decode_json.get_mut("meta_info"),
         ) {
-            // Merge input_token_logprobs
             if let (Some(prefill_logprobs), Some(decode_logprobs)) = (
                 prefill_meta.get("input_token_logprobs"),
                 decode_meta.get_mut("input_token_logprobs"),
@@ -1106,7 +1105,6 @@ impl PDRouter {
                 }
             }
 
-            // Merge input_top_logprobs
             if let (Some(prefill_top), Some(decode_top)) = (
                 prefill_meta.get("input_top_logprobs"),
                 decode_meta.get_mut("input_top_logprobs"),
@@ -1157,7 +1155,6 @@ impl PDRouter {
         // Merge prefill logprobs if available
         if let Some(ref p_logprobs) = prefill_logprobs {
             if let Some(meta) = decode_json.get_mut("meta_info") {
-                // Merge input_token_logprobs
                 if let Some(d_logprobs) = meta.get_mut("input_token_logprobs") {
                     if let (Some(p_arr), Some(d_arr)) =
                         (p_logprobs.as_array(), d_logprobs.as_array())
@@ -1168,7 +1165,6 @@ impl PDRouter {
                     }
                 }
 
-                // Merge input_top_logprobs if present in decode chunk and available in first prefill
                 if let Some(d_top) = meta.get_mut("input_top_logprobs") {
                     if let Some(prefill_top) = p_logprobs.get("input_top_logprobs").and_then(|v| v.as_array()) {
                         if let Some(d_arr) = d_top.as_array() {
@@ -1179,7 +1175,6 @@ impl PDRouter {
                     }
                 }
 
-                // Merge input_token_ids_logprobs if present
                 if let Some(d_ids) = meta.get_mut("input_token_ids_logprobs") {
                     if let Some(prefill_ids) = p_logprobs.get("input_token_ids_logprobs").and_then(|v| v.as_array()) {
                         if let Some(d_arr) = d_ids.as_array() {
