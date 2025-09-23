@@ -546,11 +546,21 @@ class DefaultModelLoader(BaseModelLoader):
             trust_remote_code=True,
         )
         rank0_log(f"ModelOpt quantization requested: {model_config.modelopt_quant}")
+        # Handle both legacy modelopt_quant and unified quantization flags
+        if model_config.modelopt_quant:
+            # Legacy approach
+            quant_choice_str = model_config.modelopt_quant
+            logger.info(f"ModelOpt quantization requested (legacy): {quant_choice_str}")
+        else:
+            # Unified approach - extract quantization type
+            quant_choice_str = model_config._get_modelopt_quant_type()
+            logger.info(
+                f"ModelOpt quantization requested (unified): {model_config.quantization} -> {quant_choice_str}"
+            )
 
-        quant_choice_str = model_config.modelopt_quant
         if not isinstance(quant_choice_str, str):
             raise TypeError(
-                f"modelopt_quant must be a string preset key (e.g., 'fp8'), "
+                f"Quantization type must be a string (e.g., 'fp8'), "
                 f"got {type(quant_choice_str)}"
             )
 
