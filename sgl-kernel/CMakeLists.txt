@@ -46,7 +46,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        a49a78ffefc86a87160dfe0ccc3a3a2d1622c918
+    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -81,7 +81,7 @@ FetchContent_Populate(repo-triton)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        1a85c439a064c1609568675aa580a409a53fb183
+    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -94,6 +94,15 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
+
+# flash-attention origin
+FetchContent_Declare(
+    repo-flash-attention-origin
+    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
+    GIT_TAG        203b9b3dba39d5d08dffb49c09aa622984dff07d
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-flash-attention-origin)
 
 # mscclpp
 FetchContent_Declare(
@@ -148,6 +157,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
+
     # The following flag leads to the CMAKE_BUILD_PARALLEL_LEVEL breaking,
     # it triggers OOM with low memory host. Extract the threads number to
     # option named SGL_KERNEL_COMPILE_THREADS, default value 32.
@@ -160,7 +170,8 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-Xcompiler=-Wno-terminate"
     "-Xcompiler=-Wfatal-errors"
     "-Xcompiler=-ftemplate-backtrace-limit=1"
-    "-Xcudafe=--diag_suppress=177"  # variable was declared but never referenced
+    "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
+    "-Xcudafe=--diag_suppress=2361"  # invalid narrowing conversion from "char" to "signed char"
 
     # uncomment to debug
     # "--ptxas-options=-v"
@@ -290,12 +301,15 @@ set(SOURCES
 
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
+    "csrc/mamba/causal_conv1d.cu"
+
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
     "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
+    "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
@@ -305,6 +319,7 @@ set(SOURCES
     "csrc/kvcacheio/transfer.cu"
 
     "csrc/speculative/eagle_utils.cu"
+    "csrc/speculative/lookahead_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
 
@@ -512,3 +527,13 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
         DESTINATION "triton_kernels"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
+
+# flash attention 4
+# TODO: find a better install condition.
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+    # flash_attn/cute
+    install(DIRECTORY "${repo-flash-attention-origin_SOURCE_DIR}/flash_attn/cute/"
+            DESTINATION "flash_attn/cute"
+            PATTERN ".git*" EXCLUDE
+            PATTERN "__pycache__" EXCLUDE)
+    endif()

@@ -68,6 +68,13 @@ You can identify potential reviewers for your code by checking the [code owners]
 Another effective strategy is to review the file modification history and contact individuals who have frequently edited the files.
 If you modify files protected by code owners, their approval is required to merge the code.
 
+## How to trigger CI
+To trigger CI, the pull request must have the "run-ci" label.
+
+- If you have write access to sgl-project/sglang, your pull request will be automatically tagged by @sglang-bot.
+- If you have triage access to sgl-project/sglang, you can manually add the label by clicking "Labels" on the right side of your pull request page.
+- If you do not have the above access, please request a review and ask other maintainers to add the label for you.
+
 ## General code style
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
