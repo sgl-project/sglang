@@ -363,7 +363,7 @@ python -m sglang_router.launch_router \
 curl -X POST http://localhost:8080/add_worker?url=http://worker3:8000
 # WARNING: This worker has NO API key even though router has one!
 
-# Adding workers with specific API keys dynamically  
+# Adding workers with specific API keys dynamically
 curl -X POST http://localhost:8080/add_worker?url=http://worker3:8000&api_key=worker3-specific-key
 ```
 
@@ -391,7 +391,7 @@ curl -X POST http://localhost:8080/add_worker?url=http://worker3:8000&api_key=wo
    ```bash
    # Start router with its key
    python -m sglang_router.launch_router --api-key "router-key"
-   
+
    # Add workers with their keys
    curl -H "Authorization: Bearer router-key" \
         -X POST http://localhost:8080/add_worker?url=http://worker:8000&api_key=worker-key
