@@ -200,6 +200,12 @@ class Modality(Enum):
         return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
 
 
+class MultimodalInputFormat(Enum):
+    NORMAL = auto()
+    PROCESSOR_OUTPUT = auto()
+    PRECOMPUTED_EMBEDDING = auto()
+
+
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
@@ -214,6 +220,8 @@ class MultimodalDataItem:
     hash: int = None
     pad_value: int = None
     offsets: Optional[list] = None
+
+    format: MultimodalInputFormat = MultimodalInputFormat.NORMAL
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
@@ -283,6 +291,9 @@ class MultimodalDataItem:
     def validate(self):
         ...
         # TODO
+
+    def is_precomputed_embedding(self):
+        return self.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
 
     @staticmethod
     def from_dict(obj: dict):
