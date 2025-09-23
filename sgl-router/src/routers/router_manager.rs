@@ -8,7 +8,7 @@ use crate::config::{ConnectionMode, RoutingMode};
 use crate::core::{WorkerRegistry, WorkerType};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    ResponsesGetParams, ResponsesRequest,
 };
 use crate::routers::RouterTrait;
 use crate::server::{AppContext, ServerConfig};
@@ -403,38 +403,19 @@ impl RouterTrait for RouterManager {
 
     async fn route_responses(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ResponsesRequest,
-        _model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
-    }
+        let selected_model = body.model.as_deref().or(model_id);
+        let router = self.select_router_for_request(headers, selected_model);
 
-    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
-            router.get_response(headers, response_id).await
+            router.route_responses(headers, body, selected_model).await
         } else {
             (
                 StatusCode::NOT_FOUND,
-                format!("No router available to get response '{}'", response_id),
-            )
-                .into_response()
-        }
-    }
-
-    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        let router = self.select_router_for_request(headers, None);
-        if let Some(router) = router {
-            router.cancel_response(headers, response_id).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!("No router available to cancel response '{}'", response_id),
+                "No router available to handle responses request",
             )
                 .into_response()
         }
@@ -458,6 +439,37 @@ impl RouterTrait for RouterManager {
             "responses api not yet implemented in inference gateway mode",
         )
             .into_response()
+    }
+
+    async fn get_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        params: &ResponsesGetParams,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.get_response(headers, response_id, params).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("No router available to get response '{}'", response_id),
+            )
+                .into_response()
+        }
+    }
+
+    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.cancel_response(headers, response_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("No router available to cancel response '{}'", response_id),
+            )
+                .into_response()
+        }
     }
 
     async fn route_embeddings(
