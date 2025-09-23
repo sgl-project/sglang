@@ -18,7 +18,7 @@ from datetime import datetime
 
 import requests
 
-from sglang.bench_serving import set_ulimit
+from sglang.benchmark.utils import set_ulimit
 from sglang.utils import get_exception_traceback
 
 

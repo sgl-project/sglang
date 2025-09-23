@@ -32,7 +32,7 @@ from data_processing import MsgContent, SampleOutput, get_dataset
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.bench_serving import get_tokenizer, remove_prefix, set_ulimit
+from sglang.benchmark.utils import get_tokenizer, remove_prefix, set_ulimit
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 

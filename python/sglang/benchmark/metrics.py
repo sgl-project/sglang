@@ -45,7 +45,7 @@ class BenchmarkMetrics:
     accept_length: Optional[float] = None
 
 
-def calculate_metrics(
+def do_calculate_metrics(
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,

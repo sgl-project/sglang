@@ -19,7 +19,7 @@ from sglang.benchmark.datasets.common import (
     RequestFuncInput,
     RequestFuncOutput,
 )
-from sglang.benchmark.metrics import calculate_metrics, print_metrics, save_results
+from sglang.benchmark.metrics import do_calculate_metrics, print_metrics, save_results
 from sglang.benchmark.utils import (
     create_bench_client_session,
     get_auth_headers,
@@ -193,7 +193,7 @@ class BenchmarkRunner:
                     "avg_spec_accept_length", None
                 )
 
-        metrics, output_lens = calculate_metrics(
+        metrics, output_lens = do_calculate_metrics(
             outputs, benchmark_duration, self.tokenizer
         )
         metrics.accept_length = accept_length

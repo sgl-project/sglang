@@ -21,7 +21,7 @@ from sglang.benchmark.utils import (
 )
 
 
-def benchmark(args: argparse.Namespace):
+def do_benchmark(args: argparse.Namespace):
     set_ulimit()
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -128,7 +128,7 @@ def benchmark(args: argparse.Namespace):
 def main(**kwargs):
     args = SimpleNamespace(**kwargs)
     print(f"Benchmark arguments:\n{args}")
-    benchmark(args)
+    do_benchmark(args)
 
 
 if __name__ == "__main__":
