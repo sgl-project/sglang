@@ -233,10 +233,12 @@ async fn test_openai_router_responses_with_mock() {
         .await
         .unwrap();
 
-    let mut request1 = ResponsesRequest::default();
-    request1.model = Some("gpt-4o-mini".to_string());
-    request1.input = ResponseInput::Text("Say hi".to_string());
-    request1.store = true;
+    let request1 = ResponsesRequest {
+        model: Some("gpt-4o-mini".to_string()),
+        input: ResponseInput::Text("Say hi".to_string()),
+        store: true,
+        ..Default::default()
+    };
 
     let response1 = router.route_responses(None, &request1, None).await;
     assert_eq!(response1.status(), StatusCode::OK);
@@ -247,11 +249,13 @@ async fn test_openai_router_responses_with_mock() {
     let resp1_id = body1["id"].as_str().expect("id missing").to_string();
     assert_eq!(body1["previous_response_id"], serde_json::Value::Null);
 
-    let mut request2 = ResponsesRequest::default();
-    request2.model = Some("gpt-4o-mini".to_string());
-    request2.input = ResponseInput::Text("Thanks".to_string());
-    request2.store = true;
-    request2.previous_response_id = Some(resp1_id.clone());
+    let request2 = ResponsesRequest {
+        model: Some("gpt-4o-mini".to_string()),
+        input: ResponseInput::Text("Thanks".to_string()),
+        store: true,
+        previous_response_id: Some(resp1_id.clone()),
+        ..Default::default()
+    };
 
     let response2 = router.route_responses(None, &request2, None).await;
     assert_eq!(response2.status(), StatusCode::OK);
