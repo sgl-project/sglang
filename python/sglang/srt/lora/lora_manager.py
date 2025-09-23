@@ -88,9 +88,9 @@ class LoRAManager:
             lora_paths=lora_paths,
         )
 
-    def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+    def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int, device):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        with torch.device("cuda"):
+        with torch.device(device):
             self.cuda_graph_batch_info = LoRABatchInfo(
                 bs=max_bs_in_cuda_graph,
                 use_cuda_graph=True,

@@ -29,9 +29,18 @@ def create_triton_csgmv_backend():
     return ChunkedSgmvLoRABackend
 
 
+@register_lora_backend("ascend")
+def create_ascend_backend():
+    from sglang.srt.lora.backend.ascend_backend import AscendLoRABackend
+
+    return AscendLoRABackend
+
+
 @register_lora_backend("flashinfer")
 def create_flashinfer_backend():
-    raise ValueError("FlashInfer LoRA backend has been deprecated, please use `triton` instead.")
+    raise ValueError(
+        "FlashInfer LoRA backend has been deprecated, please use `triton` instead."
+    )
 
 
 def get_backend_from_name(name: str) -> BaseLoRABackend:
