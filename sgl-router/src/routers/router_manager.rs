@@ -403,15 +403,22 @@ impl RouterTrait for RouterManager {
 
     async fn route_responses(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ResponsesRequest,
-        _model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
+        let selected_model = body.model.as_deref().or(model_id);
+        let router = self.select_router_for_request(headers, selected_model);
+
+        if let Some(router) = router {
+            router.route_responses(headers, body, selected_model).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to handle responses request",
+            )
+                .into_response()
+        }
     }
 
     async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
