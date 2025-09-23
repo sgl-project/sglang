@@ -79,7 +79,7 @@ def execute_sbo(
     if (e := meta_overlap_args.get("record_event_after_down")) is not None:
         e.record()
 
-    if SboFlags.enable_combine_shared_two_stream_overlap():
+    if (not force_disable) and SboFlags.enable_combine_shared_two_stream_overlap():
         # TODO reduce sm for non-deepgemm
         with deep_gemm_wrapper.configure_deep_gemm_num_sms(
             meta_overlap_args["compute_num_sms"]
