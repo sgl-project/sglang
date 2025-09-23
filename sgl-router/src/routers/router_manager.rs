@@ -21,7 +21,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct RouterId(String);
@@ -208,6 +208,11 @@ impl RouterManager {
         if !self.enable_igw {
             let default_router = self.default_router.read().unwrap();
             if let Some(ref default_id) = *default_router {
+                debug!(
+                    "Single-router mode: using default router {} for model {:?}",
+                    default_id.as_str(),
+                    model_id
+                );
                 return self.routers.get(default_id).map(|r| r.clone());
             }
         }
