@@ -18,8 +18,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-
-from sglang.srt.layers.quantization import Fp8Config
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -27,6 +25,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -34,8 +33,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM, \
-    enable_nextn_moe_bf16_cast_to_fp8
+from sglang.srt.models.deepseek_v2 import (
+    DeepseekV2DecoderLayer,
+    DeepseekV3ForCausalLM,
+    enable_nextn_moe_bf16_cast_to_fp8,
+)
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda
 
 logger = logging.getLogger(__name__)

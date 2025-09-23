@@ -85,7 +85,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
-    transform_scale_ue8m0, transform_scale_ue8m0_inplace,
+    transform_scale_ue8m0,
+    transform_scale_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -183,7 +184,11 @@ logger = logging.getLogger(__name__)
 
 
 def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
-    return quant_config is not None and quant_config.get_name() == "modelopt_fp4" and get_moe_a2a_backend().is_deepep()
+    return (
+        quant_config is not None
+        and quant_config.get_name() == "modelopt_fp4"
+        and get_moe_a2a_backend().is_deepep()
+    )
 
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
@@ -733,14 +738,21 @@ class DeepseekV2MoE(nn.Module):
 
         if HACK_SBO_SHARED_AND_RS:
             shared_output = None
+
             def _forward_shared_experts_and_put_results():
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(hidden_states, gemm_output_zero_allocator)
+                shared_output = self._forward_shared_experts(
+                    hidden_states, gemm_output_zero_allocator
+                )
 
         final_hidden_states = self.experts(
             hidden_states,
             topk_output,
-            forward_shared_experts=_forward_shared_experts_and_put_results if HACK_SBO_SHARED_AND_RS else None,
+            forward_shared_experts=(
+                _forward_shared_experts_and_put_results
+                if HACK_SBO_SHARED_AND_RS
+                else None
+            ),
             alt_stream=self.alt_stream,
         )
         if not _is_cuda and not _use_aiter:
@@ -2878,7 +2890,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             #     module_list.append(layer.self_attn.q_proj)
 
             for module in module_list:
-                transform_scale_ue8m0_inplace(module.weight_scale_inv, mn=module.weight.shape[-2])
+                transform_scale_ue8m0_inplace(
+                    module.weight_scale_inv, mn=module.weight.shape[-2]
+                )
 
     # TODO avoid code dup (currently combine from weight_requant_ue8m0 and transform_scale_ue8m0)
     def _transform_scale_nextn_moe_ue8m0(self):
@@ -2902,7 +2916,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             ]:
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
         if is_nextn:
@@ -2921,7 +2934,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
             weights = self._quant_attn_to_fp8_ue8m0(weights, is_nextn=is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
-            weights = self._quant_nextn_moe_to_fp8_ue8m0(weights, nextn_layer_id=nextn_layer_id)
+            weights = self._quant_nextn_moe_to_fp8_ue8m0(
+                weights, nextn_layer_id=nextn_layer_id
+            )
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -3159,7 +3174,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         weight_block_size = [128, 128]
 
         for layer_id in trange(
-            self.config.num_hidden_layers + int(is_nextn), desc="quant attn to fp8 ue8m0"
+            self.config.num_hidden_layers + int(is_nextn),
+            desc="quant attn to fp8 ue8m0",
         ):
             for stem in [
                 # "kv_a_proj_with_mqa",
@@ -3188,14 +3204,19 @@ class DeepseekV2ForCausalLM(nn.Module):
         for layer_id in [nextn_layer_id]:
             for expert_sub_name in [
                 "shared_experts",
-                *[f"experts.{expert_id}" for expert_id in range(self.config.n_routed_experts)],
+                *[
+                    f"experts.{expert_id}"
+                    for expert_id in range(self.config.n_routed_experts)
+                ],
             ]:
                 for stem in [
                     "gate_proj",
                     "up_proj",
                     "down_proj",
                 ]:
-                    partial_name = f"model.layers.{layer_id}.mlp.{expert_sub_name}.{stem}"
+                    partial_name = (
+                        f"model.layers.{layer_id}.mlp.{expert_sub_name}.{stem}"
+                    )
                     original_weight = weights_dict[f"{partial_name}.weight"]
                     out_w, out_s = quant_weight_ue8m0(
                         original_weight, weight_block_size=weight_block_size
