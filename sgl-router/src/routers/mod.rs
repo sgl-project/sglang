@@ -19,39 +19,18 @@ pub mod grpc;
 pub mod header_utils;
 pub mod http;
 pub mod router_manager;
-pub mod worker_initializer;
 
 pub use factory::RouterFactory;
-pub use worker_initializer::WorkerInitializer;
+
 // Re-export HTTP routers for convenience (keeps routers::openai_router path working)
 pub use http::{openai_router, pd_router, pd_types, router};
-
-/// Worker management trait for administrative operations
-///
-/// This trait is separate from RouterTrait to allow Send futures
-/// for use in service discovery and other background tasks
-#[async_trait]
-pub trait WorkerManagement: Send + Sync {
-    /// Add a worker to the router
-    async fn add_worker(
-        &self,
-        worker_url: &str,
-        api_key: &Option<String>,
-    ) -> Result<String, String>;
-
-    /// Remove a worker from the router
-    fn remove_worker(&self, worker_url: &str);
-
-    /// Get all worker URLs
-    fn get_worker_urls(&self) -> Vec<String>;
-}
 
 /// Core trait for all router implementations
 ///
 /// This trait provides a unified interface for routing requests,
 /// regardless of whether it's a regular router or PD router.
 #[async_trait]
-pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
+pub trait RouterTrait: Send + Sync + Debug {
     /// Get a reference to self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 
