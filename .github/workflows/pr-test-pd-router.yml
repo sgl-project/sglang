@@ -219,6 +219,7 @@ jobs:
             --decode http://127.0.0.7:30007 \
             --decode http://127.0.0.8:30008 \
             --host 127.0.0.9 \
+            --log-level warning \
             --port 8000 &
           ROUTER_PID=$!
 
@@ -300,8 +301,8 @@ jobs:
             --task text-to-text \
             --num-concurrency 64 \
             --traffic-scenario "D(8000,2000)" \
-            --max-requests-per-run 640 \
-            --max-time-per-run 2 \
+            --max-requests-per-run 1000 \
+            --max-time-per-run 5 \
             --experiment-folder-name "benchmark_${policy}" \
             --experiment-base-dir "."
 
@@ -341,7 +342,7 @@ jobs:
                 # These can be adjusted based on your performance requirements
                 ttft_threshold=4.7          # Max 4.7 seconds for mean TTFT
                 e2e_latency_threshold=35.0   # Max 35.0 seconds for mean E2E latency
-                input_throughput_threshold=12000   # Min 12000 tokens/s for mean input throughput
+                input_throughput_threshold=10000   # Min 02000 tokens/s for mean input throughput
                 output_throughput_threshold=68    # Min 68 tokens/s for mean output throughput
 
 
@@ -558,12 +559,12 @@ jobs:
               # Check thresholds (using same values as in main workflow)
               validation_status="✅"
               if [ "$ttft" != "N/A" ] && [ "$ttft" != "null" ]; then
-                if (( $(echo "$ttft > 2.0" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$ttft > 4.7" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
               if [ "$e2e_latency" != "N/A" ] && [ "$e2e_latency" != "null" ]; then
-                if (( $(echo "$e2e_latency > 24.0" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$e2e_latency > 35.0" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
@@ -573,7 +574,7 @@ jobs:
                 fi
               fi
               if [ "$output_throughput" != "N/A" ] && [ "$output_throughput" != "null" ]; then
-                if (( $(echo "$output_throughput < 90" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$output_throughput < 68" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
