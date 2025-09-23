@@ -26,6 +26,15 @@ def do_benchmark(args: argparse.Namespace):
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    if not hasattr(args, "tokenize_prompt"):
+        args.tokenize_prompt = False
+
+    if not hasattr(args, "output_details"):
+        args.output_details = False
+
+    if not hasattr(args, "use_trace_timestamps"):
+        args.use_trace_timestamps = False
+
     extra_request_body = {}
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
@@ -128,14 +137,6 @@ def do_benchmark(args: argparse.Namespace):
 def main(**kwargs):
     args = SimpleNamespace(**kwargs)
 
-    if not hasattr(args, "tokenize_prompt"):
-        args.tokenize_prompt = False
-
-    if not hasattr(args, "output_details"):
-        args.output_details = False
-
-    if not hasattr(args, "use_trace_timestamps"):
-        args.use_trace_timestamps = False
     print(f"Benchmark arguments:\n{args}")
     do_benchmark(args)
 
