@@ -34,7 +34,6 @@ impl Default for WorkerId {
     }
 }
 
-/// Type alias for the model index to reduce complexity
 type ModelIndex = Arc<DashMap<String, Arc<RwLock<Vec<Arc<dyn Worker>>>>>>;
 
 /// Worker registry with model-based indexing
@@ -54,8 +53,7 @@ pub struct WorkerRegistry {
 
     /// Workers indexed by connection mode
     connection_workers: Arc<DashMap<ConnectionMode, Vec<WorkerId>>>,
-
-    /// URL to worker ID mapping (for backward compatibility)
+    /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
 }
 
@@ -256,6 +254,18 @@ impl WorkerRegistry {
             .collect()
     }
 
+    pub fn get_all_urls_with_api_key(&self) -> Vec<(String, Option<String>)> {
+        self.workers
+            .iter()
+            .map(|entry| {
+                (
+                    entry.value().url().to_string(),
+                    entry.value().api_key().clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Get all model IDs with workers
     pub fn get_models(&self) -> Vec<String> {
         self.model_workers
@@ -442,6 +452,7 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
                 .build(),
         );
 
@@ -477,6 +488,7 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels1)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
                 .build(),
         );
 
@@ -487,6 +499,7 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels2)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
                 .build(),
         );
 
@@ -497,6 +510,7 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels3)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
+                .api_key("test_api_key")
                 .build(),
         );
 
