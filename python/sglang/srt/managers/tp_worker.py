@@ -230,6 +230,11 @@ class TpModelWorker:
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    def forward_stream_guard(self, model_worker_batch: ModelWorkerBatch):
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        stream_guard_output = self.model_runner.forward(forward_batch)
+        return stream_guard_output
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,

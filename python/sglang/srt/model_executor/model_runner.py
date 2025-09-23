@@ -615,6 +615,11 @@ class ModelRunner:
                     f"Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
 
+        if "Qwen3ForGuardModel" in self.model_config.hf_config.architectures:
+            server_args.disable_overlap_schedule = True
+            server_args.chunked_prefill_size = -1
+            server_args.disable_radix_cache = True
+
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
@@ -1888,7 +1893,9 @@ class ModelRunner:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
-        if not self.is_generation:
+        if not self.is_generation and (
+            not "Qwen3ForGuardModel" in self.model_config.hf_config.architectures
+        ):
             kwargs["get_embedding"] = True
         return self.model.forward(
             forward_batch.input_ids,

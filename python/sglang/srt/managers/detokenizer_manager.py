@@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchMultimodalDecodeReq,
     BatchMultimodalOut,
+    BatchStreamGuardOut,
     BatchStrOut,
     BatchTokenIDOut,
     FreezeGCReq,
@@ -101,6 +102,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                (BatchStreamGuardOut, self.handle_batch_stream_guard_out),
                 (BatchEmbeddingOut, self.handle_batch_embedding_out),
                 (BatchTokenIDOut, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
@@ -144,6 +146,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             assert len(output) > 0
             return output[:-1]
         return output
+
+    def handle_batch_stream_guard_out(self, recv_obj: BatchStreamGuardOut):
+        return recv_obj
 
     def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
         # If it is embedding model, no detokenization is needed.

@@ -78,6 +78,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
+    GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
@@ -209,6 +210,16 @@ class GenerationBatchResult:
 @dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
+    bid: int
+
+
+@dataclass
+class StreamGuardResult:
+    risk_level_logits: Optional[torch.Tensor]
+    category_logits: Optional[torch.Tensor]
+    query_risk_level_logits: Optional[torch.Tensor]
+    query_category_logits: Optional[torch.Tensor]
+    hidden_states: Optional[torch.Tensor]
     bid: int
 
 
@@ -1216,6 +1227,22 @@ class Scheduler(
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
+    def resume(self, recv_req: GenerateReqInput, req: Req):
+        if recv_req.rid not in self.stream_queue:
+            self.stream_queue[recv_req.rid] = req
+            return req
+        existing_req = self.stream_queue[recv_req.rid]
+        if (
+            self.tokenizer is not None
+            and recv_req.input_ids[0] == self.tokenizer.bos_token_id
+        ):
+            recv_req.input_ids = recv_req.input_ids[1:]
+        existing_req.origin_input_ids.extend(recv_req.input_ids)
+        existing_req.finished_reason = None
+        existing_req.output_ids = []
+        existing_req.resumable = req.resumable
+        return existing_req
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1261,7 +1288,12 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                resumable=recv_req.resumable,
             )
+
+            if self.model_config.hf_config.architectures[0] == "Qwen3ForGuardModel":
+                req = self.resume(recv_req, req)
+
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -1350,6 +1382,8 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        self.stream_queue: Dict[str, Req] = {}
 
         # Init grammar cache for this request
         add_to_grammar_queue = False
@@ -1562,7 +1596,8 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def self_check_during_idle(self):
-        self.check_memory()
+        if self.model_config.hf_config.architectures[0] != "Qwen3ForGuardModel":
+            self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()
@@ -1734,6 +1769,8 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
+        if self.model_config.hf_config.architectures[0] == "Qwen3ForGuardModel":
+            self.running_batch.filter_batch(keep_indices=[])
 
         need_dp_attn_preparation = require_mlp_sync(self.server_args)
 
@@ -2048,6 +2085,20 @@ class Scheduler(
                 bid=bid,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+        elif self.model_config.hf_config.architectures[0] == "Qwen3ForGuardModel":
+            model_worker_batch = batch.get_model_worker_batch()
+            stream_gaurd_output, _ = self.tp_worker.forward_stream_guard(
+                model_worker_batch
+            )
+            ret = StreamGuardResult(
+                risk_level_logits=stream_gaurd_output.risk_level_logits,
+                category_logits=stream_gaurd_output.category_logits,
+                query_risk_level_logits=stream_gaurd_output.query_risk_level_logits,
+                query_category_logits=stream_gaurd_output.query_category_logits,
+                hidden_states=stream_gaurd_output.hidden_states,
+                bid=model_worker_batch.bid,
+            )
+            return ret
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
@@ -2059,7 +2110,7 @@ class Scheduler(
     def process_batch_result(
         self,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, StreamGuardResult],
         launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():

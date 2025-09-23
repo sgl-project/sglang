@@ -55,6 +55,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
     BatchMultimodalOut,
+    BatchStreamGuardOut,
     BatchStrOut,
     BatchTokenIDOut,
     BatchTokenizedEmbeddingReqInput,
@@ -341,6 +342,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (
                     (
                         BatchStrOut,
+                        BatchStreamGuardOut,
                         BatchEmbeddingOut,
                         BatchTokenIDOut,
                         BatchMultimodalOut,
@@ -750,6 +752,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
+                resumable=obj.resumable,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1392,7 +1395,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     def _handle_batch_output(
         self,
         recv_obj: Union[
-            BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
+            BatchStrOut,
+            BatchEmbeddingOut,
+            BatchMultimodalOut,
+            BatchTokenIDOut,
+            BatchStreamGuardOut,
         ],
     ):
         for i, rid in enumerate(recv_obj.rids):
@@ -1426,7 +1433,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     i,
                 )
 
-            if not isinstance(recv_obj, BatchEmbeddingOut):
+            if not isinstance(recv_obj, BatchEmbeddingOut) and not isinstance(
+                recv_obj, BatchStreamGuardOut
+            ):
                 meta_info.update(
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
@@ -1467,6 +1476,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 }
             elif isinstance(recv_obj, BatchMultimodalOut):
                 raise NotImplementedError("BatchMultimodalOut not implemented")
+            elif isinstance(recv_obj, BatchStreamGuardOut):
+                out_dict = {
+                    "meta_info": meta_info,
+                    "risk_level_logits": recv_obj.risk_level_logits[i],
+                    "category_logits": recv_obj.category_logits[i],
+                    "query_risk_level_logits": recv_obj.query_risk_level_logits[i],
+                    "query_category_logits": recv_obj.query_category_logits[i],
+                }
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOut)
                 out_dict = {

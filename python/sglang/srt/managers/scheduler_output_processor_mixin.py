@@ -9,7 +9,12 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchEmbeddingOut,
+    BatchStreamGuardOut,
+    BatchTokenIDOut,
+)
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
 if TYPE_CHECKING:
@@ -34,7 +39,7 @@ class SchedulerOutputProcessorMixin:
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, StreamGuardResult],
         launch_done: Optional[threading.Event] = None,
     ):
         skip_stream_req = None
@@ -172,6 +177,29 @@ class SchedulerOutputProcessorMixin:
 
             self.set_next_batch_sampling_info_done(batch)
 
+        elif self.model_config.hf_config.architectures[0] == "Qwen3ForGuardModel":
+            # Check finish conditions
+            for i, req in enumerate(batch.reqs):
+                if req.is_retracted:
+                    continue
+
+                if req.is_chunked <= 0:
+                    # Dummy output token for embedding models
+                    req.output_ids.append(0)
+                    req.check_finished()
+
+                    if req.finished():
+                        if not req.resumable:
+                            self.tree_cache.cache_finished_req(req)
+                            if req.rid in self.stream_queue:
+                                self.stream_queue.pop(req.rid)
+                    else:
+                        self.tree_cache.cache_unfinished_req(req)
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.is_chunked -= 1
+            self.stream_ouput_guard(batch, result)
+            return
         else:  # embedding or reward model
             embeddings, bid = result.embeddings, result.bid
             embeddings = embeddings.tolist()
@@ -764,5 +792,60 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
+            )
+        )
+
+    def stream_ouput_guard(
+        self: Scheduler, batch: SchedulerBatch, result: StreamGuardResult
+    ):
+        reqs = batch.reqs
+        rids = []
+        finished_reasons: List[BaseFinishReason] = []
+        prompt_tokens = []
+        cached_tokens = []
+
+        risk_level_logits = []
+        category_logits = []
+        query_risk_level_logits = []
+        query_category_logits = []
+
+        risk_level_logits_flatten = result.risk_level_logits.tolist()
+        category_logits_flatten = result.category_logits.tolist()
+        query_risk_level_logits_flatten = result.query_risk_level_logits.tolist()
+        query_category_logits_flatten = result.query_category_logits.tolist()
+        for req in reqs:
+            req_origin_len = req.extend_input_len
+            if req.finished():
+                rids.append(req.rid)
+                finished_reasons.append(req.finished_reason.to_json())
+                prompt_tokens.append(len(req.origin_input_ids))
+                cached_tokens.append(req.cached_tokens)
+
+            risk_level_logits.append(risk_level_logits_flatten[:req_origin_len])
+            category_logits.append(category_logits_flatten[:req_origin_len])
+            query_risk_level_logits.append(
+                query_category_logits_flatten[:req_origin_len]
+            )
+            query_category_logits.append(query_category_logits_flatten[:req_origin_len])
+
+            risk_level_logits_flatten = risk_level_logits_flatten[req_origin_len:]
+            category_logits_flatten = category_logits_flatten[req_origin_len:]
+            query_risk_level_logits_flatten = query_risk_level_logits_flatten[
+                req_origin_len:
+            ]
+            query_category_logits_flatten = query_category_logits_flatten[
+                req_origin_len:
+            ]
+
+        self.send_to_detokenizer.send_pyobj(
+            BatchStreamGuardOut(
+                rids=rids,
+                finished_reasons=finished_reasons,
+                risk_level_logits=risk_level_logits,
+                category_logits=category_logits,
+                query_risk_level_logits=query_risk_level_logits,
+                query_category_logits=query_category_logits,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
             )
         )

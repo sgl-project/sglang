@@ -144,6 +144,9 @@ class GenerateReqInput:
     # For customer metric labels
     customer_labels: Optional[Dict[str, str]] = None
 
+    # Whether to resume the request
+    resumable: bool = False
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -612,6 +615,9 @@ class TokenizedGenerateReqInput:
     # tracing context
     trace_context: Optional[Dict] = None
 
+    # Whether to resume the request
+    resumable: bool = False
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput:
@@ -940,6 +946,23 @@ class BatchEmbeddingOut:
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+
+@dataclass
+class BatchStreamGuardOut:
+    # The request id
+    rids: List[str]
+    # The finish reason
+    finished_reasons: List[BaseFinishReason]
+
+    risk_level_logits: List[List[float]]
+    category_logits: List[List[float]]
+    query_risk_level_logits: List[List[float]]
+    query_category_logits: List[List[float]]
+
+    # Token counts
+    prompt_tokens: List[int]
+    cached_tokens: List[int]
 
 
 @dataclass
