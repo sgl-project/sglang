@@ -43,7 +43,7 @@ from sglang.srt.layers.quantization.int8_kernel import (
     w8a8_per_channel_per_token_matmul,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import (  # get_device_capability,
+from sglang.srt.utils import (
     apply_module_patch,
     cpu_has_amx_support,
     is_cpu,
