@@ -2,20 +2,31 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
-use sglang_router_rs::core::{BasicWorker, WorkerType};
-use sglang_router_rs::openai_api_types::{
+use sglang_router_rs::core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType};
+use sglang_router_rs::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::routers::bootstrap_injector::inject_bootstrap_fields;
+use sglang_router_rs::routers::http::pd_types::{
+    generate_room_id, get_hostname, RequestWithBootstrap,
+};
 
 fn create_test_worker() -> BasicWorker {
-    BasicWorker::new(
-        "http://test-server:8000".to_string(),
-        WorkerType::Prefill {
+    BasicWorkerBuilder::new("http://test-server:8000")
+        .worker_type(WorkerType::Prefill {
             bootstrap_port: Some(5678),
-        },
-    )
+        })
+        .build()
+}
+
+// Helper function to get bootstrap info from worker
+fn get_bootstrap_info(worker: &BasicWorker) -> (String, Option<u16>) {
+    let hostname = get_hostname(worker.url());
+    let bootstrap_port = match worker.worker_type() {
+        WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+        _ => None,
+    };
+    (hostname, bootstrap_port)
 }
 
 /// Create a default GenerateRequest for benchmarks with minimal fields set
@@ -37,49 +48,15 @@ fn default_generate_request() -> GenerateRequest {
 }
 
 /// Create a default ChatCompletionRequest for benchmarks with minimal fields set
+#[allow(deprecated)]
 fn default_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
-        model: String::new(),
+        // Required fields in OpenAI order
         messages: vec![],
-        max_tokens: None,
-        max_completion_tokens: None,
-        temperature: None,
-        top_p: None,
-        n: None,
-        stream: false,
-        stream_options: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        logit_bias: None,
-        logprobs: false,
-        top_logprobs: None,
-        user: None,
-        response_format: None,
-        seed: None,
-        tools: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        function_call: None,
-        functions: None,
-        // SGLang Extensions
-        top_k: None,
-        min_p: None,
-        min_tokens: None,
-        repetition_penalty: None,
-        regex: None,
-        ebnf: None,
-        stop_token_ids: None,
-        no_stop_trim: false,
-        ignore_eos: false,
-        continue_final_message: false,
-        skip_special_tokens: true,
-        // SGLang Extensions
-        lora_path: None,
-        session_params: None,
-        separate_reasoning: true,
-        stream_reasoning: true,
-        return_hidden_states: false,
+        model: String::new(),
+
+        // Use default for all other fields
+        ..Default::default()
     }
 }
 
@@ -120,6 +97,7 @@ fn default_completion_request() -> CompletionRequest {
         lora_path: None,
         session_params: None,
         return_hidden_states: false,
+        sampling_seed: None,
         other: serde_json::Map::new(),
     }
 }
@@ -149,6 +127,7 @@ fn create_sample_generate_request() -> GenerateRequest {
     }
 }
 
+#[allow(deprecated)]
 fn create_sample_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
@@ -193,6 +172,7 @@ fn create_sample_completion_request() -> CompletionRequest {
     }
 }
 
+#[allow(deprecated)]
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
         role: "system".to_string(),
@@ -228,7 +208,6 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         presence_penalty: Some(0.1),
         frequency_penalty: Some(0.1),
         top_logprobs: Some(5),
-        user: Some("benchmark_user".to_string()),
         seed: Some(42),
         parallel_tool_calls: Some(true),
         ..default_chat_completion_request()
@@ -331,35 +310,56 @@ fn bench_bootstrap_injection(c: &mut Criterion) {
     let completion_req = create_sample_completion_request();
     let large_chat_req = create_large_chat_completion_request();
     let worker = create_test_worker();
+    let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
 
     group.bench_function("generate_bootstrap_injection", |b| {
         b.iter(|| {
-            let mut json = to_value(black_box(&generate_req)).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &generate_req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let json = to_value(black_box(&request_with_bootstrap)).unwrap();
             black_box(json);
         });
     });
 
     group.bench_function("chat_completion_bootstrap_injection", |b| {
         b.iter(|| {
-            let mut json = to_value(black_box(&chat_req)).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &chat_req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let json = to_value(black_box(&request_with_bootstrap)).unwrap();
             black_box(json);
         });
     });
 
     group.bench_function("completion_bootstrap_injection", |b| {
         b.iter(|| {
-            let mut json = to_value(black_box(&completion_req)).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &completion_req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let json = to_value(black_box(&request_with_bootstrap)).unwrap();
             black_box(json);
         });
     });
 
     group.bench_function("large_chat_completion_bootstrap_injection", |b| {
         b.iter(|| {
-            let mut json = to_value(black_box(&large_chat_req)).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &large_chat_req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let json = to_value(black_box(&request_with_bootstrap)).unwrap();
             black_box(json);
         });
     });
@@ -441,6 +441,7 @@ fn bench_throughput_by_size(c: &mut Criterion) {
     };
 
     let worker = create_test_worker();
+    let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
 
     for (name, req) in [
         ("small", &small_generate),
@@ -449,6 +450,7 @@ fn bench_throughput_by_size(c: &mut Criterion) {
     ] {
         let json = to_string(req).unwrap();
         let size_bytes = json.len();
+        let hostname_clone = hostname.clone();
 
         group.throughput(Throughput::Bytes(size_bytes as u64));
         group.bench_with_input(BenchmarkId::new("serialize", name), &req, |b, req| {
@@ -472,10 +474,16 @@ fn bench_throughput_by_size(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("bootstrap_inject", name),
             &req,
-            |b, req| {
+            move |b, req| {
+                let hostname = hostname_clone.clone();
                 b.iter(|| {
-                    let mut json = to_value(req).unwrap();
-                    inject_bootstrap_fields(&mut json, &worker).unwrap();
+                    let request_with_bootstrap = RequestWithBootstrap {
+                        original: req,
+                        bootstrap_host: hostname.clone(),
+                        bootstrap_port,
+                        bootstrap_room: generate_room_id(),
+                    };
+                    let json = to_value(&request_with_bootstrap).unwrap();
                     black_box(json);
                 });
             },
@@ -493,17 +501,21 @@ fn bench_full_round_trip(c: &mut Criterion) {
     let chat_json = to_string(&create_sample_chat_completion_request()).unwrap();
     let completion_json = to_string(&create_sample_completion_request()).unwrap();
     let worker = create_test_worker();
+    let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
 
     group.bench_function("generate_openai_to_pd_pipeline", |b| {
         b.iter(|| {
             // Deserialize OpenAI request
             let req: GenerateRequest = from_str(black_box(&generate_json)).unwrap();
-            // Convert to JSON Value
-            let mut json = to_value(&req).unwrap();
-            // Inject bootstrap fields
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
+            // Create wrapper with bootstrap fields
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
             // Serialize final request
-            let pd_json = to_string(&json).unwrap();
+            let pd_json = to_string(&request_with_bootstrap).unwrap();
             black_box(pd_json);
         });
     });
@@ -511,9 +523,13 @@ fn bench_full_round_trip(c: &mut Criterion) {
     group.bench_function("chat_completion_openai_to_pd_pipeline", |b| {
         b.iter(|| {
             let req: ChatCompletionRequest = from_str(black_box(&chat_json)).unwrap();
-            let mut json = to_value(&req).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
-            let pd_json = to_string(&json).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let pd_json = to_string(&request_with_bootstrap).unwrap();
             black_box(pd_json);
         });
     });
@@ -521,9 +537,13 @@ fn bench_full_round_trip(c: &mut Criterion) {
     group.bench_function("completion_openai_to_pd_pipeline", |b| {
         b.iter(|| {
             let req: CompletionRequest = from_str(black_box(&completion_json)).unwrap();
-            let mut json = to_value(&req).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
-            let pd_json = to_string(&json).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let pd_json = to_string(&request_with_bootstrap).unwrap();
             black_box(pd_json);
         });
     });
@@ -575,10 +595,16 @@ fn benchmark_summary(c: &mut Criterion) {
     );
 
     // Measure bootstrap injection (replaces adaptation)
+    let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
     let start = Instant::now();
     for _ in 0..1000 {
-        let mut json = to_value(&generate_req).unwrap();
-        let _ = black_box(inject_bootstrap_fields(&mut json, &worker));
+        let request_with_bootstrap = RequestWithBootstrap {
+            original: &generate_req,
+            bootstrap_host: hostname.clone(),
+            bootstrap_port,
+            bootstrap_room: generate_room_id(),
+        };
+        let _ = black_box(to_value(&request_with_bootstrap).unwrap());
     }
     let inject_time = start.elapsed().as_nanos() / 1000;
     println!("  * Bootstrap Injection (avg): {:>6} ns/req", inject_time);

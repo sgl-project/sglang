@@ -5,8 +5,8 @@ import json
 import logging
 import os
 import random
-import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -156,7 +156,15 @@ def http_request(
             data = bytes(dumps(json), encoding="utf-8")
 
         try:
-            resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            if sys.version_info >= (3, 13):
+                # Python 3.13+: Use SSL context (cafile removed)
+                if verify and isinstance(verify, str):
+                    context = ssl.create_default_context(cafile=verify)
+                else:
+                    context = ssl.create_default_context()
+                resp = urllib.request.urlopen(req, data=data, context=context)
+            else:
+                resp = urllib.request.urlopen(req, data=data, cafile=verify)
             return HttpResponse(resp)
         except urllib.error.HTTPError as e:
             return HttpResponse(e)
@@ -458,7 +466,8 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
+                    To reduce the log length, we set the log level to warning for the server, the default log level is info.
+                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break
@@ -472,11 +481,22 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
+        self._fallback_fn = None
+
+    def add_fallback_fn(self, fallback_fn: Callable):
+        self._fallback_fn = fallback_fn
+
+    def __iadd__(self, other: "TypeBasedDispatcher"):
+        self._mapping.extend(other._mapping)
+        return self
 
     def __call__(self, obj: Any):
         for ty, fn in self._mapping:
             if isinstance(obj, ty):
                 return fn(obj)
+
+        if self._fallback_fn is not None:
+            return self._fallback_fn(obj)
         raise ValueError(f"Invalid object: {obj}")
 
 

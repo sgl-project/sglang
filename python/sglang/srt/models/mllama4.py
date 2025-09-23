@@ -961,5 +961,30 @@ class Llama4ForConditionalGeneration(nn.Module):
     def set_embed(self, embed):
         return self.language_model.set_embed(embed)
 
+    def get_hidden_dim(self, module_name, layer_idx):
+        # return input_dim, output_dim
+        if module_name == "qkv_proj":
+            return (
+                self.config.hidden_size,
+                self.config.head_dim
+                * (
+                    self.config.num_attention_heads
+                    + self.config.num_key_value_heads * 2
+                ),
+            )
+        elif module_name == "o_proj":
+            return (
+                self.config.head_dim * self.config.num_attention_heads,
+                self.config.hidden_size,
+            )
+        elif module_name == "gate_up_proj":
+            return self.config.hidden_size, self.config.intermediate_size * 2
+        elif module_name == "down_proj":
+            decoder_layer = self.language_model.get_layers()[layer_idx]
+            intermediate_size = decoder_layer.get_intermediate_size()
+            return intermediate_size, self.config.hidden_size
+        else:
+            raise NotImplementedError()
+
 
 EntryClass = Llama4ForConditionalGeneration

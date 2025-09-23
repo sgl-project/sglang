@@ -33,7 +33,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton import fused_moe
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -121,6 +123,7 @@ class XverseMoE(nn.Module):
             ]
         )
         self.pack_params()
+        self.moe_runner_config = MoeRunnerConfig(inplace=True)
 
         self.router = ReplicatedLinear(
             config.hidden_size,
@@ -128,6 +131,10 @@ class XverseMoE(nn.Module):
             bias=False,
             quant_config=None,
             prefix=add_prefix("router", prefix),
+        )
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=getattr(self.config, "norm_topk_prob", False),
         )
 
         if config.num_shared_experts is not None:
@@ -167,14 +174,13 @@ class XverseMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.router(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = fused_moe(
             hidden_states,
             self.w1,
             self.w2,
-            router_logits,
-            self.top_k,
-            renormalize=getattr(self.config, "norm_topk_prob", False),
-            inplace=True,
+            topk_output,
+            self.moe_runner_config,
         )
 
         if self.config.num_shared_experts is not None:

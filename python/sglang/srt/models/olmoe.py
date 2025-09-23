@@ -89,7 +89,6 @@ class OlmoeMoE(nn.Module):
             intermediate_size=intermediate_size,
             reduce_results=True,
             quant_config=quant_config,
-            tp_size=tp_size,
             layer_id=layer_id,
             prefix=add_prefix("experts", prefix),
         )

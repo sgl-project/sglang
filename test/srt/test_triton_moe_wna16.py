@@ -5,7 +5,7 @@ import torch
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
 NUM_EXPERTS = [8, 64]
 TOP_KS = [2, 6]
@@ -223,7 +223,7 @@ def test_fused_moe_wn16(
     topk_output = select_experts(
         hidden_states=a,
         router_logits=score,
-        top_k=topk,
+        topk_config=TopKConfig(top_k=topk),
     )
 
     triton_output = fused_moe(

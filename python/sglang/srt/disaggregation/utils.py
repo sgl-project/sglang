@@ -1,21 +1,17 @@
 from __future__ import annotations
 
-import dataclasses
 import os
 import random
-import threading
-import warnings
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 import numpy as np
-import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import get_ip, is_npu
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -99,7 +95,8 @@ class MetadataBuffers:
             # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
             device = "npu"
         elif self.custom_mem_pool:
-            device = "cuda"
+            # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
+            device = "cpu"
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -216,7 +213,9 @@ class KVClassType(Enum):
     BOOTSTRAP_SERVER = "bootstrap_server"
 
 
-def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: KVClassType
+) -> Optional[Type]:
     from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
 
     if transfer_backend == TransferBackend.MOONCAKE:
@@ -302,49 +301,6 @@ def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
 def kv_to_page_num(num_kv_indices: int, page_size: int):
     # ceil(num_kv_indices / page_size)
     return (num_kv_indices + page_size - 1) // page_size
-
-
-#########################
-# PDLB Registry
-#########################
-
-
-@dataclasses.dataclass
-class PDRegistryRequest:
-    """A request to register a machine itself to the LB."""
-
-    mode: str
-    registry_url: str
-    bootstrap_port: Optional[int] = None
-
-    def __post_init__(self):
-        if self.mode == "prefill" and self.bootstrap_port is None:
-            raise ValueError("Bootstrap port must be set in PREFILL mode.")
-        elif self.mode == "decode" and self.bootstrap_port is not None:
-            raise ValueError("Bootstrap port must not be set in DECODE mode.")
-        elif self.mode not in ["prefill", "decode"]:
-            raise ValueError(
-                f"Invalid mode: {self.mode}. Must be 'prefill' or 'decode'."
-            )
-
-
-def register_disaggregation_server(
-    mode: str, server_port: int, bootstrap_port: int, pdlb_url: str
-):
-    boostrap_port = bootstrap_port if mode == "prefill" else None
-    registry_request = PDRegistryRequest(
-        mode=mode,
-        registry_url=f"http://{get_ip()}:{server_port}",
-        bootstrap_port=boostrap_port,
-    )
-    res = requests.post(
-        f"{pdlb_url}/register",
-        json=dataclasses.asdict(registry_request),
-    )
-    if res.status_code != 200:
-        warnings.warn(
-            f"Failed to register disaggregation server: {res.status_code} {res.text}"
-        )
 
 
 #########################

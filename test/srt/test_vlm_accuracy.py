@@ -13,7 +13,6 @@ from PIL import Image
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.managers.mm_utils import embed_mm_inputs, init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -23,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.server_args import ServerArgs
 
 
@@ -161,7 +161,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         return self.model_runner.model
 
 
-class TestMiniCPMVLogits(VisionLLMLogitsBase):
+class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -257,6 +257,63 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 extend_prefix_lens=[0],
                 extend_seq_lens=[input_ids.shape[0]],
                 input_ids=input_ids,
+                input_embedding=model.get_input_embeddings(),
+                multimodal_model=model,
+                placeholder_tokens={
+                    Modality.IMAGE: self.processor.tokenizer.unk_token_id,
+                },
+            )
+
+        self.compare_outputs(sglang_output, hf_output)
+
+
+class TestMiniCPMV4Logits(VisionLLMLogitsBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model_path = "openbmb/MiniCPM-V-4"
+        cls.tokenizer = AutoTokenizer.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls.chat_template = "minicpmv"
+
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.hf_model = (
+            AutoModel.from_pretrained(
+                cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+            )
+            .eval()
+            .to(cls.device)
+        )
+        init_embedding_cache()
+
+    async def test_vlm_embedding_output(self):
+        """
+        Compares the embedding output of vlm
+        """
+        inputs = self.get_processor_output()
+
+        with torch.no_grad():
+            # hf
+            model_inputs = {
+                "input_ids": inputs.input_ids,
+                "image_bound": inputs.image_bound,
+                "pixel_values": inputs.pixel_values,
+                "tgt_sizes": inputs.tgt_sizes,
+            }
+            hf_output = self.hf_model.get_input_embeddings()(inputs.input_ids)
+
+            # sglang
+            model = self.get_model()
+            sglang_output = self.vlm_func(
+                model,
+                input_ids=inputs.input_ids.to(self.device),
+                pixel_values=inputs.pixel_values,
+                image_bound=inputs.image_bound.to(self.device),
+                tgt_sizes=inputs.tgt_sizes.to(self.device),
                 input_embedding=model.get_input_embeddings(),
                 multimodal_model=model,
                 placeholder_tokens={

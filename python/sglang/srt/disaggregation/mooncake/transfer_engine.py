@@ -51,6 +51,35 @@ class MooncakeTransferEngine:
         if ret_value != 0:
             logger.debug("Mooncake memory deregistration %s failed.", ptr)
 
+    def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
+        """Batch register multiple memory regions."""
+        try:
+            ret_value = self.engine.batch_register_memory(ptrs, lengths)
+        except Exception:
+            # Mark batch register as failed
+            ret_value = -1
+            if not hasattr(self.engine, "batch_register_memory"):
+                raise RuntimeError(
+                    "Mooncake's batch register requires a newer version of mooncake-transfer-engine. "
+                    "Please upgrade Mooncake."
+                )
+
+        if ret_value != 0:
+            logger.debug("Mooncake batch memory registration failed.")
+        return ret_value
+
+    def batch_deregister(self, ptrs: List[int]) -> int:
+        """Batch deregister multiple memory regions."""
+        try:
+            ret_value = self.engine.batch_unregister_memory(ptrs)
+        except Exception:
+            # Mark batch deregister as failed
+            ret_value = -1
+
+        if ret_value != 0:
+            logger.debug("Mooncake batch memory deregistration failed.")
+        return ret_value
+
     def initialize(
         self,
         hostname: str,

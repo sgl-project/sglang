@@ -1,12 +1,14 @@
 # SGLang Documentation
 
-We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase. Most documentation files are located under the `docs/` folder. We prefer **Jupyter Notebooks** over Markdown so that all examples can be executed and validated by our docs CI pipeline.
+We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
+Most documentation files are located under the `docs/` folder.
 
 ## Docs Workflow
 
 ### Install Dependency
 
 ```bash
+apt-get update && apt-get install -y pandoc parallel retry
 pip install -r requirements.txt
 ```
 
@@ -15,11 +17,11 @@ pip install -r requirements.txt
 Update your Jupyter notebooks in the appropriate subdirectories under `docs/`. If you add new files, remember to update `index.rst` (or relevant `.rst` files) accordingly.
 
 - **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
-- **Do not commit** directly to the `main` branch. Always create a new branch (e.g., `feature/my-new-feature`), push your changes, and open a PR from that branch.
 
 ```bash
 # 1) Compile all Jupyter notebooks
-make compile
+make compile  # This step can take a long time (10+ mins). You can consider skipping this step if you can make sure your added files are correct.
+make html
 
 # 2) Compile and Preview documentation locally with auto-build
 # This will automatically rebuild docs when files change
@@ -43,68 +45,11 @@ pre-commit run --all-files
 ```
 ---
 
-### **Port Allocation and CI Efficiency**
+## Documentation Style Guidelines
 
-**To launch and kill the server:**
-
-```python
-from sglang.test.test_utils import is_in_ci
-from sglang.utils import wait_for_server, print_highlight, terminate_process
-
-if is_in_ci():
-    from patch import launch_server_cmd
-else:
-    from sglang.utils import launch_server_cmd
-
-server_process, port = launch_server_cmd(
-    """
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
- --host 0.0.0.0
-"""
-)
-
-wait_for_server(f"http://localhost:{port}")
-
-# Terminate Server
-terminate_process(server_process)
-```
-
-**To launch and kill the engine:**
-
-```python
-# Launch Engine
-import sglang as sgl
-import asyncio
-from sglang.test.test_utils import is_in_ci
-
-if is_in_ci():
-    import patch
-
-llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
-
-# Terminalte Engine
-llm.shutdown()
-```
-
-### **Why this approach?**
-
-- **Dynamic Port Allocation**: Avoids port conflicts by selecting an available port at runtime, enabling multiple server instances to run in parallel.
-- **Optimized for CI**: The `patch` version of `launch_server_cmd` and `sgl.Engine()` in CI environments helps manage GPU memory dynamically, preventing conflicts and improving test parallelism.
-- **Better Parallel Execution**: Ensures smooth concurrent tests by avoiding fixed port collisions and optimizing memory usage.
-
-### **Model Selection**
-
-For demonstrations in the docs, **prefer smaller models** to reduce memory consumption and speed up inference. Running larger models in CI can lead to instability due to memory constraints.
-
-### **Prompt Alignment Example**
-
-When designing prompts, ensure they align with SGLang's structured formatting. For example:
-
-```python
-prompt = """You are an AI assistant. Answer concisely and accurately.
-
-User: What is the capital of France?
-Assistant: The capital of France is Paris."""
-```
-
-This keeps responses aligned with expected behavior and improves reliability across different files.
+- For common functionalities, we prefer **Jupyter Notebooks** over Markdown so that all examples can be executed and validated by our docs CI pipeline. For complex features (e.g., distributed serving), Markdown is preferred.
+- Keep in mind the documentation execution time when writing interactive Jupyter notebooks. Each interactive notebook will be run and compiled against every commit to ensure they are runnable, so it is important to apply some tips to reduce the documentation compilation time:
+  - Use small models (e.g., `qwen/qwen2.5-0.5b-instruct`) for most cases to reduce server launch time.
+  - Reuse the launched server as much as possible to reduce server launch time.
+- Do not use absolute links (e.g., `https://docs.sglang.ai/get_started/install.html`). Always prefer relative links (e.g., `../get_started/install.md`).
+- Follow the existing examples to learn how to launch a server, send a query and other common styles.

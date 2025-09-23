@@ -21,7 +21,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Test experiment runner
         timeout-minutes: 120

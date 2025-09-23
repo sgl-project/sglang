@@ -1,10 +1,10 @@
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel import moe_sum_reduce as moe_sum_reduce_cuda
 from triton.testing import do_bench
 
 
-# _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit
 def _moe_sum_reduce_kernel(
     input_ptr,
@@ -29,32 +29,36 @@ def _moe_sum_reduce_kernel(
     token_block_id = tl.program_id(0)
     dim_block_id = tl.program_id(1)
 
-    token_start = token_block_id * BLOCK_M
-    token_end = min((token_block_id + 1) * BLOCK_M, token_num)
+    offs_token = token_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_dim = dim_block_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
 
-    dim_start = dim_block_id * BLOCK_DIM
-    dim_end = min((dim_block_id + 1) * BLOCK_DIM, hidden_dim)
+    mask_token = offs_token < token_num
+    mask_dim = offs_dim < hidden_dim
 
-    offs_dim = dim_start + tl.arange(0, BLOCK_DIM)
+    base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
 
-    for token_index in range(token_start, token_end):
-        accumulator = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
-        input_t_ptr = input_ptr + token_index * input_stride_0 + offs_dim
-        for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
-            tmp = tl.load(
-                input_t_ptr + i * input_stride_1, mask=offs_dim < dim_end, other=0.0
-            )
-            accumulator += tmp
-        accumulator = accumulator * routed_scaling_factor
-        store_t_ptr = output_ptr + token_index * output_stride_0 + offs_dim
-        tl.store(
-            store_t_ptr,
-            accumulator.to(input_ptr.dtype.element_ty),
-            mask=offs_dim < dim_end,
+    accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
+
+    for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
+        tile = tl.load(
+            base_ptrs + i * input_stride_1,
+            mask=mask_token[:, None] & mask_dim[None, :],
+            other=0.0,
         )
+        accumulator += tile.to(tl.float32)
+    accumulator *= routed_scaling_factor
+
+    # -------- Write back --------
+    store_ptrs = output_ptr + offs_token[:, None] * output_stride_0 + offs_dim[None, :]
+    tl.store(
+        store_ptrs,
+        accumulator.to(input_ptr.dtype.element_ty),
+        mask=mask_token[:, None] & mask_dim[None, :],
+    )
 
 
-def moe_sum_reduce(
+# _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
+def moe_sum_reduce_triton(
     input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float
 ):
     assert input.is_contiguous()
@@ -66,7 +70,7 @@ def moe_sum_reduce(
     BLOCK_M = 1
     BLOCK_DIM = 2048
     NUM_STAGE = 1
-    num_warps = 8
+    num_warps = 16
 
     grid = (
         triton.cdiv(token_num, BLOCK_M),
@@ -114,9 +118,9 @@ def get_benchmark():
             x_names=["num_tokens"],
             x_vals=num_tokens_range,
             line_arg="version",
-            line_vals=["baseline", "compiled", "triton"],
-            line_names=["Original", "TorchCompile", "TritonKernel"],
-            styles=[("blue", "-"), ("green", "-"), ("red", "-")],
+            line_vals=["baseline", "compiled", "triton", "cuda"],
+            line_names=["Original", "TorchCompile", "TritonKernel", "CudaKernel"],
+            styles=[("blue", "-"), ("green", "-"), ("red", "-"), ("yellow", "-")],
             ylabel="us",
             plot_name="sum_scaled_performance",
             args={},
@@ -137,8 +141,10 @@ def get_benchmark():
                 compute_sum_scaled_baseline(x, out, scaling_factor)
             elif version == "compiled":
                 compute_sum_scaled_compiled(x, out, scaling_factor)
+            elif version == "triton":
+                moe_sum_reduce_triton(x, out, scaling_factor)
             else:
-                moe_sum_reduce(x, out, scaling_factor)
+                moe_sum_reduce_cuda(x, out, scaling_factor)
 
         # Benchmark
         quantiles = [0.5, 0.2, 0.8]
@@ -152,9 +158,15 @@ def get_benchmark():
                 lambda: compute_sum_scaled_compiled(x, out, scaling_factor),
                 quantiles=quantiles,
             )
+        elif version == "triton":
+            ms, min_ms, max_ms = do_bench(
+                lambda: moe_sum_reduce_triton(x, out, scaling_factor),
+                quantiles=quantiles,
+            )
         else:
             ms, min_ms, max_ms = do_bench(
-                lambda: moe_sum_reduce(x, out, scaling_factor), quantiles=quantiles
+                lambda: moe_sum_reduce_cuda(x, out, scaling_factor),
+                quantiles=quantiles,
             )
 
         return 1000 * ms, 1000 * max_ms, 1000 * min_ms
@@ -173,11 +185,16 @@ def verify_correctness(num_tokens=1024):
     compute_sum_scaled_compiled(x, out_compiled, scaling_factor)
 
     out_triton = torch.empty_like(out_baseline)
-    moe_sum_reduce(x, out_triton, scaling_factor)
+    moe_sum_reduce_triton(x, out_triton, scaling_factor)
 
-    if torch.allclose(
-        out_baseline, out_compiled, atol=1e-2, rtol=1e-2
-    ) and torch.allclose(out_baseline, out_triton, atol=1e-2, rtol=1e-2):
+    out_cuda = torch.empty_like(out_baseline)
+    moe_sum_reduce_cuda(x, out_cuda, scaling_factor)
+
+    if (
+        torch.allclose(out_baseline, out_compiled, atol=1e-2, rtol=1e-2)
+        and torch.allclose(out_baseline, out_triton, atol=1e-2, rtol=1e-2)
+        and torch.allclose(out_baseline, out_cuda, atol=1e-2, rtol=1e-2)
+    ):
         print("✅ All implementations match")
     else:
         print("❌ Implementations differ")
@@ -185,6 +202,7 @@ def verify_correctness(num_tokens=1024):
             f"Baseline vs Compiled: {(out_baseline - out_compiled).abs().max().item()}"
         )
         print(f"Baseline vs Triton: {(out_baseline - out_triton).abs().max().item()}")
+        print(f"Baseline vs Cuda: {(out_baseline - out_cuda).abs().max().item()}")
 
 
 if __name__ == "__main__":

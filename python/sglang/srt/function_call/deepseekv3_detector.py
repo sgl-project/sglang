@@ -215,6 +215,6 @@ class DeepSeekV3Detector(BaseFormatDetector):
             sequence_start_token=self.bot_token,
             sequence_end_token=self.eot_token,
             tool_call_separator="",
-            call_rule_fmt='"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n" {arguments_rule} "\\n```<｜tool▁call▁end｜>"',
+            call_rule_fmt='"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n"{arguments_rule}"\\n```<｜tool▁call▁end｜>"',
             function_format="json",
         )

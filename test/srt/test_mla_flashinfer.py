@@ -25,7 +25,7 @@ class TestFlashinferMLA(CustomTestCase):
                 [
                     "--enable-torch-compile",
                     "--cuda-graph-max-bs",
-                    "2",
+                    "4",
                     "--attention-backend",
                     "flashinfer",
                 ]
@@ -68,7 +68,6 @@ class TestFlashinferMLAMTP(CustomTestCase):
                 [
                     "--cuda-graph-max-bs",
                     "4",
-                    "--disable-radix",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",
                     "1",
