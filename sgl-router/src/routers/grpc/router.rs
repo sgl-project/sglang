@@ -237,7 +237,12 @@ impl RouterTrait for GrpcRouter {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    async fn get_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+        _params: &crate::protocols::spec::ResponsesGetParams,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
