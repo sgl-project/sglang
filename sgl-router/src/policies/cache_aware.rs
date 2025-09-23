@@ -225,20 +225,18 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             return None;
         }
 
-        // Group workers by model (using "default" for unknown/empty model_ids)
-        let mut model_workers: HashMap<String, Vec<usize>> = HashMap::new();
-        for idx in &healthy_indices {
-            let model_id = workers[*idx].model_id();
-            let tree_key = if model_id.is_empty() || model_id == "unknown" {
+        // Determine the model for this set of workers (router pre-filters by model)
+        // All workers should be from the same model
+        let model_id = if !healthy_indices.is_empty() {
+            let first_model = workers[healthy_indices[0]].model_id();
+            if first_model.is_empty() || first_model == "unknown" {
                 "default"
             } else {
-                model_id
-            };
-            model_workers
-                .entry(tree_key.to_string())
-                .or_default()
-                .push(*idx);
-        }
+                first_model
+            }
+        } else {
+            "default"
+        };
 
         // Get current load statistics
         let loads: Vec<usize> = workers.iter().map(|w| w.load()).collect();
@@ -273,13 +271,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // Even in imbalanced mode, update the tree to maintain cache state
             if let Some(text) = request_text {
                 if let Ok(mut trees) = self.trees.write() {
-                    let model_id = workers[min_load_idx].model_id();
-                    let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                        "default"
-                    } else {
-                        model_id
-                    };
-                    let tree = trees.entry(tree_key.to_string()).or_insert_with(Tree::new);
+                    let tree = trees.entry(model_id.to_string()).or_insert_with(Tree::new);
                     tree.insert(text, workers[min_load_idx].url());
                 }
             }
@@ -295,19 +287,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Use cache-aware routing when balanced
         let text = request_text.unwrap_or("");
 
-        // Since OLD version only has one tree, for multi-model support we need to
-        // select which tree to use. We'll use the tree for the first healthy worker's model
-        // to keep the logic as close as possible to OLD version
-        let primary_model_id = if let Some((model_id, _)) = model_workers.iter().next() {
-            model_id.clone()
-        } else {
-            "default".to_string()
-        };
-
         if let Ok(mut trees) = self.trees.write() {
-            let tree = trees
-                .entry(primary_model_id.clone())
-                .or_insert_with(Tree::new);
+            let tree = trees.entry(model_id.to_string()).or_insert_with(Tree::new);
             let (matched_text, matched_worker) = tree.prefix_match(text);
             let match_rate = if text.is_empty() {
                 0.0
