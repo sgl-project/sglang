@@ -43,12 +43,12 @@ def sample_random_requests(
     return_text: bool = True,
 ) -> List[DatasetRow]:
     loader_args = argparse.Namespace()
-    loader_args.input_len = input_len
-    loader_args.output_len = output_len
+    loader_args.random_input_len = input_len
+    loader_args.random_output_len = output_len
     loader_args.num_prompts = num_prompts
-    loader_args.range_ratio = range_ratio
+    loader_args.random_range_ratio = range_ratio
     loader_args.dataset_path = dataset_path
-    loader_args.random_sample = random_sample
+    loader_args.dataset_name = "random" if random_sample else "random-ids"
     loader_args.tokenize_prompt = not return_text
 
     loader = RandomLoader(args=loader_args, tokenizer=tokenizer)

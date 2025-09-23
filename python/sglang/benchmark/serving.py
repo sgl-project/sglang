@@ -127,6 +127,15 @@ def do_benchmark(args: argparse.Namespace):
 @bench_args.composite_options(bench_args.common_benchmark_options)
 def main(**kwargs):
     args = SimpleNamespace(**kwargs)
+
+    if not hasattr(args, "tokenize_prompt"):
+        args.tokenize_prompt = False
+
+    if not hasattr(args, "output_details"):
+        args.output_details = False
+
+    if not hasattr(args, "use_trace_timestamps"):
+        args.use_trace_timestamps = False
     print(f"Benchmark arguments:\n{args}")
     do_benchmark(args)
 
