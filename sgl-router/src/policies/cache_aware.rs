@@ -129,11 +129,11 @@ impl CacheAwarePolicy {
                 // Use "default" for unknown/empty model_ids for backward compatibility
                 let model_id = worker.model_id();
                 let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                    "default".to_string()
+                    "default"
                 } else {
-                    model_id.to_string()
+                    model_id
                 };
-                model_workers.entry(tree_key).or_default().push(worker);
+                model_workers.entry(tree_key.to_string()).or_default().push(worker);
             }
 
             // Initialize tree for each model
@@ -153,11 +153,11 @@ impl CacheAwarePolicy {
             // use a default tree. This preserves existing behavior for single-model routers.
             let model_id = worker.model_id();
             let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default".to_string()
+                "default"
             } else {
-                model_id.to_string()
+                model_id
             };
-            let tree = trees.entry(tree_key).or_insert_with(Tree::new);
+            let tree = trees.entry(tree_key.to_string()).or_insert_with(Tree::new);
             tree.insert("", worker.url());
         }
     }
@@ -176,11 +176,11 @@ impl CacheAwarePolicy {
             // Use same logic as add_worker for consistency
             let model_id = worker.model_id();
             let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default".to_string()
+                "default"
             } else {
-                model_id.to_string()
+                model_id
             };
-            if let Some(tree) = trees.get_mut(&tree_key) {
+            if let Some(tree) = trees.get_mut(tree_key) {
                 tree.remove_tenant(worker.url());
             }
         }
@@ -227,11 +227,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         for idx in &healthy_indices {
             let model_id = workers[*idx].model_id();
             let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default".to_string()
+                "default"
             } else {
-                model_id.to_string()
+                model_id
             };
-            model_workers.entry(tree_key).or_default().push(*idx);
+            model_workers.entry(tree_key.to_string()).or_default().push(*idx);
         }
 
         // Get current load statistics
@@ -269,11 +269,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 if let Ok(mut trees) = self.trees.write() {
                     let model_id = workers[min_load_idx].model_id();
                     let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                        "default".to_string()
+                        "default"
                     } else {
-                        model_id.to_string()
+                        model_id
                     };
-                    let tree = trees.entry(tree_key).or_insert_with(Tree::new);
+                    let tree = trees.entry(tree_key.to_string()).or_insert_with(Tree::new);
                     tree.insert(text, workers[min_load_idx].url());
                 }
             }
@@ -385,11 +385,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     if need_tree_update && !text.is_empty() {
                         let model_id = workers[selected_idx].model_id();
                         let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                            "default".to_string()
+                            "default"
                         } else {
-                            model_id.to_string()
+                            model_id
                         };
-                        let tree = trees.entry(tree_key).or_insert_with(Tree::new);
+                        let tree = trees.entry(tree_key.to_string()).or_insert_with(Tree::new);
                         tree.insert(text, workers[selected_idx].url());
                     }
                 }
