@@ -20,13 +20,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
+from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     per_tensor_dequantize,
     replace_parameter,
-)
-from sglang.srt.layers.quantization.marlin_utils import (
-    marlin_moe_permute_scales,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -84,8 +82,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
     @staticmethod
     def get_moe_method(
-        quant_config: CompressedTensorsConfig,
-        layer: torch.nn.Module
+        quant_config: CompressedTensorsConfig, layer: torch.nn.Module
     ) -> "CompressedTensorsMoEMethod":
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -577,8 +574,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
 
-        # from vllm import _custom_ops as vllm_ops
-
         marlin_w13_qweight = gptq_marlin_moe_repack(
             layer.w13_weight_packed,
             layer.w13_g_idx_sort_indices,
@@ -612,7 +607,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             self.group_size,
         )
         replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
-
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

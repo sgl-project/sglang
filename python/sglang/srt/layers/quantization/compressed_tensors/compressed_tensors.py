@@ -41,7 +41,6 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
-
 logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsLinearMethod"]
@@ -398,7 +397,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                     strategy=weight_quant.strategy,
                     is_static_input_scheme=is_static_input_scheme,
                 )
-
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
 
