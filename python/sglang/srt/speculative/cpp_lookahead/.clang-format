@@ -1,0 +1,15 @@
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 120
+AllowShortFunctionsOnASingleLine: Empty
+DerivePointerAlignment: false
+PointerAlignment: Left
+NamespaceIndentation: None
+SortIncludes: true
+AllowShortLoopsOnASingleLine: false
+BinPackParameters: false                 # Prevents packing parameters in declarations
+BinPackArguments: false                  # Prevents packing arguments in function calls
+AlignAfterOpenBracket: AlwaysBreak       # Forces a break after the opening parenthesis
+AlignOperands: Align                     # Aligns arguments vertically
+PenaltyBreakBeforeFirstCallParameter: 1  # Encourages breaking before the first argument
+PenaltyReturnTypeOnItsOwnLine: 100       # Keeps return type with function name
