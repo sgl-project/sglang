@@ -617,7 +617,7 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
     def _handle_model_specific_adjustments(self):
-        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+        if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
         hf_config = self.get_hf_config()
