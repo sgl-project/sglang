@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
@@ -176,6 +177,7 @@ class PrefillBootstrapQueue:
         )
         self._process_req(req)
         req.add_latency(RequestStage.PREFILL_PREPARE)
+        req.time_stats.prefill_bootstrap_queue_entry_time = time.time()
         self.queue.append(req)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
@@ -264,6 +266,7 @@ class PrefillBootstrapQueue:
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
+            req.time_stats.wait_queue_entry_time = time.time()
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
 
@@ -414,6 +417,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 req.add_latency(RequestStage.PREFILL_FORWARD)
                 self.disagg_prefill_inflight_queue.append(req)
+                req.time_stats.prefill_transfer_queue_entry_time = time.time()
                 if (
                     logits_output is not None
                     and logits_output.hidden_states is not None
@@ -554,6 +558,7 @@ class SchedulerDisaggregationPrefillMixin:
         for req in done_reqs:
             req: Req
             req.add_latency(RequestStage.PREFILL_TRANSFER_KV_CACHE)
+            req.time_stats.completion_time = time.time()
             self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
             req.metadata_buffer_index = -1
 

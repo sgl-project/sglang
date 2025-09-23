@@ -1883,6 +1883,9 @@ class Scheduler(
                 req.queue_time_end = time.perf_counter()
                 req.add_latency(RequestStage.PREFILL_WAITING)
 
+        for req in can_run_list:
+            req.time_stats.forward_entry_time = time.time()
+
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]

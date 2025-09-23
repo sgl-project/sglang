@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -254,6 +255,7 @@ class DecodePreallocQueue:
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)
+            req.time_stats.decode_prealloc_queue_entry_time = time.time()
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -423,6 +425,7 @@ class DecodePreallocQueue:
             )
             decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
             decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
+            decode_req.req.time_stats.decode_transfer_queue_entry_time = time.time()
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -665,6 +668,7 @@ class DecodeTransferQueue:
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
             self.queue[i].req.add_latency(RequestStage.DECODE_TRANSFERRED)
+            self.queue[i].req.time_stats.wait_queue_entry_time = time.time()
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -857,6 +861,7 @@ class SchedulerDisaggregationDecodeMixin:
             if i < num_not_used_batch:
                 can_run_list.append(req)
                 req.add_latency(RequestStage.DECODE_WAITING)
+                req.time_stats.forward_entry_time = time.time()
                 req.init_next_round_input(self.tree_cache)
             else:
                 waiting_queue.append(req)
