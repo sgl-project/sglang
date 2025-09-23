@@ -3161,13 +3161,16 @@ class DeepseekV2ForCausalLM(nn.Module):
         weight_block_size = [128, 128]
 
         for layer_id in [nextn_layer_id]:
-            for expert_id in range(self.config.n_routed_experts):
+            for expert_sub_name in [
+                "shared_experts",
+                *[f"experts.{expert_id}" for expert_id in range(self.config.n_routed_experts)],
+            ]:
                 for stem in [
                     "gate_proj",
                     "up_proj",
                     "down_proj",
                 ]:
-                    partial_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{stem}"
+                    partial_name = f"model.layers.{layer_id}.mlp.{expert_sub_name}.{stem}"
                     original_weight = weights_dict[f"{partial_name}.weight"]
                     out_w, out_s = quant_weight_ue8m0(
                         original_weight, weight_block_size=weight_block_size
