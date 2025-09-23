@@ -3348,7 +3348,7 @@ def reserve_rope_cache_for_long_sequences(
     model, server_args, model_config, req_to_token_pool=None, logger=None
 ):
     """Pre-expand RoPE cache for long sequences and speculative decoding."""
-    from sglang.environ import envs
+    from sglang.srt.environ import envs
 
     if logger is None:
         import logging
