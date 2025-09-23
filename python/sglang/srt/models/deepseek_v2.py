@@ -500,6 +500,7 @@ class DeepseekV2MoE(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.is_nextn = is_nextn
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -852,6 +853,8 @@ class DeepseekV2MoE(nn.Module):
                 ),
                 experts=self.experts,
                 alt_stream=self.alt_stream,
+                # TODO too hacky?
+                force_disable=self.is_nextn,
             ),
             hidden_states=None,
             topk_idx=None,

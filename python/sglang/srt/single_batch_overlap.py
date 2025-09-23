@@ -61,6 +61,7 @@ def execute_sbo(
     topk_weights: torch.Tensor,
     forward_batch: ForwardBatch,
     alt_stream: Optional = None,
+    force_disable: bool = False,
 ):
     shared_output = None
 
@@ -69,7 +70,7 @@ def execute_sbo(
     )
 
     combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
-        _compute_overlap_args(dispatch_output, alt_stream)
+        _compute_overlap_args(dispatch_output, alt_stream, force_disable=force_disable)
     )
 
     hidden_states = experts.moe_impl(
@@ -96,8 +97,8 @@ def execute_sbo(
     return hidden_states, shared_output
 
 
-def _compute_overlap_args(dispatch_output, alt_stream):
-    if not (
+def _compute_overlap_args(dispatch_output, alt_stream, force_disable):
+    if force_disable or not (
         SboFlags.enable_combine_down_gemm_two_stream_overlap()
         or SboFlags.enable_combine_shared_two_stream_overlap()
     ):
