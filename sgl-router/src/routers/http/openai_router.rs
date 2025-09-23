@@ -409,39 +409,35 @@ impl OpenAIRouter {
 
                         pending.push_str(&chunk_text.replace("\r\n", "\n"));
 
-                        loop {
-                            if let Some(pos) = pending.find("\n\n") {
-                                let block = pending[..pos].to_string();
-                                pending.drain(..pos + 2);
+                        while let Some(pos) = pending.find("\n\n") {
+                            let block = pending[..pos].to_string();
+                            pending.drain(..pos + 2);
 
-                                if block.trim().is_empty() {
-                                    continue;
-                                }
+                            if block.trim().is_empty() {
+                                continue;
+                            }
 
-                                let mut block_string = block;
-                                if let Some(modified) = Self::rewrite_streaming_block(
-                                    &block_string,
-                                    &original_request,
-                                    previous_response_id.as_deref(),
-                                ) {
-                                    block_string = modified;
-                                }
+                            let mut block_string = block;
+                            if let Some(modified) = Self::rewrite_streaming_block(
+                                &block_string,
+                                &original_request,
+                                previous_response_id.as_deref(),
+                            ) {
+                                block_string = modified;
+                            }
 
-                                if should_store {
-                                    accumulator.ingest_block(&block_string);
-                                }
+                            if should_store {
+                                accumulator.ingest_block(&block_string);
+                            }
 
-                                if receiver_connected {
-                                    let chunk_to_send = format!("{}\n\n", block_string);
-                                    if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
-                                        receiver_connected = false;
-                                    }
+                            if receiver_connected {
+                                let chunk_to_send = format!("{}\n\n", block_string);
+                                if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
+                                    receiver_connected = false;
                                 }
+                            }
 
-                                if !receiver_connected && !should_store {
-                                    break;
-                                }
-                            } else {
+                            if !receiver_connected && !should_store {
                                 break;
                             }
                         }
@@ -452,7 +448,7 @@ impl OpenAIRouter {
                     }
                     Err(err) => {
                         upstream_failed = true;
-                        let io_err = io::Error::new(io::ErrorKind::Other, err);
+                        let io_err = io::Error::other(err);
                         let _ = tx.send(Err(io_err));
                         break;
                     }
