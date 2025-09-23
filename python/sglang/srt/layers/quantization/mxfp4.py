@@ -731,8 +731,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
-                w13_weight_bias=layer.w13_weight_bias,
-                w2_weight_bias=layer.w2_weight_bias,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
             )
             return self.runner.run(dispatch_output, quant_info)
 
