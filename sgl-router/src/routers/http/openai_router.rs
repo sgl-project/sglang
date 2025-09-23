@@ -7,7 +7,7 @@ use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, ReasoningInfo,
     RerankRequest, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
     ResponseStatus, ResponseTextFormat, ResponsesGetParams, ResponsesRequest, ResponsesResponse,
-    ResponsesUsage, TextFormatType, ToolChoice, ToolChoiceValue, Truncation, UsageInfo,
+    ResponsesUsage, TextFormatType, UsageInfo,
 };
 use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
 use async_trait::async_trait;
@@ -24,6 +24,7 @@ use futures_util::StreamExt;
 use serde_json::{json, to_value, Value};
 use std::{
     any::Any,
+    collections::HashMap,
     convert::Infallible,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -121,24 +122,51 @@ impl OpenAIRouter {
 
                 // Parse the response
                 match response.json::<Value>().await {
-                    Ok(openai_response_json) => {
-                        // Build our complete response object
-                        let complete_response = self.build_complete_response(
-                            &openai_response_json,
-                            original_body,
-                            original_previous_response_id,
-                        );
+                    Ok(mut openai_response_json) => {
+                        if let Some(prev_id) = original_previous_response_id {
+                            if let Some(obj) = openai_response_json.as_object_mut() {
+                                let should_insert = obj
+                                    .get("previous_response_id")
+                                    .map(|v| v.is_null())
+                                    .unwrap_or(true);
+                                if should_insert {
+                                    obj.insert(
+                                        "previous_response_id".to_string(),
+                                        Value::String(prev_id),
+                                    );
+                                }
+                            }
+                        }
 
-                        // Store the response internally
+                        if let Some(obj) = openai_response_json.as_object_mut() {
+                            if !obj.contains_key("instructions") {
+                                if let Some(instructions) = &original_body.instructions {
+                                    obj.insert(
+                                        "instructions".to_string(),
+                                        Value::String(instructions.clone()),
+                                    );
+                                }
+                            }
+
+                            if !obj.contains_key("metadata") {
+                                if let Some(metadata) = &original_body.metadata {
+                                    let metadata_map: serde_json::Map<String, Value> = metadata
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), v.clone()))
+                                        .collect();
+                                    obj.insert("metadata".to_string(), Value::Object(metadata_map));
+                                }
+                            }
+                        }
+
                         if let Err(e) = self
-                            .store_response_internal(&complete_response, original_body)
+                            .store_response_internal(&openai_response_json, original_body)
                             .await
                         {
                             warn!("Failed to store response: {}", e);
                         }
 
-                        // Return the complete response object
-                        match serde_json::to_string(&complete_response) {
+                        match serde_json::to_string(&openai_response_json) {
                             Ok(json_str) => (
                                 StatusCode::OK,
                                 [("content-type", "application/json")],
@@ -150,7 +178,8 @@ impl OpenAIRouter {
                                 (
                                     StatusCode::INTERNAL_SERVER_ERROR,
                                     json!({"error": {"message": "Failed to serialize response", "type": "internal_error"}}).to_string(),
-                                ).into_response()
+                                )
+                                    .into_response()
                             }
                         }
                     }
@@ -343,122 +372,6 @@ impl OpenAIRouter {
         }
     }
 
-    fn build_complete_response(
-        &self,
-        openai_response: &Value,
-        original_body: &ResponsesRequest,
-        original_previous_response_id: Option<String>,
-    ) -> ResponsesResponse {
-        // Parse what we can from OpenAI response
-        let id = openai_response
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&original_body.request_id)
-            .to_string();
-
-        let model = openai_response
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| original_body.model.as_deref().unwrap_or("gpt-4"))
-            .to_string();
-
-        let created_at = openai_response
-            .get("created")
-            .and_then(|v| v.as_i64())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp());
-
-        // Parse output
-        let mut output = Vec::new();
-        if let Some(choices) = openai_response.get("choices").and_then(|v| v.as_array()) {
-            for choice in choices {
-                if let Some(message) = choice.get("message") {
-                    let msg_id = format!("msg_{}", Uuid::new_v4().simple());
-                    let content_text = message
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    output.push(ResponseOutputItem::Message {
-                        id: msg_id,
-                        role: "assistant".to_string(),
-                        status: "completed".to_string(),
-                        content: vec![ResponseContentPart::OutputText {
-                            text: content_text,
-                            annotations: vec![],
-                            logprobs: None,
-                        }],
-                    });
-                }
-            }
-        }
-
-        // Parse usage
-        let usage = openai_response.get("usage").map(|u| {
-            let input_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let output_tokens = u
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let total_tokens =
-                u.get("total_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(input_tokens as u64 + output_tokens as u64) as u32;
-
-            ResponsesUsage::Classic(UsageInfo {
-                prompt_tokens: input_tokens,
-                completion_tokens: output_tokens,
-                total_tokens,
-                reasoning_tokens: None,
-                prompt_tokens_details: None,
-            })
-        });
-
-        // Build complete response
-        ResponsesResponse {
-            id,
-            object: "response".to_string(),
-            created_at,
-            status: ResponseStatus::Completed,
-            error: None,
-            incomplete_details: None,
-            instructions: original_body.instructions.clone(),
-            max_output_tokens: original_body.max_output_tokens,
-            model,
-            output,
-            parallel_tool_calls: original_body.parallel_tool_calls,
-            previous_response_id: original_previous_response_id,
-            reasoning: original_body.reasoning.as_ref().map(|r| ReasoningInfo {
-                effort: r.effort.as_ref().map(|e| format!("{:?}", e)),
-                summary: None,
-            }),
-            store: original_body.store, // Return what the user requested
-            temperature: original_body.temperature.or(Some(1.0)),
-            text: Some(ResponseTextFormat {
-                format: TextFormatType {
-                    format_type: "text".to_string(),
-                },
-            }),
-            tool_choice: match &original_body.tool_choice {
-                ToolChoice::Value(v) => match v {
-                    ToolChoiceValue::Auto => "auto".to_string(),
-                    ToolChoiceValue::Required => "required".to_string(),
-                    ToolChoiceValue::None => "none".to_string(),
-                },
-                ToolChoice::Function { .. } => "function".to_string(),
-            },
-            tools: original_body.tools.clone(),
-            top_p: original_body.top_p.or(Some(1.0)),
-            truncation: match &original_body.truncation {
-                Truncation::Auto => Some("auto".to_string()),
-                Truncation::Disabled => Some("disabled".to_string()),
-            },
-            usage,
-            user: original_body.user.clone(),
-            metadata: original_body.metadata.clone().unwrap_or_default(),
-        }
-    }
-
     fn build_streaming_final_response(
         response_id: String,
         model: String,
@@ -520,52 +433,17 @@ impl OpenAIRouter {
 
     async fn store_response_internal(
         &self,
-        response: &ResponsesResponse,
+        response_json: &Value,
         original_body: &ResponsesRequest,
     ) -> Result<(), String> {
-        let input_text = match &original_body.input {
-            ResponseInput::Text(text) => text.clone(),
-            ResponseInput::Items(_) => "complex input".to_string(),
-        };
-
-        let output_text = response
-            .output
-            .iter()
-            .find_map(|item| {
-                if let ResponseOutputItem::Message { content, .. } = item {
-                    content.iter().find_map(|c| match c {
-                        ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
-        let mut stored_response = StoredResponse::new(
-            input_text,
-            output_text,
-            original_body
-                .previous_response_id
-                .as_ref()
-                .map(|id| ResponseId::from_string(id.clone())),
-        );
-
-        stored_response.instructions = original_body.instructions.clone();
-        stored_response.model = Some(response.model.clone());
-        stored_response.user = original_body.user.clone();
-        stored_response.metadata = original_body.metadata.clone().unwrap_or_default();
-        stored_response.id = ResponseId::from_string(response.id.clone());
-        stored_response.raw_response = serde_json::to_value(response).unwrap_or(Value::Null);
-
-        self.response_storage
-            .store_response(stored_response)
-            .await
-            .map_err(|e| format!("Failed to store response: {}", e))?;
-
-        info!(response_id = %response.id, "Stored response locally");
-        Ok(())
+        match Self::store_response_impl(&self.response_storage, response_json, original_body).await
+        {
+            Ok(response_id) => {
+                info!(response_id = %response_id.0, "Stored response locally");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn store_streaming_response(
@@ -573,47 +451,109 @@ impl OpenAIRouter {
         response: &ResponsesResponse,
         original_body: &ResponsesRequest,
     ) {
+        match serde_json::to_value(response) {
+            Ok(value) => {
+                match Self::store_response_impl(response_storage, &value, original_body).await {
+                    Ok(response_id) => {
+                        info!(response_id = %response_id.0, "Stored streaming response locally");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to store streaming response");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to serialize streaming response for storage");
+            }
+        }
+    }
+
+    async fn store_response_impl(
+        response_storage: &SharedResponseStorage,
+        response_json: &Value,
+        original_body: &ResponsesRequest,
+    ) -> Result<ResponseId, String> {
         let input_text = match &original_body.input {
             ResponseInput::Text(text) => text.clone(),
             ResponseInput::Items(_) => "complex input".to_string(),
         };
 
-        let output_text = response
-            .output
-            .iter()
-            .find_map(|item| {
-                if let ResponseOutputItem::Message { content, .. } = item {
-                    content.iter().find_map(|c| match c {
-                        ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
+        let output_text = Self::extract_primary_output_text(response_json).unwrap_or_default();
+
+        let mut stored_response = StoredResponse::new(input_text, output_text, None);
+
+        stored_response.instructions = response_json
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| original_body.instructions.clone());
+
+        stored_response.model = response_json
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| original_body.model.clone());
+
+        stored_response.user = response_json
+            .get("user")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| original_body.user.clone());
+
+        stored_response.metadata = response_json
+            .get("metadata")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<HashMap<_, _>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| original_body.metadata.clone().unwrap_or_default());
 
-        let mut stored_response = StoredResponse::new(
-            input_text,
-            output_text,
-            original_body
-                .previous_response_id
-                .as_ref()
-                .map(|id| ResponseId::from_string(id.clone())),
-        );
+        stored_response.previous_response_id = response_json
+            .get("previous_response_id")
+            .and_then(|v| v.as_str())
+            .map(|s| ResponseId::from_string(s.to_string()))
+            .or_else(|| {
+                original_body
+                    .previous_response_id
+                    .as_ref()
+                    .map(|id| ResponseId::from_string(id.clone()))
+            });
 
-        stored_response.instructions = original_body.instructions.clone();
-        stored_response.model = Some(response.model.clone());
-        stored_response.user = original_body.user.clone();
-        stored_response.metadata = original_body.metadata.clone().unwrap_or_default();
-        stored_response.id = ResponseId::from_string(response.id.clone());
-        stored_response.raw_response = serde_json::to_value(response).unwrap_or(Value::Null);
-
-        if let Err(e) = response_storage.store_response(stored_response).await {
-            warn!(response_id = %response.id, error = %e, "Failed to store streaming response");
-        } else {
-            info!(response_id = %response.id, "Stored streaming response locally");
+        if let Some(id_str) = response_json.get("id").and_then(|v| v.as_str()) {
+            stored_response.id = ResponseId::from_string(id_str.to_string());
         }
+
+        stored_response.raw_response = response_json.clone();
+
+        response_storage
+            .store_response(stored_response)
+            .await
+            .map_err(|e| format!("Failed to store response: {}", e))
+    }
+
+    fn extract_primary_output_text(response_json: &Value) -> Option<String> {
+        if let Some(items) = response_json.get("output").and_then(|v| v.as_array()) {
+            for item in items {
+                if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+                    for part in content {
+                        if part
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .map(|t| t == "output_text")
+                            .unwrap_or(false)
+                        {
+                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                return Some(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 }
 
