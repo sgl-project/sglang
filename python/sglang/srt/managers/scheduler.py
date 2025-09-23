@@ -145,7 +145,6 @@ from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.lora_radix_cache import LoRARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -172,6 +171,7 @@ from sglang.srt.utils import (
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
+    get_int_env_var,
     get_zmq_socket,
     is_cpu,
     kill_itself_when_parent_died,
@@ -259,7 +259,7 @@ class Scheduler(
         self.enable_metrics_for_all_schedulers = (
             server_args.enable_metrics_for_all_schedulers
         )
-        self.enable_kv_cache_events = server_args.kv_events_config is not None
+        self.enable_kv_cache_events = server_args.kv_events_config and tp_rank == 0
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -553,8 +553,10 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
-        self.init_kv_events(server_args.kv_events_config)
         self.init_dp_balance(dp_balance_meta)
+
+        if self.enable_kv_cache_events:
+            self.init_kv_events(server_args.kv_events_config)
 
         # Init disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -564,6 +566,9 @@ class Scheduler(
 
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
+
+        # Init prefill kv split size when deterministic inference is enabled with various attention backends
+        self.init_deterministic_inference_config()
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -608,6 +613,23 @@ class Scheduler(
                 (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
                 (GetLoadReqInput, self.get_load),
             ]
+        )
+
+    def init_deterministic_inference_config(self):
+        """Initialize deterministic inference configuration for different attention backends."""
+        if not self.server_args.enable_deterministic_inference:
+            self.truncation_align_size = None
+            return
+
+        backend_sizes = {
+            "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
+            "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
+        }
+        env_var, default_size = backend_sizes.get(
+            self.server_args.attention_backend, (None, None)
+        )
+        self.truncation_align_size = (
+            get_int_env_var(env_var, default_size) if env_var else None
         )
 
     def init_tokenizer(self):
@@ -704,19 +726,6 @@ class Scheduler(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     sliding_window_size=self.sliding_window_size,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                )
-            elif self.enable_lora:
-                assert (
-                    not self.enable_hierarchical_cache
-                ), "LoRA radix cache doesn't support hierarchical cache"
-                assert (
-                    self.schedule_policy == "fcfs"
-                ), "LoRA radix cache only supports FCFS policy"
-                self.tree_cache = LoRARadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                 )
@@ -1846,7 +1855,11 @@ class Scheduler(
                     continue
 
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=(self.chunked_req is not None),
+                truncation_align_size=self.truncation_align_size,
+            )
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:

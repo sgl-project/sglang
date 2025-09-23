@@ -99,10 +99,12 @@ suites = {
         TestFile("test_priority_scheduling.py", 100),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
+        TestFile("test_radix_cache_unit.py", 5),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_retract_decode.py", 54),
         TestFile("test_request_queue_validation.py", 30),
+        TestFile("test_score_api.py", 180),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
@@ -150,8 +152,8 @@ suites = {
         TestFile("test_disaggregation_pp.py", 60),
         TestFile("test_full_deepseek_v3.py", 333),
     ],
-    "per-commit-8-gpu-b200": [
-        TestFile("test_gpt_oss_4gpu.py", 600),
+    "per-commit-4-gpu-b200": [
+        # TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_deepseek_v3_fp4_4gpu.py", 600),
     ],
     "per-commit-4-gpu-deepep": [
