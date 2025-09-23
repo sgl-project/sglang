@@ -20,7 +20,9 @@ class FutureMap:
         device: torch.device,
     ):
         self.future_ct = 0
+        # A factor of 3 is used to avoid collision in the circular buffer.
         self.future_limit = max_running_requests * 3
+        # A factor of 5 is used to ensure the buffer is large enough.
         self.future_buffer_len = max_running_requests * 5
         self.device = device
 

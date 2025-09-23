@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.environ import envs
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -324,13 +325,12 @@ class EagleVerifyInput(SpecInput):
                 deterministic=True,
             )
 
-        if SIMULATE_ACC_LEN:
+        if SIMULATE_ACC_LEN > 0.0:
             # Do simulation
             accept_index = _generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
                 accept_length=accept_length,  # mutable
-                simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
