@@ -40,8 +40,6 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
-SPLIT_SIZE = 1024
-
 
 class RadixKey:
 
@@ -170,6 +168,7 @@ class RadixCache(BasePrefixCache):
         disable: bool = False,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
+        enable_deterministic_inference: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -177,6 +176,8 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        self.enable_deterministic_inference = enable_deterministic_inference
+        self.split_size = 4096  # see `init_deterministic_inference_config`
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -478,16 +479,16 @@ class RadixCache(BasePrefixCache):
 
         value = []
         match_history = [node]
-        align_split_size = align_split_size and SPLIT_SIZE != 0
+        align_split_size = align_split_size and self.enable_deterministic_inference
 
-        if align_split_size and len(key) < SPLIT_SIZE:
+        if align_split_size and len(key) < self.split_size:
             # fast path: directly return the root node if the split point is 0
             return value, node
 
-        # use the access history to first find a split point at SPLIT_SIZE and then return the value and node at that point.
+        # use the access history to first find a split point at split_size and then return the value and node at that point.
         def reconstruct_at_split_point(match_history, value_len):
-            # reverse the search process to find the last node right above the SPLIT_SIZE, split here
-            split_point = value_len // SPLIT_SIZE * SPLIT_SIZE
+            # reverse the search process to find the last node right above the split_size, split here
+            split_point = value_len // self.split_size * self.split_size
             print("value_len=", value_len, "split_point=", split_point)
             # rebuild value form history
             value = []
@@ -535,9 +536,8 @@ class RadixCache(BasePrefixCache):
         if align_split_size:
             value_len = sum(map(len, value))
             value, node = reconstruct_at_split_point(match_history, value_len)
-            print("reconstructed value=", list(map(len, value)), sum(map(len, value)))
             assert (
-                sum(map(len, value)) % SPLIT_SIZE == 0
+                sum(map(len, value)) % self.split_size == 0
             ), "The value length is not aligned with the split size"
 
         return value, node
