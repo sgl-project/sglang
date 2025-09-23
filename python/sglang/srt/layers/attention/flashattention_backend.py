@@ -355,6 +355,13 @@ class FlashAttentionBackend(AttentionBackend):
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
 
+        # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
+        # We set nums splits to 1 if deterministic inference is enabled.
+        # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
+        self.num_splits = (
+            1 if model_runner.server_args.enable_deterministic_inference else 0
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -685,8 +692,13 @@ class FlashAttentionBackend(AttentionBackend):
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
+        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
+        if (
+            self.kv_cache_dtype_str != "auto"
+            and layer.head_dim <= 256
+            and self.fa_impl_ver != 4
+        ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
@@ -776,6 +788,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
+                num_splits=self.num_splits,
                 **kwargs,
             )
 
@@ -797,6 +810,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
+                    num_splits=self.num_splits,
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -901,6 +915,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -922,6 +937,7 @@ class FlashAttentionBackend(AttentionBackend):
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
+                            num_splits=self.num_splits,
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
@@ -1042,6 +1058,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    num_splits=self.num_splits,
                     **kwargs,
                 )
             elif use_local_attn:
@@ -1061,6 +1078,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    num_splits=self.num_splits,
                     **kwargs,
                 )
             else:
@@ -1089,6 +1107,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
                     **kwargs,
                 )
                 if use_cascade_attn:
@@ -1110,6 +1129,7 @@ class FlashAttentionBackend(AttentionBackend):
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
+                            num_splits=self.num_splits,
                             **kwargs,
                         )
                     )
@@ -1165,6 +1185,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
+                num_splits=self.num_splits,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -1185,6 +1206,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
+                    num_splits=self.num_splits,
                 )
                 o, _ = merge_state_v2(
                     o,

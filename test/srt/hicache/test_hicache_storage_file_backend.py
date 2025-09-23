@@ -238,6 +238,19 @@ class TestHiCacheStorageLayerFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCa
         return server_args, {}
 
 
+class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCase):
+    """Page first direct tests for HiCache Storage functionality"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args = {
+            "--hicache-mem-layout": "page_first_direct",
+            "--hicache-io-backend": "direct",
+        }
+        return server_args, {}
+
+
 class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase):
     """Page first layout tests for HiCache Storage functionality"""
 
