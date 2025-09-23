@@ -304,8 +304,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             if let Ok(trees) = self.trees.read() {
                 let mut best_match_idx: Option<usize> = None;
                 let mut best_match_rate: f32 = 0.0;
-                let mut fallback_idx: Option<usize> = None;
-                let mut fallback_usage = usize::MAX;
                 let mut stale_entries: Vec<(String, String)> = Vec::new();
 
                 // Find best match across all models
@@ -332,22 +330,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                                 stale_entries.push((model_id.clone(), matched_worker.clone()));
                             }
                         }
-
-                        // Evaluate fallback candidates using tenant usage counts
-                        let tenant_counts = tree.get_tenant_char_count();
-                        for (tenant, count) in tenant_counts {
-                            if let Some(idx) = worker_indices
-                                .iter()
-                                .find(|&&idx| workers[idx].url() == tenant)
-                            {
-                                if count < fallback_usage {
-                                    fallback_usage = count;
-                                    fallback_idx = Some(*idx);
-                                }
-                            } else if !worker_url_set.contains(tenant.as_str()) {
-                                stale_entries.push((model_id.clone(), tenant));
-                            }
-                        }
                     }
                 }
 
@@ -360,6 +342,33 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     Some(idx)
                 } else {
                     RouterMetrics::record_cache_miss();
+
+                    // Only calculate fallback when we have a cache miss
+                    let mut fallback_idx: Option<usize> = None;
+
+                    for (model_id, worker_indices) in &model_workers {
+                        if let Some(tree) = trees.get(model_id) {
+                            // Get the smallest tenant for this tree
+                            let smallest_tenant = tree.get_smallest_tenant();
+
+                            // Find the worker index for this tenant
+                            if let Some(idx) = worker_indices
+                                .iter()
+                                .find(|&&idx| workers[idx].url() == smallest_tenant)
+                            {
+                                // For simplicity, prefer the first found smallest tenant
+                                // In the future, we could compare sizes across trees
+                                if fallback_idx.is_none() {
+                                    fallback_idx = Some(*idx);
+                                }
+                            } else if !smallest_tenant.is_empty() && smallest_tenant != "empty"
+                                && !worker_url_set.contains(smallest_tenant.as_str())
+                            {
+                                stale_entries.push((model_id.clone(), smallest_tenant));
+                            }
+                        }
+                    }
+
                     fallback_idx.or_else(|| healthy_indices.first().copied())
                 };
 
