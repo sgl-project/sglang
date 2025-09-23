@@ -868,7 +868,7 @@ class CudaGraphRunner:
                 )
 
         elif self.model_runner.spec_algorithm.is_lookahead():
-            from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+            from sglang.srt.speculative.lookahead_info import LookaheadVerifyInput
 
             spec_info = LookaheadVerifyInput(
                 draft_token=None,
