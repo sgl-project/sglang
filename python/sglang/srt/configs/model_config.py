@@ -210,6 +210,11 @@ class ModelConfig:
                 ):
                     logger.warning(msg)
                     self.context_len = context_length
+                    if is_draft_model:
+                        self.hf_text_config.max_position_embeddings = context_length
+                        logger.warning(
+                            f"Overriding the draft model's max_position_embeddings to {context_length}."
+                        )
                 else:
                     raise ValueError(
                         f"{msg} To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
@@ -749,6 +754,8 @@ multimodal_model_archs = [
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
