@@ -170,10 +170,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         )
         self.logits_processor = LogitsProcessor(config)
 
-        print("HACK: zero all weights")
-        for name, w in self.named_parameters():
-            w.data.zero_()
-
     @torch.no_grad()
     def forward(
         self,
@@ -181,8 +177,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        print(f"hi mtp forward {list(self.named_parameters())=}")
-
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
