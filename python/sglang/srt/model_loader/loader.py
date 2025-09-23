@@ -1817,6 +1817,24 @@ class ModelOptModelLoader(DefaultModelLoader):
                 rank0_log(
                     f"Restored quantized model from {quantized_ckpt_restore_path}"
                 )
+
+                # Export model if path provided (even when restoring from checkpoint)
+                if export_path:
+                    try:
+                        # Get the original model path from the model config
+                        original_model_path = getattr(
+                            self, "_original_model_path", None
+                        )
+                        self._export_modelopt_checkpoint(
+                            model, export_path, original_model_path
+                        )
+                        print(
+                            f"Quantized model exported to HuggingFace format at {export_path}"
+                        )
+                    except Exception as e:
+                        print(
+                            f"Warning: Failed to export quantized model to {export_path}: {e}"
+                        )
                 return
             except Exception as e:
                 logger.warning(
@@ -1866,7 +1884,11 @@ class ModelOptModelLoader(DefaultModelLoader):
             # Export model if path provided
             if export_path:
                 try:
-                    self._export_modelopt_checkpoint(model, export_path)
+                    # Get the original model path from the model config
+                    original_model_path = getattr(self, "_original_model_path", None)
+                    self._export_modelopt_checkpoint(
+                        model, export_path, original_model_path
+                    )
                     print(
                         f"Quantized model exported to HuggingFace format at {export_path}"
                     )
@@ -1878,13 +1900,21 @@ class ModelOptModelLoader(DefaultModelLoader):
         except Exception as e:
             raise Exception(f"Failed to set up ModelOpt quantization: {e}") from e
 
-    def _export_modelopt_checkpoint(self, model, export_path: str) -> None:
+    def _export_modelopt_checkpoint(
+        self,
+        model,
+        export_path: str,
+        model_path: str = None,
+        trust_remote_code: bool = True,
+    ) -> None:
         """
         Export the quantized model to HuggingFace format using ModelOpt export API.
 
         Args:
             model: The quantized model to export
             export_path: Directory path to export the model to
+            model_path: Path to the original model (for tokenizer export)
+            trust_remote_code: Whether to trust remote code for tokenizer loading
 
         Raises:
             ImportError: If ModelOpt export functionality is not available
@@ -1892,6 +1922,7 @@ class ModelOptModelLoader(DefaultModelLoader):
         """
         try:
             from modelopt.torch.export import export_hf_checkpoint
+            from transformers import AutoTokenizer
         except ImportError as e:
             raise ImportError(
                 "ModelOpt export functionality is not available. "
@@ -1904,6 +1935,17 @@ class ModelOptModelLoader(DefaultModelLoader):
         # Export the quantized model
         export_hf_checkpoint(model, export_dir=export_path)
 
+        # Export the tokenizer if model_path is provided
+        if model_path:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_path, trust_remote_code=trust_remote_code
+                )
+                tokenizer.save_pretrained(export_path)
+                print(f"Tokenizer exported to {export_path}")
+            except Exception as e:
+                print(f"Warning: Failed to export tokenizer: {e}")
+
     def load_model(
         self,
         *,
@@ -1912,6 +1954,9 @@ class ModelOptModelLoader(DefaultModelLoader):
     ) -> nn.Module:
 
         logger.info("ModelOptModelLoader: Loading base model...")
+
+        # Store the original model path for tokenizer export
+        self._original_model_path = model_config.model_path
 
         # Check if model is already quantized
         if model_config._is_already_quantized():
