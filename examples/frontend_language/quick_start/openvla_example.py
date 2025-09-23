@@ -1,3 +1,11 @@
+"""
+An example of using OpenVLA (https://huggingface.co/openvla/openvla-7b) with SGLang.
+SGLang adaptation of OpenVLA supports faster inference and better test-time VLA scaling such as in RoboMonkey(https://arxiv.org/abs/2506.17811).
+Usage:
+cd examples/frontend_language/quick_start
+python openvla_example.py
+"""
+
 import numpy as np
 import timm
 from transformers import AutoConfig
