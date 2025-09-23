@@ -410,28 +410,29 @@ impl OpenAIRouter {
                         pending.push_str(&chunk_text.replace("\r\n", "\n"));
 
                         while let Some(pos) = pending.find("\n\n") {
-                            let block = pending[..pos].to_string();
+                            let raw_block = pending[..pos].to_string();
                             pending.drain(..pos + 2);
 
-                            if block.trim().is_empty() {
+                            if raw_block.trim().is_empty() {
                                 continue;
                             }
 
-                            let mut block_string = block;
-                            if let Some(modified) = Self::rewrite_streaming_block(
-                                &block_string,
+                            let block_cow = if let Some(modified) = Self::rewrite_streaming_block(
+                                raw_block.as_str(),
                                 &original_request,
                                 previous_response_id.as_deref(),
                             ) {
-                                block_string = modified;
-                            }
+                                Cow::Owned(modified)
+                            } else {
+                                Cow::Borrowed(raw_block.as_str())
+                            };
 
                             if should_store {
-                                accumulator.ingest_block(&block_string);
+                                accumulator.ingest_block(block_cow.as_ref());
                             }
 
                             if receiver_connected {
-                                let chunk_to_send = format!("{}\n\n", block_string);
+                                let chunk_to_send = format!("{}\n\n", block_cow);
                                 if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
                                     receiver_connected = false;
                                 }
@@ -589,7 +590,7 @@ impl OpenAIRouter {
             if let Some(prev_id) = original_previous_response_id {
                 let should_insert = obj
                     .get("previous_response_id")
-                    .map(|v| v.is_null())
+                    .map(|v| v.is_null() || v.as_str().map(|s| s.is_empty()).unwrap_or(false))
                     .unwrap_or(true);
                 if should_insert {
                     obj.insert(
