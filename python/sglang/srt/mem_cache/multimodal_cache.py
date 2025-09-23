@@ -13,8 +13,7 @@ class MultimodalCache(abc.ABC):
     @abc.abstractmethod
     def __init__(
         self,
-    ):
-        ...
+    ): ...
 
     @staticmethod
     def combine_hashes(mm_hashes: List[int]) -> Optional[int]:
@@ -72,8 +71,8 @@ def _get_tensor_size(embedding: torch.Tensor):
 
 class MultiModalStaticCache(MultimodalCache):
     """
-    MultiModalStaticCache is a server-level cache for multimodal embedding,
-    Embeddings will be computed prior, and this cache does not really pre-alloc
+    A server-level cache for multimodal embedding.
+    Embeddings are computed prior, and this cache does not really pre-alloc
     """
 
     def __init__(
@@ -82,28 +81,33 @@ class MultiModalStaticCache(MultimodalCache):
     ):
         super().__init__()
         self.max_size = max_size
-        self.mm_cache: Dict[int, torch.Tensor] = {}
+        self.mm_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
         self.current_size = 0
 
     def get(
         self, mm_hashes: List[int], combined_hash: Optional[int] = None
     ) -> Optional[torch.Tensor]:
-
         combined_hash = self.combine_hashes(mm_hashes)
         # MultiModalStaticCache does not fallback to individual item lookup
 
-        print(f"getting cache with {combined_hash=}")
-        return self.mm_cache.get(combined_hash)
+        embedding = self.mm_cache.get(combined_hash)
+        if embedding is not None:
+            self.mm_cache.move_to_end(combined_hash)
+        return embedding
 
     def set(
         self, mm_hash: int, embedding: torch.Tensor, loc: Optional[torch.Tensor] = None
     ) -> bool:
         if mm_hash in self.mm_cache:
+            self.mm_cache.move_to_end(mm_hash)
             return True
-        print(f"setting cache with {mm_hash=}")
         data_size = _get_tensor_size(embedding)
-        if self.current_size + data_size > self.max_size:
-            return False
+        while self.current_size + data_size > self.max_size:
+            if not self.mm_cache:
+                return False
+            lru_hash, lru_embedding = self.mm_cache.popitem(last=False)
+            self.current_size -= _get_tensor_size(lru_embedding)
+
         self.mm_cache[mm_hash] = embedding
         self.current_size += data_size
         return True
