@@ -216,4 +216,3 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg);
-

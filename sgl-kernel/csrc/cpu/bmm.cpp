@@ -93,18 +93,15 @@ void bmm_kernel_impl(
   const bool use_brgemm = can_use_brgemm<at::BFloat16>(M);
 
   // parallel on [B, MB, NB]
-  at::parallel_for(0, B * MB * NB, 0, [&](int64_t begin, int64_t end) {
-    int64_t bs{0}, mb{0}, nb{0};
-    data_index_init(begin, bs, B, mb, MB, nb, NB);
-
+  parallel_2d(B * MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // for brgemm, use float32 for accumulate
     alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
     // for brgemm when mat2 is float8_e4m3
     alignas(64) at::BFloat16 Btmp[BLOCK_N * BLOCK_K];
 
-    for (int i = begin; i < end; ++i) {
-      UNUSED(i);
-      int mb_start = mb * BLOCK_M;
+    loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int bs = mb / MB;
+      int mb_start = (mb % MB) * BLOCK_M;
       int mb_size = std::min(M - mb_start, BLOCK_M);
       int nb_start = nb * BLOCK_N;
       int nb_size = std::min(N - nb_start, BLOCK_N);
@@ -123,10 +120,7 @@ void bmm_kernel_impl(
           /* ldb */ nb_size,
           /* ldc */ out_strideM,
           /* brg */ use_brgemm);
-
-      // move to the next index
-      data_index_step(bs, B, mb, MB, nb, NB);
-    }
+    });
 
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
