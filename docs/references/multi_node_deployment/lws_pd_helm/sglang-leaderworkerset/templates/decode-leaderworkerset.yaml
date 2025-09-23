@@ -1,0 +1,278 @@
+{{- if .Values.decode.enabled }}
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: {{ .Values.global.namePrefix }}-decode
+  labels:
+    app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-decode
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ include "sglang-leaderworkerset.chart" . }}
+spec:
+  leaderWorkerTemplate:
+    leaderTemplate:
+      metadata:
+        labels:
+          role: leader
+          app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-decode
+          app.kubernetes.io/instance: {{ .Release.Name }}
+      spec:
+        containers:
+        - name: sglang-leader
+          image: {{ .Values.global.image.repository }}:{{ .Values.global.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+          - python3
+          - -m
+          - sglang.launch_server
+          - --port
+          - {{ .Values.decode.config.port | quote }}
+          - --host
+          - {{ .Values.decode.config.host | quote }}
+          - --model-path
+          - {{ .Values.global.model.path }}
+          - --chunked-prefill-size
+          - {{ .Values.decode.config.chunkedPrefillSize | quote }}
+          - --page-size
+          - {{ .Values.decode.config.pageSize | quote }}
+          {{- if .Values.decode.config.enableDpAttention }}
+          - --enable-dp-attention
+          {{- end }}
+          {{- if .Values.decode.config.enableDpLmHead }}
+          - --enable-dp-lm-head
+          {{- end }}
+          - --dp-size
+          - {{ .Values.decode.config.dpSize | quote }}
+          - --moe-a2a-backend
+          - {{ .Values.decode.config.moeA2aBackend }}
+          - --disaggregation-mode
+          - {{ .Values.decode.config.disaggregationMode }}
+          - --mem-fraction-static
+          - {{ .Values.decode.config.memFractionStatic | quote }}
+          - --context-length
+          - {{ .Values.global.model.contextLength | quote }}
+          - --disaggregation-ib-device
+          - {{ .Values.global.rdma.ibDevice | quote }}
+          - --cuda-graph-max-bs
+          - {{ .Values.decode.config.cudaGraphMaxBs | quote }}
+          - --max-running-requests
+          - {{ .Values.decode.config.maxRunningRequests | quote }}
+          - --tp-size
+          - {{ .Values.decode.config.tpSize | quote }}
+          - --dist-init-addr
+          - $(LWS_LEADER_ADDRESS):{{ .Values.global.distInit.port }}
+          - --nnodes
+          - $(LWS_GROUP_SIZE)
+          - --node-rank
+          - $(LWS_WORKER_INDEX)
+          {{- if .Values.global.model.trustRemoteCode }}
+          - --trust-remote-code
+          {{- end }}
+          - --ep-num-redundant-experts
+          - {{ .Values.decode.config.epNumRedundantExperts | quote }}
+          - --moe-dense-tp-size
+          - {{ .Values.decode.config.moeDenseTpSize | quote }}
+          env:
+          {{- range $key, $value := .Values.decode.leader.env }}
+          - name: {{ $key }}
+            value: {{ $value | quote }}
+          {{- end }}
+          - name: LWS_WORKER_INDEX
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
+          ports:
+          - containerPort: {{ .Values.decode.config.port | int }}
+            protocol: TCP
+          {{- with .Values.decode.leader.readinessProbe }}
+          readinessProbe:
+            periodSeconds: {{ .periodSeconds }}
+            tcpSocket:
+              port: {{ .tcpSocket.port }}
+          {{- end }}
+          {{- with .Values.decode.leader.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+          - mountPath: /root/.cache
+            name: sgl-cache
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /work/models
+            name: model
+          - mountPath: /dev/infiniband
+            name: ib
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+            name: cf
+        dnsPolicy: {{ .Values.dnsPolicy }}
+        hostIPC: {{ .Values.hostIPC }}
+        hostNetwork: {{ .Values.hostNetwork }}
+        {{- with .Values.global.nodeSelector }}
+        nodeSelector:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.global.tolerations }}
+        tolerations:
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+        volumes:
+        - name: sgl-cache
+          hostPath:
+            path: {{ .Values.decode.volumes.cache.hostPath }}
+            {{- if .Values.global.volumes.cache.type }}
+            type: {{ .Values.global.volumes.cache.type }}
+            {{- end }}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: model
+          hostPath:
+            path: {{ .Values.global.volumes.model.hostPath }}
+        - name: ib
+          hostPath:
+            path: /dev/infiniband
+        - name: cf
+          hostPath:
+            path: {{ .Values.global.volumes.config.hostPath }}
+    
+    restartPolicy: {{ .Values.decode.leaderWorkerSet.restartPolicy }}
+    size: {{ .Values.decode.leaderWorkerSet.size }}
+    
+    workerTemplate:
+      metadata:
+        labels:
+          app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-decode
+          app.kubernetes.io/instance: {{ .Release.Name }}
+      spec:
+        containers:
+        - name: sglang-worker
+          image: {{ .Values.global.image.repository }}:{{ .Values.global.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+          - python3
+          - -m
+          - sglang.launch_server
+          - --model-path
+          - {{ .Values.global.model.path }}
+          - --chunked-prefill-size
+          - {{ .Values.decode.config.chunkedPrefillSize | quote }}
+          - --page-size
+          - {{ .Values.decode.config.pageSize | quote }}
+          {{- if .Values.decode.config.enableDpAttention }}
+          - --enable-dp-attention
+          {{- end }}
+          {{- if .Values.decode.config.enableDpLmHead }}
+          - --enable-dp-lm-head
+          {{- end }}
+          - --dp-size
+          - {{ .Values.decode.config.dpSize | quote }}
+          - --moe-a2a-backend
+          - {{ .Values.decode.config.moeA2aBackend }}
+          - --disaggregation-mode
+          - {{ .Values.decode.config.disaggregationMode }}
+          - --mem-fraction-static
+          - {{ .Values.decode.config.memFractionStatic | quote }}
+          - --context-length
+          - {{ .Values.global.model.contextLength | quote }}
+          - --disaggregation-ib-device
+          - {{ .Values.global.rdma.ibDevice | quote }}
+          - --cuda-graph-max-bs
+          - {{ .Values.decode.config.cudaGraphMaxBs | quote }}
+          - --max-running-requests
+          - {{ .Values.decode.config.maxRunningRequests | quote }}
+          - --tp-size
+          - {{ .Values.decode.config.tpSize | quote }}
+          - --dist-init-addr
+          - $(LWS_LEADER_ADDRESS):{{ .Values.global.distInit.port }}
+          - --nnodes
+          - $(LWS_GROUP_SIZE)
+          - --node-rank
+          - $(LWS_WORKER_INDEX)
+          {{- if .Values.global.model.trustRemoteCode }}
+          - --trust-remote-code
+          {{- end }}
+          - --ep-num-redundant-experts
+          - {{ .Values.decode.config.epNumRedundantExperts | quote }}
+          - --moe-dense-tp-size
+          - {{ .Values.decode.config.moeDenseTpSize | quote }}
+          env:
+          {{- range $key, $value := .Values.decode.worker.env }}
+          - name: {{ $key }}
+            value: {{ $value | quote }}
+          {{- end }}
+          - name: LWS_WORKER_INDEX
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
+          ports:
+          - containerPort: {{ .Values.decode.worker.port | int }}
+          {{- with .Values.decode.worker.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+          - mountPath: /root/.cache
+            name: sgl-cache
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /work/models
+            name: model
+          - mountPath: /dev/infiniband
+            name: ib
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+            name: cf
+        dnsPolicy: {{ .Values.dnsPolicy }}
+        hostIPC: {{ .Values.hostIPC }}
+        hostNetwork: {{ .Values.hostNetwork }}
+        {{- with .Values.global.nodeSelector }}
+        nodeSelector:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.global.tolerations }}
+        tolerations:
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+        volumes:
+        - name: sgl-cache
+          hostPath:
+            path: {{ .Values.decode.volumes.cache.hostPath }}
+            {{- if .Values.global.volumes.cache.type }}
+            type: {{ .Values.global.volumes.cache.type }}
+            {{- end }}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: ib
+          hostPath:
+            path: /dev/infiniband
+        - name: model
+          hostPath:
+            path: {{ .Values.global.volumes.model.hostPath }}
+        - name: cf
+          hostPath:
+            path: {{ .Values.global.volumes.config.hostPath }}
+            
+  {{- with .Values.decode.leaderWorkerSet.networkConfig }}
+  networkConfig:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  
+  {{- if .Values.decode.leaderWorkerSet.replicas }}
+  replicas: {{ .Values.decode.leaderWorkerSet.replicas }}
+  {{- end }}
+  
+  {{- with .Values.decode.leaderWorkerSet.rolloutStrategy }}
+  rolloutStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  
+  {{- if .Values.decode.leaderWorkerSet.startupPolicy }}
+  startupPolicy: {{ .Values.decode.leaderWorkerSet.startupPolicy }}
+  {{- end }}
+{{- end }}

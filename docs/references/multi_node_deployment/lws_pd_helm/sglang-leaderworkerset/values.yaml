@@ -1,0 +1,272 @@
+# Default values for sglang-pd
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Global configuration
+global:
+  # Name prefix for all resources
+  namePrefix: "deepseekr10528"
+  image:
+    repository: lmsysorg/sglang
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  
+  model:
+    # modify according to you deployment
+    path: "/data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528"
+    contextLength: "32768"
+    trustRemoteCode: true
+  
+  nodeSelector:
+    pd: "yes"
+  
+  tolerations:
+    - key: bopd
+      operator: Exists
+    - key: node-role
+      operator: Exists
+  
+  rdma:
+    ibDevice: "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3"
+    hcaPeMapping: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
+  
+  # Distributed initialization configuration
+  distInit:
+    port: "20102"  # Port for distributed initialization communication
+  
+  volumes:
+    model:
+      # modify according to you deployment
+      hostPath: "/data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528"
+    config:
+      # modify according to you deployment
+      hostPath: "/data1/maas_hosted_models/models/fused_moe_triton/configs"
+    cache:
+      hostPath: "/data1/sgl_cache"
+      type: "DirectoryOrCreate"
+
+# Prefill configuration
+prefill:
+  enabled: true
+  
+  leaderWorkerSet:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    replicas: 1
+  
+  config:
+    port: "30000"
+    host: "0.0.0.0"
+    chunkedPrefillSize: "524288"
+    maxPrefillTokens: "32768"
+    pageSize: "64"
+    epDispatchAlgorithm: "dynamic"
+    eplbAlgorithm: "deepseek"
+    enableDpLmHead: true
+    enableDpAttention: true
+    dpSize: "16"
+    disableRadixCache: true
+    moeA2aBackend: "deepep"
+    disaggregationMode: "prefill"
+    memFractionStatic: "0.7"
+    tp: "16"
+    epNumRedundantExperts: "32"
+    moeDenseTpSize: "1"
+    maxRunningRequests: "1024"
+  
+  leader:
+    env:
+      NVSHMEM_HCA_PE_MAPPING: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
+      NVSHMEM_IB_GID_INDEX: "3"
+      NVSHMEM_ENABLE_NIC_PE_MAPPING: "1"
+      SGLANG_SET_CPU_AFFINITY: "true"
+      SGL_ENABLE_JIT_DEEPGEMM: "1"
+      NCCL_IB_QPS_PER_CONNECTION: "8"
+      NCCL_IB_SPLIT_DATA_ON_QPS: "1"
+      NCCL_NET_PLUGIN: "none"
+      NCCL_IB_TC: "136"
+      NCCL_MIN_NCHANNELS: "4"
+      MC_TE_METRIC: "false"
+      NCCL_IB_SL: "5"
+      NCCL_IB_HCA: "^=mlx5_0,mlx5_5,mlx5_6"
+    
+    readinessProbe:
+      periodSeconds: 30
+      tcpSocket:
+        port: 30000
+    
+    resources:
+      limits:
+        "nvidia.com/gpu": "8"
+  
+  # Worker container specific configuration
+  worker:
+    port: 30001  # Worker container port
+    env:
+      SGLANG_SET_CPU_AFFINITY: "true"
+      NVSHMEM_HCA_PE_MAPPING: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
+      NCCL_IB_HCA: "^=mlx5_0,mlx5_5,mlx5_6"
+      NVSHMEM_IB_TRAFFIC_CLASS: "16"
+      NVSHMEM_IB_GID_INDEX: "3"
+      NVSHMEM_ENABLE_NIC_PE_MAPPING: "1"
+      CUDA_LAUNCH_BLOCKING: "0"
+      SGLANG_MOONCAKE_TRANS_THREAD: "8"
+      SGL_ENABLE_JIT_DEEPGEMM: "1"
+      SGL_CHUNKED_PREFIX_CACHE_THRESHOLD: "0"
+      NCCL_IB_QPS_PER_CONNECTION: "8"
+      NCCL_IB_SPLIT_DATA_ON_QPS: "1"
+      NCCL_NET_PLUGIN: "none"
+      NCCL_IB_TC: "136"
+      NCCL_MIN_NCHANNELS: "4"
+      MC_TE_METRIC: "true"
+      NCCL_IB_SL: "5"
+    
+    resources:
+      limits:
+        "nvidia.com/gpu": "8"
+
+# Decode configuration
+decode:
+  enabled: true
+  
+  # LeaderWorkerSet configuration
+  leaderWorkerSet:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    replicas: 1
+    networkConfig:
+      subdomainPolicy: Shared
+    rolloutStrategy:
+      type: RollingUpdate
+      rollingUpdateConfiguration:
+        maxSurge: 0
+        maxUnavailable: 1
+    startupPolicy: LeaderCreated
+  
+  # Specific decode parameters
+  config:
+    port: "30000"
+    host: "0.0.0.0"
+    chunkedPrefillSize: "262144"
+    pageSize: "64"
+    enableDpAttention: true
+    enableDpLmHead: true
+    dpSize: "16"
+    moeA2aBackend: "deepep"
+    disaggregationMode: "decode"
+    memFractionStatic: "0.849"
+    cudaGraphMaxBs: "64"
+    maxRunningRequests: "2048"
+    tpSize: "16"
+    epNumRedundantExperts: "32"
+    moeDenseTpSize: "1"
+  
+  # Leader container specific configuration
+  leader:
+    env:
+      CUDA_LAUNCH_BLOCKING: "0"
+      NVSHMEM_IB_GID_INDEX: "3"
+      NVSHMEM_ENABLE_NIC_PE_MAPPING: "1"
+      NVSHMEM_HCA_PE_MAPPING: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
+      NCCL_IB_QPS_PER_CONNECTION: "8"
+      NCCL_IB_SPLIT_DATA_ON_QPS: "1"
+      NCCL_NET_PLUGIN: "none"
+      NCCL_IB_TC: "136"
+      NCCL_MIN_NCHANNELS: "4"
+      NCCL_IB_SL: "5"
+      MC_TE_METRIC: "true"
+      SGLANG_MOONCAKE_TRANS_THREAD: "16"
+      SGL_ENABLE_JIT_DEEPGEMM: "1"
+      NCCL_IB_HCA: "^=mlx5_0,mlx5_5,mlx5_6"
+    
+    readinessProbe:
+      periodSeconds: 30
+      tcpSocket:
+        port: 30000
+    
+    resources:
+      limits:
+        "nvidia.com/gpu": "8"
+  
+  # Worker container specific configuration
+  worker:
+    port: 30001  # Worker container port
+    env:
+      NVSHMEM_IB_TRAFFIC_CLASS: "16"
+      NVSHMEM_IB_GID_INDEX: "3"
+      NVSHMEM_ENABLE_NIC_PE_MAPPING: "1"
+      NVSHMEM_HCA_PE_MAPPING: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
+      NCCL_IB_QPS_PER_CONNECTION: "8"
+      NCCL_IB_SPLIT_DATA_ON_QPS: "1"
+      NCCL_NET_PLUGIN: "none"
+      NCCL_IB_TC: "136"
+      NCCL_MIN_NCHANNELS: "4"
+      MC_TE_METRIC: "true"
+      NCCL_IB_SL: "5"
+      SGLANG_MOONCAKE_TRANS_THREAD: "16"
+      SGL_ENABLE_JIT_DEEPGEMM: "1"
+      NCCL_IB_HCA: "^=mlx5_0,mlx5_5,mlx5_6"
+    
+    resources:
+      limits:
+        "nvidia.com/gpu": "8"
+  
+  # Volume configuration specific to decode
+  volumes:
+    cache:
+      hostPath: "/data1/sgl_cache1"
+
+# Service configuration
+service:
+  enabled: true
+  prefill:
+    port: 30000
+    targetPort: 30000
+    protocol: TCP
+  decode:
+    port: 30000
+    targetPort: 30000
+    protocol: TCP
+
+# Load Balancer configuration
+loadBalancer:
+  enabled: true
+  
+  deployment:
+    replicas: 1
+    
+  config:
+    port: "8000"
+    host: "0.0.0.0"
+    
+  nodeSelector:
+    bo: "yes"
+    
+  tolerations:
+    - key: bopd
+      operator: Exists
+    - key: node-role
+      operator: Exists
+  
+  service:
+    type: NodePort
+    port: 8000
+    targetPort: 8000
+    nodePort: 30800
+    
+  resources: {}
+
+# Security context - controls Pod security permissions and capabilities
+securityContext:
+  capabilities:
+    add:
+      # IPC_LOCK: Lock memory pages to prevent swap, required for GPU memory optimization
+      - IPC_LOCK
+  # privileged: Required for GPU/RDMA device access and /dev/infiniband communication
+  privileged: true
+
+# DNS and networking - optimized for distributed AI communication
+dnsPolicy: ClusterFirstWithHostNet
+hostIPC: true
+# hostNetwork: Direct RDMA access, bypass container network overhead
+hostNetwork: true

@@ -1,0 +1,95 @@
+{{- $prefillServiceName := printf "%s-prefill" .Values.global.namePrefix -}}
+{{- $decodeServiceName := printf "%s-decode" .Values.global.namePrefix -}}
+{{- $lbServiceName := printf "%s-lb-service" .Values.global.namePrefix -}}
+
+1. Get the application URL by running these commands:
+
+{{- if .Values.loadBalancer.enabled }}
+{{- if eq .Values.loadBalancer.service.type "NodePort" }}
+  You can access the SGLang PD service via NodePort:
+  
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ $lbServiceName }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT
+
+{{- else if eq .Values.loadBalancer.service.type "LoadBalancer" }}
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+        You can watch the status of by running 'kubectl get --namespace {{ .Release.Namespace }} svc -w {{ $lbServiceName }}'
+
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ $lbServiceName }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+  echo http://$SERVICE_IP:{{ .Values.loadBalancer.service.port }}
+
+{{- else if eq .Values.loadBalancer.service.type "ClusterIP" }}
+  To access the service from within the cluster:
+  
+  kubectl run sglang-pd-test --rm -i --tty --image=curlimages/curl -- /bin/sh
+  curl http://{{ $lbServiceName }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.loadBalancer.service.port }}
+
+  To access from outside the cluster:
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ $lbServiceName }} 8080:{{ .Values.loadBalancer.service.port }}
+  Then access http://127.0.0.1:8080
+
+{{- end }}
+{{- end }}
+
+2. Check the status of your deployment:
+
+  kubectl get leaderworkerset --namespace {{ .Release.Namespace }}
+
+{{- if .Values.prefill.enabled }}
+  kubectl get pods -l leaderworkerset.sigs.k8s.io/name={{ .Values.global.namePrefix }}-prefill --namespace {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.decode.enabled }}
+  kubectl get pods -l leaderworkerset.sigs.k8s.io/name={{ .Values.global.namePrefix }}-decode --namespace {{ .Release.Namespace }}
+{{- end }}
+
+3. View logs:
+
+{{- if .Values.prefill.enabled }}
+  # Prefill leader logs
+  kubectl logs -l leaderworkerset.sigs.k8s.io/name={{ .Values.global.namePrefix }}-prefill,role=leader --namespace {{ .Release.Namespace }}
+  
+  # Prefill worker logs  
+  kubectl logs -l leaderworkerset.sigs.k8s.io/name={{ .Values.global.namePrefix }}-prefill,leaderworkerset.sigs.k8s.io/worker-index=1 --namespace {{ .Release.Namespace }}
+{{- end }}
+
+{{- if .Values.decode.enabled }}
+  # Decode leader logs
+  kubectl logs -l leaderworkerset.sigs.k8s.io/name={{ .Values.global.namePrefix }}-decode,role=leader --namespace {{ .Release.Namespace }}
+  
+  # Decode worker logs
+  kubectl logs -l leaderworkerset.sigs.k8s.io/name={{ .Values.global.namePrefix }}-decode,leaderworkerset.sigs.k8s.io/worker-index=1 --namespace {{ .Release.Namespace }}
+{{- end }}
+
+{{- if .Values.loadBalancer.enabled }}
+  # Load balancer logs
+  kubectl logs -l app={{ .Values.global.namePrefix }}-lb --namespace {{ .Release.Namespace }}
+{{- end }}
+
+4. Test the API (after accessing the service):
+
+  curl -X POST "http://<SERVICE_URL>/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer None" \
+    -d '{
+      "rid": "test123",
+      "model": "r1",
+      "messages": [
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "Hello, how are you?"}
+      ],
+      "max_tokens": 100
+    }'
+
+{{- if not .Values.global.volumes.model.hostPath }}
+WARNING: You need to configure the model path in values.yaml under global.volumes.model.hostPath
+{{- end }}
+
+{{- if not .Values.global.rdma.ibDevice }}
+WARNING: You need to configure RDMA IB devices in values.yaml under global.rdma.ibDevice
+{{- end }}
+
+For more information:
+- Check the SGLang documentation: https://github.com/sgl-project/sglang
+- Customize configuration by editing values.yaml
+- Use 'helm upgrade {{ .Release.Name }} ./sglang-pd' to apply changes

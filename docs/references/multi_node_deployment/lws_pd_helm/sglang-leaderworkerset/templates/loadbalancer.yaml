@@ -1,0 +1,79 @@
+{{- if .Values.loadBalancer.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.global.namePrefix }}-lb
+  labels:
+    app: {{ .Values.global.namePrefix }}-lb
+    app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-lb
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ include "sglang-leaderworkerset.chart" . }}
+spec:
+  replicas: {{ .Values.loadBalancer.deployment.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.global.namePrefix }}-lb
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.global.namePrefix }}-lb
+        app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-lb
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      {{- with .Values.loadBalancer.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.loadBalancer.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: sgl-minilb
+          image: {{ .Values.global.image.repository }}:{{ .Values.global.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+          - python3
+          - -m
+          - sglang_router.launch_router
+          - --pd-disaggregation
+          - --prefill
+          - http://{{ .Values.global.namePrefix }}-prefill:{{ .Values.service.prefill.port }}
+          - --decode
+          - http://{{ .Values.global.namePrefix }}-decode:{{ .Values.service.decode.port }}
+          - --host
+          - {{ .Values.loadBalancer.config.host }}
+          - --port
+          - {{ .Values.loadBalancer.config.port | quote }}
+          ports:
+            - containerPort: {{ .Values.loadBalancer.config.port | int }}
+          {{- with .Values.loadBalancer.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.global.namePrefix }}-lb-service
+  labels:
+    app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-lb-service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ include "sglang-leaderworkerset.chart" . }}
+spec:
+  type: {{ .Values.loadBalancer.service.type }}
+  selector:
+    app: {{ .Values.global.namePrefix }}-lb
+  ports:
+    - protocol: TCP
+      port: {{ .Values.loadBalancer.service.port }}
+      targetPort: {{ .Values.loadBalancer.service.targetPort }}
+      {{- if and (eq .Values.loadBalancer.service.type "NodePort") .Values.loadBalancer.service.nodePort }}
+      nodePort: {{ .Values.loadBalancer.service.nodePort }}
+      {{- end }}
+{{- end }}
