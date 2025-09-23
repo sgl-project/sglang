@@ -517,6 +517,50 @@ def make_layers(
     return modules, start_layer, end_layer
 
 
+cmo_stream = None
+
+
+def get_cmo_stream():
+    """
+    Cache Management Operation(CMO).
+    Launch a new stream to prefetch the weight of matmul when running other
+    AIV or communication kernels, aiming to overlap the memory access time.
+    """
+    global cmo_stream
+    if cmo_stream is None:
+        cmo_stream = torch.get_device_module().Stream()
+    return cmo_stream
+
+
+def prepare_weight_cache(handle, cache):
+    import torch_npu
+
+    NPU_PREFETCH_MAX_SIZE_BYTES = (
+        1000000000  # 1GB, a large value to prefetch entire weight
+    )
+    stream = get_cmo_stream()
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        if isinstance(cache, list):
+            for weight in cache:
+                torch_npu.npu_prefetch(
+                    weight,
+                    handle,
+                    NPU_PREFETCH_MAX_SIZE_BYTES,
+                )
+        else:
+            torch_npu.npu_prefetch(
+                cache,
+                handle,
+                NPU_PREFETCH_MAX_SIZE_BYTES,
+            )
+
+
+def wait_cmo_stream():
+    cur_stream = torch.get_device_module().current_stream()
+    cur_stream.wait_stream(get_cmo_stream())
+
+
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
     random.seed(seed)
