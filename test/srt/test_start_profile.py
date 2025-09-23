@@ -10,6 +10,7 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.environ import envs
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -25,7 +26,7 @@ class TestStartProfile(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TORCH_PROFILER_DIR"] = OUTPUT_DIR
+        envs.SGLANG_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
