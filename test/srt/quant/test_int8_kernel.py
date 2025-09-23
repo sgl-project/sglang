@@ -203,7 +203,7 @@ class TestW8A8Int8Gemm(CustomTestCase):
         a, scale_a = per_token_quant_int8(a)
         b, scale_b = per_token_quant_int8(b)
         if with_bias:
-            bias = torch.randn((N,), dtype=dtype) * 10
+            bias = torch.randn((N,), dtype=dtype)
         else:
             bias = None
 
