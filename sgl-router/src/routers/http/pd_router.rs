@@ -610,10 +610,7 @@ impl PDRouter {
                                     obj.insert("input_top_logprobs".to_string(), v.clone());
                                 }
                                 if let Some(v) = meta.get("input_token_ids_logprobs") {
-                                    obj.insert(
-                                        "input_token_ids_logprobs".to_string(),
-                                        v.clone(),
-                                    );
+                                    obj.insert("input_token_ids_logprobs".to_string(), v.clone());
                                 }
                                 Some(Value::Object(obj))
                             })
@@ -1152,7 +1149,10 @@ impl PDRouter {
                 }
 
                 if let Some(d_top) = meta.get_mut("input_top_logprobs") {
-                    if let Some(prefill_top) = p_logprobs.get("input_top_logprobs").and_then(|v| v.as_array()) {
+                    if let Some(prefill_top) = p_logprobs
+                        .get("input_top_logprobs")
+                        .and_then(|v| v.as_array())
+                    {
                         if let Some(d_arr) = d_top.as_array() {
                             let mut merged = prefill_top.clone();
                             merged.extend(d_arr.clone());
@@ -1162,7 +1162,10 @@ impl PDRouter {
                 }
 
                 if let Some(d_ids) = meta.get_mut("input_token_ids_logprobs") {
-                    if let Some(prefill_ids) = p_logprobs.get("input_token_ids_logprobs").and_then(|v| v.as_array()) {
+                    if let Some(prefill_ids) = p_logprobs
+                        .get("input_token_ids_logprobs")
+                        .and_then(|v| v.as_array())
+                    {
                         if let Some(d_arr) = d_ids.as_array() {
                             let mut merged = prefill_ids.clone();
                             merged.extend(d_arr.clone());

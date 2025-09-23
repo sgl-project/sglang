@@ -333,9 +333,18 @@ mod generation_tests {
         assert!(meta_info.get("output_token_logprobs").is_some());
 
         let echo = body_json.get("echo_request").unwrap();
-        assert_eq!(echo.get("return_logprob").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(echo.get("logprob_start_len").and_then(|v| v.as_i64()), Some(0));
-        assert_eq!(echo.get("top_logprobs_num").and_then(|v| v.as_i64()), Some(3));
+        assert_eq!(
+            echo.get("return_logprob").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            echo.get("logprob_start_len").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            echo.get("top_logprobs_num").and_then(|v| v.as_i64()),
+            Some(3)
+        );
         assert_eq!(
             echo.get("sampling_params")
                 .and_then(|sp| sp.get("max_new_tokens"))

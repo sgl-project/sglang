@@ -1975,7 +1975,6 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub return_logprob: bool,
 
-
     // ============= SGLang Extensions =============
     /// Start position for computing input logprobs
     #[serde(skip_serializing_if = "Option::is_none")]
