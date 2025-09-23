@@ -4,10 +4,10 @@ use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
 use crate::data_connector::{ResponseId, SharedResponseStorage, StoredResponse};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, ReasoningInfo,
-    RerankRequest, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+    ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
     ResponseStatus, ResponseTextFormat, ResponsesGetParams, ResponsesRequest, ResponsesResponse,
-    ResponsesUsage, TextFormatType, UsageInfo,
+    TextFormatType,
 };
 use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
 use async_trait::async_trait;
@@ -15,23 +15,18 @@ use axum::{
     body::Body,
     extract::Request,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
-    response::{
-        sse::{Event, Sse},
-        IntoResponse, Response,
-    },
+    response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
 use serde_json::{json, to_value, Value};
 use std::{
     any::Any,
     collections::HashMap,
-    convert::Infallible,
     sync::atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::mpsc;
-use tokio_stream::{iter, wrappers::ReceiverStream};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
 /// Router for OpenAI backend
 pub struct OpenAIRouter {
@@ -546,7 +541,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         } else {
             // Stream SSE bytes to client
             let stream = resp.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::unbounded_channel();
             tokio::spawn(async move {
                 let mut s = stream;
                 while let Some(chunk) = s.next().await {
@@ -563,9 +558,7 @@ impl super::super::RouterTrait for OpenAIRouter {
                     }
                 }
             });
-            let mut response = Response::new(Body::from_stream(
-                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
-            ));
+            let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
             *response.status_mut() = status;
             response
                 .headers_mut()
@@ -762,9 +755,7 @@ impl super::super::RouterTrait for OpenAIRouter {
                 return (
                     StatusCode::OK,
                     [("content-type", "application/json")],
-                    serde_json::to_string(&openai_response).unwrap_or_else(
-                        |e| format!("{"error": "Failed to serialize response: {}"}", e),
-                    ),
+                    raw_value.to_string(),
                 )
                     .into_response();
             }

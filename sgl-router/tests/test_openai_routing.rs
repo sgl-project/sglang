@@ -5,18 +5,23 @@ use axum::{
     extract::Request,
     http::{Method, StatusCode},
     routing::post,
-    Router,
+    Json, Router,
 };
 use serde_json::json;
 use sglang_router_rs::{
     config::{RouterConfig, RoutingMode},
-    data_connector::MemoryResponseStorage,
+    data_connector::{MemoryResponseStorage, ResponseId, ResponseStorage},
     protocols::spec::{
-        ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, UserMessageContent,
+        ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
+        ResponsesGetParams, ResponsesRequest, UserMessageContent,
     },
     routers::{openai_router::OpenAIRouter, RouterTrait},
 };
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 mod common;
@@ -170,6 +175,134 @@ async fn test_openai_router_models() {
 
     assert_eq!(models["object"], "list");
     assert!(models["data"].is_array());
+}
+
+#[tokio::test]
+async fn test_openai_router_responses_with_mock() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+
+    let app = Router::new().route(
+        "/v1/responses",
+        post({
+            move |Json(request): Json<serde_json::Value>| {
+                let counter = counter_clone.clone();
+                async move {
+                    let idx = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    let model = request
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("gpt-4o-mini")
+                        .to_string();
+                    let id = format!("resp_mock_{idx}");
+                    let response = json!({
+                        "id": id,
+                        "object": "response",
+                        "created_at": 1_700_000_000 + idx as i64,
+                        "status": "completed",
+                        "model": model,
+                        "output": [{
+                            "type": "message",
+                            "id": format!("msg_{idx}"),
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{
+                                "type": "output_text",
+                                "text": format!("mock_output_{idx}"),
+                                "annotations": []
+                            }]
+                        }],
+                        "metadata": {}
+                    });
+                    Json(response)
+                }
+            }
+        }),
+    );
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let base_url = format!("http://{}", addr);
+    let storage = Arc::new(MemoryResponseStorage::new());
+
+    let router = OpenAIRouter::new(base_url, None, storage.clone())
+        .await
+        .unwrap();
+
+    let mut request1 = ResponsesRequest::default();
+    request1.model = Some("gpt-4o-mini".to_string());
+    request1.input = ResponseInput::Text("Say hi".to_string());
+    request1.store = true;
+
+    let response1 = router.route_responses(None, &request1, None).await;
+    assert_eq!(response1.status(), StatusCode::OK);
+    let body1_bytes = axum::body::to_bytes(response1.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body1: serde_json::Value = serde_json::from_slice(&body1_bytes).unwrap();
+    let resp1_id = body1["id"].as_str().expect("id missing").to_string();
+    assert_eq!(body1["previous_response_id"], serde_json::Value::Null);
+
+    let mut request2 = ResponsesRequest::default();
+    request2.model = Some("gpt-4o-mini".to_string());
+    request2.input = ResponseInput::Text("Thanks".to_string());
+    request2.store = true;
+    request2.previous_response_id = Some(resp1_id.clone());
+
+    let response2 = router.route_responses(None, &request2, None).await;
+    assert_eq!(response2.status(), StatusCode::OK);
+    let body2_bytes = axum::body::to_bytes(response2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body2: serde_json::Value = serde_json::from_slice(&body2_bytes).unwrap();
+    let resp2_id = body2["id"].as_str().expect("second id missing");
+    assert_eq!(
+        body2["previous_response_id"].as_str(),
+        Some(resp1_id.as_str())
+    );
+
+    let stored1 = storage
+        .get_response(&ResponseId::from_string(resp1_id.clone()))
+        .await
+        .unwrap()
+        .expect("first response missing");
+    assert_eq!(stored1.input, "Say hi");
+    assert_eq!(stored1.output, "mock_output_1");
+    assert!(stored1.previous_response_id.is_none());
+
+    let stored2 = storage
+        .get_response(&ResponseId::from_string(resp2_id.to_string()))
+        .await
+        .unwrap()
+        .expect("second response missing");
+    assert_eq!(stored2.previous_response_id.unwrap().0, resp1_id);
+    assert_eq!(stored2.output, "mock_output_2");
+
+    let get1 = router
+        .get_response(None, &stored1.id.0, &ResponsesGetParams::default())
+        .await;
+    assert_eq!(get1.status(), StatusCode::OK);
+    let get1_body_bytes = axum::body::to_bytes(get1.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get1_json: serde_json::Value = serde_json::from_slice(&get1_body_bytes).unwrap();
+    assert_eq!(get1_json, body1);
+
+    let get2 = router
+        .get_response(None, &stored2.id.0, &ResponsesGetParams::default())
+        .await;
+    assert_eq!(get2.status(), StatusCode::OK);
+    let get2_body_bytes = axum::body::to_bytes(get2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get2_json: serde_json::Value = serde_json::from_slice(&get2_body_bytes).unwrap();
+    assert_eq!(get2_json, body2);
+
+    server.abort();
 }
 
 /// Test router factory with OpenAI routing mode
