@@ -23,12 +23,12 @@ jobs:
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
+          docker-images: false
           android: true
           dotnet: true
           haskell: true
           large-packages: true
-          docker-images: true
-          swap-storage: true
+          swap-storage: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -64,12 +64,12 @@ jobs:
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
+          docker-images: false
           android: true
           dotnet: true
           haskell: true
           large-packages: true
-          docker-images: true
-          swap-storage: true
+          swap-storage: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -90,7 +90,7 @@ jobs:
 
   build-blackwell-arm:
     if: ${{ github.repository == 'sgl-project/sglang' }}
-    runs-on: ubuntu-22.04-arm
+    runs-on: labubu
     strategy:
       matrix:
         variant:
@@ -105,12 +105,12 @@ jobs:
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
+          docker-images: false
           android: true
           dotnet: true
           haskell: true
           large-packages: true
-          docker-images: true
-          swap-storage: true
+          swap-storage: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
