@@ -398,7 +398,6 @@ class EagleVerifyInput:
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
-        accept_length_cpu = torch.empty((bs,), dtype=torch.int32)
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
@@ -567,7 +566,8 @@ class EagleVerifyInput:
         verified_id = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
-        accept_length_cpu.copy_(accept_length, non_blocking=True)
+        accept_length_cpu = accept_length.cpu()
+        accept_length_list = accept_length_cpu.tolist()
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
@@ -650,7 +650,7 @@ class EagleVerifyInput:
                 hidden_states=batch.spec_info.hidden_states[accept_index],
                 verified_id=verified_id,
                 accept_length=accept_length,
-                accept_length_cpu=accept_length_cpu.tolist(),
+                accept_length_cpu=accept_length_list,
                 seq_lens_for_draft_extend=batch.seq_lens,
                 seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu,
                 req_pool_indices_for_draft_extend=batch.req_pool_indices,
@@ -683,7 +683,7 @@ class EagleVerifyInput:
                     unfinished_index, dtype=torch.int64, device=predict.device
                 )
                 draft_input_accept_length_cpu = [
-                    accept_length_cpu[i] for i in unfinished_index
+                    accept_length_list[i] for i in unfinished_index
                 ]
                 if page_size == 1 or self.topk == 1:
                     batch.out_cache_loc = batch.out_cache_loc[unfinished_accept_index]
@@ -734,7 +734,7 @@ class EagleVerifyInput:
                 draft_input=draft_input,
                 logits_output=logits_output,
                 verified_id=verified_id,
-                accept_length_per_req_cpu=accept_length_cpu,
+                accept_length_per_req_cpu=accept_length_list,
                 accepted_indices=accept_index,
             )
 
