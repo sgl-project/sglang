@@ -843,23 +843,46 @@ class ModelRunner:
 
     def _reserve_rope_cache_for_long_sequences(self):
         """Pre-expand RoPE cache for long sequences and speculative decoding."""
-        base_ctx = getattr(self.model_config, 'max_model_len', 2048)
-        spec_steps = getattr(self.server_args, 'speculative_num_steps', 0) or 0
-        draft_tokens = getattr(self.server_args, 'speculative_num_draft_tokens', 0) or 0
-        
-        max_input_len = 2048
-        spec_expansion = spec_steps * draft_tokens * 2  # 2x safety factor
-        safety_margin = 1024
-        
-        reserve_len = max(base_ctx, max_input_len) + spec_expansion + safety_margin
-        
-        logger.info(f"Pre-expanding RoPE cache to {reserve_len} positions for long sequences and speculative decoding")
-        
+        import os
+
+        # Tunables (env overridable; defaults work for most workloads)
+        SAFETY_FACTOR = int(os.getenv("SGLANG_SPEC_EXPANSION_SAFETY_FACTOR", "2"))
+        MARGIN        = int(os.getenv("SGLANG_ROPE_CACHE_SAFETY_MARGIN", "1024"))
+        ALIGN         = int(os.getenv("SGLANG_ROPE_CACHE_ALIGN", "128"))
+
+        # 1) Estimate base context upper bound
+        base_ctx = (
+            getattr(self.server_args, "context_length", None)
+            or getattr(self.model_config, "context_len", None)
+            or getattr(self.model_config, "max_model_len", None)
+            or getattr(self.model_config.hf_text_config, "max_position_embeddings", None)
+            or 2048
+        )
+
+        # 2) Runtime input capacity (including extra_len from req_to_token_pool)
+        inferred_cap = getattr(getattr(self, "req_to_token_pool", None), "max_context_len", None) or base_ctx
+
+        # 3) Speculative decoding expansion
+        steps = int(getattr(self.server_args, "speculative_num_steps", 0) or 0)
+        draft = int(getattr(self.server_args, "speculative_num_draft_tokens", 0) or 0)
+        reserve = inferred_cap + steps * draft * SAFETY_FACTOR + MARGIN
+
+        # 4) Cap by model's max_position_embeddings if no rope_scaling enabled
+        hf = self.model_config.hf_text_config
+        if getattr(hf, "max_position_embeddings", None) and not getattr(hf, "rope_scaling", None):
+            reserve = min(reserve, int(hf.max_position_embeddings))
+
+        # 5) Align to reduce reallocation frequency
+        reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
+
+        logger.info(f"RoPE cache reserve={reserve} (base={base_ctx}, cap={inferred_cap}, steps={steps}, draft={draft}, k={SAFETY_FACTOR}, margin={MARGIN})")
+
+        # Recursively expand all RoPE layers
         def reserve_rope_cache_recursive(module):
             for child in module.children():
                 if hasattr(child, '_ensure_cos_sin_cache_length') and hasattr(child, 'cos_sin_cache'):
                     old_len = child.cos_sin_cache.shape[0]
-                    child._ensure_cos_sin_cache_length(reserve_len)
+                    child._ensure_cos_sin_cache_length(reserve - 1)
                     new_len = child.cos_sin_cache.shape[0]
                     if new_len > old_len:
                         logger.info(f"Expanded RoPE cache from {old_len} to {new_len} positions")
