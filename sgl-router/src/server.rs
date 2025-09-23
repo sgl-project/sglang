@@ -477,6 +477,7 @@ pub fn build_app(
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
+        .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))

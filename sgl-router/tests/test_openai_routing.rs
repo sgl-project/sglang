@@ -4,24 +4,27 @@ use axum::{
     body::Body,
     extract::Request,
     http::{Method, StatusCode},
+    response::Response,
     routing::post,
     Json, Router,
 };
 use serde_json::json;
 use sglang_router_rs::{
     config::{RouterConfig, RoutingMode},
-    data_connector::{MemoryResponseStorage, ResponseId, ResponseStorage},
+    data_connector::{MemoryResponseStorage, ResponseId, ResponseStorage, StoredResponse},
     protocols::spec::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
         ResponsesGetParams, ResponsesRequest, UserMessageContent,
     },
     routers::{openai_router::OpenAIRouter, RouterTrait},
 };
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use tokio::net::TcpListener;
+use tokio::time::{sleep, Duration};
 use tower::ServiceExt;
 
 mod common;
@@ -305,6 +308,255 @@ async fn test_openai_router_responses_with_mock() {
         .unwrap();
     let get2_json: serde_json::Value = serde_json::from_slice(&get2_body_bytes).unwrap();
     assert_eq!(get2_json, body2);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_openai_router_responses_streaming_with_mock() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let sse_handler = post(|Json(_request): Json<serde_json::Value>| async move {
+        let response_id = "resp_stream_123";
+        let message_id = "msg_stream_123";
+        let final_text = "Once upon a streamed unicorn adventure.";
+
+        let events = vec![
+            (
+                "response.created",
+                json!({
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": 1_700_000_500,
+                        "status": "in_progress",
+                        "model": "",
+                        "output": [],
+                        "parallel_tool_calls": true,
+                        "previous_response_id": null,
+                        "reasoning": null,
+                        "store": false,
+                        "temperature": 1.0,
+                        "text": {"format": {"type": "text"}},
+                        "tool_choice": "auto",
+                        "tools": [],
+                        "top_p": 1.0,
+                        "truncation": "disabled",
+                        "usage": null,
+                        "metadata": null
+                    }
+                }),
+            ),
+            (
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "in_progress",
+                        "content": []
+                    }
+                }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 2,
+                    "item_id": message_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "Once upon a streamed unicorn adventure.",
+                    "logprobs": []
+                }),
+            ),
+            (
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "sequence_number": 3,
+                    "item_id": message_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": final_text,
+                    "logprobs": []
+                }),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": 4,
+                    "output_index": 0,
+                    "item": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": final_text,
+                            "annotations": [],
+                            "logprobs": []
+                        }]
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                json!({
+                    "type": "response.completed",
+                    "sequence_number": 5,
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": 1_700_000_500,
+                        "status": "completed",
+                        "model": "",
+                        "output": [{
+                            "id": message_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{
+                                "type": "output_text",
+                                "text": final_text,
+                                "annotations": [],
+                                "logprobs": []
+                            }]
+                        }],
+                        "parallel_tool_calls": true,
+                        "previous_response_id": null,
+                        "reasoning": null,
+                        "store": false,
+                        "temperature": 1.0,
+                        "text": {"format": {"type": "text"}},
+                        "tool_choice": "auto",
+                        "tools": [],
+                        "top_p": 1.0,
+                        "truncation": "disabled",
+                        "usage": {
+                            "input_tokens": 10,
+                            "input_tokens_details": {"cached_tokens": 0},
+                            "output_tokens": 20,
+                            "output_tokens_details": {"reasoning_tokens": 5},
+                            "total_tokens": 30
+                        },
+                        "metadata": null,
+                        "instructions": null,
+                        "user": null
+                    }
+                }),
+            ),
+        ];
+
+        let sse_payload = events
+            .into_iter()
+            .map(|(event, data)| format!("event: {}\ndata: {}\n\n", event, data))
+            .collect::<String>();
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(sse_payload))
+            .unwrap()
+    });
+
+    let app = Router::new().route("/v1/responses", sse_handler);
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let base_url = format!("http://{}", addr);
+    let storage = Arc::new(MemoryResponseStorage::new());
+
+    // Seed a previous response so previous_response_id logic has data to pull from.
+    let mut previous = StoredResponse::new(
+        "Earlier bedtime question".to_string(),
+        "Earlier answer".to_string(),
+        None,
+    );
+    previous.id = ResponseId::from_string("resp_prev_chain".to_string());
+    storage.store_response(previous).await.unwrap();
+
+    let router = OpenAIRouter::new(base_url, None, storage.clone())
+        .await
+        .unwrap();
+
+    let mut metadata = HashMap::new();
+    metadata.insert("topic".to_string(), json!("unicorns"));
+
+    let request = ResponsesRequest {
+        model: Some("gpt-5-nano".to_string()),
+        input: ResponseInput::Text("Tell me a bedtime story.".to_string()),
+        instructions: Some("Be kind".to_string()),
+        metadata: Some(metadata),
+        previous_response_id: Some("resp_prev_chain".to_string()),
+        store: true,
+        stream: true,
+        ..Default::default()
+    };
+
+    let response = router.route_responses(None, &request, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let headers = response.headers();
+    let ct = headers
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(ct.contains("text/event-stream"));
+
+    let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8(response_body.to_vec()).unwrap();
+    assert!(body_text.contains("response.completed"));
+    assert!(body_text.contains("Once upon a streamed unicorn adventure."));
+
+    // Wait for the storage task to persist the streaming response.
+    let target_id = ResponseId::from_string("resp_stream_123".to_string());
+    let stored = loop {
+        if let Some(resp) = storage.get_response(&target_id).await.unwrap() {
+            break resp;
+        }
+        sleep(Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(stored.input, "Tell me a bedtime story.");
+    assert_eq!(stored.output, "Once upon a streamed unicorn adventure.");
+    assert_eq!(
+        stored
+            .previous_response_id
+            .as_ref()
+            .expect("previous_response_id missing")
+            .0,
+        "resp_prev_chain"
+    );
+    assert_eq!(stored.metadata.get("topic"), Some(&json!("unicorns")));
+    assert_eq!(stored.instructions.as_deref(), Some("Be kind"));
+    assert_eq!(stored.model.as_deref(), Some("gpt-5-nano"));
+    assert_eq!(stored.user, None);
+    assert_eq!(stored.raw_response["store"], json!(true));
+    assert_eq!(
+        stored.raw_response["previous_response_id"].as_str(),
+        Some("resp_prev_chain")
+    );
+    assert_eq!(stored.raw_response["metadata"]["topic"], json!("unicorns"));
+    assert_eq!(
+        stored.raw_response["instructions"].as_str(),
+        Some("Be kind")
+    );
 
     server.abort();
 }

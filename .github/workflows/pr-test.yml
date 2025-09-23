@@ -618,7 +618,7 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
+          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
 
   pr-test-finish:
     needs: [
