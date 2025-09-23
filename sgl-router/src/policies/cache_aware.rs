@@ -227,15 +227,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
-        let model_id = if !healthy_indices.is_empty() {
-            let first_model = workers[healthy_indices[0]].model_id();
-            if first_model.is_empty() || first_model == "unknown" {
-                "default"
-            } else {
-                first_model
-            }
-        } else {
+        let first_model = workers[healthy_indices[0]].model_id();
+        let model_id = if first_model.is_empty() || first_model == "unknown" {
             "default"
+        } else {
+            first_model
         };
 
         // Get current load statistics
@@ -316,8 +312,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
             // Find the index of the selected worker
             if let Some(selected_idx) = workers.iter().position(|w| w.url() == selected_url) {
-                // Only proceed if the worker is healthy
-                if healthy_indices.contains(&selected_idx) {
+                // Only proceed if the worker is healthy - use direct check like OLD version
+                if workers[selected_idx].is_healthy() {
                     // Update the tree with this request
                     tree.insert(text, &selected_url);
 
