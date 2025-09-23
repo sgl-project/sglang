@@ -6,8 +6,8 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.environ import envs
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
