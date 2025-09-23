@@ -25,6 +25,9 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
+from sglang.srt.layers.quantization.marlin_utils import (
+    marlin_moe_permute_scales,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
@@ -57,12 +60,6 @@ if _use_aiter:
 
 if _is_cuda:
     from sgl_kernel import fused_marlin_moe
-# try:
-#     import vllm
-
-#     VLLM_AVAILABLE = True
-# except ImportError:
-#     VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +85,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
     @staticmethod
     def get_moe_method(
         quant_config: CompressedTensorsConfig,
+        layer: torch.nn.Module
     ) -> "CompressedTensorsMoEMethod":
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -95,10 +93,8 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-            # if not VLLM_AVAILABLE:
-            #     raise ImportError(
-            #         "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm."
-            #     )
+
+            logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
             return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
@@ -398,10 +394,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         **extra_weight_attrs,
     ):
 
-        assert (
-            params_dtype == torch.float16
-        ), "float16 is required for MoE compressed models. Set dtype=torch.float16"  # noqa: E501
-
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
         # shard for TP along the transposed dims
@@ -539,44 +531,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             getattr(layer, name).copy_(new_t)
             del new_t
 
-        def get_scale_perms(num_bits: int):
-            scale_perm: List[int] = []
-            for i in range(8):
-                scale_perm.extend([i + 8 * j for j in range(8)])
-            scale_perm_single: List[int] = []
-            for i in range(4):
-                scale_perm_single.extend(
-                    [2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]]
-                )
-            return scale_perm, scale_perm_single
-
-        def marlin_permute_scales(
-            s: torch.Tensor, size_k: int, size_n: int, group_size: int, num_bits: int
-        ):
-            scale_perm, scale_perm_single = get_scale_perms(num_bits)
-            if group_size < size_k and group_size != -1:
-                s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
-            else:
-                s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
-            s = s.reshape((-1, size_n)).contiguous()
-            return s
-
-        def marlin_moe_permute_scales(
-            s: torch.Tensor, size_k: int, size_n: int, group_size: int, num_bits: int
-        ):
-            num_experts = s.shape[0]
-            output = torch.empty(
-                (num_experts, s.shape[1], s.shape[2]), device=s.device, dtype=s.dtype
-            )
-            for e in range(num_experts):
-                output[e] = marlin_permute_scales(
-                    s[e], size_k, size_n, group_size, num_bits
-                )
-            return output
-
-        size_k2 = layer.w2_weight_packed.shape[2]
-        size_k13 = layer.w13_weight_packed.shape[2]
-
         num_experts = layer.w13_weight_g_idx.shape[0]
         device = layer.w13_weight_g_idx.device
 
@@ -632,7 +586,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_weight_packed.shape[2],
             self.num_bits,
         )
-        replace_tensor("w13_weight_packed", marlin_w13_qweight)
+        replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
         marlin_w2_qweight = gptq_marlin_moe_repack(
             layer.w2_weight_packed,
             layer.w2_g_idx_sort_indices,
@@ -640,25 +594,25 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_packed.shape[2],
             self.num_bits,
         )
-        replace_tensor("w2_weight_packed", marlin_w2_qweight)
+        replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
         # Repack scales
         marlin_w13_scales = marlin_moe_permute_scales(
             layer.w13_weight_scale,
-            size_k13,
+            layer.w13_weight_packed.shape[2],
             layer.w13_weight_scale.shape[2],
             self.group_size,
-            self.num_bits,
         )
-        replace_tensor("w13_weight_scale", marlin_w13_scales)
+        replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
+
         marlin_w2_scales = marlin_moe_permute_scales(
             layer.w2_weight_scale,
             layer.w2_weight_scale.shape[1]
             * (self.group_size if self.group_size != -1 else self.packed_factor),
-            size_k2,
+            layer.w2_weight_scale.shape[2],
             self.group_size,
-            self.num_bits,
         )
-        replace_tensor("w2_weight_scale", marlin_w2_scales)
+        replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
+
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

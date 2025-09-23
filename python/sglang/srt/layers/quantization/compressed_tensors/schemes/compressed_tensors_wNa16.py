@@ -24,31 +24,21 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.marlin_utils import (
     MarlinLinearLayerConfig,
     apply_gptq_marlin_linear,
-    check_marlin_supported,
     check_marlin_supports_shape,
     marlin_is_k_full,
     marlin_make_empty_g_idx,
     marlin_make_workspace,
-    marlin_moe_permute_scales,
     marlin_permute_scales,
     marlin_repeat_scales_on_all_ranks,
     marlin_sort_g_idx,
     marlin_zero_points,
-    verify_marlin_supported,
 )
 from sglang.srt.layers.quantization.utils import (
-    get_linear_quant_method,
     get_scalar_types,
     replace_parameter,
     unpack_cols,
 )
 from sglang.srt.utils import is_cuda
-
-# from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
-#     MPLinearLayerConfig, choose_mp_linear_kernel)
-
-
-
 
 _is_cuda = is_cuda()
 
@@ -57,7 +47,6 @@ if _is_cuda:
 
 
 ScalarType, scalar_types = get_scalar_types()
-
 
 logger = logging.getLogger(__name__)
 
@@ -214,12 +203,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
                                             input_dim=0,
                                             weight_loader=weight_loader)
             layer.register_parameter("weight_g_idx", weight_g_idx)
-
-        # self.kernel = kernel_type(mp_linear_kernel_config,
-        #                           w_q_param_name="weight_packed",
-        #                           w_s_param_name="weight_scale",
-        #                           w_zp_param_name="weight_zero_point",
-        #                           w_gidx_param_name="weight_g_idx")
 
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
