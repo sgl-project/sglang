@@ -41,6 +41,7 @@ pub struct PDRouter {
     pub prefill_client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
+    pub enable_igw: bool,
     prefill_drain_tx: mpsc::Sender<reqwest::Response>,
 }
 
@@ -317,6 +318,7 @@ impl PDRouter {
             prefill_drain_tx,
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
+            enable_igw: ctx.router_config.enable_igw,
         })
     }
 
@@ -849,7 +851,14 @@ impl PDRouter {
         request_text: Option<&str>,
         model_id: Option<&str>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
-        let prefill_workers = if let Some(model) = model_id {
+        let effective_model_id = if !self.enable_igw { None } else { model_id };
+
+        debug!(
+            "Selecting PD pair: enable_igw={}, model_id={:?}, effective_model_id={:?}",
+            self.enable_igw, model_id, effective_model_id
+        );
+
+        let prefill_workers = if let Some(model) = effective_model_id {
             self.worker_registry
                 .get_by_model_fast(model)
                 .into_iter()
@@ -859,7 +868,7 @@ impl PDRouter {
             self.worker_registry.get_prefill_workers()
         };
 
-        let decode_workers = if let Some(model) = model_id {
+        let decode_workers = if let Some(model) = effective_model_id {
             self.worker_registry
                 .get_by_model_fast(model)
                 .into_iter()
@@ -1797,6 +1806,7 @@ mod tests {
             prefill_drain_tx: mpsc::channel(100).0,
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
+            enable_igw: false,
         }
     }
 
