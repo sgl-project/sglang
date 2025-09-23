@@ -32,7 +32,6 @@ class OpenVLAImageProcessor(BaseMultimodalProcessor):
         image = image_data[0]
         image, image_size = load_image(image)
         image = image.resize((224, 224))
-        # pixel_value = self._processor.process_image(image).to(torch.bfloat16).to(0)
         pixel_value = np.array(image)
         return {
             "origin_input_ids": [None],
