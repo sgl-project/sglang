@@ -449,12 +449,8 @@ class ServerArgs:
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
-        # Handle memory-related configurations.
-        self._handle_mem_fraction_static(gpu_mem)
-        self._handle_chunked_prefill_size(gpu_mem)
-
-        # Handle CUDA graph settings.
-        self._handle_cuda_graph_max_bs(gpu_mem)
+        # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
+        self._handle_gpu_memory_settings(gpu_mem)
 
         # Handle device-specific backends.
         self._handle_hpu_backends()
@@ -1175,79 +1171,6 @@ class ServerArgs:
 
     def _handle_other_validations(self):
         pass
-
-    def __post_init__(self):
-        """
-        Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
-        """
-        # Step 1: Handle deprecated arguments.
-        self._handle_deprecated_args()
-
-        # Step 2: Set missing default values.
-        self._handle_missing_default_values()
-
-        # Get GPU memory capacity, which is a common dependency for several configuration steps.
-        gpu_mem = get_device_memory_capacity(self.device)
-
-        # Step 3: Handle memory-related, chunked prefill, and cuda graph batch size configurations.
-        self._handle_gpu_memory_settings(gpu_mem)
-
-        # Step 4: Handle device-specific backends.
-        self._handle_hpu_backends()
-        self._handle_cpu_backends()
-
-        # Step 5: Apply model-specific adjustments.
-        if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
-            self.model_specific_adjustments()
-
-        # Step 6: Set kernel backends.
-        self._handle_sampling_backend()
-        self._handle_attention_backend_compatibility()
-        self._handle_page_size()
-        self._handle_amd_specifics()
-        self._handle_grammar_backend()
-
-        # Step 7: Handle data parallelism.
-        self._handle_data_parallelism()
-
-        # Step 8: Handle MoE configurations.
-        self._handle_moe_kernel_config()
-        self._handle_deepep_moe()
-        self._handle_eplb_and_dispatch()
-        self._handle_expert_distribution_metrics()
-
-        # Step 9: Handle pipeline parallelism.
-        self._handle_pipeline_parallelism()
-
-        # Step 10: Handle Hicache settings.
-        self._handle_hicache()
-
-        # Step 11: Handle speculative decoding logic.
-        self._handle_speculative_decoding()
-
-        # Step 12: Handle model loading format.
-        self._handle_load_format()
-
-        # Step 13: Handle PD disaggregation.
-        self._handle_disaggregation()
-
-        # Step 14: Validate tokenizer settings.
-        self._handle_tokenizer_batching()
-
-        # Step 15: Propagate environment variables.
-        self._handle_environment_variables()
-
-        # Step 16: Validate cache settings.
-        self._handle_cache_compatibility()
-
-        # Step 17: Validate metrics labels.
-        self._handle_metrics_labels()
-
-        # Step 18: Handle deterministic inference.
-        self._handle_deterministic_inference()
-
-        # Step 19: Handle any other necessary validations.
-        self._handle_other_validations()
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
