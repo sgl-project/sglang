@@ -4,7 +4,7 @@ use crate::{
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
-    middleware::{self, QueuedRequest, TokenBucket},
+    middleware::{self, AuthConfig, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
         spec::{
@@ -275,6 +275,16 @@ async fn add_worker(
     State(state): State<Arc<AppState>>,
     Query(AddWorkerQuery { url, api_key }): Query<AddWorkerQuery>,
 ) -> Response {
+    // Warn if router has API key but worker is being added without one
+    if state.context.router_config.api_key.is_some() && api_key.is_none() {
+        warn!(
+            "Adding worker {} without API key while router has API key configured. \
+            Worker will be accessible without authentication. \
+            If the worker requires the same API key as the router, please specify it explicitly.",
+            url
+        );
+    }
+
     let result = WorkerManager::add_worker(&url, &api_key, &state.context).await;
 
     match result {
@@ -312,6 +322,16 @@ async fn create_worker(
     State(state): State<Arc<AppState>>,
     Json(config): Json<WorkerConfigRequest>,
 ) -> Response {
+    // Warn if router has API key but worker is being added without one
+    if state.context.router_config.api_key.is_some() && config.api_key.is_none() {
+        warn!(
+            "Adding worker {} without API key while router has API key configured. \
+            Worker will be accessible without authentication. \
+            If the worker requires the same API key as the router, please specify it explicitly.",
+            config.url
+        );
+    }
+
     let result = WorkerManager::add_worker_from_config(&config, &state.context).await;
 
     match result {
@@ -423,6 +443,7 @@ pub struct ServerConfig {
 
 pub fn build_app(
     app_state: Arc<AppState>,
+    auth_config: AuthConfig,
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
@@ -448,6 +469,10 @@ pub fn build_app(
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             middleware::concurrency_limit_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
         ));
 
     let public_routes = Router::new()
@@ -464,13 +489,21 @@ pub fn build_app(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
-        .route("/get_loads", get(get_loads));
+        .route("/get_loads", get(get_loads))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
 
     let worker_routes = Router::new()
         .route("/workers", post(create_worker))
         .route("/workers", get(list_workers_rest))
         .route("/workers/{url}", get(get_worker))
-        .route("/workers/{url}", delete(delete_worker));
+        .route("/workers/{url}", delete(delete_worker))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
 
     Router::new()
         .merge(protected_routes)
@@ -629,8 +662,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ]
     });
 
+    let auth_config = AuthConfig {
+        api_key: config.router_config.api_key.clone(),
+    };
+
     let app = build_app(
         app_state,
+        auth_config,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
