@@ -7,6 +7,47 @@ from pathlib import Path
 import torch
 
 
+def _get_compute_capability():
+    """Get the compute capability of the current GPU."""
+    if not torch.cuda.is_available():
+        return None
+
+    # Get the current device
+    device = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device)
+
+    # Return as integer (major * 10 + minor)
+    return properties.major * 10 + properties.minor
+
+
+def _get_ops_library():
+    """Get the appropriate ops library based on GPU architecture."""
+    compute_capability = _get_compute_capability()
+
+    if compute_capability is None:
+        # CPU fallback or no CUDA
+        from sgl_kernel import common_ops_sm100
+        return common_ops_sm100.ops.sgl_kernel_precise
+
+    if compute_capability == 90:
+        # SM90 (Hopper/H100) - use fast math
+        try:
+            from sgl_kernel import common_ops_sm90
+            return common_ops_sm90.ops.sgl_kernel_fast
+        except ImportError:
+            # Fallback to precise version
+            from sgl_kernel import common_ops_sm100
+            return common_ops_sm100.ops.sgl_kernel_precise
+    else:
+        # SM100+ (Blackwell) or other architectures - use precise math
+        from sgl_kernel import common_ops_sm100
+        return common_ops_sm100.ops.sgl_kernel_precise
+
+
+# Initialize the ops library based on current GPU
+ops = _get_ops_library()
+
+
 # copy & modify from torch/utils/cpp_extension.py
 def _find_cuda_home():
     """Find the CUDA install path."""
@@ -42,7 +83,8 @@ if torch.version.cuda is not None:
     if cuda_include.exists():
         ctypes.CDLL(str(cuda_include), mode=ctypes.RTLD_GLOBAL)
 
-from sgl_kernel import common_ops
+# Architecture-specific library loading handled by _get_ops_library()
+# from sgl_kernel import common_ops  # Replaced with namespace-aware loading
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     cutlass_mla_decode,

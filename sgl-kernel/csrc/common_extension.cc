@@ -16,9 +16,10 @@ limitations under the License.
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include "sgl_namespace_config.h"
 #include "sgl_kernel_ops.h"
 
-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+TORCH_LIBRARY_FRAGMENT(SGL_NAMESPACE, m) {
   /*
    * From csrc/allreduce
    */

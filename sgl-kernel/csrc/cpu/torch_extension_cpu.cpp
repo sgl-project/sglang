@@ -17,6 +17,7 @@ limitations under the License.
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include "sgl_namespace_config.h"
 #include "sgl_kernel_ops.h"
 #include "shm.h"
 
@@ -233,7 +234,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+TORCH_LIBRARY_FRAGMENT(SGL_NAMESPACE, m) {
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
   m.impl("silu_and_mul_cpu", torch::kCPU, &silu_and_mul_cpu);

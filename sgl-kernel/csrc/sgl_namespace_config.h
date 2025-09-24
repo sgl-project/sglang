@@ -13,18 +13,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <torch/all.h>
-#include <torch/library.h>
+#pragma once
 
-#include "sgl_namespace_config.h"
-#include "sgl_kernel_ops.h"
+// Namespace configuration for PyTorch operator registration
+// This allows building multiple libraries with different namespaces
+// to avoid operator registration conflicts
 
-TORCH_LIBRARY_FRAGMENT(SGL_NAMESPACE, m) {
-  /*
-   * From csrc/spatial
-   */
-  m.def("create_greenctx_stream_by_value(int smA, int smB, int device) -> int[]");
-  m.impl("create_greenctx_stream_by_value", &create_greenctx_stream_by_value);
-}
+#ifndef SGL_NAMESPACE
+  #define SGL_NAMESPACE sgl_kernel  // Default namespace if not defined
+#endif
 
-REGISTER_EXTENSION(spatial_ops)
+// Helper macros for string conversion
+#define SGL_STRINGIFY(x) #x
+#define SGL_TOSTRING(x) SGL_STRINGIFY(x)
+#define SGL_NAMESPACE_STR SGL_TOSTRING(SGL_NAMESPACE)

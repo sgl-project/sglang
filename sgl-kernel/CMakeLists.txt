@@ -329,10 +329,35 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
-Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+# Build SM90 library with fast math optimization and custom namespace
+Python_add_library(common_ops_sm90 MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-target_include_directories(common_ops PRIVATE
+target_compile_definitions(common_ops_sm90 PRIVATE
+    SGL_NAMESPACE=sgl_kernel_fast
+    USE_FAST_MATH=1
+)
+target_compile_options(common_ops_sm90 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
+)
+target_include_directories(common_ops_sm90 PRIVATE
+    ${PROJECT_SOURCE_DIR}/csrc
+    ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
+    ${repo-cutlass_SOURCE_DIR}/examples/common
+    ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
+)
+
+# Build SM100+ library with precise math and custom namespace
+Python_add_library(common_ops_sm100 MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+
+target_compile_definitions(common_ops_sm100 PRIVATE
+    SGL_NAMESPACE=sgl_kernel_precise
+    USE_FAST_MATH=0
+)
+target_compile_options(common_ops_sm100 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+)
+target_include_directories(common_ops_sm100 PRIVATE
+    ${PROJECT_SOURCE_DIR}/csrc
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
@@ -362,16 +387,22 @@ add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops_sm90 PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops_sm100 PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
 # flash attention
-target_compile_definitions(common_ops PRIVATE
+target_compile_definitions(common_ops_sm90 PRIVATE
+    FLASHATTENTION_DISABLE_BACKWARD
+    FLASHATTENTION_DISABLE_DROPOUT
+    FLASHATTENTION_DISABLE_UNEVEN_K
+)
+target_compile_definitions(common_ops_sm100 PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
 )
 
-install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
+install(TARGETS common_ops_sm90 common_ops_sm100 LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file
