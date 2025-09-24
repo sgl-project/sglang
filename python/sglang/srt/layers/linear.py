@@ -33,13 +33,18 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import get_int_env_var, get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
         QuantizationConfig,
         QuantizeMethodBase,
     )
+
+_is_hip = is_hip()
+_disable_hip_linear_quant = _is_hip and get_bool_env_var(
+    "SGLANG_ROCM_DISABLE_LINEARQUANT"
+)
 
 _is_hip = is_hip()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
@@ -1294,6 +1299,9 @@ class RowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
+        self.gemm_ar_attn_op = None
+        self.gemm_ar_mlp_op = None            
+
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
@@ -1386,6 +1394,55 @@ class RowParallelLinear(LinearBase):
                 param.load_row_parallel_weight(loaded_weight)
 
     def forward(self, input_, skip_all_reduce=False):
+        if input_.shape[0] >= 128 and get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
+            if self.gemm_ar_attn_op:
+                output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
+
+                # m = input_.shape[0]
+                # k = input_.shape[1] 
+                # n = self.weight.shape[0]
+                # if self.tp_rank == 0:
+                #     start_event = torch.cuda.Event(enable_timing=True)
+                #     end_event = torch.cuda.Event(enable_timing=True)
+                #     start_event.record()
+                #     output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
+                #     end_event.record()
+                #     end_event.synchronize()
+                #     execution_time = start_event.elapsed_time(end_event)
+                #     print(f"gemm_ar_attn_op: m={m}, n={n}, k={k}, forward execution time: {execution_time:.3f} ms")
+                # else:
+                #     output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
+                
+                # output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
+                #print(f"gemm_ar_attn_op: input_.shape: {input_.shape}, input_.stride(): {input_.stride()}, input_.dtype: {input_.dtype}; self.weight.shape: {self.weight.shape}, self.weight.stride(): {self.weight.stride()}, self.weight.dtype: {self.weight.dtype}; self.bias: {self.bias}")
+                # input_.shape: torch.Size([256, 2048]), input_.stride(): (2048, 1)
+                # self.weight.shape: torch.Size([8192, 2048]), self.weight.stride(): (2048, 1)
+                # self.bias: None
+            else:
+                output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
+                # m = input_.shape[0]
+                # k = input_.shape[1]
+                # n = self.weight.shape[0]
+                # if self.tp_rank == 0:
+                #     start_event = torch.cuda.Event(enable_timing=True)
+                #     end_event = torch.cuda.Event(enable_timing=True)
+                #     start_event.record()
+                #     output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
+                #     end_event.record()
+                #     end_event.synchronize()
+                #     execution_time = start_event.elapsed_time(end_event)
+                #     print(f"gemm_ar_mlp_op: m={m}, n={n}, k={k}, forward execution time: {execution_time:.3f} ms")
+                # else:
+                #     output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
+                
+                # print(f"gemm_ar_mlp_op forward: input_.shape: {input_.shape}, input_.stride(): {input_.stride()}, input_.dtype: {input_.dtype}; self.weight.shape: {self.weight.shape}, self.weight.stride(): {self.weight.stride()}, self.weight.dtype: {self.weight.dtype}; self.bias: {self.bias}")
+                # output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
+                # 没打
+                # print(f"forward else, original output.shape: {output.shape}, original output.stride(): {output.stride()}")
+                
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+                    
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1399,6 +1456,7 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -1408,7 +1466,16 @@ class RowParallelLinear(LinearBase):
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
-
+        # end_event.record()
+        # end_event.synchronize()
+        # execution_time = start_event.elapsed_time(end_event)
+        # if self.tp_rank == 0:
+        #     m = input_parallel.shape[0]
+        #     k = input_parallel.shape[1]
+        #     n = output_parallel.shape[1]
+        #     print(f"SGLang original gemm_ar_op: m={m}, n={n}, k={k}, forward execution time: {execution_time:.3f} ms")
+        #     # print(f"input_parallel shape: {input_parallel.shape}, output_parallel shape: {output_parallel.shape}, output shape: {output.shape}, forward execution time: {execution_time:.3f} ms")
+    
         output_bias = self.bias if self.skip_bias_add else None
 
         return output, output_bias
