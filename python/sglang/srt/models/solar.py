@@ -30,11 +30,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.python.sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-)
-from sglang.python.sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -57,6 +54,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.utils import add_prefix, make_layers
 
 
 class SolarMLP(nn.Module):

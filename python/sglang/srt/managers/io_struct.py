@@ -84,6 +84,8 @@ class GenerateReqInput:
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
     rid: Optional[Union[List[str], str]] = None
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[Union[List[str], str]] = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -570,6 +572,7 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: List[int]
     # Whether to stream output
     stream: bool
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -604,6 +607,9 @@ class TokenizedGenerateReqInput:
 
     # Priority for the request
     priority: Optional[int] = None
+
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[str] = None
 
     # Image gen grpc migration
     return_bytes: bool = False
@@ -656,6 +662,8 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -763,6 +771,8 @@ class TokenizedEmbeddingReqInput:
     data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
+    # Priority for the request
+    priority: Optional[int] = None
 
 
 @dataclass
@@ -1085,6 +1095,17 @@ class InitWeightsUpdateGroupReqInput:
 
 @dataclass
 class InitWeightsUpdateGroupReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    group_name: str = "weight_update_group"
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqOutput:
     success: bool
     message: str
 
