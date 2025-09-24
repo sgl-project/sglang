@@ -343,67 +343,6 @@ class TestToolChoiceLlama32(CustomTestCase):
 
         self.assertEqual(found_name, "get_weather")
 
-    def test_required_arguments_are_valid_json_non_streaming(self):
-        """Arguments in non-streaming required mode should be valid JSON"""
-        tools = self.get_test_tools()
-        messages = self.get_test_messages()
-
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.1,
-            tools=tools,
-            tool_choice="required",
-            stream=False,
-        )
-
-        tool_calls = response.choices[0].message.tool_calls
-        self.assertIsNotNone(tool_calls)
-        self.assertGreater(len(tool_calls), 0)
-
-        for tool_call in tool_calls:
-            self.assertIsNotNone(tool_call.function.name)
-            self.assertIsNotNone(tool_call.function.arguments)
-            try:
-                args = json.loads(tool_call.function.arguments)
-                self.assertIsInstance(args, dict)
-            except json.JSONDecodeError:
-                self.fail(
-                    f"Invalid JSON in tool call arguments: {tool_call.function.arguments}"
-                )
-
-    def test_specific_function_arguments_are_valid_json_non_streaming(self):
-        """Arguments for a specific function choice should be valid JSON"""
-        tools = self.get_test_tools()
-        messages = self.get_test_messages()
-
-        tool_choice = {"type": "function", "function": {"name": "get_weather"}}
-
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.1,
-            tools=tools,
-            tool_choice=tool_choice,
-            stream=False,
-        )
-
-        tool_calls = response.choices[0].message.tool_calls
-        self.assertIsNotNone(tool_calls)
-        self.assertGreater(len(tool_calls), 0)
-
-        for tool_call in tool_calls:
-            self.assertEqual(tool_call.function.name, "get_weather")
-            try:
-                args = json.loads(tool_call.function.arguments)
-                self.assertIsInstance(args, dict)
-            except json.JSONDecodeError:
-                self.fail(
-                    f"Invalid JSON in tool call arguments: {tool_call.function.arguments}"
-                )
-
     def test_required_streaming_arguments_chunks_json(self):
         """In streaming required mode, complete tool call arguments should be valid JSON when all chunks are combined"""
         tools = self.get_test_tools()

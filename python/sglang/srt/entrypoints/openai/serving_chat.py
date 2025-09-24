@@ -7,9 +7,9 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-import jsonschema
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
+from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -98,10 +98,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 if not hasattr(tool.function, "parameters"):
                     return f"Tool {i} function is missing required 'parameters' field."
                 try:
-                    jsonschema.Draft202012Validator.check_schema(
-                        tool.function.parameters
-                    )
-                except jsonschema.SchemaError as e:
+                    Draft202012Validator.check_schema(tool.function.parameters)
+                except SchemaError as e:
                     return (
                         f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
                     )

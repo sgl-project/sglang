@@ -1,9 +1,12 @@
+# ...existing code...
 """
 Tests for JSON schema constraint functionality used by JsonArrayParser
 """
 
 import json
 import unittest
+
+import jsonschema
 
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
@@ -67,6 +70,8 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         schema = get_json_schema_constraint(self.tools, "required")
 
         self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
         self.assertIn("items", schema)
@@ -90,6 +95,8 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         schema = get_json_schema_constraint(self.tools, tool_choice)
 
         self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
         self.assertEqual(schema["maxItems"], 1)
@@ -105,6 +112,8 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         schema = get_json_schema_constraint(self.tools, tool_choice)
 
         self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
         self.assertEqual(schema["maxItems"], 1)
@@ -176,6 +185,8 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         schema = get_json_schema_constraint(tools_with_defs, "required")
 
         self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
         self.assertIn("$defs", schema)
         self.assertIn("NestedType", schema["$defs"])
 
@@ -239,32 +250,13 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         schema = get_json_schema_constraint(tools_without_params, "required")
 
         self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
         item_schema = schema["items"]["anyOf"][0]
         self.assertEqual(
             item_schema["properties"]["parameters"],
             {"type": "object", "properties": {}},
         )
-
-    def test_schema_structure_validation(self):
-        """Test that generated schemas are valid JSON schemas"""
-        schema = get_json_schema_constraint(self.tools, "required")
-
-        # Should be valid JSON
-        json_str = json.dumps(schema)
-        parsed = json.loads(json_str)
-        self.assertEqual(parsed, schema)
-
-        # Should have required fields
-        self.assertIn("type", schema)
-        self.assertIn("items", schema)
-        self.assertIn("anyOf", schema["items"])
-
-        # Each tool schema should have required fields
-        for tool_schema in schema["items"]["anyOf"]:
-            self.assertIn("properties", tool_schema)
-            self.assertIn("required", tool_schema)
-            self.assertIn("name", tool_schema["properties"])
-            self.assertIn("parameters", tool_schema["properties"])
 
     def test_json_schema_vs_ebnf_constraint_generation(self):
         """Test direct comparison between JSON schema and EBNF constraint generation"""
@@ -277,6 +269,9 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         # Generate JSON schema constraint
         json_schema = get_json_schema_constraint(self.tools, tool_choice)
 
+        self.assertIsNotNone(json_schema)
+        jsonschema.Draft202012Validator.check_schema(json_schema)
+
         # Generate EBNF constraint using FunctionCallParser
         parser = FunctionCallParser(
             self.tools, "llama3"
@@ -284,7 +279,6 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         ebnf_constraint = parser.get_ebnf(tool_choice)
 
         # Verify JSON schema constraint
-        self.assertIsNotNone(json_schema)
         self.assertEqual(json_schema["type"], "array")
         self.assertEqual(json_schema["minItems"], 1)
         self.assertEqual(json_schema["maxItems"], 1)
@@ -296,10 +290,13 @@ class TestJsonSchemaConstraint(unittest.TestCase):
 
         # Test with required tool choice
         required_json_schema = get_json_schema_constraint(self.tools, "required")
+
+        self.assertIsNotNone(required_json_schema)
+        jsonschema.Draft202012Validator.check_schema(required_json_schema)
+
         required_ebnf_constraint = parser.get_ebnf("required")
 
         # Verify required JSON schema constraint
-        self.assertIsNotNone(required_json_schema)
         self.assertEqual(required_json_schema["type"], "array")
         self.assertEqual(required_json_schema["minItems"], 1)
         self.assertIn("anyOf", required_json_schema["items"])
