@@ -245,7 +245,6 @@ class XLMRobertaModel(nn.Module):
         embeddings = self.pooler(hidden_states, forward_batch)
 
         if self._is_sparse:
-            print(type(embeddings.embeddings))
             for token_id in self._special_tokens:
                 embeddings.embeddings[:, token_id] = 0.0
             embeddings.embeddings = embeddings.embeddings.to_sparse()
