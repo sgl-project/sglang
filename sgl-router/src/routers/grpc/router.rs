@@ -610,58 +610,46 @@ impl GrpcRouter {
         request: &ChatCompletionRequest,
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
-        // Check for existing constraints first (similar to Python implementation)
-        let mut existing_constraints = 0;
-        let mut constraint_result = None;
+        let mut constraints = Vec::new();
 
         if let Some(ResponseFormat::JsonSchema { json_schema }) = &request.response_format {
             let schema_str = serde_json::to_string(&json_schema.schema)
                 .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
-            constraint_result = Some(proto::sampling_params::Constraint::JsonSchema(schema_str));
-            existing_constraints += 1;
+            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
         }
 
         if let Some(ebnf) = &request.ebnf {
-            constraint_result = Some(proto::sampling_params::Constraint::EbnfGrammar(
+            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
                 ebnf.clone(),
             ));
-            existing_constraints += 1;
         }
 
         if let Some(regex) = &request.regex {
-            constraint_result = Some(proto::sampling_params::Constraint::Regex(regex.clone()));
-            existing_constraints += 1;
+            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
         }
 
-        // Handle tool call constraint (matches Python implementation logic)
+        // Handle tool call constraint
         if let Some((constraint_type, constraint_value)) = tool_call_constraint {
-            if existing_constraints > 0 {
+            if !constraints.is_empty() {
                 return Err("Constrained decoding is not compatible with tool calls.".to_string());
             }
-
-            return match constraint_type.as_str() {
-                "structural_tag" => Ok(Some(proto::sampling_params::Constraint::StructuralTag(
-                    constraint_value,
-                ))),
-                "json_schema" => Ok(Some(proto::sampling_params::Constraint::JsonSchema(
-                    constraint_value,
-                ))),
-                "ebnf" => Ok(Some(proto::sampling_params::Constraint::EbnfGrammar(
-                    constraint_value,
-                ))),
-                "regex" => Ok(Some(proto::sampling_params::Constraint::Regex(
-                    constraint_value,
-                ))),
-                _ => Err(format!("Unknown constraint type: {}", constraint_type)),
+            let tool_constraint = match constraint_type.as_str() {
+                "structural_tag" => {
+                    proto::sampling_params::Constraint::StructuralTag(constraint_value)
+                }
+                "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
+                "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
+                "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
+                _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
             };
+            constraints.push(tool_constraint);
         }
 
-        // Check for multiple constraints (should not happen with current logic, but good to verify)
-        if existing_constraints > 1 {
-            return Err("Multiple constraints are not allowed.".to_string());
+        match constraints.len() {
+            0 => Ok(None),
+            1 => Ok(constraints.pop()),
+            _ => Err("Multiple constraints are not allowed.".to_string()),
         }
-
-        Ok(constraint_result)
     }
 
     /// Generate tool constraints for structured generation
