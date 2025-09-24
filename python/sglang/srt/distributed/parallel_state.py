@@ -1587,6 +1587,16 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
         _TP = old_tp_group
 
 
+def get_world_size():
+    """Return world size for the world group."""
+    return get_world_group().world_size
+
+
+def get_world_rank():
+    """Return my rank for the world group."""
+    return get_world_group().rank_in_group
+
+
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     return get_tp_group().world_size

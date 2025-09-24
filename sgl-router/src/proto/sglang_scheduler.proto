@@ -8,9 +8,6 @@ import "google/protobuf/struct.proto";
 // Service definition for SGLang scheduler communication
 // This protocol bridges the Rust router and Python scheduler
 service SglangScheduler {
-  // Initialize connection and get model info
-  rpc Initialize(InitializeRequest) returns (InitializeResponse);
-
   // Submit a generation request (supports streaming)
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
 
@@ -23,8 +20,6 @@ service SglangScheduler {
   // Abort a running request
   rpc Abort(AbortRequest) returns (AbortResponse);
 
-  // Flush KV cache
-  rpc FlushCache(FlushCacheRequest) returns (FlushCacheResponse);
 }
 
 // =====================
@@ -41,7 +36,7 @@ message SamplingParams {
   float presence_penalty = 6;
   float repetition_penalty = 7;
 
-  int32 max_new_tokens = 8;
+  optional int32 max_new_tokens = 8;
   repeated string stop = 9;
   repeated int32 stop_token_ids = 10;
   bool skip_special_tokens = 11;
@@ -75,14 +70,6 @@ message SamplingParams {
   google.protobuf.Struct custom_params = 25;
 }
 
-// Session parameters for continual prompting
-message SessionParams {
-  string session_id = 1;
-  string request_id = 2;
-  int32 offset = 3;
-  bool replace = 4;
-  bool drop_previous_output = 5;
-}
 
 // Disaggregated serving parameters
 message DisaggregatedParams {
@@ -92,136 +79,49 @@ message DisaggregatedParams {
 }
 
 // =====================
-// Initialize
-// =====================
-
-message InitializeRequest {
-  string client_id = 1;
-  string client_version = 2;
-
-  // Operating mode
-  enum Mode {
-    REGULAR = 0;      // Normal mode with local scheduler
-    PREFILL = 1;      // Prefill-only mode for disaggregated serving
-    DECODE = 2;       // Decode-only mode for disaggregated serving
-  }
-  Mode mode = 3;
-}
-
-message InitializeResponse {
-  bool success = 1;
-  string scheduler_version = 2;
-
-  // Model information
-  ModelInfo model_info = 3;
-
-  // Server capabilities
-  ServerCapabilities capabilities = 4;
-
-  // Error message if success is false
-  string error_message = 5;
-}
-
-message ModelInfo {
-  string model_name = 1;
-  int32 max_context_length = 2;
-  int32 vocab_size = 3;
-  bool supports_tool_calling = 4;
-  bool supports_vision = 5;
-  repeated string special_tokens = 6;
-
-  // Additional model metadata
-  string model_type = 7;
-  int32 num_layers = 8;
-  int32 hidden_size = 9;
-  int32 num_attention_heads = 10;
-  int32 num_key_value_heads = 11;
-
-  // Tokenizer info
-  string tokenizer_type = 12;
-  repeated int32 eos_token_ids = 13;
-  int32 pad_token_id = 14;
-  int32 bos_token_id = 15;
-}
-
-message ServerCapabilities {
-  bool continuous_batching = 1;
-  bool disaggregated_serving = 2;
-  bool speculative_decoding = 3;
-  int32 max_batch_size = 4;
-  int32 max_num_batched_tokens = 5;
-  int32 max_prefill_tokens = 6;
-  string attention_backend = 7;  // "flashinfer", "triton", "torch"
-
-  // Additional capabilities
-  bool supports_lora = 8;
-  bool supports_grammar = 9;
-  bool supports_multimodal = 10;
-  repeated string supported_modalities = 11;  // ["image", "video", "audio"]
-  bool supports_custom_logit_processor = 12;
-  bool supports_session = 13;
-
-  // Hardware info
-  int32 num_gpus = 14;
-  string gpu_type = 15;
-  int64 total_gpu_memory = 16;
-
-  // Parallelism info
-  int32 tensor_parallel_size = 17;
-  int32 pipeline_parallel_size = 18;
-  int32 data_parallel_size = 19;
-}
-
-// =====================
 // Generate Request
 // =====================
 
 message GenerateRequest {
   string request_id = 1;
 
-  // Input can be either text or tokenized
-  oneof input {
-    string text = 2;
-    TokenizedInput tokenized = 3;
-  }
+  // Input must be tokenized (no raw text)
+  TokenizedInput tokenized = 2;
 
   // Multimodal inputs
-  MultimodalInputs mm_inputs = 4;
+  MultimodalInputs mm_inputs = 3;
 
   // Generation parameters
-  SamplingParams sampling_params = 5;
+  SamplingParams sampling_params = 4;
 
   // Return options
-  bool return_logprob = 6;
-  int32 logprob_start_len = 7;
-  int32 top_logprobs_num = 8;
-  repeated int32 token_ids_logprob = 9;
-  bool return_hidden_states = 10;
-
-  // Session management
-  SessionParams session_params = 11;
+  bool return_logprob = 5;
+  int32 logprob_start_len = 6;
+  int32 top_logprobs_num = 7;
+  repeated int32 token_ids_logprob = 8;
+  bool return_hidden_states = 9;
 
   // For disaggregated serving
-  DisaggregatedParams disaggregated_params = 12;
+  DisaggregatedParams disaggregated_params = 10;
 
   // Custom logit processor (serialized)
-  string custom_logit_processor = 13;
+  string custom_logit_processor = 11;
 
   // Request metadata
-  google.protobuf.Timestamp timestamp = 14;
-  bool log_metrics = 15;
+  google.protobuf.Timestamp timestamp = 12;
+  bool log_metrics = 13;
 
   // Input embeddings (alternative to text/tokens)
-  repeated float input_embeds = 16;
+  repeated float input_embeds = 14;
 
   // LoRA adapter ID (if pre-loaded)
-  string lora_id = 17;
+  string lora_id = 15;
 
   // Data parallel routing
-  int32 data_parallel_rank = 18;
+  int32 data_parallel_rank = 16;
 
   // For load balancing
-  int32 dp_balance_id = 19;
+  int32 dp_balance_id = 17;
 }
 
 message TokenizedInput {
@@ -303,19 +203,6 @@ message GenerateComplete {
   }
   FinishReason finish_reason = 3;
 
-  // Final counts
-  int32 prompt_tokens = 4;
-  int32 completion_tokens = 5;
-  int32 cached_tokens = 6;
-
-  // Performance metrics
-  float total_generation_time = 7;
-  float time_to_first_token = 8;
-  float tokens_per_second = 9;
-
-  // Spec decode metrics
-  int32 spec_verify_count = 10;
-
   // All logprobs if requested
   repeated LogProbs all_logprobs = 11;
 
@@ -359,10 +246,8 @@ message HiddenStates {
 message EmbedRequest {
   string request_id = 1;
 
-  oneof input {
-    string text = 2;
-    TokenizedInput tokenized = 3;
-  }
+  // Input must be tokenized (no raw text)
+  TokenizedInput tokenized = 2;
 
   // Multimodal inputs
   MultimodalInputs mm_inputs = 4;
@@ -422,39 +307,13 @@ message EmbedError {
 // =====================
 
 message HealthCheckRequest {
-  bool include_detailed_metrics = 1;
+  // Input for health test generation (must be tokenized)
+  TokenizedInput tokenized = 1;
 }
 
 message HealthCheckResponse {
   bool healthy = 1;
-
-  // Current load metrics
-  int32 num_requests_running = 2;
-  int32 num_requests_waiting = 3;
-  float gpu_cache_usage = 4;
-  float gpu_memory_usage = 5;
-
-  // KV cache metrics
-  int32 kv_cache_total_blocks = 6;
-  int32 kv_cache_used_blocks = 7;
-  float kv_cache_hit_rate = 8;
-
-  // Additional metrics
-  int32 num_grammar_queue_requests = 9;
-  float generation_throughput = 10;  // tokens/sec
-  float average_queue_time = 11;     // seconds
-  float average_generation_time = 12; // seconds
-
-  // System metrics
-  float cpu_usage = 13;
-  int64 memory_usage = 14;
-
-  // Disaggregation metrics
-  int32 num_prefill_requests = 15;
-  int32 num_decode_requests = 16;
-
-  // Detailed metrics (optional)
-  google.protobuf.Struct detailed_metrics = 17;
+  string message = 2;
 }
 
 message AbortRequest {
@@ -467,17 +326,6 @@ message AbortResponse {
   string message = 2;
 }
 
-message FlushCacheRequest {
-  bool flush_all = 1;
-  repeated string session_ids = 2;  // Flush specific sessions
-}
-
-message FlushCacheResponse {
-  bool success = 1;
-  int32 num_entries_flushed = 2;
-  int64 memory_freed = 3;  // bytes
-  string message = 4;
-}
 
 // =====================
 // Additional Operations (Future)

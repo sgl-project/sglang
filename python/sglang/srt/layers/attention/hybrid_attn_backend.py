@@ -21,6 +21,7 @@ class HybridAttnBackend(AttentionBackend):
         self.model_runner = model_runner
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+        self.data_type = model_runner.kv_cache_dtype
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
