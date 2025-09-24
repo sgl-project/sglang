@@ -2080,8 +2080,8 @@ class GemmARLayer:
             dtype=torch.int32
         )
         barrier_flag.fill_(0)
-        # symm = symm_mem.rendezvous(barrier_flag, group=self.tp_group.group_name)
-        symm = symm_mem.rendezvous(barrier_flag, group=dist.group.WORLD.group_name)        
+        symm = symm_mem.rendezvous(barrier_flag, group=self.tp_group.group_name)
+        # symm = symm_mem.rendezvous(barrier_flag, group=dist.group.WORLD.group_name)        
         barrier_flag_mc = symm.multicast_ptr
             
         barrier_flag_memref = from_dlpack(barrier_flag)
@@ -2133,9 +2133,9 @@ class GemmARLayer:
         c_tensor.element_type = self.output_dtype
         c_tensor = c_tensor.mark_layout_dynamic(leading_dim=1)
         
-        # print(f"a_tensor: {a_tensor.shape, a_tensor._dtype}")
-        # print(f"b_tensor: {b_tensor.shape, b_tensor._dtype}")
-        # print(f"c_tensor: {c_tensor.shape, c_tensor._dtype}")
+        print(f"a_tensor: {a_tensor.shape, a_tensor._dtype}")
+        print(f"b_tensor: {b_tensor.shape, b_tensor._dtype}")
+        print(f"c_tensor: {c_tensor.shape, c_tensor._dtype}, actual_m: {actual_m}")
         # dist.barrier(group=self.tp_group)
         if self.all_reduce == "none":
             self.compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
@@ -2148,5 +2148,6 @@ class GemmARLayer:
             )
         
         result = self.c_torch_gpu.squeeze(-1)
+        print(f"result: {result.shape}")
         return result[:actual_m, :]
     

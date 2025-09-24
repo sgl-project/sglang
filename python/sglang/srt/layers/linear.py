@@ -1397,6 +1397,7 @@ class RowParallelLinear(LinearBase):
         if input_.shape[0] >= 128 and get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
             if self.gemm_ar_attn_op:
                 output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
+                print(f"gemm_ar_attn_op: input_.shape: {input_.shape}; self.weight.shape: {self.weight.shape}; output.shape: {output.shape}")
 
                 # m = input_.shape[0]
                 # k = input_.shape[1] 
@@ -1420,6 +1421,8 @@ class RowParallelLinear(LinearBase):
                 # self.bias: None
             else:
                 output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
+                print(f"gemm_ar_mlp_op: input_.shape: {input_.shape}; self.weight.shape: {self.weight.shape}; output.shape: {output.shape}")
+
                 # m = input_.shape[0]
                 # k = input_.shape[1]
                 # n = self.weight.shape[0]

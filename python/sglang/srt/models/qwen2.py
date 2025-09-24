@@ -252,8 +252,10 @@ class Qwen2DecoderLayer(nn.Module):
         )
 
         # Fully Connected
+        # print(f"Qwen2DecoderLayer: hidden_states.shape: {hidden_states.shape}, residual.shape: {residual.shape}")
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        # print(f"Qwen2DecoderLayer: hidden_states.shape: {hidden_states.shape}, residual.shape: {residual.shape}")
         return hidden_states, residual
 
 
