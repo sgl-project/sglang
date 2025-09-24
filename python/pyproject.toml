@@ -66,7 +66,7 @@ dependencies = [
   "openai==1.99.1",
   "tiktoken",
   "anthropic>=0.20.0",
-  "torch_memory_saver==0.0.8",
+  "torch_memory_saver==0.0.9rc1",
   "nvidia-cutlass-dsl==4.2.0",
 ]
 
