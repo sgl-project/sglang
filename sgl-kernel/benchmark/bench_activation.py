@@ -16,6 +16,7 @@ from vllm import _custom_ops as vllm_ops
 # gelu_quick is only available on HIP/ROCm platforms
 try:
     from sgl_kernel import gelu_quick
+
     GELU_QUICK_AVAILABLE = True
 except ImportError:
     GELU_QUICK_AVAILABLE = False
@@ -42,8 +43,10 @@ def calculate_diff(
     # activation-only quick GELU
     if kernel == "gelu_quick":
         if not GELU_QUICK_AVAILABLE:
-            print(f"[{kernel:14s} | {str(dtype):9s} | B={batch_size:3d} | "
-                  f"L={seq_len:3d} | D={dim:5d}] ⚠️  not available on this platform")
+            print(
+                f"[{kernel:14s} | {str(dtype):9s} | B={batch_size:3d} | "
+                f"L={seq_len:3d} | D={dim:5d}] ⚠️  not available on this platform"
+            )
             return True
         x = torch.randn(batch_size, seq_len, dim, dtype=dtype, device=device)
         ref_out = torch.zeros_like(x)
@@ -118,7 +121,9 @@ def benchmark(kernel, dtype, batch_size, seq_len, dim, provider):
         for _ in range(5):
             fn()
         torch.cuda.synchronize()
-        ms, qmin, qmax = triton.testing.do_bench_cudagraph(fn, quantiles=[0.5, 0.2, 0.8])
+        ms, qmin, qmax = triton.testing.do_bench_cudagraph(
+            fn, quantiles=[0.5, 0.2, 0.8]
+        )
         return 1000 * ms, 1000 * qmax, 1000 * qmin
 
     if provider == "vllm":

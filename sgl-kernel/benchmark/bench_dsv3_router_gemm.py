@@ -119,9 +119,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
 
-    benchmark_bf16_output.run(
-        print_data=True
-    )
-    benchmark_float_output.run(
-        print_data=True
-    )
+    benchmark_bf16_output.run(print_data=True)
+    benchmark_float_output.run(print_data=True)

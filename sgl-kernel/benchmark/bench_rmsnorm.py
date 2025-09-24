@@ -183,9 +183,11 @@ def calculate_diff(batch_size, seq_len, hidden_size, use_residual=True):
     print(f"VLLM output={output_vllm}")
     print(f"SGLang output={output_sglang}")
 
-    if torch.allclose(
-        output_naive, output_flashinfer, atol=1e-2, rtol=1e-2
-    ) and torch.allclose(output_naive, output_vllm, atol=1e-2, rtol=1e-2) and torch.allclose(output_naive, output_sglang, atol=1e-2, rtol=1e-2):
+    if (
+        torch.allclose(output_naive, output_flashinfer, atol=1e-2, rtol=1e-2)
+        and torch.allclose(output_naive, output_vllm, atol=1e-2, rtol=1e-2)
+        and torch.allclose(output_naive, output_sglang, atol=1e-2, rtol=1e-2)
+    ):
         print("✅ All implementations match")
     else:
         print("❌ Implementations differ")
@@ -226,45 +228,59 @@ def benchmark(batch_size, seq_len, hidden_size, provider, use_residual):
         for _ in range(5):
             fn()
         torch.cuda.synchronize()
-        ms, qmin, qmax = triton.testing.do_bench_cudagraph(fn, quantiles=[0.5, 0.2, 0.8])
+        ms, qmin, qmax = triton.testing.do_bench_cudagraph(
+            fn, quantiles=[0.5, 0.2, 0.8]
+        )
         return 1000 * ms, 1000 * qmax, 1000 * qmin
 
     if provider == "huggingface":
-        return timed(lambda: rmsnorm_naive(
-            x.clone(),
-            weight,
-            residual.clone() if residual is not None else None,
-        ))
+        return timed(
+            lambda: rmsnorm_naive(
+                x.clone(),
+                weight,
+                residual.clone() if residual is not None else None,
+            )
+        )
     elif provider == "flashinfer":
-        return timed(lambda: rmsnorm_flashinfer(
-            x.clone(),
-            weight,
-            residual.clone() if residual is not None else None,
-        ))
+        return timed(
+            lambda: rmsnorm_flashinfer(
+                x.clone(),
+                weight,
+                residual.clone() if residual is not None else None,
+            )
+        )
     elif provider == "vllm":
-        return timed(lambda: rmsnorm_vllm(
-            x.clone(),
-            weight,
-            residual.clone() if residual is not None else None,
-        ))
+        return timed(
+            lambda: rmsnorm_vllm(
+                x.clone(),
+                weight,
+                residual.clone() if residual is not None else None,
+            )
+        )
     elif provider == "sglang":
-        return timed(lambda: rmsnorm_sglang(
-            x.clone(),
-            weight,
-            residual.clone() if residual is not None else None,
-        ))
+        return timed(
+            lambda: rmsnorm_sglang(
+                x.clone(),
+                weight,
+                residual.clone() if residual is not None else None,
+            )
+        )
 
     # provider == "speedup"
-    t_ref, _, _ = timed(lambda: rmsnorm_vllm(
-        x.clone(),
-        weight,
-        residual.clone() if residual is not None else None,
-    ))
-    t_sgl, _, _ = timed(lambda: rmsnorm_sglang(
-        x.clone(),
-        weight,
-        residual.clone() if residual is not None else None,
-    ))
+    t_ref, _, _ = timed(
+        lambda: rmsnorm_vllm(
+            x.clone(),
+            weight,
+            residual.clone() if residual is not None else None,
+        )
+    )
+    t_sgl, _, _ = timed(
+        lambda: rmsnorm_sglang(
+            x.clone(),
+            weight,
+            residual.clone() if residual is not None else None,
+        )
+    )
     spd = t_ref / t_sgl
     return (spd, spd, spd)
 
@@ -274,7 +290,9 @@ if __name__ == "__main__":
     p.add_argument("--batch_sizes", type=str2int_list, default=default_batch_sizes)
     p.add_argument("--seq_lens", type=str2int_list, default=default_seq_lens)
     p.add_argument("--hidden_sizes", type=str2int_list, default=default_hidden_sizes)
-    p.add_argument("--use_residual", action="store_true", help="Whether to use residual connection")
+    p.add_argument(
+        "--use_residual", action="store_true", help="Whether to use residual connection"
+    )
     p.add_argument("--verify_only", action="store_true")
     args = p.parse_args()
 

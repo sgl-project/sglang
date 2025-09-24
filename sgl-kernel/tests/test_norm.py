@@ -86,7 +86,9 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     x_fused = x.clone()
     residual_fused = residual.clone()
     enable_pdl = is_arch_support_pdl()
-    sgl_kernel.fused_add_rmsnorm(x_fused, residual_fused, weight, eps, enable_pdl=enable_pdl)
+    sgl_kernel.fused_add_rmsnorm(
+        x_fused, residual_fused, weight, eps, enable_pdl=enable_pdl
+    )
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
@@ -128,7 +130,9 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     x_fused = x.clone()
     residual_fused = residual.clone()
     enable_pdl = is_arch_support_pdl()
-    sgl_kernel.gemma_fused_add_rmsnorm(x_fused, residual_fused, weight, eps, enable_pdl=enable_pdl)
+    sgl_kernel.gemma_fused_add_rmsnorm(
+        x_fused, residual_fused, weight, eps, enable_pdl=enable_pdl
+    )
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
