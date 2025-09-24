@@ -5,13 +5,15 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::config::{RouterConfig, RoutingMode};
+use sglang_router_rs::core::WorkerManager;
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
 
 /// Test context that manages mock workers
 struct TestContext {
     workers: Vec<MockWorker>,
-    router: Arc<dyn RouterTrait>,
+    _router: Arc<dyn RouterTrait>,
+    worker_urls: Vec<String>,
 }
 
 impl TestContext {
@@ -48,8 +50,7 @@ impl TestContext {
 
         // Initialize workers in the registry before creating router
         if !worker_urls.is_empty() {
-            use sglang_router_rs::routers::WorkerInitializer;
-            WorkerInitializer::initialize_workers(&config, &app_context.worker_registry, None)
+            WorkerManager::initialize_workers(&config, &app_context.worker_registry, None)
                 .await
                 .expect("Failed to initialize workers");
         }
@@ -61,7 +62,11 @@ impl TestContext {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
 
-        Self { workers, router }
+        Self {
+            workers,
+            _router: router,
+            worker_urls: worker_urls.clone(),
+        }
     }
 
     async fn shutdown(mut self) {
@@ -83,13 +88,11 @@ impl TestContext {
     ) -> Result<Vec<String>, String> {
         let client = Client::new();
 
-        // Get any worker URL for testing
-        let worker_urls = self.router.get_worker_urls();
-        if worker_urls.is_empty() {
-            return Err("No available workers".to_string());
-        }
-
-        let worker_url = &worker_urls[0];
+        // Use the first worker URL from the context
+        let worker_url = self
+            .worker_urls
+            .first()
+            .ok_or_else(|| "No workers available".to_string())?;
 
         let response = client
             .post(format!("{}{}", worker_url, endpoint))

@@ -185,7 +185,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
 
         if self.model_config.is_multimodal:
-            import_processors()
+            import_processors("sglang.srt.multimodal.processors")
             try:
                 _processor = get_processor(
                     server_args.tokenizer_path,
