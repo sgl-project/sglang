@@ -699,12 +699,13 @@ impl RouterTrait for GrpcRouter {
         self
     }
 
-    async fn health(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        // TODO: Implement actual generation test for gRPC
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Health generate not yet implemented for gRPC",
+        )
+            .into_response()
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
@@ -786,20 +787,12 @@ impl RouterTrait for GrpcRouter {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn flush_cache(&self) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
     async fn get_worker_loads(&self) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
     fn router_type(&self) -> &'static str {
         "grpc"
-    }
-
-    fn readiness(&self) -> Response {
-        (StatusCode::SERVICE_UNAVAILABLE).into_response()
     }
 }
 
