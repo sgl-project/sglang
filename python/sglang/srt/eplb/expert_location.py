@@ -113,6 +113,7 @@ class ExpertLocationMetadata:
         server_args: ServerArgs,
         model_config: ModelConfig,
         physical_to_logical_map,
+        gpu_id: int = None,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
@@ -125,8 +126,11 @@ class ExpertLocationMetadata:
 
         model_config_for_expert_location = common["model_config_for_expert_location"]
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
-            physical_to_logical_map,
+            server_args=server_args,
+            physical_to_logical_map=physical_to_logical_map,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
+            num_gpus=common["ep_size"],
+            gpu_id=gpu_id,
         )
 
         return ExpertLocationMetadata._init_raw(
@@ -303,7 +307,11 @@ def set_global_expert_location_metadata(value):
 
 
 def _compute_logical_to_all_physical_map(
-    physical_to_logical_map: torch.Tensor, num_logical_experts: int
+    server_args: ServerArgs,
+    physical_to_logical_map: torch.Tensor,
+    num_logical_experts: int,
+    num_gpus: int,
+    gpu_id: int,
 ):
     # This is rarely called, so we use for loops for maximum clarity
 
@@ -320,6 +328,29 @@ def _compute_logical_to_all_physical_map(
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )
+
+    if gpu_id is not None:
+        num_local_gpu_physical_experts = num_physical_experts // num_gpus
+        num_gpus_per_node = server_args.ep_size // server_args.nnodes
+        num_local_node_physical_experts = (
+            num_local_gpu_physical_experts * num_gpus_per_node
+        )
+        for layer_id in range(num_layers):
+            for logical_expert_id in range(num_logical_experts):
+                nearest_expert = _find_nearest_expert(
+                    candidate_physical_expert_ids=logical_to_all_physical_map[layer_id][
+                        logical_expert_id
+                    ],
+                    num_local_gpu_physical_experts=num_local_gpu_physical_experts,
+                    gpu_id=gpu_id,
+                    num_gpus_per_node=num_gpus_per_node,
+                    num_local_node_physical_experts=num_local_node_physical_experts,
+                )
+                if nearest_expert != -1:
+                    # Replace with the nearest physical expert
+                    logical_to_all_physical_map[layer_id][logical_expert_id] = [
+                        nearest_expert
+                    ]
 
     logical_to_all_physical_map = _pad_nested_array(
         logical_to_all_physical_map, pad_value=-1
@@ -372,32 +403,16 @@ def compute_logical_to_rank_dispatch_physical_map(
             ]
 
             for gpu_id in range(num_gpus):
-                same_gpu_physical_expert_ids = [
-                    physical_expert_id
-                    for physical_expert_id in candidate_physical_expert_ids
-                    if _compute_gpu_id_of_physical_expert(
-                        physical_expert_id, num_local_gpu_physical_experts
-                    )
-                    == gpu_id
-                ]
-                if len(same_gpu_physical_expert_ids) > 0:
-                    # 1. Prefer same-GPU experts
-                    output_partial[gpu_id] = same_gpu_physical_expert_ids[0]
-                else:
-                    # 2. Otherwise, prefer same-node experts
-                    node_id = gpu_id // num_gpus_per_node
-                    same_node_physical_expert_ids = [
-                        physical_expert_id
-                        for physical_expert_id in candidate_physical_expert_ids
-                        if _compute_node_id_of_physical_expert(
-                            physical_expert_id, num_local_node_physical_experts
-                        )
-                        == node_id
-                    ]
-                    if len(same_node_physical_expert_ids) > 0:
-                        output_partial[gpu_id] = same_node_physical_expert_ids[0]
+                # Fill with the nearest physical expert
+                output_partial[gpu_id] = _find_nearest_expert(
+                    candidate_physical_expert_ids=candidate_physical_expert_ids,
+                    num_local_gpu_physical_experts=num_local_gpu_physical_experts,
+                    gpu_id=gpu_id,
+                    num_gpus_per_node=num_gpus_per_node,
+                    num_local_node_physical_experts=num_local_node_physical_experts,
+                )
 
-            # 3. Fill remaining slots with fair random choices
+            # Fill remaining slots with fair random choices
             num_remain = torch.sum(output_partial == -1).item()
             output_partial[output_partial == -1] = torch.tensor(
                 _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r),
@@ -434,6 +449,40 @@ def _compute_node_id_of_physical_expert(
     return physical_expert_id // num_local_host_physical_experts
 
 
+def _find_nearest_expert(
+    candidate_physical_expert_ids: List[int],
+    num_local_gpu_physical_experts: int,
+    gpu_id: int,
+    num_gpus_per_node: int,
+    num_local_node_physical_experts: int,
+) -> int:
+    same_gpu_physical_expert_ids = [
+        physical_expert_id
+        for physical_expert_id in candidate_physical_expert_ids
+        if _compute_gpu_id_of_physical_expert(
+            physical_expert_id, num_local_gpu_physical_experts
+        )
+        == gpu_id
+    ]
+    if len(same_gpu_physical_expert_ids) > 0:
+        # 1. Prefer same-GPU experts
+        return same_gpu_physical_expert_ids[0]
+    else:
+        # 2. Otherwise, prefer same-node experts
+        node_id = gpu_id // num_gpus_per_node
+        same_node_physical_expert_ids = [
+            physical_expert_id
+            for physical_expert_id in candidate_physical_expert_ids
+            if _compute_node_id_of_physical_expert(
+                physical_expert_id, num_local_node_physical_experts
+            )
+            == node_id
+        ]
+        if len(same_node_physical_expert_ids) > 0:
+            return same_node_physical_expert_ids[0]
+    return -1
+
+
 def _fair_choices(arr: List, k: int, r: random.Random) -> List:
     quotient, remainder = divmod(k, len(arr))
     ans = arr * quotient + r.sample(arr, k=remainder)
@@ -459,7 +508,9 @@ class ModelConfigForExpertLocation:
 
 
 def compute_initial_expert_location_metadata(
-    server_args: ServerArgs, model_config: ModelConfig
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    gpu_id: int,
 ) -> Optional[ExpertLocationMetadata]:
     data = server_args.init_expert_location
     if data == "trivial":
@@ -478,7 +529,10 @@ def compute_initial_expert_location_metadata(
             "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"
         )
         return ExpertLocationMetadata.init_by_mapping(
-            server_args, model_config, **data_dict
+            server_args,
+            model_config,
+            **data_dict,
+            gpu_id=gpu_id,
         )
     elif "logical_count" in data_dict:
         logger.info(
