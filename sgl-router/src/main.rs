@@ -396,17 +396,30 @@ impl CliArgs {
         }
     }
 
+    fn resolve_oracle_connect_details(&self) -> ConfigResult<(Option<String>, String)> {
+        if let Some(dsn) = self.oracle_dsn.clone() {
+            return Ok((self.oracle_wallet_path.clone(), dsn));
+        }
+
+        let wallet_path = self
+            .oracle_wallet_path
+            .clone()
+            .ok_or(ConfigError::MissingRequired {
+                field: "oracle_wallet_path or ATP_WALLET_PATH".to_string(),
+            })?;
+
+        let tns_alias = self
+            .oracle_tns_alias
+            .clone()
+            .ok_or(ConfigError::MissingRequired {
+                field: "oracle_tns_alias or ATP_TNS_ALIAS".to_string(),
+            })?;
+
+        Ok((Some(wallet_path), tns_alias))
+    }
+
     fn build_oracle_config(&self) -> ConfigResult<OracleConfig> {
-        let wallet_path = self.oracle_wallet_path.clone();
-        let connect_descriptor = if let Some(dsn) = self.oracle_dsn.clone() {
-            dsn
-        } else if let Some(alias) = self.oracle_tns_alias.clone() {
-            alias
-        } else {
-            return Err(ConfigError::MissingRequired {
-                field: "oracle_dsn/oracle_tns_alias (ATP_DSN or ATP_TNS_ALIAS)".to_string(),
-            });
-        };
+        let (wallet_path, connect_descriptor) = self.resolve_oracle_connect_details()?;
         let username = self
             .oracle_user
             .clone()
