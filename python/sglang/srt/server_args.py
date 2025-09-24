@@ -2982,7 +2982,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         The server arguments.
     """
     # Import here to avoid circular imports
-    from sglang.srt.config_parser import ConfigArgumentMerger
+    from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 
     # Check for config file and merge arguments if present
     if "--config" in argv:

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from sglang.srt.config_parser import ConfigArgumentMerger
+from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.srt.server_args import prepare_server_args
 
 
@@ -19,7 +19,7 @@ def merger():
     return ConfigArgumentMerger()
 
 
-def test_config_parser(merger):
+def test_server_args_config_parser(merger):
     """Test the config parser functionality."""
     # Create a temporary config file
     config_data = {
