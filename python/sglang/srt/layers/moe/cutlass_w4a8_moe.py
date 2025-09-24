@@ -4,7 +4,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda_alike
 
 _is_cuda_alike = is_cuda_alike()
 
