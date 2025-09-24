@@ -60,7 +60,10 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+from sglang.srt.layers.attention.attention_registry import (
+    ATTENTION_BACKENDS,
+    attn_backend_wrapper,
+)
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -1750,7 +1753,8 @@ class ModelRunner:
     def _get_attention_backend_from_str(self, backend_str: str):
         if backend_str not in ATTENTION_BACKENDS:
             raise ValueError(f"Invalid attention backend: {backend_str}")
-        return ATTENTION_BACKENDS[backend_str](self)
+        full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
+        return attn_backend_wrapper(self, full_attention_backend)
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"
