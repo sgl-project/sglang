@@ -59,7 +59,7 @@ fn detect_format_with_ast(template: &str) -> Option<ChatTemplateContentFormat> {
     let ast = match parse(
         template,
         "template",
-        SyntaxConfig::default(),
+        SyntaxConfig {},
         WhitespaceConfig::default(),
     ) {
         Ok(ast) => ast,
@@ -327,10 +327,7 @@ impl ChatTemplateProcessor {
             .map_err(|e| anyhow!("Failed to get template: {}", e))?;
 
         // Convert ChatMessage to minijinja::Value for rendering using serde like pydantic.model_dump()
-        let minijinja_messages: Vec<Value> = messages
-            .iter()
-            .map(|msg| Value::from_serialize(msg))
-            .collect();
+        let minijinja_messages: Vec<Value> = messages.iter().map(Value::from_serialize).collect();
 
         // Render the template directly with the provided values
         let rendered = tmpl
@@ -580,7 +577,7 @@ assistant:
             Some("</s>".to_string()),
         );
 
-        let messages = vec![spec::ChatMessage::User {
+        let messages = [spec::ChatMessage::User {
             role: "user".to_string(),
             content: spec::UserMessageContent::Text("Test".to_string()),
             name: None,
