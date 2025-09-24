@@ -70,6 +70,7 @@ rmcp = { version = "0.6.3", features = ["client", "server",
     "auth"] }
 serde_yaml = "0.9"
 oracle = { version = "0.6.3", features = ["chrono"] }
+subtle = "2.6"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.12", features = ["tls", "gzip", "transport"] }
