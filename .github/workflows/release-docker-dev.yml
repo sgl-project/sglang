@@ -96,7 +96,7 @@ jobs:
 
   build-blackwell-arm:
     if: ${{ github.repository == 'sgl-project/sglang' }}
-    runs-on: ubuntu-22.04-arm
+    runs-on: labubu
     strategy:
       matrix:
         variant:
