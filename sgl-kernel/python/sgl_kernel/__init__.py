@@ -25,24 +25,30 @@ def _get_ops_library():
     compute_capability = _get_compute_capability()
 
     if compute_capability is None:
-        # CPU fallback or no CUDA
-        from sgl_kernel import common_ops_sm100
-        return common_ops_sm100.ops.sgl_kernel_precise
-
+        # CPU fallback or no CUDA - try new libraries first, then fallback to common_ops
+        try:
+            from sgl_kernel import common_ops_sm100
+            return common_ops_sm100.ops.sgl_kernel_precise
+        except ImportError:
+            pass
+    
     if compute_capability == 90:
         # SM90 (Hopper/H100) - use fast math
         try:
             from sgl_kernel import common_ops_sm90
             return common_ops_sm90.ops.sgl_kernel_fast
         except ImportError:
-            # Fallback to precise version
-            from sgl_kernel import common_ops_sm100
-            return common_ops_sm100.ops.sgl_kernel_precise
+            pass
     else:
         # SM100+ (Blackwell) or other architectures - use precise math
-        from sgl_kernel import common_ops_sm100
-        return common_ops_sm100.ops.sgl_kernel_precise
+        try:
+            from sgl_kernel import common_ops_sm100
+            return common_ops_sm100.ops.sgl_kernel_precise
+        except ImportError:
+            pass
 
+    from sgl_kernel import common_ops
+    return common_ops
 
 # Initialize the ops library based on current GPU
 ops = _get_ops_library()
@@ -84,7 +90,6 @@ if torch.version.cuda is not None:
         ctypes.CDLL(str(cuda_include), mode=ctypes.RTLD_GLOBAL)
 
 # Architecture-specific library loading handled by _get_ops_library()
-# from sgl_kernel import common_ops  # Replaced with namespace-aware loading
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     cutlass_mla_decode,
