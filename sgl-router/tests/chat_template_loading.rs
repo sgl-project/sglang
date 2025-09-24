@@ -1,13 +1,12 @@
 #[cfg(test)]
 mod tests {
+    use sglang_router_rs::protocols::spec;
+    use sglang_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;
     use std::fs;
     use tempfile::TempDir;
 
     #[test]
     fn test_load_chat_template_from_file() {
-        use sglang_router_rs::tokenizer::chat_template::ChatMessage;
-        use sglang_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;
-
         // Create temporary directory
         let temp_dir = TempDir::new().unwrap();
         let template_path = temp_dir.path().join("template.jinja");
@@ -59,11 +58,28 @@ mod tests {
 
         // Test that the custom template is used
         let messages = vec![
-            ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi there"),
+            spec::ChatMessage::User {
+                role: "user".to_string(),
+                content: spec::UserMessageContent::Text("Hello".to_string()),
+                name: None,
+            },
+            spec::ChatMessage::Assistant {
+                role: "assistant".to_string(),
+                content: Some("Hi there".to_string()),
+                name: None,
+                tool_calls: None,
+                function_call: None,
+                reasoning_content: None,
+            },
         ];
 
-        let result = tokenizer.apply_chat_template(&messages, true).unwrap();
+        // Convert to JSON values like the router does
+        let json_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|msg| serde_json::to_value(msg).unwrap())
+            .collect();
+
+        let result = tokenizer.apply_chat_template(&json_messages, true).unwrap();
 
         // Verify the custom template format
         assert!(result.contains("<|user|>Hello"));
@@ -73,9 +89,6 @@ mod tests {
 
     #[test]
     fn test_override_existing_template() {
-        use sglang_router_rs::tokenizer::chat_template::ChatMessage;
-        use sglang_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;
-
         // Create temporary directory
         let temp_dir = TempDir::new().unwrap();
 
@@ -124,8 +137,21 @@ mod tests {
         )
         .unwrap();
 
-        let messages = vec![ChatMessage::user("Test")];
-        let result = tokenizer.apply_chat_template(&messages, false).unwrap();
+        let messages = [spec::ChatMessage::User {
+            role: "user".to_string(),
+            content: spec::UserMessageContent::Text("Test".to_string()),
+            name: None,
+        }];
+
+        // Convert to JSON values
+        let json_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|msg| serde_json::to_value(msg).unwrap())
+            .collect();
+
+        let result = tokenizer
+            .apply_chat_template(&json_messages, false)
+            .unwrap();
 
         // Should use CUSTOM template, not built-in
         assert!(result.starts_with("CUSTOM:"));
@@ -135,9 +161,6 @@ mod tests {
 
     #[test]
     fn test_set_chat_template_after_creation() {
-        use sglang_router_rs::tokenizer::chat_template::ChatMessage;
-        use sglang_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;
-
         // Create temporary directory and tokenizer file
         let temp_dir = TempDir::new().unwrap();
         let tokenizer_json = r#"{
@@ -173,8 +196,31 @@ mod tests {
             "NEW: {% for msg in messages %}{{ msg.role }}: {{ msg.content }}; {% endfor %}";
         tokenizer.set_chat_template(new_template.to_string());
 
-        let messages = vec![ChatMessage::user("Hello"), ChatMessage::assistant("World")];
-        let result = tokenizer.apply_chat_template(&messages, false).unwrap();
+        let messages = vec![
+            spec::ChatMessage::User {
+                role: "user".to_string(),
+                content: spec::UserMessageContent::Text("Hello".to_string()),
+                name: None,
+            },
+            spec::ChatMessage::Assistant {
+                role: "assistant".to_string(),
+                content: Some("World".to_string()),
+                name: None,
+                tool_calls: None,
+                function_call: None,
+                reasoning_content: None,
+            },
+        ];
+
+        // Convert to JSON values
+        let json_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|msg| serde_json::to_value(msg).unwrap())
+            .collect();
+
+        let result = tokenizer
+            .apply_chat_template(&json_messages, false)
+            .unwrap();
 
         assert!(result.starts_with("NEW:"));
         assert!(result.contains("user: Hello;"));
