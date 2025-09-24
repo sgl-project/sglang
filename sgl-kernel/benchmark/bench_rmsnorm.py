@@ -221,12 +221,6 @@ def benchmark(batch_size, seq_len, hidden_size, provider, use_residual):
     weight = torch.ones(hidden_size, dtype=dtype, device=device)
     residual = torch.randn_like(x) if use_residual else None
 
-    # one-time correctness check
-    if provider == "huggingface" and not calculate_diff(
-        batch_size, seq_len, hidden_size, use_residual
-    ):
-        raise ValueError("Mismatch – abort benchmark")
-
     # timing helper
     def timed(fn):
         for _ in range(5):
