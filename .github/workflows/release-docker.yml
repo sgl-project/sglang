@@ -20,7 +20,7 @@ jobs:
             build_type: 'blackwell'
           - cuda_version: '12.9.1'
             build_type: 'blackwell'
-    runs-on: ubuntu-latest
+    runs-on: nv-docker
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
