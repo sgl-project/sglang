@@ -273,7 +273,6 @@ class HiCacheController:
                 self.storage_config.is_mla_model
                 # todo: load balancing
                 and self.storage_config.tp_rank != 0
-                and self.storage_backend_type != "eic"
             )
 
             # Use storage backend factory for dynamic backend creation
@@ -311,7 +310,7 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if self.storage_backend_type in ["hf3fs", "mooncake"]:
+            if self.storage_backend_type in ["hf3fs", "mooncake", "eic"]:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
@@ -579,13 +578,6 @@ class HiCacheController:
         chunks = host_indices.split(self.mem_pool_host.page_size)
         for chunk in chunks:
             self.host_mem_release_queue.put(chunk)
-    
-    def _eic_batch_exists(self, batch_hashes):
-        suffix = ''
-        if self.mem_pool_host.layout == "page_first":
-            suffix = '_k' if self.storage_config.is_mla_model else '__K'
-        hit_page_num = self.storage_backend.batch_exists(batch_hashes, suffix=suffix)
-        return hit_page_num 
 
     def _page_get_zero_copy(self, operation, hash_values, host_indices):
         results = self.storage_backend.batch_get_v1(hash_values, host_indices)
@@ -768,25 +760,6 @@ class HiCacheController:
 
     def _page_set_zero_copy(self, hash_values, host_indices) -> bool:
         return all(self.storage_backend.batch_set_v1(hash_values, host_indices))
-
-    def _eic_page_set(self, hash_values, host_indices) -> bool:
-        if self.mem_pool_host.layout == "page_first":
-            # zero copy set
-            key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-                hash_values, host_indices, ''
-            )
-            return self.storage_backend.batch_set(
-                key_strs,
-                target_locations=buffer_ptrs,
-                target_sizes=buffer_sizes,
-            )
-        else:
-            # generic set
-            page_data = [
-                self.mem_pool_host.get_flat_data_page(host_indices[j * self.page_size])
-                for j in range(len(hash_values))
-            ]
-            return self.storage_backend.batch_set(hash_values, page_data)
 
     # Backup batch by batch
     def _page_backup(self, operation):
