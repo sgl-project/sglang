@@ -49,6 +49,7 @@ sources = [
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/speculative/eagle_utils.cu",
+    "csrc/kvcacheio/transfer.cu",
 ]
 
 cxx_flags = ["-O3"]

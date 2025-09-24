@@ -13,8 +13,8 @@ from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
 
 from sglang.srt.layers.moe.fused_moe_triton import override_config
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-    fused_moe,
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
     get_config_dtype_str,
     get_config_file_name,
     get_default_config,
@@ -22,7 +22,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.utils import is_hip, is_rocm
+from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
@@ -287,7 +287,7 @@ class BenchmarkWorker:
             )
         else:
             config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
-        with torch.cuda.device(self.device_id) if is_rocm() else nullcontext():
+        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             kernel_time = benchmark_config(
                 config,
                 num_tokens,
@@ -319,7 +319,7 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
-        with torch.cuda.device(self.device_id) if is_rocm() else nullcontext():
+        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             for config in tqdm(search_space):
                 try:
                     kernel_time = benchmark_config(
@@ -336,7 +336,7 @@ class BenchmarkWorker:
                         block_shape,
                         num_iters=10,
                     )
-                except triton.runtime.autotuner.OutOfResources:
+                except (triton.runtime.autotuner.OutOfResources, RuntimeError):
                     # Some configurations may be invalid and fail to compile.
                     continue
 
@@ -411,7 +411,11 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in ["Qwen2MoeForCausalLM", "Qwen3MoeForCausalLM"]:
+    elif config.architectures[0] in [
+        "Qwen2MoeForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3NextForCausalLM",
+    ]:
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
@@ -438,6 +442,15 @@ def main(args: argparse.Namespace):
         "Grok1AForCausalLM",
     ]:
         E = config.num_local_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] in [
+        "BailingMoEForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
+    ]:
+        E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size

@@ -4,7 +4,7 @@ Unit tests for Jinja chat template utils.
 
 import unittest
 
-from sglang.srt.jinja_template_utils import (
+from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     process_content_for_template_format,
 )

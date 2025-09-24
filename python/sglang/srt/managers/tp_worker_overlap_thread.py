@@ -12,42 +12,41 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
+from __future__ import annotations
 
 import dataclasses
 import logging
 import signal
 import threading
 from queue import Queue
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import psutil
 import torch
 
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import DynamicGradMode, get_compiler_backend
+from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import LayerDoneCounter
+
 logger = logging.getLogger(__name__)
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def resolve_future_token_ids(input_ids, future_token_ids_map):
-    input_ids[:] = torch.where(
-        input_ids < 0,
-        future_token_ids_map[torch.clamp(-input_ids, min=0)],
-        input_ids,
-    )
 
 
 class TpModelWorkerClient:
@@ -72,14 +71,10 @@ class TpModelWorkerClient:
         self.gpu_id = gpu_id
 
         # Init future mappings
-        self.future_token_ids_ct = 0
-        self.future_token_ids_limit = self.max_running_requests * 3
-        self.future_token_ids_map = torch.empty(
-            (self.max_running_requests * 5,), dtype=torch.int64, device=self.device
-        )
+        self.future_map = FutureMap(self.max_running_requests, self.device)
 
         # Launch threads
-        self.input_queue = Queue()
+        self.input_queue = Queue[Tuple[ModelWorkerBatch, int, torch.Event]]()
         self.output_queue = Queue()
         self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
@@ -93,12 +88,8 @@ class TpModelWorkerClient:
 
         self.hicache_layer_transfer_counter = None
 
-    def register_hicache_layer_transfer_counter(self, counter):
+    def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
-
-    def set_hicache_consumer(self, consumer_index):
-        if self.hicache_layer_transfer_counter is not None:
-            self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -147,10 +138,10 @@ class TpModelWorkerClient:
     @DynamicGradMode()
     def forward_thread_func_(self):
         batch_pt = 0
-        batch_lists = [None] * 2
+        batch_lists: List = [None] * 2
 
         while True:
-            model_worker_batch, future_token_ids_ct, sync_event = self.input_queue.get()
+            model_worker_batch, future_map_ct, sync_event = self.input_queue.get()
             if not model_worker_batch:
                 break
 
@@ -166,29 +157,33 @@ class TpModelWorkerClient:
             copy_done = torch.get_device_module(self.device).Event()
 
             # Resolve future tokens in the input
-            input_ids = model_worker_batch.input_ids
-            resolve_future_token_ids(input_ids, self.future_token_ids_map)
+            self.future_map.resolve_future(model_worker_batch)
 
-            # update the consumer index of hicache to the running batch
-            self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
             # Run forward
             logits_output, next_token_ids, can_run_cuda_graph = (
                 self.worker.forward_batch_generation(
-                    model_worker_batch, model_worker_batch.launch_done
+                    model_worker_batch,
+                    model_worker_batch.launch_done,
+                    #  Skip sampling for prefill-only requests
+                    skip_sample=model_worker_batch.is_prefill_only,
                 )
             )
 
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
-            self.future_token_ids_map[
-                future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
-            ] = next_token_ids
+            if model_worker_batch.is_prefill_only:
+                # For prefill-only requests, create dummy token IDs on CPU
+                next_token_ids = torch.zeros(bs, dtype=torch.long)
+
+            # store the future indices into future map
+            self.future_map.store_to_map(future_map_ct, bs, next_token_ids)
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.to("cpu", non_blocking=True)
-                )
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                    )
                 if logits_output.input_token_logprobs is not None:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.to("cpu", non_blocking=True)
@@ -197,7 +192,9 @@ class TpModelWorkerClient:
                 logits_output.hidden_states = logits_output.hidden_states.to(
                     "cpu", non_blocking=True
                 )
-            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
+            # Only copy to CPU if not already on CPU
+            if next_token_ids.device.type != "cpu":
+                next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
 
             self.output_queue.put(
@@ -221,10 +218,10 @@ class TpModelWorkerClient:
             logits_output.next_token_logprobs = (
                 logits_output.next_token_logprobs.tolist()
             )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
-                )
+        if logits_output.input_token_logprobs is not None:
+            logits_output.input_token_logprobs = tuple(
+                logits_output.input_token_logprobs.tolist()
+            )
         next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids, can_run_cuda_graph
 
@@ -245,20 +242,14 @@ class TpModelWorkerClient:
         sync_event.record(self.scheduler_stream)
 
         # Push a new batch to the queue
-        self.input_queue.put((model_worker_batch, self.future_token_ids_ct, sync_event))
-
-        # Allocate output future objects
         bs = len(model_worker_batch.seq_lens)
-        future_next_token_ids = torch.arange(
-            -(self.future_token_ids_ct + 1),
-            -(self.future_token_ids_ct + 1 + bs),
-            -1,
-            dtype=torch.int64,
-            device=self.device,
+        cur_future_map_ct = self.future_map.update_ct(bs)
+        self.input_queue.put((model_worker_batch, cur_future_map_ct, sync_event))
+
+        # get this forward batch's future token ids
+        future_next_token_ids = self.future_map.update_next_future(
+            cur_future_map_ct, bs
         )
-        self.future_token_ids_ct = (
-            self.future_token_ids_ct + bs
-        ) % self.future_token_ids_limit
         return None, future_next_token_ids, False
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
@@ -267,6 +258,24 @@ class TpModelWorkerClient:
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.worker.init_weights_update_group(recv_req)
+        return success, message
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        success, message = self.worker.destroy_weights_update_group(recv_req)
+        return success, message
+
+    def init_weights_send_group_for_remote_instance(
+        self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        success, message = self.worker.init_weights_send_group_for_remote_instance(
+            recv_req
+        )
+        return success, message
+
+    def send_weights_to_remote_instance(
+        self, recv_req: SendWeightsToRemoteInstanceReqInput
+    ):
+        success, message = self.worker.send_weights_to_remote_instance(recv_req)
         return success, message
 
     def update_weights_from_distributed(

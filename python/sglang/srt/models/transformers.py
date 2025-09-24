@@ -213,7 +213,7 @@ class TransformersForCausalLM(nn.Module):
         """
         tp_plan = getattr(self.model.config, "base_model_tp_plan", None) or {}
 
-        if not tp_plan and self.tp_size > 1:
+        if not tp_plan and tp_size > 1:
             raise ValueError(
                 f"{type(self.model)} does not support tensor parallel yet!"
             )

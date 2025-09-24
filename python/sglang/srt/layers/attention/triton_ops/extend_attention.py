@@ -69,6 +69,7 @@ def _fwd_kernel(
     stride_buf_vh,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
     Lq: tl.constexpr,
     Lv: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -108,6 +109,15 @@ def _fwd_kernel(
 
     mask_d = offs_d < Lq
     mask_dv = offs_dv < Lv
+
+    if xai_temperature_len > 0:
+        offs_qidx = cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m
+        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+        xai_temperature_reg = tl.where(
+            offs_qidx > xai_temperature_len,
+            tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale,
+            1.0,
+        )
 
     offs_q = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
@@ -202,6 +212,9 @@ def _fwd_kernel(
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
+
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg[:, None]
 
             qk = tl.where(final_mask, qk, float("-inf"))
 
@@ -306,6 +319,9 @@ def _fwd_kernel(
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
 
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg[:, None]
+
             qk = tl.where(final_mask, qk, float("-inf"))
 
             row_max = tl.max(qk, 1)
@@ -373,6 +389,7 @@ def extend_attention_fwd(
     sliding_window_size=-1,
     sinks=None,
     window_kv_offsets=None,
+    xai_temperature_len=-1,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -477,6 +494,7 @@ def extend_attention_fwd(
         v_buffer.stride(1),
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,

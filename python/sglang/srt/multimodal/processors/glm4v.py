@@ -2,7 +2,6 @@ import re
 from typing import List, Union
 
 from decord import VideoReader
-from transformers.video_utils import VideoMetadata
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
@@ -66,17 +65,18 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         total_num_frames = len(vr)
         duration = total_num_frames / video_fps if video_fps else 0
 
-        metadata = VideoMetadata(
-            total_num_frames=int(total_num_frames),
-            fps=float(video_fps),
-            duration=float(duration),
-            video_backend="decord",
-        )
-
         # Extract all frames
         indices = list(range(total_num_frames))
         frames = vr.get_batch(indices).asnumpy()
-        metadata.frames_indices = indices
+
+        # Return metadata as dict so transformers can properly create VideoMetadata objects
+        metadata = {
+            "total_num_frames": int(total_num_frames),
+            "fps": float(video_fps),
+            "duration": float(duration),
+            "video_backend": "decord",
+            "frames_indices": indices,
+        }
 
         return frames, metadata
 

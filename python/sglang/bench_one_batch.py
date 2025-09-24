@@ -61,6 +61,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -509,6 +510,8 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
+    initialize_moe_config(server_args)
+
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)
