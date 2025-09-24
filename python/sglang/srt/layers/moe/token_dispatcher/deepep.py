@@ -77,24 +77,8 @@ class DeepEPLLOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_LL
 
 
-class AscendDeepEPLLOutput(NamedTuple):
-    """AscendDeepEP low latency dispatch output."""
-
-    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
-    topk_idx: torch.Tensor
-    topk_weights: torch.Tensor
-    masked_m: torch.Tensor
-    seg_indptr: torch.Tensor
-    expected_m: int
-
-    @property
-    def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.ASCENT_LL
-
-
 assert isinstance(DeepEPNormalOutput, DispatchOutput)
 assert isinstance(DeepEPLLOutput, DispatchOutput)
-assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
@@ -180,10 +164,19 @@ class DeepEPBuffer:
                 num_rdma_bytes,
             )
 
+        # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
         if deepep_mode == DeepEPMode.NORMAL:
-            num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
-        elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            num_qps_per_rank = DeepEPConfig.get_instance().num_sms
+        elif deepep_mode == DeepEPMode.LOW_LATENCY:
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
             num_qps_per_rank = num_experts // group.size()
+        elif deepep_mode == DeepEPMode.AUTO:
+            # low-latency and normal mode all need run
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            num_qps_per_rank = max(
+                DeepEPConfig.get_instance().num_sms, num_experts // group.size()
+            )
         else:
             raise NotImplementedError
 
@@ -434,12 +427,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-
         from sglang.srt.layers.moe.ep_moe.kernels import (
             deepep_post_reorder_triton_kernel,
         )
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
@@ -525,7 +517,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=True,
+            # TODO(shuw): pending https://github.com/deepseek-ai/DeepEP/pull/341
+            use_fp8=not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"),
         )
         return (
             hidden_states,
@@ -553,23 +546,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             masked_m
         )
 
-        if _is_npu:
-            deepep_output = AscendDeepEPLLOutput(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                masked_m,
-                self.handle[1],
-                expected_m,
-            )
-        else:
-            deepep_output = DeepEPLLOutput(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                masked_m,
-                expected_m,
-            )
+        deepep_output = DeepEPLLOutput(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            masked_m,
+            expected_m,
+        )
         return deepep_output
 
     def _dispatch_core(
