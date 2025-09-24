@@ -13,6 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Generate both client and server code
         .build_server(true)
         .build_client(true)
+        // Add protoc arguments for proto3 optional support
+        .protoc_arg("--experimental_allow_proto3_optional")
         // Add a module-level attribute for documentation and clippy warnings
         .server_mod_attribute(
             "sglang.grpc.scheduler",

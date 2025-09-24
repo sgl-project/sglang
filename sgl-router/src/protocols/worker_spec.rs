@@ -11,6 +11,10 @@ pub struct WorkerConfigRequest {
     /// Worker URL (required)
     pub url: String,
 
+    /// Worker API key (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
     /// Model ID (optional, will query from server if not provided)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
