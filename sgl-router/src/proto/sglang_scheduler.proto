@@ -36,7 +36,7 @@ message SamplingParams {
   float presence_penalty = 6;
   float repetition_penalty = 7;
 
-  int32 max_new_tokens = 8;
+  optional int32 max_new_tokens = 8;
   repeated string stop = 9;
   repeated int32 stop_token_ids = 10;
   bool skip_special_tokens = 11;
