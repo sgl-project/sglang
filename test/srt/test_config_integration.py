@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.srt.server_args import prepare_server_args
+from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 
 
 @pytest.fixture
