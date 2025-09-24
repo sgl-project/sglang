@@ -102,7 +102,7 @@ jobs:
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 50
+        timeout-minutes: 30
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 8
 
@@ -113,6 +113,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi300-gpu-2, linux-mi325-gpu-2]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -127,9 +128,9 @@ jobs:
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 40
+        timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-4-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
@@ -152,7 +153,7 @@ jobs:
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 40
+        timeout-minutes: 30
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-4-gpu-amd
 
@@ -163,6 +164,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi300-gpu-8]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -177,9 +179,9 @@ jobs:
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   performance-test-1-gpu-part-1-amd:
     needs: check-changes
@@ -350,7 +352,7 @@ jobs:
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 60
+        timeout-minutes: 30
         run: |
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_moe_eval_accuracy_large.py
 
@@ -377,7 +379,7 @@ jobs:
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 50
+        timeout-minutes: 30
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd-mi35x
 
