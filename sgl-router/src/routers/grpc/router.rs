@@ -313,7 +313,7 @@ impl GrpcRouter {
                 .map(|tools| {
                     tools
                         .iter()
-                        .map(|tool| serde_json::to_value(tool))
+                        .map(serde_json::to_value)
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .transpose()
@@ -346,12 +346,13 @@ impl GrpcRouter {
             let params = ChatTemplateParams {
                 add_generation_prompt: true,
                 continue_final_message: request.continue_final_message,
-                tools: tools_json.as_ref().map(|t| t.as_slice()),
+                tools: tools_json.as_deref(),
                 template_kwargs: final_template_kwargs,
                 ..Default::default()
             };
+
             // Handle assistant prefix for continue_final_message
-            let (final_transformed_messages, assistant_prefix) = if request.continue_final_message
+            let assistant_prefix = if request.continue_final_message
                 && !transformed_messages.is_empty()
                 && transformed_messages
                     .last()
@@ -359,22 +360,19 @@ impl GrpcRouter {
                     .and_then(|v| v.as_str())
                     == Some("assistant")
             {
-                // Extract assistant content as prefix and remove the message
-                let mut msgs = transformed_messages.clone();
-                let last_msg = msgs.pop().unwrap();
-                let prefix = last_msg
+                // Pop the last message to handle it separately
+                let last_msg = transformed_messages.pop().unwrap();
+                last_msg
                     .get("content")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                (msgs, Some(prefix))
+                    .map(|s| s.to_string())
             } else {
-                (transformed_messages, None)
+                None
             };
 
-            // Apply chat template with the processed messages
+            // Apply chat template with the (now possibly shorter) list of messages
             let rendered = hf_tokenizer
-                .apply_chat_template(&final_transformed_messages, params)
+                .apply_chat_template(&transformed_messages, params)
                 .map_err(|e| format!("Failed to apply chat template: {}", e))?;
 
             // Append assistant prefix if we have one
@@ -502,10 +500,12 @@ impl GrpcRouter {
                 // Parse JSON string to object (like Python json.loads)
                 match serde_json::from_str::<serde_json::Value>(args_str) {
                     Ok(parsed) => *args = parsed,
-                    Err(_) => eprintln!(
-                        "Warning: Failed to parse tool call arguments as JSON: {}",
-                        args_str
-                    ),
+                    Err(e) => {
+                        return Err(format!(
+                            "Failed to parse tool call arguments as JSON: '{}'. Error: {}",
+                            args_str, e
+                        ))
+                    }
                 }
             }
         }
