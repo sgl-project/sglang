@@ -120,8 +120,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     benchmark_bf16_output.run(
-        print_data=True, show_plots=True, save_path="bench_dsv3_router_gemm"
+        print_data=True
     )
     benchmark_float_output.run(
-        print_data=True, show_plots=True, save_path="bench_dsv3_router_gemm"
+        print_data=True
     )

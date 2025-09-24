@@ -174,8 +174,6 @@ if __name__ == "__main__":
         print(f"{model_name} N={N} K={K}: ")
         benchmark.run(
             print_data=True,
-            show_plots=True,
-            save_path="bench_fp8_blockwise_res",
             N=N,
             K=K,
         )

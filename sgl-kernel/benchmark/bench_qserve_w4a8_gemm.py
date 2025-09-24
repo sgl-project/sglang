@@ -189,8 +189,6 @@ if __name__ == "__main__":
         print(f"{model_name} N={N} K={K}: ")
         benchmark.run(
             print_data=True,
-            show_plots=True,
-            save_path="bench_qserve_w4a8_gemm_res",
             N=N,
             K=K,
         )

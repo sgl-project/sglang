@@ -54,4 +54,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
 
-    benchmark.run(print_data=True, show_plots=True, save_path="bench_dsv3_gemm")
+    benchmark.run(print_data=True)
