@@ -46,20 +46,20 @@ global:
   # Modify to actual model path
   model:
     path: "/your/model/path"
-  
+
   # Modify node selector
   nodeSelector:
     your-label: "value"
-  
+
   # Modify tolerations
   tolerations:
     - key: your-taint-key
       operator: Exists
-  
+
   # Modify RDMA configuration (according to actual network environment)
   rdma:
     ibDevice: "your_ib_devices"
-    
+
   # Modify storage volume paths
   volumes:
     model:
@@ -126,7 +126,7 @@ curl -X POST "http://$NODE_IP:$NODE_PORT/v1/chat/completions" \
   -H "Authorization: Bearer None" \
   -d '{
     "rid": "test123",
-    "model": "<MODEL_NAME>", 
+    "model": "<MODEL_NAME>",
     "messages": [
       {"role": "system", "content": "You are a helpful AI assistant"},
       {"role": "user", "content": "Hello, please introduce yourself"}
@@ -343,7 +343,7 @@ prefill:
 # Prefill logs
 kubectl logs -f -l leaderworkerset.sigs.k8s.io/name=<name-prefix>-prefill,role=leader
 
-# Decode logs  
+# Decode logs
 kubectl logs -f -l leaderworkerset.sigs.k8s.io/name=<name-prefix>-decode,role=leader
 
 # LoadBalancer logs

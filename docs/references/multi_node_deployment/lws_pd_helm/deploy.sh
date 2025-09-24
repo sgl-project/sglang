@@ -56,7 +56,7 @@ check_prerequisites() {
     # Check LWS CRD
     if ! kubectl get crd leaderworkersets.leaderworkerset.x-k8s.io &> /dev/null; then
         log_error "LeaderWorkerSet CRD not installed, please install LWS Operator first"
-        log_info "Install command: kubectl apply -f https://github.com/kubernetes-sigs/lws/releases/download/v0.3.0/manifests.yaml"
+        log_info "Install command: kubectl apply -f https://github.com/kubernetes-sigs/lws/releases/download/v0.7.0/manifests.yaml"
         exit 1
     fi
 
