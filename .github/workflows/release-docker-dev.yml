@@ -1,4 +1,4 @@
-name: Build Development Docker Image
+name: Build and Push Development Docker Images
 
 on:
   workflow_dispatch:
@@ -16,19 +16,22 @@ jobs:
             type: all
             tag: dev
     steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: false
-          docker-images: false
+          tool-cache: true
+          docker-images: true
           android: true
           dotnet: true
           haskell: true
           large-packages: true
-          swap-storage: false
+          swap-storage: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -45,7 +48,7 @@ jobs:
 
   build-blackwell-x86:
     if: ${{ github.repository == 'sgl-project/sglang' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         variant:
@@ -57,19 +60,22 @@ jobs:
             tag: blackwell-cu129
 
     steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: false
-          docker-images: false
+          tool-cache: true
+          docker-images: true
           android: true
           dotnet: true
           haskell: true
           large-packages: true
-          swap-storage: false
+          swap-storage: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -98,19 +104,22 @@ jobs:
             type: blackwell_aarch
             tag: blackwell-cu129
     steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: false
-          docker-images: false
+          tool-cache: true
+          docker-images: true
           android: true
           dotnet: true
           haskell: true
           large-packages: true
-          swap-storage: false
+          swap-storage: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
