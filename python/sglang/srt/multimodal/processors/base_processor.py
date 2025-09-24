@@ -222,6 +222,7 @@ class BaseMultimodalProcessor(ABC):
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
                 "Qwen2AudioProcessor",
+                "Qwen3OmniMoeProcessor",
             }:
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
@@ -426,13 +427,14 @@ class BaseMultimodalProcessor(ABC):
 
         # collect all data
         data_iterators = {}
+        print(f"{image_data=}")
         if multimodal_tokens.image_token and image_data:
             data_iterators[Modality.IMAGE] = iter(image_data)
         if multimodal_tokens.video_token and video_data:
             data_iterators[Modality.VIDEO] = iter(video_data)
         if multimodal_tokens.audio_token and audio_data:
             data_iterators[Modality.AUDIO] = iter(audio_data)
-
+        print(f"{data_iterators=}")
         # futures: the futures of loaded data
         # task_info: modality, raw_data, and other metadata of each data
         futures, task_info = self.submit_data_loading_tasks(

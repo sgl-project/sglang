@@ -232,6 +232,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = hf_config.vision_end_token_id
+
+        self.audio_start_token_id = getattr(hf_config, "audio_start_token_id", None)
+        self.audio_token_id = getattr(hf_config, "audio_token_id", None)
+        print(f"{self.audio_token_id=}")
+
         self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
@@ -245,6 +250,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
             ),
             video_token_id=hf_config.video_token_id,
+            audio_token_id=self.audio_token_id,
         ).build(_processor)
 
     async def process_mm_data_async(
@@ -255,11 +261,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        print(f"{request_obj=}")
 
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
+            audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
         )
 
@@ -318,6 +326,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "im_end_id": self.IM_END_TOKEN_ID,
             "im_token_id": self.mm_tokens.image_token_id,
             "video_token_id": self.mm_tokens.video_token_id,
+            "audio_token_id": self.mm_tokens.audio_token_id,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
         }

@@ -16,12 +16,13 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Callable, Iterable, Optional, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, MoeCausalLMOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -47,18 +48,16 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeAttention, Qwen3MoeDecoderLayer
-from sglang.srt.models.qwen3_vl import (
-    Qwen3VLMoeVisionModel,
-)
+from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     Qwen3VLMoeTextModel,
 )
 from sglang.srt.utils import add_prefix
-from transformers import PreTrainedModel
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +90,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = 0.0
         self.is_decoder = False
         self.is_causal = False
@@ -153,10 +152,12 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
-    def __init__(self,
-                 config: Qwen3OmniMoeAudioEncoderConfig,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = "", ):
+    def __init__(
+        self,
+        config: Qwen3OmniMoeAudioEncoderConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         embed_dim = config.d_model
         self.embed_dim = config.d_model
@@ -203,9 +204,8 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(
-            hidden_states=hidden_states,
+            x=hidden_states,
             cu_seqlens=cu_seqlens,
-            **kwargs,
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
@@ -465,12 +465,14 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         spatial_merge_size: int = 2,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        use_postshuffle_norm=False
+        use_postshuffle_norm=False,
     ) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size ** 2)
+        self.hidden_size = context_dim * (spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
-        self.ln_q = RMSNorm(self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6)
+        self.ln_q = RMSNorm(
+            self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6
+        )
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -502,10 +504,12 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         # x_parallel = mlp_act(x_parallel)
         # out, _ = mlp_fc2(x_parallel)
         # return out
-        x = x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x.view(-1, x.shape[-1])
-        hidden = self.ln_q(x).view(
-            -1, self.hidden_size
+        x = (
+            x.view(-1, self.hidden_size)
+            if self.use_postshuffle_norm
+            else x.view(-1, x.shape[-1])
         )
+        hidden = self.ln_q(x).view(-1, self.hidden_size)
         for layer in self.mlp:
             if isinstance(hidden, tuple):
                 hidden = hidden[0]
@@ -520,9 +524,13 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
 class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
     config: Qwen3OmniMoeVisionEncoderConfig
 
-    def __init__(self, config: Qwen3OmniMoeVisionEncoderConfig,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = None, **kwargs):
+    def __init__(
+        self,
+        config: Qwen3OmniMoeVisionEncoderConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = None,
+        **kwargs,
+    ):
         super().__init__(config, quant_config)
 
         self.merger = Qwen3OmniMoeVisionPatchMerger(
@@ -551,6 +559,14 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
     @property
     def deepstack_merger_list(self):
         return self.merger_list
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.patch_embed.proj.weight.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.patch_embed.proj.weight.device
 
 
 class Qwen3OmniMoeThinkerTextAttention(Qwen3MoeAttention):
@@ -665,10 +681,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         self.rope_deltas = None
         self.num_experts = config.text_config.num_experts
         self.num_experts_per_tok = config.text_config.num_experts_per_tok
-
-    @property
-    def use_deepstack(self) -> bool:
-        return hasattr(self, "deepstack_visual_indexes")
+        self.use_deepstack = {Modality.IMAGE: True}
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -676,137 +689,35 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
     def set_input_embeddings(self, value):
         self.model.set_input_embeddings(value)
 
-    # def get_video_features(
-    #     self,
-    #     pixel_values_videos: torch.FloatTensor,
-    #     video_grid_thw: Optional[torch.LongTensor] = None,
-    # ):
-    #     """
-    #     Encodes videos into continuous embeddings that can be forwarded to the language model.
-    #
-    #     Args:
-    #         pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
-    #             The tensors corresponding to the input videos.
-    #         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-    #             The temporal, height and width of feature shape of each video in LLM.
-    #     """
-    #     pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-    #     video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-    #     return video_embeds
-    #
-    # def get_image_features(
-    #     self,
-    #     pixel_values: torch.FloatTensor,
-    #     image_grid_thw: Optional[torch.LongTensor] = None,
-    # ):
-    #     pixel_values = pixel_values.type(self.visual.dtype)
-    #     image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-    #     return image_embeds
-    #
-    # def get_audio_features(
-    #     self,
-    #     input_features: torch.FloatTensor,
-    #     feature_attention_mask: Optional[torch.LongTensor] = None,
-    #     audio_feature_lengths: Optional[torch.LongTensor] = None,
-    # ):
-    #     if feature_attention_mask is not None:
-    #         audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-    #         input_features = input_features.permute(0, 2, 1)[
-    #             feature_attention_mask.bool()
-    #         ].permute(1, 0)
-    #     else:
-    #         audio_feature_lengths = None
-    #
-    #     feature_lens = (
-    #         audio_feature_lengths
-    #         if audio_feature_lengths is not None
-    #         else feature_attention_mask.sum(-1)
-    #     )
-    #     audio_outputs = self.audio_tower(
-    #         input_features,
-    #         feature_lens=feature_lens,
-    #     )
-    #     audio_features = audio_outputs.last_hidden_state
-    #
-    #     return audio_features
-
-    def get_placeholder_mask(
-        self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
-        image_features: Optional[torch.FloatTensor] = None,
-        video_features: Optional[torch.FloatTensor] = None,
-    ):
-        """
-        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
-        equal to the length of multimodal features. If the lengths are different, an error is raised.
-        """
-        if input_ids is None:
-            special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(
-                    self.config.image_token_id,
-                    dtype=torch.long,
-                    device=inputs_embeds.device,
-                )
-            )
-            special_image_mask = special_image_mask.all(-1)
-            special_video_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(
-                    self.config.video_token_id,
-                    dtype=torch.long,
-                    device=inputs_embeds.device,
-                )
-            )
-            special_video_mask = special_video_mask.all(-1)
-            special_audio_mask = (
-                inputs_embeds
-                == self.get_input_embeddings()(
-                torch.tensor(
-                    self.config.audio_token_id,
-                    dtype=torch.long,
-                    device=inputs_embeds.device,
-                )
-            )
-            ).all(-1)
+    def get_audio_feature(self, items: List[MultimodalDataItem]):
+        feature_attention_mask = torch.cat(
+            [item.feature_attention_mask for item in items], dim=0
+        ).type(torch.long)
+        input_features = (
+            torch.cat([item.feature for item in items])
+            .type(self.audio_tower.dtype)
+            .to(next(self.audio_tower.parameters()).device)
+        )
+        if feature_attention_mask is not None:
+            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            input_features = input_features.permute(0, 2, 1)[
+                feature_attention_mask.bool()
+            ].permute(1, 0)
         else:
-            special_image_mask = input_ids == self.config.image_token_id
-            special_video_mask = input_ids == self.config.video_token_id
-            special_audio_mask = input_ids == self.config.audio_token_id
+            audio_feature_lengths = None
 
-        n_image_tokens = special_image_mask.sum()
-        special_image_mask = (
-            special_image_mask.unsqueeze(-1)
-            .expand_as(inputs_embeds)
-            .to(inputs_embeds.device)
+        feature_lens = (
+            audio_feature_lengths
+            if audio_feature_lengths is not None
+            else feature_attention_mask.sum(-1)
         )
-        if (
-            image_features is not None
-            and inputs_embeds[special_image_mask].numel() != image_features.numel()
-        ):
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
-            )
+        audio_outputs = self.audio_tower(
+            input_features,
+            feature_lens=feature_lens,
+        )
+        audio_features = audio_outputs.last_hidden_state
 
-        n_video_tokens = special_video_mask.sum()
-        special_video_mask = (
-            special_video_mask.unsqueeze(-1)
-            .expand_as(inputs_embeds)
-            .to(inputs_embeds.device)
-        )
-        if (
-            video_features is not None
-            and inputs_embeds[special_video_mask].numel() != video_features.numel()
-        ):
-            raise ValueError(
-                f"Videos features and image tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
-            )
-
-        special_audio_mask = (
-            special_audio_mask.unsqueeze(-1)
-            .expand_as(inputs_embeds)
-            .to(inputs_embeds.device)
-        )
-        return special_image_mask, special_video_mask, special_audio_mask
+        return audio_features
 
     def forward(
         self,
@@ -979,6 +890,8 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             if ("talker" in name or "code2wav" in name) and not self.enable_talker:
                 continue
 
+            name = name.replace(".self_attn.out_proj", ".self_attn.proj")
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                     is_fused_expert = True
@@ -1021,7 +934,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    if "visual" in name:
+                    if "visual" in name or "audio_tower" in name:
                         continue
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
@@ -1078,10 +991,11 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                     if is_expert_weight:
                         # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
-                    if "visual" in name:
+                    if "visual" in name or "audio_tower" in name:
                         # adapt to VisionAttention
                         name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                         name = name.replace(r"model.visual.", r"visual.")
+                        name = name.replace(r"attn.out_proj.", r"attn.proj.")
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name.endswith(ignore_suffixes) and name not in params_dict:

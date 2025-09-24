@@ -1607,9 +1607,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             max_position_ids = position_ids.max(0, keepdim=False)[0].max(
                 -1, keepdim=True
             )[0]
-            mrope_position_deltas = (
-                max_position_ids + 1 - torch.sum(attention_mask, dim=-1, keepdim=True)
-            )
+            mrope_position_deltas = max_position_ids + 1 - s
 
             return position_ids, mrope_position_deltas
 
