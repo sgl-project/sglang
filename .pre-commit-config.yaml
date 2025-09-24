@@ -68,6 +68,6 @@ repos:
     rev: v1.0
     hooks:
       - id: fmt
-        args: ['--manifest-path', 'sgl-router/Cargo.toml', '--all', '--', '--check']
+        args: ['--manifest-path', 'sgl-router/Cargo.toml', '--', '--check']
       - id: clippy
         args: ['--manifest-path', 'sgl-router/Cargo.toml', '--all-targets', '--all-features', '--', '-D', 'warnings']
