@@ -3,12 +3,18 @@
 from typing import Optional
 
 import torch
-from sgl_kernel import (
-    cutlass_w4a8_moe_mm,
-    get_cutlass_w4a8_moe_mm_data,
-    sgl_per_tensor_quant_fp8,
-    silu_and_mul,
-)
+
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import (
+        cutlass_w4a8_moe_mm,
+        get_cutlass_w4a8_moe_mm_data,
+    )
+
+from sgl_kernel import sgl_per_tensor_quant_fp8, silu_and_mul
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
     post_reorder_triton_kernel_for_cutlass_moe,
