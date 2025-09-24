@@ -168,6 +168,13 @@ suites = {
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
     ],
+    "quant_test": [
+        TestFile("quant/test_awq.py", 163),
+        TestFile("test_bnb.py", 5),
+        TestFile("test_gptqmodel_dynamic.py", 102),
+        TestFile("test_int4_quant.py", 185),
+        # TestFile("test_gguf.py", 96),
+    ],
 }
 
 # Add AMD tests

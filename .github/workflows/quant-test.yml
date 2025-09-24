@@ -1,0 +1,42 @@
+name: Quant Test
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/ci/**"
+      - "test/**"
+      - ".github/workflows/quant-test.yml"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/ci/**"
+      - "test/**"
+      - ".github/workflows/quant-test.yml"
+    types: [synchronize, labeled]
+  workflow_dispatch:
+
+concurrency:
+  group: quant-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quant-test:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+          pip install "bitsandbytes>=0.44.0"
+
+      - name: Run Quant tests
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite quant_test --timeout-per-file 600
