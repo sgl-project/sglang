@@ -200,3 +200,18 @@ pub struct ServerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template: Option<String>,
 }
+
+/// Result from flush cache operations across workers
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FlushCacheResult {
+    /// URLs of workers where cache flush succeeded
+    pub successful: Vec<String>,
+    /// URLs and error messages for workers where cache flush failed
+    pub failed: Vec<(String, String)>,
+    /// Total number of workers attempted
+    pub total_workers: usize,
+    /// Number of HTTP workers (gRPC workers don't support flush cache)
+    pub http_workers: usize,
+    /// Human-readable summary message
+    pub message: String,
+}
