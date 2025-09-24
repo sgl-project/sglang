@@ -814,7 +814,7 @@ def get_multimodal_data_bounds(
     return valid_pairs_tensor
 
 
-def reconstruct_tensor_from_infos(ts_infos: dict):
+def reconstruct_tensor_from_infos(ts_infos: dict, target_device=None):
     device = ts_infos["device"]
     dtype = ts_infos["dtype"]
     ipc_handle_list = ts_infos["ipc_handle_list"]
@@ -835,6 +835,10 @@ def reconstruct_tensor_from_infos(ts_infos: dict):
             )
             ts_list.append(recreated_tensor)
 
+    if target_device is not None:
+        for idx in range(len(ts_list)):
+            ts_list[idx] = ts_list[idx].to(target_device, non_blocking=True)
+
     return ts_list
 
 
@@ -844,10 +848,14 @@ def data_hash(data) -> int:
 
     if isinstance(data, dict):
         if data["cat_feature"]:
-            recons_ret = reconstruct_tensor_from_infos(data)
+            recons_ret = reconstruct_tensor_from_infos(
+                data, torch.cuda.current_device()
+            )
             new_tensor = torch.cat(recons_ret)
         else:
-            recons_ret = reconstruct_tensor_from_infos(data)
+            recons_ret = reconstruct_tensor_from_infos(
+                data, torch.cuda.current_device()
+            )
             new_tensor = torch.stack(recons_ret)
         data["pixel_values"] = new_tensor
         assert "hash_keys" in data, "invalid dict data"

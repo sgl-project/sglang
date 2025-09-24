@@ -289,6 +289,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         ).build(_processor)
 
         self.image_cache_table = FIFOTensorCache()
+        self._cache_lock = asyncio.Lock()
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -544,10 +545,10 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                 "remove_image_idx": remove_image_idx,
                 "image_grid_thw_lists": image_grid_thw_lists,
             }
-
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens, **args_dict
-            )
+            async with self._cache_lock:
+                mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens, **args_dict
+                )
 
         else:
             # Qwen-specific: resize images if they are raw Image objects

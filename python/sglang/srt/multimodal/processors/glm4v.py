@@ -1,5 +1,5 @@
+import asyncio
 import math
-import re
 from typing import List, Union
 
 import torch
@@ -109,6 +109,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         ).build(_processor)
 
         self.image_cache_table = FIFOTensorCache()
+        self._cache_lock = asyncio.Lock()
 
     # adapted from https://github.com/huggingface/transformers/blob/369c99d0cea403b77bd0aef818527106453fd9fc/src/transformers/video_utils.py#L312
     async def preprocess_video(self, vr: VideoReader):
@@ -426,10 +427,10 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # transformer requires the video inputs to be under this format
             base_output.videos = [base_output.videos]
             video_metadata = [video_metadata]
-
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens, video_metadata=video_metadata, **args_dict
-        )
+        async with self._cache_lock:
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens, video_metadata=video_metadata, **args_dict
+            )
 
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
