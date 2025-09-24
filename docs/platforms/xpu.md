@@ -26,20 +26,11 @@ Currently SGLang XPU only supports installation from source. Please refer to ["G
 
 ```bash
 # Create and activate a conda environment
-conda create -n sgl-cpu python=3.12 -y
-conda activate sgl-cpu
+conda create -n sgl-xpu python=3.12 -y
+conda activate sgl-xpu
 
-# Set PyTorch CPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
-pip3 install torch==2.8.0 torchvision torchaudio pytorch-triton-xpu==3.4.0 --index-url https://download.pytorch.org/whl/xpu
-
-# Check if some conda related environment variables have been set
-env | grep -i conda
-# The following environment variable settings are required
-# if they have not been set properly
-export CONDA_EXE=$(which conda)
-export CONDA_ROOT=${CONDA_EXE}/../..
-export CONDA_PREFIX=${CONDA_ROOT}/envs/sgl-cpu
-export PATH=${PATH}:${CONDA_ROOT}/bin:${CONDA_ROOT}/condabin
+# Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
+pip3 install torch==2.8.0+xpu torchao torchvision torchaudio pytorch-triton-xpu==3.4.0 --index-url https://download.pytorch.org/whl/xpu
 
 # Clone the SGLang code
 git clone https://github.com/sgl-project/sglang.git
@@ -50,12 +41,7 @@ git checkout <YOUR-DESIRED-VERSION>
 cp python/pyproject_xpu.toml python/pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
-conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
 pip install -e "python[all_xpu]"
-
-# Other required environment variables
-# Recommend to set these in ~/.bashrc in order not to set every time in a new terminal
-export LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libiomp5.so:${CONDA_PREFIX}/lib/libtcmalloc.so:${CONDA_PREFIX}/lib/libtbbmalloc.so.2
 ```
 
 ### Install Using Docker
