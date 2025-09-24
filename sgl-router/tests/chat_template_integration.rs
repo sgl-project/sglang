@@ -198,7 +198,7 @@ assistant:
 
     let processor = ChatTemplateProcessor::new(template.to_string(), None, None);
 
-    let messages = vec![spec::ChatMessage::User {
+    let messages = [spec::ChatMessage::User {
         role: "user".to_string(),
         content: spec::UserMessageContent::Text("Test".to_string()),
         name: None,
@@ -281,7 +281,7 @@ fn test_template_with_multimodal_content() {
 
     let processor = ChatTemplateProcessor::new(template.to_string(), None, None);
 
-    let messages = vec![spec::ChatMessage::User {
+    let messages = [spec::ChatMessage::User {
         role: "user".to_string(),
         content: spec::UserMessageContent::Parts(vec![
             spec::ContentPart::Text {

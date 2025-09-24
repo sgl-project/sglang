@@ -137,7 +137,7 @@ mod tests {
         )
         .unwrap();
 
-        let messages = vec![spec::ChatMessage::User {
+        let messages = [spec::ChatMessage::User {
             role: "user".to_string(),
             content: spec::UserMessageContent::Text("Test".to_string()),
             name: None,
