@@ -9,6 +9,7 @@ from sgl_kernel.testing.rotary_embedding import (
     RotaryEmbedding,
     create_inputs,
 )
+from sgl_kernel.utils import is_arch_support_pdl
 
 from sglang.srt.bench_utils import bench_kineto
 
@@ -70,6 +71,7 @@ def benchmark(batch_size, seq_len, save_kv_cache, provider):
 
     query_flashinfer, key_flashinfer = inputs["query"].clone(), inputs["key"].clone()
 
+    enable_pdl = is_arch_support_pdl()
     bench_fn = lambda: rope_flashinfer.forward_cuda(
         inputs["pos_ids"],
         query_flashinfer,
@@ -86,6 +88,7 @@ def benchmark(batch_size, seq_len, save_kv_cache, provider):
             if save_kv_cache
             else None
         ),
+        enable_pdl=enable_pdl,
     )
 
     time_s = bench_kineto(bench_fn, kernel_names="BatchQKApplyRotaryPosIds")
