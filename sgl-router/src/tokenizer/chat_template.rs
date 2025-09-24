@@ -307,7 +307,8 @@ impl ChatTemplateProcessor {
 
     /// Apply the chat template to a list of messages
     ///
-    /// This mimics the behavior of HuggingFace's apply_chat_template method.
+    /// This mimics the behavior of HuggingFace's apply_chat_template method
+    /// but returns the formatted string instead of token IDs.
     /// Messages should be pre-processed into the format expected by the template.
     pub fn apply_chat_template(
         &self,
