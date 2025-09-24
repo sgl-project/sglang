@@ -177,10 +177,6 @@ message GenerateStreamChunk {
 
   // Hidden states (if requested)
   repeated float hidden_states = 7;
-
-  // Metadata
-  float generation_time = 8;  // Time to generate this token
-  int32 queue_time = 9;       // Time spent in queue
 }
 
 message GenerateComplete {
@@ -285,10 +281,9 @@ message EmbedComplete {
 
   // Additional metadata
   int32 embedding_dim = 4;
-  float generation_time = 5;
 
   // For batch embeddings
-  repeated Embedding batch_embeddings = 6;
+  repeated Embedding batch_embeddings = 5;
 }
 
 message Embedding {

@@ -161,7 +161,7 @@ class GenerateResponse(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., chunk: _Optional[_Union[GenerateStreamChunk, _Mapping]] = ..., complete: _Optional[_Union[GenerateComplete, _Mapping]] = ..., error: _Optional[_Union[GenerateError, _Mapping]] = ...) -> None: ...
 
 class GenerateStreamChunk(_message.Message):
-    __slots__ = ("token_id", "text", "prompt_tokens", "completion_tokens", "cached_tokens", "logprobs", "hidden_states", "generation_time", "queue_time")
+    __slots__ = ("token_id", "text", "prompt_tokens", "completion_tokens", "cached_tokens", "logprobs", "hidden_states")
     TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
     TEXT_FIELD_NUMBER: _ClassVar[int]
     PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
@@ -169,8 +169,6 @@ class GenerateStreamChunk(_message.Message):
     CACHED_TOKENS_FIELD_NUMBER: _ClassVar[int]
     LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     HIDDEN_STATES_FIELD_NUMBER: _ClassVar[int]
-    GENERATION_TIME_FIELD_NUMBER: _ClassVar[int]
-    QUEUE_TIME_FIELD_NUMBER: _ClassVar[int]
     token_id: int
     text: str
     prompt_tokens: int
@@ -178,9 +176,7 @@ class GenerateStreamChunk(_message.Message):
     cached_tokens: int
     logprobs: LogProbs
     hidden_states: _containers.RepeatedScalarFieldContainer[float]
-    generation_time: float
-    queue_time: int
-    def __init__(self, token_id: _Optional[int] = ..., text: _Optional[str] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., logprobs: _Optional[_Union[LogProbs, _Mapping]] = ..., hidden_states: _Optional[_Iterable[float]] = ..., generation_time: _Optional[float] = ..., queue_time: _Optional[int] = ...) -> None: ...
+    def __init__(self, token_id: _Optional[int] = ..., text: _Optional[str] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., logprobs: _Optional[_Union[LogProbs, _Mapping]] = ..., hidden_states: _Optional[_Iterable[float]] = ...) -> None: ...
 
 class GenerateComplete(_message.Message):
     __slots__ = ("output_ids", "output_text", "finish_reason", "all_logprobs", "all_hidden_states")
@@ -283,20 +279,18 @@ class EmbedResponse(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., complete: _Optional[_Union[EmbedComplete, _Mapping]] = ..., error: _Optional[_Union[EmbedError, _Mapping]] = ...) -> None: ...
 
 class EmbedComplete(_message.Message):
-    __slots__ = ("embedding", "prompt_tokens", "cached_tokens", "embedding_dim", "generation_time", "batch_embeddings")
+    __slots__ = ("embedding", "prompt_tokens", "cached_tokens", "embedding_dim", "batch_embeddings")
     EMBEDDING_FIELD_NUMBER: _ClassVar[int]
     PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
     CACHED_TOKENS_FIELD_NUMBER: _ClassVar[int]
     EMBEDDING_DIM_FIELD_NUMBER: _ClassVar[int]
-    GENERATION_TIME_FIELD_NUMBER: _ClassVar[int]
     BATCH_EMBEDDINGS_FIELD_NUMBER: _ClassVar[int]
     embedding: _containers.RepeatedScalarFieldContainer[float]
     prompt_tokens: int
     cached_tokens: int
     embedding_dim: int
-    generation_time: float
     batch_embeddings: _containers.RepeatedCompositeFieldContainer[Embedding]
-    def __init__(self, embedding: _Optional[_Iterable[float]] = ..., prompt_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., embedding_dim: _Optional[int] = ..., generation_time: _Optional[float] = ..., batch_embeddings: _Optional[_Iterable[_Union[Embedding, _Mapping]]] = ...) -> None: ...
+    def __init__(self, embedding: _Optional[_Iterable[float]] = ..., prompt_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., embedding_dim: _Optional[int] = ..., batch_embeddings: _Optional[_Iterable[_Union[Embedding, _Mapping]]] = ...) -> None: ...
 
 class Embedding(_message.Message):
     __slots__ = ("values", "index")

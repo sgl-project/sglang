@@ -266,7 +266,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     prompt_tokens=result.get("prompt_tokens", 0),
                     cached_tokens=0,
                     embedding_dim=len(result["embedding"]),
-                    generation_time=time.time() - self.start_time,
                 ),
             )
 
@@ -485,8 +484,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 prompt_tokens=0,
                 completion_tokens=len(output.get("token_ids", [])),
                 cached_tokens=0,
-                generation_time=time.time() - self.start_time,
-                queue_time=0.0,
             ),
         )
 
