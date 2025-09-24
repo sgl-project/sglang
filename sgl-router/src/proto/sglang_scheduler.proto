@@ -47,6 +47,7 @@ message SamplingParams {
     string regex = 13;
     string json_schema = 14;
     string ebnf_grammar = 15;
+    string structural_tag = 24;
   }
 
   // LoRA adapter
@@ -64,7 +65,6 @@ message SamplingParams {
   bool no_stop_trim = 21;
   int32 stream_interval = 22;
   map<string, float> logit_bias = 23;
-  string structural_tag = 24;
 
   // Custom parameters for extensibility
   google.protobuf.Struct custom_params = 25;
