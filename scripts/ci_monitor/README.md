@@ -321,7 +321,7 @@ The tool recognizes these failure patterns:
 
 ### Common Issues
 
-1. **404 Error**: 
+1. **404 Error**:
    - Ensure the repository name is correct (`sgl-project/sglang`)
    - **Most common cause**: Missing `repo` or `workflow` permissions in your GitHub token
    - Go to [GitHub Settings > Personal Access Tokens](https://github.com/settings/tokens) and regenerate with correct permissions
