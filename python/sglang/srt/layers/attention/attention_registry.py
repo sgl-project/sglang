@@ -24,12 +24,16 @@ def attn_backend_wrapper(runner, full_attn_backend):
 
     # wrap for hybrid GDN models
     if runner.is_hybrid_gdn:
-        from sglang.srt.utils import is_blackwell
+        from sglang.srt.utils import is_blackwell, is_npu
 
         if is_blackwell():
             assert (
                 runner.server_args.attention_backend == "triton"
             ), "triton backend is the only supported backend on Blackwell GPUs for hybrid GDN models, use --attention-backend triton to specify the backend."
+        if is_npu():
+            assert (
+                runner.server_args.attention_backend == "ascend"
+            ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
         logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             HybridLinearAttnBackend,
