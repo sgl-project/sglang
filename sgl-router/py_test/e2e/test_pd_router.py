@@ -261,3 +261,74 @@ def test_pd_genai_bench(e2e_model: str, pd_cluster, genai_bench_runner):
         },
         kill_procs=pd_cluster.workers,
     )
+
+
+@pytest.mark.e2e
+def test_pd_logprobs_merge(e2e_model: str, pd_cluster):
+    """
+    Verify PD router returns full input/output logprobs and input_top_logprobs merged
+    across prefill and decode for a generate request.
+    """
+    url = f"{pd_cluster.router_url}/generate"
+
+    payload = {
+        "input_ids": [[128000, 3923, 892, 374, 433, 30, 318, 281, 220, 50256]],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 4},
+        "return_logprob": True,
+        "logprob_start_len": 0,
+        "top_logprobs_num": 2,
+    }
+
+    r = requests.post(url, json=payload, timeout=60)
+    assert r.status_code == 200, f"unexpected status {r.status_code}: {r.text}"
+    data = r.json()
+    assert "meta_info" in data
+    meta = data["meta_info"]
+
+    assert "input_token_logprobs" in meta
+    assert "output_token_logprobs" in meta
+
+    input_len = len(payload["input_ids"][0])
+    assert isinstance(meta["input_token_logprobs"], list)
+    assert (
+        len(meta["input_token_logprobs"])
+        >= max(1, input_len - payload["logprob_start_len"]) - 1
+    )
+
+    assert isinstance(meta["output_token_logprobs"], list)
+    assert (
+        len(meta["output_token_logprobs"])
+        == payload["sampling_params"]["max_new_tokens"]
+    )
+
+    if payload["top_logprobs_num"] > 0:
+        assert "input_top_logprobs" in meta
+        assert isinstance(meta["input_top_logprobs"], list)
+        assert len(meta["input_top_logprobs"]) >= len(meta["input_token_logprobs"])
+
+    payload_stream = dict(payload)
+    payload_stream["stream"] = True
+    with requests.post(url, json=payload_stream, stream=True, timeout=60) as rs:
+        assert rs.status_code == 200
+        line_count = 0
+        first_event = None
+        for line in rs.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("data: "):
+                content = line[len("data: ") :]
+                if content == "[DONE]":
+                    break
+                first_event = content
+                line_count += 1
+                break
+        assert line_count >= 1 and first_event is not None
+        try:
+            ev = rs.json()
+        except Exception:
+            import json as _json
+
+            ev = _json.loads(first_event)
+        assert "meta_info" in ev
+        assert "input_token_logprobs" in ev["meta_info"]
+        assert "completion_tokens" in ev["meta_info"]
