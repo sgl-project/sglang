@@ -90,7 +90,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
    fi \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
- && python3 -m flashinfer --download-cubin
+ && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 
 # Download source files
