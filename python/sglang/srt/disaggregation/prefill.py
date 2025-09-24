@@ -416,8 +416,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.hidden_states_tensor = (
-                            batch.spec_info.hidden_states[i].cpu().clone()
-                        )
+                        batch.spec_info.hidden_states[i].cpu().clone()
+                    )
                 else:
                     req.hidden_states_tensor = None
                 if req.return_logprob:
