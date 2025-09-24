@@ -162,6 +162,22 @@ def _check(cc_major):
     ) >= (12, 3)
 
 
+@contextmanager
+def device_context(device: torch.device):
+    if device.type == "cuda" and is_cuda():
+        with torch.cuda.device(device.index):
+            yield
+    elif device.type == "xpu" and is_xpu():
+        with torch.xpu.device(device.index):
+            yield
+    elif device.type == "npu" and is_npu():
+        with torch.npu.device(device.index):
+            yield
+    else:
+        # other vendors' devices, e.g., hpu, npu, cpu
+        yield
+
+
 is_ampere_with_cuda_12_3 = lambda: _check(8)
 is_hopper_with_cuda_12_3 = lambda: _check(9)
 
@@ -251,6 +267,14 @@ def cpu_has_amx_support():
 
 def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
+
+
+def xpu_has_xmx_support():
+    # TODO: update with XPU capalibity query
+    if is_xpu():
+        # currently only PVC/LNL/BMG supports F64, so we only support these now
+        return torch.xpu.get_device_properties().has_fp64
+    return False
 
 
 def is_flashinfer_available():
