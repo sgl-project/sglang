@@ -71,7 +71,8 @@ jobs:
       github.repository == 'sgl-project/sglang' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       contains(github.event.pull_request.labels.*.name, 'benchmark'))
+       (contains(github.event.pull_request.labels.*.name, 'router-benchmark') &&
+        contains(github.event.pull_request.labels.*.name, 'run-ci')))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -143,7 +144,8 @@ jobs:
       github.repository == 'sgl-project/sglang' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       contains(github.event.pull_request.labels.*.name, 'benchmark'))
+       (contains(github.event.pull_request.labels.*.name, 'router-benchmark') &&
+        contains(github.event.pull_request.labels.*.name, 'run-ci')))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -209,7 +211,8 @@ jobs:
       github.repository == 'sgl-project/sglang' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       contains(github.event.pull_request.labels.*.name, 'benchmark'))
+       (contains(github.event.pull_request.labels.*.name, 'router-benchmark') &&
+        contains(github.event.pull_request.labels.*.name, 'run-ci')))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

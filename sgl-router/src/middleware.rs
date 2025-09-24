@@ -1,12 +1,13 @@
 use axum::{
-    extract::Request, extract::State, http::HeaderValue, http::StatusCode, middleware::Next,
-    response::IntoResponse, response::Response,
+    body::Body, extract::Request, extract::State, http::header, http::HeaderValue,
+    http::StatusCode, middleware::Next, response::IntoResponse, response::Response,
 };
 use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
@@ -16,6 +17,49 @@ pub use crate::core::token_bucket::TokenBucket;
 
 use crate::metrics::RouterMetrics;
 use crate::server::AppState;
+
+#[derive(Clone)]
+pub struct AuthConfig {
+    pub api_key: Option<String>,
+}
+
+/// Middleware to validate Bearer token against configured API key
+/// Only active when router has an API key configured
+pub async fn auth_middleware(
+    State(auth_config): State<AuthConfig>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if let Some(expected_key) = &auth_config.api_key {
+        // Extract Authorization header
+        let auth_header = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok());
+
+        match auth_header {
+            Some(header_value) if header_value.starts_with("Bearer ") => {
+                let token = &header_value[7..]; // Skip "Bearer "
+                                                // Use constant-time comparison to prevent timing attacks
+                let token_bytes = token.as_bytes();
+                let expected_bytes = expected_key.as_bytes();
+
+                // Check if lengths match first (this is not constant-time but necessary)
+                if token_bytes.len() != expected_bytes.len() {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+
+                // Constant-time comparison of the actual values
+                if token_bytes.ct_eq(expected_bytes).unwrap_u8() != 1 {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+
+    Ok(next.run(request).await)
+}
 
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
