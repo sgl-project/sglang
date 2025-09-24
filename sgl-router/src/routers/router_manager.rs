@@ -289,10 +289,6 @@ impl RouterTrait for RouterManager {
         self
     }
 
-    async fn health(&self, _req: Request<Body>) -> Response {
-        (StatusCode::OK, "RouterManager is healthy").into_response()
-    }
-
     async fn health_generate(&self, _req: Request<Body>) -> Response {
         // TODO: Should check if any router has healthy workers
         (
@@ -512,16 +508,6 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn flush_cache(&self) -> Response {
-        // TODO: Call flush_cache on all routers that have workers
-        if self.routers.is_empty() {
-            (StatusCode::SERVICE_UNAVAILABLE, "No routers configured").into_response()
-        } else {
-            // TODO: Actually flush cache on all routers
-            (StatusCode::OK, "Cache flush requested").into_response()
-        }
-    }
-
     async fn get_worker_loads(&self) -> Response {
         let workers = self.worker_registry.get_all();
         let loads: Vec<serde_json::Value> = workers
@@ -548,15 +534,6 @@ impl RouterTrait for RouterManager {
 
     fn router_type(&self) -> &'static str {
         "manager"
-    }
-
-    fn readiness(&self) -> Response {
-        if self.routers.is_empty() {
-            (StatusCode::SERVICE_UNAVAILABLE, "No routers configured").into_response()
-        } else {
-            // TODO: Check readiness of all routers
-            (StatusCode::OK, "Ready").into_response()
-        }
     }
 }
 
