@@ -77,7 +77,7 @@ RUN pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --inde
 
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
-    (cd sglang/python && pip install -v .[srt_npu] --no-cache-dir) && \
+    (cd sglang/python && rm -rf pyproject.toml && mv pyproject_other.toml pyproject.toml && pip install -v .[srt_npu] --no-cache-dir) && \
     (cd sglang/sgl-router && python -m build && pip install --force-reinstall dist/*.whl) && \
     rm -rf sglang
 
