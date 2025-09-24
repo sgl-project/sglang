@@ -355,7 +355,8 @@ class EICStorage(HiCacheStorage):
             return self.zero_copy_batch_get([key], [target_location])
         else:
             return self.generic_batch_get([key], [target_location])
-
+     
+    # use for v1 interface, and shound not be called directly
     def batch_get(
         self,
         keys: List[str],
@@ -688,7 +689,7 @@ class EICStorage(HiCacheStorage):
 
     def _batch_get_preprocess(self, keys, host_indices):
         page_num = len(host_indices) // self.page_size
-        # use mmeory pool directly or dummy page
+        # use memory pool directly or dummy page
         values = (
             [
                 self.memory_pool_host.get_data_page(host_indices[i * self.page_size], flat=False)
