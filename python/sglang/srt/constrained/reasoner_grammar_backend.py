@@ -21,11 +21,11 @@ from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
-    def __init__(self, grammar: BaseGrammarObject, think_end_id):
+    def __init__(self, grammar: BaseGrammarObject, think_end_id, may_can_reasoning):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
-        self.is_in_reasoning = True
+        self.is_in_reasoning = may_can_reasoning
 
     def accept_token(self, token: int):
         if token == self.think_end_id:
@@ -34,10 +34,16 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if not self.is_in_reasoning and token != self.think_end_id:
             self.grammar.accept_token(token)
 
+    def rollback(self, k: int):
+        self.grammar.rollback(k)
+
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
         return self.grammar.allocate_vocab_mask(vocab_size, batch_size, device)
+
+    def is_terminated(self):
+        return self.grammar.is_terminated()
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if not self.is_in_reasoning:
@@ -51,7 +57,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self.grammar.apply_vocab_mask
 
     def copy(self) -> BaseGrammarObject:
-        return ReasonerGrammarObject(self.grammar.copy(), self.think_end_id)
+        return ReasonerGrammarObject(
+            self.grammar.copy(), self.think_end_id, self.is_in_reasoning
+        )
 
     @property
     def finished(self):
@@ -82,9 +90,10 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self.think_end_id = think_end_id
 
     def _init_value_dispatch(
-        self, key: Tuple[str, str]
+        self, key: Tuple[str, str, bool]
     ) -> Optional[ReasonerGrammarObject]:
         ret = self.grammar_backend._init_value_dispatch(key)
         if ret is None:
             return None
-        return ReasonerGrammarObject(ret, self.think_end_id)
+        may_can_reasoning = key[2]
+        return ReasonerGrammarObject(ret, self.think_end_id, may_can_reasoning)
