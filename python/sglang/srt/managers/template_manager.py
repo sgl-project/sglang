@@ -198,7 +198,6 @@ class TemplateManager:
         # Set the global completion template name in the parser
         set_completion_template_name(self._completion_template_name)
 
-
     def initialize_templates(
         self,
         tokenizer_manager,
@@ -293,7 +292,6 @@ class TemplateManager:
         self._completion_template_name = template["name"]
         # Set the global completion template name in the parser
         set_completion_template_name(self._completion_template_name)
-
 
     def _resolve_hf_chat_template(self, tokenizer_manager) -> Optional[str]:
         """
