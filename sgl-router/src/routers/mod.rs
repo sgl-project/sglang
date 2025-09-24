@@ -11,7 +11,7 @@ use std::fmt::Debug;
 
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    ResponsesGetParams, ResponsesRequest,
 };
 
 pub mod factory;
@@ -82,7 +82,12 @@ pub trait RouterTrait: Send + Sync + Debug {
     ) -> Response;
 
     /// Retrieve a stored/background response by id
-    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
+    async fn get_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        params: &ResponsesGetParams,
+    ) -> Response;
 
     /// Cancel a background response by id
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
