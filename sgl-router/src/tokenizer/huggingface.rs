@@ -4,7 +4,8 @@ use anyhow::{Error, Result};
 use tokenizers::tokenizer::Tokenizer as HfTokenizer;
 
 use super::chat_template::{
-    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateProcessor,
+    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
+    ChatTemplateProcessor,
 };
 use super::traits::{
     Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
@@ -165,16 +166,11 @@ impl HuggingFaceTokenizer {
     pub fn apply_chat_template(
         &self,
         messages: &[serde_json::Value],
-        add_generation_prompt: bool,
+        params: ChatTemplateParams,
     ) -> Result<String> {
         if let Some(ref template) = self.chat_template {
-            let processor = ChatTemplateProcessor::new(
-                template.clone(),
-                self.special_tokens.bos_token.clone(),
-                self.special_tokens.eos_token.clone(),
-            );
-
-            processor.apply_chat_template(messages, add_generation_prompt)
+            let processor = ChatTemplateProcessor::new(template.clone());
+            processor.apply_chat_template(messages, params)
         } else {
             Err(Error::msg(
                 "Cannot use chat template functions because tokenizer.chat_template is not set and no template \
