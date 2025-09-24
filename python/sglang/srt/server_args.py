@@ -550,7 +550,7 @@ class ServerArgs:
                 elif gpu_mem < 90 * 1024:
                     # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs -)
                     # if tp >= 4, cuda_graph_max_bs 512, else 256
-                    reserved_mem = (11.5 + parallel_size / 2) * 1024
+                    reserved_mem = (12 + parallel_size / 2) * 1024
                 elif gpu_mem < 100 * 1024:
                     # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
                     reserved_mem = (15 + parallel_size / 2) * 1024
@@ -625,37 +625,36 @@ class ServerArgs:
                 self.cuda_graph_max_bs = 160
 
         if self.cuda_graph_bs is None:
-            self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes(gpu_mem)
+            self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
 
-    def _generate_cuda_graph_batch_sizes(self, gpu_mem):
+    def _generate_cuda_graph_batch_sizes(self):
         """
-        Generate the list of batch sizes for CUDA graph capture based on GPU memory and configuration.
+        Generate the list of batch sizes for CUDA graph capture based on cuda_graph_max_bs.
         This integrates the logic from cuda_graph_runner.py.
         """
         if self.speculative_algorithm is None:
             if self.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + list(
-                    range(48, min(self.cuda_graph_max_bs + 1, 161), 16)
-                )
+                capture_bs = list(range(1, self.cuda_graph_max_bs))
             else:
-                capture_bs = [1, 2, 4, 8] + list(
-                    range(16, min(self.cuda_graph_max_bs + 1, 161), 8)
+                # Normal case: [1, 2, 4, 8] + list(range(16, 257, 8)) + list(range(272, 512, 16)) + list(range(512, cuda_graph_max_bs))
+                capture_bs = (
+                    [1, 2, 4, 8] + list(range(16, 257, 8)) + list(range(272, 512, 16))
                 )
+                if self.cuda_graph_max_bs > 512:
+                    capture_bs += list(range(512, self.cuda_graph_max_bs))
         else:
-            # Since speculative decoding requires more cuda graph memory, we capture less.
+            # Spec decoding case: list(range(1, 9, 1)) + list(range(10, 33, 2)) + list(range(40, 64, 4)) + list(range(72, 257, 8))
             capture_bs = (
-                list(range(1, 9))
+                list(range(1, 9, 1))
                 + list(range(10, 33, 2))
-                + list(range(40, 64, 8))
-                + list(range(80, min(self.cuda_graph_max_bs + 1, 161), 16))
+                + list(range(40, 64, 4))
+                + list(range(72, 257, 8))
             )
+            if self.cuda_graph_max_bs > 257:
+                capture_bs += list(range(272, self.cuda_graph_max_bs, 16))
 
-        # Add additional batch sizes based on GPU memory capacity
-        if gpu_mem is not None:
-            if gpu_mem > 90 * 1024 and gpu_mem < 160 * 1000:  # H200, H20
-                capture_bs += list(range(160, min(self.cuda_graph_max_bs + 1, 513), 16))
-            if gpu_mem > 160 * 1000:  # B200, MI300
-                capture_bs += list(range(160, 257, 8)) + list(range(256, 513, 16))
+        # Filter batch sizes to ensure they don't exceed cuda_graph_max_bs
+        capture_bs = [bs for bs in capture_bs if bs < self.cuda_graph_max_bs]
 
         return capture_bs
 
