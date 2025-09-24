@@ -1840,7 +1840,7 @@ class ServerArgs:
         parser.add_argument(
             "--mm-attention-backend",
             type=str,
-            choices=["sdpa", "fa3", "triton_attn", "ascend_attn"],
+            choices=["sdpa", "fa3", "triton", "ascend_attn"],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
         )

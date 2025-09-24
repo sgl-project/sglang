@@ -389,7 +389,7 @@ class VisionAscendAttention(nn.Module):
 
 
 QKV_BACKEND_IMPL = {
-    "triton_attn": VisionTritonAttention,
+    "triton": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
     "ascend_attn": VisionAscendAttention,
@@ -525,7 +525,7 @@ class VisionAttention(nn.Module):
         Priority: server args override > constructor arg > platform default.
 
         Platform defaults:
-        - CUDA: "triton_attn"
+        - CUDA: "triton"
         - Non-CUDA: "sdpa"
         """
         override_backend = global_server_args_dict["mm_attention_backend"]
@@ -538,7 +538,7 @@ class VisionAttention(nn.Module):
             if major == 9:
                 backend = "fa3"
             else:
-                backend = "triton_attn"
+                backend = "triton"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell():

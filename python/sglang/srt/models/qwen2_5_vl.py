@@ -131,7 +131,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             flatten_batch = True
         elif attn_implementation == "flash_attention_2":
             softmax_in_single_precision = False
-            qkv_backend = "triton_attn"
+            qkv_backend = "triton"
             flatten_batch = True
         elif attn_implementation == "eager":
             softmax_in_single_precision = True

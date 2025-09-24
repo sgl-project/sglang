@@ -110,7 +110,7 @@ class SiglipEncoderLayer(nn.Module):
             qkv_backend = "sdpa"
             softmax_in_single_precision = False
         elif attn_implementation == "flash_attention_2":
-            qkv_backend = "triton_attn"
+            qkv_backend = "triton"
             softmax_in_single_precision = False
         elif attn_implementation == "eager":
             qkv_backend = "sdpa"
