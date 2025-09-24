@@ -159,7 +159,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         ):
             kwargs["device"] = "cuda"
 
-        cache_mm_image_items = get_bool_env_var("SGL_CACHE_MM_IMAGE")
+        cache_mm_image_items = get_bool_env_var("SGLANG_CACHE_MM_IMAGE")
         is_glm4v_processor = isinstance(
             processor.image_processor,
             transformers.models.glm4v.image_processing_glm4v_fast.Glm4vImageProcessorFast,
@@ -258,13 +258,13 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             available_size_mb = (total - allocated - reserved) // (1024 * 1024)
 
             max_cache_image_size = CACHED_IMAGE_MAX_MB_SIZE
-            if get_int_env_var("SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB"):
+            if get_int_env_var("SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB"):
                 max_cache_image_size = get_int_env_var(
-                    "SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB"
+                    "SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB"
                 )
             else:
                 logger.info(
-                    "not set SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB, use default value = {}".format(
+                    "not set SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB, use default value = {}".format(
                         max_cache_image_size
                     )
                 )
@@ -346,7 +346,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        cache_mm_image_items = get_bool_env_var("SGL_CACHE_MM_IMAGE")
+        cache_mm_image_items = get_bool_env_var("SGLANG_CACHE_MM_IMAGE")
         is_glm4_5_v_processor = isinstance(
             self._processor.image_processor,
             transformers.models.glm4v.image_processing_glm4v_fast.Glm4vImageProcessorFast,

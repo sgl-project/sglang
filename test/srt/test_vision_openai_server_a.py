@@ -348,7 +348,7 @@ class TestQwen2_5_AI_AGENT(TestOpenAIOmniServerBase):
         env_1["SGLANG_VLM_CACHE_SIZE_MB"] = "512"
         env_2["CUDA_VISIBLE_DEVICES"] = "1"
         env_2["SGLANG_VLM_CACHE_SIZE_MB"] = "512"
-        env_2["SGL_CACHE_MM_IMAGE"] = "1"
+        env_2["SGLANG_CACHE_MM_IMAGE"] = "1"
 
         logging.info("launch server without mm_item_cache")
         cls.process = popen_launch_server(

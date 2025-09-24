@@ -22,7 +22,8 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.mm_utils import FIFOTensorCache, reconstruct_tensor_from_infos
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
-
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import (
     fast_image_hash,
     generate_reconstruct_cudatensor_infos,
@@ -30,10 +31,6 @@ from sglang.srt.multimodal.mm_utils import (
     insert_input_ids,
     operate_substrings,
 )
-
-from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
-
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -310,7 +307,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         ):
             kwargs["device"] = "cuda"
 
-        cache_mm_image_items = get_bool_env_var("SGL_CACHE_MM_IMAGE")
+        cache_mm_image_items = get_bool_env_var("SGLANG_CACHE_MM_IMAGE")
         is_qwen2_processor = isinstance(
             processor.image_processor,
             transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast,
@@ -410,13 +407,13 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             available_size_mb = (total - allocated - reserved) // (1024 * 1024)
 
             max_cache_image_size = CACHED_IMAGE_MAX_MB_SIZE
-            if get_int_env_var("SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB"):
+            if get_int_env_var("SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB"):
                 max_cache_image_size = get_int_env_var(
-                    "SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB"
+                    "SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB"
                 )
             else:
                 logger.info(
-                    "not set SGL_TOKENIZER_CACHED_IMAGE_SIZE_MB, use default value = {}".format(
+                    "not set SGLANG_TOKENIZER_CACHED_IMAGE_SIZE_MB, use default value = {}".format(
                         max_cache_image_size
                     )
                 )
@@ -482,7 +479,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        cache_mm_image_items = get_bool_env_var("SGL_CACHE_MM_IMAGE")
+        cache_mm_image_items = get_bool_env_var("SGLANG_CACHE_MM_IMAGE")
         if cache_mm_image_items:
             images = base_output.images
 
