@@ -82,6 +82,7 @@ class SchedulerOutputProcessorMixin:
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
+                    self.req_to_token_pool.free(req.req_pool_idx)
                     continue
 
                 if req.is_chunked <= 0:
