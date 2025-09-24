@@ -60,6 +60,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -146,6 +147,25 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+MLA_ATTENTION_BACKENDS = [
+    "aiter",
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "triton",
+    "flashmla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "ascend",
+]
+
+
+def add_mla_attention_backend(backend_name):
+    if backend_name not in MLA_ATTENTION_BACKENDS:
+        MLA_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
+
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -157,6 +177,13 @@ SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
+
+
+if _is_npu:
+    import torch_npu
+
+    torch.npu.config.allow_internal_format = True
+    torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
 class RankZeroFilter(logging.Filter):
@@ -386,6 +413,12 @@ class ModelRunner:
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
+        # Enable batch invariant mode
+        if server_args.enable_deterministic_inference:
+            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
+
+            enable_batch_invariant_mode()
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -512,17 +545,7 @@ class ModelRunner:
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
-                if server_args.attention_backend in [
-                    "aiter",
-                    "flashinfer",
-                    "fa3",
-                    "fa4",
-                    "triton",
-                    "flashmla",
-                    "cutlass_mla",
-                    "trtllm_mla",
-                    "ascend",
-                ]:
+                if server_args.attention_backend in MLA_ATTENTION_BACKENDS:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
                     )
@@ -1025,6 +1048,19 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
+    def destroy_weights_update_group(self, group_name):
+        try:
+            if group_name in self._model_update_group:
+                pg = self._model_update_group.pop(group_name)
+                torch.distributed.destroy_process_group(pg)
+                return True, "Succeeded to destroy custom process group."
+            else:
+                return False, "The group to be destroyed does not exist."
+        except Exception as e:
+            message = f"Failed to destroy custom process group: {e}."
+            logger.error(message)
+            return False, message
+
     def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
         """
         Update specific parameter in the model weights online
@@ -1166,6 +1202,7 @@ class ModelRunner:
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
+            server_args=self.server_args,
         )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
@@ -1388,7 +1425,7 @@ class ModelRunner:
         if self.is_hybrid_gdn:
             max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size)
 
-        if not self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
@@ -1720,149 +1757,9 @@ class ModelRunner:
         return attn_backend
 
     def _get_attention_backend_from_str(self, backend_str: str):
-        if backend_str == "flashinfer":
-            if not self.use_mla_backend:
-                from sglang.srt.layers.attention.flashinfer_backend import (
-                    FlashInferAttnBackend,
-                )
-
-                # Init streams
-                if self.server_args.speculative_algorithm == "EAGLE":
-                    if (
-                        not hasattr(self, "plan_stream_for_flashinfer")
-                        or not self.plan_stream_for_flashinfer
-                    ):
-                        self.plan_stream_for_flashinfer = torch.cuda.Stream()
-                return FlashInferAttnBackend(self)
-            else:
-                from sglang.srt.layers.attention.flashinfer_mla_backend import (
-                    FlashInferMLAAttnBackend,
-                )
-
-                return FlashInferMLAAttnBackend(self)
-        elif backend_str == "aiter":
-            from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
-
-            return AiterAttnBackend(self)
-        elif self.server_args.attention_backend == "wave":
-            from sglang.srt.layers.attention.wave_backend import WaveAttnBackend
-
-            return WaveAttnBackend(self)
-        elif backend_str == "ascend":
-            from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
-
-            return AscendAttnBackend(self)
-        elif backend_str == "triton":
-            assert not self.model_config.is_encoder_decoder, (
-                "Cross attention is not supported in the triton attention backend. "
-                "Please use `--attention-backend flashinfer`."
-            )
-            if self.server_args.enable_double_sparsity:
-                from sglang.srt.layers.attention.double_sparsity_backend import (
-                    DoubleSparseAttnBackend,
-                )
-
-                return DoubleSparseAttnBackend(self)
-            else:
-                from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-                return TritonAttnBackend(self)
-        elif backend_str == "torch_native":
-            from sglang.srt.layers.attention.torch_native_backend import (
-                TorchNativeAttnBackend,
-            )
-
-            return TorchNativeAttnBackend(self)
-        elif backend_str == "flashmla":
-            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
-
-            return FlashMLABackend(self)
-        elif backend_str == "fa3":
-            assert (
-                torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
-            ) or torch.cuda.get_device_capability()[0] == 9, (
-                "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
-                "Please use `--attention-backend flashinfer`."
-            )
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
-
-            return FlashAttentionBackend(self)
-        elif backend_str == "fa4":
-            assert (
-                self.use_mla_backend
-            ), "FlashAttention v4 Support is at an early stage, only MLA model supported now"
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
-
-            return FlashAttentionBackend(self, fa_impl_ver=4)
-        elif backend_str == "cutlass_mla":
-            from sglang.srt.layers.attention.cutlass_mla_backend import (
-                CutlassMLABackend,
-            )
-
-            return CutlassMLABackend(self)
-        elif backend_str == "trtllm_mla":
-            if not self.use_mla_backend:
-                raise ValueError("trtllm_mla backend can only be used with MLA models.")
-            from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
-
-            return TRTLLMMLABackend(self)
-        elif backend_str == "trtllm_mha":
-            if self.use_mla_backend:
-                raise ValueError(
-                    "trtllm_mha backend can only be used with non-MLA models."
-                )
-            from sglang.srt.layers.attention.trtllm_mha_backend import (
-                TRTLLMHAAttnBackend,
-            )
-
-            return TRTLLMHAAttnBackend(self)
-        elif backend_str == "intel_amx":
-            from sglang.srt.layers.attention.intel_amx_backend import (
-                IntelAMXAttnBackend,
-            )
-
-            return IntelAMXAttnBackend(self)
-        elif backend_str == "dual_chunk_flash_attn":
-            from sglang.srt.layers.attention.dual_chunk_flashattention_backend import (
-                DualChunkFlashAttentionBackend,
-            )
-
-            return DualChunkFlashAttentionBackend(self)
-        elif backend_str == "hybrid_linear_attn":
-            assert (
-                self.is_hybrid_gdn
-            ), "hybrid_linear_attn backend can only be used with hybrid GDN models."
-            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-                HybridLinearAttnBackend,
-                MambaAttnBackend,
-            )
-
-            if _is_npu:
-                from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
-
-                full_attn_backend = AscendAttnBackend(self)
-            elif is_blackwell():
-                from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-                full_attn_backend = TritonAttnBackend(self)
-            else:
-                from sglang.srt.layers.attention.flashattention_backend import (
-                    FlashAttentionBackend,
-                )
-
-                full_attn_backend = FlashAttentionBackend(self)
-
-            linear_attn_backend = MambaAttnBackend(self)
-            full_attn_layers = self.model_config.hf_config.full_attention_layer_ids
-            return HybridLinearAttnBackend(
-                full_attn_backend, linear_attn_backend, full_attn_layers
-            )
-        else:
+        if backend_str not in ATTENTION_BACKENDS:
             raise ValueError(f"Invalid attention backend: {backend_str}")
+        return ATTENTION_BACKENDS[backend_str](self)
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"
@@ -2159,7 +2056,6 @@ class ModelRunner:
             )
 
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
-
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -2167,6 +2063,12 @@ class ModelRunner:
             forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
+            # For prefill, we only use the position of the last token.
+            (
+                forward_batch.positions
+                if forward_batch.forward_mode.is_decode()
+                else forward_batch.seq_lens - 1
+            ),
         )
         return next_token_ids
 
