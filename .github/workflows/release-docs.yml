@@ -41,7 +41,7 @@ jobs:
           make compile
 
       - name: Push HTML to sgl-project.github.io
-        timeout-minutes: 60
+        timeout-minutes: 30
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_DOCUMENTATION }}
         run: |
