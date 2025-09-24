@@ -136,8 +136,6 @@ if __name__ == "__main__":
             print(f"block_size={block_size}, num_kv_splits={kv_split}: ")
             benchmark.run(
                 print_data=True,
-                show_plots=True,
-                save_path="bench_blackwell_mla_res",
                 block_size=block_size,
                 num_kv_splits=kv_split,
             )
