@@ -550,10 +550,7 @@ class ServerArgs:
                 elif gpu_mem < 90 * 1024:
                     # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs -)
                     # if tp >= 4, cuda_graph_max_bs 512, else 256
-                    if parallel_size >= 4:
-                        reserved_mem = (11 + parallel_size / 2) * 1024
-                    else:
-                        reserved_mem = (9.5 + parallel_size / 2) * 1024
+                    reserved_mem = (11.5 + parallel_size / 2) * 1024
                 elif gpu_mem < 100 * 1024:
                     # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
                     reserved_mem = (15 + parallel_size / 2) * 1024
