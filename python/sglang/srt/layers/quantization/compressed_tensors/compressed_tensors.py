@@ -44,6 +44,7 @@ try:
         WNA16_SUPPORTED_BITS,
         CompressedTensorsWNA16,
     )
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import CompressedTensorsW4A16Fp4
 
     VLLM_AVAILABLE = True
 except ImportError:
@@ -344,6 +345,20 @@ class CompressedTensorsConfig(QuantizationConfig):
         # All conditions satisfied.
         return True
 
+    def _is_fp4a16_nvfp4(self, weight_quant: QuantizationArgs,
+                         input_quant: QuantizationArgs):
+        is_weight_only = weight_quant is not None and input_quant is None
+        is_tensor_group_quant = (
+            weight_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value)
+        is_symmetric = weight_quant.symmetric
+
+        is_group_size_16 = weight_quant.group_size == 16
+        is_float_type = weight_quant.type == QuantizationType.FLOAT
+        is_4_bits = weight_quant.num_bits == 4
+
+        return (is_weight_only and is_tensor_group_quant and is_float_type
+                and is_4_bits and is_group_size_16 and is_symmetric)
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -362,6 +377,9 @@ class CompressedTensorsConfig(QuantizationConfig):
     ) -> CompressedTensorsScheme:
 
         # Detect If Mixed Precision
+        if self._is_fp4a16_nvfp4(weight_quant, input_quant):
+            return CompressedTensorsW4A16Fp4()
+
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not VLLM_AVAILABLE:
                 raise ImportError(
