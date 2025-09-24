@@ -16,13 +16,12 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Iterable, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, MoeCausalLMOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -42,24 +41,24 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_rank,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
-from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeAttention, Qwen3MoeDecoderLayer
 from sglang.srt.models.qwen3_vl import (
     Qwen3VLMoeVisionModel,
-    Qwen3VLMoeVisionPatchMerger,
 )
 from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     Qwen3VLMoeTextModel,
 )
 from sglang.srt.utils import add_prefix
+from transformers import PreTrainedModel
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +91,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attention_dropout = 0.0
         self.is_decoder = False
         self.is_causal = False
@@ -154,10 +153,27 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
-    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig):
+    def __init__(self,
+                 config: Qwen3OmniMoeAudioEncoderConfig,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = "", ):
         super().__init__()
+        embed_dim = config.d_model
         self.embed_dim = config.d_model
-        self.self_attn = Qwen3OmniMoeAudioAttention(config)
+        # self.self_attn = Qwen3OmniMoeAudioAttention(config)
+        self.self_attn = VisionAttention(
+            embed_dim=embed_dim,
+            num_heads=config.encoder_attention_heads,
+            projection_size=embed_dim,
+            use_qkv_parallel=True,
+            rotary_embed="normal",
+            proj_bias=True,
+            qkv_backend="fa3",
+            softmax_in_single_precision=False,
+            flatten_batch=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
+        )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
@@ -189,7 +205,6 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             cu_seqlens=cu_seqlens,
-            attention_mask=attention_mask,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -441,22 +456,96 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         return input_lengths, output_lengths
 
 
+class Qwen3OmniMoeVisionPatchMerger(nn.Module):
+
+    def __init__(
+        self,
+        dim: int,
+        context_dim: int,
+        spatial_merge_size: int = 2,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        use_postshuffle_norm=False
+    ) -> None:
+        super().__init__()
+        self.hidden_size = context_dim * (spatial_merge_size ** 2)
+        self.use_postshuffle_norm = use_postshuffle_norm
+        self.ln_q = RMSNorm(self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6)
+        self.mlp = nn.ModuleList(
+            [
+                ColumnParallelLinear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=add_prefix("mlp.0", prefix),
+                ),
+                nn.GELU(),
+                RowParallelLinear(
+                    self.hidden_size,
+                    dim,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=add_prefix("mlp.2", prefix),
+                ),
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x expected shape: [S, B, context_dim]
+        # S, B, D = x.shape
+        # x2d = x.reshape(-1, D)
+        # x2d = self.ln_q(x2d)  # RMSNorm expects 2D
+        # x2d = x2d.view(-1, self.hidden_size)  # group into spatial_merge_unit
+        # mlp_fc1, mlp_act, mlp_fc2 = self.mlp
+        # x_parallel, _ = mlp_fc1(x2d)
+        # x_parallel = mlp_act(x_parallel)
+        # out, _ = mlp_fc2(x_parallel)
+        # return out
+        x = x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x.view(-1, x.shape[-1])
+        hidden = self.ln_q(x).view(
+            -1, self.hidden_size
+        )
+        for layer in self.mlp:
+            if isinstance(hidden, tuple):
+                hidden = hidden[0]
+            hidden = layer(hidden)
+
+        if isinstance(hidden, tuple):
+            hidden = hidden[0]
+
+        return hidden
+
+
 class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
     config: Qwen3OmniMoeVisionEncoderConfig
-    _no_split_modules = ["Qwen3OmniMoeVisionBlock"]
 
-    def __init__(self, config, quant_config, *inputs, **kwargs):
+    def __init__(self, config: Qwen3OmniMoeVisionEncoderConfig,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = None, **kwargs):
         super().__init__(config, quant_config)
+
+        self.merger = Qwen3OmniMoeVisionPatchMerger(
+            dim=config.out_hidden_size,
+            context_dim=config.hidden_size,
+            spatial_merge_size=config.spatial_merge_size,
+            quant_config=quant_config,
+            use_postshuffle_norm=False,
+            prefix=add_prefix("merger", prefix),
+        )
         self.merger_list = nn.ModuleList(
             [
-                Qwen3VLMoeVisionPatchMerger(
-                    config=config,
+                Qwen3OmniMoeVisionPatchMerger(
+                    dim=config.out_hidden_size,
+                    context_dim=config.hidden_size,
+                    spatial_merge_size=config.spatial_merge_size,
                     use_postshuffle_norm=True,
+                    quant_config=quant_config,
+                    prefix=add_prefix("merger_list", prefix),
                 )
                 for _ in range(len(config.deepstack_visual_indexes))
             ]
         )
-        super().__init__(config, *inputs, **kwargs)
         del self.deepstack_merger_list
 
     @property
@@ -558,13 +647,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         super().__init__(config, quant_config, prefix)
         self.config = config
         self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config)
-        # self.visual = Qwen3OmniMoeVisionEncoder(
-        #     config.vision_config, quant_config=quant_config
-        # )
+        self.visual = Qwen3OmniMoeVisionEncoder(
+            config.vision_config, quant_config=quant_config
+        )
         self.vocab_size = config.text_config.vocab_size
-        # self.model = Qwen3OmniMoeThinkerTextModel(
-        #     config.text_config, quant_config=quant_config
-        # )
+
         self.model = self.language_model
         delattr(self, "language_model")
 
@@ -674,12 +761,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
             special_audio_mask = (
                 inputs_embeds
                 == self.get_input_embeddings()(
-                    torch.tensor(
-                        self.config.audio_token_id,
-                        dtype=torch.long,
-                        device=inputs_embeds.device,
-                    )
+                torch.tensor(
+                    self.config.audio_token_id,
+                    dtype=torch.long,
+                    device=inputs_embeds.device,
                 )
+            )
             ).all(-1)
         else:
             special_image_mask = input_ids == self.config.image_token_id
@@ -774,9 +861,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             config.thinker_config, quant_config=quant_config, prefix=prefix
         )
         self.enable_talker = False
-
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        return self.thinker.pad_input_ids(self, input_ids, mm_inputs)
+        self.pad_input_ids = self.thinker.pad_input_ids
 
     def forward(
         self,
