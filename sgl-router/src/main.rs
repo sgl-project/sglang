@@ -351,6 +351,11 @@ struct CliArgs {
     oracle_pool_timeout_secs: Option<u64>,
 }
 
+enum OracleConnectSource {
+    Dsn { descriptor: String },
+    Wallet { path: String, alias: String },
+}
+
 impl CliArgs {
     /// Determine connection mode from worker URLs
     fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
@@ -396,9 +401,9 @@ impl CliArgs {
         }
     }
 
-    fn resolve_oracle_connect_details(&self) -> ConfigResult<(Option<String>, String)> {
+    fn resolve_oracle_connect_details(&self) -> ConfigResult<OracleConnectSource> {
         if let Some(dsn) = self.oracle_dsn.clone() {
-            return Ok((self.oracle_wallet_path.clone(), dsn));
+            return Ok(OracleConnectSource::Dsn { descriptor: dsn });
         }
 
         let wallet_path = self
@@ -415,11 +420,17 @@ impl CliArgs {
                 field: "oracle_tns_alias or ATP_TNS_ALIAS".to_string(),
             })?;
 
-        Ok((Some(wallet_path), tns_alias))
+        Ok(OracleConnectSource::Wallet {
+            path: wallet_path,
+            alias: tns_alias,
+        })
     }
 
     fn build_oracle_config(&self) -> ConfigResult<OracleConfig> {
-        let (wallet_path, connect_descriptor) = self.resolve_oracle_connect_details()?;
+        let (wallet_path, connect_descriptor) = match self.resolve_oracle_connect_details()? {
+            OracleConnectSource::Dsn { descriptor } => (None, descriptor),
+            OracleConnectSource::Wallet { path, alias } => (Some(path), alias),
+        };
         let username = self
             .oracle_user
             .clone()
