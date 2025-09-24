@@ -62,7 +62,7 @@ impl TestContext {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle_history: None,
+            oracle: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1409,7 +1409,7 @@ mod error_tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle_history: None,
+            oracle: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1769,7 +1769,7 @@ mod pd_mode_tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle_history: None,
+            oracle: None,
         };
 
         // Create app context
@@ -1933,7 +1933,7 @@ mod request_id_tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-            oracle_history: None,
+            oracle: None,
         };
 
         let ctx = TestContext::new_with_config(

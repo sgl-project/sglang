@@ -1,8 +1,8 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use sglang_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleHistoryConfig, PolicyConfig,
-    RetryConfig, RouterConfig, RoutingMode,
+    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig,
+    RouterConfig, RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
@@ -396,7 +396,7 @@ impl CliArgs {
         }
     }
 
-    fn build_oracle_history_config(&self) -> ConfigResult<OracleHistoryConfig> {
+    fn build_oracle_config(&self) -> ConfigResult<OracleConfig> {
         let wallet_path = self.oracle_wallet_path.clone();
         let connect_descriptor = if let Some(dsn) = self.oracle_dsn.clone() {
             dsn
@@ -422,10 +422,10 @@ impl CliArgs {
 
         let pool_min = self
             .oracle_pool_min
-            .unwrap_or_else(OracleHistoryConfig::default_pool_min);
+            .unwrap_or_else(OracleConfig::default_pool_min);
         let pool_max = self
             .oracle_pool_max
-            .unwrap_or_else(OracleHistoryConfig::default_pool_max);
+            .unwrap_or_else(OracleConfig::default_pool_max);
 
         if pool_min == 0 {
             return Err(ConfigError::InvalidValue {
@@ -445,9 +445,9 @@ impl CliArgs {
 
         let pool_timeout_secs = self
             .oracle_pool_timeout_secs
-            .unwrap_or_else(OracleHistoryConfig::default_pool_timeout_secs);
+            .unwrap_or_else(OracleConfig::default_pool_timeout_secs);
 
-        Ok(OracleHistoryConfig {
+        Ok(OracleConfig {
             wallet_path,
             connect_descriptor,
             username,
@@ -559,8 +559,8 @@ impl CliArgs {
             _ => HistoryBackend::Memory,
         };
 
-        let oracle_history = if history_backend == HistoryBackend::Oracle {
-            Some(self.build_oracle_history_config()?)
+        let oracle = if history_backend == HistoryBackend::Oracle {
+            Some(self.build_oracle_config()?)
         } else {
             None
         };
@@ -618,7 +618,7 @@ impl CliArgs {
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
             history_backend,
-            oracle_history,
+            oracle,
         })
     }
 

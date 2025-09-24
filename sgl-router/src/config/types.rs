@@ -72,7 +72,7 @@ pub struct RouterConfig {
     pub history_backend: HistoryBackend,
     /// Oracle history backend configuration (required when `history_backend` = "oracle")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub oracle_history: Option<OracleHistoryConfig>,
+    pub oracle: Option<OracleConfig>,
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -93,7 +93,7 @@ pub enum HistoryBackend {
 
 /// Oracle history backend configuration
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub struct OracleHistoryConfig {
+pub struct OracleConfig {
     /// Directory containing the ATP wallet or TLS config files (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_path: Option<String>,
@@ -114,7 +114,7 @@ pub struct OracleHistoryConfig {
     pub pool_timeout_secs: u64,
 }
 
-impl OracleHistoryConfig {
+impl OracleConfig {
     pub fn default_pool_min() -> usize {
         default_pool_min()
     }
@@ -140,9 +140,9 @@ fn default_pool_timeout_secs() -> u64 {
     30
 }
 
-impl std::fmt::Debug for OracleHistoryConfig {
+impl std::fmt::Debug for OracleConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OracleHistoryConfig")
+        f.debug_struct("OracleConfig")
             .field("wallet_path", &self.wallet_path)
             .field("connect_descriptor", &self.connect_descriptor)
             .field("username", &self.username)
@@ -448,7 +448,7 @@ impl Default for RouterConfig {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
-            oracle_history: None,
+            oracle: None,
         }
     }
 }
@@ -1016,7 +1016,7 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
-            oracle_history: None,
+            oracle: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1081,7 +1081,7 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
-            oracle_history: None,
+            oracle: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1142,7 +1142,7 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
-            oracle_history: None,
+            oracle: None,
         };
 
         assert!(config.has_service_discovery());

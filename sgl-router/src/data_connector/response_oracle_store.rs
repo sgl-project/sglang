@@ -1,4 +1,4 @@
-use crate::config::OracleHistoryConfig;
+use crate::config::OracleConfig;
 use crate::data_connector::responses::{
     ResponseChain, ResponseId, ResponseStorage, ResponseStorageError, Result as StorageResult,
     StoredResponse,
@@ -21,7 +21,7 @@ pub struct OracleResponseStorage {
 }
 
 impl OracleResponseStorage {
-    pub fn new(config: OracleHistoryConfig) -> StorageResult<Self> {
+    pub fn new(config: OracleConfig) -> StorageResult<Self> {
         let config = Arc::new(config);
         configure_oracle_client(&config)?;
         initialize_schema(&config)?;
@@ -285,7 +285,7 @@ struct OracleConnectionManager {
 }
 
 impl OracleConnectionManager {
-    fn new(config: Arc<OracleHistoryConfig>) -> Self {
+    fn new(config: Arc<OracleConfig>) -> Self {
         let params = OracleConnectParams {
             username: config.username.clone(),
             password: config.password.clone(),
@@ -353,7 +353,7 @@ impl Manager for OracleConnectionManager {
     }
 }
 
-fn configure_oracle_client(config: &OracleHistoryConfig) -> StorageResult<()> {
+fn configure_oracle_client(config: &OracleConfig) -> StorageResult<()> {
     if let Some(wallet_path) = &config.wallet_path {
         let wallet_path = Path::new(wallet_path);
         if !wallet_path.is_dir() {
@@ -375,7 +375,7 @@ fn configure_oracle_client(config: &OracleHistoryConfig) -> StorageResult<()> {
     Ok(())
 }
 
-fn initialize_schema(config: &OracleHistoryConfig) -> StorageResult<()> {
+fn initialize_schema(config: &OracleConfig) -> StorageResult<()> {
     let conn = Connection::connect(
         &config.username,
         &config.password,

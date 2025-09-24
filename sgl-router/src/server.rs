@@ -95,9 +95,8 @@ impl AppContext {
             HistoryBackend::Memory => Arc::new(MemoryResponseStorage::new()),
             HistoryBackend::None => Arc::new(NoOpResponseStorage::new()),
             HistoryBackend::Oracle => {
-                let oracle_cfg = router_config.oracle_history.clone().ok_or_else(|| {
-                    "oracle_history configuration is required when history_backend=oracle"
-                        .to_string()
+                let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
+                    "oracle configuration is required when history_backend=oracle".to_string()
                 })?;
 
                 let storage = OracleResponseStorage::new(oracle_cfg).map_err(|err| {
