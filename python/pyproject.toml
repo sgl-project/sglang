@@ -62,12 +62,12 @@ dependencies = [
   "torchaudio==2.8.0",
   "torchvision",
   "cuda-python",
-  "flashinfer_python==0.4.0rc1",
+  "flashinfer_python==0.4.0rc2",
   "openai==1.99.1",
   "tiktoken",
   "anthropic>=0.20.0",
   "torch_memory_saver==0.0.8",
-  "nvidia-cutlass-dsl==4.2.0",
+  "nvidia-cutlass-dsl==4.2.1",
 ]
 
 [project.optional-dependencies]
