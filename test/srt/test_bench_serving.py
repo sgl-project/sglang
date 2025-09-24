@@ -472,9 +472,9 @@ class TestBenchServing(CustomTestCase):
             f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
         )
         self.assertEqual(res["successful_requests"], res["total_requests"])
-        self.assertLess(res["avg_latency_ms"], 48)  # Less than 48 ms average latency
-        self.assertLess(res["p95_latency_ms"], 50)  # Less than 50 ms P95 latency
-        self.assertGreater(res["throughput"], 20)  # At least 20 req/s
+        self.assertLess(res["avg_latency_ms"], 48)
+        self.assertLess(res["p95_latency_ms"], 50)
+        self.assertGreater(res["throughput"], 20)
 
     def test_score_api_batch_scaling(self):
         """Test score API performance with different batch sizes"""
@@ -491,21 +491,40 @@ class TestBenchServing(CustomTestCase):
                 write_github_step_summary(
                     f"### test_score_api_batch_scaling_size_{batch_size}\n"
                     f"Batch size: {batch_size}\n"
-                    f"Throughput: {res['throughput']:.2f} req/s\n"
                     f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                    f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                    f"Throughput: {res['throughput']:.2f} req/s\n"
                     f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
                 )
             
             print(
                 f"### test_score_api_batch_scaling_size_{batch_size}\n"
                 f"Batch size: {batch_size}\n"
-                f"Throughput: {res['throughput']:.2f} req/s\n"
                 f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                f"Throughput: {res['throughput']:.2f} req/s\n"
                 f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
             )
 
-            self.assertGreater(res["successful_requests"], res["total_requests"])  # 100% success rate
-            self.assertLess(res["avg_latency_ms"], 5000)  # Less than 5 seconds average
+            self.assertEqual(res["successful_requests"], res["total_requests"])
+            if batch_size == 10:
+                avg_latency_bound = 45
+            elif batch_size == 25:
+                avg_latency_bound = 50
+            elif batch_size == 50:
+                avg_latency_bound = 60
+            else:
+                avg_latency_bound = 60
+            self.assertLess(res["avg_latency_ms"], avg_latency_bound)
+            if batch_size == 10:
+                p95_latency_bound = 50
+            elif batch_size == 25:
+                p95_latency_bound = 60
+            elif batch_size == 50:
+                p95_latency_bound = 65
+            else:
+                p95_latency_bound = 65
+            self.assertLess(res["p95_latency_ms"], p95_latency_bound)
 
 
 if __name__ == "__main__":
