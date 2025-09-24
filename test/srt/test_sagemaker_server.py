@@ -128,6 +128,10 @@ class TestSageMakerServer(CustomTestCase):
                 is_firsts[index] = False
                 continue
 
+            # Skip chunks that are just empty placeholders, usually at stream end/stop
+            if data.get("content") is None:
+                continue
+
             if logprobs:
                 assert line.get("choices")[0].get("logprobs")
                 assert isinstance(
