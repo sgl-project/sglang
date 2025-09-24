@@ -57,7 +57,13 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self.grammar.apply_vocab_mask
 
     def copy(self) -> BaseGrammarObject:
+<<<<<<< HEAD
         return ReasonerGrammarObject(self.grammar.copy(), self.think_end_id, self.is_in_reasoning)
+=======
+        return ReasonerGrammarObject(
+            self.grammar.copy(), self.think_end_id, self.is_in_reasoning
+        )
+>>>>>>> 942c28241 ([Bugfix] fix the issue with the default reasoning mode in reasoner_grammar #10810)
 
     @property
     def finished(self):

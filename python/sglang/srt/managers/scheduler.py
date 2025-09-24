@@ -1369,7 +1369,13 @@ class Scheduler(
             elif req.sampling_params.structural_tag:
                 key = ("structural_tag", req.sampling_params.structural_tag)
 
+<<<<<<< HEAD
             may_can_reasoning = not getattr(self.tokenizer, "think_end_id", None) in getattr(req, "origin_input_ids", [])
+=======
+            may_can_reasoning = not getattr(
+                self.tokenizer, "think_end_id", None
+            ) in getattr(req, "origin_input_ids", [])
+>>>>>>> 942c28241 ([Bugfix] fix the issue with the default reasoning mode in reasoner_grammar #10810)
             key = (key[0], key[1], may_can_reasoning)
             req._may_can_reasoning = may_can_reasoning
 

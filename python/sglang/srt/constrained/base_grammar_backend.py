@@ -149,7 +149,13 @@ class BaseGrammarBackend:
     def dispatch_structural_tag(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("structural_tag", key_string)
 
+<<<<<<< HEAD
     def _init_value_dispatch(self, key: Tuple[str, str, bool]) -> Optional[BaseGrammarObject]:
+=======
+    def _init_value_dispatch(
+        self, key: Tuple[str, str, bool]
+    ) -> Optional[BaseGrammarObject]:
+>>>>>>> 942c28241 ([Bugfix] fix the issue with the default reasoning mode in reasoner_grammar #10810)
         s = time.perf_counter()
         key_type, key_string, may_can_reasoning = key
         if key_type == "json":
