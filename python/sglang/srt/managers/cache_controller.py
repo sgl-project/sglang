@@ -289,8 +289,6 @@ class HiCacheController:
                 )
 
                 self.storage_backend = MooncakeStore(self.storage_config)
-                self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
-                assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":
                 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
                     HiCacheHF3FS,
@@ -312,6 +310,8 @@ class HiCacheController:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
                 )
+
+            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -335,18 +335,10 @@ class HiCacheController:
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
-            self.batch_exists_func = self.storage_backend.batch_exists
-            self.is_3fs_zerocopy = (
-                self.storage_backend_type == "hf3fs"
-                and self.mem_pool_host.layout == "page_first"
-            )
-            if self.storage_backend_type == "mooncake":
-                self.page_get_func = self._mooncake_page_get
-                self.page_set_func = self._mooncake_page_set
-            elif self.is_3fs_zerocopy:
-                self.page_get_func = self._3fs_zero_copy_page_get
-                self.page_set_func = self._3fs_zero_copy_page_set
-                self.batch_exists_func = self._3fs_zero_copy_batch_exists
+
+            if self.storage_backend_type in ["hf3fs", "mooncake"]:
+                self.page_get_func = self._page_get_zero_copy
+                self.page_set_func = self._page_set_zero_copy
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -630,42 +622,19 @@ class HiCacheController:
         for chunk in chunks:
             self.host_mem_release_queue.put(chunk)
 
-    def _3fs_zero_copy_batch_exists(self, batch_hashes):
-        _batch_hashes, _, factor = self.mem_pool_host.get_buffer_with_hash(batch_hashes)
-        hit_page_num = self.storage_backend.batch_exists(_batch_hashes) // factor
-        return hit_page_num
+    def _page_get_zero_copy(self, operation, hash_values, host_indices):
+        results = self.storage_backend.batch_get_v1(hash_values, host_indices)
+        inc = 0
+        for i in range(len(hash_values)):
+            if not results[i]:
+                logger.warning(
+                    f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
+                )
+                break
+            inc += self.page_size
+        operation.increment(inc)
 
-    def _3fs_zero_copy_page_get(self, operation, hash_values, host_indices):
-        hashes, dsts, factor = self.mem_pool_host.get_buffer_with_hash(
-            hash_values, host_indices
-        )
-        page_data = self.storage_backend.batch_get(hashes, dsts)
-        if page_data:
-            inc = self.page_size * len(hashes) // factor
-            operation.increment(inc)
-        else:
-            logger.warning(
-                f"Prefetch operation {operation.request_id} failed to retrieve page {hashes}."
-            )
-
-    def _mooncake_page_get(self, operation, hash_values, host_indices):
-        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-            hash_values,
-            host_indices,
-            self.storage_config.tp_rank,
-        )
-        get_result = self.storage_backend.batch_get(
-            key_strs,
-            target_locations=buffer_ptrs,
-            target_sizes=buffer_sizes,
-        )
-        if get_result != len(hash_values):
-            logger.warning(
-                f"Prefetch operation {operation.request_id} failed or partially failed."
-            )
-        if get_result != 0:
-            operation.increment(get_result * self.page_size)
-
+    # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices):
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
@@ -755,7 +724,7 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            hit_page_num = self.batch_exists_func(batch_hashes)
+            hit_page_num = self.storage_backend.batch_exists(batch_hashes)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -824,34 +793,16 @@ class HiCacheController:
         self.backup_queue.put(operation)
         return operation.id
 
-    # non-zero copy
+    # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices) -> bool:
         data = [
-            self.mem_pool_host.get_flat_data_page(host_indices[i * self.page_size])
+            self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)
 
-    # zero copy
-    def _mooncake_page_set(self, hash_values, host_indices) -> bool:
-        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-            hash_values,
-            host_indices,
-            self.storage_config.tp_rank,
-        )
-        success = self.storage_backend.batch_set(
-            key_strs,
-            target_locations=buffer_ptrs,
-            target_sizes=buffer_sizes,
-        )
-        return success
-
-    # zero copy
-    def _3fs_zero_copy_page_set(self, hash_values, host_indices) -> bool:
-        hashes, dsts, _ = self.mem_pool_host.get_buffer_with_hash(
-            hash_values, host_indices
-        )
-        return self.storage_backend.batch_set(hashes, dsts)
+    def _page_set_zero_copy(self, hash_values, host_indices) -> bool:
+        return all(self.storage_backend.batch_set_v1(hash_values, host_indices))
 
     # Backup batch by batch
     def _page_backup(self, operation):

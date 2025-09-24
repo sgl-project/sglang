@@ -185,7 +185,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
 
         if self.model_config.is_multimodal:
-            import_processors()
+            import_processors("sglang.srt.multimodal.processors")
             try:
                 _processor = get_processor(
                     server_args.tokenizer_path,
@@ -750,6 +750,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
+                extra_key=obj.extra_key,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
