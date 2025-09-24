@@ -22,7 +22,7 @@ from transformers.processing_utils import (
     VideosKwargs,
 )
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
-from transformers.utils import TensorType, add_start_docstrings, logging
+from transformers.utils import TensorType, logging
 from transformers.video_processing_utils import (
     BASE_VIDEO_PROCESSOR_DOCSTRING,
     BaseVideoProcessor,
@@ -1017,18 +1017,6 @@ class Qwen3VLVideoProcessorInitKwargs(VideosKwargs):
     max_frames: Optional[int]
 
 
-@add_start_docstrings(
-    "Constructs a fast Qwen3-VL image processor that dynamically resizes videos based on the original videos.",
-    BASE_VIDEO_PROCESSOR_DOCSTRING,
-    """
-        patch_size (`int`, *optional*, defaults to 16):
-            The spatial patch size of the vision encoder.
-        temporal_patch_size (`int`, *optional*, defaults to 2):
-            The temporal patch size of the vision encoder.
-        merge_size (`int`, *optional*, defaults to 2):
-            The merge size of the vision encoder to llm encoder.
-    """,
-)
 class Qwen3VLVideoProcessor(BaseVideoProcessor):
     resample = PILImageResampling.BICUBIC
     size = {"shortest_edge": 128 * 32 * 32, "longest_edge": 32 * 32 * 768}
