@@ -196,7 +196,7 @@ class Qwen3_VisionBlock(nn.Module):
         return x
 
 
-class Qwen3_VisionPatchMerger(nn.Module):
+class Qwen3VLMoeVisionPatchMerger(nn.Module):
 
     def __init__(
         self,
@@ -286,7 +286,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
                 for layer_idx in range(vision_config.depth)
             ]
         )
-        self.merger = Qwen3_VisionPatchMerger(
+        self.merger = Qwen3VLMoeVisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=self.hidden_size,
             norm_layer=norm_layer,
@@ -297,7 +297,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
 
         self.deepstack_merger_list = nn.ModuleList(
             [
-                Qwen3_VisionPatchMerger(
+                Qwen3VLMoeVisionPatchMerger(
                     dim=vision_config.out_hidden_size,
                     context_dim=self.hidden_size,
                     spatial_merge_size=self.spatial_merge_size,
@@ -660,6 +660,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        print(f"get_image_feature")
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype

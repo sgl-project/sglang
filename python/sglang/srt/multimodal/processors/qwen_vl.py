@@ -210,8 +210,8 @@ async def preprocess_video(
     return video
 
 
-# Compatible with Qwen2VL and Qwen2_5VL
-class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
+# Compatible with Qwen-VL & Qwen-Omni Series
+class QwenVLImageProcessor(SGLangBaseProcessor):
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
@@ -222,9 +222,11 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        self.model_type = hf_config.model_type
         if hf_config.model_type == "qwen3_omni_moe":
             hf_config = hf_config.thinker_config
+
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
@@ -275,13 +277,23 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens
         )
 
+        audio_feature_lengths = None
+
+        if self.model_type == "qwen3_omni_moe":
+            audio_item = next((mm for mm in mm_items if mm.is_audio()), None)
+            if audio_item:
+                audio_feature_lengths = torch.sum(
+                    audio_item.feature_attention_mask, dim=1
+                )
+
         input_ids = input_ids.flatten()
+
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
             video_token_id=self.mm_tokens.video_token_id,
             vision_start_token_id=self.vision_start_token_id,
-            model_type=self.hf_config.model_type,
+            model_type=self.model_type,
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
@@ -289,6 +301,13 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
             second_per_grid_ts=getattr(ret, "second_per_grid_ts", None),
+            use_audio_in_video=False,
+            audio_seqlens=audio_feature_lengths,
+            audio_token_id=getattr(self.hf_config, "audio_token_id", None),
+            audio_start_token_id=getattr(self.hf_config, "audio_start_token_id", None),
+            position_id_per_seconds=getattr(
+                self.hf_config, "position_id_per_seconds", None
+            ),
         )
         mrope_positions = mrope_positions.squeeze(1)
 

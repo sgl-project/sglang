@@ -148,14 +148,13 @@ class Qwen3VLMoeTextModel(Qwen3MoeModel):
 class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(
         self,
-        *,
         config: Qwen3VLMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super(Qwen3VLForConditionalGeneration, self).__init__()
         self.config = config
-
+        print("Qwen3VLMoeForConditionalGeneration")
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),

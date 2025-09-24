@@ -155,7 +155,6 @@ class BaseMultimodalProcessor(ABC):
     ):
         self.hf_config = hf_config
         self._processor = _processor
-        self.arch = hf_config.architectures[0]
         self.server_args = server_args
         self.transport_mode = transport_mode
 
@@ -191,6 +190,7 @@ class BaseMultimodalProcessor(ABC):
             "input_features": Modality.AUDIO,
             "input_features_mask": Modality.AUDIO,
             "audio_attention_mask": Modality.AUDIO,
+            "feature_attention_mask": Modality.AUDIO,
             # Video-related attributes
             "pixel_values_videos": Modality.VIDEO,
             "second_per_grid_ts": Modality.VIDEO,

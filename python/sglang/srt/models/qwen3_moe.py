@@ -102,8 +102,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
         )
 
-        print(f"{config.hidden_size=}")
-        print(f"{config.moe_intermediate_size=}")
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
             + get_global_server_args().ep_num_redundant_experts,
@@ -665,6 +663,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
         prefix: str = "",
     ) -> None:
         alt_stream = torch.cuda.Stream() if _is_cuda else None
+        print("Qwen3MoeModel")
         super().__init__(
             config=config,
             quant_config=quant_config,
