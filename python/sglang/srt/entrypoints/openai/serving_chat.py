@@ -58,6 +58,7 @@ class OpenAIServingChat(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+        self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -933,11 +934,11 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
             # For Qwen3 models, `enable_thinking` is supported.
-            if request.chat_template_kwargs.get("enable_thinking") is not None:
-                return request.chat_template_kwargs.get("enable_thinking")
+            if self.reasoning_parser in ["qwen3-thinking", "qwen3", "glm45"]:
+                return request.chat_template_kwargs.get("enable_thinking", False)
             # For DeepSeek-V3.1 models, `thinking` is supported.
-            elif request.chat_template_kwargs.get("thinking") is not None:
-                return request.chat_template_kwargs.get("thinking")
+            elif self.reasoning_parser in ["deepseek-v3"]:
+                return request.chat_template_kwargs.get("thinking", False)
             else:
                 return False
         return False
