@@ -23,7 +23,7 @@ pub struct OracleResponseStorage {
 impl OracleResponseStorage {
     pub fn new(config: OracleHistoryConfig) -> StorageResult<Self> {
         let config = Arc::new(config);
-        ensure_wallet(&config)?;
+        configure_oracle_client(&config)?;
         initialize_schema(&config)?;
 
         let manager = OracleConnectionManager::new(config.clone());
@@ -289,7 +289,7 @@ impl OracleConnectionManager {
         let params = OracleConnectParams {
             username: config.username.clone(),
             password: config.password.clone(),
-            connect_descriptor: config.tns_alias.clone(),
+            connect_descriptor: config.connect_descriptor.clone(),
         };
 
         Self {
@@ -353,29 +353,35 @@ impl Manager for OracleConnectionManager {
     }
 }
 
-fn ensure_wallet(config: &OracleHistoryConfig) -> StorageResult<()> {
-    let wallet_path = Path::new(&config.wallet_path);
-    if !wallet_path.is_dir() {
-        return Err(ResponseStorageError::StorageError(format!(
-            "Oracle wallet path '{}' is not a directory",
-            wallet_path.display()
-        )));
-    }
+fn configure_oracle_client(config: &OracleHistoryConfig) -> StorageResult<()> {
+    if let Some(wallet_path) = &config.wallet_path {
+        let wallet_path = Path::new(wallet_path);
+        if !wallet_path.is_dir() {
+            return Err(ResponseStorageError::StorageError(format!(
+                "Oracle wallet/config path '{}' is not a directory",
+                wallet_path.display()
+            )));
+        }
 
-    if !wallet_path.join("tnsnames.ora").exists() {
-        return Err(ResponseStorageError::StorageError(format!(
-            "Oracle wallet path '{}' does not contain tnsnames.ora",
-            wallet_path.display()
-        )));
-    }
+        if !wallet_path.join("tnsnames.ora").exists() && !wallet_path.join("sqlnet.ora").exists() {
+            return Err(ResponseStorageError::StorageError(format!(
+                "Oracle wallet/config path '{}' is missing tnsnames.ora or sqlnet.ora",
+                wallet_path.display()
+            )));
+        }
 
-    std::env::set_var("TNS_ADMIN", wallet_path);
+        std::env::set_var("TNS_ADMIN", wallet_path);
+    }
     Ok(())
 }
 
 fn initialize_schema(config: &OracleHistoryConfig) -> StorageResult<()> {
-    let conn = Connection::connect(&config.username, &config.password, &config.tns_alias)
-        .map_err(map_oracle_error)?;
+    let conn = Connection::connect(
+        &config.username,
+        &config.password,
+        &config.connect_descriptor,
+    )
+    .map_err(map_oracle_error)?;
 
     let exists: i64 = conn
         .query_row_as(

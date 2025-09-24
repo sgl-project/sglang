@@ -318,13 +318,17 @@ struct CliArgs {
     #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle"])]
     history_backend: String,
 
-    /// Directory containing the Oracle ATP wallet files
+    /// Directory containing the Oracle ATP wallet/config files (optional)
     #[arg(long, env = "ATP_WALLET_PATH")]
     oracle_wallet_path: Option<String>,
 
     /// Wallet TNS alias to use (e.g. `<db_name>_low`)
     #[arg(long, env = "ATP_TNS_ALIAS")]
     oracle_tns_alias: Option<String>,
+
+    /// Oracle connection descriptor / DSN (e.g. `tcps://host:port/service_name`)
+    #[arg(long, env = "ATP_DSN")]
+    oracle_dsn: Option<String>,
 
     /// Oracle ATP username
     #[arg(long, env = "ATP_USER")]
@@ -393,18 +397,16 @@ impl CliArgs {
     }
 
     fn build_oracle_history_config(&self) -> ConfigResult<OracleHistoryConfig> {
-        let wallet_path = self
-            .oracle_wallet_path
-            .clone()
-            .ok_or(ConfigError::MissingRequired {
-                field: "oracle_wallet_path or ATP_WALLET_PATH".to_string(),
-            })?;
-        let tns_alias = self
-            .oracle_tns_alias
-            .clone()
-            .ok_or(ConfigError::MissingRequired {
-                field: "oracle_tns_alias or ATP_TNS_ALIAS".to_string(),
-            })?;
+        let wallet_path = self.oracle_wallet_path.clone();
+        let connect_descriptor = if let Some(dsn) = self.oracle_dsn.clone() {
+            dsn
+        } else if let Some(alias) = self.oracle_tns_alias.clone() {
+            alias
+        } else {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle_dsn/oracle_tns_alias (ATP_DSN or ATP_TNS_ALIAS)".to_string(),
+            });
+        };
         let username = self
             .oracle_user
             .clone()
@@ -447,7 +449,7 @@ impl CliArgs {
 
         Ok(OracleHistoryConfig {
             wallet_path,
-            tns_alias,
+            connect_descriptor,
             username,
             password,
             pool_min,

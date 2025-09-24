@@ -94,10 +94,11 @@ pub enum HistoryBackend {
 /// Oracle history backend configuration
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct OracleHistoryConfig {
-    /// Directory containing the ATP wallet files (tnsnames.ora, cwallet.sso, etc.)
-    pub wallet_path: String,
-    /// TNS alias from the wallet to use for connections (e.g. `<db_name>_low`)
-    pub tns_alias: String,
+    /// Directory containing the ATP wallet or TLS config files (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_path: Option<String>,
+    /// Connection descriptor / DSN (e.g. `tcps://host:port/service`)
+    pub connect_descriptor: String,
     /// Database username
     pub username: String,
     /// Database password
@@ -143,7 +144,7 @@ impl std::fmt::Debug for OracleHistoryConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OracleHistoryConfig")
             .field("wallet_path", &self.wallet_path)
-            .field("tns_alias", &self.tns_alias)
+            .field("connect_descriptor", &self.connect_descriptor)
             .field("username", &self.username)
             .field("pool_min", &self.pool_min)
             .field("pool_max", &self.pool_max)
