@@ -272,7 +272,7 @@ def test_pd_logprobs_merge(e2e_model: str, pd_cluster):
     url = f"{pd_cluster.router_url}/generate"
 
     payload = {
-        "text": ["What time is it?"],
+        "text": "What time is it?",
         "sampling_params": {"temperature": 0.0, "max_new_tokens": 4},
         "return_logprob": True,
         "logprob_start_len": 0,
