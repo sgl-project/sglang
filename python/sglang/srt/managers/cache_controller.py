@@ -17,6 +17,7 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from queue import Empty, Full, PriorityQueue, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Set, Tuple
 
@@ -28,6 +29,14 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    EventBatch,
+    KVCacheEvent,
+    KVEventBatch,
+)
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -259,6 +268,8 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
+        self.kv_event_queue: list[KVCacheEvent] = []
+        self.enable_kv_cache_events: bool = False  # default off unless enabled elsewhere
 
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -301,6 +312,10 @@ class HiCacheController:
                 elif self.mem_pool_host.layout == "layer_first":
                     bytes_per_page = (
                         mem_pool_host.get_size_per_token() * mem_pool_host.page_size
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported host layout: {self.mem_pool_host.layout}"
                     )
                 dtype = mem_pool_host.dtype
                 self.storage_backend = HiCacheHF3FS.from_env_config(
@@ -421,6 +436,14 @@ class HiCacheController:
             extra_config=extra_config,
         )
 
+    @staticmethod
+    def _drain_queue(q: Queue) -> None:
+        try:
+            while True:
+                q.get_nowait()
+        except Empty:
+            pass
+
     def reset(self):
         self.stop_event.set()
 
@@ -430,6 +453,7 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
+        self._record_all_cleared_event()
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
@@ -744,6 +768,15 @@ class HiCacheController:
                 if operation is None:
                     continue
 
+                # Optional soft rate limit to avoid overfetch
+                if self.prefetch_rate_limited():
+                    self.prefetch_revoke_queue.put(operation.request_id)
+                    self.append_host_mem_release(operation.host_indices)
+                    logger.debug(
+                        f"Revoking prefetch for {operation.request_id}: rate-limited."
+                    )
+                    continue
+
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
@@ -838,3 +871,19 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def _record_all_cleared_event(self):
+        if self.enable_kv_cache_events:
+            self.kv_event_queue.append(AllBlocksCleared())
+
+    def take_events(self):
+        """Atomically takes all events and clears the queue.
+
+        Returns:
+            A list of KV cache events.
+        """
+        if not self.enable_kv_cache_events:
+            return []
+        events = self.kv_event_queue
+        self.kv_event_queue = []
+        return events
