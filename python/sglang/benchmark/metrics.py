@@ -163,6 +163,20 @@ def print_metrics(metrics: BenchmarkMetrics, args: Namespace, duration: float):
     print("=" * 50)
 
 
+def convert_numpy_to_native(data):
+    cleaned_data = {}
+    for key, value in data.items():
+        if isinstance(value, np.integer):
+            cleaned_data[key] = int(value)
+        elif isinstance(value, np.floating):
+            cleaned_data[key] = float(value)
+        elif isinstance(value, np.ndarray):
+            cleaned_data[key] = value.tolist()
+        else:
+            cleaned_data[key] = value
+    return cleaned_data
+
+
 def save_results(
     metrics: BenchmarkMetrics,
     args: Namespace,
@@ -170,6 +184,7 @@ def save_results(
     outputs: List[RequestFuncOutput],
     output_lens: List[int],
 ):
+    cleaned_metrics = convert_numpy_to_native(metrics.__dict__)
     result = {
         # Arguments
         "backend": args.backend,
@@ -182,7 +197,7 @@ def save_results(
         "random_range_ratio": args.random_range_ratio,
         # Results
         "duration": duration,
-        **metrics.__dict__,
+        **cleaned_metrics,
     }
 
     if args.output_file:
