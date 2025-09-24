@@ -90,7 +90,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
-      "Tensor pos_ids, bool interleave, int cuda_stream, "
+      "Tensor pos_ids, bool interleave, bool enable_pdl, int cuda_stream, "
       "Tensor? v, Tensor!? k_buffer, Tensor!? v_buffer, Tensor? kv_cache_loc) -> ()");
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
@@ -98,6 +98,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "downcast_fp8(Tensor k, Tensor v, Tensor k_out, Tensor v_out, Tensor k_scale, Tensor v_scale, Tensor loc, int "
       "mult, int offset, int cuda_stream) -> ()");
   m.impl("downcast_fp8", torch::kCUDA, &downcast_fp8);
+
+  m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
+  m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
+  m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
+  m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
+
+  m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
+  m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
 
   /*
    * From csrc/gemm
@@ -158,6 +166,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("scaled_fp4_experts_quant", torch::kCUDA, &scaled_fp4_experts_quant);
 
   m.def(
+      "silu_and_mul_scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
+      "Tensor input, Tensor input_global_scale, Tensor mask, bool use_silu_and_mul) -> ()");
+  m.impl("silu_and_mul_scaled_fp4_experts_quant", torch::kCUDA, &silu_and_mul_scaled_fp4_experts_quant);
+
+  m.def(
       "cutlass_fp4_group_mm(Tensor! output, Tensor a, Tensor b,"
       "Tensor a_blockscale, Tensor b_blockscale, Tensor alphas,"
       "Tensor ab_strides, Tensor c_strides, Tensor problem_sizes,"
@@ -204,23 +217,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
+  m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
+  m.impl("moe_sum_reduce", torch::kCUDA, &moe_sum_reduce);
   m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
       "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
-  m.def(
-      "ep_moe_pre_reorder(Tensor input, Tensor gateup_input, Tensor src2dst, Tensor topk_ids, Tensor "
-      "a1_scales, int start_expert_id, int end_expert_id, int topk, bool use_per_token_if_dynamic) -> ()");
-  m.impl("ep_moe_pre_reorder", torch::kCUDA, &ep_moe_pre_reorder);
-  m.def(
-      "ep_moe_silu_and_mul(Tensor gateup_output, Tensor down_input, Tensor reorder_topk_ids, Tensor scales, int "
-      "start_expert_id, int end_expert_id) -> ()");
-  m.impl("ep_moe_silu_and_mul", torch::kCUDA, &ep_moe_silu_and_mul);
-  m.def(
-      "ep_moe_post_reorder(Tensor down_output, Tensor output, Tensor src2dst, Tensor topk_ids, Tensor "
-      "topk_weights, int start_expert_id, int end_expert_id, int topk) -> ()");
-  m.impl("ep_moe_post_reorder", torch::kCUDA, &ep_moe_post_reorder);
   m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
       "a_scales_ptrs, Tensor b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
@@ -291,6 +294,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
 
   m.def(
+      "reconstruct_indices_from_tree_mask(Tensor tree_mask, Tensor verified_seq_len, Tensor positions, "
+      "Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "int batch_size, int draft_token_num) -> ()");
+  m.impl("reconstruct_indices_from_tree_mask", torch::kCUDA, &reconstruct_indices_from_tree_mask);
+
+  m.def(
       "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
       "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
       "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> "
@@ -343,6 +352,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");
   m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);
+  m.def(
+      "transfer_kv_per_layer_direct_pf_lf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
+      "Tensor dst_indices, int layer_id, int page_size)->() ");
+  m.impl("transfer_kv_per_layer_direct_pf_lf", torch::kCUDA, &transfer_kv_per_layer_direct_pf_lf);
+  m.def(
+      "transfer_kv_all_layer_direct_lf_pf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
+      "Tensor dst_indices, int page_size) ->() ");
+  m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
 
   /*
    * From csrc/memory
@@ -445,6 +462,31 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "qserve_w4a8_per_group_gemm(Tensor _in_feats, Tensor _kernel, Tensor _zeros, Tensor _scales_i8, Tensor _wscales, "
       "Tensor _ascales, Tensor! _out_feats) -> ()");
   m.impl("qserve_w4a8_per_group_gemm", torch::kCUDA, &qserve_w4a8_per_group_gemm);
+
+  /*
+   * From csrc/mamba
+   */
+  m.def(
+      "causal_conv1d_update(Tensor! x,"
+      "Tensor! conv_state,"
+      "Tensor! weight,"
+      "Tensor? bias_,"
+      "bool silu_activation,"
+      "Tensor? cache_seqlens_,"
+      "Tensor? conv_state_indices,"
+      "int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_update", torch::kCUDA, &causal_conv1d_update);
+
+  m.def(
+      "causal_conv1d_fwd(Tensor! x, Tensor! weight,"
+      "Tensor? bias_,"
+      "Tensor!? conv_states,"
+      "Tensor? query_start_loc,"
+      "Tensor? cache_indices,"
+      "Tensor? has_initial_state,"
+      "bool silu_activation,"
+      "int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
 }
 
 REGISTER_EXTENSION(common_ops)

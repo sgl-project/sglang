@@ -16,6 +16,7 @@
 """Inference-only GptOss model compatible with HuggingFace weights."""
 
 import logging
+import math
 from collections.abc import Iterable
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -57,7 +58,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id, is_sm100_supported
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -70,6 +71,7 @@ from sglang.srt.utils import (
     add_prefix,
     is_cuda,
     is_flashinfer_available,
+    is_sm100_supported,
     make_layers,
 )
 
@@ -119,7 +121,7 @@ class GptOssSparseMoeBlock(nn.Module):
         )
 
         self.top_k = config.num_experts_per_tok
-        experts_type = get_moe_impl_class()
+        experts_type = get_moe_impl_class(quant_config)
         extra_kwargs = {}
         if experts_type.__name__ == "FusedMoE":
             quant_config_name = (
@@ -191,8 +193,9 @@ class GptOssSparseMoeBlock(nn.Module):
         return ans
 
 
-def _enable_fused_set_kv_buffer():
-    return _is_cuda
+def _enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
+    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    return _is_cuda and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
 
 
 # TODO maybe move to a model-common utils
@@ -339,7 +342,7 @@ class GptOssAttention(nn.Module):
                     layer=self.attn,
                     forward_batch=forward_batch,
                 )
-                if _enable_fused_set_kv_buffer()
+                if _enable_fused_set_kv_buffer(forward_batch)
                 else None
             ),
         )
@@ -353,7 +356,7 @@ class GptOssAttention(nn.Module):
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            save_kv_cache=not _enable_fused_set_kv_buffer(),
+            save_kv_cache=not _enable_fused_set_kv_buffer(forward_batch),
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -453,43 +456,10 @@ class GptOssDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            is_last_layer=(
+                self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+            ),
         )
-
-        self._fuse_allreduce_lookup_table = self._build_fuse_allreduce_lookup_table()
-
-    def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
-        """Check if MLP allreduce can be fused with next layer's residual_rmsnorm"""
-
-        batch_size = (
-            forward_batch.input_ids.shape[0]
-            if hasattr(forward_batch, "input_ids")
-            else 0
-        )
-
-        if batch_size > 128:
-            return False
-
-        return self._fuse_allreduce_lookup_table.get(batch_size, False)
-
-    def _build_fuse_allreduce_lookup_table(self):
-        static_conditions_met = (
-            self.layer_id != self.config.num_hidden_layers - 1
-            and get_tensor_model_parallel_world_size() > 1
-            and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
-            and _is_sm100_supported
-            and _is_flashinfer_available
-        )
-
-        if not static_conditions_met:
-            return {}
-
-        lookup_table = {}
-        for batch_size in range(129):  # 0 to 128
-            is_last_layer = self.layer_id == self.config.num_hidden_layers - 1
-            should_fuse = batch_size > 0 and batch_size <= 128 and not is_last_layer
-            lookup_table[batch_size] = should_fuse
-
-        return lookup_table
 
     def forward(
         self,
@@ -514,8 +484,9 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         should_allreduce_fusion = (
-            self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
-            and not self.is_nextn
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
         )
 
         hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
@@ -820,18 +791,27 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_size = get_moe_expert_parallel_world_size()
 
         intermediate_size = self.config.intermediate_size
+        assert (
+            intermediate_size % mxfp4_block == 0
+        ), f"{intermediate_size=} must be divisible by {mxfp4_block=}"
         intermediate_size_block = intermediate_size // mxfp4_block
-        per_rank_intermediate_size_block = intermediate_size_block // moe_tp_size
+
+        per_rank_intermediate_size_block = math.ceil(
+            intermediate_size_block / moe_tp_size
+        )
+
         per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
 
         # Calculate common slicing bounds for current rank
         assert self.config.num_local_experts % moe_ep_size == 0
         moe_num_global_experts = self.config.num_local_experts
         moe_num_local_experts = self.config.num_local_experts // moe_ep_size
+
         moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
         moe_tp_rank_end = min(
             (moe_tp_rank + 1) * per_rank_intermediate_size, intermediate_size
         )
+
         moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
@@ -1050,10 +1030,6 @@ class GptOssForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        params_checker = {k: False for k, v in params_dict.items()}
-
-        for other_loaded_param_name in other_loaded_param_names:
-            params_checker[other_loaded_param_name] = True
 
         for name, loaded_weight in weights:
             loaded_weight = _WeightCreator.maybe_materialize(loaded_weight)
@@ -1090,7 +1066,6 @@ class GptOssForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                params_checker[name] = True
                 break
             else:
                 for mapping in expert_params_mapping:
@@ -1113,7 +1088,6 @@ class GptOssForCausalLM(nn.Module):
                         name,
                         shard_id=shard_id,
                     )
-                    params_checker[name] = True
                     break
                 else:
                     if name.endswith(".bias") and name not in params_dict:
@@ -1123,7 +1097,7 @@ class GptOssForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "sinks" in name:
-                            start = tp_rank * param.numel()
+                            start = get_attention_tp_rank() * param.numel()
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
@@ -1132,16 +1106,8 @@ class GptOssForCausalLM(nn.Module):
                                 param, "weight_loader", default_weight_loader
                             )
                             weight_loader(param, loaded_weight)
-                        params_checker[name] = True
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-
-        not_loaded_params = [k for k, v in params_checker.items() if not v]
-        if tp_rank == 0:
-            if len(not_loaded_params) > 0:
-                raise Exception(f"Not all parameters loaded: {not_loaded_params}")
-            else:
-                logging.info("All parameters loaded successfully.")
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

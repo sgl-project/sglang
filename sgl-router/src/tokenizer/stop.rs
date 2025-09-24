@@ -1,9 +1,7 @@
-use super::traits;
-use crate::metrics::TokenizerMetrics;
+use super::traits::{self, TokenIdType};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Output from the sequence decoder
 #[derive(Debug, Clone, PartialEq)]
@@ -22,18 +20,18 @@ pub enum SequenceDecoderOutput {
 #[derive(Debug, Clone, Default)]
 pub struct StopSequenceConfig {
     /// Token IDs that trigger a stop
-    pub stop_tokens: HashSet<u32>,
+    pub stop_tokens: HashSet<TokenIdType>,
     /// String sequences that trigger a stop
     pub stop_sequences: Vec<String>,
     /// Token IDs for visible stops (included in output)
-    pub visible_stop_tokens: HashSet<u32>,
+    pub visible_stop_tokens: HashSet<TokenIdType>,
     /// String sequences for visible stops (included in output)
     pub visible_stop_sequences: Vec<String>,
 }
 
 impl StopSequenceConfig {
     /// Builder pattern - add a stop token
-    pub fn with_stop_token(mut self, token_id: u32) -> Self {
+    pub fn with_stop_token(mut self, token_id: TokenIdType) -> Self {
         self.stop_tokens.insert(token_id);
         self
     }
@@ -45,7 +43,7 @@ impl StopSequenceConfig {
     }
 
     /// Builder pattern - add a visible stop token
-    pub fn with_visible_stop_token(mut self, token_id: u32) -> Self {
+    pub fn with_visible_stop_token(mut self, token_id: TokenIdType) -> Self {
         self.visible_stop_tokens.insert(token_id);
         self
     }
@@ -64,7 +62,7 @@ pub struct StopSequenceDecoder {
     /// Buffer for partial matches (the "jail")
     jail_buffer: String,
     /// Accumulated tokens
-    token_buffer: Vec<u32>,
+    token_buffer: Vec<TokenIdType>,
     /// Offset where the prefix text starts (for context)
     prefix_offset: usize,
     /// Offset marking the end of previously decoded text
@@ -94,9 +92,7 @@ impl StopSequenceDecoder {
     }
 
     /// Process a single token
-    pub fn process_token(&mut self, token_id: u32) -> Result<SequenceDecoderOutput> {
-        let start = Instant::now();
-
+    pub fn process_token(&mut self, token_id: TokenIdType) -> Result<SequenceDecoderOutput> {
         if self.stopped {
             return Ok(SequenceDecoderOutput::Stopped);
         }
@@ -104,22 +100,18 @@ impl StopSequenceDecoder {
         // Check for token-level stops first
         if self.config.stop_tokens.contains(&token_id) {
             self.stopped = true;
-            TokenizerMetrics::record_stop_sequence_detected("token");
 
             // Flush any jailed text before stopping
             if !self.jail_buffer.is_empty() {
                 let output = self.jail_buffer.clone();
                 self.jail_buffer.clear();
-                TokenizerMetrics::record_stop_detection_duration(start.elapsed());
                 return Ok(SequenceDecoderOutput::StoppedWithText(output));
             }
-            TokenizerMetrics::record_stop_detection_duration(start.elapsed());
             return Ok(SequenceDecoderOutput::Stopped);
         }
 
         if self.config.visible_stop_tokens.contains(&token_id) {
             self.stopped = true;
-            TokenizerMetrics::record_stop_sequence_detected("visible_token");
 
             // Include jailed text plus the stop token
             let stop_text = self
@@ -127,7 +119,6 @@ impl StopSequenceDecoder {
                 .decode(&[token_id], self.skip_special_tokens)?;
             let output = format!("{}{}", self.jail_buffer, stop_text);
             self.jail_buffer.clear();
-            TokenizerMetrics::record_stop_detection_duration(start.elapsed());
             return Ok(SequenceDecoderOutput::StoppedWithText(output));
         }
 
@@ -172,12 +163,10 @@ impl StopSequenceDecoder {
         for stop_seq in &self.config.stop_sequences {
             if let Some(pos) = check_text.find(stop_seq) {
                 self.stopped = true;
-                TokenizerMetrics::record_stop_sequence_detected("string");
 
                 // Output text before the stop sequence
                 let output = check_text[..pos].to_string();
                 self.jail_buffer.clear();
-                TokenizerMetrics::record_stop_detection_duration(start.elapsed());
                 return Ok(if output.is_empty() {
                     SequenceDecoderOutput::Stopped
                 } else {
@@ -190,13 +179,11 @@ impl StopSequenceDecoder {
         for stop_seq in &self.config.visible_stop_sequences {
             if let Some(pos) = check_text.find(stop_seq) {
                 self.stopped = true;
-                TokenizerMetrics::record_stop_sequence_detected("visible_string");
 
                 // Include the stop sequence in output
                 let end_pos = pos + stop_seq.len();
                 let output = check_text[..end_pos].to_string();
                 self.jail_buffer.clear();
-                TokenizerMetrics::record_stop_detection_duration(start.elapsed());
                 return Ok(SequenceDecoderOutput::StoppedWithText(output));
             }
         }
@@ -219,8 +206,6 @@ impl StopSequenceDecoder {
         }
 
         if partial_match_len > 0 {
-            TokenizerMetrics::record_partial_match();
-
             // Split: output safe text, jail the potential match
             let safe_end = check_text.len() - partial_match_len;
             let safe_text = &check_text[..safe_end];
@@ -229,8 +214,6 @@ impl StopSequenceDecoder {
             // Update offsets for next iteration
             self.prefix_offset = self.read_offset;
             self.read_offset = self.token_buffer.len();
-
-            TokenizerMetrics::record_stop_detection_duration(start.elapsed());
 
             if safe_text.is_empty() {
                 Ok(SequenceDecoderOutput::Held)
@@ -245,14 +228,15 @@ impl StopSequenceDecoder {
             self.prefix_offset = self.read_offset;
             self.read_offset = self.token_buffer.len();
 
-            TokenizerMetrics::record_stop_detection_duration(start.elapsed());
-
             Ok(SequenceDecoderOutput::Text(check_text))
         }
     }
 
     /// Process multiple tokens
-    pub fn process_tokens(&mut self, token_ids: &[u32]) -> Result<Vec<SequenceDecoderOutput>> {
+    pub fn process_tokens(
+        &mut self,
+        token_ids: &[TokenIdType],
+    ) -> Result<Vec<SequenceDecoderOutput>> {
         let mut outputs = Vec::new();
         for &token_id in token_ids {
             outputs.push(self.process_token(token_id)?);
@@ -302,7 +286,7 @@ impl StopSequenceDecoderBuilder {
         }
     }
 
-    pub fn stop_token(mut self, token_id: u32) -> Self {
+    pub fn stop_token(mut self, token_id: TokenIdType) -> Self {
         self.config.stop_tokens.insert(token_id);
         self
     }
@@ -312,7 +296,7 @@ impl StopSequenceDecoderBuilder {
         self
     }
 
-    pub fn visible_stop_token(mut self, token_id: u32) -> Self {
+    pub fn visible_stop_token(mut self, token_id: TokenIdType) -> Self {
         self.config.visible_stop_tokens.insert(token_id);
         self
     }

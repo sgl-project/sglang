@@ -24,20 +24,20 @@ import os
 import re
 from typing import Optional
 
-from sglang.srt.code_completion_parser import (
+from sglang.srt.parser.code_completion_parser import (
     CompletionTemplate,
     FimPosition,
     completion_template_exists,
     register_completion_template,
 )
-from sglang.srt.conversation import (
+from sglang.srt.parser.conversation import (
     Conversation,
     SeparatorStyle,
     chat_template_exists,
     get_conv_template_by_model_path,
     register_conv_template,
 )
-from sglang.srt.jinja_template_utils import detect_jinja_template_content_format
+from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,7 @@ class TemplateManager:
         if template is None:
             return False
 
+        # TODO: remove this hard code the reasoning pattern
         force_reasoning_pattern = r"<\|im_start\|>assistant\\n<think>\\n"
         has_reasoning = re.search(force_reasoning_pattern, template) is not None
 
@@ -128,11 +129,12 @@ class TemplateManager:
                     logger.info(
                         f"Using default HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
                     )
-                    return
-
-            # Default to string content format if no template was found
-            self._jinja_template_content_format = "string"
-            logger.info("No chat template found, defaulting to 'string' content format")
+                else:
+                    # Default to string content format if no template was found
+                    self._jinja_template_content_format = "string"
+                    logger.info(
+                        "No chat template found, defaulting to 'string' content format"
+                    )
 
         # Detect reasoning pattern from chat template
         if tokenizer_manager.tokenizer:

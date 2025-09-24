@@ -893,6 +893,35 @@ class QKVParallelLinear(ColumnParallelLinear):
                 )
             self.weight_loader_v2(param, loaded_weight_shard, shard_id)
 
+    def _load_qkv_block_scale(
+        self, param: BasevLLMParameter, loaded_weight: torch.Tensor
+    ):
+        block_n, _ = self.quant_method.quant_config.weight_block_size
+        q_size = self.total_num_heads * self.head_size // block_n
+        k_size = self.total_num_kv_heads * self.head_size // block_n
+        v_size = self.total_num_kv_heads * self.head_size // block_n
+        shard_offsets = [
+            # (shard_id, shard_offset, shard_size)
+            ("q", 0, q_size),
+            ("k", q_size, k_size),
+            ("v", q_size + k_size, v_size),
+        ]
+        for shard_id, shard_offset, shard_size in shard_offsets:
+            loaded_weight_shard = loaded_weight.narrow(
+                param.output_dim, shard_offset, shard_size
+            )
+            rank_shard_offset = self._get_shard_offset_mapping(shard_id) // block_n
+            rank_shard_size = self._get_shard_size_mapping(shard_id) // block_n
+            param.load_qkv_weight(
+                loaded_weight=loaded_weight_shard,
+                num_heads=self.num_kv_head_replicas,
+                shard_id=shard_id,
+                shard_offset=rank_shard_offset,
+                shard_size=rank_shard_size,
+                tp_rank=self.tp_rank,
+                use_presharded_weights=self.use_presharded_weights,
+            )
+
     def weight_loader_v2(
         self,
         param: BasevLLMParameter,
@@ -905,6 +934,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_qkv_weight(loaded_weight=loaded_weight)
+                return
+            elif isinstance(param, BlockQuantScaleParameter):
+                self._load_qkv_block_scale(param, loaded_weight)
                 return
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(param, loaded_weight)

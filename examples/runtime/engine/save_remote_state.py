@@ -14,8 +14,7 @@ python save_remote_state.py \
 Then, the model can be loaded with
 
 llm = Engine(
-    model_path="/path/to/save",
-    --remote-model-url [protocol]://[host]:[port]/[model_name],
+    model_path="[protocol]://[host]:[port]/[model_name]",
     tensor_parallel_size=8,
 )
 """
@@ -34,6 +33,12 @@ parser.add_argument(
     type=str,
     help="remote address to store model weights",
 )
+parser.add_argument(
+    "--remote-draft-model-save-url",
+    default=None,
+    type=str,
+    help="remote address to store draft model weights",
+)
 
 
 def main(args):
@@ -43,7 +48,10 @@ def main(args):
         raise ValueError("model path must be a local directory")
     # Create LLM instance from arguments
     llm = Engine(**dataclasses.asdict(engine_args))
-    llm.save_remote_model(url=args.remote_model_save_url)
+    llm.save_remote_model(
+        url=args.remote_model_save_url, draft_url=args.remote_draft_model_save_url
+    )
+    print("save remote (draft) model successfully")
 
 
 if __name__ == "__main__":

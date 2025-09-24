@@ -7,6 +7,9 @@ use std::collections::HashMap;
 pub struct RouterConfig {
     /// Routing mode configuration
     pub mode: RoutingMode,
+    /// Worker connection mode
+    #[serde(default)]
+    pub connection_mode: ConnectionMode,
     /// Policy configuration
     pub policy: PolicyConfig,
     /// Server host address
@@ -37,6 +40,12 @@ pub struct RouterConfig {
     pub request_id_headers: Option<Vec<String>>,
     /// Maximum concurrent requests allowed (for rate limiting)
     pub max_concurrent_requests: usize,
+    /// Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)
+    pub queue_size: usize,
+    /// Maximum time (in seconds) a request can wait in queue before timing out
+    pub queue_timeout_secs: u64,
+    /// Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    pub rate_limit_tokens_per_second: Option<usize>,
     /// CORS allowed origins
     pub cors_allowed_origins: Vec<String>,
     /// Retry configuration
@@ -51,6 +60,40 @@ pub struct RouterConfig {
     pub disable_circuit_breaker: bool,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
+    /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
+    #[serde(default)]
+    pub enable_igw: bool,
+    /// Model path for loading tokenizer (can be a HuggingFace model ID or local path)
+    pub model_path: Option<String>,
+    /// Explicit tokenizer path (overrides model_path tokenizer if provided)
+    pub tokenizer_path: Option<String>,
+    /// History backend configuration (memory or none, default: memory)
+    #[serde(default = "default_history_backend")]
+    pub history_backend: HistoryBackend,
+}
+
+fn default_history_backend() -> HistoryBackend {
+    HistoryBackend::Memory
+}
+
+/// History backend configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryBackend {
+    /// In-memory storage (default)
+    Memory,
+    /// No history storage
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(tag = "type")]
+pub enum ConnectionMode {
+    #[default]
+    #[serde(rename = "http")]
+    Http,
+    #[serde(rename = "grpc")]
+    Grpc,
 }
 
 /// Routing mode configuration
@@ -75,6 +118,11 @@ pub enum RoutingMode {
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
     },
+    #[serde(rename = "openai")]
+    OpenAI {
+        /// OpenAI-compatible API base(s), provided via worker URLs
+        worker_urls: Vec<String>,
+    },
 }
 
 impl RoutingMode {
@@ -90,6 +138,8 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
+            // OpenAI mode represents a single upstream
+            RoutingMode::OpenAI { .. } => 1,
         }
     }
 
@@ -317,12 +367,20 @@ impl Default for RouterConfig {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 256,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
+            history_backend: default_history_backend(),
         }
     }
 }
@@ -347,6 +405,7 @@ impl RouterConfig {
         match self.mode {
             RoutingMode::Regular { .. } => "regular",
             RoutingMode::PrefillDecode { .. } => "prefill_decode",
+            RoutingMode::OpenAI { .. } => "openai",
         }
     }
 
@@ -376,6 +435,11 @@ impl RouterConfig {
             cfg.failure_threshold = u32::MAX;
         }
         cfg
+    }
+
+    /// Check if running in IGW (Inference Gateway) mode
+    pub fn is_igw_mode(&self) -> bool {
+        self.enable_igw
     }
 }
 
@@ -438,24 +502,9 @@ mod tests {
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
             port: 8080,
-            max_payload_size: 1024,
-            request_timeout_secs: 30,
-            worker_startup_timeout_secs: 60,
-            worker_startup_check_interval_secs: 5,
-            dp_aware: false,
-            api_key: None,
-            discovery: Some(DiscoveryConfig::default()),
-            metrics: Some(MetricsConfig::default()),
             log_dir: Some("/var/log".to_string()),
             log_level: Some("debug".to_string()),
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: HealthCheckConfig::default(),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -464,8 +513,11 @@ mod tests {
         assert_eq!(config.host, deserialized.host);
         assert_eq!(config.port, deserialized.port);
         assert_eq!(config.max_payload_size, deserialized.max_payload_size);
-        assert!(deserialized.discovery.is_some());
-        assert!(deserialized.metrics.is_some());
+        assert_eq!(config.log_dir, deserialized.log_dir);
+        assert_eq!(config.log_level, deserialized.log_level);
+        // discovery and metrics are None in Default implementation
+        assert!(deserialized.discovery.is_none());
+        assert!(deserialized.metrics.is_none());
     }
 
     // ============= RoutingMode Tests =============
@@ -888,6 +940,14 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
+            history_backend: default_history_backend(),
         };
 
         assert!(config.mode.is_pd_mode());
@@ -944,6 +1004,14 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
+            history_backend: default_history_backend(),
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -996,6 +1064,14 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
+            history_backend: default_history_backend(),
         };
 
         assert!(config.has_service_discovery());
