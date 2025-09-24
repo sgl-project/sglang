@@ -83,14 +83,13 @@ impl CircuitBreaker {
 
     /// Check if a request can be executed
     pub fn can_execute(&self) -> bool {
-        // First check if we need to transition from Open to HalfOpen
         self.check_and_update_state();
 
         let state = *self.state.read().unwrap();
         match state {
             CircuitState::Closed => true,
             CircuitState::Open => false,
-            CircuitState::HalfOpen => true, // Allow limited requests in half-open state
+            CircuitState::HalfOpen => true,
         }
     }
 
@@ -114,22 +113,17 @@ impl CircuitBreaker {
         self.total_successes.fetch_add(1, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Release);
         let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
-        // Outcome-level metrics are recorded at the worker level where the worker label is known
 
         let current_state = *self.state.read().unwrap();
 
         match current_state {
             CircuitState::HalfOpen => {
-                // Check if we've reached the success threshold to close the circuit
                 if successes >= self.config.success_threshold {
                     self.transition_to(CircuitState::Closed);
                 }
             }
-            CircuitState::Closed => {
-                // Already closed, nothing to do
-            }
+            CircuitState::Closed => {}
             CircuitState::Open => {
-                // Shouldn't happen, but if it does, stay open
                 tracing::warn!("Success recorded while circuit is open");
             }
         }
@@ -140,9 +134,7 @@ impl CircuitBreaker {
         self.total_failures.fetch_add(1, Ordering::Relaxed);
         self.consecutive_successes.store(0, Ordering::Release);
         let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-        // Outcome-level metrics are recorded at the worker level where the worker label is known
 
-        // Update last failure time
         {
             let mut last_failure = self.last_failure_time.write().unwrap();
             *last_failure = Some(Instant::now());
@@ -152,18 +144,14 @@ impl CircuitBreaker {
 
         match current_state {
             CircuitState::Closed => {
-                // Check if we've reached the failure threshold to open the circuit
                 if failures >= self.config.failure_threshold {
                     self.transition_to(CircuitState::Open);
                 }
             }
             CircuitState::HalfOpen => {
-                // Single failure in half-open state reopens the circuit
                 self.transition_to(CircuitState::Open);
             }
-            CircuitState::Open => {
-                // Already open, nothing to do
-            }
+            CircuitState::Open => {}
         }
     }
 
@@ -172,7 +160,6 @@ impl CircuitBreaker {
         let current_state = *self.state.read().unwrap();
 
         if current_state == CircuitState::Open {
-            // Check if timeout has expired
             let last_change = *self.last_state_change.read().unwrap();
             if last_change.elapsed() >= self.config.timeout_duration {
                 self.transition_to(CircuitState::HalfOpen);
@@ -188,11 +175,9 @@ impl CircuitBreaker {
         if old_state != new_state {
             *state = new_state;
 
-            // Update last state change time
             let mut last_change = self.last_state_change.write().unwrap();
             *last_change = Instant::now();
 
-            // Reset counters based on transition
             match new_state {
                 CircuitState::Closed => {
                     self.consecutive_failures.store(0, Ordering::Release);
@@ -218,7 +203,6 @@ impl CircuitBreaker {
                 CircuitState::HalfOpen => "half_open",
             };
             info!("Circuit breaker state transition: {} -> {}", from, to);
-            // Transition metrics are recorded at the worker level where the worker label is known
         }
     }
 
@@ -533,7 +517,6 @@ mod tests {
         let cb = Arc::new(CircuitBreaker::new());
         let mut handles = vec![];
 
-        // Spawn threads that record failures
         for _ in 0..10 {
             let cb_clone = Arc::clone(&cb);
             let handle = thread::spawn(move || {
@@ -544,12 +527,10 @@ mod tests {
             handles.push(handle);
         }
 
-        // Wait for all threads
         for handle in handles {
             handle.join().unwrap();
         }
 
-        // Should have recorded 1000 failures
         assert_eq!(cb.total_failures(), 1000);
     }
 }

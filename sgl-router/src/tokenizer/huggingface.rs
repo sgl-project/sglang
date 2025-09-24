@@ -210,6 +210,10 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     fn id_to_token(&self, id: TokenIdType) -> Option<String> {
         self.reverse_vocab.get(&id).cloned()
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]
