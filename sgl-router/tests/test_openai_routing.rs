@@ -10,7 +10,9 @@ use axum::{
 };
 use serde_json::json;
 use sglang_router_rs::{
-    config::{RouterConfig, RoutingMode},
+    config::{
+        ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
+    },
     data_connector::{MemoryResponseStorage, ResponseId, ResponseStorage, StoredResponse},
     protocols::spec::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
@@ -843,4 +845,64 @@ async fn test_openai_router_models_auth_forwarding() {
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
     let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
     assert_eq!(models["object"], "list");
+}
+
+#[test]
+fn oracle_config_validation_requires_config_when_enabled() {
+    let mut config = RouterConfig::default();
+    config.mode = RoutingMode::OpenAI {
+        worker_urls: vec!["https://api.openai.com".to_string()],
+    };
+    config.history_backend = HistoryBackend::Oracle;
+    config.oracle = None;
+
+    let err =
+        ConfigValidator::validate(&config).expect_err("config should fail without oracle details");
+
+    match err {
+        ConfigError::MissingRequired { field } => {
+            assert_eq!(field, "oracle");
+        }
+        other => panic!("unexpected error: {:?}", other),
+    }
+}
+
+#[test]
+fn oracle_config_validation_accepts_dsn_only() {
+    let mut config = RouterConfig::default();
+    config.mode = RoutingMode::OpenAI {
+        worker_urls: vec!["https://api.openai.com".to_string()],
+    };
+    config.history_backend = HistoryBackend::Oracle;
+    config.oracle = Some(OracleConfig {
+        wallet_path: None,
+        connect_descriptor: "tcps://db.example.com:1522/service".to_string(),
+        username: "scott".to_string(),
+        password: "tiger".to_string(),
+        pool_min: 1,
+        pool_max: 4,
+        pool_timeout_secs: 30,
+    });
+
+    ConfigValidator::validate(&config).expect("dsn-based config should validate");
+}
+
+#[test]
+fn oracle_config_validation_accepts_wallet_alias() {
+    let mut config = RouterConfig::default();
+    config.mode = RoutingMode::OpenAI {
+        worker_urls: vec!["https://api.openai.com".to_string()],
+    };
+    config.history_backend = HistoryBackend::Oracle;
+    config.oracle = Some(OracleConfig {
+        wallet_path: Some("/etc/sglang/oracle-wallet".to_string()),
+        connect_descriptor: "db_low".to_string(),
+        username: "app_user".to_string(),
+        password: "secret".to_string(),
+        pool_min: 1,
+        pool_max: 8,
+        pool_timeout_secs: 45,
+    });
+
+    ConfigValidator::validate(&config).expect("wallet-based config should validate");
 }
