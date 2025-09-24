@@ -12,6 +12,7 @@ from torchvision.transforms import InterpolationMode
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
+from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -216,11 +217,15 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         Qwen2_5_VLForConditionalGeneration,
         Qwen3VLForConditionalGeneration,
         Qwen3VLMoeForConditionalGeneration,
+        Qwen3VLMoeForConditionalGeneration,
+        Qwen3OmniMoeForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        # The regex that matches expanded image tokens.
+        if hf_config.model_type == "qwen3_omni_moe":
+            hf_config = hf_config.thinker_config
+
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.vision_start_token_id = hf_config.vision_start_token_id
@@ -233,6 +238,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
+            # The regex that matches expanded image tokens.
             image_token_regex=re.compile(
                 r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
             ),

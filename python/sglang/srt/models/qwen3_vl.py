@@ -246,13 +246,13 @@ class Qwen3_VisionPatchMerger(nn.Module):
         return out
 
 
-class Qwen3_VisionTransformer(nn.Module):
+class Qwen3VLMoeVisionModel(nn.Module):
 
     def __init__(
         self,
         vision_config: Qwen3VLVisionConfig,
-        norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
+        norm_eps: float = 1e-6,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -606,12 +606,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        self.visual = Qwen3_VisionTransformer(
+        self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
             quant_config=quant_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("visual", prefix),
         )
 

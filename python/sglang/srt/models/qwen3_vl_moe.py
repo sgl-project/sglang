@@ -45,8 +45,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import (
-    Qwen3_VisionTransformer,
     Qwen3VLForConditionalGeneration,
+    Qwen3VLMoeVisionModel,
 )
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -56,10 +56,9 @@ logger = logging.getLogger(__name__)
 cached_get_processor = lru_cache(get_processor)
 
 
-class Qwen3MoeLLMModel(Qwen3MoeModel):
+class Qwen3VLMoeTextModel(Qwen3MoeModel):
     def __init__(
         self,
-        *,
         config: Qwen3VLMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -157,7 +156,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         super(Qwen3VLForConditionalGeneration, self).__init__()
         self.config = config
 
-        self.visual = Qwen3_VisionTransformer(
+        self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -166,14 +165,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             prefix=add_prefix("visual", prefix),
         )
 
-        self.model = Qwen3MoeLLMModel(
+        self.language_model = Qwen3VLMoeTextModel(
             config=config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
 
         if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+            self.lm_head = self.language_model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -229,7 +228,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            language_model=self.model,
+            language_model=self.language_model,
             multimodal_model=self,
             positions=positions,
             use_deepstack=self.use_deepstack,
@@ -329,8 +328,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self._cached_params_dict = dict(self.named_parameters())
         params_dict = self._cached_params_dict
         for name, loaded_weight in weights:
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
@@ -453,9 +450,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # Lazy initialization of expert weights cache to avoid slowing down load_weights
         # if not hasattr(self, "routed_experts_weights_of_layer"):
         #     self.routed_experts_weights_of_layer = {
-        #         layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+        #         layer_id: self.language_model.layers[layer_id].mlp.get_moe_weights()
         #         for layer_id in range(self.start_layer, self.end_layer)
-        #         if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
+        #         if isinstance(self.language_model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
         #     }
 
 
