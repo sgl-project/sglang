@@ -1,20 +1,9 @@
 // gRPC Router Implementation
 
-use crate::config::types::RetryConfig;
-use crate::core::{
-    BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
-};
-use crate::grpc::{proto, SglangSchedulerClient};
-use crate::metrics::RouterMetrics;
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, ContentPart, ResponseFormat, StringOrArray,
-    UserMessageContent,
-};
-use crate::reasoning_parser::ParserFactory;
-use crate::routers::RouterTrait;
-use crate::tokenizer::{chat_template::ChatMessage as TokenizerChatMessage, traits::Tokenizer};
-use crate::tool_parser::ParserRegistry;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -22,11 +11,24 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+use crate::config::types::RetryConfig;
+use crate::core::{
+    BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
+};
+use crate::grpc::{proto, SglangSchedulerClient};
+use crate::metrics::RouterMetrics;
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::protocols::spec::{ChatCompletionRequest, ResponseFormat, StringOrArray};
+use crate::reasoning_parser::ParserFactory;
+use crate::routers::RouterTrait;
+use crate::tokenizer::traits::Tokenizer;
+use crate::tool_parser::ParserRegistry;
 use uuid::Uuid;
+
+use crate::tokenizer::chat_template::ChatTemplateContentFormat;
+use serde_json::Value;
 
 // Data structures for processing
 #[derive(Debug)]
@@ -290,16 +292,19 @@ impl GrpcRouter {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<ProcessedMessages, String> {
-        let tokenizer_messages = self.convert_messages_for_tokenizer(&request.messages)?;
-
         // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
         let formatted_text = if let Some(hf_tokenizer) =
             self.tokenizer
                 .as_any()
                 .downcast_ref::<crate::tokenizer::HuggingFaceTokenizer>()
         {
+            // Get content format and transform messages accordingly
+            let content_format = hf_tokenizer.chat_template_content_format();
+            let transformed_messages =
+                Self::transform_messages_for_content_format(&request.messages, content_format)?;
+
             hf_tokenizer
-                .apply_chat_template(&tokenizer_messages, true)
+                .apply_chat_template(&transformed_messages, true)
                 .map_err(|e| format!("Failed to apply chat template: {}", e))?
         } else {
             return Err(
@@ -317,46 +322,76 @@ impl GrpcRouter {
         })
     }
 
-    /// Convert spec ChatMessage enum to tokenizer ChatMessage struct
-    fn convert_messages_for_tokenizer(
-        &self,
-        messages: &[ChatMessage],
-    ) -> Result<Vec<TokenizerChatMessage>, String> {
-        let mut converted = Vec::new();
+    /// Transform messages based on content format for ANY message type
+    fn transform_messages_for_content_format(
+        messages: &[crate::protocols::spec::ChatMessage],
+        content_format: crate::tokenizer::chat_template::ChatTemplateContentFormat,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        messages
+            .iter()
+            .map(|message| {
+                let mut message_json = serde_json::to_value(message)
+                    .map_err(|e| format!("Failed to serialize message: {}", e))?;
 
-        for message in messages {
-            let tokenizer_msg = match message {
-                ChatMessage::System { content, .. } => TokenizerChatMessage::new("system", content),
-                ChatMessage::User { content, .. } => {
-                    let text_content = match content {
-                        UserMessageContent::Text(text) => text.clone(),
-                        UserMessageContent::Parts(parts) => {
-                            // Simple text extraction for now - multimodal is placeholder
-                            parts
-                                .iter()
-                                .filter_map(|part| match part {
-                                    ContentPart::Text { text } => Some(text.as_str()),
-                                    ContentPart::ImageUrl { .. } => None, // Skip images for now
-                                })
-                                .collect::<Vec<&str>>()
-                                .join(" ")
-                        }
-                    };
-                    TokenizerChatMessage::new("user", text_content)
+                if let Some(obj) = message_json.as_object_mut() {
+                    if let Some(content_value) = obj.get_mut("content") {
+                        Self::transform_content_field(content_value, content_format);
+                    }
                 }
-                ChatMessage::Assistant { content, .. } => {
-                    // Simple content extraction - no special tool/reasoning formatting
-                    TokenizerChatMessage::new("assistant", content.as_deref().unwrap_or(""))
+
+                Ok(message_json)
+            })
+            .collect()
+    }
+
+    /// Transform a single content field based on content format
+    fn transform_content_field(
+        content_value: &mut Value,
+        content_format: ChatTemplateContentFormat,
+    ) {
+        let Some(content_array) = content_value.as_array() else {
+            return; // Not multimodal, keep as-is
+        };
+
+        match content_format {
+            ChatTemplateContentFormat::String => {
+                // Extract and join text parts only
+                let text_parts: Vec<String> = content_array
+                    .iter()
+                    .filter_map(|part| {
+                        part.as_object()?
+                            .get("type")?
+                            .as_str()
+                            .filter(|&t| t == "text")
+                            .and_then(|_| part.as_object()?.get("text")?.as_str())
+                            .map(String::from)
+                    })
+                    .collect();
+
+                if !text_parts.is_empty() {
+                    *content_value = Value::String(text_parts.join(" "));
                 }
-                ChatMessage::Tool { content, .. } => TokenizerChatMessage::new("tool", content),
-                ChatMessage::Function { content, .. } => {
-                    TokenizerChatMessage::new("function", content)
-                }
-            };
-            converted.push(tokenizer_msg);
+            }
+            ChatTemplateContentFormat::OpenAI => {
+                // Replace media URLs with simple type placeholders
+                let processed_parts: Vec<Value> = content_array
+                    .iter()
+                    .map(|part| {
+                        part.as_object()
+                            .and_then(|obj| obj.get("type")?.as_str())
+                            .and_then(|type_str| match type_str {
+                                "image_url" => Some(serde_json::json!({"type": "image"})),
+                                "video_url" => Some(serde_json::json!({"type": "video"})),
+                                "audio_url" => Some(serde_json::json!({"type": "audio"})),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| part.clone())
+                    })
+                    .collect();
+
+                *content_value = Value::Array(processed_parts);
+            }
         }
-
-        Ok(converted)
     }
 
     /// Build gRPC SamplingParams from OpenAI request
@@ -634,5 +669,262 @@ impl RouterTrait for GrpcRouter {
 
     fn readiness(&self) -> Response {
         (StatusCode::SERVICE_UNAVAILABLE).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::spec::{ChatMessage, ContentPart, ImageUrl, UserMessageContent};
+    use crate::tokenizer::chat_template::ChatTemplateContentFormat;
+    use serde_json::json;
+
+    #[test]
+    fn test_transform_messages_string_format() {
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Hello".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/image.jpg".to_string(),
+                        detail: None,
+                    },
+                },
+                ContentPart::Text {
+                    text: "World".to_string(),
+                },
+            ]),
+            name: None,
+        }];
+
+        let result = GrpcRouter::transform_messages_for_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+        )
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let transformed_message = &result[0];
+
+        // Should flatten multimodal content to text only
+        assert_eq!(
+            transformed_message["content"].as_str().unwrap(),
+            "Hello World"
+        );
+        assert_eq!(transformed_message["role"].as_str().unwrap(), "user");
+    }
+
+    #[test]
+    fn test_transform_messages_openai_format() {
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Describe this image:".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/image.jpg".to_string(),
+                        detail: Some("high".to_string()),
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let result = GrpcRouter::transform_messages_for_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+        )
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let transformed_message = &result[0];
+
+        // Should replace media URLs with simple type placeholders
+        let content_array = transformed_message["content"].as_array().unwrap();
+        assert_eq!(content_array.len(), 2);
+
+        // Text part should remain unchanged
+        assert_eq!(content_array[0]["type"], "text");
+        assert_eq!(content_array[0]["text"], "Describe this image:");
+
+        // Image part should be replaced with simple type placeholder
+        assert_eq!(content_array[1], json!({"type": "image"}));
+    }
+
+    #[test]
+    fn test_transform_messages_simple_string_content() {
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Text("Simple text message".to_string()),
+            name: None,
+        }];
+
+        let result = GrpcRouter::transform_messages_for_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+        )
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let transformed_message = &result[0];
+
+        // Simple string content should remain unchanged
+        assert_eq!(
+            transformed_message["content"].as_str().unwrap(),
+            "Simple text message"
+        );
+    }
+
+    #[test]
+    fn test_transform_messages_assistant_message() {
+        let messages = vec![ChatMessage::Assistant {
+            role: "assistant".to_string(),
+            content: Some("Assistant response".to_string()),
+            name: None,
+            tool_calls: None,
+            function_call: None,
+            reasoning_content: None,
+        }];
+
+        let result = GrpcRouter::transform_messages_for_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+        )
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let transformed_message = &result[0];
+
+        assert_eq!(transformed_message["role"].as_str().unwrap(), "assistant");
+        assert_eq!(
+            transformed_message["content"].as_str().unwrap(),
+            "Assistant response"
+        );
+    }
+
+    #[test]
+    fn test_transform_messages_multiple_messages() {
+        let messages = vec![
+            ChatMessage::System {
+                role: "system".to_string(),
+                content: "System prompt".to_string(),
+                name: None,
+            },
+            ChatMessage::User {
+                role: "user".to_string(),
+                content: UserMessageContent::Parts(vec![
+                    ContentPart::Text {
+                        text: "User message".to_string(),
+                    },
+                    ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "https://example.com/image.jpg".to_string(),
+                            detail: None,
+                        },
+                    },
+                ]),
+                name: None,
+            },
+        ];
+
+        let result = GrpcRouter::transform_messages_for_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+        )
+        .unwrap();
+
+        assert_eq!(result.len(), 2);
+
+        // System message should remain unchanged
+        assert_eq!(result[0]["role"].as_str().unwrap(), "system");
+        assert_eq!(result[0]["content"].as_str().unwrap(), "System prompt");
+
+        // User message should be flattened to text only
+        assert_eq!(result[1]["role"].as_str().unwrap(), "user");
+        assert_eq!(result[1]["content"].as_str().unwrap(), "User message");
+    }
+
+    #[test]
+    fn test_transform_messages_empty_text_parts() {
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/image.jpg".to_string(),
+                    detail: None,
+                },
+            }]),
+            name: None,
+        }];
+
+        let result = GrpcRouter::transform_messages_for_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+        )
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let transformed_message = &result[0];
+
+        // Should keep original multimodal content when no text parts exist
+        assert!(transformed_message["content"].is_array());
+    }
+
+    #[test]
+    fn test_transform_messages_mixed_content_types() {
+        // Test with both text and multimodal content
+        let messages = vec![
+            ChatMessage::User {
+                role: "user".to_string(),
+                content: UserMessageContent::Text("Plain text".to_string()),
+                name: None,
+            },
+            ChatMessage::User {
+                role: "user".to_string(),
+                content: UserMessageContent::Parts(vec![
+                    ContentPart::Text {
+                        text: "With image".to_string(),
+                    },
+                    ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "https://example.com/image.jpg".to_string(),
+                            detail: Some("low".to_string()),
+                        },
+                    },
+                ]),
+                name: None,
+            },
+        ];
+
+        // Test String format
+        let result_string = GrpcRouter::transform_messages_for_content_format(
+            &messages,
+            ChatTemplateContentFormat::String,
+        )
+        .unwrap();
+
+        assert_eq!(result_string.len(), 2);
+        assert_eq!(result_string[0]["content"].as_str().unwrap(), "Plain text");
+        assert_eq!(result_string[1]["content"].as_str().unwrap(), "With image");
+
+        // Test OpenAI format
+        let result_openai = GrpcRouter::transform_messages_for_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+        )
+        .unwrap();
+
+        assert_eq!(result_openai.len(), 2);
+        assert_eq!(result_openai[0]["content"].as_str().unwrap(), "Plain text");
+
+        let content_array = result_openai[1]["content"].as_array().unwrap();
+        assert_eq!(content_array.len(), 2);
+        assert_eq!(content_array[0]["type"], "text");
+        assert_eq!(content_array[1], json!({"type": "image"}));
     }
 }
