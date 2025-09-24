@@ -6,7 +6,7 @@ use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    RerankRequest, RerankResponse, RerankResult, ResponsesGetParams, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::RouterTrait;
@@ -35,6 +35,7 @@ pub struct Router {
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
     dp_aware: bool,
+    enable_igw: bool,
     retry_config: RetryConfig,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
@@ -93,6 +94,7 @@ impl Router {
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
             dp_aware: ctx.router_config.dp_aware,
+            enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
@@ -101,10 +103,11 @@ impl Router {
 
     fn select_first_worker(&self) -> Result<String, String> {
         let workers = self.worker_registry.get_all();
-        if workers.is_empty() {
+        let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
+        if healthy_workers.is_empty() {
             Err("No workers are available".to_string())
         } else {
-            Ok(workers[0].url().to_string())
+            Ok(healthy_workers[0].url().to_string())
         }
     }
 
@@ -162,9 +165,11 @@ impl Router {
         model_id: Option<&str>,
         text: Option<&str>,
     ) -> Option<Arc<dyn Worker>> {
+        let effective_model_id = if !self.enable_igw { None } else { model_id };
+
         // Get workers for the specified model O(1), filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
-            model_id,
+            effective_model_id,
             Some(WorkerType::Regular),
             Some(ConnectionMode::Http),
             false, // get all workers, we'll filter by is_available() next
@@ -899,7 +904,12 @@ impl RouterTrait for Router {
             .await
     }
 
-    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn get_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        _params: &ResponsesGetParams,
+    ) -> Response {
         let endpoint = format!("v1/responses/{}", response_id);
         self.route_get_request(headers, &endpoint).await
     }
@@ -1106,7 +1116,15 @@ mod tests {
             retry_config: RetryConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+            enable_igw: false,
         }
+    }
+
+    fn create_test_unhealthy_router() -> Router {
+        let router = create_test_regular_router();
+        let workers = router.worker_registry.get_all();
+        workers[0].set_healthy(false);
+        router
     }
 
     #[test]
@@ -1129,5 +1147,17 @@ mod tests {
         let url = result.unwrap();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_select_first_worker_with_unhealthy_worker() {
+        let router = create_test_unhealthy_router();
+        let result = router.select_first_worker();
+
+        assert!(result.is_ok());
+        let url = result.unwrap();
+
+        let worker = router.worker_registry.get_by_url(&url).unwrap();
+        assert!(worker.is_healthy());
     }
 }
