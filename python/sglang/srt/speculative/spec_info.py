@@ -12,7 +12,14 @@ class SpeculativeAlgorithm(IntEnum):
         return self == SpeculativeAlgorithm.NONE
 
     def is_eagle(self):
-        return self == SpeculativeAlgorithm.EAGLE or self == SpeculativeAlgorithm.EAGLE3
+        return self in [
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.SIMPLE_EAGLE,
+        ]
+    
+    def is_simple_eagle(self):
+        return self == SpeculativeAlgorithm.SIMPLE_EAGLE
 
     def is_eagle3(self):
         return self == SpeculativeAlgorithm.EAGLE3
@@ -28,6 +35,7 @@ class SpeculativeAlgorithm(IntEnum):
         name_map = {
             "EAGLE": SpeculativeAlgorithm.EAGLE,
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
+            "SIMPLE_EAGLE": SpeculativeAlgorithm.SIMPLE_EAGLE,
             "STANDALONE": SpeculativeAlgorithm.STANDALONE,
             "LOOKAHEAD": SpeculativeAlgorithm.LOOKAHEAD,
             None: SpeculativeAlgorithm.NONE,
