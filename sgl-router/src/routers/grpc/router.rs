@@ -675,32 +675,30 @@ impl RouterTrait for GrpcRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::spec::{ChatMessage, UserMessageContent, ContentPart, ImageUrl};
+    use crate::protocols::spec::{ChatMessage, ContentPart, ImageUrl, UserMessageContent};
     use crate::tokenizer::chat_template::ChatTemplateContentFormat;
     use serde_json::json;
 
     #[test]
     fn test_transform_messages_string_format() {
-        let messages = vec![
-            ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Parts(vec![
-                    ContentPart::Text {
-                        text: "Hello".to_string(),
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Hello".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/image.jpg".to_string(),
+                        detail: None,
                     },
-                    ContentPart::ImageUrl {
-                        image_url: ImageUrl {
-                            url: "https://example.com/image.jpg".to_string(),
-                            detail: None,
-                        },
-                    },
-                    ContentPart::Text {
-                        text: "World".to_string(),
-                    },
-                ]),
-                name: None,
-            },
-        ];
+                },
+                ContentPart::Text {
+                    text: "World".to_string(),
+                },
+            ]),
+            name: None,
+        }];
 
         let result = GrpcRouter::transform_messages_for_content_format(
             &messages,
@@ -721,23 +719,21 @@ mod tests {
 
     #[test]
     fn test_transform_messages_openai_format() {
-        let messages = vec![
-            ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Parts(vec![
-                    ContentPart::Text {
-                        text: "Describe this image:".to_string(),
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Describe this image:".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/image.jpg".to_string(),
+                        detail: Some("high".to_string()),
                     },
-                    ContentPart::ImageUrl {
-                        image_url: ImageUrl {
-                            url: "https://example.com/image.jpg".to_string(),
-                            detail: Some("high".to_string()),
-                        },
-                    },
-                ]),
-                name: None,
-            },
-        ];
+                },
+            ]),
+            name: None,
+        }];
 
         let result = GrpcRouter::transform_messages_for_content_format(
             &messages,
@@ -762,13 +758,11 @@ mod tests {
 
     #[test]
     fn test_transform_messages_simple_string_content() {
-        let messages = vec![
-            ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Text("Simple text message".to_string()),
-                name: None,
-            },
-        ];
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Text("Simple text message".to_string()),
+            name: None,
+        }];
 
         let result = GrpcRouter::transform_messages_for_content_format(
             &messages,
@@ -788,16 +782,14 @@ mod tests {
 
     #[test]
     fn test_transform_messages_assistant_message() {
-        let messages = vec![
-            ChatMessage::Assistant {
-                role: "assistant".to_string(),
-                content: Some("Assistant response".to_string()),
-                name: None,
-                tool_calls: None,
-                function_call: None,
-                reasoning_content: None,
-            },
-        ];
+        let messages = vec![ChatMessage::Assistant {
+            role: "assistant".to_string(),
+            content: Some("Assistant response".to_string()),
+            name: None,
+            tool_calls: None,
+            function_call: None,
+            reasoning_content: None,
+        }];
 
         let result = GrpcRouter::transform_messages_for_content_format(
             &messages,
@@ -859,20 +851,16 @@ mod tests {
 
     #[test]
     fn test_transform_messages_empty_text_parts() {
-        let messages = vec![
-            ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Parts(vec![
-                    ContentPart::ImageUrl {
-                        image_url: ImageUrl {
-                            url: "https://example.com/image.jpg".to_string(),
-                            detail: None,
-                        },
-                    },
-                ]),
-                name: None,
-            },
-        ];
+        let messages = vec![ChatMessage::User {
+            role: "user".to_string(),
+            content: UserMessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/image.jpg".to_string(),
+                    detail: None,
+                },
+            }]),
+            name: None,
+        }];
 
         let result = GrpcRouter::transform_messages_for_content_format(
             &messages,
@@ -899,7 +887,9 @@ mod tests {
             ChatMessage::User {
                 role: "user".to_string(),
                 content: UserMessageContent::Parts(vec![
-                    ContentPart::Text { text: "With image".to_string() },
+                    ContentPart::Text {
+                        text: "With image".to_string(),
+                    },
                     ContentPart::ImageUrl {
                         image_url: ImageUrl {
                             url: "https://example.com/image.jpg".to_string(),
