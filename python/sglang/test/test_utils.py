@@ -70,7 +70,9 @@ DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE = "nytopop/Qwen3-30B-A3B.w8a8"
 
 # INT4 models
-DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+)
 
 # EAGLE
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"

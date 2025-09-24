@@ -310,6 +310,7 @@ suites.update(suite_xeon)
 suites.update(suite_ascend)
 suites.update(suite_xpu)
 
+
 def auto_partition(files, rank, size):
     """
     Partition files into size sublists with approximately equal sums of estimated times
