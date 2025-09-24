@@ -901,7 +901,7 @@ def run_score_benchmark(
         from sglang.srt.hf_transformers_utils import get_tokenizer
 
         tokenizer = get_tokenizer(model)
-        
+
         # Score API configuration
         score_query_tokens = 120
         score_item_tokens = 180
