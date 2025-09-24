@@ -857,22 +857,50 @@ class FlashInferIndicesUpdaterDecode:
             global_override_indptr_cpu[0] = 0
             global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
 
-        wrapper.begin_forward(
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            data_type=self.data_type,
-            q_data_type=self.q_data_type,
-            non_blocking=True,
-            fixed_split_size=fixed_split_size,
-            disable_split_kv=(
-                disable_split_kv if disable_split_kv is not None else False
-            ),
+        # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
+        # by checking if it's a partial function with fast_decode_plan as the func
+        wrapper_uses_fast_decode_plan = (
+            hasattr(wrapper.begin_forward, "func")
+            and wrapper.begin_forward.func == fast_decode_plan
         )
+
+        if wrapper_uses_fast_decode_plan:
+            # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
+            wrapper.begin_forward(
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                data_type=self.data_type,
+                q_data_type=self.q_data_type,
+                non_blocking=True,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=(
+                    disable_split_kv if disable_split_kv is not None else False
+                ),
+                global_override_indptr_cpu=global_override_indptr_cpu,
+            )
+        else:
+            # When using original begin_forward, don't pass global_override_indptr_cpu
+            wrapper.begin_forward(
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                data_type=self.data_type,
+                q_data_type=self.q_data_type,
+                non_blocking=True,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=(
+                    disable_split_kv if disable_split_kv is not None else False
+                ),
+            )
 
         if locally_override:
             global_override_indptr_cpu = None
