@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pytest
 import torch
 from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
-from sgl_kernel.utils import is_arch_support_pdl
 from sgl_kernel.testing.rotary_embedding import (
     FlashInferRotaryEmbedding,
     MHATokenToKVPool,
@@ -103,7 +102,6 @@ def test_correctness(
             cache_v=inputs["value"].view(-1, num_kv_heads, head_size),
         )
 
-    enable_pdl = is_arch_support_pdl()
     query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(
         inputs["pos_ids"],
         query_flashinfer,
@@ -120,7 +118,6 @@ def test_correctness(
             if save_kv_cache
             else None
         ),
-        enable_pdl=enable_pdl,
     )
 
     torch.testing.assert_close(
