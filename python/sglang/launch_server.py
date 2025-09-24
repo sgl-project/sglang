@@ -10,7 +10,7 @@ from sglang.srt.utils import kill_process_tree
 MOVE_ENVS_WARN = """
 ########################################################################
 # For contributors and developers:                                    #
-# Please move environment variable definitions to 'sglang/environ.py' #
+# Please move environment variable definitions to sglang.srt.environ  #
 # using the following pattern:                                        #
 #     SGLANG_XXX = EnvBool(False)                                     #
 #                                                                     #
