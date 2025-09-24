@@ -1,11 +1,14 @@
+use std::collections::HashMap;
+
+use anyhow::{Error, Result};
+use tokenizers::tokenizer::Tokenizer as HfTokenizer;
+
+use super::chat_template::{
+    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateProcessor,
+};
 use super::traits::{
     Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
 };
-use anyhow::{Error, Result};
-use std::collections::HashMap;
-use tokenizers::tokenizer::Tokenizer as HfTokenizer;
-
-use super::chat_template::{ChatMessage, ChatTemplateProcessor};
 
 /// HuggingFace tokenizer wrapper
 pub struct HuggingFaceTokenizer {
@@ -14,6 +17,8 @@ pub struct HuggingFaceTokenizer {
     vocab: HashMap<String, TokenIdType>,
     reverse_vocab: HashMap<TokenIdType, String>,
     chat_template: Option<String>,
+    /// Detected chat template content format (computed once at initialization)
+    content_format: ChatTemplateContentFormat,
 }
 
 impl HuggingFaceTokenizer {
@@ -49,12 +54,20 @@ impl HuggingFaceTokenizer {
             Self::load_chat_template(file_path)
         };
 
+        // Detect content format once at initialization
+        let content_format = if let Some(ref template) = chat_template {
+            detect_chat_template_content_format(template)
+        } else {
+            ChatTemplateContentFormat::String // Default if no template
+        };
+
         Ok(HuggingFaceTokenizer {
             tokenizer,
             special_tokens,
             vocab,
             reverse_vocab,
             chat_template,
+            content_format,
         })
     }
 
@@ -73,6 +86,7 @@ impl HuggingFaceTokenizer {
             vocab,
             reverse_vocab,
             chat_template: None,
+            content_format: ChatTemplateContentFormat::String, // Default
         }
     }
 
@@ -135,13 +149,22 @@ impl HuggingFaceTokenizer {
 
     /// Set or override the chat template
     pub fn set_chat_template(&mut self, template: String) {
+        // Detect format for the new template
+        self.content_format = detect_chat_template_content_format(&template);
         self.chat_template = Some(template);
     }
 
+    /// Get the content format expected by the chat template
+    pub fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
+        self.content_format
+    }
+
     /// Apply chat template if available
+    ///
+    /// Takes transformed JSON Values (already transformed based on content format)
     pub fn apply_chat_template(
         &self,
-        messages: &[ChatMessage],
+        messages: &[serde_json::Value],
         add_generation_prompt: bool,
     ) -> Result<String> {
         if let Some(ref template) = self.chat_template {
@@ -150,17 +173,15 @@ impl HuggingFaceTokenizer {
                 self.special_tokens.bos_token.clone(),
                 self.special_tokens.eos_token.clone(),
             );
+
             processor.apply_chat_template(messages, add_generation_prompt)
         } else {
-            // Fallback to simple formatting if no template is available
-            let mut result = String::new();
-            for msg in messages {
-                result.push_str(&format!("{}: {}\n", msg.role, msg.content));
-            }
-            if add_generation_prompt {
-                result.push_str("assistant: ");
-            }
-            Ok(result)
+            Err(Error::msg(
+                "Cannot use chat template functions because tokenizer.chat_template is not set and no template \
+                argument was passed! For information about writing templates and setting the \
+                tokenizer.chat_template attribute, please see the documentation at \
+                https://huggingface.co/docs/transformers/main/en/chat_templating"
+            ))
         }
     }
 }
@@ -218,21 +239,6 @@ impl TokenizerTrait for HuggingFaceTokenizer {
 
 #[cfg(test)]
 mod tests {
-    use super::ChatMessage;
-
-    #[test]
-    fn test_chat_message_creation() {
-        let msg = ChatMessage::system("You are a helpful assistant");
-        assert_eq!(msg.role, "system");
-        assert_eq!(msg.content, "You are a helpful assistant");
-
-        let user_msg = ChatMessage::user("Hello!");
-        assert_eq!(user_msg.role, "user");
-
-        let assistant_msg = ChatMessage::assistant("Hi there!");
-        assert_eq!(assistant_msg.role, "assistant");
-    }
-
     // Note: Actual tokenizer tests would require a real tokenizer file
     // These would be integration tests rather than unit tests
 }
