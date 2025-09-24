@@ -86,12 +86,12 @@ def benchmark(batch_size, provider, N, K):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == "sgl-kernel":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: int8_scaled_mm(a, b, scale_a, scale_b, torch.float16, bias),
             quantiles=quantiles,
         )
     if provider == "vllm":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: vllm_scaled_mm(a, b, scale_a, scale_b, torch.float16, bias),
             quantiles=quantiles,
         )

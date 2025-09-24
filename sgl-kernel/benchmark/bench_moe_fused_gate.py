@@ -56,14 +56,14 @@ def benchmark(seq_length, provider):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "original":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: biased_grouped_topk_org(
                 scores.clone(), bias.clone(), num_expert_group, topk_group, topk
             ),
             quantiles=quantiles,
         )
     elif provider == "kernel":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: biased_grouped_topk_org_fuse_kernel(
                 scores.clone(), bias.clone(), num_expert_group, topk_group, topk
             ),

@@ -41,7 +41,7 @@ def benchmark(num_tokens, impl):
         def runner():
             dsv3_fused_a_gemm(mat_a, mat_b)
 
-    ms, min_ms, max_ms = triton.testing.do_bench(runner, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(runner, quantiles=quantiles)
 
     def tflops(t_ms):
         flops = 2 * M * K * N

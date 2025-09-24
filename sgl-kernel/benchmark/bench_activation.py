@@ -108,7 +108,7 @@ def benchmark(kernel, dtype, batch_size, seq_len, dim, provider):
         for _ in range(5):
             fn()
         torch.cuda.synchronize()
-        ms, qmin, qmax = triton.testing.do_bench(fn, quantiles=[0.5, 0.2, 0.8])
+        ms, qmin, qmax = triton.testing.do_bench_cudagraph(fn, quantiles=[0.5, 0.2, 0.8])
         return 1000 * ms, 1000 * qmax, 1000 * qmin
 
     if provider == "vllm":
