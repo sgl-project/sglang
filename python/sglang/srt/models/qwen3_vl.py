@@ -519,13 +519,15 @@ class Qwen3LLMModel(Qwen3Model):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config=config.text_config, quant_config=quant_config, prefix=prefix
+        )
         if not self.pp_group.is_first_rank:
             assert self.start_layer >= len(
                 config.vision_config.deepstack_visual_indexes
             ), "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
 
-        self.hidden_size = config.hidden_size
+        self.hidden_size = config.text_config.hidden_size
         self.deepstack_embed_to_decoder_layer = range(
             len(config.vision_config.deepstack_visual_indexes)
         )
@@ -608,7 +610,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.config = config
+        self.config = config.text_config
         self.visual = Qwen3_VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
@@ -628,14 +630,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
+                config.text_config.vocab_size,
+                config.text_config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(config.text_config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states

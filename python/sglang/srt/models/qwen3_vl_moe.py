@@ -164,7 +164,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         prefix: str = "",
     ):
         super(Qwen3VLForConditionalGeneration, self).__init__()
-        self.config = config
+        self.config = config.text_config
 
         self.visual = Qwen3_VisionTransformer(
             config.vision_config,
@@ -176,7 +176,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
         self.model = Qwen3MoeLLMModel(
-            config=config,
+            config=config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
@@ -185,14 +185,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
+                config.text_config.vocab_size,
+                config.text_config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(config.text_config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
         # deepstack
