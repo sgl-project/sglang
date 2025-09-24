@@ -60,6 +60,9 @@ class SamplingBatchInfo:
         Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
     ] = None
 
+    # Used for deterministic sampling
+    sampling_seed: Optional[torch.Tensor] = None
+
     # Device
     device: str = "cuda"
 
@@ -67,26 +70,41 @@ class SamplingBatchInfo:
     logit_bias: Optional[torch.Tensor] = None
 
     @classmethod
+    def _get_global_server_args_dict(cls):
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+        return global_server_args_dict
+
+    @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
+        global_server_args_dict = cls._get_global_server_args_dict()
+        enable_deterministic = global_server_args_dict["enable_deterministic_inference"]
+
         reqs = batch.reqs
         device = batch.device
-        temperatures = (
-            torch.tensor(
-                [r.sampling_params.temperature for r in reqs],
-                dtype=torch.float,
-            )
-            .view(-1, 1)
-            .to(device, non_blocking=True)
-        )
+        temperatures = torch.tensor(
+            [r.sampling_params.temperature for r in reqs],
+            dtype=torch.float,
+            device=device,
+        ).view(-1, 1)
         top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float
-        ).to(device, non_blocking=True)
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
+        )
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32
-        ).to(device, non_blocking=True)
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
+        )
         min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float
-        ).to(device, non_blocking=True)
+            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
+        )
+        sampling_seed = (
+            torch.tensor(
+                [r.sampling_params.sampling_seed for r in reqs],
+                dtype=torch.int32,
+                device=device,
+            )
+            if enable_deterministic
+            else None
+        )
 
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
@@ -97,10 +115,11 @@ class SamplingBatchInfo:
                         logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            batch.enable_custom_logit_processor  # check the flag first.
-            and any(r.custom_logit_processor for r in reqs)  # then check the requests.
-        )
+        has_custom_logit_processor = global_server_args_dict[
+            "enable_custom_logit_processor"
+        ] and any(  # check the flag first.
+            r.custom_logit_processor for r in reqs
+        )  # then check the requests.
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -151,6 +170,7 @@ class SamplingBatchInfo:
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
+            sampling_seed=sampling_seed,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
@@ -232,9 +252,11 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "sampling_seed",
         ]:
             value = getattr(self, item, None)
-            setattr(self, item, value[keep_indices_device])
+            if value is not None:
+                setattr(self, item, value[keep_indices_device])
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -322,6 +344,12 @@ class SamplingBatchInfo:
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
 
+        # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
+        # See note below on len(self) and len(other).
+        self.logit_bias = merge_bias_tensor(
+            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
+        )
+
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
@@ -330,20 +358,17 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "sampling_seed",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
-            setattr(self, item, torch.cat([self_val, other_val]))
+            if self_val is not None and other_val is not None:
+                setattr(self, item, torch.cat([self_val, other_val]))
 
         self.is_all_greedy &= other.is_all_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
-
-        # Merge logit bias
-        self.logit_bias = merge_bias_tensor(
-            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
-        )
 
 
 def merge_bias_tensor(

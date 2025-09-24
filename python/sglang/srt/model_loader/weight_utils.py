@@ -35,6 +35,7 @@ from tqdm.auto import tqdm
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.utils import print_warning_once
@@ -229,6 +230,8 @@ def get_quant_config(
                     f"Unsupported quantization config"
                     f" found for {model_config.quantization} in {f}."
                 )
+        elif model_config.quantization == "w8a8_int8":
+            config["packed_modules_mapping"] = packed_modules_mapping
 
     return quant_cls.from_config(config)
 
@@ -678,7 +681,7 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_attention_tp_rank()
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
@@ -840,6 +843,16 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
                 )
                 return None
             return remapped_name
+
+    quark_scale_names = {
+        ".q_proj.output_scale": ".attn.q_scale",
+        ".k_proj.output_scale": ".attn.k_scale",
+        ".v_proj.output_scale": ".attn.v_scale",
+        "self_attn.prob_output_scale": ".attn.prob_scale",
+    }
+    for quark_scale_name, sglang_scale_name in quark_scale_names.items():
+        if name.endswith(quark_scale_name):
+            return name.replace(quark_scale_name, sglang_scale_name)
 
     # If there were no matches, return the untouched param name
     return name

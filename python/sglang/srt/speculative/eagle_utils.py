@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -12,6 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -22,10 +24,8 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
-
-logger = logging.getLogger(__name__)
 
 if is_cuda():
     from sgl_kernel import (
@@ -43,10 +43,12 @@ logger = logging.getLogger(__name__)
 
 
 # Simulate acceptance length for benchmarking purposes
-SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
-SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
+SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
+SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
+
+TREE_SPEC_KERNEL_AVAILABLE = "tree_speculative_sampling_target_only" in globals()
 
 
 @dataclass
@@ -70,9 +72,20 @@ class EagleDraftInput:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
+    # Shape info for padding
+    num_tokens_per_batch: int = -1
+    num_tokens_for_logprob_per_batch: int = -1
+
+    # Inputs for draft extend
+    # shape: (b,)
+    seq_lens_for_draft_extend: torch.Tensor = None
+    req_pool_indices_for_draft_extend: torch.Tensor = None
+
     def prepare_for_extend(self, batch: ScheduleBatch):
+
         if batch.forward_mode.is_idle():
             return
+
         # Prefill only generate 1 token.
         assert len(self.verified_id) == len(batch.seq_lens)
 
@@ -94,7 +107,7 @@ class EagleDraftInput:
         capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
-            verified_id=None,
+            verified_id=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
@@ -108,7 +121,10 @@ class EagleDraftInput:
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
-        batch.forward_mode = ForwardMode.DRAFT_EXTEND
+
+        if batch.forward_mode.is_idle():
+            return
+
         batch.input_ids = self.verified_id
         batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
@@ -162,11 +178,24 @@ class EagleDraftInput:
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
-    def filter_batch(self, new_indices: torch.Tensor):
-        self.topk_p = self.topk_p[: len(new_indices)]
-        self.topk_index = self.topk_index[: len(new_indices)]
-        self.hidden_states = self.hidden_states[: len(new_indices)]
-        self.verified_id = self.verified_id[: len(new_indices)]
+    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if has_been_filtered:
+            # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
+            # therefore, we don't need to filter the batch again in scheduler
+            if len(new_indices) != len(self.topk_p):
+                logger.warning(
+                    f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
+                )
+            self.topk_p = self.topk_p[: len(new_indices)]
+            self.topk_index = self.topk_index[: len(new_indices)]
+            self.hidden_states = self.hidden_states[: len(new_indices)]
+            self.verified_id = self.verified_id[: len(new_indices)]
+        else:
+            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
+            self.topk_p = self.topk_p[new_indices]
+            self.topk_index = self.topk_index[new_indices]
+            self.hidden_states = self.hidden_states[new_indices]
+            self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
         if self.hidden_states is None:
@@ -315,7 +344,7 @@ class EagleVerifyInput:
     def verify(
         self,
         batch: ScheduleBatch,
-        logits_output: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
@@ -362,6 +391,11 @@ class EagleVerifyInput:
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
 
+        if bs != len(sampling_info):
+            sampling_info = copy.deepcopy(sampling_info)
+            # NOTE: retrive_index are the indices of the requests that are kept.
+            sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
+
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(
@@ -390,8 +424,15 @@ class EagleVerifyInput:
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
-        # Sample tokens
-        if batch.sampling_info.is_all_greedy:
+        # Sample tokens. Force greedy sampling on AMD
+        is_all_greedy = sampling_info.is_all_greedy
+        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+            logger.warning(
+                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
+                "Falling back to greedy verification."
+            )
+
+        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
 
@@ -420,12 +461,13 @@ class EagleVerifyInput:
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                ),
-            )
+            if not torch.all(sampling_info.top_ps == 1.0):
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, self.draft_token_num, dim=0
+                    ),
+                )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
             draft_probs = torch.zeros(
@@ -459,13 +501,12 @@ class EagleVerifyInput:
                 deterministic=True,
             )
 
-        if SIMULATE_ACC_LEN:
+        if SIMULATE_ACC_LEN > 0.0:
             # Do simulation
             accept_index = _generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
                 accept_length=accept_length,  # mutable
-                simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
@@ -593,13 +634,14 @@ class EagleVerifyInput:
                 batch.out_cache_loc = tgt_cache_loc
             batch.seq_lens.add_(accept_length + 1)
 
-            draft_input = EagleDraftInput()
-            draft_input.hidden_states = batch.spec_info.hidden_states[accept_index]
-            draft_input.verified_id = verified_id
-            draft_input.accept_length = accept_length
-            draft_input.accept_length_cpu = accept_length.tolist()
-            draft_input.seq_lens_for_draft_extend = batch.seq_lens
-            draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices
+            draft_input = EagleDraftInput(
+                hidden_states=batch.spec_info.hidden_states[accept_index],
+                verified_id=verified_id,
+                accept_length=accept_length,
+                accept_length_cpu=accept_length.tolist(),
+                seq_lens_for_draft_extend=batch.seq_lens,
+                req_pool_indices_for_draft_extend=batch.req_pool_indices,
+            )
 
             return EagleVerifyOutput(
                 draft_input=draft_input,
@@ -622,7 +664,6 @@ class EagleVerifyInput:
                 batch.seq_lens.add_(accept_length + 1)
 
             accept_length_cpu = accept_length.tolist()
-            draft_input = EagleDraftInput()
             if len(unfinished_accept_index) > 0:
                 unfinished_accept_index = torch.cat(unfinished_accept_index)
                 unfinished_index_device = torch.tensor(
@@ -653,18 +694,26 @@ class EagleVerifyInput:
                         next_power_of_2(self.draft_token_num),
                     )
 
-                draft_input.hidden_states = batch.spec_info.hidden_states[
-                    unfinished_accept_index
-                ]
-                draft_input.verified_id = predict[unfinished_accept_index]
-                draft_input.accept_length_cpu = draft_input_accept_length_cpu
-                draft_input.accept_length = accept_length[unfinished_index_device]
-                draft_input.seq_lens_for_draft_extend = batch.seq_lens[
-                    unfinished_index_device
-                ]
-                draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices[
-                    unfinished_index_device
-                ]
+                draft_input = EagleDraftInput(
+                    hidden_states=batch.spec_info.hidden_states[
+                        unfinished_accept_index
+                    ],
+                    verified_id=predict[unfinished_accept_index],
+                    accept_length_cpu=draft_input_accept_length_cpu,
+                    accept_length=accept_length[unfinished_index_device],
+                    seq_lens_for_draft_extend=batch.seq_lens[unfinished_index_device],
+                    req_pool_indices_for_draft_extend=batch.req_pool_indices[
+                        unfinished_index_device
+                    ],
+                )
+            else:
+                draft_input = EagleDraftInput.create_idle_input(
+                    device=batch.device,
+                    hidden_size=batch.model_config.hidden_size,
+                    dtype=batch.model_config.dtype,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                )
 
             return EagleVerifyOutput(
                 draft_input=draft_input,
@@ -1082,14 +1131,16 @@ def _generate_simulated_accept_index(
     accept_index,
     predict,
     accept_length,
-    simulate_acc_len,
     bs,
     spec_steps,
+    simulate_acc_len: float = SIMULATE_ACC_LEN,
+    simulate_acc_method: str = SIMULATE_ACC_METHOD,
 ):
-    simulate_acc_len_float = float(simulate_acc_len)
-    if SIMULATE_ACC_METHOD == "multinomial":
+    assert simulate_acc_len > 0.0
+
+    if simulate_acc_method == "multinomial":
         simulated_values = torch.normal(
-            mean=simulate_acc_len_float,
+            mean=simulate_acc_len,
             std=1.0,
             size=(1,),
             device="cpu",
@@ -1097,19 +1148,19 @@ def _generate_simulated_accept_index(
         # clamp simulated values to be between 1 and self.spec_steps
         simulated_values = torch.clamp(simulated_values, min=1.0, max=spec_steps + 1)
         simulate_acc_len = int(simulated_values.round().item())
-    elif SIMULATE_ACC_METHOD == "match-expected":
+    elif simulate_acc_method == "match-expected":
         # multinomial sampling does not match the expected length
         # we keep it for the sake of compatibility of existing tests
         # but it's better to use "match-expected" for the cases that need to
         # match the expected length, One caveat is that this will only sample
         # either round down or round up of the expected length
-        simulate_acc_len_float = max(1.0, min(spec_steps + 1, simulate_acc_len_float))
-        lower = int(simulate_acc_len_float // 1)
+        simulate_acc_len = max(1.0, min(spec_steps + 1, simulate_acc_len))
+        lower = int(simulate_acc_len // 1)
         upper = lower + 1 if lower < spec_steps + 1 else lower
         if lower == upper:
             simulate_acc_len = lower
         else:
-            weight_upper = simulate_acc_len_float - lower
+            weight_upper = simulate_acc_len - lower
             weight_lower = 1.0 - weight_upper
             probs = torch.tensor([weight_lower, weight_upper], device="cpu")
             sampled_index = torch.multinomial(probs, num_samples=1)

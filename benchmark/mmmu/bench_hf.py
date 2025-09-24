@@ -141,9 +141,13 @@ def eval_mmmu(args):
         print(f"response: {response}")
         process_result(response, sample, answer_dict, out_samples)
 
-    args.output_path = f"{args.model_path}_val_hf.json"
+    args.output_path = f"{args.model_path}_answer_hf.json"
     save_json(args.output_path, out_samples)
-    eval_result(model_answer_path=args.output_path, answer_dict=answer_dict)
+    eval_result(
+        model_answer_path=args.output_path,
+        answer_dict=answer_dict,
+        eval_output_path=f"{args.model_path}_val_hf.json",
+    )
 
 
 if __name__ == "__main__":

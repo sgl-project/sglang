@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import re
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.multimodal_processor import (
@@ -27,8 +26,8 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
 
     models = [Gemma3nForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         self.IM_START_TOKEN_ID = hf_config.boi_token_id
         self.IM_END_TOKEN_ID = hf_config.eoi_token_id
@@ -38,14 +37,8 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<image_soft_token>",
             image_token_id=hf_config.image_token_id,
-            image_token_regex=re.compile(
-                r"<start_of_image>(?:(?:<image_soft_token>)*<end_of_image>)?"
-            ),
             audio_token="<audio_soft_token>",
             audio_token_id=hf_config.audio_token_id,
-            audio_token_regex=re.compile(
-                r"<start_of_audio>(?:(?:<audio_soft_token>)*<end_of_audio>)?"
-            ),
         ).build(_processor)
 
     async def process_mm_data_async(
@@ -54,7 +47,6 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         audio_data: Optional[List[Union[str, bytes, Dict]]] = None,
         input_text: str = "",
         request_obj=None,
-        max_req_input_len: int = 0,
         *args,
         **kwargs,
     ):
@@ -63,7 +55,6 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             prompt=input_text,
             image_data=image_data,
             audio_data=audio_data,
-            max_req_input_len=max_req_input_len,
             multimodal_tokens=self.mm_tokens,
         )
 
