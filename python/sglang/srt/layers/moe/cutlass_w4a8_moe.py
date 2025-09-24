@@ -6,9 +6,9 @@ import torch
 
 from sglang.srt.utils import is_cuda
 
-_is_cuda = is_cuda()
+_is_cuda_alike = is_cuda_alike()
 
-if _is_cuda:
+if _is_cuda_alike:
     from sgl_kernel import (
         cutlass_w4a8_moe_mm,
         get_cutlass_w4a8_moe_mm_data,
