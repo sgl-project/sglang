@@ -881,10 +881,10 @@ def run_score_benchmark(
     """Score API benchmark function compatible with run_bench_serving pattern"""
     if other_server_args is None:
         other_server_args = []
-    
+
     if device == "auto":
         device = auto_config_device()
-    
+
     # Launch the server (consistent with run_bench_serving)
     base_url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -893,11 +893,12 @@ def run_score_benchmark(
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_server_args,
     )
-    
+
     async def _run_benchmark():
-        
+
         # Load tokenizer for generating test data
         from sglang.srt.hf_transformers_utils import get_tokenizer
+
         tokenizer = get_tokenizer(model)
         
         # Score API configuration
@@ -905,39 +906,47 @@ def run_score_benchmark(
         score_item_tokens = 180
         score_label_token_ids = [9454, 2753]  # Yes/No token IDs
         special_token = "<|im_start|>"
-        
+
         def generate_text_with_token_count(num_tokens):
             """Generate text with precise token count using replicated token."""
             text = special_token * num_tokens
             actual_tokens = len(tokenizer.encode(text, add_special_tokens=False))
             if actual_tokens != num_tokens:
-                text = special_token * (num_tokens // len(tokenizer.encode(special_token, add_special_tokens=False)))
+                text = special_token * (
+                    num_tokens
+                    // len(tokenizer.encode(special_token, add_special_tokens=False))
+                )
             return text
-        
+
         if need_warmup:
             warmup_data = {
                 "query": generate_text_with_token_count(score_query_tokens),
-                "items": [generate_text_with_token_count(score_item_tokens) for _ in range(3)],
+                "items": [
+                    generate_text_with_token_count(score_item_tokens) for _ in range(3)
+                ],
                 "label_token_ids": score_label_token_ids,
                 "model": model,
                 "apply_softmax": True,
             }
-            
+
             async with aiohttp.ClientSession() as session:
                 try:
                     await session.post(
                         f"{base_url}/v1/score",
                         json=warmup_data,
-                        timeout=aiohttp.ClientTimeout(total=30)
+                        timeout=aiohttp.ClientTimeout(total=30),
                     )
                 except:
                     pass  # Ignore warmup errors
-        
+
         test_requests = []
         for i in range(num_requests):
             query = generate_text_with_token_count(score_query_tokens)
-            items = [generate_text_with_token_count(score_item_tokens) for _ in range(batch_size)]
-            
+            items = [
+                generate_text_with_token_count(score_item_tokens)
+                for _ in range(batch_size)
+            ]
+
             score_data = {
                 "query": query,
                 "items": items,
@@ -946,12 +955,12 @@ def run_score_benchmark(
                 "apply_softmax": True,
             }
             test_requests.append(score_data)
-        
+
         start_time = time.time()
         successful_requests = 0
         total_latency = 0
         latencies = []
-        
+
         async with aiohttp.ClientSession() as session:
             for request_data in test_requests:
                 try:
@@ -959,12 +968,12 @@ def run_score_benchmark(
                     async with session.post(
                         f"{base_url}/v1/score",
                         json=request_data,
-                        timeout=aiohttp.ClientTimeout(total=30)
+                        timeout=aiohttp.ClientTimeout(total=30),
                     ) as response:
                         if response.status == 200:
                             response_data = await response.json()
                             request_end = time.time()
-                            
+
                             if "scores" in response_data or "logprobs" in response_data:
                                 latency_ms = (request_end - request_start) * 1000
                                 latencies.append(latency_ms)
@@ -972,16 +981,16 @@ def run_score_benchmark(
                                 successful_requests += 1
                 except Exception:
                     continue
-        
+
         end_time = time.time()
         total_time = end_time - start_time
-        
+
         if successful_requests > 0:
             throughput = successful_requests / total_time
             avg_latency = total_latency / successful_requests
             latencies.sort()
             p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0
-            
+
             return {
                 "completed": successful_requests,
                 "total_requests": num_requests,
@@ -999,12 +1008,12 @@ def run_score_benchmark(
                 "p95_latency_ms": 0,
                 "successful_requests": 0,
             }
-    
+
     try:
         res = asyncio.run(_run_benchmark())
     finally:
         kill_process_tree(process.pid)
-    
+
     assert res["completed"] == res["successful_requests"]
     return res
 
@@ -1606,6 +1615,3 @@ def dump_bench_raw_result(
 def _ensure_remove_suffix(text: str, suffix: str):
     assert text.endswith(suffix)
     return text.removesuffix(suffix)
-
-
-

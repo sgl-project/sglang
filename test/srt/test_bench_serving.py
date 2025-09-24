@@ -472,7 +472,7 @@ class TestBenchServing(CustomTestCase):
     def test_score_api_batch_scaling(self):
         """Test score API performance with different batch sizes"""
         batch_sizes = [10, 25, 50]
-        
+
         for batch_size in batch_sizes:
             res = run_score_benchmark(
                 model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
