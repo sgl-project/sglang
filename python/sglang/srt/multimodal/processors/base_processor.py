@@ -13,9 +13,10 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
+from sglang.srt.utils import is_npu, is_xpu, load_audio, load_image, load_video, logger
 
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 
 @dataclasses.dataclass
@@ -234,14 +235,17 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            if not _is_npu:
+            if _is_xpu:
+                kwargs["device"] = "xpu"
+            elif _is_npu:
+                if processor.__class__.__name__ not in {
+                    "Qwen2_5_VLProcessor",
+                    "Qwen3VLProcessor",
+                }:
+                    # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
+                    kwargs["device"] = "npu"
+            else:
                 kwargs["device"] = "cuda"
-            elif processor.__class__.__name__ not in {
-                "Qwen2_5_VLProcessor",
-                "Qwen3VLProcessor",
-            }:
-                # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
-                kwargs["device"] = "npu"
         result = processor.__call__(
             text=[input_text],
             padding=True,
