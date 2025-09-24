@@ -663,8 +663,18 @@ class Scheduler(
             logger.info(
                 f"Using draft model load_format: '{server_args.speculative_draft_load_format}'"
             )
+        if self.spec_algorithm.is_simple_eagle():
+            from sglang.srt.speculative.simple_eagle import SimpleEagleWorker
 
-        if self.spec_algorithm.is_eagle():
+            self.draft_worker = SimpleEagleWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        elif self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
             from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
