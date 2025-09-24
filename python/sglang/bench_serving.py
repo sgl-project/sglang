@@ -1930,9 +1930,11 @@ async def benchmark(
     return result | result_details
 
 
-def check_chat_template(tokenizer_id):
+def check_chat_template(tokenizer_path):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path, trust_remote_code=True
+        )
         return "chat_template" in tokenizer.init_kwargs
     except Exception as e:
         print(f"Fail to load tokenizer config with error={e}")
