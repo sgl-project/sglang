@@ -255,7 +255,7 @@ impl ResponseStorage for OracleResponseStorage {
             let mut rows = stmt.query(&[&user]).map_err(map_oracle_error)?;
             let mut results = Vec::new();
 
-            while let Some(row) = rows.next() {
+            for row in &mut rows {
                 let row = row.map_err(map_oracle_error)?;
                 results.push(OracleResponseStorage::build_response_from_row(&row)?);
             }
@@ -343,6 +343,7 @@ impl Manager for OracleConnectionManager {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn recycle(
         &self,
         conn: &mut Connection,

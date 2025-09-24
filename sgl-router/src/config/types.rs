@@ -1015,6 +1015,7 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            oracle_history: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1079,6 +1080,7 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            oracle_history: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1139,6 +1141,7 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            oracle_history: None,
         };
 
         assert!(config.has_service_discovery());
