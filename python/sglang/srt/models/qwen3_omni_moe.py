@@ -22,7 +22,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, MoeCausalLMOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -42,7 +41,9 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_rank,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -56,6 +57,7 @@ from sglang.srt.models.qwen3_moe import (
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeTextModel
 from sglang.srt.utils import add_prefix
+from transformers import PreTrainedModel
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +90,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attention_dropout = 0.0
         self.is_decoder = False
         self.is_causal = False
@@ -323,8 +325,8 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         for i in range(1, len(cu_seqlens)):
             attention_mask[
                 ...,
-                cu_seqlens[i - 1] : cu_seqlens[i],
-                cu_seqlens[i - 1] : cu_seqlens[i],
+                cu_seqlens[i - 1]: cu_seqlens[i],
+                cu_seqlens[i - 1]: cu_seqlens[i],
             ] = 0
         return attention_mask
 
@@ -465,7 +467,7 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -517,7 +519,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
 
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
-            self.layers[self.start_layer : self.end_layer]
+            self.layers[self.start_layer: self.end_layer]
         ):
             layer_idx = layer_idx + self.start_layer
             if layer_idx in self.layers_to_capture:
@@ -537,7 +539,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 sep = self.hidden_size * layer_idx
                 hidden_states = (
                     hidden_states
-                    + input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    + input_deepstack_embeds[:, sep: sep + self.hidden_size]
                 )
 
         if not self.pp_group.is_last_rank:
@@ -565,7 +567,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         self, config: Qwen3OmniMoeVisionEncoderConfig, use_postshuffle_norm=False
     ) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        self.hidden_size = config.hidden_size * (config.spatial_merge_size ** 2)
         self.use_postshuffle_norm = use_postshuffle_norm
         self.ln_q = nn.LayerNorm(
             self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6
@@ -720,7 +722,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(PreTrainedModel):
 
         self.is_mrope_enabled = "mrope_section" in self.config.text_config.rope_scaling
 
-        print(f"{self.is_mrope_enabled=}")
+        self.logits_processor = LogitsProcessor(config.text_config)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
         # deepstack
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
@@ -840,12 +844,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(PreTrainedModel):
             special_audio_mask = (
                 inputs_embeds
                 == self.get_input_embeddings()(
-                    torch.tensor(
-                        self.config.audio_token_id,
-                        dtype=torch.long,
-                        device=inputs_embeds.device,
-                    )
+                torch.tensor(
+                    self.config.audio_token_id,
+                    dtype=torch.long,
+                    device=inputs_embeds.device,
                 )
+            )
             ).all(-1)
         else:
             special_image_mask = input_ids == self.config.image_token_id
