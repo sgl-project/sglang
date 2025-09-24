@@ -291,6 +291,8 @@ using ScalarTypeId = ScalarType::Id;
 
 // "rust style" names generally following:
 //   https://github.com/pytorch/pytorch/blob/6d9f74f0af54751311f0dd71f7e5c01a93260ab3/torch/csrc/api/include/torch/types.h#L60-L70
+static inline constexpr auto kS1 = ScalarType::int_(1);  // -1, +1
+static inline constexpr auto kU1 = ScalarType::uint(1);  // 0, 1
 static inline constexpr auto kS4 = ScalarType::int_(4);
 static inline constexpr auto kU4 = ScalarType::uint(4);
 static inline constexpr auto kU4B8 = ScalarType::uint(4, 8);
@@ -307,6 +309,8 @@ static inline constexpr auto kFE5M10 = ScalarType::float_IEEE754(5, 10);
 
 // Fixed width style names, generally following:
 //  https://github.com/pytorch/pytorch/blob/6d9f74f0af54751311f0dd71f7e5c01a93260ab3/torch/csrc/api/include/torch/types.h#L47-L57
+static inline constexpr auto kInt1 = kS1;
+static inline constexpr auto kUint1 = kU1;
 static inline constexpr auto kInt4 = kS4;
 static inline constexpr auto kUint4 = kU4;
 static inline constexpr auto kUint4b8 = kU4B8;

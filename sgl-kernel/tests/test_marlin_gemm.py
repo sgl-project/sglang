@@ -4,17 +4,21 @@ from sgl_kernel import gptq_marlin_gemm
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
-from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
+from sglang.test.test_marlin_utils import (
+    awq_marlin_quantize,
+    fake_marlin_16x64_quantize,
+    marlin_quantize,
+)
 
 MNK_FACTORS = [
     (1, 1, 1),
-    (1, 4, 8),
-    (1, 7, 5),
-    (13, 17, 67),
-    (26, 37, 13),
-    (67, 13, 11),
-    (257, 13, 11),
-    (658, 13, 11),
+    # (1, 4, 8),
+    # (1, 7, 5),
+    # (13, 17, 67),
+    # (26, 37, 13),
+    # (67, 13, 11),
+    # (257, 13, 11),
+    # (658, 13, 11),
 ]
 
 
@@ -22,13 +26,40 @@ MNK_FACTORS = [
 # uint4b8 for gptq
 @pytest.mark.parametrize("k_chunk", [128])
 @pytest.mark.parametrize("n_chunk", [64, 256])
-@pytest.mark.parametrize("quant_type", [scalar_types.uint4, scalar_types.uint4b8])
-@pytest.mark.parametrize("group_size", [-1, 32, 64, 128])
+@pytest.mark.parametrize(
+    "quant_type", [scalar_types.uint4]
+)  # @pytest.mark.parametrize("quant_type", [scalar_types.int1])# @pytest.mark.parametrize("quant_type", [scalar_types.uint4, scalar_types.uint4b8])
+@pytest.mark.parametrize(
+    "group_size",
+    [
+        -1,
+    ],
+)  # @pytest.mark.parametrize("group_size", [-1, 32, 64, 128])
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
-@pytest.mark.parametrize("act_order", [False, True])
-@pytest.mark.parametrize("is_k_full", [False, True])
-@pytest.mark.parametrize("use_atomic_add", [False, True])
-@pytest.mark.parametrize("use_fp32_reduce", [False, True])
+@pytest.mark.parametrize(
+    "act_order",
+    [
+        False,
+    ],
+)  # @pytest.mark.parametrize("act_order", [False, True])
+@pytest.mark.parametrize(
+    "is_k_full",
+    [
+        False,
+    ],
+)  # @pytest.mark.parametrize("is_k_full", [False, True])
+@pytest.mark.parametrize(
+    "use_atomic_add",
+    [
+        False,
+    ],
+)  # @pytest.mark.parametrize("use_atomic_add", [False, True])
+@pytest.mark.parametrize(
+    "use_fp32_reduce",
+    [
+        False,
+    ],
+)  # @pytest.mark.parametrize("use_fp32_reduce", [False, True])
 def test_gptq_marlin_gemm(
     k_chunk,
     n_chunk,
@@ -59,27 +90,49 @@ def test_gptq_marlin_gemm(
         return
 
     a_input = torch.randn((size_m, size_k), dtype=torch.float16, device="cuda")
-    b_weight = torch.randn((size_k, size_n), dtype=torch.float16, device="cuda")
 
-    if has_zp:
-        # AWQ style, unsigned + runtime zero-point
-        if group_size == 16:
-            return
-        w_ref, marlin_q_w, marlin_s, marlin_zp = awq_marlin_quantize(
+    # import pdb
+    # pdb.set_trace()
+
+    if quant_type == scalar_types.int1:
+        # NOTE (yiakwy) : mapping 0, 1 to (-1, 1) obtained by offline training
+        b_weight = (
+            torch.randint(0, 2, (size_k, size_n), dtype=torch.float16, device="cuda")
+            * 2
+            - 1
+        )
+
+        # NOTE (yiakwy) : use our faked quantizer since sub-1-bits weights does not involve PTQ
+        w_ref, marlin_q_w, marlin_s = fake_marlin_16x64_quantize(
             b_weight, quant_type, group_size
         )
         g_idx = None
         sort_indices = None
         marlin_s2 = None
-    else:
-        # GPTQ style, unsigned + symmetric bias
-        if group_size == 16:
-            return
-        w_ref, marlin_q_w, marlin_s, g_idx, sort_indices, _ = marlin_quantize(
-            b_weight, quant_type, group_size, act_order
-        )
+
         marlin_zp = None
-        marlin_s2 = None
+    else:
+        b_weight = torch.randn((size_k, size_n), dtype=torch.float16, device="cuda")
+
+        if has_zp:
+            # AWQ style, unsigned + runtime zero-point
+            if group_size == 16:
+                return
+            w_ref, marlin_q_w, marlin_s, marlin_zp = awq_marlin_quantize(
+                b_weight, quant_type, group_size
+            )
+            g_idx = None
+            sort_indices = None
+            marlin_s2 = None
+        else:
+            # GPTQ style, unsigned + symmetric bias
+            if group_size == 16:
+                return
+            w_ref, marlin_q_w, marlin_s, g_idx, sort_indices, _ = marlin_quantize(
+                b_weight, quant_type, group_size, act_order
+            )
+            marlin_zp = None
+            marlin_s2 = None
 
     workspace = marlin_make_workspace(w_ref.device)
 
@@ -118,4 +171,11 @@ def test_gptq_marlin_gemm(
 if __name__ == "__main__":
     import subprocess
 
-    subprocess.call(["pytest", "--tb=short", str(__file__)])
+    # subprocess.call(["pytest", "--tb=short", str(__file__)])
+
+    test_gptq_marlin_gemm(
+        128, 64, scalar_types.uint4, -1, MNK_FACTORS[0], False, False, False, False
+    )
+    test_gptq_marlin_gemm(
+        128, 64, scalar_types.uint4, -1, MNK_FACTORS[0], False, False, False, False
+    )

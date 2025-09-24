@@ -14,7 +14,10 @@ find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COM
 
 # CXX
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+
+# NOTE (yiakwy)
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g")
 
 # CUDA
 enable_language(CUDA)
@@ -116,7 +119,8 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
 endif()
 
 # Enable gencode below SM90
-option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
+# NOTE(yiakwy) : disable sm90 temporily
+option(ENABLE_BELOW_SM90 "Enable below SM90" OFF)
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(ENABLE_BELOW_SM90 OFF)
@@ -136,7 +140,10 @@ include_directories(
 set(SGL_KERNEL_CUDA_FLAGS
     "-DNDEBUG"
     "-DOPERATOR_NAMESPACE=sgl-kernel"
-    "-O3"
+
+    # NOTE yiakwy -O3
+    # "-O3"
+
     "-Xcompiler"
     "-fPIC"
     "-gencode=arch=compute_90,code=sm_90"
@@ -157,8 +164,9 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-Xcompiler=-fno-strict-aliasing"
 
     # uncomment to debug
-    # "--ptxas-options=-v"
-    # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
+    "-g -O0"
+    "--ptxas-options=-v"
+    "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
 
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
@@ -170,19 +178,21 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_80,code=sm_80"
-        "-gencode=arch=compute_89,code=sm_89"
+        # NOTE (yiakwy) : removed not used architectures
+        # "-gencode=arch=compute_80,code=sm_80"
+        # "-gencode=arch=compute_89,code=sm_89"
     )
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100,code=sm_100"
-        "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_101,code=sm_101"
-        "-gencode=arch=compute_101a,code=sm_101a"
-        "-gencode=arch=compute_120,code=sm_120"
-        "-gencode=arch=compute_120a,code=sm_120a"
+        # NOTE (yiakwy) : removed not used architectures, 12.8 targeted to sm >= 90
+        # "-gencode=arch=compute_100,code=sm_100"
+        # "-gencode=arch=compute_100a,code=sm_100a"
+        # "-gencode=arch=compute_101,code=sm_101"
+        # "-gencode=arch=compute_101a,code=sm_101a"
+        # "-gencode=arch=compute_120,code=sm_120"
+        # "-gencode=arch=compute_120a,code=sm_120a"
     )
 else()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -341,7 +351,9 @@ if (SGL_KERNEL_ENABLE_FA3)
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
         "-DOPERATOR_NAMESPACE=sgl-kernel"
-        "-O3"
+
+        "-O0"
+
         "-Xcompiler"
         "-fPIC"
         "-gencode=arch=compute_90a,code=sm_90a"
@@ -361,8 +373,8 @@ if (SGL_KERNEL_ENABLE_FA3)
 
     if (ENABLE_BELOW_SM90)
         list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_80,code=sm_80"
-            "-gencode=arch=compute_86,code=sm_86"
+            # "-gencode=arch=compute_80,code=sm_80"
+            # "-gencode=arch=compute_86,code=sm_86"
         )
         # SM8X Logic
         file(GLOB FA3_SM8X_GEN_SRCS

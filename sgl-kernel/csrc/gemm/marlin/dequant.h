@@ -454,6 +454,65 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162>(int q, nv_bfloat162* fra
   frag_b[0] = *reinterpret_cast<const nv_bfloat162*>(&Out2);
 }
 
+template <>
+__device__ inline void dequant<half2, sglang::kU1.id(), false>(int q, half2* frag_b);
+
+template <>
+__device__ inline void dequant<half2, sglang::kU1.id(), true>(int q, half2* frag_b) {
+  dequant<half2, sglang::kU1.id(), false>(q, frag_b);
+}
+
+template <>
+__device__ inline void dequant<half2, sglang::kU1.id(), false>(int q, half2* frag_b) {
+  constexpr int LO = 0x00010001;
+  constexpr int HI = 0x00100010;
+
+  // NOTE (yiakwy) : pack two 1024 (16 bit) to extract mantissa of weights, see
+  constexpr int EX = 0x64006400;
+
+  // Guarantee that the `(a & b) | c` operations are LOP3s.
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+
+  constexpr int SUB = EX;
+  constexpr int MUL = 0x40004000;  // mul fp16(2.0)
+  constexpr int ADD = 0xbc00bc00;  // fp16(-1.0)
+
+  frag_b[0] = __hsub2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<const half2*>(&SUB));
+  frag_b[1] = __hfma2(
+      *reinterpret_cast<half2*>(&hi), *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD));
+}
+
+template <>
+__device__ inline void dequant<nv_bfloat162, sglang::kU1.id(), false>(int q, nv_bfloat162* frag_b);
+
+template <>
+__device__ inline void dequant<nv_bfloat162, sglang::kU1.id(), true>(int q, nv_bfloat162* frag_b) {
+  dequant<nv_bfloat162, sglang::kU1.id(), false>(q, frag_b);
+}
+
+template <>
+__device__ inline void dequant<nv_bfloat162, sglang::kU1.id(), false>(int q, nv_bfloat162* frag_b) {
+  constexpr int LO = 0x00010001;
+  constexpr int HI = 0x00100010;
+
+  // NOTE (yiakwy) : pack two 1024 (16 bit) to extract mantissa of weights, see
+  constexpr unsigned EX = 0x89008900;
+
+  // Guarantee that the `(a & b) | c` operations are LOP3s.
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+
+  constexpr int SUB = EX;
+  constexpr int MUL = 0x2c002c00;  // 1/16
+  constexpr int ADD = 0xd000d000;  // fp16(-1.0)
+
+  frag_b[0] =
+      *reinterpret_cast<nv_bfloat162*>(&__hsub2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<const half2*>(&SUB)));
+  frag_b[1] = *reinterpret_cast<nv_bfloat162*>(&__hfma2(
+      *reinterpret_cast<half2*>(&hi), *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD)));
+}
+
 #endif
 
 }  // namespace MARLIN_NAMESPACE_NAME

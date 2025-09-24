@@ -48,6 +48,8 @@ struct Vec {
 };
 
 using I4 = Vec<int, 4>;
+using I2 = Vec<int, 2>;
+using I1 = Vec<int, 1>;
 
 constexpr int div_ceil(int a, int b) {
   return (a + b - 1) / b;
@@ -77,6 +79,19 @@ __device__ inline void cp_async4(void* smem_ptr, const void* glob_ptr) {
   asm volatile(
       "{\n"
       "   cp.async.cg.shared.global [%0], [%1], %2;\n"
+      "}\n" ::"r"(smem),
+      "l"(glob_ptr),
+      "n"(BYTES));
+}
+
+__device__ inline void cp_async(void* smem_ptr, const void* glob_ptr) {
+  const int BYTES = 4;
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "{\n"
+      "   .reg .b64 p;\n"
+      "   createpolicy.fractional.L2::evict_first.b64 p, 1.0;"
+      "   cp.async.ca.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
       "}\n" ::"r"(smem),
       "l"(glob_ptr),
       "n"(BYTES));

@@ -341,6 +341,8 @@ bool is_valid_config(
   COMMON_GET_IF_M234(W_TYPE, 8, 4, 128)  \
   COMMON_GET_IF_M234(W_TYPE, 4, 8, 128)
 
+#define COMMON_GET_IF_0(W_TYPE) COMMON_GET_IF_M1(W_TYPE, 4, 8, 128)
+
 #define BIGGROUP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 8, NUM_THREADS, false)   \
@@ -432,6 +434,8 @@ MarlinFuncPtr get_marlin_kernel(
   auto kernel = MarlinDefault;
   if (false) {
   }
+
+  COMMON_GET_IF_0(sglang::kU1)
 
   COMMON_GET_IF(sglang::kU4)
   COMMON_GET_IF(sglang::kU4B8)
@@ -568,12 +572,13 @@ void marlin_mm(
     bool is_zp_float) {
   if (has_zp) {
     TORCH_CHECK(
-        q_type == sglang::kU4 || q_type == sglang::kU8,
+        q_type == sglang::kU1 || q_type == sglang::kU4 || q_type == sglang::kU8,
         "q_type must be u4 or u8 when has_zp = True. Got = ",
         q_type.str());
   } else {
     TORCH_CHECK(
-        q_type == sglang::kU4B8 || q_type == sglang::kU8B128 || q_type == sglang::kFE4M3fn || q_type == sglang::kFE2M1f,
+        q_type == sglang::kU1 || q_type == sglang::kU4B8 || q_type == sglang::kU8B128 || q_type == sglang::kFE4M3fn ||
+            q_type == sglang::kFE2M1f,
         "q_type must be uint4b8, uint8b128, float8_e4m3fn or float4_e2m1f when "
         "has_zp = False. Got = ",
         q_type.str());
@@ -683,6 +688,12 @@ void marlin_mm(
         max_thread_m_blocks--;
         continue;
       }
+    }
+
+    if (num_bits == 1 && (thread_tfg.thread_k == -1 || thread_tfg.thread_n == -1)) {
+      thread_tfg.num_threads = 128;
+      thread_tfg.thread_k = 128;
+      thread_tfg.thread_n = 64;
     }
 
     int num_threads = thread_tfg.num_threads;
@@ -820,7 +831,9 @@ torch::Tensor gptq_marlin_gemm(
     bool use_fp32_reduce,
     bool is_zp_float) {
   sglang::ScalarType const b_q_type = sglang::ScalarType::from_id(b_q_type_id);
-  int pack_factor = 32 / b_q_type.size_bits();
+
+  // NOTE(yiakwy) : use int8 to pack sub-1-bit weights
+  int pack_factor = b_q_type.size_bits() == 1 ? 8 : 32 / b_q_type.size_bits();
 
   // Verify A
   TORCH_CHECK(a.size(0) == size_m, "Shape mismatch: a.size(0) = ", a.size(0), ", size_m = ", size_m);
@@ -976,13 +989,13 @@ torch::Tensor gptq_marlin_gemm(
   bool has_zp = b_zeros.size(-1) > 0;
   if (has_zp) {
     TORCH_CHECK(
-        b_q_type == sglang::kU4 || b_q_type == sglang::kU8,
+        b_q_type == sglang::kU1 || b_q_type == sglang::kU4 || b_q_type == sglang::kU8,
         "b_q_type must be u4 or u8 when has_zp = True. Got = ",
         b_q_type.str());
   } else {
     TORCH_CHECK(
-        b_q_type == sglang::kU4B8 || b_q_type == sglang::kU8B128 || b_q_type == sglang::kFE4M3fn ||
-            b_q_type == sglang::kFE2M1f,
+        b_q_type == sglang::kU1 || b_q_type == sglang::kU4B8 || b_q_type == sglang::kU8B128 ||
+            b_q_type == sglang::kFE4M3fn || b_q_type == sglang::kFE2M1f,
         "b_q_type must be uint4b8, uint8b128, float8_e4m3fn or "
         "float4_e2m1f when "
         "has_zp = False. Got = ",

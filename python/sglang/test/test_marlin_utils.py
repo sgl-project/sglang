@@ -54,6 +54,23 @@ def marlin_permute_weights(q_w, size_k, size_n, perm, tile=GPTQ_MARLIN_TILE):
     return q_w
 
 
+# NOTE (yiakwy)
+def pack_1_bit_weights(weights, dtype=torch.int32):
+    K, N = weights.shape
+    pack_size = dtype.itemsize * 8
+    assert K % pack_size == 0, f"K must be divisible by {pack_size}"
+
+    binary = ((weights + 1) // 2).to(dtype)
+
+    binary = binary.reshape(K, N // pack_size, pack_size)
+    packed = torch.zeros((K, N // pack_size), dtype=dtype, device=weights.device)
+
+    for i in range(pack_size):
+        packed |= binary[:, :, i] << i
+
+    return packed
+
+
 def marlin_weights(q_w, size_k, size_n, num_bits, perm):
     # Permute
     q_w = marlin_permute_weights(q_w, size_k, size_n, perm)
@@ -73,7 +90,7 @@ def marlin_weights(q_w, size_k, size_n, num_bits, perm):
     return q_packed
 
 
-def get_weight_perm(num_bits: int):
+def get_weight_perm(num_bits: int, dtype=torch.int32):
     perm_list: list[int] = []
     for i in range(32):
         perm1: list[int] = []
@@ -91,7 +108,55 @@ def get_weight_perm(num_bits: int):
 
     perm = np.array(perm_list)
 
-    if num_bits == 4:
+    # import pdb
+    # pdb.set_trace()
+
+    if num_bits == 1:
+        if dtype == torch.int8:
+            interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+        elif dtype == torch.int32:
+            # NOTE (yiakwy) : 4 x 1bit x 32 = 128 bit (accessing in z order with interleave 32)
+            interleave = np.array(
+                [
+                    0,
+                    16,
+                    2,
+                    18,
+                    4,
+                    20,
+                    6,
+                    22,
+                    8,
+                    24,
+                    10,
+                    26,
+                    12,
+                    28,
+                    14,
+                    30,
+                    1,
+                    17,
+                    3,
+                    19,
+                    5,
+                    21,
+                    7,
+                    23,
+                    9,
+                    25,
+                    11,
+                    27,
+                    13,
+                    29,
+                    15,
+                    31,
+                ]
+            )
+    elif num_bits == 2:
+        # NOTE (yiakwy) : 4 x 2bit x 16 = 128 bit (accessing in z order with interleave 16)
+        interleave = np.array([0, 8, 2, 10, 4, 12, 6, 14, 1, 9, 3, 11, 5, 13, 7, 15])
+    elif num_bits == 4:
+        # NOTE (yiakwy) : 4 x 4bit x 8 = 128 bit (accessing in z order with interleave 8)
         interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
     elif num_bits == 8:
         interleave = np.array([0, 2, 1, 3])
@@ -131,6 +196,10 @@ def marlin_quantize(
 
     # Reformat to marlin
     weight_perm = get_weight_perm(num_bits)
+
+    # import pdb
+    # pdb.set_trace()
+
     marlin_q_w = marlin_weights(q_w, size_k, size_n, num_bits, weight_perm)
     marlin_s = marlin_permute_scales(s, size_k, size_n, group_size)
 
@@ -159,12 +228,54 @@ def awq_marlin_quantize(w: torch.Tensor, quant_type: ScalarType, group_size: int
 
     # Reformat to marlin
     weight_perm = get_weight_perm(quant_type.size_bits)
+
     marlin_q_w = marlin_weights(q_w, size_k, size_n, quant_type.size_bits, weight_perm)
     marlin_s = marlin_permute_scales(s, size_k, size_n, group_size)
     marlin_zp = marlin_zero_points(zp, num_groups, size_n, quant_type.size_bits)
 
     # Create result
     res_list = [w_ref, marlin_q_w, marlin_s, marlin_zp]
+    for i in range(len(res_list)):
+        res_list[i] = res_list[i].to(w.device)
+
+    return res_list
+
+
+def fake_marlin_16x64_quantize(
+    w: torch.Tensor, quant_type: ScalarType, group_size: int
+):
+    size_k, size_n = w.shape
+
+    # Normalize group_size
+    if group_size == -1 or group_size == None:
+        group_size = size_k
+    assert group_size <= size_k
+
+    # Detect num groups
+    assert size_k % group_size == 0
+    num_groups = size_k // group_size
+
+    # fake quantize
+    def _fake_quantize(w):
+        w_ref = w
+        marlin_q_w = w
+        w_s = torch.ones((1, size_n), dtype=torch.float16, device=w.device)
+        return w_ref, marlin_q_w, w_s
+
+    w_ref, q_w, s = _fake_quantize(w)
+
+    # Reformat to marlin
+    packed_dtype = torch.int32  # torch.int8
+    weight_perm = get_weight_perm(quant_type.size_bits, dtype=packed_dtype)
+
+    marlin_q_w = marlin_permute_weights(q_w, size_k, size_n, weight_perm)
+    marlin_q_w = pack_1_bit_weights(marlin_q_w, dtype=packed_dtype)
+
+    # import pdb
+    # pdb.set_trace()
+
+    # Create result
+    res_list = [w_ref, marlin_q_w, s]
     for i in range(len(res_list)):
         res_list[i] = res_list[i].to(w.device)
 

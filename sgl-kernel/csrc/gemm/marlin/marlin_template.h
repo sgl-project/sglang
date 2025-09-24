@@ -22,10 +22,13 @@
 #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
+#include <cuda/std/type_traits>
+
 #include "dequant.h"
 #include "marlin.cuh"
 #include "marlin_dtypes.cuh"
 #include "scalar_type.hpp"
+#include "utils.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                        \
   static_assert(                                                                         \
@@ -326,8 +329,11 @@ __global__ void Marlin(
 
   static constexpr auto w_type = sglang::ScalarType::from_id(w_type_id);
   constexpr bool has_zp = w_type == sglang::kU4 || w_type == sglang::kU8;
-  constexpr bool is_int_type =
-      w_type == sglang::kU4 || w_type == sglang::kU8 || w_type == sglang::kU4B8 || w_type == sglang::kU8B128;
+
+  // NOTE (yiakwy) : kU1
+  constexpr bool is_int_type = w_type == sglang::kU1 || w_type == sglang::kU4 || w_type == sglang::kU8 ||
+                               w_type == sglang::kU4B8 || w_type == sglang::kU8B128;
+
   // see comments of dequant.h for more details
   constexpr bool dequant_skip_flop = !is_int_type ||
                                      has_zp && !is_zp_float && !std::is_same<scalar_t, nv_bfloat16>::value ||
@@ -343,7 +349,10 @@ __global__ void Marlin(
   constexpr bool has_act_order = group_blocks == 0;
   constexpr int m_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
 
-  constexpr int pack_factor = 32 / w_type.size_bits();
+  // NOTE (yiakwy) : kU1
+  constexpr int pack_factor = w_type.size_bits() == 1 ? 8 : 32 / w_type.size_bits();
+  constexpr int defactor = w_type.size_bits() == 1 ? 4 : 1;
+
   static_assert(thread_m_blocks == 1 || !m_block_size_8);
 
   // For larger GEMMs we run multiple batchsize 64 versions in parallel for a
@@ -356,7 +365,25 @@ __global__ void Marlin(
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
+
   int iters = div_ceil(k_tiles * n_tiles * parallel, gridDim.x);
+
+  // NOTE (yiakwy) : DEBUG
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("Init\n");
+    printf("====\n");
+    printf("[Init] iters=%d, k_tiles=%d, n_tiles=%d, parallel=%d\n", iters, k_tiles, n_tiles, parallel);
+    printf("[Init] prob_m=%d, prob_n=%d, prob_k=%d\n", prob_m, prob_n, prob_k);
+    printf(
+        "[Init] m_block_size=%d, thread_m_blocks=%d, thread_n_blocks==%d, thread_k_blocks=%d, group_blocks=%d\n",
+        m_block_size,
+        thread_m_blocks,
+        thread_n_blocks,
+        thread_k_blocks,
+        group_blocks);
+    printf("\n\n");
+  }
+  __syncthreads();
 
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {
@@ -386,6 +413,26 @@ __global__ void Marlin(
     slice_col = slice_col_par % n_tiles;
     par_id = slice_col_par / n_tiles;
   }
+
+  // NOTE (yiakwy) : DEBUG
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("Global offset\n");
+    printf("====\n");
+    printf(
+        "[Global offset] lda=%d, slice_row=%d, slice_col_par=%d, slice_col=%d, par_id=%d\n",
+        lda,
+        slice_row,
+        slice_col_par,
+        slice_col,
+        par_id);
+    printf(
+        "[Global offset] A += %d, C+=%d \n",
+        (slice_col_par / n_tiles) * 16 * thread_m_blocks * lda / 8,
+        (slice_col_par / n_tiles) * 16 * thread_m_blocks * prob_n / 8);
+    printf("\n\n");
+  }
+  __syncthreads();
+
   if (parallel * n_tiles >= gridDim.x) {
     // when parallel * n_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
@@ -476,7 +523,10 @@ __global__ void Marlin(
   // B sizes/strides
   int b_gl_stride = 16 * prob_n / (pack_factor * 4);
   constexpr int b_sh_stride = ((thread_n_blocks * 16) * 16 / pack_factor) / 4;
-  constexpr int b_thread_vecs = w_type.size_bits() == 4 ? 1 : 2;
+
+  // NOTE (yiakwy) : DEBUG
+  constexpr int b_thread_vecs = (w_type.size_bits() == 4 || w_type.size_bits() == 1 ? 1 : 2);
+
   constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
 
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
@@ -485,6 +535,20 @@ __global__ void Marlin(
   constexpr int b_sh_rd_delta = threads * b_thread_vecs;
   constexpr int b_sh_stage = b_sh_stride * thread_k_blocks;
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
+
+  // NOTE (yiakwy) : DEBUG
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("B offset\n");
+    printf("====\n");
+    printf("[B offset] b_gl_stride=%d, b_sh_stride=%d\n", b_gl_stride, b_sh_stride);
+    printf("[B offset] b_thread_vecs=%d, b_sh_stride_threads=%d\n", b_thread_vecs, b_sh_stride_threads);
+    printf(
+        "[B offset] b_gl_rd_delta_o=%d, b_gl_rd_delta_i=%d, threads=%d\n", b_gl_rd_delta_o, b_gl_rd_delta_i, threads);
+    printf("[B offset] b_sh_wr_delta=%d, b_sh_rd_deltae=%d\n", b_sh_wr_delta, b_sh_rd_delta);
+    printf("[B offset] b_sh_wr_iters=%d, b_sh_stage=%d\n", b_sh_wr_iters, b_sh_stage);
+    printf("\n\n");
+  }
+  __syncthreads();
 
   // Scale sizes/strides without act_order
   int s_gl_stride = prob_n / 8;
@@ -635,10 +699,39 @@ __global__ void Marlin(
   // runtime; we break dependencies between subsequent accesses with a tile by
   // maintining multiple pointers (we have enough registers), a tiny
   // optimization.
-  const int4* B_ptr[b_sh_wr_iters];
+
+#define INT32_LOAD_VEC_SIZE 4
+
+  using vec_type_t = cuda::std::conditional_t<w_type.size_bits() == 1, int, int4>;
+
+  const vec_type_t* B_ptr[b_sh_wr_iters];
+
+  // NOTE(yiakwy) : safe loop for 1/2 bit operations
+  if constexpr (w_type.size_bits() == 1) {
 #pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; i++)
-    B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
+    for (int i = 0; i < b_sh_wr_iters; i++)
+      B_ptr[i] = reinterpret_cast<const vec_type_t*>(B) + b_gl_rd_delta_i * i + b_gl_rd;
+  } else {
+#pragma unroll
+    for (int i = 0; i < b_sh_wr_iters; i++)
+      B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
+  }
+
+  // NOTE (yiakwy) : DEBUG
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("Loading B to B_ptr\n");
+    printf("==================\n");
+    printf(
+        "[load B] b_gl_rd_delta_i=%d, b_gl_rd=%d, (b_gl_rd_delta_i = b_gl_stride(=%d) * (threads(=%d) / "
+        "b_sh_stride_threads(=%d)))\n",
+        b_gl_rd_delta_i,
+        b_gl_rd,
+        b_gl_stride,
+        threads,
+        b_sh_stride_threads);
+    printf("\n\n");
+  }
+  __syncthreads();
 
   extern __shared__ int4 sh[];
   // Shared memory storage for global fetch pipelines.
@@ -660,7 +753,11 @@ __global__ void Marlin(
 
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks];
-  I4 frag_b_quant[2][b_thread_vecs];
+
+  using vec_dtype_simd_t = cuda::std::conditional_t<w_type.size_bits() == 1, I1, I4>;
+
+  vec_dtype_simd_t frag_b_quant[2][b_thread_vecs];
+
   FragC frag_c[thread_m_blocks][4][2];
   FragS frag_s[2][4];                    // No act-order
   FragS act_frag_s[2][4][4];             // For act-order
@@ -721,12 +818,16 @@ __global__ void Marlin(
             &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
             a_sh_wr_pred[i]);
       }
-      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+      vec_type_t* sh_b_stage = reinterpret_cast<vec_type_t*>(sh_b) + b_sh_stage * pipe;
 #pragma unroll
       for (int i = 0; i < b_sh_wr_iters; i++) {
 #pragma unroll
         for (int j = 0; j < b_thread_vecs; j++) {
-          cp_async4(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j], B_ptr[i] + j);
+          if constexpr (w_type.size_bits() == 1) {
+            cp_async4(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j], B_ptr[i] + j);
+          } else {
+            cp_async(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr], B_ptr[i]);
+          }
         }
 
         B_ptr[i] += b_gl_rd_delta_o;
@@ -823,11 +924,12 @@ __global__ void Marlin(
 #pragma unroll
     for (int i = 0; i < thread_m_blocks; i++)
       ldsm<m_block_size_8 ? 2 : 4, scalar_t>(frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
-    int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+    vec_type_t* sh_b_stage = reinterpret_cast<vec_type_t*>(sh_b) + b_sh_stage * pipe;
 
 #pragma unroll
     for (int i = 0; i < b_thread_vecs; i++) {
-      frag_b_quant[k % 2][i] = *reinterpret_cast<I4*>(&sh_b_stage[b_sh_rd_delta * (k % b_sh_wr_iters) + b_sh_rd + i]);
+      frag_b_quant[k % 2][i] =
+          *reinterpret_cast<vec_dtype_simd_t*>(&sh_b_stage[b_sh_rd_delta * (k % b_sh_wr_iters) + b_sh_rd + i]);
     }
   };
 
@@ -1064,7 +1166,10 @@ __global__ void Marlin(
         FragB frag_zp_1;
         int zp_quant_0, zp_quant_1;
 
-        if constexpr (w_type.size_bits() == 4) {
+        if constexpr (w_type.size_bits() == 1) {
+          // NOTE (yiakwy) : do nothing
+          static_assert(!has_zp);
+        } else if constexpr (w_type.size_bits() == 4) {
           zp_quant_0 = frag_qzp[k2][0];
           zp_quant_1 = zp_quant_0 >> 8;
         } else {
@@ -1099,7 +1204,10 @@ __global__ void Marlin(
       FragB frag_b1;
       int b_quant_0, b_quant_1;
 
-      if constexpr (w_type_id == sglang::kFE2M1f.id()) {
+      if constexpr (w_type.size_bits() == 1) {
+        b_quant_0 = frag_b_quant[k2][0][j / defactor] >> (j % 4);
+        b_quant_1 = b_quant_0 >> 8;
+      } else if constexpr (w_type_id == sglang::kFE2M1f.id()) {
         b_quant_1 = frag_b_quant[k2][0][j];
         b_quant_0 = b_quant_1 << 8;
       } else if constexpr (w_type.size_bits() == 4) {
