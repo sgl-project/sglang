@@ -69,6 +69,7 @@ rmcp = { version = "0.6.3", features = ["client", "server",
     "reqwest",
     "auth"] }
 serde_yaml = "0.9"
+subtle = "2.6"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.12", features = ["tls", "gzip", "transport"] }
