@@ -42,7 +42,7 @@ from sglang.utils import get_exception_traceback, logger
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     if getattr(config, "sliding_window", None) is not None:
-        return config.sliding_window
+        return config.sliding_window - 1
     else:
         return None
 

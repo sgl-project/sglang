@@ -700,7 +700,7 @@ class ServerArgs:
                     "fa3",
                     "triton",
                     "trtllm_mha",
-                }, "flashinfer, fa3, triton, or trtllm_mla is required for Exaone4ForCausalLM-32B"
+                }, "fa3, triton, or trtllm_mla is required for Exaone4ForCausalLM-32B"
                 self.disable_hybrid_swa_memory = True
 
     def _handle_sampling_backend(self):
