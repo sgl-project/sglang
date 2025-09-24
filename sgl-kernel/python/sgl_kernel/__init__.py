@@ -1,14 +1,46 @@
 import ctypes
 import os
 import platform
+import shutil
+from pathlib import Path
 
 import torch
 
-SYSTEM_ARCH = platform.machine()
 
-cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
-if os.path.exists(cuda_path):
-    ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
+# copy & modify from torch/utils/cpp_extension.py
+def _find_cuda_home():
+    """Find the CUDA install path."""
+    # Guess #1
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home is None:
+        # Guess #2
+        nvcc_path = shutil.which("nvcc")
+        if nvcc_path is not None:
+            cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
+        else:
+            # Guess #3
+            cuda_home = "/usr/local/cuda"
+    return cuda_home
+
+
+if torch.version.cuda is not None:
+    cuda_home = Path(_find_cuda_home())
+
+    if (cuda_home / "lib").is_dir():
+        cuda_path = cuda_home / "lib"
+    elif (cuda_home / "lib64").is_dir():
+        cuda_path = cuda_home / "lib64"
+    else:
+        # Search for 'libcudart.so.12' in subdirectories
+        for path in cuda_home.rglob("libcudart.so.12"):
+            cuda_path = path.parent
+            break
+        else:
+            raise RuntimeError("Could not find CUDA lib directory.")
+
+    cuda_include = (cuda_path / "libcudart.so.12").resolve()
+    if cuda_include.exists():
+        ctypes.CDLL(str(cuda_include), mode=ctypes.RTLD_GLOBAL)
 
 from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
@@ -23,6 +55,7 @@ from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_
 from sgl_kernel.elementwise import (
     FusedSetKVBufferArg,
     apply_rope_with_cos_sin_cache_inplace,
+    concat_mla_absorb_q,
     concat_mla_k,
     copy_to_gpu_no_ce,
     downcast_fp8,
@@ -34,11 +67,6 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
-from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
-
-if torch.version.hip is not None:
-    from sgl_kernel.elementwise import gelu_quick
-
 from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.gemm import (
     awq_dequantize,
@@ -58,7 +86,8 @@ from sgl_kernel.gemm import (
     scaled_fp4_grouped_quant,
     scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
-    sgl_per_token_group_quant_8bit,
+    sgl_per_token_group_quant_fp8,
+    sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
     shuffle_rows,
     silu_and_mul_scaled_fp4_grouped_quant,
@@ -70,6 +99,7 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
+from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
 from sgl_kernel.marlin import (
     awq_marlin_moe_repack,
     awq_marlin_repack,
@@ -82,6 +112,7 @@ from sgl_kernel.moe import (
     fp8_blockwise_scaled_grouped_mm,
     moe_align_block_size,
     moe_fused_gate,
+    moe_sum_reduce,
     prepare_moe_input,
     topk_softmax,
 )
@@ -96,12 +127,16 @@ from sgl_kernel.sampling import (
 )
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,
+    reconstruct_indices_from_tree_mask,
     segment_packbits,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__
+
+if torch.version.hip is not None:
+    from sgl_kernel.elementwise import gelu_quick
 
 
 def create_greenctx_stream_by_value(*args, **kwargs):
