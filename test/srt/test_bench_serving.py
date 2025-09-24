@@ -463,14 +463,7 @@ class TestBenchServing(CustomTestCase):
                 f"Score API throughput: {res['throughput']:.2f} req/s\n"
                 f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
             )
-        
-        print(
-            f"### test_score_api_throughput\n"
-            f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
-            f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
-            f"Score API throughput: {res['throughput']:.2f} req/s\n"
-            f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
-        )
+
         self.assertEqual(res["successful_requests"], res["total_requests"])
         self.assertLess(res["avg_latency_ms"], 48)
         self.assertLess(res["p95_latency_ms"], 50)
@@ -496,15 +489,6 @@ class TestBenchServing(CustomTestCase):
                     f"Throughput: {res['throughput']:.2f} req/s\n"
                     f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
                 )
-            
-            print(
-                f"### test_score_api_batch_scaling_size_{batch_size}\n"
-                f"Batch size: {batch_size}\n"
-                f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
-                f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
-                f"Throughput: {res['throughput']:.2f} req/s\n"
-                f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
-            )
 
             self.assertEqual(res["successful_requests"], res["total_requests"])
             if batch_size == 10:
