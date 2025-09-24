@@ -224,8 +224,8 @@ endif()
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100F)
     if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.9")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_100f,code=sm_100"
-            "-gencode=arch=compute_120f,code=sm_120"
+            "-gencode=arch=compute_100f,code=sm_100f"
+            "-gencode=arch=compute_120f,code=sm_120f"
         )
     else()
         list(APPEND SGL_KERNEL_CUDA_FLAGS
