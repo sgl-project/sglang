@@ -938,7 +938,7 @@ class BatchEmbeddingOut:
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
-    embeddings: List[List[float]]
+    embeddings: Union[List[List[float]], List[Dict[int, float]]]
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]

@@ -57,6 +57,7 @@ class ModelConfig:
         context_length: Optional[int] = None,
         model_override_args: str = "{}",
         is_embedding: Optional[bool] = None,
+        use_bge_m3_sparse: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
@@ -89,6 +90,7 @@ class ModelConfig:
         self.remote_instance_weight_loader_send_weights_group_ports = (
             remote_instance_weight_loader_send_weights_group_ports
         )
+        self.use_bge_m3_sparse = use_bge_m3_sparse
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
@@ -199,6 +201,7 @@ class ModelConfig:
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            use_bge_m3_sparse=server_args.use_bge_m3_sparse,
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
