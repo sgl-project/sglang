@@ -39,7 +39,7 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.function_call.utils import get_json_schema_constraint, validate_tool_definitions
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -91,8 +91,6 @@ class OpenAIServingChat(OpenAIServingBase):
         # Validate tool definitions
         if request.tools:
             for i, tool in enumerate(request.tools):
-                if not hasattr(tool, "function") or not tool.function:
-                    return f"Tool {i} is missing required 'function' field."
                 if not hasattr(tool.function, "name") or not tool.function.name:
                     return f"Tool {i} function is missing required 'name' field."
                 if not hasattr(tool.function, "parameters"):
@@ -103,7 +101,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     return (
                         f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
                     )
-
+            
+            # Check for conflicting tool definitions when tool_choice is required or specific
+            if (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ToolChoice)
+            ):
+                try:
+                    validate_tool_definitions(request.tools)
+                except ValueError as e:
+                    return str(e)
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
         if (
@@ -223,10 +230,6 @@ class OpenAIServingChat(OpenAIServingBase):
             if (
                 request.tool_choice == "required"
                 or isinstance(request.tool_choice, ToolChoice)
-                or (
-                    isinstance(request.tool_choice, dict)
-                    and "function" in request.tool_choice
-                )
             ):
                 json_schema = get_json_schema_constraint(
                     request.tools, request.tool_choice
@@ -1089,12 +1092,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if (
                 request.tool_choice == "required"
                 or isinstance(request.tool_choice, ToolChoice)
-                or (
-                    isinstance(request.tool_choice, dict)
-                    and "function" in request.tool_choice
-                )
             ):
-                # Store JsonArrayParser directly for JSON schema constraints
                 parser_dict[index] = JsonArrayParser()
             else:
                 parser_dict[index] = FunctionCallParser(

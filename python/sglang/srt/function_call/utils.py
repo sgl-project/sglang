@@ -56,6 +56,30 @@ def _is_complete_json(input_str: str) -> bool:
     except JSONDecodeError:
         return False
 
+def validate_tool_definitions(tools: List[Tool]) -> None:
+    """
+    Validate that tool definitions don't have conflicting $defs.
+    
+    Raises:
+        ValueError: If there are conflicting tool definitions
+    """
+    all_defs = {}
+    for tool in tools:
+        if tool.function.parameters is None:
+            continue
+        # Make a copy to avoid modifying original
+        params = tool.function.parameters.copy()
+        defs = params.pop("$defs", {})
+        for def_name, def_schema in defs.items():
+            if def_name in all_defs and all_defs[def_name] != def_schema:
+                raise ValueError(
+                    f"Tool definition '{def_name}' has "
+                    "multiple schemas, which is not "
+                    "supported."
+                )
+            else:
+                all_defs[def_name] = def_schema
+
 
 def get_json_schema_constraint(
     tools: List[Tool], tool_choice: Union[ToolChoice, Literal["required"]]
@@ -83,14 +107,9 @@ def get_json_schema_constraint(
             "required": ["name", "parameters"],
         }
 
-    if isinstance(tool_choice, ToolChoice) or (
-        isinstance(tool_choice, dict) and "function" in tool_choice
-    ):
+    if isinstance(tool_choice, ToolChoice):
         # For specific function choice, return the user's parameters schema directly
-        if isinstance(tool_choice, ToolChoice):
-            fn_name = tool_choice.function.name
-        else:
-            fn_name = tool_choice["function"]["name"]
+        fn_name = tool_choice.function.name
         for tool in tools:
             if tool.function.name == fn_name:
                 return {
@@ -101,6 +120,8 @@ def get_json_schema_constraint(
                 }
         return None
     elif tool_choice == "required":
+        # Validate tool definitions first
+        validate_tool_definitions(tools)
 
         def get_tool_schema_defs(tools):
             all_defs = {}
@@ -111,14 +132,7 @@ def get_json_schema_constraint(
                 params = tool.function.parameters.copy()
                 defs = params.pop("$defs", {})
                 for def_name, def_schema in defs.items():
-                    if def_name in all_defs and all_defs[def_name] != def_schema:
-                        raise ValueError(
-                            f"Tool definition '{def_name}' has "
-                            "multiple schemas, which is not "
-                            "supported."
-                        )
-                    else:
-                        all_defs[def_name] = def_schema
+                    all_defs[def_name] = def_schema
             return all_defs
 
         json_schema = {
