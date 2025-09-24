@@ -779,9 +779,9 @@ class TestToolChoiceLlama32(CustomTestCase):
                 stream=False,
             )
 
-        # Verify the error message indicates invalid JSON schema
+        # Verify the error message indicates invalid JSON schema for parameters field
         error_msg = str(context.exception).lower()
-        self.assertIn("json schema", error_msg)
+        self.assertIn("invalid 'parameters' schema", error_msg)
 
 
 class TestToolChoiceQwen25(TestToolChoiceLlama32):
