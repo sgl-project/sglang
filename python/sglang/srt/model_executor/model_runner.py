@@ -672,7 +672,7 @@ class ModelRunner:
 
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
-                backend=self.dist_backend,
+                backend=backend,
                 world_size=self.tp_size * self.pp_size,
                 rank=self.tp_size * self.pp_rank + self.tp_rank,
                 local_rank=self.gpu_id,
