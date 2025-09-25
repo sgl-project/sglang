@@ -36,6 +36,21 @@ Consolidated utility classes:
 - **NixlRegistration** - Manages memory registration for tensors, files and objects
 - **NixlFileManager** - Handles file system operations and NIXL tuple creation
 
+## Using NIXL for HiCache backend
+When running the SGLang server, indicate `nixl` for `hicache-storage-backend` parameter, for instance:
+
+```bash
+python3 -m sglang.launch_server --model-path <model> --host <ip> --port <port> --page-size 64 --enable-hierarchical-cache --hicache-ratio 2 --hicache-size 64 --hicache-write-policy write_through --hicache-storage-backend nixl
+```
+
+To customize the base directory for files, you can set the following environment variable:
+
+```bash
+export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/desired/dir
+```
+
+Selection of any storage backend like 3FS requires availability of that library on the system, and the backend is selected based on the priority mentioned above.
+
 ## Running Unit Tests
 
 ### Prerequisites
@@ -43,33 +58,26 @@ Consolidated utility classes:
 - PyTorch installed
 - Python 3.8+
 
-### Unit tests from Project root
-Navigate to the project root directory (`/path/to/sglang`) and run:
+### Unit tests from current directory
+From the current directory run:
 
 #### Run all NIXL tests:
 ```bash
-PYTHONPATH=. python -m pytest test/srt/test_hicache_nixl_storage.py -o asyncio_mode=strict
+PYTHONPATH=. python -m pytest test_hicache_nixl_storage.py -o asyncio_mode=strict
 ```
 
 #### Run with verbose output:
 ```bash
-PYTHONPATH=. python -m pytest test/srt/test_hicache_nixl_storage.py -v -o asyncio_mode=strict
+PYTHONPATH=. python -m pytest test_hicache_nixl_storage.py -v -o asyncio_mode=strict
 ```
 
 Note: The `-v` flag provides more detailed output, showing each test case name and its result.
 
 #### Run a specific test:
 ```bash
-PYTHONPATH=. python -m pytest test/srt/test_hicache_nixl_storage.py -v -k test_single_set_get -o asyncio_mode=strict
+PYTHONPATH=. python -m pytest test_hicache_nixl_storage.py -v -k test_single_set_get -o asyncio_mode=strict
 ```
 
-### From Tests Directory
-Navigate to the tests directory and run:
-
-```bash
-cd test/srt
-PYTHONPATH=../.. python -m pytest test_hicache_nixl_storage.py -o asyncio_mode=strict
-```
 Note: The `-o asyncio_mode=strict` flag is added to suppress warnings about asyncio configuration. This is not required for test functionality but provides cleaner output.
 
 ## Test Coverage

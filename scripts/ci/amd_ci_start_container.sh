@@ -2,151 +2,125 @@
 set -euo pipefail
 
 # Get version from SGLang version.py file
-FALLBACK_SGLANG_VERSION="v0.4.10.post2"
 SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
+SGLANG_VERSION="v0.5.0rc0"   # Default version, will be overridden if version.py is found
 
 if [ -f "$SGLANG_VERSION_FILE" ]; then
-  SGLANG_VERSION=$(python3 -c '
+  VERSION_FROM_FILE=$(python3 -c '
 import re, sys
 with open(sys.argv[1], "r") as f:
     content = f.read()
     match = re.search(r"__version__\s*=\s*[\"'"'"'](.*?)[\"'"'"']", content)
     if match:
         print("v" + match.group(1))
-' "$SGLANG_VERSION_FILE")
+' "$SGLANG_VERSION_FILE" 2>/dev/null || echo "")
 
-  if [ -z "$SGLANG_VERSION" ]; then
-      SGLANG_VERSION="$FALLBACK_SGLANG_VERSION"
-      echo "Warning: Could not parse version from $SGLANG_VERSION_FILE, using fallback version: $SGLANG_VERSION" >&2
+  if [ -n "$VERSION_FROM_FILE" ]; then
+      SGLANG_VERSION="$VERSION_FROM_FILE"
+      echo "Using SGLang version from version.py: $SGLANG_VERSION"
+  else
+      echo "Warning: Could not parse version from $SGLANG_VERSION_FILE, using default: $SGLANG_VERSION" >&2
   fi
 else
-  # Fallback version if file is not found
-  SGLANG_VERSION="$FALLBACK_SGLANG_VERSION"
-  echo "Warning: version.py not found, using fallback version: $SGLANG_VERSION" >&2
+  echo "Warning: version.py not found, using default version: $SGLANG_VERSION" >&2
 fi
 
-echo "Using SGLang version: $SGLANG_VERSION"
 
 # Default base tags (can be overridden by command line arguments)
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm630-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi35x"
 
 # Parse command line arguments
-MI30X_BASE_TAG="$DEFAULT_MI30X_BASE_TAG"
-MI35X_BASE_TAG="$DEFAULT_MI35X_BASE_TAG"
+MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
+MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --mi30x-base-tag)
-      MI30X_BASE_TAG="$2"
-      shift 2
-      ;;
-    --mi35x-base-tag)
-      MI35X_BASE_TAG="$2"
-      shift 2
-      ;;
+    --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
+    --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
     -h|--help)
       echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG]"
-      echo "  --mi30x-base-tag TAG    Base tag for mi30x images (default: $DEFAULT_MI30X_BASE_TAG)"
-      echo "  --mi35x-base-tag TAG    Base tag for mi35x images (default: $DEFAULT_MI35X_BASE_TAG)"
       exit 0
       ;;
-    *)
-      echo "Unknown option $1"
-      echo "Use --help for usage information"
-      exit 1
-      ;;
+    *) echo "Unknown option $1"; exit 1;;
   esac
 done
 
+
+
+# Detect GPU architecture from the Kubernetes runner hostname
+HOSTNAME_VALUE=$(hostname)
+GPU_ARCH="mi30x"   # default
+
+# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
+if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+  GPU_ARCH="${BASH_REMATCH[1]}"
+  echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
+else
+  echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
+fi
+
+# Normalise / collapse architectures we don’t yet build specifically for
+case "${GPU_ARCH}" in
+  mi35x)
+    echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
+    ;;
+  mi30x|mi300|mi325)
+    echo "Runner uses ${GPU_ARCH}; will fetch mi30x image."
+    GPU_ARCH="mi30x"
+    ;;
+  *)
+    echo "Runner architecture '${GPU_ARCH}' unrecognised; defaulting to mi30x image." >&2
+    GPU_ARCH="mi30x"
+    ;;
+esac
+
+
 # Set up DEVICE_FLAG based on Kubernetes pod info
-if [ -f "/etc/podinfo/gha-render-devices" ]; then
+if [[ -f /etc/podinfo/gha-render-devices ]]; then
   DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
 else
   DEVICE_FLAG="--device /dev/dri"
 fi
 
-# Function to find latest available image for a given GPU architecture
+
+# Find the latest image
 find_latest_image() {
   local gpu_arch=$1
-  local base_tag
+  local base_tag days_back image_tag
 
-  if [ "$gpu_arch" == "mi30x" ]; then
-    base_tag="$MI30X_BASE_TAG"
-  elif [ "$gpu_arch" == "mi35x" ]; then
-    base_tag="$MI35X_BASE_TAG"
-  else
-    echo "Error: Unsupported GPU architecture '$gpu_arch'" >&2
-    return 1
-  fi
+  case "${gpu_arch}" in
+      mi30x) base_tag="${MI30X_BASE_TAG}" ;;
+      mi35x) base_tag="${MI35X_BASE_TAG}" ;;
+      *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
+  esac
 
-  local days_back=0
-
-  while [ $days_back -lt 30 ]; do
-    local check_date=$(date -d "$days_back days ago" +%Y%m%d)
-    local image_tag="${base_tag}-${check_date}"
-
+  for days_back in {0..6}; do
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
-
-    # Check if the image exists by trying to get its manifest
     if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
       echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
       echo "rocm/sgl-dev:${image_tag}"
       return 0
     fi
-
-    days_back=$((days_back + 1))
   done
 
-  echo "Error: No ${gpu_arch} image found in the last 30 days" >&2
-  return 1
+  echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
+  echo "Using hard-coded fallback…" >&2
+  if [[ "${gpu_arch}" == "mi35x" ]]; then
+    echo "rocm/sgl-dev:v0.5.0rc0-rocm700-mi35x-20250812"
+  else
+    echo "rocm/sgl-dev:v0.5.0rc0-rocm630-mi30x-20250812"
+  fi
 }
 
-# Determine image finder and fallback based on runner
-# In Kubernetes, the hostname contains the GPU type (e.g., linux-mi300-gpu-1-bgg8r-runner-vknlb)
-# Extract the GPU type from hostname
-HOSTNAME_VALUE=$(hostname)
-RUNNER_NAME="unknown"
+# Pull and run the latest image
+IMAGE=$(find_latest_image "${GPU_ARCH}")
+echo "Pulling Docker image: ${IMAGE}"
+docker pull "${IMAGE}"
 
-if [[ "${HOSTNAME_VALUE}" =~ ^(linux-mi[0-9]+-gpu-[0-9]+) ]]; then
-  RUNNER_NAME="${BASH_REMATCH[1]}"
-  echo "Extracted runner from hostname: ${RUNNER_NAME}"
-else
-  echo "Could not extract runner info from hostname: ${HOSTNAME_VALUE}"
-fi
-
-echo "The runner is: ${RUNNER_NAME}"
-GPU_ARCH="mi30x"
-FALLBACK_IMAGE="rocm/sgl-dev:${MI30X_BASE_TAG}-20250715"
-FALLBACK_MSG="No mi30x image found in last 30 days, using fallback image"
-
-# Check for mi350/mi355 runners
-if [[ "${RUNNER_NAME}" =~ ^linux-mi350-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi355-gpu-[0-9]+$ ]]; then
-  echo "Runner is ${RUNNER_NAME}, will find mi35x image."
-  GPU_ARCH="mi35x"
-  FALLBACK_IMAGE="rocm/sgl-dev:${MI35X_BASE_TAG}-20250715"
-  FALLBACK_MSG="No mi35x image found in last 30 days, using fallback image"
-# Check for mi300/mi325 runners
-elif [[ "${RUNNER_NAME}" =~ ^linux-mi300-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi325-gpu-[0-9]+$ ]]; then
-  echo "Runner is ${RUNNER_NAME}, will find mi30x image."
-else
-  echo "Runner type not recognized: '${RUNNER_NAME}'"
-  echo "Defaulting to find mi30x image"
-fi
-
-# Find and pull the latest image
-if IMAGE=$(find_latest_image "${GPU_ARCH}"); then
-  echo "Pulling Docker image: $IMAGE"
-else
-  echo "$FALLBACK_MSG" >&2
-  IMAGE="$FALLBACK_IMAGE"
-  echo "Pulling fallback Docker image: $IMAGE"
-fi
-docker pull "$IMAGE"
-
-# Run the container
-echo "Starting container: ci_sglang"
-docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+echo "Launching container: ci_sglang"
+docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   --ipc=host --group-add video \
   --shm-size 32g \
@@ -155,4 +129,4 @@ docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
   --name ci_sglang \
-  "$IMAGE"
+  "${IMAGE}"

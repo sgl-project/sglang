@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from torch.nn import Module
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -22,7 +24,10 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -256,7 +261,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         layer: Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
@@ -272,25 +277,28 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         )
         # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
         # Required by column parallel or enabling merged weights
-        if intermediate_size % block_n != 0:
+        if intermediate_size_per_partition % block_n != 0:
             raise ValueError(
                 f"The output_size of gate's and up's weight = "
-                f"{intermediate_size} is not divisible by "
+                f"{intermediate_size_per_partition} is not divisible by "
                 f"weight quantization block_n = {block_n}."
             )
         if tp_size > 1:
             # Required by row parallel
-            if intermediate_size % block_k != 0:
+            if intermediate_size_per_partition % block_k != 0:
                 raise ValueError(
                     f"The input_size of down's weight = "
-                    f"{intermediate_size} is not divisible by "
+                    f"{intermediate_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -299,7 +307,10 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts, hidden_size, intermediate_size, dtype=params_dtype
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -310,7 +321,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         w13_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
-                2 * ((intermediate_size + block_n - 1) // block_n),
+                2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                 (hidden_size + block_k - 1) // block_k,
                 dtype=torch.float32,
             ),
@@ -320,7 +331,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             torch.ones(
                 num_experts,
                 (hidden_size + block_n - 1) // block_n,
-                (intermediate_size + block_k - 1) // block_k,
+                (intermediate_size_per_partition + block_k - 1) // block_k,
                 dtype=torch.float32,
             ),
             requires_grad=False,
@@ -343,35 +354,27 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         # Block quant doesn't need to process weights after loading
         return
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
 
-        # Expert fusion with INT8 quantization
-        return fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_output=topk_output,
-            inplace=inplace,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
             use_int8_w8a8=True,
-            w1_scale=(layer.w13_weight_scale_inv),
-            w2_scale=(layer.w2_weight_scale_inv),
-            a1_scale=layer.w13_input_scale,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )
+
+        return self.runner.run(dispatch_output, quant_info)

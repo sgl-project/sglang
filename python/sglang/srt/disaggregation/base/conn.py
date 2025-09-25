@@ -30,6 +30,7 @@ class KVArgs:
     # for pp prefill
     prefill_pp_size: int
     pp_rank: int
+    prefill_start_layer: int
     # for system dp
     system_dp_rank: int
 
@@ -130,4 +131,4 @@ class BaseKVReceiver(ABC):
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
-    def __init__(self, port: int): ...
+    def __init__(self, host: str, port: int): ...

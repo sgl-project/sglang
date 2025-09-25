@@ -40,6 +40,7 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
             "w8a8_int8",
             "--tp-size",
             4,
+            "--disable-radix-cache",
         ]
 
     def test_a_gsm8k(self):

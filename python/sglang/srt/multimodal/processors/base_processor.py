@@ -13,7 +13,9 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import load_audio, load_image, load_video, logger
+from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
+
+_is_npu = is_npu()
 
 
 @dataclasses.dataclass
@@ -217,9 +219,9 @@ class BaseMultimodalProcessor(ABC):
         if videos:
             kwargs["videos"] = videos
         if audios:
-            if self.arch in {
-                "Gemma3nForConditionalGeneration",
-                "Qwen2AudioForConditionalGeneration",
+            if self._processor.__class__.__name__ in {
+                "Gemma3nProcessor",
+                "Qwen2AudioProcessor",
             }:
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
@@ -232,19 +234,27 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            kwargs["device"] = "cuda"
+            if not _is_npu:
+                kwargs["device"] = "cuda"
+            elif processor.__class__.__name__ not in {
+                "Qwen2_5_VLProcessor",
+                "Qwen3VLProcessor",
+            }:
+                # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
+                kwargs["device"] = "npu"
         result = processor.__call__(
             text=[input_text],
             padding=True,
             return_tensors="pt",
             **kwargs,
         )
-        # move feature tensors to cpu
-        for feature_name in self.FEATURE_NAMES:
-            if feature_name in result and isinstance(
-                result[feature_name], torch.Tensor
-            ):
-                result[feature_name] = result[feature_name].to("cpu")
+        if not self.server_args.keep_mm_feature_on_device:
+            # move feature tensors to cpu
+            for feature_name in self.FEATURE_NAMES:
+                if feature_name in result and isinstance(
+                    result[feature_name], torch.Tensor
+                ):
+                    result[feature_name] = result[feature_name].to("cpu")
 
         return result
 

@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.reasoning_parser import (
+from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
     KimiDetector,

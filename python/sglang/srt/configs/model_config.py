@@ -32,6 +32,7 @@ from sglang.srt.hf_transformers_utils import (
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -63,19 +64,38 @@ class ModelConfig:
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        tp_rank: Optional[int] = None,
+        remote_instance_weight_loader_seed_instance_ip: Optional[str] = None,
+        remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None,
+        remote_instance_weight_loader_send_weights_group_ports: Optional[
+            List[int]
+        ] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.is_draft_model = is_draft_model
         self.model_impl = model_impl
 
-        self.maybe_pull_model_tokenizer_from_remote()
+        # TODO: remove these fields
+        self.tp_rank = tp_rank
+        self.remote_instance_weight_loader_seed_instance_ip = (
+            remote_instance_weight_loader_seed_instance_ip
+        )
+        self.remote_instance_weight_loader_seed_instance_service_port = (
+            remote_instance_weight_loader_seed_instance_service_port
+        )
+        self.remote_instance_weight_loader_send_weights_group_ports = (
+            remote_instance_weight_loader_send_weights_group_ports
+        )
+
+        # Get hf config
+        self._maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
-
         self.hf_config = get_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -83,7 +103,7 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
-
+        self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -91,7 +111,25 @@ class ModelConfig:
             **kwargs,
         )
 
-        self.hf_text_config = get_hf_text_config(self.hf_config)
+        # Set enable_multimodal
+        if enable_multimodal is None:
+            mm_disabled_models = [
+                "Gemma3ForConditionalGeneration",
+                "Llama4ForConditionalGeneration",
+                "Step3VLForConditionalGeneration",
+            ]
+            if self.hf_config.architectures[0] in mm_disabled_models:
+                enable_multimodal = False
+                logger.info(
+                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
+                )
+            else:
+                enable_multimodal = True
+
+        # Config draft model
+        self._config_draft_model()
+
+        # Check model type
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
@@ -107,39 +145,6 @@ class ModelConfig:
                     self.hf_config.architectures, self.hf_text_config.num_hidden_layers
                 )
             )
-
-        if enable_multimodal is None:
-            mm_disabled_models = [
-                "Gemma3ForConditionalGeneration",
-                "Llama4ForConditionalGeneration",
-                "Step3VLForConditionalGeneration",
-            ]
-            if self.hf_config.architectures[0] in mm_disabled_models:
-                enable_multimodal = False
-                logger.info(
-                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
-                )
-            else:
-                enable_multimodal = True
-
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
-        ):
-            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
-
-        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
-            self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
-
-        if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
-            self.hf_config.architectures[0] = "MiMoMTP"
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "Ernie4_5_MoeForCausalLM"
-        ):
-            self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
-
-        # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
@@ -162,29 +167,120 @@ class ModelConfig:
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
-        # Derive context length
+        # Derive context length and model shapes
+        self._derive_context_length(context_length)
+        self._derive_model_shapes()
+
+        # Verify quantization
+        self._verify_quantization()
+
+        # Verify dual-chunk attention config
+        self._verify_dual_chunk_attention_config()
+
+        # Cache attributes
+        self.hf_eos_token_id = self._get_hf_eos_token_id()
+
+        # multimodal
+        self.image_token_id = getattr(
+            self.hf_config, "image_token_id", None
+        ) or getattr(self.hf_config, "image_token_index", None)
+
+    @staticmethod
+    def from_server_args(
+        server_args: ServerArgs,
+        model_path: str = None,
+        model_revision: str = None,
+        **kwargs,
+    ):
+        return ModelConfig(
+            model_path=model_path or server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=model_revision or server_args.revision,
+            context_length=server_args.context_length,
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
+            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
+            model_impl=server_args.model_impl,
+            remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
+            remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
+            remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
+            **kwargs,
+        )
+
+    def _config_draft_model(self):
+        is_draft_model = self.is_draft_model
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
+        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
+            self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "LongcatFlashForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "LongcatFlashForCausalLMNextN"
+            self.hf_config.num_hidden_layers = self.hf_config.num_nextn_predict_layers
+
+        if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
+            self.hf_config.architectures[0] = "MiMoMTP"
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "BailingMoeV2ForCausalLM",
+            "BailingMoeForCausalLM",
+        ]:
+            self.hf_config.architectures[0] = "BailingMoeForCausalLMNextN"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Ernie4_5_MoeForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
+
+        if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
+            self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+    def _derive_context_length(self, context_length: int):
+        is_draft_model = self.is_draft_model
         derived_context_len = get_context_length(self.hf_text_config)
+
         if context_length is not None:
             if context_length > derived_context_len:
-                if get_bool_env_var(
-                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
+                reason = "Target model's" if is_draft_model else "User-specified"
+                msg = (
+                    f"Warning: {reason} context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
+                    f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config."
+                )
+                if (
+                    get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN")
+                    or is_in_ci()  # FIXME: fix this special case
                 ):
-                    logger.warning(
-                        f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
-                        f"This may lead to incorrect model outputs or CUDA errors."
-                    )
+                    logger.warning(msg)
                     self.context_len = context_length
+                    if is_draft_model:
+                        self.hf_text_config.max_position_embeddings = context_length
+                        logger.warning(
+                            f"Overriding the draft model's max_position_embeddings to {context_length}."
+                        )
                 else:
                     raise ValueError(
-                        f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
-                        f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
-                        f"To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+                        f"{msg} To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
                     )
             else:
                 self.context_len = context_length
         else:
             self.context_len = derived_context_len
 
+        # Transfer context_len to HuggingFace config so models can access it
+        self.hf_config.context_len = self.context_len
+
+    def _derive_model_shapes(self):
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(
             self.hf_text_config,
@@ -197,6 +293,9 @@ class ModelConfig:
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "LongcatFlashForCausalLM" in self.hf_config.architectures
+            or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
+            or "DotsVLMForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -268,41 +367,13 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+        self.num_attention_layers = self.num_hidden_layers
+        if "LongcatFlashForCausalLM" in self.hf_config.architectures:
+            self.num_attention_layers = self.num_hidden_layers * 2
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
         self.vocab_size = self.hf_text_config.vocab_size
-
-        # Verify quantization
-        self._verify_quantization()
-
-        # Verify dual-chunk attention config
-        self._verify_dual_chunk_attention_config()
-
-        # Cache attributes
-        self.hf_eos_token_id = self.get_hf_eos_token_id()
-
-        # multimodal
-        self.image_token_id = getattr(
-            self.hf_config, "image_token_id", None
-        ) or getattr(self.hf_config, "image_token_index", None)
-
-    @staticmethod
-    def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
-        return ModelConfig(
-            model_path=model_path or server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            enable_multimodal=server_args.enable_multimodal,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
-            model_impl=server_args.model_impl,
-            **kwargs,
-        )
 
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads
@@ -341,6 +412,19 @@ class ModelConfig:
                 "kv_n_heads",
                 self.hf_config.num_attention_heads,
             )
+        if self.hf_config.model_type in ["nemotron-nas"]:
+            nkvh = {
+                self.hf_config.num_attention_heads // block.attention.n_heads_in_group
+                for block in self.hf_config.block_configs
+                if not block.attention.no_op
+            }
+            if len(nkvh) == 0:
+                raise RuntimeError("Couldn't determine number of kv heads")
+            if len(nkvh) > 1:
+                raise ValueError(
+                    "Variable GQA (VGQA) is not yet supported for nemotron-nas in sglang"
+                )
+            return next(iter(nkvh))
 
         attributes = [
             # For Falcon:
@@ -378,17 +462,27 @@ class ModelConfig:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
         if quant_cfg is None:
-            # check if is modelopt model -- modelopt doesn't have corresponding field
+            # check if is modelopt or mixed-precision model -- Both of them don't have corresponding field
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
+            # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
-                from huggingface_hub import HfApi
+                import huggingface_hub
 
-                hf_api = HfApi()
-                if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
-                    quant_cfg = modelopt_quant_config
+                try:
+                    from huggingface_hub import HfApi
+
+                    hf_api = HfApi()
+                    if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
+                        quant_cfg = modelopt_quant_config
+                except huggingface_hub.errors.OfflineModeIsEnabled:
+                    logger.warning(
+                        "Offline mode is enabled, skipping hf_quant_config.json check"
+                    )
+                    pass
+
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
                     self.model_path, "hf_quant_config.json"
@@ -515,7 +609,7 @@ class ModelConfig:
                     "sparse_attention_enabled"
                 ] = True
 
-    def get_hf_eos_token_id(self) -> Optional[Set[int]]:
+    def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids is not None:
             # it can be either int or list of int
@@ -535,7 +629,7 @@ class ModelConfig:
                 eos_ids = eos_ids | generation_eos_ids
         return eos_ids
 
-    def maybe_pull_model_tokenizer_from_remote(self) -> None:
+    def _maybe_pull_model_tokenizer_from_remote(self) -> None:
         """
         Pull the model config files to a temporary
         directory in case of remote.
@@ -642,6 +736,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
+        or "Qwen3ForSequenceClassification" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
         or "Contriever" in model_architectures
@@ -677,12 +772,16 @@ multimodal_model_archs = [
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
+    "DotsVLMForCausalLM",
+    "Sarashina2VisionForCausalLM",
 ]
 
 

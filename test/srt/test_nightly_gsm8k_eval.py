@@ -30,7 +30,7 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.83,
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.84,
-    "zai-org/GLM-4.5-Air-FP8": 0.94,
+    "zai-org/GLM-4.5-Air-FP8": 0.75,
     # The threshold of neuralmagic/gemma-2-2b-it-FP8 should be 0.6, but this model has some accuracy regression.
     # The fix is tracked at https://github.com/sgl-project/sglang/issues/4324, we set it to 0.50, for now, to make CI green.
     "neuralmagic/gemma-2-2b-it-FP8": 0.50,

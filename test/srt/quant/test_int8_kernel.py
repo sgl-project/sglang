@@ -5,7 +5,7 @@ import torch
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.test.test_utils import CustomTestCase
 
@@ -118,7 +118,7 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
-                top_k=topk,
+                topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
             out = fused_moe(
                 a,

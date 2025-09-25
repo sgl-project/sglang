@@ -5,14 +5,18 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
-      - "scripts/**"
+      - "scripts/ci/**"
       - "test/**"
+      - ".github/workflows/vllm-dependency-test.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "python/**"
-      - "scripts/**"
+      - "scripts/ci/**"
       - "test/**"
+      - ".github/workflows/vllm-dependency-test.yml"
+    types: [synchronize, labeled]
+  workflow_dispatch:
 
 concurrency:
   group: vllm-dependency-test-${{ github.ref }}
@@ -20,8 +24,7 @@ concurrency:
 
 jobs:
   vllm-dependency-test:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -30,19 +33,10 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_dependency.sh
-          pip install "vllm==0.10.0"
-          pip install "openai==1.99.1"
           pip install "bitsandbytes>=0.44.0"
 
-          # NOTE: The latest sgl-kernel depends on torch 2.8.0 but the latest vllm depends on torch 2.7.0
-          # so they are not compatible. Here we install the old sgl-kernel to make the test pass.
-          # TODO: remove this once vllm supports torch 2.8.0.
-          pip install "sgl-kernel==0.2.9"
-
       - name: Run vLLM dependency tests
-        timeout-minutes: 60
+        timeout-minutes: 30
         run: |
-          export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
-
           cd test/srt
-          python3 run_suite.py --suite vllm_dependency_test --timeout-per-file 3600
+          python3 run_suite.py --suite vllm_dependency_test

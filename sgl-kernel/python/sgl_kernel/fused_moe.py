@@ -2,6 +2,7 @@ import functools
 from typing import Optional
 
 import torch
+from sgl_kernel import silu_and_mul
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -159,13 +160,13 @@ def fused_marlin_moe(
         size_m=M,
         size_n=2 * N,
         size_k=K,
-        is_full_k=is_k_full,
+        is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
 
-    torch.ops._C.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, 2 * N))
+    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
     if expert_map is not None:
         intermediate_cache3.zero_()
@@ -191,7 +192,7 @@ def fused_marlin_moe(
         size_m=M * topk,
         size_n=K,
         size_k=N,
-        is_full_k=is_k_full,
+        is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,

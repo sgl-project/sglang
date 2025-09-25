@@ -61,7 +61,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
+from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -267,7 +267,6 @@ def extend(reqs, model_runner):
         model_config=model_runner.model_config,
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
-        enable_custom_logit_processor=False,
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
@@ -301,11 +300,6 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             speculative_num_draft_tokens=None,
-            enable_two_batch_overlap=model_runner.server_args.enable_two_batch_overlap,
-            enable_deepep_moe=MoeA2ABackend(
-                model_runner.server_args.moe_a2a_backend
-            ).is_deepep(),
-            deepep_mode=DeepEPMode(model_runner.server_args.deepep_mode),
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
         )
@@ -516,6 +510,8 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
+    initialize_moe_config(server_args)
+
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)
