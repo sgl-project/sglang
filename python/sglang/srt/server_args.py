@@ -448,6 +448,8 @@ class ServerArgs:
     enable_flashinfer_mxfp4_moe: bool = False
 
     def __post_init__(self):
+        self.enable_pdmux = True
+
         # Check deprecated arguments
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
