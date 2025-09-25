@@ -653,6 +653,8 @@ class ServerArgs:
                 + list(range(272, self.cuda_graph_max_bs + 1, 16))
             )
 
+        capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
+
         return capture_bs
 
     def _handle_hpu_backends(self):
