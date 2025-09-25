@@ -91,6 +91,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
+    HybridLinearReqToTokenPool,
     SWAKVPool,
 )
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -1397,6 +1398,14 @@ class ModelRunner:
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     pre_alloc_size=pre_alloc_size,
+                )
+            elif getattr(self.model_config.hf_config, "layer_group_size", 0) > 1:
+                self.req_to_token_pool = HybridLinearReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                 )
             elif self.is_hybrid_gdn:
                 config = self.model_config.hf_config

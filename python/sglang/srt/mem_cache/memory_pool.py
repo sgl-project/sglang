@@ -101,6 +101,91 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size))
 
+class HybridLinearReqToTokenPool:
+    """A memory pool that maps a request to its token locations."""
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+    ):
+
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+
+        self.size = size
+        self.max_context_len = max_context_len
+        self.device = device
+        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.req_to_token = torch.zeros(
+                (size, max_context_len), dtype=torch.int32, device=device
+            )
+            self.req_to_constant = torch.full(
+                (size+1,), -1, dtype=torch.int32, device=device
+            )
+        self.rid_to_req = {}
+        self.req_to_rid = {}
+
+        self.free_slots = list(range(size))
+        self.linear_free_slots = list(range(size))
+
+    def write(self, indices, values):
+        self.req_to_token[indices] = values
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int, reqs) -> List[int]:
+        if need_size > len(self.free_slots):
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        req_to_constant = []
+        for req in reqs:
+            rid = req.rid
+            if rid in self.rid_to_req:
+                pre_index = self.rid_to_req[rid]
+            else:
+                pre_index = self.linear_free_slots.pop()
+                self.rid_to_req[rid] = pre_index
+                self.req_to_rid[pre_index] = rid
+            
+            req_to_constant.append(pre_index)
+        self.req_to_constant[select_index] = torch.tensor(req_to_constant, dtype=torch.int32, device=self.device)
+
+        return select_index
+
+    def free(self, free_index: Union[int, List[int]], free_constant_cache=True):
+        if isinstance(free_index, (int,)):
+            self.free_slots.append(free_index)
+            if free_constant_cache:
+                linear_free_index = self.req_to_constant[free_index].item()
+                self.linear_free_slots.append(linear_free_index)
+                rid = self.req_to_rid[linear_free_index]
+                self.rid_to_req.pop(rid)
+                self.req_to_rid.pop(linear_free_index)
+
+
+        else:
+            self.free_slots.extend(free_index)
+            if free_constant_cache:
+                linear_free_index = self.req_to_constant[free_index].tolist()
+                self.linear_free_slots.extend(linear_free_index)
+                for index in linear_free_index:
+                    rid = self.req_to_rid[index]
+                    self.rid_to_req.pop(rid)
+                    self.req_to_rid.pop(index)
+
+
+    def clear(self):
+        self.free_slots = list(range(self.size))
+        self.linear_free_slots = list(range(self.size))
+        self.rid_to_req = {}
+        self.req_to_constant.fill_(-1)
 
 class MambaPool:
     def __init__(
