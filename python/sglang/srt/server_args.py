@@ -340,6 +340,7 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
+    enable_backup_priority: bool = False
     # LMCache
     enable_lmcache: bool = False
 
@@ -2170,6 +2171,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--enable-backup-priority",
+            action="store_true",
+            default=ServerArgs.enable_backup_priority,
+            help="Enable priority calculation when node is write to host memory",
         )
         # LMCache
         parser.add_argument(

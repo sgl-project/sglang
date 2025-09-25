@@ -44,6 +44,7 @@ class HiRadixCache(RadixCache):
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
+        enable_backup_priority: bool = False
     ):
 
         if hicache_io_backend == "direct":
@@ -125,6 +126,7 @@ class HiRadixCache(RadixCache):
             page_size,
             disable=False,
             eviction_policy=eviction_policy,
+            enable_backup_priority=enable_backup_priority,
         )
 
     def reset(self):
@@ -161,16 +163,31 @@ class HiRadixCache(RadixCache):
         else:
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
+        
+    def calculate_node_value(self, node: TreeNode):
+        # 基于访问频率和最近访问时间
+        recency = time.monotonic() - node.last_access_time
+        frequency = node.hit_count
 
-    def write_backup(self, node: TreeNode, write_back=False):
+        # 价值公式：高频 + 近期 = 高价值
+        value = frequency / (recency + 1)  # +1 避免除零
+
+        # 大节点价值更高（节省更多内存）
+        value *= len(node.value) 
+
+        return value 
+
+    def write_backup(self, node: TreeNode, priority=None, write_back=False):
         host_indices = self.cache_controller.write(
             device_indices=node.value,
+            priority=priority,
             node_id=node.id,
         )
         if host_indices is None:
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
+                priority=priority,
                 node_id=node.id,
             )
         if host_indices is not None:
@@ -201,7 +218,10 @@ class HiRadixCache(RadixCache):
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
                 # write to host if the node is not backuped
-                self.write_backup(node)
+                priority = None
+                if self.enable_backup_priority:
+                    priority = self.calculate_node_value(node)
+                self.write_backup(node, priority)
 
     def writing_check(self, write_back=False):
         if write_back:
