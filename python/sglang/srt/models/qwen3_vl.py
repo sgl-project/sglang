@@ -266,6 +266,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size**2
         self.temporal_patch_size = vision_config.temporal_patch_size
+        # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
@@ -462,7 +463,6 @@ class Qwen3VLMoeVisionModel(nn.Module):
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
-        # max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
         x = x.unsqueeze(1)
 
         deepstack_feature_lists = []
@@ -618,9 +618,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("visual", prefix),
         )
 
-        print(getattr(config, "rms_norm_eps", 1e-6))
-        print("1111")
-
         self.model = language_model_cls(
             config=config,
             quant_config=quant_config,
@@ -647,7 +644,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
 
-        self.use_deepstack = {Modality.IMAGE: True}
+        self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
     def separate_deepstack_embeds(self, embedding):
         assert (
@@ -672,6 +669,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        print(f"{image_embeds.shape=}")
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -683,6 +681,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        print(f"{video_embeds.shape=}")
         return video_embeds
 
     def get_input_embeddings(self):

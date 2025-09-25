@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, MoeCausalLMOutputWithPast
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
@@ -49,7 +50,6 @@ from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.utils import add_prefix, logger
-from transformers import PreTrainedModel
 
 
 @dataclass
@@ -339,7 +339,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         use_postshuffle_norm=False,
     ) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size ** 2)
+        self.hidden_size = context_dim * (spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
         self.ln_q = RMSNorm(
             self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6

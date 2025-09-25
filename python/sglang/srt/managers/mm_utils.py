@@ -552,7 +552,7 @@ def embed_mm_inputs(
             modality_id = modality.name.lower()
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
-            assert embedder is not None, f"no embedding function found for {modality}"
+            assert embedder is not None, f"no embedding method found for {modality}"
             placeholder_tensor = torch.as_tensor(
                 [item.pad_value for item in items],
                 device=input_ids.device,
@@ -587,8 +587,6 @@ def embed_mm_inputs(
                 embedding, deepstack_embedding = (
                     multimodal_model.separate_deepstack_embeds(embedding)
                 )
-                # print(f"{embedding.shape=}")
-                # print(f"{deepstack_embedding.shape=}")
                 deepstack_embeddings += [deepstack_embedding]
             modalities += [modality]
             embeddings += [embedding]
@@ -607,13 +605,12 @@ def embed_mm_inputs(
 
     # deepstack embedding
     if use_deepstack:
-        num_deepstack_embeddings = (
-            len(multimodal_model.deepstack_visual_indexes) if use_deepstack else 0
-        )
+        num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
+
         deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
             inputs_embeds.shape[-1] * num_deepstack_embeddings,
         )
-
+        # a zero-filled embedding, with the same length of inputs_embeds, but different hidden_size
         input_deepstack_embeds = torch.zeros(
             deepstack_embedding_shape,
             device=inputs_embeds.device,

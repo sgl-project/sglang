@@ -427,14 +427,13 @@ class BaseMultimodalProcessor(ABC):
 
         # collect all data
         data_iterators = {}
-        print(f"{image_data=}")
         if multimodal_tokens.image_token and image_data:
             data_iterators[Modality.IMAGE] = iter(image_data)
         if multimodal_tokens.video_token and video_data:
             data_iterators[Modality.VIDEO] = iter(video_data)
         if multimodal_tokens.audio_token and audio_data:
             data_iterators[Modality.AUDIO] = iter(audio_data)
-        print(f"{data_iterators=}")
+
         # futures: the futures of loaded data
         # task_info: modality, raw_data, and other metadata of each data
         futures, task_info = self.submit_data_loading_tasks(

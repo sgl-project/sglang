@@ -234,7 +234,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         self.audio_start_token_id = getattr(hf_config, "audio_start_token_id", None)
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
-        print(f"{self.audio_token_id=}")
 
         self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
@@ -260,8 +259,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        # print(f"{request_obj=}")
-
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -293,6 +290,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                     audio_item.feature_attention_mask, dim=1
                 )
 
+        second_per_grid_ts = getattr(ret, "second_per_grid_ts", None) or getattr(
+            ret, "video_second_per_grid", None
+        )
+
         input_ids = input_ids.flatten()
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
@@ -307,7 +308,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             input_ids=input_ids.unsqueeze(0),
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
-            second_per_grid_ts=getattr(ret, "second_per_grid_ts", None),
+            second_per_grid_ts=second_per_grid_ts,
             use_audio_in_video=False,
             audio_seqlens=audio_feature_lengths,
             audio_token_id=getattr(self.hf_config, "audio_token_id", None),

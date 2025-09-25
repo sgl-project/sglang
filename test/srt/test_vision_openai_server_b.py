@@ -241,9 +241,31 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
         cls.base_url += "/v1"
 
 
+class TestQwen3OmniMoeServer(OmniOpenAITestMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.68",
+                "--cuda-graph-max-bs",
+                "4",
+                "--tp=2",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
 if __name__ == "__main__":
     del (
-        TestOpenAIOmniServerBase,
+        TestOpenAIMLLMServerBase,
         ImageOpenAITestMixin,
         VideoOpenAITestMixin,
         AudioOpenAITestMixin,
