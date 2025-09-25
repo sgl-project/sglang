@@ -347,10 +347,10 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 _is_cpu_amx_available
             ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["weight"])
-        elif _is_cuda:
+        elif _is_hip:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
             self.gemm_func = w8a8_per_channel_per_token_matmul
-        elif _is_hip:
+        elif _is_cuda:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
             self.gemm_func = int8_scaled_mm
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
