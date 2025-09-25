@@ -4,9 +4,8 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 
-from sglang.srt.layers.openvla import PrismaticProcessor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.openvla import OpenVLAForActionPrediction
+from sglang.srt.models.openvla import OpenVLAForActionPrediction, PrismaticProcessor
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,
