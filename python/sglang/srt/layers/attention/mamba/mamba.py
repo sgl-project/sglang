@@ -609,8 +609,8 @@ class MambaMixer2(torch.nn.Module):
         # norm usage
         hidden_states = self.norm(preallocated_ssm_out,
                                     gate)
-        else:
 
+            
 
         # 5. Final linear projection
         output[:], _ = self.out_proj(hidden_states)

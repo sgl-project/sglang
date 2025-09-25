@@ -1,30 +1,25 @@
 import enum
 import logging
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, List
+from typing import Any, Iterable, Optional, Set, Tuple, List
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.distributed import (
-    divide,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
-from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader, MambaMixer2
+from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -38,27 +33,18 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    sharded_weight_loader,
 )
 from sglang.srt.utils import (
-    LazyValue,
     add_prefix,
     is_cuda,
-    is_npu,
     make_layers,
-    set_weight_attrs,
 )
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
-_is_npu = is_npu()
-
-import triton
-import triton.language as tl
 
 
 class FalconH1MLP(nn.Module):
@@ -239,13 +225,13 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = GemmaRMSNorm(
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_ff_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -427,7 +413,7 @@ class FalconH1Model(nn.Module):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
 
-        self.final_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.infer_count = 0
 
     def forward(
