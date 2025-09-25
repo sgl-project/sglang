@@ -61,6 +61,8 @@ class ModelConfig:
         dtype: str = "auto",
         quantization: Optional[str] = None,
         modelopt_quant: Optional[Union[str, Dict]] = None,
+        modelopt_checkpoint_restore_path: Optional[str] = None,
+        modelopt_checkpoint_save_path: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
@@ -91,6 +93,8 @@ class ModelConfig:
             remote_instance_weight_loader_send_weights_group_ports
         )
         self.modelopt_quant = modelopt_quant
+        self.modelopt_checkpoint_restore_path = modelopt_checkpoint_restore_path
+        self.modelopt_checkpoint_save_path = modelopt_checkpoint_save_path
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
