@@ -101,27 +101,6 @@ async fn test_openai_router_creation() {
     assert!(!router.is_pd_mode());
 }
 
-/// Test health endpoints
-#[tokio::test]
-async fn test_openai_router_health() {
-    let router = OpenAIRouter::new(
-        "https://api.openai.com".to_string(),
-        None,
-        Arc::new(MemoryResponseStorage::new()),
-    )
-    .await
-    .unwrap();
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/health")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.health(req).await;
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
 /// Test server info endpoint
 #[tokio::test]
 async fn test_openai_router_server_info() {

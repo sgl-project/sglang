@@ -12,7 +12,7 @@ use crate::core::{
     Worker, WorkerFactory, WorkerRegistry, WorkerType,
 };
 use crate::policies::PolicyRegistry;
-use crate::protocols::worker_spec::WorkerConfigRequest;
+use crate::protocols::worker_spec::{FlushCacheResult, WorkerConfigRequest};
 use crate::server::AppContext;
 use futures::future;
 use once_cell::sync::Lazy;
@@ -980,6 +980,104 @@ impl WorkerManager {
             failure_threshold: config.failure_threshold,
             success_threshold: config.success_threshold,
         }
+    }
+    /// Flush cache on all workers
+    ///
+    /// Sends a POST request to /flush_cache endpoint on all HTTP workers.
+    /// Returns detailed results showing which workers succeeded and which failed.
+    pub async fn flush_cache_all(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+    ) -> Result<FlushCacheResult, String> {
+        warn!("Flushing cache for ALL workers - this may impact performance temporarily");
+
+        let workers = worker_registry.get_all();
+
+        let http_workers: Vec<_> = workers
+            .iter()
+            .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
+            .collect();
+
+        if http_workers.is_empty() {
+            return Ok(FlushCacheResult {
+                successful: vec![],
+                failed: vec![],
+                total_workers: workers.len(),
+                http_workers: 0,
+                message: "No HTTP workers available for cache flush".to_string(),
+            });
+        }
+
+        info!(
+            "Flushing cache on {} HTTP workers (out of {} total workers)",
+            http_workers.len(),
+            workers.len()
+        );
+
+        let mut tasks = Vec::new();
+        for worker in &http_workers {
+            let url = worker.url().to_string();
+            let flush_url = format!("{}/flush_cache", url);
+            let mut request = client.post(&flush_url);
+
+            if let Some(api_key) = worker.api_key() {
+                request = request.header("Authorization", format!("Bearer {}", api_key));
+            }
+
+            let worker_url = url.clone();
+            tasks.push(async move {
+                let result = request.send().await;
+                (worker_url, result)
+            });
+        }
+
+        let results = futures::future::join_all(tasks).await;
+
+        let mut successful = Vec::new();
+        let mut failed = Vec::new();
+
+        for (url, result) in results {
+            match result {
+                Ok(response) if response.status().is_success() => {
+                    debug!("Successfully flushed cache on worker: {}", url);
+                    successful.push(url);
+                }
+                Ok(response) => {
+                    let error = format!("HTTP {}", response.status());
+                    warn!("Failed to flush cache on worker {}: {}", url, error);
+                    failed.push((url, error));
+                }
+                Err(e) => {
+                    let error = e.to_string();
+                    error!("Failed to connect to worker {}: {}", url, error);
+                    failed.push((url, error));
+                }
+            }
+        }
+
+        let message = if failed.is_empty() {
+            format!(
+                "Successfully flushed cache on all {} HTTP workers",
+                successful.len()
+            )
+        } else {
+            format!(
+                "Cache flush completed: {} succeeded, {} failed (out of {} HTTP workers)",
+                successful.len(),
+                failed.len(),
+                http_workers.len()
+            )
+        };
+
+        info!("{}", message);
+
+        Ok(FlushCacheResult {
+            successful,
+            failed,
+            total_workers: workers.len(),
+            http_workers: http_workers.len(),
+            message,
+        })
     }
 }
 

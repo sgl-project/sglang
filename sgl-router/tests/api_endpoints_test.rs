@@ -239,13 +239,6 @@ mod health_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // The health endpoint returns plain text, not JSON
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_str = String::from_utf8_lossy(&body);
-        assert!(body_str.contains("All servers healthy"));
-
         ctx.shutdown().await;
     }
 

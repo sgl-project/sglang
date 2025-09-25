@@ -103,10 +103,11 @@ impl Router {
 
     fn select_first_worker(&self) -> Result<String, String> {
         let workers = self.worker_registry.get_all();
-        if workers.is_empty() {
+        let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
+        if healthy_workers.is_empty() {
             Err("No workers are available".to_string())
         } else {
-            Ok(workers[0].url().to_string())
+            Ok(healthy_workers[0].url().to_string())
         }
     }
 
@@ -828,25 +829,6 @@ impl RouterTrait for Router {
         self
     }
 
-    async fn health(&self, _req: Request<Body>) -> Response {
-        let workers = self.worker_registry.get_all();
-        let unhealthy_servers: Vec<_> = workers
-            .iter()
-            .filter(|w| !w.is_healthy())
-            .map(|w| w.url().to_string())
-            .collect();
-
-        if unhealthy_servers.is_empty() {
-            (StatusCode::OK, "All servers healthy").into_response()
-        } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Unhealthy servers: {:?}", unhealthy_servers),
-            )
-                .into_response()
-        }
-    }
-
     async fn health_generate(&self, req: Request<Body>) -> Response {
         self.proxy_get_request(req, "health_generate").await
     }
@@ -971,68 +953,6 @@ impl RouterTrait for Router {
         }
     }
 
-    async fn flush_cache(&self) -> Response {
-        // Get all workers
-        let workers = self.worker_registry.get_all();
-        let worker_urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
-
-        // Send requests to all workers concurrently without headers
-        let mut tasks = Vec::new();
-        for worker_url in &worker_urls {
-            // Get the worker's API key if available
-            let api_key = self
-                .worker_registry
-                .get_by_url(worker_url)
-                .and_then(|w| w.api_key().clone());
-
-            let worker_url = if self.dp_aware {
-                // Need to extract the URL from "http://host:port@dp_rank"
-                let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
-                    Ok(tup) => tup,
-                    Err(e) => {
-                        error!("Failed to extract dp_rank: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to extract dp_rank: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-                worker_url_prefix
-            } else {
-                worker_url
-            };
-            let mut request_builder = self.client.post(format!("{}/flush_cache", worker_url));
-
-            if let Some(key) = api_key {
-                request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", key));
-            }
-
-            tasks.push(request_builder.send());
-        }
-
-        // Wait for all responses
-        let results = futures_util::future::join_all(tasks).await;
-
-        // Check if all succeeded
-        let all_success = results.iter().all(|r| {
-            r.as_ref()
-                .map(|res| res.status().is_success())
-                .unwrap_or(false)
-        });
-
-        if all_success {
-            (StatusCode::OK, "Cache flushed on all servers").into_response()
-        } else {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Cache flush failed on one or more servers",
-            )
-                .into_response()
-        }
-    }
-
     async fn get_worker_loads(&self) -> Response {
         let urls_with_key = self.worker_registry.get_all_urls_with_api_key();
         let mut loads = Vec::new();
@@ -1054,32 +974,6 @@ impl RouterTrait for Router {
 
     fn router_type(&self) -> &'static str {
         "regular"
-    }
-
-    fn readiness(&self) -> Response {
-        // Regular router is ready if it has at least one healthy worker
-        let workers = self.worker_registry.get_all();
-        let healthy_count = workers.iter().filter(|w| w.is_healthy()).count();
-        let total_workers = workers.len();
-
-        if healthy_count > 0 {
-            Json(serde_json::json!({
-                "status": "ready",
-                "healthy_workers": healthy_count,
-                "total_workers": total_workers
-            }))
-            .into_response()
-        } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "status": "not_ready",
-                    "reason": "no healthy workers available",
-                    "total_workers": total_workers
-                })),
-            )
-                .into_response()
-        }
     }
 }
 
@@ -1119,6 +1013,13 @@ mod tests {
         }
     }
 
+    fn create_test_unhealthy_router() -> Router {
+        let router = create_test_regular_router();
+        let workers = router.worker_registry.get_all();
+        workers[0].set_healthy(false);
+        router
+    }
+
     #[test]
     fn test_router_get_worker_urls_regular() {
         let router = create_test_regular_router();
@@ -1139,5 +1040,17 @@ mod tests {
         let url = result.unwrap();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_select_first_worker_with_unhealthy_worker() {
+        let router = create_test_unhealthy_router();
+        let result = router.select_first_worker();
+
+        assert!(result.is_ok());
+        let url = result.unwrap();
+
+        let worker = router.worker_registry.get_by_url(&url).unwrap();
+        assert!(worker.is_healthy());
     }
 }
