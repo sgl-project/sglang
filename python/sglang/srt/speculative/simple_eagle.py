@@ -12,24 +12,23 @@ from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 from sglang.srt.layers.dp_attention import disable_dp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch, get_last_loc
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.eagle_utils import assign_draft_cache_locs
-from sglang.srt.managers.schedule_batch import get_last_loc
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_utils import (
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
+    align_evict_mask_to_page_size,
     assign_req_to_token_pool,
     create_draft_kv_indices,
-    align_evict_mask_to_page_size,
 )
+from sglang.srt.speculative.eagle_worker import get_last_loc_large_page_size_top_k_1
 from sglang.srt.speculative.simple_eagle_cuda_graph_runner import (
     SimpleEAGLECudaGraphRunner,
 )
@@ -41,7 +40,7 @@ from sglang.srt.utils import (
     is_cuda,
     next_power_of_2,
 )
-from sglang.srt.speculative.eagle_worker import get_last_loc_large_page_size_top_k_1
+
 if is_cuda():
     from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
@@ -54,6 +53,7 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with disable_dp_size(), patch_tensor_parallel_group(tp_group):
         yield
+
 
 class SimpleEagleWorker(TpModelWorker):
 
@@ -277,9 +277,11 @@ class SimpleEagleWorker(TpModelWorker):
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
                 batch.seq_lens,
-                2)
+                2,
+            )
             batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
-                seq_lens, end_offset, last_loc, num_seqs * 2)
+                seq_lens, end_offset, last_loc, num_seqs * 2
+            )
 
         assign_req_to_token_pool[(num_seqs,)](
             batch.req_pool_indices,
@@ -447,7 +449,7 @@ class SimpleEagleWorker(TpModelWorker):
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
-                    accept_index[i, j + 1:] = -1
+                    accept_index[i, j + 1 :] = -1
                     break
                 else:
                     new_accept_index_.append(idx)

@@ -146,7 +146,7 @@ class EagleDraftInput:
             self.verified_id,
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
-        
+
     def prepare_extend_after_decode_for_simple_eagle(
         self,
         batch: ScheduleBatch,
@@ -752,6 +752,7 @@ class EagleVerifyInput:
                 accepted_indices=accept_index,
             )
 
+
 @triton.jit
 def create_extend_spec_info(
     verified_id,
@@ -1230,6 +1231,7 @@ def _generate_simulated_accept_index(
     accept_length.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
+
 
 @triton.jit
 def create_draft_kv_indices(

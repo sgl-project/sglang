@@ -7,6 +7,7 @@ class SpeculativeAlgorithm(IntEnum):
     EAGLE3 = auto()
     STANDALONE = auto()
     LOOKAHEAD = auto()
+    SIMPLE_EAGLE = auto()
 
     def is_none(self):
         return self == SpeculativeAlgorithm.NONE
@@ -17,7 +18,7 @@ class SpeculativeAlgorithm(IntEnum):
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.SIMPLE_EAGLE,
         ]
-    
+
     def is_simple_eagle(self):
         return self == SpeculativeAlgorithm.SIMPLE_EAGLE
 
