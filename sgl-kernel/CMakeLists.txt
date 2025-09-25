@@ -344,8 +344,11 @@ target_include_directories(common_ops_sm90_build PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
-# Set output name to common_ops.so (not common_ops_sm90.so)
-set_target_properties(common_ops_sm90_build PROPERTIES OUTPUT_NAME "common_ops")
+# Set output name and separate build directory to avoid conflicts
+set_target_properties(common_ops_sm90_build PROPERTIES
+    OUTPUT_NAME "common_ops"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
+)
 
 # Build SM100+ library with precise math (same namespace, different directory)
 Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
@@ -362,8 +365,11 @@ target_include_directories(common_ops_sm100_build PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
-# Set output name to common_ops.so (not common_ops_sm100.so)
-set_target_properties(common_ops_sm100_build PROPERTIES OUTPUT_NAME "common_ops")
+# Set output name and separate build directory to avoid conflicts
+set_target_properties(common_ops_sm100_build PROPERTIES
+    OUTPUT_NAME "common_ops"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
+)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
@@ -405,6 +411,8 @@ target_compile_definitions(common_ops_sm100_build PRIVATE
 )
 
 # Install to different subdirectories
+# CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
+# and install them to the specified destinations
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
 install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
