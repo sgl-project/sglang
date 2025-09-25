@@ -163,7 +163,6 @@ class HiCacheFile(HiCacheStorage):
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
         self.file_path = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", file_path)
-        
         tp_rank, tp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
             storage_config.tp_size,
