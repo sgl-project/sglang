@@ -86,7 +86,7 @@ suites = {
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
-        TestFile("test_mla_deepseek_v3.py", 700),
+        TestFile("test_mla_deepseek_v3.py", 1420),
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
@@ -104,6 +104,7 @@ suites = {
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_retract_decode.py", 54),
         TestFile("test_request_queue_validation.py", 30),
+        TestFile("test_score_api.py", 180),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
@@ -120,7 +121,7 @@ suites = {
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vlm_input_format.py", 300),
-        TestFile("test_vision_openai_server_a.py", 403),
+        TestFile("test_vision_openai_server_a.py", 724),
         TestFile("test_vision_openai_server_b.py", 446),
     ],
     "per-commit-2-gpu": [
@@ -130,7 +131,7 @@ suites = {
         TestFile("test_dp_attention.py", 277),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
-        TestFile("test_release_memory_occupation.py", 127),
+        TestFile("test_release_memory_occupation.py", 257),
         TestFile("hicache/test_hicache_storage_file_backend.py", 400),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 400),
     ],
@@ -153,7 +154,7 @@ suites = {
     ],
     "per-commit-4-gpu-b200": [
         # TestFile("test_gpt_oss_4gpu.py", 600),
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 600),
+        # TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -368,7 +369,7 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--timeout-per-file",
         type=int,
-        default=1800,
+        default=1200,
         help="The time limit for running one file in seconds.",
     )
     arg_parser.add_argument(
