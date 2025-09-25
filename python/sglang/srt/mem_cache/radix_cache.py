@@ -322,7 +322,7 @@ class RadixCache(BasePrefixCache):
         all_token_len = len(token_ids)
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : all_token_len
+            req.req_pool_idx, :all_token_len
         ]
 
         if self.page_size != 1:
@@ -336,8 +336,10 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
             if self.is_eagle:
                 self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
-        
-        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+
+        page_aligned_token_len = (
+            page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        )
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
@@ -347,9 +349,9 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.last_matched_prefix_len : new_prefix_len]
         )
-        
+
         req.last_matched_prefix_len = new_prefix_len
-        
+
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
@@ -364,7 +366,7 @@ class RadixCache(BasePrefixCache):
         # The actual kv len for EAGLE is len(token_ids), since EAGLE uses bigram key
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : all_token_len
+            req.req_pool_idx, :all_token_len
         ]
 
         if self.page_size != 1:
@@ -375,9 +377,11 @@ class RadixCache(BasePrefixCache):
         else:
             page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
-        
+
         # For EAGLE, the page_aligned_len is for the bigram key, the normal key len should +1
-        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        page_aligned_token_len = (
+            page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        )
         page_aligned_token_ids = token_ids[:page_aligned_token_len]
 
         # Radix Cache takes one ref in memory pool
@@ -401,7 +405,7 @@ class RadixCache(BasePrefixCache):
 
         # The last_matched_prefix_len is not always equal to len(req.prefix_indices)
         # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
-        # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak. 
+        # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
         # So we introduce this `last_matched_prefix_len` field to make sure the partial part can be freed correctly.
         req.last_matched_prefix_len = len(new_indices)
 
