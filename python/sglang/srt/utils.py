@@ -1631,6 +1631,14 @@ def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
 
 
+@lru_cache(maxsize=1)
+def get_distributed_backend() -> str:
+    device = get_device().lower()
+
+    backend_map = {"cuda": "nccl", "xpu": "ccl", "hpu": "hccl", "cpu": "gloo"}
+    return backend_map[device]
+
+
 @lru_cache(maxsize=8)
 def get_device(device_id: Optional[int] = None) -> str:
     if is_cpu():
