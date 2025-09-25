@@ -530,9 +530,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             if save_kv_cache:
                 if k_rope is not None:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, cache_loc, k, k_rope
+                        layer, cache_loc, k, k_rope,
+                        k_scale=layer.k_scale,
                     )
                 else:
+                    raise NotImplementedError("should not go here")
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -560,6 +562,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
             )
+
+            assert k.dtype == torch.bfloat16
+            if k_buf.dtype != torch.bfloat16:
+                k_buf = (k_buf.to(torch.float32) * layer.k_scale).to(torch.bfloat16)
+
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -589,6 +596,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        raise NotImplementedError("should not go here")
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
 

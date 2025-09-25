@@ -388,6 +388,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         cos_sin_cache: torch.Tensor,
         is_neox: bool,
+        quant_scale_kv: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize and apply RoPE for FP8 attention path.
 
@@ -452,7 +453,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             k_nope_out=k_nope_out,
             # Quantization scales (set to 1.0 for no additional scaling)
             quant_scale_q=1.0,
-            quant_scale_kv=1.0,
+            quant_scale_kv=quant_scale_kv,
         )
 
         return q_out, k_nope_out, k_rope_out
@@ -486,6 +487,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch,
                 cos_sin_cache,
                 is_neox,
+                quant_scale_kv=1.0 / getattr(layer, "k_scale_float", 1.0),
             )
             merge_query = False
 
@@ -538,7 +540,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             else 1.0
         )
 
+        v_scale = layer.v_scale_float
+        assert k_scale == v_scale, f"{k_scale=} {v_scale=}"
+
         bmm1_scale = q_scale * k_scale * layer.scaling
+        bmm2_scale = v_scale
 
         # Call TRT-LLM kernel
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -552,6 +558,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             max_seq_len=metadata.max_seq_len,
             bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
         )
 
         # Reshape output directly without slicing
