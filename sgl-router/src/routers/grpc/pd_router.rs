@@ -8,7 +8,7 @@ use crate::grpc::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::reasoning_parser::ParserFactory;
-use crate::routers::{RouterTrait, WorkerManagement};
+use crate::routers::RouterTrait;
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ParserRegistry;
 use async_trait::async_trait;
@@ -252,12 +252,13 @@ impl RouterTrait for GrpcPDRouter {
         self
     }
 
-    async fn health(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        // TODO: Implement actual generation test for gRPC PD mode
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Health generate not yet implemented for gRPC PD",
+        )
+            .into_response()
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
@@ -308,7 +309,12 @@ impl RouterTrait for GrpcPDRouter {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn get_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    async fn get_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+        _params: &crate::protocols::spec::ResponsesGetParams,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
@@ -334,58 +340,7 @@ impl RouterTrait for GrpcPDRouter {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
-    async fn flush_cache(&self) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
-    async fn get_worker_loads(&self) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
     fn router_type(&self) -> &'static str {
         "grpc_pd"
-    }
-
-    fn readiness(&self) -> Response {
-        (StatusCode::SERVICE_UNAVAILABLE).into_response()
-    }
-}
-
-#[async_trait]
-impl WorkerManagement for GrpcPDRouter {
-    async fn add_worker(
-        &self,
-        _worker_url: &str,
-        _api_key: &Option<String>,
-    ) -> Result<String, String> {
-        Err("Not implemented".to_string())
-    }
-
-    fn remove_worker(&self, _worker_url: &str) {}
-
-    fn get_worker_urls(&self) -> Vec<String> {
-        let mut urls = Vec::new();
-
-        // Get gRPC prefill worker URLs only
-        let prefill_workers = self.worker_registry.get_workers_filtered(
-            None,
-            Some(WorkerType::Prefill {
-                bootstrap_port: None,
-            }),
-            Some(crate::core::ConnectionMode::Grpc { port: None }),
-            false,
-        );
-        urls.extend(prefill_workers.iter().map(|w| w.url().to_string()));
-
-        // Get gRPC decode worker URLs only
-        let decode_workers = self.worker_registry.get_workers_filtered(
-            None,
-            Some(WorkerType::Decode),
-            Some(crate::core::ConnectionMode::Grpc { port: None }),
-            false,
-        );
-        urls.extend(decode_workers.iter().map(|w| w.url().to_string()));
-
-        urls
     }
 }
