@@ -1,7 +1,9 @@
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{WorkerManager, WorkerRegistry, WorkerType},
-    data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
+    data_connector::{
+        MemoryResponseStorage, NoOpResponseStorage, OracleResponseStorage, SharedResponseStorage,
+    },
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
     middleware::{self, AuthConfig, QueuedRequest, TokenBucket},
@@ -92,6 +94,17 @@ impl AppContext {
         let response_storage: SharedResponseStorage = match router_config.history_backend {
             HistoryBackend::Memory => Arc::new(MemoryResponseStorage::new()),
             HistoryBackend::None => Arc::new(NoOpResponseStorage::new()),
+            HistoryBackend::Oracle => {
+                let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
+                    "oracle configuration is required when history_backend=oracle".to_string()
+                })?;
+
+                let storage = OracleResponseStorage::new(oracle_cfg).map_err(|err| {
+                    format!("failed to initialize Oracle response storage: {err}")
+                })?;
+
+                Arc::new(storage)
+            }
         };
 
         Ok(Self {
