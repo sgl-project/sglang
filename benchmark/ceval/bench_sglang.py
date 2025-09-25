@@ -132,7 +132,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, default="ceval-exam")
+    parser.add_argument("--data-path", type=str, default="ceval/ceval-exam")
     parser.add_argument("--num-questions", type=int, default=None)
     args = add_common_sglang_args_and_parse(parser)
     main(args)

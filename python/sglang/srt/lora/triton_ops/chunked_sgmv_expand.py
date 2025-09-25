@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.utils import LoRABatchInfo
-from sglang.utils import cached_triton_kernel
+from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"]))
