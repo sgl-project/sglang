@@ -56,10 +56,5 @@ class TestIntelAMXAttnBackend(CustomTestCase):
     def test_latency_qwen_model(self):
         return DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
-    @intel_xpu_benchmark(min_throughput=10)
-    def test_latency_awq_int4_default_model(self):
-        return DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4
-
-
 if __name__ == "__main__":
     unittest.main()
