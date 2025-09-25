@@ -45,12 +45,12 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -702,7 +702,7 @@ class BailingMoEModel(nn.Module):
                 self.embed_dim,
                 quant_config=quant_config,
                 prefix=add_prefix("word_embeddings", prefix),
-                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+                enable_tp=not is_dp_attention_enabled(),
             )
         else:
             self.word_embeddings = PPMissingLayer()

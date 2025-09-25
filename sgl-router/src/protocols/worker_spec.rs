@@ -11,6 +11,10 @@ pub struct WorkerConfigRequest {
     /// Worker URL (required)
     pub url: String,
 
+    /// Worker API key (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
     /// Model ID (optional, will query from server if not provided)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
@@ -195,4 +199,44 @@ pub struct ServerInfo {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template: Option<String>,
+}
+
+/// Result from flush cache operations across workers
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FlushCacheResult {
+    /// URLs of workers where cache flush succeeded
+    pub successful: Vec<String>,
+    /// URLs and error messages for workers where cache flush failed
+    pub failed: Vec<(String, String)>,
+    /// Total number of workers attempted
+    pub total_workers: usize,
+    /// Number of HTTP workers (gRPC workers don't support flush cache)
+    pub http_workers: usize,
+    /// Human-readable summary message
+    pub message: String,
+}
+
+/// Result from getting worker loads
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkerLoadsResult {
+    /// Worker URL and load pairs
+    pub loads: Vec<WorkerLoadInfo>,
+    /// Total number of workers
+    pub total_workers: usize,
+    /// Number of workers with successful load fetches
+    pub successful: usize,
+    /// Number of workers with failed load fetches
+    pub failed: usize,
+}
+
+/// Individual worker load information
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkerLoadInfo {
+    /// Worker URL
+    pub worker: String,
+    /// Worker type (regular, prefill, decode)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_type: Option<String>,
+    /// Current load (-1 indicates failure to fetch)
+    pub load: isize,
 }

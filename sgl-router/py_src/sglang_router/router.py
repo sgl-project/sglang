@@ -53,7 +53,7 @@ class Router:
             Useful when the dp aware scheduling strategy is enabled.
             Default: None
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
-        log_level: Logging level. Options: 'debug', 'info', 'warning', 'error', 'critical'.
+        log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
             automatically discover worker pods based on the selector. Default: False
         selector: Dictionary mapping of label keys to values for Kubernetes pod selection.

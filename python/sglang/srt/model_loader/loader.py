@@ -206,7 +206,10 @@ def _initialize_model(
     if _is_npu:
         packed_modules_mapping.update(
             {
-                "visual": {"qkv_proj": ["qkv"]},
+                "visual": {
+                    "qkv_proj": ["qkv"],
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                },
                 "vision_model": {
                     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
                     "proj": ["out_proj"],

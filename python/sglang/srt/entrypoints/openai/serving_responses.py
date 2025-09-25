@@ -245,6 +245,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
+                        extra_key=self._compute_extra_key(request),
                         background=request.background,
                     )
 
@@ -1250,6 +1251,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 sampling_params=sampling_params,
                 stream=adapted_request.stream,
                 rid=request_id,
+                extra_key=adapted_request.extra_key,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,
                 top_logprobs_num=adapted_request.top_logprobs_num,
