@@ -1,7 +1,5 @@
 import logging
 
-import torch
-
 from sglang.srt.utils import get_bool_env_var, get_device_sm, is_blackwell
 
 logger = logging.getLogger(__name__)
@@ -15,7 +13,6 @@ def _compute_enable_deep_gemm():
     try:
         import deep_gemm
     except ImportError:
-        logger.warning("Failed to import deep_gemm, disable ENABLE_JIT_DEEPGEMM.")
         return False
 
     return get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true")
