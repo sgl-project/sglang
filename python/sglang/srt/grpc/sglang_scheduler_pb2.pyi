@@ -161,25 +161,23 @@ class GenerateResponse(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., chunk: _Optional[_Union[GenerateStreamChunk, _Mapping]] = ..., complete: _Optional[_Union[GenerateComplete, _Mapping]] = ..., error: _Optional[_Union[GenerateError, _Mapping]] = ...) -> None: ...
 
 class GenerateStreamChunk(_message.Message):
-    __slots__ = ("token_id", "text", "prompt_tokens", "completion_tokens", "cached_tokens", "logprobs", "hidden_states")
+    __slots__ = ("token_id", "prompt_tokens", "completion_tokens", "cached_tokens", "logprobs", "hidden_states")
     TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
-    TEXT_FIELD_NUMBER: _ClassVar[int]
     PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
     COMPLETION_TOKENS_FIELD_NUMBER: _ClassVar[int]
     CACHED_TOKENS_FIELD_NUMBER: _ClassVar[int]
     LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     HIDDEN_STATES_FIELD_NUMBER: _ClassVar[int]
     token_id: int
-    text: str
     prompt_tokens: int
     completion_tokens: int
     cached_tokens: int
     logprobs: LogProbs
     hidden_states: _containers.RepeatedScalarFieldContainer[float]
-    def __init__(self, token_id: _Optional[int] = ..., text: _Optional[str] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., logprobs: _Optional[_Union[LogProbs, _Mapping]] = ..., hidden_states: _Optional[_Iterable[float]] = ...) -> None: ...
+    def __init__(self, token_id: _Optional[int] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., logprobs: _Optional[_Union[LogProbs, _Mapping]] = ..., hidden_states: _Optional[_Iterable[float]] = ...) -> None: ...
 
 class GenerateComplete(_message.Message):
-    __slots__ = ("output_ids", "output_text", "finish_reason", "all_logprobs", "all_hidden_states")
+    __slots__ = ("output_ids", "finish_reason", "prompt_tokens", "completion_tokens", "cached_tokens", "all_logprobs", "all_hidden_states")
     class FinishReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         STOP: _ClassVar[GenerateComplete.FinishReason]
@@ -193,16 +191,20 @@ class GenerateComplete(_message.Message):
     STOP_STR: GenerateComplete.FinishReason
     ABORT: GenerateComplete.FinishReason
     OUTPUT_IDS_FIELD_NUMBER: _ClassVar[int]
-    OUTPUT_TEXT_FIELD_NUMBER: _ClassVar[int]
     FINISH_REASON_FIELD_NUMBER: _ClassVar[int]
+    PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    COMPLETION_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    CACHED_TOKENS_FIELD_NUMBER: _ClassVar[int]
     ALL_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     ALL_HIDDEN_STATES_FIELD_NUMBER: _ClassVar[int]
     output_ids: _containers.RepeatedScalarFieldContainer[int]
-    output_text: str
     finish_reason: GenerateComplete.FinishReason
+    prompt_tokens: int
+    completion_tokens: int
+    cached_tokens: int
     all_logprobs: _containers.RepeatedCompositeFieldContainer[LogProbs]
     all_hidden_states: _containers.RepeatedCompositeFieldContainer[HiddenStates]
-    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., output_text: _Optional[str] = ..., finish_reason: _Optional[_Union[GenerateComplete.FinishReason, str]] = ..., all_logprobs: _Optional[_Iterable[_Union[LogProbs, _Mapping]]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ...) -> None: ...
+    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., finish_reason: _Optional[_Union[GenerateComplete.FinishReason, str]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., all_logprobs: _Optional[_Iterable[_Union[LogProbs, _Mapping]]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ...) -> None: ...
 
 class GenerateError(_message.Message):
     __slots__ = ("message", "http_status_code", "details")
