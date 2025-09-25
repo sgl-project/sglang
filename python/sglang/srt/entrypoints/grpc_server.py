@@ -482,7 +482,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             chunk=sglang_scheduler_pb2.GenerateStreamChunk(
                 token_id=output["token_ids"][-1] if output.get("token_ids") else 0,
                 prompt_tokens=meta_info.get("prompt_tokens", 0),
-                completion_tokens=meta_info.get("completion_tokens", len(output.get("token_ids", []))),
+                completion_tokens=meta_info.get("completion_tokens", 0),
                 cached_tokens=0,
             ),
         )
@@ -506,7 +506,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 output_ids=output.get("token_ids", []),
                 finish_reason=finish_reason,
                 prompt_tokens=meta_info.get("prompt_tokens", 0),
-                completion_tokens=meta_info.get("completion_tokens", len(output.get("token_ids", []))),
+                completion_tokens=meta_info.get(
+                    "completion_tokens", len(output.get("token_ids", []))
+                ),
                 cached_tokens=meta_info.get("cached_tokens", 0),
             ),
         )
