@@ -476,7 +476,7 @@ class LogitsProcessor(nn.Module):
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )       
+                )
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

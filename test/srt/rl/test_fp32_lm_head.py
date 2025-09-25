@@ -37,10 +37,19 @@ class TestLMHeadFP32(unittest.TestCase):
         cfg = SimpleNamespace(vocab_size=vocab_size, final_logit_softcapping=None)
         return LogitsProcessor(cfg, skip_all_gather=True, logit_scale=None)
 
-    def _run_case(self, hidden_state_dtype, enable_fp32, weights_dtype):
+    def _run_case(
+        self,
+        hidden_state_dtype,
+        enable_fp32,
+        weights_dtype,
+        expected_a_dtype,
+        expected_b_dtype,
+    ):
         device = "cuda"
         BATCH_SIZE, HIDDEN_SIZE, VOCAB_SIZE = 2, 64, 128
-        hidden_state = torch.randn(BATCH_SIZE, HIDDEN_SIZE, dtype=hidden_state_dtype, device=device)
+        hidden_state = torch.randn(
+            BATCH_SIZE, HIDDEN_SIZE, dtype=hidden_state_dtype, device=device
+        )
         head = LMHeadStub(VOCAB_SIZE, HIDDEN_SIZE, dtype=weights_dtype, device=device)
         meta = DummyMeta()
         logprocessor = self._make_logprocessor(VOCAB_SIZE, enable_fp32)
@@ -48,7 +57,12 @@ class TestLMHeadFP32(unittest.TestCase):
         original_matmul = torch.matmul
         original_linear = F.linear
 
-        state = {"called": False, "operation": None, "a": None, "b": None}
+        state = {
+            "called": False,  # Whether a matmul/linear call has been intercepted yet
+            "operation": None,  # Which operation was captured ("matmul" or "linear")
+            "a": None,  # The dtype of the first input tensor to the operation
+            "b": None,  # The dtype of the second input tensor to the operation
+        }
 
         def probe_matmul(a, b, *args, **kw):
             if not state["called"]:
@@ -64,32 +78,32 @@ class TestLMHeadFP32(unittest.TestCase):
             "torch.nn.functional.linear", new=probe_linear
         ):
             logits = logprocessor._get_logits(hidden_state, head, meta)
-
-        self.assertEqual(logits.dtype, torch.float32)
+        if enable_fp32:
+            self.assertEqual(logits.dtype, torch.float32)
+        else:
+            self.assertEqual(logits.dtype, weights_dtype)
         self.assertEqual(hidden_state.dtype, hidden_state_dtype)
         self.assertTrue(state["called"], "no call lm head matlmul/linear")
-
-        return state["a"], state["b"]
+        self.assertEqual(state["a"], expected_a_dtype)
+        self.assertEqual(state["b"], expected_b_dtype)
 
     def test_flag_true_fp16_activations(self):
-        a, b = self._run_case(torch.float16, True, torch.float16)
-        self.assertEqual(a, torch.float32)
-        self.assertEqual(b, torch.float32)
+        self._run_case(torch.float16, True, torch.float16, torch.float32, torch.float32)
 
     def test_flag_true_bf16_activations(self):
-        a, b = self._run_case(torch.bfloat16, True, torch.bfloat16)
-        self.assertEqual(a, torch.float32)
-        self.assertEqual(b, torch.float32)
+        self._run_case(
+            torch.bfloat16, True, torch.bfloat16, torch.float32, torch.float32
+        )
 
     def test_flag_false_fp16_path(self):
-        a, b = self._run_case(torch.float16, False, torch.float16)
-        self.assertEqual(a, torch.float16)
-        self.assertEqual(b, torch.float16)
+        self._run_case(
+            torch.float16, False, torch.float16, torch.float16, torch.float16
+        )
 
     def test_flag_false_bf16_path(self):
-        a, b = self._run_case(torch.bfloat16, False, torch.bfloat16)
-        self.assertEqual(a, torch.bfloat16)
-        self.assertEqual(b, torch.bfloat16)
+        self._run_case(
+            torch.bfloat16, False, torch.bfloat16, torch.bfloat16, torch.bfloat16
+        )
 
 
 if __name__ == "__main__":
