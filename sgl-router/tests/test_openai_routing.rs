@@ -849,12 +849,14 @@ async fn test_openai_router_models_auth_forwarding() {
 
 #[test]
 fn oracle_config_validation_requires_config_when_enabled() {
-    let mut config = RouterConfig::default();
-    config.mode = RoutingMode::OpenAI {
-        worker_urls: vec!["https://api.openai.com".to_string()],
+    let config = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["https://api.openai.com".to_string()],
+        },
+        history_backend: HistoryBackend::Oracle,
+        oracle: None,
+        ..Default::default()
     };
-    config.history_backend = HistoryBackend::Oracle;
-    config.oracle = None;
 
     let err =
         ConfigValidator::validate(&config).expect_err("config should fail without oracle details");
@@ -869,40 +871,44 @@ fn oracle_config_validation_requires_config_when_enabled() {
 
 #[test]
 fn oracle_config_validation_accepts_dsn_only() {
-    let mut config = RouterConfig::default();
-    config.mode = RoutingMode::OpenAI {
-        worker_urls: vec!["https://api.openai.com".to_string()],
+    let config = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["https://api.openai.com".to_string()],
+        },
+        history_backend: HistoryBackend::Oracle,
+        oracle: Some(OracleConfig {
+            wallet_path: None,
+            connect_descriptor: "tcps://db.example.com:1522/service".to_string(),
+            username: "scott".to_string(),
+            password: "tiger".to_string(),
+            pool_min: 1,
+            pool_max: 4,
+            pool_timeout_secs: 30,
+        }),
+        ..Default::default()
     };
-    config.history_backend = HistoryBackend::Oracle;
-    config.oracle = Some(OracleConfig {
-        wallet_path: None,
-        connect_descriptor: "tcps://db.example.com:1522/service".to_string(),
-        username: "scott".to_string(),
-        password: "tiger".to_string(),
-        pool_min: 1,
-        pool_max: 4,
-        pool_timeout_secs: 30,
-    });
 
     ConfigValidator::validate(&config).expect("dsn-based config should validate");
 }
 
 #[test]
 fn oracle_config_validation_accepts_wallet_alias() {
-    let mut config = RouterConfig::default();
-    config.mode = RoutingMode::OpenAI {
-        worker_urls: vec!["https://api.openai.com".to_string()],
+    let config = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["https://api.openai.com".to_string()],
+        },
+        history_backend: HistoryBackend::Oracle,
+        oracle: Some(OracleConfig {
+            wallet_path: Some("/etc/sglang/oracle-wallet".to_string()),
+            connect_descriptor: "db_low".to_string(),
+            username: "app_user".to_string(),
+            password: "secret".to_string(),
+            pool_min: 1,
+            pool_max: 8,
+            pool_timeout_secs: 45,
+        }),
+        ..Default::default()
     };
-    config.history_backend = HistoryBackend::Oracle;
-    config.oracle = Some(OracleConfig {
-        wallet_path: Some("/etc/sglang/oracle-wallet".to_string()),
-        connect_descriptor: "db_low".to_string(),
-        username: "app_user".to_string(),
-        password: "secret".to_string(),
-        pool_min: 1,
-        pool_max: 8,
-        pool_timeout_secs: 45,
-    });
 
     ConfigValidator::validate(&config).expect("wallet-based config should validate");
 }
