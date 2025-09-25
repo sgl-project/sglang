@@ -100,11 +100,19 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 max_seqlen_pad,
             )
-            mla_metadata, num_splits = get_mla_metadata(
-                forward_batch.seq_lens.to(torch.int32),
-                self.num_q_heads,
-                1,
-            )
+            # fix bug : unsupported operand type(s) for *: 'NoneType' and 'int'
+            if self.num_draft_tokens:
+                mla_metadata, num_splits = get_mla_metadata(
+                    seq_lens.to(torch.int32),
+                    self.num_draft_tokens * self.num_q_heads,
+                    1,
+                )
+            else:
+                mla_metadata, num_splits = get_mla_metadata(
+                    seq_lens.to(torch.int32),
+                    self.num_q_heads,
+                    1,
+                    )
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
                 num_splits,
