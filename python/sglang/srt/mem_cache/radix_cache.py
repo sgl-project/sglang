@@ -419,7 +419,13 @@ class RadixCache(BasePrefixCache):
                 [new_indices, kv_indices[len(new_indices) :]]
             )
         else:
-            req.prefix_indices = new_indices
+            if self.is_eagle:
+                # Attach the kv index of the last token for EAGLE, it can be used in chunked prefill
+                req.prefix_indices = torch.cat(
+                    [new_indices, kv_indices[actual_kv_len:]]
+                )
+            else:
+                req.prefix_indices = new_indices
         req.last_node = new_last_node
 
     def pretty_print(self):
