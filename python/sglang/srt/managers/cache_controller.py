@@ -247,6 +247,7 @@ class HiCacheController:
         load_cache_event: threading.Event,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
+        backup_skip: bool = False,
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
@@ -273,7 +274,7 @@ class HiCacheController:
                 self.storage_config.is_mla_model
                 # todo: load balancing
                 and self.storage_config.tp_rank != 0
-            )
+            ) or backup_skip
 
             if storage_backend == "file":
                 from sglang.srt.mem_cache.hicache_storage import HiCacheFile

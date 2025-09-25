@@ -338,6 +338,7 @@ class ServerArgs:
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
+    hicache_backup_skip: bool = False
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
     # LMCache
@@ -2143,6 +2144,11 @@ class ServerArgs:
             choices=["direct", "kernel"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
+            "--hicache-backup-skip",
+            action="store_true",
+            help="Hicache will skip backup and operate in read-only mode.",
         )
         parser.add_argument(
             "--hicache-mem-layout",

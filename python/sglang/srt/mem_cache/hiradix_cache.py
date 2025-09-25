@@ -44,6 +44,7 @@ class HiRadixCache(RadixCache):
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
+        hicache_backup_skip: Optional[bool] = False,
     ):
 
         if hicache_io_backend == "direct":
@@ -52,7 +53,10 @@ class HiRadixCache(RadixCache):
                 logger.warning(
                     "Page first layout is not supported with direct IO backend, switching to layer first layout"
                 )
-
+        if hicache_backup_skip:
+            logger.warning(
+                "Disable HiCache storage backup function, read-only storage."
+            )
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
@@ -92,6 +96,7 @@ class HiRadixCache(RadixCache):
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
             io_backend=hicache_io_backend,
+            backup_skip=hicache_backup_skip,
             storage_backend=hicache_storage_backend,
             prefetch_threshold=self.prefetch_threshold,
             model_name=model_name,
