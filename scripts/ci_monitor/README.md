@@ -8,7 +8,9 @@ A simple tool to analyze CI failures for the SGLang project. This tool fetches r
 - **Category Classification**: Automatically categorize failures by type (unit-test, performance, etc.)
 - **Pattern Recognition**: Identify common failure patterns (timeouts, build failures, etc.)
 - **CI Links**: Direct links to recent failed CI runs for detailed investigation
+- **Last Success Tracking**: Track the last successful run for each failed job with PR information
 - **JSON Export**: Export detailed analysis data to JSON format
+- **Automated Monitoring**: GitHub Actions workflow for continuous CI monitoring
 
 ## Installation
 
@@ -79,218 +81,335 @@ Detailed analysis data including:
 ## Example Output
 
 ```
+
 ============================================================
 SGLang CI Analysis Report
 ============================================================
 
 Overall Statistics:
   Total runs: 1000
-  Successful: 383
-  Failed: 210
-  Cancelled: 157
-  Skipped: 238
-  Success rate: 38.3%
+  Successful: 392
+  Failed: 187
+  Cancelled: 181
+  Skipped: 150
+  Success rate: 39.2%
 
 Category Failure Statistics:
-  unit-test: 167 failures
-  accuracy: 27 failures
-  performance: 18 failures
-  deepep: 5 failures
-  sgl-kernel: 4 failures
+  unit-test: 351 failures
+  accuracy: 84 failures
+  performance: 55 failures
+  deepep: 1 failures
 
 Most Frequently Failed Jobs (Top 50):
-   1. per-commit-4-ascend-npu: 27 times
-      - Run #10066 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053422
-      - Run #10061 (2025-09-24 11:04): https://github.com/sgl-project/sglang/actions/runs/17974703166
-      - Run #10040 (2025-09-24 08:23): https://github.com/sgl-project/sglang/actions/runs/17970858501
-   2. per-commit-2-ascend-npu: 26 times
-      - Run #10066 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053422
-      - Run #10051 (2025-09-24 09:29): https://github.com/sgl-project/sglang/actions/runs/17972481302
-      - Run #10049 (2025-09-24 09:10): https://github.com/sgl-project/sglang/actions/runs/17972001115
-   3. per-commit-1-ascend-npu: 25 times
-      - Run #10051 (2025-09-24 09:29): https://github.com/sgl-project/sglang/actions/runs/17972481302
-      - Run #10049 (2025-09-24 09:10): https://github.com/sgl-project/sglang/actions/runs/17972001115
-      - Run #10040 (2025-09-24 08:23): https://github.com/sgl-project/sglang/actions/runs/17970858501
-   4. unit-test-backend-1-gpu-amd-mi35x (linux-mi35x-gpu-1): 18 times
-      - Run #28891 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053408
-      - Run #28890 (2025-09-24 12:20): https://github.com/sgl-project/sglang/actions/runs/17976435645
-      - Run #28885 (2025-09-24 11:04): https://github.com/sgl-project/sglang/actions/runs/17974703173
-   5. unit-test-backend-1-gpu (5): 15 times
-      - Run #34538 (2025-09-24 13:54): https://github.com/sgl-project/sglang/actions/runs/17978943308
-      - Run #34536 (2025-09-24 13:35): https://github.com/sgl-project/sglang/actions/runs/17978451365
-      - Run #34526 (2025-09-24 10:40): https://github.com/sgl-project/sglang/actions/runs/17974174403
-   6. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 3): 14 times
-      - Run #28893 (2025-09-24 13:35): https://github.com/sgl-project/sglang/actions/runs/17978451434
-      - Run #28891 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053408
-      - Run #28890 (2025-09-24 12:20): https://github.com/sgl-project/sglang/actions/runs/17976435645
-   7. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 0): 14 times
-      - Run #28891 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053408
-      - Run #28890 (2025-09-24 12:20): https://github.com/sgl-project/sglang/actions/runs/17976435645
-      - Run #28885 (2025-09-24 11:04): https://github.com/sgl-project/sglang/actions/runs/17974703173
-   8. accuracy-test-2-gpu-amd (linux-mi35x-gpu-2): 14 times
-      - Run #28883 (2025-09-24 10:40): https://github.com/sgl-project/sglang/actions/runs/17974174456
-      - Run #28879 (2025-09-24 10:26): https://github.com/sgl-project/sglang/actions/runs/17973839120
-      - Run #28872 (2025-09-24 09:10): https://github.com/sgl-project/sglang/actions/runs/17972001138
-   9. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 5): 11 times
-      - Run #28893 (2025-09-24 13:35): https://github.com/sgl-project/sglang/actions/runs/17978451434
-      - Run #28891 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053408
-      - Run #28890 (2025-09-24 12:20): https://github.com/sgl-project/sglang/actions/runs/17976435645
-  10. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 7): 10 times
-      - Run #28893 (2025-09-24 13:35): https://github.com/sgl-project/sglang/actions/runs/17978451434
-      - Run #28874 (2025-09-24 09:29): https://github.com/sgl-project/sglang/actions/runs/17972481308
-      - Run #28872 (2025-09-24 09:10): https://github.com/sgl-project/sglang/actions/runs/17972001138
-  11. bench-test-2-gpu-amd (linux-mi300-gpu-2): 9 times
-      - Run #28891 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053408
-      - Run #28890 (2025-09-24 12:20): https://github.com/sgl-project/sglang/actions/runs/17976435645
-      - Run #28879 (2025-09-24 10:26): https://github.com/sgl-project/sglang/actions/runs/17973839120
-  12. unit-test-backend-1-gpu (4): 8 times
-      - Run #34534 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053442
-      - Run #34526 (2025-09-24 10:40): https://github.com/sgl-project/sglang/actions/runs/17974174403
-      - Run #34498 (2025-09-24 07:59): https://github.com/sgl-project/sglang/actions/runs/17970287163
-  13. unit-test-backend-2-gpu (0): 7 times
-      - Run #34536 (2025-09-24 13:35): https://github.com/sgl-project/sglang/actions/runs/17978451365
-      - Run #34526 (2025-09-24 10:40): https://github.com/sgl-project/sglang/actions/runs/17974174403
-      - Run #34520 (2025-09-24 10:09): https://github.com/sgl-project/sglang/actions/runs/17973442270
-  14. unit-test-backend-1-gpu (9): 6 times
-      - Run #34538 (2025-09-24 13:54): https://github.com/sgl-project/sglang/actions/runs/17978943308
-      - Run #34536 (2025-09-24 13:35): https://github.com/sgl-project/sglang/actions/runs/17978451365
-      - Run #34526 (2025-09-24 10:40): https://github.com/sgl-project/sglang/actions/runs/17974174403
-  15. unit-test-backend-4-gpu (1): 6 times
-      - Run #34502 (2025-09-24 08:23): https://github.com/sgl-project/sglang/actions/runs/17970858519
-      - Run #34483 (2025-09-24 06:48): https://github.com/sgl-project/sglang/actions/runs/17968745498
-      - Run #34478 (2025-09-24 06:36): https://github.com/sgl-project/sglang/actions/runs/17968517871
-  16. unit-test-backend-4-gpu-b200: 6 times
-      - Run #34462 (2025-09-24 05:11): https://github.com/sgl-project/sglang/actions/runs/17966982224
-      - Run #34454 (2025-09-24 04:26): https://github.com/sgl-project/sglang/actions/runs/17966297243
-      - Run #34439 (2025-09-24 03:14): https://github.com/sgl-project/sglang/actions/runs/17965208392
-  17. performance-test-1-gpu-part-2-amd (linux-mi300-gpu-1): 5 times
-      - Run #28893 (2025-09-24 13:35): https://github.com/sgl-project/sglang/actions/runs/17978451434
-      - Run #28883 (2025-09-24 10:40): https://github.com/sgl-project/sglang/actions/runs/17974174456
-      - Run #28879 (2025-09-24 10:26): https://github.com/sgl-project/sglang/actions/runs/17973839120
-  18. unit-test-backend-8-gpu-amd (linux-mi300-gpu-8): 5 times
-      - Run #28885 (2025-09-24 11:04): https://github.com/sgl-project/sglang/actions/runs/17974703173
-      - Run #28874 (2025-09-24 09:29): https://github.com/sgl-project/sglang/actions/runs/17972481308
-      - Run #28872 (2025-09-24 09:10): https://github.com/sgl-project/sglang/actions/runs/17972001138
-  19. unit-test-backend-2-gpu (1): 5 times
-      - Run #34520 (2025-09-24 10:09): https://github.com/sgl-project/sglang/actions/runs/17973442270
-      - Run #34473 (2025-09-24 06:15): https://github.com/sgl-project/sglang/actions/runs/17968102842
-      - Run #34460 (2025-09-24 05:07): https://github.com/sgl-project/sglang/actions/runs/17966918287
-  20. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 6): 5 times
-      - Run #28863 (2025-09-24 08:23): https://github.com/sgl-project/sglang/actions/runs/17970858439
-      - Run #28862 (2025-09-24 08:23): https://github.com/sgl-project/sglang/actions/runs/17970850775
-      - Run #28855 (2025-09-24 07:30): https://github.com/sgl-project/sglang/actions/runs/17969671345
-  21. unit-test-deepep-4-gpu: 4 times
-      - Run #34527 (2025-09-24 10:43): https://github.com/sgl-project/sglang/actions/runs/17974237736
-      - Run #34491 (2025-09-24 07:16): https://github.com/sgl-project/sglang/actions/runs/17969342167
-      - Run #34490 (2025-09-24 07:12): https://github.com/sgl-project/sglang/actions/runs/17969251353
-  22. accuracy-test-1-gpu-amd (linux-mi325-gpu-1): 4 times
-      - Run #28883 (2025-09-24 10:40): https://github.com/sgl-project/sglang/actions/runs/17974174456
-      - Run #28860 (2025-09-24 07:59): https://github.com/sgl-project/sglang/actions/runs/17970287151
-      - Run #28855 (2025-09-24 07:30): https://github.com/sgl-project/sglang/actions/runs/17969671345
-  23. performance-test-1-gpu-part-1: 4 times
-      - Run #34520 (2025-09-24 10:09): https://github.com/sgl-project/sglang/actions/runs/17973442270
-      - Run #34491 (2025-09-24 07:16): https://github.com/sgl-project/sglang/actions/runs/17969342167
-      - Run #34473 (2025-09-24 06:15): https://github.com/sgl-project/sglang/actions/runs/17968102842
-  24. performance-test-1-gpu-part-2: 4 times
-      - Run #34520 (2025-09-24 10:09): https://github.com/sgl-project/sglang/actions/runs/17973442270
-      - Run #34491 (2025-09-24 07:16): https://github.com/sgl-project/sglang/actions/runs/17969342167
-      - Run #34473 (2025-09-24 06:15): https://github.com/sgl-project/sglang/actions/runs/17968102842
-  25. unit-test-backend-2-gpu-amd (linux-mi300-gpu-2): 3 times
-      - Run #28891 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053408
-      - Run #28874 (2025-09-24 09:29): https://github.com/sgl-project/sglang/actions/runs/17972481308
-      - Run #28797 (2025-09-24 02:22): https://github.com/sgl-project/sglang/actions/runs/17964402266
-  26. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 1): 3 times
-      - Run #28885 (2025-09-24 11:04): https://github.com/sgl-project/sglang/actions/runs/17974703173
-      - Run #28844 (2025-09-24 06:47): https://github.com/sgl-project/sglang/actions/runs/17968741096
-      - Run #28837 (2025-09-24 06:20): https://github.com/sgl-project/sglang/actions/runs/17968205489
-  27. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 7): 3 times
-      - Run #28885 (2025-09-24 11:04): https://github.com/sgl-project/sglang/actions/runs/17974703173
-      - Run #28879 (2025-09-24 10:26): https://github.com/sgl-project/sglang/actions/runs/17973839120
-      - Run #28839 (2025-09-24 06:30): https://github.com/sgl-project/sglang/actions/runs/17968407818
-  28. unit-test-backend-1-gpu (8): 3 times
-      - Run #34526 (2025-09-24 10:40): https://github.com/sgl-project/sglang/actions/runs/17974174403
-      - Run #34522 (2025-09-24 10:26): https://github.com/sgl-project/sglang/actions/runs/17973839111
-      - Run #34421 (2025-09-24 02:19): https://github.com/sgl-project/sglang/actions/runs/17964353674
-  29. unit-test-frontend: 3 times
-      - Run #34520 (2025-09-24 10:09): https://github.com/sgl-project/sglang/actions/runs/17973442270
-      - Run #34473 (2025-09-24 06:15): https://github.com/sgl-project/sglang/actions/runs/17968102842
-      - Run #34423 (2025-09-24 02:20): https://github.com/sgl-project/sglang/actions/runs/17964379996
-  30. accuracy-test-1-gpu: 3 times
-      - Run #34520 (2025-09-24 10:09): https://github.com/sgl-project/sglang/actions/runs/17973442270
-      - Run #34473 (2025-09-24 06:15): https://github.com/sgl-project/sglang/actions/runs/17968102842
-      - Run #34423 (2025-09-24 02:20): https://github.com/sgl-project/sglang/actions/runs/17964379996
-  31. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 0): 3 times
-      - Run #28860 (2025-09-24 07:59): https://github.com/sgl-project/sglang/actions/runs/17970287151
-      - Run #28852 (2025-09-24 07:12): https://github.com/sgl-project/sglang/actions/runs/17969251355
-      - Run #28850 (2025-09-24 07:01): https://github.com/sgl-project/sglang/actions/runs/17969003175
-  32. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 3): 3 times
-      - Run #28853 (2025-09-24 07:16): https://github.com/sgl-project/sglang/actions/runs/17969342193
-      - Run #28830 (2025-09-24 05:35): https://github.com/sgl-project/sglang/actions/runs/17967409723
-      - Run #28794 (2025-09-24 02:20): https://github.com/sgl-project/sglang/actions/runs/17964379983
-  33. accuracy-test-2-gpu-amd (linux-mi300-gpu-2): 3 times
-      - Run #28847 (2025-09-24 06:57): https://github.com/sgl-project/sglang/actions/runs/17968932516
-      - Run #28840 (2025-09-24 06:36): https://github.com/sgl-project/sglang/actions/runs/17968517855
-      - Run #28830 (2025-09-24 05:35): https://github.com/sgl-project/sglang/actions/runs/17967409723
-  34. mla-test-1-gpu-amd (linux-mi325-gpu-1): 3 times
-      - Run #28839 (2025-09-24 06:30): https://github.com/sgl-project/sglang/actions/runs/17968407818
-      - Run #28797 (2025-09-24 02:22): https://github.com/sgl-project/sglang/actions/runs/17964402266
-      - Run #28794 (2025-09-24 02:20): https://github.com/sgl-project/sglang/actions/runs/17964379983
-  35. build-test (all): 2 times
-      - Run #15749 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053404
-      - Run #15652 (2025-09-24 02:22): https://github.com/sgl-project/sglang/actions/runs/17964402263
-  36. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 5): 2 times
-      - Run #28890 (2025-09-24 12:20): https://github.com/sgl-project/sglang/actions/runs/17976435645
-      - Run #28855 (2025-09-24 07:30): https://github.com/sgl-project/sglang/actions/runs/17969671345
-  37. unit-test-backend-8-gpu (0): 2 times
-      - Run #34528 (2025-09-24 11:04): https://github.com/sgl-project/sglang/actions/runs/17974703178
-      - Run #34512 (2025-09-24 09:10): https://github.com/sgl-project/sglang/actions/runs/17972001211
-  38. bench-test-2-gpu-amd (linux-mi325-gpu-2): 2 times
-      - Run #28883 (2025-09-24 10:40): https://github.com/sgl-project/sglang/actions/runs/17974174456
-      - Run #28853 (2025-09-24 07:16): https://github.com/sgl-project/sglang/actions/runs/17969342193
-  39. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 4): 2 times
-      - Run #28874 (2025-09-24 09:29): https://github.com/sgl-project/sglang/actions/runs/17972481308
-      - Run #28853 (2025-09-24 07:16): https://github.com/sgl-project/sglang/actions/runs/17969342193
-  40. per-commit-16-ascend-a3: 2 times
-      - Run #10030 (2025-09-24 07:16): https://github.com/sgl-project/sglang/actions/runs/17969342205
-      - Run #9975 (2025-09-24 02:22): https://github.com/sgl-project/sglang/actions/runs/17964402265
-  41. performance-test-1-gpu-part-1-amd (linux-mi325-gpu-1): 2 times
-      - Run #28853 (2025-09-24 07:16): https://github.com/sgl-project/sglang/actions/runs/17969342193
-      - Run #28850 (2025-09-24 07:01): https://github.com/sgl-project/sglang/actions/runs/17969003175
-  42. unit-test-backend-1-gpu (2): 2 times
-      - Run #34491 (2025-09-24 07:16): https://github.com/sgl-project/sglang/actions/runs/17969342167
-      - Run #34454 (2025-09-24 04:26): https://github.com/sgl-project/sglang/actions/runs/17966297243
-  43. performance-test-2-gpu: 2 times
-      - Run #34491 (2025-09-24 07:16): https://github.com/sgl-project/sglang/actions/runs/17969342167
-      - Run #34475 (2025-09-24 06:20): https://github.com/sgl-project/sglang/actions/runs/17968205483
-  44. unit-test-backend-1-gpu (3): 2 times
-      - Run #34490 (2025-09-24 07:12): https://github.com/sgl-project/sglang/actions/runs/17969251353
-      - Run #34460 (2025-09-24 05:07): https://github.com/sgl-project/sglang/actions/runs/17966918287
-  45. accuracy-test-1-gpu-amd (linux-mi300-gpu-1): 2 times
-      - Run #28844 (2025-09-24 06:47): https://github.com/sgl-project/sglang/actions/runs/17968741096
-      - Run #28797 (2025-09-24 02:22): https://github.com/sgl-project/sglang/actions/runs/17964402266
-  46. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 4): 2 times
-      - Run #28840 (2025-09-24 06:36): https://github.com/sgl-project/sglang/actions/runs/17968517855
-      - Run #28839 (2025-09-24 06:30): https://github.com/sgl-project/sglang/actions/runs/17968407818
-  47. mla-test-1-gpu-amd (linux-mi300-gpu-1): 2 times
-      - Run #28837 (2025-09-24 06:20): https://github.com/sgl-project/sglang/actions/runs/17968205489
-      - Run #28794 (2025-09-24 02:20): https://github.com/sgl-project/sglang/actions/runs/17964379983
-  48. sgl-kernel-mla-test: 2 times
-      - Run #34473 (2025-09-24 06:15): https://github.com/sgl-project/sglang/actions/runs/17968102842
-      - Run #34423 (2025-09-24 02:20): https://github.com/sgl-project/sglang/actions/runs/17964379996
-  49. sgl-kernel-unit-test: 2 times
-      - Run #34473 (2025-09-24 06:15): https://github.com/sgl-project/sglang/actions/runs/17968102842
-      - Run #34423 (2025-09-24 02:20): https://github.com/sgl-project/sglang/actions/runs/17964379996
-  50. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 2): 1 times
-      - Run #28891 (2025-09-24 12:44): https://github.com/sgl-project/sglang/actions/runs/17977053408
+   1. unit-test-backend-1-gpu-amd-mi35x (linux-mi35x-gpu-1): 32 times
+      Last Success: Run #28893 (2025-09-24 13:35) by Xiaoze Fan: https://github.com/sgl-project/sglang/actions/runs/17978451434
+      Recent Failures:
+        - Run #28958 (2025-09-25 01:51) (PR #1 by Yuhao Yao): https://github.com/sgl-project/sglang/actions/runs/17994520789
+        - Run #28957 (2025-09-25 01:10) (PR #10883 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993860400
+        - Run #28956 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826732
+   2. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 3): 31 times
+      Last Success: Run #28903 (2025-09-24 15:38) by gholmes829: https://github.com/sgl-project/sglang/actions/runs/17981905113
+      Recent Failures:
+        - Run #28958 (2025-09-25 01:51) (PR #1 by Yuhao Yao): https://github.com/sgl-project/sglang/actions/runs/17994520789
+        - Run #28957 (2025-09-25 01:10) (PR #10883 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993860400
+        - Run #28956 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826732
+   3. accuracy-test-2-gpu-amd (linux-mi35x-gpu-2): 29 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28958 (2025-09-25 01:51) (PR #1 by Yuhao Yao): https://github.com/sgl-project/sglang/actions/runs/17994520789
+        - Run #28957 (2025-09-25 01:10) (PR #10883 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993860400
+        - Run #28956 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826732
+   4. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 5): 23 times
+      Last Success: Run #28906 (2025-09-24 15:43) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17982029749
+      Recent Failures:
+        - Run #28958 (2025-09-25 01:51) (PR #1 by Yuhao Yao): https://github.com/sgl-project/sglang/actions/runs/17994520789
+        - Run #28956 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826732
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+   5. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 0): 23 times
+      Last Success: Run #28893 (2025-09-24 13:35) by Xiaoze Fan: https://github.com/sgl-project/sglang/actions/runs/17978451434
+      Recent Failures:
+        - Run #28956 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826732
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+   6. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 7): 18 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28956 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826732
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+   7. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 3): 17 times
+      Last Success: Run #28893 (2025-09-24 13:35) by Xiaoze Fan: https://github.com/sgl-project/sglang/actions/runs/17978451434
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+   8. build-test (all): 16 times
+      Last Success: Run #15748 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435618
+      Recent Failures:
+        - Run #15824 (2025-09-25 02:16) by Yuan Luo: https://github.com/sgl-project/sglang/actions/runs/17994892894
+        - Run #15814 (2025-09-25 00:53) by diwei sun: https://github.com/sgl-project/sglang/actions/runs/17993616261
+        - Run #15812 (2025-09-25 00:35) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993338746
+   9. bench-test-2-gpu-amd (linux-mi300-gpu-2): 15 times
+      Last Success: Run #28893 (2025-09-24 13:35) by Xiaoze Fan: https://github.com/sgl-project/sglang/actions/runs/17978451434
+      Recent Failures:
+        - Run #28957 (2025-09-25 01:10) (PR #10883 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993860400
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  10. performance-test-1-gpu-part-2-amd (linux-mi300-gpu-1): 15 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  11. accuracy-test-1-gpu-amd (linux-mi325-gpu-1): 15 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  12. unit-test-backend-8-gpu-amd (linux-mi300-gpu-8): 15 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+        - Run #28951 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619816
+  13. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 1): 14 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  14. unit-test-backend-2-gpu-amd (linux-mi300-gpu-2): 14 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+        - Run #28951 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619816
+  15. performance-test-1-gpu-part-1-amd (linux-mi325-gpu-1): 13 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  16. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 2): 13 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  17. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 4): 13 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  18. accuracy-test-2-gpu-amd (linux-mi325-gpu-2): 13 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+        - Run #28951 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619816
+  19. mla-test-1-gpu-amd (linux-mi325-gpu-1): 13 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+        - Run #28951 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619816
+  20. accuracy-test-2-gpu-amd (linux-mi300-gpu-2): 13 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+        - Run #28951 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619816
+  21. accuracy-test-1-gpu-amd (linux-mi300-gpu-1): 12 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  22. performance-test-1-gpu-part-2-amd (linux-mi325-gpu-1): 12 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  23. bench-test-2-gpu-amd (linux-mi325-gpu-2): 11 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28957 (2025-09-25 01:10) (PR #10883 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993860400
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  24. unit-test-sgl-kernel-amd (linux-mi325-gpu-1): 11 times
+      Last Success: Run #28891 (2025-09-24 12:44) by Yuan Luo: https://github.com/sgl-project/sglang/actions/runs/17977053408
+      Recent Failures:
+        - Run #28956 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826732
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  25. performance-test-1-gpu-part-1-amd (linux-mi300-gpu-1): 11 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  26. unit-test-backend-1-gpu-amd (linux-mi300-gpu-1, 6): 11 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  27. unit-test-backend-2-gpu-amd (linux-mi325-gpu-2): 11 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+        - Run #28951 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619816
+  28. unit-test-backend-1-gpu (9): 10 times
+      Last Success: Run #34533 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435636
+      Recent Failures:
+        - Run #34623 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826751
+        - Run #34617 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619818
+        - Run #34581 (2025-09-24 19:49) by Yineng Zhang: https://github.com/sgl-project/sglang/actions/runs/17987860976
+  29. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 0): 10 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+  30. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 1): 10 times
+      Last Success: Run #28891 (2025-09-24 12:44) by Yuan Luo: https://github.com/sgl-project/sglang/actions/runs/17977053408
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+        - Run #28951 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619816
+  31. mla-test-1-gpu-amd (linux-mi300-gpu-1): 10 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+        - Run #28951 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619816
+  32. unit-test-backend-1-gpu (5): 9 times
+      Last Success: Run #34533 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435636
+      Recent Failures:
+        - Run #34624 (2025-09-25 01:10) (PR #10883 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993860412
+        - Run #34617 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619818
+        - Run #34560 (2025-09-24 17:01) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17983919007
+  33. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 2): 9 times
+      Last Success: Run #28906 (2025-09-24 15:43) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17982029749
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+        - Run #28951 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619816
+  34. unit-test-sgl-kernel-amd (linux-mi300-gpu-1): 9 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28952 (2025-09-24 23:57) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992751764
+        - Run #28951 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619816
+  35. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 4): 7 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28955 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426068
+        - Run #28953 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178855
+        - Run #28949 (2025-09-24 23:44) (PR #10372 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992591372
+  36. unit-test-backend-1-gpu-amd (linux-mi325-gpu-1, 6): 7 times
+      Last Success: Run #28890 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435645
+      Recent Failures:
+        - Run #28950 (2025-09-24 23:45) (PR #1 by Xiaoyu Zhang): https://github.com/sgl-project/sglang/actions/runs/17992598523
+        - Run #28946 (2025-09-24 23:39) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992521547
+        - Run #28936 (2025-09-24 21:32) by xiafang: https://github.com/sgl-project/sglang/actions/runs/17990244192
+  37. vllm-dependency-test: 6 times
+      Last Success: Run #22949 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435651
+      Recent Failures:
+        - Run #23028 (2025-09-25 02:39) by xuyongfei.xyf: https://github.com/sgl-project/sglang/actions/runs/17995251178
+        - Run #23021 (2025-09-25 02:16) by Yuan Luo: https://github.com/sgl-project/sglang/actions/runs/17994892873
+        - Run #22993 (2025-09-24 21:32) by xiafang: https://github.com/sgl-project/sglang/actions/runs/17990244213
+  38. per-commit-4-ascend-npu: 6 times
+      Last Success: Run #10065 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435703
+      Recent Failures:
+        - Run #10138 (2025-09-25 02:17) by wangyi: https://github.com/sgl-project/sglang/actions/runs/17994908950
+        - Run #10137 (2025-09-25 02:16) by Yuan Luo: https://github.com/sgl-project/sglang/actions/runs/17994892896
+        - Run #10124 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619819
+  39. unit-test-backend-2-gpu (0): 6 times
+      Last Success: Run #34533 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435636
+      Recent Failures:
+        - Run #34624 (2025-09-25 01:10) (PR #10883 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993860412
+        - Run #34593 (2025-09-24 21:32) by xiafang: https://github.com/sgl-project/sglang/actions/runs/17990244227
+        - Run #34576 (2025-09-24 18:46) by eigen: https://github.com/sgl-project/sglang/actions/runs/17986403452
+  40. unit-test-backend-1-gpu (4): 6 times
+      Last Success: Run #34533 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435636
+      Recent Failures:
+        - Run #34623 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826751
+        - Run #34609 (2025-09-24 23:25) (PR #10853 by Yineng Zhang): https://github.com/sgl-project/sglang/actions/runs/17992311361
+        - Run #34560 (2025-09-24 17:01) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17983919007
+  41. run-all-notebooks: 6 times
+      Last Success: Run #26939 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435610
+      Recent Failures:
+        - Run #26988 (2025-09-24 23:25) (PR #10853 by Yineng Zhang): https://github.com/sgl-project/sglang/actions/runs/17992311396
+        - Run #26982 (2025-09-24 21:32) by xiafang: https://github.com/sgl-project/sglang/actions/runs/17990244193
+        - Run #26973 (2025-09-24 18:46) by eigen: https://github.com/sgl-project/sglang/actions/runs/17986403458
+  42. per-commit-2-ascend-npu: 5 times
+      Last Success: Run #10065 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435703
+      Recent Failures:
+        - Run #10135 (2025-09-25 02:16) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17994888152
+        - Run #10109 (2025-09-24 21:32) by xiafang: https://github.com/sgl-project/sglang/actions/runs/17990244207
+        - Run #10085 (2025-09-24 16:42) by likesen: https://github.com/sgl-project/sglang/actions/runs/17983486537
+  43. unit-test-backend-8-gpu (0): 5 times
+      Last Success: Run #34533 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435636
+      Recent Failures:
+        - Run #34623 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826751
+        - Run #34621 (2025-09-25 00:40) by Hubert Lu: https://github.com/sgl-project/sglang/actions/runs/17993426098
+        - Run #34619 (2025-09-25 00:24) (PR #10372 by BBuf): https://github.com/sgl-project/sglang/actions/runs/17993178853
+  44. pytest-rust: 5 times
+      Last Success: Run #1761 (2025-09-24 16:39) by Chang Su: https://github.com/sgl-project/sglang/actions/runs/17983415401
+      Recent Failures:
+        - Run #1770 (2025-09-24 21:02) by Simo Lin: https://github.com/sgl-project/sglang/actions/runs/17989538977
+        - Run #1769 (2025-09-24 20:54) by Simo Lin: https://github.com/sgl-project/sglang/actions/runs/17989380799
+        - Run #1767 (2025-09-24 20:36) by Ata Fatahi: https://github.com/sgl-project/sglang/actions/runs/17988964074
+  45. per-commit-16-ascend-a3: 4 times
+      Last Success: Run #10065 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435703
+      Recent Failures:
+        - Run #10138 (2025-09-25 02:17) by wangyi: https://github.com/sgl-project/sglang/actions/runs/17994908950
+        - Run #10135 (2025-09-25 02:16) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17994888152
+        - Run #10109 (2025-09-24 21:32) by xiafang: https://github.com/sgl-project/sglang/actions/runs/17990244207
+  46. unit-test-backend-1-gpu (7): 4 times
+      Last Success: Run #34533 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435636
+      Recent Failures:
+        - Run #34624 (2025-09-25 01:10) (PR #10883 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993860412
+        - Run #34573 (2025-09-24 18:45) by Tejesh Anand: https://github.com/sgl-project/sglang/actions/runs/17986382981
+        - Run #34565 (2025-09-24 17:35) by YAMY: https://github.com/sgl-project/sglang/actions/runs/17984740528
+  47. unit-test-backend-2-gpu (1): 4 times
+      Last Success: Run #34533 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435636
+      Recent Failures:
+        - Run #34593 (2025-09-24 21:32) by xiafang: https://github.com/sgl-project/sglang/actions/runs/17990244227
+        - Run #34576 (2025-09-24 18:46) by eigen: https://github.com/sgl-project/sglang/actions/runs/17986403452
+        - Run #34565 (2025-09-24 17:35) by YAMY: https://github.com/sgl-project/sglang/actions/runs/17984740528
+  48. per-commit-1-ascend-npu: 3 times
+      Last Success: Run #10065 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435703
+      Recent Failures:
+        - Run #10138 (2025-09-25 02:17) by wangyi: https://github.com/sgl-project/sglang/actions/runs/17994908950
+        - Run #10109 (2025-09-24 21:32) by xiafang: https://github.com/sgl-project/sglang/actions/runs/17990244207
+        - Run #10085 (2025-09-24 16:42) by likesen: https://github.com/sgl-project/sglang/actions/runs/17983486537
+  49. unit-test-backend-1-gpu (1): 3 times
+      Last Success: Run #34533 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435636
+      Recent Failures:
+        - Run #34623 (2025-09-25 01:07) (PR #10495 by Lianmin Zheng): https://github.com/sgl-project/sglang/actions/runs/17993826751
+        - Run #34554 (2025-09-24 16:29) by Yuan Luo: https://github.com/sgl-project/sglang/actions/runs/17983177051
+        - Run #34548 (2025-09-24 15:38) by gholmes829: https://github.com/sgl-project/sglang/actions/runs/17981905143
+  50. unit-test-backend-1-gpu (8): 3 times
+      Last Success: Run #34533 (2025-09-24 12:20) by Yuhong Guo: https://github.com/sgl-project/sglang/actions/runs/17976435636
+      Recent Failures:
+        - Run #34617 (2025-09-24 23:47) (PR #10881 by Chang Su): https://github.com/sgl-project/sglang/actions/runs/17992619818
+        - Run #34581 (2025-09-24 19:49) by Yineng Zhang: https://github.com/sgl-project/sglang/actions/runs/17987860976
+        - Run #34554 (2025-09-24 16:29) by Yuan Luo: https://github.com/sgl-project/sglang/actions/runs/17983177051
 
 Failure Pattern Analysis:
-  Unit Test Failure: 164 times
-  Other: 82 times
-  Accuracy Test Failure: 27 times
-  Performance Test Failure: 18 times
-  Dependency Installation Failure: 17 times
-  GPU Related Failure: 16 times
-  Build Failure: 1 times
+  GPU Related Failure: 223 times
+  Unit Test Failure: 190 times
+  Accuracy Test Failure: 84 times
+  Performance Test Failure: 54 times
+  Other: 34 times
+  Dependency Installation Failure: 19 times
+  Build Failure: 15 times
 ```
 
 ## CI Job Categories
@@ -337,6 +456,23 @@ For detailed API call information, you can modify the code to include logging:
 import logging
 logging.basicConfig(level=logging.DEBUG)
 ```
+
+## Automated Monitoring
+
+The CI monitor is also available as a GitHub Actions workflow that runs automatically every 6 hours. The workflow:
+
+- Analyzes the last 500 CI runs
+- Generates detailed reports
+- Uploads analysis results as artifacts
+
+### Workflow Configuration
+
+The workflow is located at `.github/workflows/ci-monitor.yml` and uses the `GH_PAT_FOR_NIGHTLY_CI` secret for GitHub API access.
+
+### Manual Trigger
+
+You can manually trigger the workflow from the GitHub Actions tab with custom parameters:
+- `limit`: Number of CI runs to analyze (default: 500)
 
 ## License
 

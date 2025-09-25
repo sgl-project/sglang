@@ -102,11 +102,11 @@ class SGLangCIAnalyzer:
             "skipped_runs": 0,
             "category_failures": defaultdict(int),
             "job_failures": defaultdict(int),
-            "workflow_failures": defaultdict(int),
             "failure_patterns": defaultdict(int),
             "job_failure_links": defaultdict(
                 list
             ),  # Store recent failure links for each job
+            "job_last_success": {},  # Store last successful run for each job
         }
 
         total_runs = len(runs)
@@ -125,7 +125,6 @@ class SGLangCIAnalyzer:
             # Count run status
             if run_status == "failure":
                 stats["failed_runs"] += 1
-                stats["workflow_failures"][workflow_name] += 1
             elif run_status == "success":
                 stats["successful_runs"] += 1
             elif run_status == "cancelled":
@@ -133,45 +132,56 @@ class SGLangCIAnalyzer:
             elif run_status == "skipped":
                 stats["skipped_runs"] += 1
 
-            # Get detailed job information for failed runs
-            if run_status == "failure":
-                jobs = self._get_job_details(run_id)
-                run_url = f"https://github.com/{self.repo}/actions/runs/{run_id}"
+            # Get detailed job information for all runs
+            jobs = self._get_job_details(run_id)
+            run_url = f"https://github.com/{self.repo}/actions/runs/{run_id}"
+            pr_info = self._get_pr_info(run)
 
-                for job in jobs:
-                    job_name = job.get("name", "Unknown")
-                    job_conclusion = job.get("conclusion", "unknown")
+            for job in jobs:
+                job_name = job.get("name", "Unknown")
+                job_conclusion = job.get("conclusion", "unknown")
 
-                    if job_conclusion == "failure":
-                        # Filter out non-specific CI failures
-                        if job_name not in [
-                            "check-changes",
-                            "pr-test-finish",
-                            "pr-test-h20-finish",
-                            "lint",
-                        ]:
-                            stats["job_failures"][job_name] += 1
+                # Filter out non-specific CI jobs
+                if job_name not in [
+                    "check-changes",
+                    "pr-test-finish",
+                    "pr-test-h20-finish",
+                    "lint",
+                ]:
+                    # Record successful jobs (update last success)
+                    if job_conclusion == "success":
+                        stats["job_last_success"][job_name] = {
+                            "url": run_url,
+                            "run_number": run_number,
+                            "created_at": created_at,
+                            "pr_info": pr_info,
+                        }
 
-                            # Store failure link (keep only last 3 for each job)
-                            if len(stats["job_failure_links"][job_name]) < 3:
-                                stats["job_failure_links"][job_name].append(
-                                    {
-                                        "url": run_url,
-                                        "run_number": run_number,
-                                        "created_at": created_at,
-                                    }
-                                )
+                    # Record failed jobs
+                    elif job_conclusion == "failure" and run_status == "failure":
+                        stats["job_failures"][job_name] += 1
 
-                            # Categorize failed jobs
-                            for category, jobs_list in job_categories.items():
-                                if any(
-                                    job_pattern in job_name for job_pattern in jobs_list
-                                ):
-                                    stats["category_failures"][category] += 1
-                                    break
+                        # Store failure link (keep only last 3 for each job)
+                        if len(stats["job_failure_links"][job_name]) < 3:
+                            stats["job_failure_links"][job_name].append(
+                                {
+                                    "url": run_url,
+                                    "run_number": run_number,
+                                    "created_at": created_at,
+                                    "pr_info": pr_info,
+                                }
+                            )
 
-                            # Analyze failure patterns
-                            self._analyze_failure_pattern(job, stats)
+                        # Categorize failed jobs
+                        for category, jobs_list in job_categories.items():
+                            if any(
+                                job_pattern in job_name for job_pattern in jobs_list
+                            ):
+                                stats["category_failures"][category] += 1
+                                break
+
+                        # Analyze failure patterns
+                        self._analyze_failure_pattern(job, stats)
 
             time.sleep(0.1)  # Avoid API rate limits
 
@@ -186,6 +196,22 @@ class SGLangCIAnalyzer:
             return response.json().get("jobs", [])
         except:
             return []
+
+    def _get_pr_info(self, run: Dict) -> Dict:
+        """Get PR information from a run"""
+        pr_info = {
+            "pr_number": None,
+            "author": run.get("head_commit", {}).get("author", {}).get("name", "Unknown"),
+            "head_sha": run.get("head_sha", ""),
+            "head_branch": run.get("head_branch", ""),
+        }
+        
+        # Try to extract PR number from pull_requests
+        pull_requests = run.get("pull_requests", [])
+        if pull_requests:
+            pr_info["pr_number"] = pull_requests[0].get("number")
+        
+        return pr_info
 
     def _analyze_failure_pattern(self, job: Dict, stats: Dict):
         """Analyze failure patterns"""
@@ -254,17 +280,44 @@ class SGLangCIAnalyzer:
                 1,
             ):
                 print(f"  {i:2d}. {job}: {count} times")
+                
+                # Show last successful run
+                if job in stats["job_last_success"]:
+                    last_success = stats["job_last_success"][job]
+                    success_date = datetime.fromisoformat(
+                        last_success["created_at"].replace("Z", "+00:00")
+                    )
+                    pr_info = last_success["pr_info"]
+                    
+                    pr_text = ""
+                    if pr_info["pr_number"]:
+                        pr_text = f" (PR #{pr_info['pr_number']} by {pr_info['author']})"
+                    else:
+                        pr_text = f" by {pr_info['author']}"
+                    
+                    print(f"      Last Success: Run #{last_success['run_number']} ({success_date.strftime('%Y-%m-%d %H:%M')}){pr_text}: {last_success['url']}")
+                
                 # Show recent failure links
                 if (
                     job in stats["job_failure_links"]
                     and stats["job_failure_links"][job]
                 ):
+                    print("      Recent Failures:")
                     for link_info in stats["job_failure_links"][job]:
                         created_at = datetime.fromisoformat(
                             link_info["created_at"].replace("Z", "+00:00")
                         )
+                        
+                        # Format PR info for failures
+                        pr_info = link_info.get("pr_info", {})
+                        pr_text = ""
+                        if pr_info.get("pr_number"):
+                            pr_text = f" (PR #{pr_info['pr_number']} by {pr_info.get('author', 'Unknown')})"
+                        else:
+                            pr_text = f" by {pr_info.get('author', 'Unknown')}"
+                        
                         print(
-                            f"      - Run #{link_info['run_number']} ({created_at.strftime('%Y-%m-%d %H:%M')}): {link_info['url']}"
+                            f"        - Run #{link_info['run_number']} ({created_at.strftime('%Y-%m-%d %H:%M')}){pr_text}: {link_info['url']}"
                         )
 
         # Failure pattern analysis
