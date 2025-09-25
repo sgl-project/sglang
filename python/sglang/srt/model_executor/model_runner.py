@@ -93,8 +93,8 @@ from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
     HybridLinearReqToTokenPool,
+    HybridLinearTokenToKVPool,
     HybridReqToTokenPool,
-    LinearTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -1693,7 +1693,7 @@ class ModelRunner:
                     device=self.device,
                 )
             elif self.server_args.attention_backend == "bailing_hybrid_linear":
-                self.token_to_kv_pool = LinearTokenToKVPool(
+                self.token_to_kv_pool = HybridLinearTokenToKVPool(
                     size=self.max_total_num_tokens,
                     linear_size=max_num_reqs,
                     page_size=self.page_size,

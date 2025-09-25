@@ -827,7 +827,7 @@ class HybridLinearKVPool(KVCache):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
 
 
-class LinearTokenToKVPool(KVCache):
+class HybridLinearTokenToKVPool(KVCache):
     def __init__(
         self,
         size: int,
