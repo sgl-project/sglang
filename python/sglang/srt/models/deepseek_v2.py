@@ -55,6 +55,7 @@ from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
+from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -1034,6 +1035,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.kv_cache_dtype = global_server_args_dict["kv_cache_dtype"]
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
@@ -1415,41 +1417,24 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a)
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q[..., self.qk_nope_head_dim :] = q_pe
+
+        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        if (
+            forward_batch.mha_merge_prefix_extend
+            and sum(forward_batch.extend_prefix_lens_cpu) != 0
+        ):
+            kv_a, k_pe = self._get_mla_kv_buffer(
+                forward_batch.fetch_kv_indices(), q.dtype, forward_batch
+            )
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
-        k = torch.empty_like(q)
 
-        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
-        if (
-            _is_cuda
-            and (self.num_local_heads == 128)
-            and (self.qk_nope_head_dim == 128)
-            and (self.qk_rope_head_dim == 64)
-        ):
-            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
-        else:
-            k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
-
-        if not _is_npu:
-            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-            latent_cache[:, :, self.kv_lora_rank :] = k_pe
-
-            # Save latent cache
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-            )
-        else:
-            # To reduce a time-costing split operation
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-            )
-
+        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
     def forward_normal_core(self, q, k, v, forward_batch):
@@ -2259,20 +2244,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         for i in range(forward_batch.num_prefix_chunks):
             forward_batch.set_prefix_chunk_idx(i)
 
+            kv_indices = forward_batch.prefix_chunk_kv_indices[i]
             # Fetch latent cache from memory pool with precomputed chunked kv indices
-            latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
-                self.attn_mha.layer_id
+            kv_a_normed, k_pe = self._get_mla_kv_buffer(
+                kv_indices, q.dtype, forward_batch
             )
-            latent_cache = (
-                latent_cache_buf[forward_batch.prefix_chunk_kv_indices[i]]
-                .contiguous()
-                .to(q.dtype)
-            )
-
-            kv_a_normed, k_pe = latent_cache.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
-            kv_a_normed = kv_a_normed.squeeze(1).contiguous()
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -2308,6 +2284,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        if forward_batch.mha_merge_prefix_extend is None:
+            supported_attn = self.current_attention_backend in ["fa3", "flashinfer"]
+            seq_sum = sum(forward_batch.seq_lens_cpu)
+            forward_batch.mha_merge_prefix_extend = (
+                supported_attn and seq_sum <= forward_batch.get_max_chunk_capacity()
+            )
+
         # In normal mha, the k and v tensors will become overly large when the prefix length is long.
         # To avoid this, we split the kv cache into chunks and process them one after another.
         # Since mha is compute friendly, the for loop induced here will not introduce significant overhead.
@@ -2320,6 +2303,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
+        if forward_batch.mha_merge_prefix_extend:
+            return self.forward_normal_merge_kv_core(q, k, v, forward_batch)
+
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
@@ -2346,6 +2332,95 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def forward_normal_merge_kv_core(self, q, k, v, forward_batch):
+        has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        # Only initialize the info once
+        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+            forward_batch.num_prefix_chunks = 0
+            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
+                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+        forward_batch.mha_return_lse = False
+        # Do mha for extended part without prefix
+        forward_batch.set_attn_attend_prefix_cache(False)
+        return self.forward_normal_core(q, k, v, forward_batch)
+
+    def _set_mla_kv_buffer(
+        self,
+        latent_cache: torch.Tensor,
+        kv_a: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if _is_cuda:
+            # Save latent cache
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
+        elif _is_npu:
+            # To reduce a time-costing split operation
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
+        else:
+            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
+            latent_cache[:, :, self.kv_lora_rank :] = k_pe
+
+            # Save latent cache
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+            )
+
+    def _get_mla_kv_buffer(
+        self,
+        kv_indices: torch.Tensor,
+        dst_dtype: torch.dtype,
+        forward_batch: ForwardBatch,
+    ):
+        if _is_cuda:
+            kv_a, k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                self.attn_mha, kv_indices, dst_dtype
+            )
+            kv_a = kv_a.squeeze(1)
+        else:
+            latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
+                self.attn_mha.layer_id
+            )
+            latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+
+            kv_a, k_pe = latent_cache.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            kv_a = kv_a.squeeze(1).contiguous()
+        return kv_a, k_pe
+
+    def _concat_and_cast_mha_k(self, k_nope, k_pe, forward_batch):
+        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
+        k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
+        if (
+            _is_cuda
+            and (self.num_local_heads == 128)
+            and (self.qk_nope_head_dim == 128)
+            and (self.qk_rope_head_dim == 64)
+        ):
+            k = k_nope.new_empty(*k_shape)
+            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
+        elif _is_cuda:
+            # fa3 mha support fp8 inputs
+            if (
+                self.current_attention_backend == "fa3"
+                and self.kv_cache_dtype != "auto"
+            ):
+                attn_dtype = forward_batch.token_to_kv_pool.dtype
+            else:
+                attn_dtype = k_nope.dtype
+            k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
+            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+        else:
+            k = k_nope.new_empty(*k_shape)
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_pe
+        return k
 
 
 class DeepseekV2DecoderLayer(nn.Module):
@@ -3428,8 +3503,4 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
-class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
-    pass
-
-
-EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]
+EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM]
