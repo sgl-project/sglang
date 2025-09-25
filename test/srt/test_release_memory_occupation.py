@@ -28,8 +28,10 @@ data parallel size, we test it in verl.
 import time
 import unittest
 
-import sglang as sgl
 import torch
+from transformers import AutoModelForCausalLM
+
+import sglang as sgl
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -38,7 +40,6 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     CustomTestCase,
 )
-from transformers import AutoModelForCausalLM
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
 _DEBUG_EXTRA = False
@@ -49,7 +50,14 @@ def get_gpu_memory_gb():
 
 
 class TestReleaseMemoryOccupation(CustomTestCase):
-    def _setup_engine(self, model_name, mem_fraction_static=0.8, tp_size=1, ep_size=1, enable_weights_cpu_backup=False):
+    def _setup_engine(
+        self,
+        model_name,
+        mem_fraction_static=0.8,
+        tp_size=1,
+        ep_size=1,
+        enable_weights_cpu_backup=False,
+    ):
         """Common setup for engine and HF model."""
         engine = sgl.Engine(
             model_path=model_name,
@@ -151,14 +159,15 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             self.assertEqual(outputs, params["expect_output_after_update_weights"])
             engine.shutdown()
 
-
     def test_release_and_resume_occupation_with_weights_cpu_backup(self):
         # Test release and resume occupation with weights CPU backup
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
         print("Testing test_release_and_resume_occupation_with_weights_cpu_backup")
         engine = self._setup_engine(
-            model_name=model_name, mem_fraction_static=0.6, enable_weights_cpu_backup=True,
+            model_name=model_name,
+            mem_fraction_static=0.6,
+            enable_weights_cpu_backup=True,
         )
         params = self._common_test_params()
 
@@ -193,10 +202,8 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         )
 
         print("generate post resume")
-        outputs = engine.generate(params["prompt"], params["sampling_params"])[
-            "text"
-        ]
-        self.assertEqual(outputs, params["expect_output_after_update_weights"])
+        outputs = engine.generate(params["prompt"], params["sampling_params"])["text"]
+        self.assertEqual(outputs, params["expect_output_before_update_weights"])
         engine.shutdown()
 
     def test_multi_stage_release_and_resume(self):

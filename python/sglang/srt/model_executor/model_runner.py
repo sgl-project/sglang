@@ -28,6 +28,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -764,7 +765,10 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS, enable_cpu_backup=self.server_args.enable_weights_cpu_backup):
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_WEIGHTS,
+            enable_cpu_backup=self.server_args.enable_weights_cpu_backup,
+        ):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
