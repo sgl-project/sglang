@@ -38,7 +38,12 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.quantization.int8_kernel import (
+    per_token_quant_int8,
+    naive_per_token_quant_int8,
+    naive_w8a8_per_token_matmul,
+    naive_w8a8_per_column_moe,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     apply_module_patch,
@@ -338,12 +343,10 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
-            _amx_process_weight_after_loading(layer, ["weight"])
+        if _is_cpu and _is_cpu_amx_available:
+                _amx_process_weight_after_loading(layer, ["weight"])
         else:
+            layer.use_intel_amx_backend = False
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
@@ -384,15 +387,21 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if use_intel_amx_backend(layer):
-            return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
-                x,
-                layer.weight,
-                layer.weight_scale,
-                bias,
-                x.dtype,
-                True,  # is_vnni
-            )
+        if _is_cpu:
+            if use_intel_amx_backend(layer):
+                return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
+                    x,
+                    layer.weight,
+                    layer.weight_scale,
+                    bias,
+                    x.dtype,
+                    True,  # is_vnni
+                )
+            else:
+                x_q, x_scale = naive_per_token_quant_int8(x)
+                return naive_w8a8_per_token_matmul(
+                    x_q, layer.weight, x_scale, layer.weight_scale, bias, x.dtype
+                )
 
         x_q, x_scale = per_token_quant_int8(x)
 
@@ -480,12 +489,10 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
+        if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
+            layer.use_intel_amx_backend = False
             layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
             layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         layer.w13_weight_scale = Parameter(
@@ -511,29 +518,40 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        if use_intel_amx_backend(layer):
+        if all(w.device.type == "cpu" for w in [layer.w13_weight, layer.w2_weight]):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
                 self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
-            output = torch.ops.sgl_kernel.fused_experts_cpu(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                False,  # inplace See [Note] inplace should be False in fused_experts.
-                True,  # use_int8_w8a8
-                False,  # use_fp8_w8a16
-                layer.w13_weight_scale,  # w1_scale
-                layer.w2_weight_scale,  # w2_scale
-                None,  # block_size
-                layer.w13_input_scale,  # a1_scale
-                layer.w2_input_scale,  # a2_scale
-                True,  # is_vnni
-            )
+            if use_intel_amx_backend(layer):
+                output = torch.ops.sgl_kernel.fused_experts_cpu(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    False,  # inplace See [Note] inplace should be False in fused_experts.
+                    True,  # use_int8_w8a8
+                    False,  # use_fp8_w8a16
+                    layer.w13_weight_scale,  # w1_scale
+                    layer.w2_weight_scale,  # w2_scale
+                    None,  # block_size
+                    layer.w13_input_scale,  # a1_scale
+                    layer.w2_input_scale,  # a2_scale
+                    True,  # is_vnni
+                )
+            else:
+                output = naive_w8a8_per_column_moe(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale,
+                    layer.w2_weight_scale,
+                    topk_weights,
+                    topk_ids,
+                )
             return StandardCombineInput(hidden_states=output)
 
         quant_info = TritonMoeQuantInfo(

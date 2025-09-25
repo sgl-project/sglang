@@ -423,3 +423,140 @@ def w8a8_block_int8_matmul(
     )
 
     return C
+
+
+def naive_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    """This function is a naive implementation of silu_and_mul with native torch ops.
+
+    Args:
+        x: The input tensor, e.g., activation.
+
+    Returns:
+        torch.Tensor: The result of silu_and_mul.
+    """
+    dtype = x.dtype
+    x = x.to(torch.float32)
+    d = x.shape[-1] // 2
+    out = torch.nn.functional.silu(x[..., :d]) * x[..., d:]
+    return out.to(dtype)
+
+
+def naive_per_token_quant_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """This function is a naive implementation of per token int8 quantization.
+
+    Args:
+        x: The input tensor to be quantized.
+
+    Returns:
+        x_q: The quantized tensor;
+        scale_x: The scaling factor of the quantization.
+    """
+    x = x.float()
+    absmax = x.abs().max(dim=-1).values
+    absmax = absmax.clamp_min(1e-7).unsqueeze(-1)
+    scale_x = absmax / 127
+    x_q = x.mul(127 / absmax)
+    x_q = torch.round(x_q).to(torch.int8)
+
+    return x_q, scale_x
+
+
+def naive_w8a8_per_token_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """This function is a naive impl. of matrix multiplication
+        that supports per-token input quantization and per-column weight quantization.
+
+    Args:
+        A: The input tensor, e.g., activation;
+        B: The input tensor, e.g., weight;
+        As: The per-token quantization scale for `A`;
+        Bs: The per-column quantization scale for `B`;
+        bias: (optional) The bias that need to be added to the output;
+        output_dtype: Desired data type of the output result.
+
+    Returns:
+        torch.Tensor: The output result.
+    """
+    A = A.to(torch.float32)
+    B = B.to(torch.float32)
+
+    assert B.ndim == 2, "B must be a 2D tensor"
+    assert A.shape[-1] == B.shape[0], "Dimension mismatch"
+
+    # Reshape input
+    M = A.numel() // A.shape[-1]
+    N, K = B.shape
+    origin_C_shape = A.shape[:-1] + (K,)
+    A = A.reshape(M, N)
+
+    # As is per-token [M, 1], Bs is per-column [1, K]
+    C = torch.matmul(A, B)  # [M, K]
+    C = As * C * Bs.view(1, -1)  # Broadcast per-column scale
+
+    if bias is not None:
+        C.add_(bias.view(1, -1))
+
+    return C.reshape(origin_C_shape).to(output_dtype)
+
+
+def naive_w8a8_per_column_moe(
+    a: torch.Tensor,
+    w1,
+    w2,
+    w1_s,
+    w2_s,
+    topk_weight,
+    topk_ids,
+):
+    """This function is a naive implementation that
+        performs fused moe with per-column int8 quantization using native torch.
+
+    Args:
+
+
+
+    """
+    print(type(topk_ids))
+    print(f"topk_ids shape: {topk_ids.shape}")
+    topk = topk_ids.shape[0]
+    B, D = a.shape
+    # Perform per-token quantization
+    a_q, a_s = naive_per_token_quant_int8(a)
+    # Repeat tokens to match topk
+    a_q = a_q.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+    # Also repeat the scale
+    a_s = a_s.view(B, -1, 1).repeat(1, topk, 1).reshape(-1, 1)  # [B*topk, 1]
+
+    out = torch.zeros(B * topk, w2.shape[1], dtype=torch.float32, device=a.device)
+
+    # Calculate routing
+    topk_weight = topk_weight.view(-1)
+    topk_ids = topk_ids.view(-1)
+    # Process each expert
+    for i in range(w1.shape[0]):
+        mask = topk_ids == i
+        if mask.sum():
+            # First MLP layer: note that a_s is now per-token
+            inter_out = naive_w8a8_per_token_matmul(
+                a_q[mask], w1[i].t(), a_s[mask], w1_s[i], output_dtype=torch.float32
+            )
+            # Activation function
+            act_out = naive_silu_and_mul(inter_out)
+            # Quantize activation output with per-token
+            act_out_q, act_out_s = naive_per_token_quant_int8(act_out)
+            # Second MLP layer
+            out[mask] = naive_w8a8_per_token_matmul(
+                act_out_q, w2[i].t(), act_out_s, w2_s[i], output_dtype=torch.float32
+            )
+    # Apply routing weights and sum
+    return (
+        (out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype))
+        .sum(dim=1)
+        .to(a.dtype)
+    )
