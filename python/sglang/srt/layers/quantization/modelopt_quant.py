@@ -152,12 +152,9 @@ class ModelOptFp8Config(QuantizationConfig):
                 if kv_cache_scheme.upper() == "FP8":
                     kv_cache_type = "float"
                     kv_cache_bits = 8
-            
+
             # Now, safely use the extracted values
-            if (
-                kv_cache_type == "float"
-                and kv_cache_bits == 8
-            ):
+            if kv_cache_type == "float" and kv_cache_bits == 8:
                 kv_cache_quant_method = "FP8"
 
             # Map 'ignore' field to 'exclude_modules'
@@ -607,7 +604,7 @@ class ModelOptFp4Config(QuantizationConfig):
             if not kv_cache_quant_algo:
                 # For config.json format, derive from kv_cache_scheme if available
                 kv_cache_scheme = config.get("kv_cache_scheme")
-                
+
                 kv_cache_type = None
                 kv_cache_bits = None
                 if isinstance(kv_cache_scheme, dict):
@@ -620,12 +617,9 @@ class ModelOptFp4Config(QuantizationConfig):
                     if kv_cache_scheme.upper() == "FP8":
                         kv_cache_type = "float"
                         kv_cache_bits = 8
-            
+
                 # Now, safely use the extracted values in the original logic
-                if (
-                    kv_cache_type == "float"
-                    and kv_cache_bits == 8
-                ):
+                if kv_cache_type == "float" and kv_cache_bits == 8:
                     kv_cache_quant_algo = "FP8"
                 else:
                     kv_cache_quant_algo = "auto"
