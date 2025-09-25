@@ -438,6 +438,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         regex = None
         json_schema = None
         ebnf_grammar = None
+        structural_tag = None
 
         if grpc_params.HasField("regex"):
             regex = grpc_params.regex
@@ -445,6 +446,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             json_schema = grpc_params.json_schema
         elif grpc_params.HasField("ebnf_grammar"):
             ebnf_grammar = grpc_params.ebnf_grammar
+        elif grpc_params.HasField("structural_tag"):
+            structural_tag = grpc_params.structural_tag
 
         return SGLSamplingParams(
             temperature=grpc_params.temperature or 1.0,
@@ -465,6 +468,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             regex=regex,
             json_schema=json_schema,
             ebnf=ebnf_grammar,
+            structural_tag=structural_tag,
             n=grpc_params.n or 1,
             ignore_eos=grpc_params.ignore_eos,
         )
