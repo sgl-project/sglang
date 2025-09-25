@@ -231,6 +231,7 @@ impl Router {
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
             history_backend: config::HistoryBackend::Memory,
+            oracle: None,
         })
     }
 }
