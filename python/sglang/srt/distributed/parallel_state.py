@@ -37,7 +37,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
-from torch.distributed import Backend, ProcessGroup
+from torch.distributed import Backend, ProcessGroup, ProcessGroupNCCL
 
 from sglang.srt.utils import (
     direct_register_custom_op,
@@ -66,6 +66,14 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
+
+import dataclasses
+
+
+@dataclasses.dataclass
+class P2PWork:
+    work: Optional[torch.distributed.Work]
+    payload: Optional[torch.Tensor]
 
 
 def _split_tensor_dict(
@@ -861,7 +869,12 @@ class GroupCoordinator:
         torch.distributed.all_gather_object(objs, obj, group=self.cpu_group)
         return objs
 
-    def send_object(self, obj: Any, dst: int) -> None:
+    def send_object(
+        self,
+        obj: Any,
+        dst: int,
+        async_send: bool = False,
+    ) -> List[P2PWork]:
         """Send the input object list to the destination rank."""
         """NOTE: `dst` is the local rank of the destination rank."""
 
@@ -871,30 +884,38 @@ class GroupCoordinator:
             "Invalid destination rank. Destination rank is the same "
             "as the current rank."
         )
-
         # Serialize object to tensor and get the size as well
-        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8).cuda(
-            device=torch.cuda.current_device()
-        )
-
+        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+        send_func = torch.distributed.isend if async_send else torch.distributed.send
         size_tensor = torch.tensor(
             [object_tensor.numel()],
             dtype=torch.long,
             device="cpu",
         )
         # Send object size
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
-
-        # Send object
-        torch.distributed.send(
-            object_tensor,
-            dst=self.ranks[dst],
-            group=self.device_group,
+        p2p_work = []
+        size_work = send_func(
+            size_tensor,
+            self.ranks[dst],
+            group=self.cpu_group,
         )
+        if async_send:
+            p2p_work.append(P2PWork(size_work, size_tensor))
 
-        return None
+        object_work = send_func(
+            object_tensor,
+            self.ranks[dst],
+            group=self.cpu_group,
+        )
+        if async_send:
+            p2p_work.append(P2PWork(object_work, object_tensor))
 
-    def recv_object(self, src: int) -> Any:
+        return p2p_work
+
+    def recv_object(
+        self,
+        src: int,
+    ) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
 
@@ -903,30 +924,27 @@ class GroupCoordinator:
         assert (
             src != self.rank_in_group
         ), "Invalid source rank. Source rank is the same as the current rank."
-
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
-        rank_size = torch.distributed.recv(
+        work = torch.distributed.irecv(
             size_tensor, src=self.ranks[src], group=self.cpu_group
         )
+        work.wait()
 
         # Tensor to receive serialized objects into.
-        object_tensor = torch.empty(  # type: ignore[call-overload]
+        object_tensor: Any = torch.empty(  # type: ignore[call-overload]
             size_tensor.item(),  # type: ignore[arg-type]
             dtype=torch.uint8,
-            device=torch.cuda.current_device(),
+            device="cpu",
         )
 
-        rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.device_group
+        work = torch.distributed.irecv(
+            object_tensor, src=self.ranks[src], group=self.cpu_group
         )
+        work.wait()
 
-        assert (
-            rank_object == rank_size
-        ), "Received object sender rank does not match the size sender rank."
-
-        obj = pickle.loads(object_tensor.cpu().numpy())
+        obj = pickle.loads(object_tensor.numpy())
 
         return obj
 
@@ -1017,7 +1035,8 @@ class GroupCoordinator:
         tensor_dict: Dict[str, Union[torch.Tensor, Any]],
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
-    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        async_send=False,
+    ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
         """
@@ -1047,7 +1066,11 @@ class GroupCoordinator:
         # 1. Superior D2D transfer bandwidth
         # 2. Ability to overlap send and recv operations
         # Thus the net performance gain justifies this approach.
-        self.send_object(metadata_list, dst=dst)
+        if async_send:
+            send_func = torch.distributed.isend
+        else:
+            send_func = torch.distributed.send
+        p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
@@ -1056,16 +1079,15 @@ class GroupCoordinator:
             # send-allgather: send only a slice, then do allgather.
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
-
             if tensor.is_cpu:
                 # use metadata_group for CPU tensors
-                torch.distributed.send(
-                    tensor, dst=self.ranks[dst], group=metadata_group
-                )
+                work = send_func(tensor, self.ranks[dst], group=metadata_group)
+                p2p_works.append(P2PWork(work, tensor))
             else:
                 # use group for GPU tensors
-                torch.distributed.send(tensor, dst=self.ranks[dst], group=group)
-        return None
+                work = send_func(tensor, self.ranks[dst], group=group)
+                p2p_works.append(P2PWork(work, tensor))
+        return p2p_works
 
     def recv_tensor_dict(
         self,
@@ -1113,12 +1135,16 @@ class GroupCoordinator:
 
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
-                    torch.distributed.recv(
+                    work = torch.distributed.irecv(
                         tensor, src=self.ranks[src], group=metadata_group
                     )
+                    work.wait()
                 else:
                     # use group for GPU tensors
-                    torch.distributed.recv(tensor, src=self.ranks[src], group=group)
+                    work = torch.distributed.irecv(
+                        tensor, src=self.ranks[src], group=group
+                    )
+                    work.wait()
                 if use_all_gather:
                     # do the allgather
                     tensor = all_gather_group.all_gather(tensor, dim=0)  # type: ignore
