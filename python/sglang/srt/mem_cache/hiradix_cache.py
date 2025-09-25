@@ -170,7 +170,7 @@ class HiRadixCache(RadixCache):
         frequency = node.hit_count
 
         # high value = big size Node which is frequently & recently accessed
-        value = frequency / (recency + 1)  # +1 避免除零
+        value = frequency / (recency + 1)  # +1 avoid dividing by 0
 
         
         value *= len(node.value) 

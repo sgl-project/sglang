@@ -473,7 +473,7 @@ class HiCacheController:
         if len(self.write_queue) == 0:
             return
 
-        op = CacheOperation.merge_ops(self.write_queue)        
+        op = CacheOperation.merge_ops(self.write_queue)
         host_indices, device_indices = self.move_indices(op)
         self.write_queue.clear()
 
