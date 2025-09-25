@@ -91,7 +91,6 @@ class ModelConfig:
             remote_instance_weight_loader_send_weights_group_ports
         )
         self.modelopt_quant = modelopt_quant
-        self.impl = impl
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
