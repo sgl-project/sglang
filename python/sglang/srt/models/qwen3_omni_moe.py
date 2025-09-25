@@ -581,7 +581,6 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         for name, loaded_weight in weights:
             name = name.replace(r"model.language_model.", r"model.")
 
-            # print(f"{name=}")
             if ("talker" in name or "code2wav" in name) and not self.enable_talker:
                 continue
 

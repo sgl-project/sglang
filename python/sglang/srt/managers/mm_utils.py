@@ -600,10 +600,8 @@ def embed_mm_inputs(
     input_ids.clamp_(min=0, max=vocab_size - 1)
     inputs_embeds = input_embedding(input_ids)
 
-    # 4. scatter embeddings into input embedding
-
     # deepstack embedding
-    if use_deepstack is not None:
+    if use_deepstack:
         num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
 
         deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
@@ -618,6 +616,7 @@ def embed_mm_inputs(
 
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
+    # 4. scatter embeddings into input embedding
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
     ):

@@ -1346,7 +1346,6 @@ class MRotaryEmbedding(RotaryEmbedding):
             )
             image_idx, video_idx, audio_idx = 0, 0, 0
             for i, current_input_ids in enumerate(total_input_ids):
-                # current_input_ids = current_input_ids[attention_mask[i]]
                 image_nums, video_nums, audio_nums = 0, 0, 0
                 vision_start_indices = torch.argwhere(
                     current_input_ids == vision_start_token_id
