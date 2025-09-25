@@ -330,6 +330,9 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 @with_nvml_context
 def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
+    if os.getenv("SGLANG_SKIP_NVLINK_CHECK", "0") == "1":
+        logger.info("Skipping NVLink check.")
+        return True    
     if _is_hip:
         """
         query if the set of gpus are fully connected by xgmi (1 hop)
