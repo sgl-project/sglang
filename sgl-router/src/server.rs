@@ -1,15 +1,15 @@
 use crate::{
-    config::{ConnectionMode, HistoryBackend, RouterConfig},
+    config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{WorkerManager, WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
-    middleware::{self, QueuedRequest, TokenBucket},
+    middleware::{self, AuthConfig, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, ResponsesRequest, V1RerankReqInput,
+            RerankRequest, ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -28,7 +28,7 @@ use axum::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
@@ -121,16 +121,56 @@ async fn sink_handler() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn liveness(State(state): State<Arc<AppState>>) -> Response {
-    state.router.liveness()
+async fn liveness() -> Response {
+    (StatusCode::OK, "OK").into_response()
 }
 
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
-    state.router.readiness()
+    let workers = state.context.worker_registry.get_all();
+    let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
+
+    let is_ready = if state.context.router_config.enable_igw {
+        !healthy_workers.is_empty()
+    } else {
+        match &state.context.router_config.mode {
+            RoutingMode::PrefillDecode { .. } => {
+                let has_prefill = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }));
+                let has_decode = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Decode));
+                has_prefill && has_decode
+            }
+            RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
+            RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
+        }
+    };
+
+    if is_ready {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ready",
+                "healthy_workers": healthy_workers.len(),
+                "total_workers": workers.len()
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not ready",
+                "reason": "insufficient healthy workers"
+            })),
+        )
+            .into_response()
+    }
 }
 
-async fn health(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    state.router.health(req).await
+async fn health(_state: State<Arc<AppState>>) -> Response {
+    liveness().await
 }
 
 async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -224,10 +264,11 @@ async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
     headers: http::HeaderMap,
+    Query(params): Query<ResponsesGetParams>,
 ) -> Response {
     state
         .router
-        .get_response(Some(&headers), &response_id)
+        .get_response(Some(&headers), &response_id, &params)
         .await
 }
 
@@ -274,6 +315,16 @@ async fn add_worker(
     State(state): State<Arc<AppState>>,
     Query(AddWorkerQuery { url, api_key }): Query<AddWorkerQuery>,
 ) -> Response {
+    // Warn if router has API key but worker is being added without one
+    if state.context.router_config.api_key.is_some() && api_key.is_none() {
+        warn!(
+            "Adding worker {} without API key while router has API key configured. \
+            Worker will be accessible without authentication. \
+            If the worker requires the same API key as the router, please specify it explicitly.",
+            url
+        );
+    }
+
     let result = WorkerManager::add_worker(&url, &api_key, &state.context).await;
 
     match result {
@@ -300,17 +351,93 @@ async fn remove_worker(
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    state.router.flush_cache().await
+    match WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
+        .await
+    {
+        Ok(result) => {
+            if result.failed.is_empty() {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "success",
+                        "message": result.message,
+                        "workers_flushed": result.successful.len(),
+                        "total_http_workers": result.http_workers,
+                        "total_workers": result.total_workers
+                    })),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    Json(json!({
+                        "status": "partial_success",
+                        "message": result.message,
+                        "successful": result.successful,
+                        "failed": result.failed.into_iter().map(|(url, err)| json!({
+                            "worker": url,
+                            "error": err
+                        })).collect::<Vec<_>>(),
+                        "total_http_workers": result.http_workers,
+                        "total_workers": result.total_workers
+                    })),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => {
+            error!("Failed to flush cache: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": format!("Failed to flush cache: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    state.router.get_worker_loads().await
+    let result =
+        WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
+            .await;
+
+    let loads: Vec<Value> = result
+        .loads
+        .iter()
+        .map(|info| {
+            json!({
+                "worker": &info.worker,
+                "load": info.load
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "workers": loads
+        })),
+    )
+        .into_response()
 }
 
 async fn create_worker(
     State(state): State<Arc<AppState>>,
     Json(config): Json<WorkerConfigRequest>,
 ) -> Response {
+    // Warn if router has API key but worker is being added without one
+    if state.context.router_config.api_key.is_some() && config.api_key.is_none() {
+        warn!(
+            "Adding worker {} without API key while router has API key configured. \
+            Worker will be accessible without authentication. \
+            If the worker requires the same API key as the router, please specify it explicitly.",
+            config.url
+        );
+    }
+
     let result = WorkerManager::add_worker_from_config(&config, &state.context).await;
 
     match result {
@@ -422,6 +549,7 @@ pub struct ServerConfig {
 
 pub fn build_app(
     app_state: Arc<AppState>,
+    auth_config: AuthConfig,
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
@@ -447,6 +575,10 @@ pub fn build_app(
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             middleware::concurrency_limit_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
         ));
 
     let public_routes = Router::new()
@@ -463,19 +595,28 @@ pub fn build_app(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
-        .route("/get_loads", get(get_loads));
+        .route("/get_loads", get(get_loads))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
 
     let worker_routes = Router::new()
         .route("/workers", post(create_worker))
         .route("/workers", get(list_workers_rest))
         .route("/workers/{url}", get(get_worker))
-        .route("/workers/{url}", delete(delete_worker));
+        .route("/workers/{url}", delete(delete_worker))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
 
     Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
+        .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
@@ -627,8 +768,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ]
     });
 
+    let auth_config = AuthConfig {
+        api_key: config.router_config.api_key.clone(),
+    };
+
     let app = build_app(
         app_state,
+        auth_config,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
