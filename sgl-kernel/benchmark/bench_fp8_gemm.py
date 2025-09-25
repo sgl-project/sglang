@@ -125,7 +125,7 @@ def benchmark(batch_size, provider, N, K):
         a_fp8, scale_a_fp8 = vllm_scaled_fp8_quant(a, scale_a)
         b_fp8, scale_b_fp8 = vllm_scaled_fp8_quant(b, scale_b)
         b_fp8 = b_fp8.t()
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: vllm_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype),
             quantiles=quantiles,
         )
@@ -133,7 +133,7 @@ def benchmark(batch_size, provider, N, K):
         a_fp8, scale_a_fp8 = sglang_scaled_fp8_quant(a, scale_a)
         b_fp8, scale_b_fp8 = sglang_scaled_fp8_quant(b, scale_b)
         b_fp8 = b_fp8.t()
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: sgl_scaled_mm(
                 a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=None
             ),
@@ -177,8 +177,6 @@ if __name__ == "__main__":
     KN_model_names = prepare_shapes(args)
     for K, N, model_name in KN_model_names:
         print(f"{model_name} N={N} K={K}: ")
-        benchmark.run(
-            print_data=True, show_plots=True, save_path="bench_fp8_res", N=N, K=K
-        )
+        benchmark.run(print_data=True, N=N, K=K)
 
     print("Benchmark finished!")
