@@ -742,7 +742,7 @@ class HybridLinearAttentionBackend(AttentionBackend):
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             metadata.max_seq_len_k = max_len
             metadata.req_pool_indices = req_pool_indices_long
-            normal_decode_set_medadata(
+            normal_decode_set_metadata(
                 metadata,
                 self.req_to_token,
                 self.req_to_constant,
