@@ -164,6 +164,8 @@ def _convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
     # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
     if len(tokens) < 2:
         return []
+    if isinstance(tokens[0], tuple):
+        return tokens
     return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
 
 
@@ -301,7 +303,7 @@ class RadixCache(BasePrefixCache):
             value = torch.tensor(key.token_ids, dtype=torch.int64)
 
         if self.is_eagle:
-            # EAGLE uses bigram key, the key length should -1
+            # Make sure the value len equal to the EAGLE bigram key len
             value = value[: len(key)]
 
         return self._insert_helper(self.root_node, key, value)
@@ -317,41 +319,37 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        all_token_len = len(token_ids)
+        actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, : all_token_len
         ]
 
         if self.page_size != 1:
-            if self.is_eagle:
-                page_aligned_len = (
-                    (len(kv_indices) - 1) // self.page_size * self.page_size
-                ) + 1
-            else:
-                page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_len = actual_kv_len // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
-            page_aligned_len = len(kv_indices)
+            page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            if self.is_eagle:
+                self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        
+        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
-            RadixKey(token_ids[:page_aligned_len], req.extra_key),
+            RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
             page_aligned_kv_indices,
         )
         self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
+            kv_indices[req.last_matched_prefix_len : new_prefix_len]
         )
-
-        if self.is_eagle:
-            # For EAGLE, len(bigram_key) == len(kv_indices) - 1, the last kv index is not inserted to the tree, which should be freed
-            # For page_size > 1, only free it when the last kv index in an additional page
-            free_len = len(kv_indices) - page_aligned_len + 1
-            if free_len == 1:
-                self.token_to_kv_pool_allocator.free(kv_indices[-free_len:])
-
+        
+        req.last_matched_prefix_len = new_prefix_len
+        
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
@@ -362,24 +360,25 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = req.fill_ids
+        all_token_len = len(token_ids)
+        # The actual kv len for EAGLE is len(token_ids), since EAGLE uses bigram key
+        actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, : all_token_len
         ]
 
         if self.page_size != 1:
-            if self.is_eagle:
-                page_aligned_len = (
-                    (len(kv_indices) - 1) // self.page_size * self.page_size
-                ) + 1
-            else:
-                page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_len = actual_kv_len // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )
         else:
-            page_aligned_len = len(kv_indices)
+            page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
-        page_aligned_token_ids = token_ids[:page_aligned_len]
+        
+        # For EAGLE, the page_aligned_len is for the bigram key, the normal key len should +1
+        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        page_aligned_token_ids = token_ids[:page_aligned_token_len]
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
@@ -388,7 +387,7 @@ class RadixCache(BasePrefixCache):
             chunked=chunked,
         )
         self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
+            kv_indices[req.last_matched_prefix_len : new_prefix_len]
         )
 
         # The prefix indices could be updated, reuse it
@@ -396,16 +395,22 @@ class RadixCache(BasePrefixCache):
             RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key)
         )
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
-            new_indices[len(req.prefix_indices) :],
+            (req.req_pool_idx, slice(req.last_matched_prefix_len, len(new_indices))),
+            new_indices[req.last_matched_prefix_len :],
         )
+
+        # The last_matched_prefix_len is not always equal to len(req.prefix_indices)
+        # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
+        # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak. 
+        # So we introduce this `last_matched_prefix_len` field to make sure the partial part can be freed correctly.
+        req.last_matched_prefix_len = len(new_indices)
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if self.page_size != 1:
-            # TODO: check EAGLE chunked prefill
+            # Handle partial page, the partial part should be freed in the next cache_unfinished_req and final cache_finished_req.
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
             )
