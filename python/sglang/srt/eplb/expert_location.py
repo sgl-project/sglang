@@ -457,6 +457,9 @@ def _find_nearest_expert(
     num_gpus_per_node: int,
     num_local_node_physical_experts: int,
 ) -> int:
+    if len(candidate_physical_expert_ids) == 1:
+        return candidate_physical_expert_ids[0]
+
     same_gpu_physical_expert_ids = [
         physical_expert_id
         for physical_expert_id in candidate_physical_expert_ids
