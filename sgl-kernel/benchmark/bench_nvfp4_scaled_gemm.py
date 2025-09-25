@@ -165,8 +165,6 @@ if __name__ == "__main__":
     KN_model_names = prepare_shapes(args)
     for K, N, model_name in KN_model_names:
         print(f"{model_name} N={N} K={K}: ")
-        benchmark.run(
-            print_data=True, show_plots=True, save_path="bench_fp4_res", N=N, K=K
-        )
+        benchmark.run(print_data=True, N=N, K=K)
 
     print("Benchmark finished!")
