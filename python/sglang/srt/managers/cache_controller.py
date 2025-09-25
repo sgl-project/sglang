@@ -289,6 +289,14 @@ class HiCacheController:
                 )
 
                 self.storage_backend = MooncakeStore(self.storage_config)
+            elif storage_backend == "aibrix":
+                from sglang.srt.mem_cache.storage.aibrix_kvcache.aibrix_kvcache_storage import (
+                    AibrixKVCacheStorage,
+                )
+
+                self.storage_backend = AibrixKVCacheStorage(
+                    self.storage_config, self.mem_pool_host
+                )
             elif storage_backend == "hf3fs":
                 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
                     HiCacheHF3FS,
@@ -462,7 +470,6 @@ class HiCacheController:
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
-        self.mem_pool_host.protect_write(host_indices)
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -486,7 +493,6 @@ class HiCacheController:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
-            self.mem_pool_host.complete_io(op.host_indices)
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -510,7 +516,6 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
-        self.mem_pool_host.protect_load(host_indices)
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -555,7 +560,6 @@ class HiCacheController:
                     self.io_backend,
                 )
                 producer_event.complete(i)
-            self.mem_pool_host.complete_io(op.host_indices)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
@@ -573,29 +577,16 @@ class HiCacheController:
         )
         return producer_id
 
-    def evict_device(
-        self, device_indices: torch.Tensor, host_indices: torch.Tensor
-    ) -> int:
-        if self.mem_pool_host.is_synced(host_indices):
-            self.mem_pool_device_allocator.free(device_indices)
-            self.mem_pool_host.update_backup(host_indices)
-            return len(device_indices)
-        else:
-            raise ValueError(
-                f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
-            )
+    def evict_device(self, device_indices: torch.Tensor) -> int:
+        self.mem_pool_device_allocator.free(device_indices)
+        return len(device_indices)
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:
             raise ValueError("Other eviction policies are not supported yet.")
 
-        if self.mem_pool_host.is_backup(host_indices):
-            self.mem_pool_host.free(host_indices)
-            return len(host_indices)
-        else:
-            raise ValueError(
-                f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
-            )
+        self.mem_pool_host.free(host_indices)
+        return len(host_indices)
 
     def prefetch(
         self,

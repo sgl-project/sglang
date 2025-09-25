@@ -208,6 +208,7 @@ mod test_pd_routing {
                 model_path: None,
                 tokenizer_path: None,
                 history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+                oracle: None,
             };
 
             let app_context =
