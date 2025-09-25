@@ -8,6 +8,23 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
 ## Common launch commands
 
+- To use a configuration file, create a YAML file with your server arguments and specify it with `--config`. CLI arguments will override config file values.
+
+  ```bash
+  # Create config.yaml
+  cat > config.yaml << EOF
+  model-path: meta-llama/Meta-Llama-3-8B-Instruct
+  host: 0.0.0.0
+  port: 30000
+  tensor-parallel-size: 2
+  enable-metrics: true
+  log-requests: true
+  EOF
+
+  # Launch server with config file
+  python -m sglang.launch_server --config config.yaml
+  ```
+
 - To enable multi-GPU tensor parallelism, add `--tp 2`. If it reports the error "peer access is not supported between these two devices", add `--enable-p2p-check` to the server launch command.
 
   ```bash
@@ -43,10 +60,20 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
   ```bash
   # Node 0
-  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --dist-init-addr sgl-dev-0:50000 --nnodes 2 --node-rank 0
+  python -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+    --tp 4 \
+    --dist-init-addr sgl-dev-0:50000 \
+    --nnodes 2 \
+    --node-rank 0
 
   # Node 1
-  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 4 --dist-init-addr sgl-dev-0:50000 --nnodes 2 --node-rank 1
+  python -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+    --tp 4 \
+    --dist-init-addr sgl-dev-0:50000 \
+    --nnodes 2 \
+    --node-rank 1
   ```
 
 Please consult the documentation below and [server_args.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py) to learn more about the arguments you may provide when launching a server.
@@ -55,6 +82,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
+| `--config` | Path to a YAML configuration file containing server arguments. Arguments in the config file will be merged with command-line arguments, with CLI arguments taking precedence. | None |
 | `--model-path` | The path of the model weights. This can be a local folder or a Hugging Face repo ID. | None |
 | `--tokenizer-path` | The path of the tokenizer. | None |
 | `--tokenizer-mode` | Tokenizer mode. 'auto' will use the fast tokenizer if available, and 'slow' will always use the slow tokenizer. | auto |

@@ -1,12 +1,13 @@
 use axum::{
-    extract::Request, extract::State, http::HeaderValue, http::StatusCode, middleware::Next,
-    response::IntoResponse, response::Response,
+    body::Body, extract::Request, extract::State, http::header, http::HeaderValue,
+    http::StatusCode, middleware::Next, response::IntoResponse, response::Response,
 };
 use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
@@ -16,6 +17,49 @@ pub use crate::core::token_bucket::TokenBucket;
 
 use crate::metrics::RouterMetrics;
 use crate::server::AppState;
+
+#[derive(Clone)]
+pub struct AuthConfig {
+    pub api_key: Option<String>,
+}
+
+/// Middleware to validate Bearer token against configured API key
+/// Only active when router has an API key configured
+pub async fn auth_middleware(
+    State(auth_config): State<AuthConfig>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if let Some(expected_key) = &auth_config.api_key {
+        // Extract Authorization header
+        let auth_header = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok());
+
+        match auth_header {
+            Some(header_value) if header_value.starts_with("Bearer ") => {
+                let token = &header_value[7..]; // Skip "Bearer "
+                                                // Use constant-time comparison to prevent timing attacks
+                let token_bytes = token.as_bytes();
+                let expected_bytes = expected_key.as_bytes();
+
+                // Check if lengths match first (this is not constant-time but necessary)
+                if token_bytes.len() != expected_bytes.len() {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+
+                // Constant-time comparison of the actual values
+                if token_bytes.ct_eq(expected_bytes).unwrap_u8() != 1 {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+
+    Ok(next.run(request).await)
+}
 
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
@@ -113,38 +157,14 @@ where
 
         let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
 
-        // Insert request ID into request extensions
+        // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));
-
-        // Create a span with the request ID for this request
-        let span = tracing::info_span!(
-            "http_request",
-            method = %req.method(),
-            uri = %req.uri(),
-            version = ?req.version(),
-            request_id = %request_id
-        );
-
-        // Log within the span
-        let _enter = span.enter();
-        tracing::info!(
-            target: "sglang_router_rs::request",
-            "started processing request"
-        );
-        drop(_enter);
-
-        // Capture values we need in the async block
-        let method = req.method().clone();
-        let uri = req.uri().clone();
-        let version = req.version();
 
         // Call the inner service
         let future = self.inner.call(req);
 
         Box::pin(async move {
-            let start_time = Instant::now();
             let mut response = future.await?;
-            let latency = start_time.elapsed();
 
             // Add request ID to response headers
             response.headers_mut().insert(
@@ -152,36 +172,6 @@ where
                 HeaderValue::from_str(&request_id)
                     .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
             );
-
-            // Log the response with proper request ID in span
-            let status = response.status();
-            let span = tracing::info_span!(
-                "http_request",
-                method = %method,
-                uri = %uri,
-                version = ?version,
-                request_id = %request_id,
-                status = %status,
-                latency = ?latency
-            );
-
-            let _enter = span.enter();
-            if status.is_server_error() {
-                tracing::error!(
-                    target: "sglang_router_rs::response",
-                    "request failed with server error"
-                );
-            } else if status.is_client_error() {
-                tracing::warn!(
-                    target: "sglang_router_rs::response",
-                    "request failed with client error"
-                );
-            } else {
-                tracing::info!(
-                    target: "sglang_router_rs::response",
-                    "finished processing request"
-                );
-            }
 
             Ok(response)
         })
@@ -225,7 +215,11 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
-        // Don't log here - we already log in RequestIdService with the proper request_id
+        // Log the request start
+        info!(
+            target: "sglang_router_rs::request",
+            "started processing request"
+        );
     }
 }
 
@@ -251,7 +245,24 @@ impl<B> OnResponse<B> for ResponseLogger {
         span.record("status_code", status.as_u16());
         span.record("latency", format!("{:?}", latency));
 
-        // Don't log here - RequestIdService handles all logging with proper request IDs
+        // Log the response completion
+        let _enter = span.enter();
+        if status.is_server_error() {
+            error!(
+                target: "sglang_router_rs::response",
+                "request failed with server error"
+            );
+        } else if status.is_client_error() {
+            warn!(
+                target: "sglang_router_rs::response",
+                "request failed with client error"
+            );
+        } else {
+            info!(
+                target: "sglang_router_rs::response",
+                "finished processing request"
+            );
+        }
     }
 }
 
