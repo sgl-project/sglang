@@ -201,16 +201,18 @@ class SGLangCIAnalyzer:
         """Get PR information from a run"""
         pr_info = {
             "pr_number": None,
-            "author": run.get("head_commit", {}).get("author", {}).get("name", "Unknown"),
+            "author": run.get("head_commit", {})
+            .get("author", {})
+            .get("name", "Unknown"),
             "head_sha": run.get("head_sha", ""),
             "head_branch": run.get("head_branch", ""),
         }
-        
+
         # Try to extract PR number from pull_requests
         pull_requests = run.get("pull_requests", [])
         if pull_requests:
             pr_info["pr_number"] = pull_requests[0].get("number")
-        
+
         return pr_info
 
     def _analyze_failure_pattern(self, job: Dict, stats: Dict):
@@ -280,7 +282,7 @@ class SGLangCIAnalyzer:
                 1,
             ):
                 print(f"  {i:2d}. {job}: {count} times")
-                
+
                 # Show last successful run
                 if job in stats["job_last_success"]:
                     last_success = stats["job_last_success"][job]
@@ -288,15 +290,19 @@ class SGLangCIAnalyzer:
                         last_success["created_at"].replace("Z", "+00:00")
                     )
                     pr_info = last_success["pr_info"]
-                    
+
                     pr_text = ""
                     if pr_info["pr_number"]:
-                        pr_text = f" (PR #{pr_info['pr_number']} by {pr_info['author']})"
+                        pr_text = (
+                            f" (PR #{pr_info['pr_number']} by {pr_info['author']})"
+                        )
                     else:
                         pr_text = f" by {pr_info['author']}"
-                    
-                    print(f"      Last Success: Run #{last_success['run_number']} ({success_date.strftime('%Y-%m-%d %H:%M')}){pr_text}: {last_success['url']}")
-                
+
+                    print(
+                        f"      Last Success: Run #{last_success['run_number']} ({success_date.strftime('%Y-%m-%d %H:%M')}){pr_text}: {last_success['url']}"
+                    )
+
                 # Show recent failure links
                 if (
                     job in stats["job_failure_links"]
@@ -307,7 +313,7 @@ class SGLangCIAnalyzer:
                         created_at = datetime.fromisoformat(
                             link_info["created_at"].replace("Z", "+00:00")
                         )
-                        
+
                         # Format PR info for failures
                         pr_info = link_info.get("pr_info", {})
                         pr_text = ""
@@ -315,7 +321,7 @@ class SGLangCIAnalyzer:
                             pr_text = f" (PR #{pr_info['pr_number']} by {pr_info.get('author', 'Unknown')})"
                         else:
                             pr_text = f" by {pr_info.get('author', 'Unknown')}"
-                        
+
                         print(
                             f"        - Run #{link_info['run_number']} ({created_at.strftime('%Y-%m-%d %H:%M')}){pr_text}: {link_info['url']}"
                         )
