@@ -85,7 +85,7 @@ class ExpertLocationMetadata:
     # -------------------------------- construction ------------------------------------
 
     @staticmethod
-    def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
+    def init_trivial(server_args: ServerArgs, model_config: ModelConfig, gpu_id: int):
         """Trivial location - logical expert i corresponds to physical expert i"""
         common = ExpertLocationMetadata._init_common(server_args, model_config)
 
@@ -106,6 +106,7 @@ class ExpertLocationMetadata:
             server_args,
             model_config,
             physical_to_logical_map=physical_to_logical_map,
+            gpu_id=gpu_id,
         )
 
     @staticmethod
@@ -514,7 +515,7 @@ def compute_initial_expert_location_metadata(
 ) -> Optional[ExpertLocationMetadata]:
     data = server_args.init_expert_location
     if data == "trivial":
-        return ExpertLocationMetadata.init_trivial(server_args, model_config)
+        return ExpertLocationMetadata.init_trivial(server_args, model_config, gpu_id)
 
     # TODO unify with the utils function
     if data.endswith(".pt"):
