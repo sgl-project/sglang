@@ -829,7 +829,7 @@ class ModelRunner:
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
-        if "mooncake" in self.dist_backend:
+        if self.server_args.enable_mooncake_dist_backend:
             # Mooncake does not support `monitored_barrier`
             dist.barrier(group=get_tp_group().cpu_group)
         else:
