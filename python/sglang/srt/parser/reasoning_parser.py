@@ -250,6 +250,23 @@ class GptOssDetector(BaseReasoningFormatDetector):
         )
 
 
+class SeedOssDetector(BaseReasoningFormatDetector):
+    """
+    Detector for SeedOSS model.
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+        # SeedOSS is assumed to be reasoning until `</seed:think>` token
+        super().__init__(
+            "<seed:think>",
+            "</seed:think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -270,6 +287,7 @@ class ReasoningParser:
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "step3": DeepSeekR1Detector,
+        "seed_oss": SeedOssDetector,
     }
 
     def __init__(
