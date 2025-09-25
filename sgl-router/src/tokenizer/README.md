@@ -51,7 +51,7 @@ as of `sgl-router/src/tokenizer/*`.
 - Caches vocab forward and reverse maps for `token_to_id`/`id_to_token` support.
 - Extracts special tokens using common patterns (e.g. `<s>`, `[CLS]`).
 - Supports optional chat templates: either auto-discovered next to the tokenizer via
-  `tokenizer_config.json` or overrideable with an explicit template path.
+  `tokenizer_config.json` or overridable with an explicit template path.
 - Exposes `apply_chat_template` which renders a minijinja template given JSON message payloads and
   template parameters.
 
