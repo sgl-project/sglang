@@ -78,19 +78,19 @@ class HiRadixCache(RadixCache):
         self.enable_storage = hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and enable_metrics
 
-        # Parse and extract parameters from storage backend extra config
         (
             extra_config,
             prefetch_threshold,
             prefetch_timeout_base,
             prefetch_timeout_per_ki_token,
         ) = self._parse_storage_backend_extra_config(storage_backend_extra_config)
-
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
         self.prefetch_timeout_per_page = (
             page_size / 1024 * prefetch_timeout_per_ki_token
         )
+        # TODO: support more timeout check functions
+        self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
@@ -163,8 +163,12 @@ class HiRadixCache(RadixCache):
 
         # Extract parameters from extra_config if they exist, otherwise use defaults
         prefetch_threshold = 256  # tokens
-        prefetch_timeout_base = 1  # seconds
-        prefetch_timeout_per_ki_token = 0.25  # seconds
+        prefetch_timeout_base = (
+            1  # seconds. A conservative estimate for scheduling overhead
+        )
+        prefetch_timeout_per_ki_token = (
+            0.25  # seconds. A conservative estimate for data transfer overhead
+        )
         if extra_config is not None:
             prefetch_threshold = extra_config.pop(
                 "prefetch_threshold", prefetch_threshold
@@ -576,6 +580,15 @@ class HiRadixCache(RadixCache):
             host_indices = torch.cat(host_indices_list, dim=0)
             cc.mem_pool_host.free(host_indices)
 
+    # Timeout is linearly increasing with the number of pages
+    def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
+        # If hash_value has not been computed in timeout_base seconds, terminate it.
+        return (
+            time.monotonic() - operation.start_time
+            > self.prefetch_timeout_base
+            + len(operation.hash_value) * self.prefetch_timeout_per_page
+        )
+
     def can_terminate_prefetch(self, operation: PrefetchOperation):
         can_terminate = True
 
@@ -592,12 +605,7 @@ class HiRadixCache(RadixCache):
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
-            can_terminate = completed or (
-                # If hash_value has not been computed in timeout_base seconds, terminate it.
-                time.monotonic() - operation.start_time
-                > self.prefetch_timeout_base
-                + len(operation.hash_value) * self.prefetch_timeout_per_page
-            )
+            can_terminate = completed or self.is_prefetch_timeout(operation)
         else:
             # unknown prefetch stop policy, just return True
             return True
