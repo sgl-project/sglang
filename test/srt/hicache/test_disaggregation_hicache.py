@@ -71,7 +71,7 @@ class DisaggregationHiCacheBase(TestDisaggregationBase):
             "--mem-fraction-static",
             "0.8",
             "--disaggregation-ib-device",
-            "erdma_0,erdma_1",
+            "mlx5_roce0",
             "--disaggregation-transfer-backend",
             "mooncake",
         ]
@@ -149,7 +149,7 @@ class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):
             "--base-gpu-id",
             "1",
             "--disaggregation-ib-device",
-            "erdma_0,erdma_1",
+            "mlx5_roce0",
             "--disaggregation-transfer-backend",
             "mooncake",
         ]
@@ -202,7 +202,7 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
             "--base-gpu-id",
             "1",
             "--disaggregation-ib-device",
-            "erdma_0,erdma_1",
+            "mlx5_roce0",
             "--disaggregation-transfer-backend",
             "mooncake",
             "--disaggregation-decode-enable-offload-kvcache",
