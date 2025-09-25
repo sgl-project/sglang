@@ -67,10 +67,8 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
-import dataclasses
 
-
-@dataclasses.dataclass
+@dataclass
 class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
