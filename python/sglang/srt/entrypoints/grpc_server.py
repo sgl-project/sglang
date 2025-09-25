@@ -409,7 +409,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             return_logprob=grpc_req.return_logprob,
             logprob_start_len=grpc_req.logprob_start_len or -1,
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
-            stream=True,  # Always stream for gRPC
+            stream=grpc_req.stream or False,
             lora_path=grpc_req.lora_id if grpc_req.lora_id else None,
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None

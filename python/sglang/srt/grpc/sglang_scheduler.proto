@@ -122,6 +122,9 @@ message GenerateRequest {
 
   // For load balancing
   int32 dp_balance_id = 17;
+
+  // Whether client wants streaming response
+  bool stream = 18;
 }
 
 message TokenizedInput {

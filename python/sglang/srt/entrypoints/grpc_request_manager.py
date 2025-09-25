@@ -81,11 +81,9 @@ class GrpcReqState:
     last_completion_tokens: int = 1
 
     # Streaming state
-    last_output_offset: int = 0
     stream_finished: bool = False
 
-    # Output accumulation
-    text: str = ""
+    # Token accumulation (for non-streaming)
     output_ids: List[int] = dataclasses.field(default_factory=list)
     input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
     input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
@@ -306,20 +304,31 @@ class GrpcRequestManager:
             # Send to scheduler - let exceptions bubble up to grpc_server.py
             await self._send_to_scheduler(obj)
 
-            # Stream responses from the queue
+            is_stream = getattr(obj, "stream", False)
+
             while True:
+                # Client cancelled - notify scheduler and exit
                 if grpc_context and grpc_context.cancelled():
-                    # Client cancelled - notify scheduler and exit
                     await self.abort_request(request_id)
                     return
 
                 try:
                     response = await asyncio.wait_for(state.out_queue.get(), timeout=4)
-                    yield response
 
-                    # Check if this is the final response
-                    if isinstance(response, dict) and response.get("finished", False):
+                    if is_stream:
+                        yield response
+
+                    # Non-streaming: yield final response with accumulated tokens from state
+                    if (
+                        isinstance(response, dict)
+                        and response.get("finished", False)
+                        and not is_stream
+                    ):
+                        final_response = response.copy()
+                        final_response["token_ids"] = state.output_ids
+                        yield final_response
                         break
+
                 except asyncio.TimeoutError:
                     # Timeout waiting for response - abort and cleanup
                     logger.warning(
@@ -487,7 +496,6 @@ class GrpcRequestManager:
             # Extract output for this request
             output_data = {
                 "request_id": rid,
-                "text": batch_out.decoded_texts[i] if batch_out.decoded_texts else "",
                 "token_ids": batch_out.output_ids[i] if batch_out.output_ids else [],
                 "finished": batch_out.finished_reasons[i] is not None,
                 "meta_info": {
@@ -521,15 +529,10 @@ class GrpcRequestManager:
                     ),
                 }
 
-            # Update state
-            if output_data["text"]:
-                state.text += output_data["text"][state.last_output_offset :]
-                state.last_output_offset = len(output_data["text"])
-
+            # Update state for accumulation
             if output_data["token_ids"]:
                 state.output_ids.extend(output_data["token_ids"])
 
-            # Send to output queue
             await state.out_queue.put(output_data)
 
             # Handle completion
