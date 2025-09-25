@@ -146,6 +146,9 @@ class GenerateReqInput:
     # For customer metric labels
     customer_labels: Optional[Dict[str, str]] = None
 
+    # OpenTelemetry trace headers
+    trace_headers: Optional[Dict[str, str]] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)

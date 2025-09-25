@@ -23,18 +23,24 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 opentelemetry_imported = False
 tracing_enabled = False
 
+TRACE_HEADERS = ["traceparent", "tracestate"]
+
 try:
     from opentelemetry import context, propagate, trace
+    from opentelemetry.context.context import Context
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import TracerProvider, id_generator
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.trace.propagation.tracecontext import (
+        TraceContextTextMapPropagator,
+    )
 
     opentelemetry_imported = True
 except ImportError:
@@ -44,6 +50,14 @@ except ImportError:
             pass
 
     logger.info("opentelemetry package is not installed, tracing disabled")
+
+
+def is_tracing_enabled() -> bool:
+    return tracing_enabled
+
+
+def extract_trace_headers(headers: Mapping[str, str]) -> Mapping[str, str]:
+    return {h: headers[h] for h in TRACE_HEADERS if h in headers}
 
 
 @dataclass
@@ -329,6 +343,7 @@ def trace_req_start(
     rid: str,
     bootstrap_room: Optional[int] = None,
     ts: Optional[int] = None,
+    trace_headers: Optional[Dict[str, str]] = None,
 ):
     if not tracing_enabled:
         return
@@ -350,12 +365,15 @@ def trace_req_start(
         is_copy=False,
     )
 
+    trace_context = extract_trace_context(trace_headers)
+
     # Drop the worker_id added by MultiTokenizer
     orig_rid = rid.split("_")[-1]
     tracer = threads_info[pid].tracer
     root_span = tracer.start_span(
         name=f"Req {orig_rid[:8]}",
         start_time=ts,
+        context=trace_context,
     )
 
     root_span.set_attributes(
@@ -550,3 +568,11 @@ def trace_slice_add_attr(rid: str, attrs: Dict[str, Any]):
 
     slice_info = thread_context.cur_slice_stack[-1]
     slice_info.span.set_attributes(attrs)
+
+
+def extract_trace_context(headers: Optional[Mapping[str, str]]) -> Optional[Context]:
+    if tracing_enabled:
+        headers = headers or {}
+        return TraceContextTextMapPropagator().extract(headers)
+    else:
+        return None
