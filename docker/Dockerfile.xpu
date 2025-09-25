@@ -40,20 +40,8 @@ RUN --mount=type=secret,id=github_token \
     # Install Torch
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
 
-# Install vllm from source
-RUN --mount=type=secret,id=github_token \
-    cd /root && \
-    . /miniforge3/bin/activate && \
-    conda activate py${PYTHON_VERSION} && \
-    git clone https://github.com/vllm-project/vllm.git -b v0.10.1 && \
-    cd vllm && \
-    pip install --upgrade pip && \
-    pip install -v -r requirements/xpu.txt && \
-    VLLM_TARGET_DEVICE=xpu python setup.py install
-
 # Install SGlang from source
 RUN --mount=type=secret,id=github_token \
-    # Install vllm from source
     cd /root && \
     . /miniforge3/bin/activate && \
     conda activate py${PYTHON_VERSION} && \
