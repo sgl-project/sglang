@@ -480,7 +480,7 @@ class ServingChatTestCase(unittest.TestCase):
             call_info2 = Mock()
             call_info2.name = "get_weather"
             call_info2.parameters = '{"city":"Tokyo"}'
-            call_info2.tool_index = 0
+            call_info2.tool_index = 1
 
             parser_instance.has_tool_call.return_value = True
             parser_instance.parse_non_stream.return_value = (

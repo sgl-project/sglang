@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -839,6 +840,26 @@ class OpenAIServingChat(OpenAIServingBase):
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
         return ChoiceLogprobs(content=token_logprobs)
 
+    def _process_tool_call_id(
+        self,
+        call_item: ToolCallItem,
+        history_tool_calls_cnt: int,
+    ) -> str:
+        """Process for generating a new and unique `tool_call_id`"""
+        if self.tool_call_parser != "kimi_k2":
+            # A simple uuid is sufficient for all models except for Kimi-K2.
+            tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+            return tool_call_id
+        else:
+            # Align with Kimi-K2 format: functions.{name}:{index}
+            # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
+            # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
+            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
+            logger.debug(
+                f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
+            )
+            return tool_call_id
+
     def _process_tool_calls(
         self,
         text: str,
@@ -856,16 +877,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = []
                 for call_info in call_info_list:
-                    # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
-                    if (
-                        self.tool_call_parser == "kimi_k2"
-                        and call_info.name is not None
-                    ):
-                        tool_id = f"functions.{call_info.name}:{history_tool_calls_cnt}"
-                        history_tool_calls_cnt += 1
-                    else:
-                        tool_id = f"call_{uuid.uuid4().hex[:24]}"
-
+                    tool_id = self._process_tool_call_id(
+                        call_info, history_tool_calls_cnt
+                    )
                     tool_calls.append(
                         ToolCall(
                             id=tool_id,
@@ -933,10 +947,6 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             The total number of tool calls in the history, or 0 if not applicable.
         """
-
-        if self.tool_call_parser != "kimi_k2":
-            return 0
-
         messages = getattr(request, "messages", [])
         idx = 0
         for msg in messages:
@@ -1010,19 +1020,9 @@ class OpenAIServingChat(OpenAIServingBase):
             # Tool call ID should be generated only once per tool call
             if call_item.name:
                 # First chunk: include ID and function name
-                if self.tool_call_parser == "kimi_k2":
-                    # Align with Kimi-K2 format: functions.{name}:{index}
-                    # The model generated index might be always 0 and make the model confuse with tool calls.
-                    # Follow the Kimi-K2 chat format, let's reset the latest index with `history_tool_calls_cnt` here.
-                    logger.debug(
-                        f"Process stream tool call idx parser: {self.tool_call_parser} name: {call_item.name}, index: {call_item.tool_index}, history: {history_tool_calls_cnt}"
-                    )
-                    tool_call_id = (
-                        f"functions.{call_item.name}:{history_tool_calls_cnt}"
-                    )
-                    history_tool_calls_cnt += 1
-                else:
-                    tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                tool_call_id = self._process_tool_call_id(
+                    call_item, history_tool_calls_cnt
+                )
                 function_name = call_item.name
             else:
                 # Subsequent chunks: null ID and name for argument deltas
