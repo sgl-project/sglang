@@ -9,8 +9,6 @@ from urllib.parse import urlparse
 import pytest
 import requests
 
-pytest_plugins = ("py_test.shared.genai_bench",)
-
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

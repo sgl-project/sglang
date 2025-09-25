@@ -6,11 +6,13 @@ on:
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'sgl-router/**'
+      - '.github/workflows/pr-test-pd-router.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'sgl-router/**'
+      - '.github/workflows/pr-test-pd-router.yml'
     types: [synchronize, labeled]
   workflow_dispatch:
 

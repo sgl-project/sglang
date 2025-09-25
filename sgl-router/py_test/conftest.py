@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+pytest_plugins = ("py_test.shared.genai_bench",)
+
 # Ensure local sources in py_src are importable ahead of any installed package
 _ROOT = Path(__file__).resolve().parents[1]
 _SRC = _ROOT / "py_src"

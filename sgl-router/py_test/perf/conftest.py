@@ -20,8 +20,6 @@ from py_test.shared.genai_bench import BenchmarkStats
 
 logger = logging.getLogger(__name__)
 
-pytest_plugins = ("py_test.shared.genai_bench",)
-
 _PD_PERF_MARKER = "perf"
 _PYTEST_HTML_ACTIVE = False
 
