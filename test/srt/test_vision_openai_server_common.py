@@ -522,7 +522,9 @@ class VideoOpenAITestMixin(TestOpenAIMLLMServerBase):
         self.assertGreater(len(video_response), 0)
 
 
-class OmniOpenAITestMixin(ImageOpenAITestMixin, VideoOpenAITestMixin, AudioOpenAITestMixin):
+class OmniOpenAITestMixin(
+    ImageOpenAITestMixin, VideoOpenAITestMixin, AudioOpenAITestMixin
+):
     def test_mixed_modality_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         messages = [
