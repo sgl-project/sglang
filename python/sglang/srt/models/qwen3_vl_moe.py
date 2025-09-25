@@ -20,7 +20,7 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
+from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_rank,
@@ -51,12 +51,11 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
     def __init__(
         self,
         *,
-        config: Qwen3VLMoeConfig,
+        config: Qwen3VLMoeTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-
         self.hidden_size = config.hidden_size
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -132,8 +131,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         config: Qwen3VLMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        language_model_cls=Qwen3MoeLLMModel,
     ):
-        super().__init__(config, quant_config, prefix, Qwen3MoeLLMModel)
+        super().__init__(config, quant_config, prefix, language_model_cls)
 
     def load_fused_expert_weights(
         self,
@@ -222,8 +222,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self._cached_params_dict = dict(self.named_parameters())
         params_dict = self._cached_params_dict
         for name, loaded_weight in weights:
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+            name = name.replace(r"model.language_model.", r"model.")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:

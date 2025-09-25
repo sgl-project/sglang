@@ -14,7 +14,6 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import math
-from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -23,14 +22,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
-from transformers.modeling_outputs import BaseModelOutput, MoeCausalLMOutputWithPast
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-)
+from transformers.modeling_outputs import BaseModelOutput
 
 from sglang.srt.configs.qwen3_omni import (
     Qwen3OmniMoeAudioEncoderConfig,
-    Qwen3OmniMoeTextConfig,
     Qwen3OmniMoeThinkerConfig,
     Qwen3OmniMoeVisionEncoderConfig,
 )
@@ -46,21 +41,12 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
-from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from sglang.srt.models.qwen3_vl_moe import (
+    Qwen3MoeLLMModel,
+    Qwen3VLMoeForConditionalGeneration,
+)
 from sglang.srt.utils import add_prefix, logger
-
-
-@dataclass
-class Qwen3OmniMoeThinkerCausalLMOutputWithPast(MoeCausalLMOutputWithPast):
-    r"""
-    Args:
-        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
-            The rope index difference between sequence length and multimodal rope.
-    """
-
-    rope_deltas: Optional[torch.LongTensor] = None
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
@@ -98,14 +84,11 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
             layer_head_mask (`torch.FloatTensor`): mask for attention heads in a given layer of size
                 `(encoder_attention_heads,)`.
             output_attentions (`bool`, *optional*):
@@ -434,43 +417,6 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
         return self.patch_embed.proj.weight.device
 
 
-class Qwen3OmniMoeThinkerTextDecoderLayer(Qwen3MoeDecoderLayer):
-    def __init__(
-        self,
-        config: Qwen3OmniMoeTextConfig,
-        layer_idx,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
-    ):
-        super().__init__(config, layer_idx, quant_config, prefix, alt_stream)
-
-
-class Qwen3OmniMoeThinkerTextRotaryEmbedding(Qwen2_5_VisionRotaryEmbedding):
-    pass
-
-
-class Qwen3OmniMoeThinkerTextModel(Qwen3MoeModel):
-    config_class = Qwen3OmniMoeTextConfig
-
-    def __init__(
-        self,
-        config: Qwen3OmniMoeTextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-    ):
-        super().__init__(config, quant_config)
-        self.layers = nn.ModuleList(
-            [
-                Qwen3OmniMoeThinkerTextDecoderLayer(
-                    config, layer_idx, quant_config=quant_config
-                )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
-        head_dim = config.hidden_size // config.num_attention_heads
-        self.rotary_pos_emb = Qwen3OmniMoeThinkerTextRotaryEmbedding(head_dim // 2)
-
-
 class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
     config: Qwen3OmniMoeThinkerConfig
 
@@ -480,24 +426,22 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        for k, v in config.text_config.__dict__.items():
-            if k != "vision_config":
-                setattr(config, k, v)
-        config.vocab_size = config.text_config.vocab_size
-        super().__init__(config, quant_config, prefix)
+        # for k, v in config.text_config.__dict__.items():
+        #     setattr(config, k, v)
+        # config.vocab_size = config.text_config.vocab_size
+        super().__init__(
+            config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
+        )
         self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config)
         self.visual = Qwen3OmniMoeVisionEncoder(
-            config.vision_config, quant_config=quant_config
+            config.vision_config,
+            quant_config=quant_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            prefix=add_prefix("visual", prefix),
         )
         self.pad_token_id = (
             self.config.pad_token_id if self.config.pad_token_id is not None else -1
         )
-
-    def get_input_embeddings(self):
-        return self.model.get_input_embeddings()
-
-    def set_input_embeddings(self, value):
-        self.model.set_input_embeddings(value)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]):
         feature_attention_mask = torch.cat(
@@ -634,10 +578,9 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             self._cached_params_dict = dict(self.named_parameters())
         params_dict = self._cached_params_dict
 
-        # print(f"{params_dict.keys()=}")
         for name, loaded_weight in weights:
-            # if "language_model" in name:
-            #     name = name.replace(r"model.language_model.", r"model.")
+            name = name.replace(r"model.language_model.", r"model.")
+
             # print(f"{name=}")
             if ("talker" in name or "code2wav" in name) and not self.enable_talker:
                 continue
