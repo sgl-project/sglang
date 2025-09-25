@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
@@ -44,7 +44,7 @@ jobs:
           python ci_analyzer.py --token $GITHUB_TOKEN --limit ${{ github.event.inputs.limit || '1000' }} --output ci_analysis_$(date +%Y%m%d_%H%M%S).json
 
       - name: Upload Analysis Results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ci-analysis-results-${{ github.run_number }}
           path: scripts/ci_monitor/ci_analysis_*.json
