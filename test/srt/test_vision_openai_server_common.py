@@ -215,7 +215,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
-    def _test_single_image_chat_completion(self):
+    def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
@@ -245,7 +245,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
 
         self.verify_single_image_response(response)
 
-    def _test_multi_turn_chat_completion(self):
+    def test_multi_turn_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
@@ -393,7 +393,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
 
         return messages
 
-    def _test_video_images_chat_completion(self):
+    def test_video_images_chat_completion(self):
         url = VIDEO_JOBS_URL
         file_path = self.get_or_download_file(url)
 
@@ -522,42 +522,41 @@ class VideoOpenAITestMixin(TestOpenAIMLLMServerBase):
         self.assertGreater(len(video_response), 0)
 
 
-class OmniOpenAITestMixin(ImageOpenAITestMixin):
-    ...
-    # def test_mixed_modality_chat_completion(self):
-    #     client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-    #     messages = [
-    #         {
-    #             "role": "user",
-    #             "content": [
-    #                 {
-    #                     "type": "image_url",
-    #                     "image_url": {"url": IMAGE_MAN_IRONING_URL},
-    #                 },
-    #                 {
-    #                     "type": "audio_url",
-    #                     "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
-    #                 },
-    #                 {
-    #                     "type": "text",
-    #                     "text": "I have an image and audio, which are not related at all. Please:  1. Describe the image in a sentence, 2. Repeat the exact words from the audio I provided. Be exact",
-    #                 },
-    #             ],
-    #         },
-    #     ]
-    #     response = client.chat.completions.create(
-    #         model="default",
-    #         messages=messages,
-    #         temperature=0,
-    #         max_tokens=128,
-    #         stream=False,
-    #     )
-    #
-    #     text = response.choices[0].message.content
-    #
-    #     print("-" * 30)
-    #     print(f"Mixed modality response:\n{text}")
-    #     print("-" * 30)
-    #
-    #     self.verify_single_image_response(response=response)
-    #     self.verify_speech_recognition_response(text=text)
+class OmniOpenAITestMixin(ImageOpenAITestMixin, VideoOpenAITestMixin, AudioOpenAITestMixin):
+    def test_mixed_modality_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                    },
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
+                    },
+                    {
+                        "type": "text",
+                        "text": "I have an image and audio, which are not related at all. Please:  1. Describe the image in a sentence, 2. Repeat the exact words from the audio I provided. Be exact",
+                    },
+                ],
+            },
+        ]
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=128,
+            stream=False,
+        )
+
+        text = response.choices[0].message.content
+
+        print("-" * 30)
+        print(f"Mixed modality response:\n{text}")
+        print("-" * 30)
+
+        self.verify_single_image_response(response=response)
+        self.verify_speech_recognition_response(text=text)

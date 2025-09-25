@@ -678,7 +678,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        print(f"{image_embeds.shape=}")
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -690,7 +689,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
-        print(f"{video_embeds.shape=}")
         return video_embeds
 
     def get_input_embeddings(self):
