@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from python.sglang.srt.utils import DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE
+
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -177,7 +179,7 @@ class RadixCache(BasePrefixCache):
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
         self.enable_deterministic_inference = enable_deterministic_inference
-        self.split_size = 4096  # see `init_deterministic_inference_config`
+        self.split_size = DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
