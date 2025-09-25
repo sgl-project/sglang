@@ -201,11 +201,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_q_heads,
-                1,
-            )
+            if self.num_draft_tokens:
+                mla_metadata, num_splits = get_mla_metadata(
+                    seq_lens.to(torch.int32),
+                    self.num_draft_tokens * self.num_q_heads,
+                    1,
+                )
+            else:
+                mla_metadata, num_splits = get_mla_metadata(
+                    seq_lens.to(torch.int32),
+                    self.num_q_heads,
+                    1,
+                )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.forward_metadata = FlashMLADecodeMetadata(
@@ -275,11 +282,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_q_heads,
-                1,
-            )
+            if self.num_draft_tokens:
+                mla_metadata, num_splits = get_mla_metadata(
+                    seq_lens.to(torch.int32),
+                    self.num_draft_tokens * self.num_q_heads,
+                    1,
+                )
+            else:
+                mla_metadata, num_splits = get_mla_metadata(
+                    seq_lens.to(torch.int32),
+                    self.num_q_heads,
+                    1,
+                )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata
