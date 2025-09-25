@@ -31,7 +31,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, retry
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -475,13 +475,31 @@ class ModelConfig:
                     from huggingface_hub import HfApi
 
                     hf_api = HfApi()
-                    if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
+
+                    def check_hf_quant_config():
+                        return hf_api.file_exists(
+                            self.model_path, "hf_quant_config.json"
+                        )
+
+                    # Retry HF API call up to 3 times
+                    file_exists = retry(
+                        check_hf_quant_config,
+                        max_retry=2,
+                        initial_delay=1.0,
+                        max_delay=5.0,
+                    )
+
+                    if file_exists:
                         quant_cfg = modelopt_quant_config
+
                 except huggingface_hub.errors.OfflineModeIsEnabled:
                     logger.warning(
                         "Offline mode is enabled, skipping hf_quant_config.json check"
                     )
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to check hf_quant_config.json: {self.model_path} {e}"
+                    )
 
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
