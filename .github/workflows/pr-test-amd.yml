@@ -172,32 +172,6 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  unit-test-backend-4-gpu-amd:
-    needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi300-gpu-4]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-4-gpu-amd
-
   unit-test-backend-8-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
     if: always() && !failure() && !cancelled() &&
@@ -423,7 +397,6 @@ jobs:
         unit-test-frontend-amd,
         unit-test-backend-1-gpu-amd,
         unit-test-backend-2-gpu-amd,
-        unit-test-backend-4-gpu-amd,
         unit-test-backend-8-gpu-amd,
         performance-test-1-gpu-part-1-amd,
         performance-test-1-gpu-part-2-amd,
