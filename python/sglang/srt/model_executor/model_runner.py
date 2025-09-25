@@ -195,7 +195,6 @@ class ModelRunner:
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
-        self.dist_backend = server_args.dist_backend
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -614,17 +613,19 @@ class ModelRunner:
             )
             raise
 
-        if self.dist_backend is None:
-            if self.device == "cuda":
-                self.dist_backend = "nccl"
-            elif self.device == "xpu":
-                self.dist_backend = "xccl"
-            elif self.device == "hpu":
-                self.dist_backend = "hccl"
-            elif self.device == "cpu":
-                self.dist_backend = "gloo"
-            elif self.device == "npu":
-                self.dist_backend = "hccl"
+        if self.device == "cuda":
+            if self.server_args.enable_mooncake_dist_backend:
+                backend = "mooncake"
+            else:
+                backend = "nccl"
+        elif self.device == "xpu":
+            backend = "xccl"
+        elif self.device == "hpu":
+            backend = "hccl"
+        elif self.device == "cpu":
+            backend = "gloo"
+        elif self.device == "npu":
+            backend = "hccl"
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
