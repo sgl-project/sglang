@@ -181,20 +181,38 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
 
-            # Submit to request manager
-            output_queue = await self.request_manager.generate_request(
+            # Submit to request manager (automatically handles n>1)
+            response_generator = self.request_manager.generate_request(
                 obj=tokenized_req,
                 request_id=request.request_id,
                 grpc_context=context,
             )
 
-            # Stream outputs
-            while True:
-                try:
-                    # Get output with timeout
-                    output = await asyncio.wait_for(output_queue.get(), timeout=4)
-
-                    # Check for errors
+            # Stream outputs from the generator
+            async for output in response_generator:
+                # Handle batch responses (for n>1 non-streaming)
+                if isinstance(output, list):
+                    for batch_output in output:
+                        if "error" in batch_output:
+                            yield sglang_scheduler_pb2.GenerateResponse(
+                                request_id=request.request_id,
+                                error=sglang_scheduler_pb2.GenerateError(
+                                    message=batch_output["error"],
+                                    http_status_code=(
+                                        "500" if "abort" not in batch_output else "499"
+                                    ),
+                                ),
+                            )
+                        elif batch_output.get("finished", False):
+                            yield self._create_completion_response(
+                                request.request_id, batch_output
+                            )
+                        else:
+                            yield self._create_chunk_response(
+                                request.request_id, batch_output
+                            )
+                else:
+                    # Handle single responses (for n=1 or n>1 streaming)
                     if "error" in output:
                         yield sglang_scheduler_pb2.GenerateResponse(
                             request_id=request.request_id,
@@ -205,26 +223,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 ),
                             ),
                         )
-                        break
-
-                    # Check if finished
-                    if output.get("finished", False):
+                    elif output.get("finished", False):
                         # Send completion
                         yield self._create_completion_response(
                             request.request_id, output
                         )
-                        break
                     else:
                         # Send chunk
                         yield self._create_chunk_response(request.request_id, output)
-
-                except asyncio.TimeoutError:
-                    # Check if context is still active
-                    if context.cancelled():
-                        # Abort the request
-                        await self.request_manager.abort_request(request.request_id)
-                        break
-                    continue
 
         except Exception as e:
             logger.error(f"Generate failed: {e}\n{get_exception_traceback()}")
