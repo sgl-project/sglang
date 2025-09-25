@@ -476,13 +476,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self, request_id: str, output: Dict
     ) -> sglang_scheduler_pb2.GenerateResponse:
         """Create a streaming chunk response."""
+        meta_info = output.get("meta_info", {})
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
             chunk=sglang_scheduler_pb2.GenerateStreamChunk(
                 token_id=output["token_ids"][-1] if output.get("token_ids") else 0,
                 text=output.get("text", ""),
-                prompt_tokens=0,
-                completion_tokens=len(output.get("token_ids", [])),
+                prompt_tokens=meta_info.get("prompt_tokens", 0),
+                completion_tokens=meta_info.get("completion_tokens", len(output.get("token_ids", []))),
                 cached_tokens=0,
             ),
         )
