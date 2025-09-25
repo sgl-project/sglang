@@ -17,10 +17,10 @@ use crate::config::types::RetryConfig;
 use crate::core::{
     BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
 };
-use crate::grpc::{proto, SglangSchedulerClient};
+use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{ChatCompletionRequest, ResponseFormat, StringOrArray};
+use crate::protocols::spec::{ChatCompletionRequest, StringOrArray};
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
 use crate::tokenizer::traits::Tokenizer;
@@ -247,40 +247,31 @@ impl GrpcRouter {
             None
         };
 
-        // Step 6: Build SamplingParams for gRPC
-        let sampling_params = match self.build_grpc_sampling_params(body, tool_call_constraint) {
-            Ok(params) => params,
+        // Step 6: Build the base gRPC request
+        let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+        let base_request = match client.build_generate_request(
+            request_id,
+            body,
+            processed_messages.text.clone(),
+            token_ids.into_iter().map(|id| id as i32).collect(),
+            processed_messages.multimodal_inputs,
+            tool_call_constraint, // Pass the full tuple (type, value)
+        ) {
+            Ok(request) => request,
             Err(e) => {
-                error!("Failed to build sampling parameters: {}", e);
+                error!("Failed to build gRPC request: {}", e);
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("Invalid sampling parameters: {}", e),
+                    format!("Invalid request parameters: {}", e),
                 )
                     .into_response();
             }
         };
 
-        // Step 7: Create GenerateRequest
-        let grpc_request = proto::GenerateRequest {
-            request_id: format!("chatcmpl-{}", Uuid::new_v4()),
-            tokenized: Some(proto::TokenizedInput {
-                original_text: processed_messages.text.clone(),
-                input_ids: token_ids.into_iter().map(|id| id as i32).collect(),
-            }),
-            mm_inputs: processed_messages.multimodal_inputs,
-            sampling_params: Some(sampling_params),
-            return_logprob: body.logprobs,
-            logprob_start_len: -1,
-            top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
-            return_hidden_states: body.return_hidden_states,
-            ..Default::default()
-        };
-
-        // Step 8: Handle streaming vs non-streaming
         if body.stream {
-            self.handle_streaming_chat(client, grpc_request, body).await
+            self.handle_streaming_chat(client, base_request, body).await
         } else {
-            self.handle_non_streaming_chat(client, grpc_request, body)
+            self.handle_non_streaming_chat(client, base_request, body)
                 .await
         }
     }
@@ -545,111 +536,6 @@ impl GrpcRouter {
             }
         }
         Ok(())
-    }
-
-    /// Build gRPC SamplingParams from OpenAI request
-    fn build_grpc_sampling_params(
-        &self,
-        request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
-    ) -> Result<proto::SamplingParams, String> {
-        let stop_sequences = self.extract_stop_strings(request);
-
-        // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
-        // If neither is specified, use None to let the backend decide the default
-        #[allow(deprecated)]
-        let max_new_tokens = request
-            .max_completion_tokens
-            .or(request.max_tokens)
-            .map(|v| v as i32);
-
-        // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
-        let skip_special_tokens = if request.tools.is_some() {
-            match &request.tool_choice {
-                Some(crate::protocols::spec::ToolChoice::Value(
-                    crate::protocols::spec::ToolChoiceValue::None,
-                )) => request.skip_special_tokens,
-                Some(_) => false, // tool_choice is not "none"
-                None => false, // TODO: this assumes tool_choice defaults to "auto" when tools present
-            }
-        } else {
-            request.skip_special_tokens
-        };
-
-        #[allow(deprecated)]
-        Ok(proto::SamplingParams {
-            temperature: request.temperature.unwrap_or(1.0),
-            top_p: request.top_p.unwrap_or(1.0),
-            top_k: request.top_k.unwrap_or(-1),
-            min_p: request.min_p.unwrap_or(0.0),
-            frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
-            presence_penalty: request.presence_penalty.unwrap_or(0.0),
-            repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
-            max_new_tokens,
-            stop: stop_sequences,
-            stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
-            skip_special_tokens,
-            n: request.n.unwrap_or(1) as i32,
-            constraint: self.build_constraint(request, tool_call_constraint)?,
-            ..Default::default()
-        })
-    }
-
-    /// Extract stop strings from request
-    fn extract_stop_strings(&self, request: &ChatCompletionRequest) -> Vec<String> {
-        match &request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        }
-    }
-
-    /// Build constraint for structured generation
-    fn build_constraint(
-        &self,
-        request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
-    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
-        let mut constraints = Vec::new();
-
-        if let Some(ResponseFormat::JsonSchema { json_schema }) = &request.response_format {
-            let schema_str = serde_json::to_string(&json_schema.schema)
-                .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
-        }
-
-        if let Some(ebnf) = &request.ebnf {
-            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
-            ));
-        }
-
-        if let Some(regex) = &request.regex {
-            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
-        }
-
-        // Handle tool call constraint
-        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
-            if !constraints.is_empty() {
-                return Err("Constrained decoding is not compatible with tool calls.".to_string());
-            }
-            let tool_constraint = match constraint_type.as_str() {
-                "structural_tag" => {
-                    proto::sampling_params::Constraint::StructuralTag(constraint_value)
-                }
-                "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
-                "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
-                "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
-                _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
-            };
-            constraints.push(tool_constraint);
-        }
-
-        match constraints.len() {
-            0 => Ok(None),
-            1 => Ok(constraints.pop()),
-            _ => Err("Multiple constraints are not allowed.".to_string()),
-        }
     }
 
     /// Generate tool constraints for structured generation
