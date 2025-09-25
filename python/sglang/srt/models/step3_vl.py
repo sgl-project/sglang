@@ -133,7 +133,7 @@ class Step3TextMoEMLP(nn.Module):
             use_grouped_topk=False,
         )
 
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.moe_num_experts,
             top_k=config.moe_top_k,
             hidden_size=config.hidden_size,
