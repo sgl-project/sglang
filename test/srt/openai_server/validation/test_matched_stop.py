@@ -175,6 +175,13 @@ class TestRegexPatternMaxLength(unittest.TestCase):
         cls.regex_str_to_max_len = {
             "((ab|cd(e|f){2}){3,5}g|hij)*k": MAX_LEN,
             # - '*' → infinite tokens need to be stored
+            "abc*?k": MAX_LEN,
+            # - '*?' → infinite tokens still need to be stored even if lazy matching used
+            "^spec(foo|at)$": 7,
+            # - '^' and '$' don't add any characters to the max length
+            # "spec" → 4
+            # "(foo|at)" → max(3, 2) = 3
+            # Whole regex = 7
             "(a(bca|de(fg|hi){2,3})j){2}kl": 22,
             # - Innermost alt: "fg" vs "hi" → 2
             # - Repeat {2,3}: max = 3 * 2 = 6

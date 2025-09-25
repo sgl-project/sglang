@@ -204,7 +204,7 @@ def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
         if token in {
             sre_parse.LITERAL,  # `value` is any one character
             sre_parse.IN,  # Any character within `value`
-            sre_parse.ANY,  # "." or "*"
+            sre_parse.ANY,  # "."
         }:
             total += 1
         elif token == sre_parse.SUBPATTERN:
@@ -217,14 +217,18 @@ def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
         elif token == sre_parse.BRANCH:
             _, branches = value
             total += max(_max_length_from_subpattern(branch) for branch in branches)
-        elif token == sre_parse.MAX_REPEAT:
+        elif token in {sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT}:
             _, max_num_repeat, inner_subpattern = value
-            if max_num_repeat == sre_parse.MAX_REPEAT:
+            if max_num_repeat in {sre_parse.MAX_REPEAT, sre_parse.MAXREPEAT}:
                 total += MAX_LEN
             else:
                 total += max_num_repeat * _max_length_from_subpattern(inner_subpattern)
+        elif token == sre_parse.AT:
+            # These are zero-width assertions like ^, $, and \b that don't add to the max
+            # length
+            total += 0
         else:
-            logger.error(f"Got unhandled token: {token}")
+            logger.warning(f"Got unhandled regex token: {token}")
 
             total += MAX_LEN
 
