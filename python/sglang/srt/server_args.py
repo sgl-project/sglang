@@ -613,10 +613,10 @@ class ServerArgs:
                         self.cuda_graph_max_bs = 80
                 elif gpu_mem < 90 * 1024:
                     # H100, A100
-                    if self.tp_size >= 4:
-                        self.cuda_graph_max_bs = 512
-                    else:
+                    if self.tp_size < 4:
                         self.cuda_graph_max_bs = 256
+                    else:
+                        self.cuda_graph_max_bs = 512
                 else:
                     # H20, H200, B200, MI300
                     self.cuda_graph_max_bs = 512
