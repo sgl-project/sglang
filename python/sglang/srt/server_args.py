@@ -654,7 +654,7 @@ class ServerArgs:
                 capture_bs += list(range(272, self.cuda_graph_max_bs, 16))
 
         # Filter batch sizes to ensure they don't exceed cuda_graph_max_bs
-        capture_bs = [bs for bs in capture_bs if bs < self.cuda_graph_max_bs]
+        capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
         return capture_bs
 
