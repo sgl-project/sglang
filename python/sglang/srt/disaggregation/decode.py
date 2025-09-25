@@ -48,7 +48,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool, HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
@@ -122,6 +122,52 @@ class DecodeReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
 
+class HybridDecodeReqToTokenPool(HybridReqToTokenPool):
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
+        mamba_layers: List[int],
+        conv_state_shape: Tuple[int, int],
+        temporal_state_shape: Tuple[int, int],
+        speculative_num_draft_tokens: int,
+        pre_alloc_size: int,
+    ):
+        DecodeReqToTokenPool.__init__(
+            size=size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            pre_alloc_size=pre_alloc_size
+        )
+        self.mamba_pool = MambaPool(
+            size + pre_alloc_size,
+            conv_dtype,
+            ssm_dtype,
+            len(mamba_layers),
+            conv_state_shape,
+            temporal_state_shape,
+            device,
+            speculative_num_draft_tokens,
+        )
+        self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layers)}
+
+        self.device = device
+        self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
+            size, dtype=torch.int32, device=self.device
+        )
+
+        self.rid_to_mamba_index_mapping: Dict[str, int] = {}
+        self.mamba_index_to_rid_mapping: Dict[int, str] = {}
+
+    def clear(self):
+        self.free_slots = list(range(self.size + self.pre_alloc_size))
+        self.mamba_pool.clear()
 
 @dataclass
 class DecodeRequest:
