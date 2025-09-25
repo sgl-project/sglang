@@ -76,6 +76,11 @@ from sglang.srt.model_loader.utils import (
     post_load_weights,
     set_default_torch_dtype,
 )
+
+# Constants for memory management
+DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
+    0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
+)
 from sglang.srt.model_loader.weight_utils import (
     _BAR_FORMAT,
     default_weight_loader,
@@ -517,19 +522,19 @@ class DefaultModelLoader(BaseModelLoader):
         inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
 
         on_cpu = "cpu" in inferred_device_map.values()
-        gpu_mem_percentage = 0.8
         model_kwargs = {"torch_dtype": "auto"}
         device_map = "auto"
 
         if on_cpu:
             for device in max_memory.keys():
                 if isinstance(device, int):
-                    max_memory[device] *= gpu_mem_percentage
+                    max_memory[device] *= DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION
 
             logger.warning(
                 "Model does not fit to the GPU mem. "
                 f"We apply the following memory limit for calibration: \n{max_memory}\n"
-                "If you hit GPU OOM issue, please adjust `gpu_mem_percentage` or "
+                f"If you hit GPU OOM issue, please adjust the memory fraction "
+                f"(currently {DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION}) or "
                 "reduce the calibration `batch_size` manually."
             )
             model_kwargs["max_memory"] = max_memory
