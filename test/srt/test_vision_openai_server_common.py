@@ -184,7 +184,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
         text = response.choices[0].message.content
         assert isinstance(text, str)
 
-    def _test_mixed_batch(self):
+    def test_mixed_batch(self):
         image_ids = [0, 1, 2] * 4
         with ThreadPoolExecutor(4) as executor:
             list(executor.map(self.run_decode_with_image, image_ids))
@@ -317,8 +317,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
                         },
                         {
                             "type": "text",
-                            "text": "I have two very different images. They are not related at all. "
-                            "Please describe the first image in one sentence, and then describe the second image in another sentence.",
+                            "text": "I have two very different images. Please describe them.",
                         },
                     ],
                 },

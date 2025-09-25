@@ -280,7 +280,6 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
             input_ids_tensor[input_ids_tensor == token_id] = pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
-
         return ret_input_ids
 
 
@@ -604,7 +603,7 @@ def embed_mm_inputs(
     # 4. scatter embeddings into input embedding
 
     # deepstack embedding
-    if use_deepstack:
+    if use_deepstack is not None:
         num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
 
         deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
@@ -627,7 +626,6 @@ def embed_mm_inputs(
         # in-place update
         indices = torch.where(mask.squeeze(dim=-1))[0]
         inputs_embeds[indices] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
-
         if use_deepstack.get(modality, None):
             input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
                 inputs_embeds.device, inputs_embeds.dtype

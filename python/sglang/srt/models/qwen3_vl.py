@@ -629,7 +629,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         )
 
         self.model = language_model_cls(
-            # config=config,
             config=config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
@@ -654,7 +653,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # deepstack
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
     def separate_deepstack_embeds(self, embedding):
@@ -719,8 +717,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         """
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
-            if forward_batch.forward_mode == ForwardMode.EXTEND:
-                print(f"{forward_batch.mrope_positions=}")
 
         if not (
             forward_batch.forward_mode.is_decode()
