@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.nn.functional as F
+
 from sglang.srt.layers.dp_attention import set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -45,14 +46,14 @@ if TYPE_CHECKING:
 
 if is_cuda():
     from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
 )
-import logging
-logger = logging.getLogger(__name__)
+
 
 class SimpleEAGLECudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
@@ -355,7 +356,7 @@ class SimpleEAGLECudaGraphRunner:
 
             # add
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(None,num_tokens)
+            set_dp_buffer_len(None, num_tokens)
 
             forward_batch.forward_mode = self.capture_forward_mode
             verify_spec_info_backup = forward_batch.spec_info

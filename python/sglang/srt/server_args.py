@@ -1168,13 +1168,21 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE","SIMPLE_EAGLE"):
+        if self.speculative_algorithm in (
+            "EAGLE",
+            "EAGLE3",
+            "STANDALONE",
+            "SIMPLE_EAGLE",
+        ):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
                     "Currently standalone speculative decoding does not support dp attention."
                 )
-            if self.max_running_requests is None and self.speculative_algorithm != "SIMPLE_EAGLE":
+            if (
+                self.max_running_requests is None
+                and self.speculative_algorithm != "SIMPLE_EAGLE"
+            ):
                 self.max_running_requests = 48
 
             if self.speculative_algorithm == "EAGLE" and self.enable_beta_spec:
@@ -2238,7 +2246,14 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN","SIMPLE_EAGLE", "STANDALONE", "NGRAM"],
+            choices=[
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "SIMPLE_EAGLE",
+                "STANDALONE",
+                "NGRAM",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(

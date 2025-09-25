@@ -112,7 +112,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     seq_lens.to(torch.int32),
                     self.num_q_heads,
                     1,
-                    )
+                )
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
                 num_splits,
@@ -120,26 +120,34 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
         elif forward_batch.forward_mode.is_simple_draft():
             seq_lens = forward_batch.seq_lens + 1
-            max_seqlen_pad = triton.cdiv((forward_batch.seq_lens_cpu + 1).max().item(), PAGE_SIZE)
+            max_seqlen_pad = triton.cdiv(
+                (forward_batch.seq_lens_cpu + 1).max().item(), PAGE_SIZE
+            )
 
             block_kv_indices = torch.full(
-	            (bs, max_seqlen_pad), -1, dtype=torch.int32, device=seq_lens.device
-	        )
+                (bs, max_seqlen_pad), -1, dtype=torch.int32, device=seq_lens.device
+            )
             create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token, forward_batch.req_pool_indices, seq_lens,
-                None, block_kv_indices, self.req_to_token.stride(0), max_seqlen_pad
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                seq_lens,
+                None,
+                block_kv_indices,
+                self.req_to_token.stride(0),
+                max_seqlen_pad,
             )
 
             mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_q_heads,
-                1
+                seq_lens.to(torch.int32), self.num_q_heads, 1
             )
 
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata, num_splits, block_kv_indices
             )
-        elif forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_simple_verify():
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_simple_verify()
+        ):
             seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
             seq_lens = forward_batch.seq_lens + self.num_draft_tokens
 
@@ -432,10 +440,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if forward_batch.forward_mode.is_simple_verify():
-            cache_seqlens = forward_batch.seq_lens.to(torch.int32) + self.num_draft_tokens
+            cache_seqlens = (
+                forward_batch.seq_lens.to(torch.int32) + self.num_draft_tokens
+            )
         else:
             cache_seqlens = forward_batch.seq_lens.to(torch.int32)
-        
+
         if self.data_type == torch.float8_e4m3fn:
             reshape_q_fp8 = reshape_q.to(torch.float8_e4m3fn)
             o, _ = flash_mla_with_kvcache(

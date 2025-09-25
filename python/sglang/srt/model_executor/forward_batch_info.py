@@ -105,7 +105,7 @@ class ForwardMode(IntEnum):
 
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
-    
+
     def is_simple_draft(self):
         return self == ForwardMode.SIMPLE_DRAFT_EXTEND
 
