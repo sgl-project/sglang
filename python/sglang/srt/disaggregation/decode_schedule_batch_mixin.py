@@ -125,10 +125,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 req.grammar.finished = req.finished()
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
-        # Simulate the eagle run. We add mock data to hidden states for the
-        # ease of implementation now meaning the first token will have acc rate
-        # of 0.
-        if not self.spec_algorithm.is_none():
+        # Simulate the eagle run.
+        if self.spec_algorithm.is_eagle():
 
             b = len(self.reqs)
             topk = server_args.speculative_eagle_topk
