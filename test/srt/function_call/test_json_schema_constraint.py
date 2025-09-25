@@ -15,7 +15,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.function_call.utils import get_json_schema_constraint, validate_tool_definitions
+from sglang.srt.function_call.utils import (
+    get_json_schema_constraint,
+    validate_tool_definitions,
+)
 
 
 class TestJsonSchemaConstraint(unittest.TestCase):
@@ -354,28 +357,36 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         with self.assertRaises(ValueError) as context:
             validate_tool_definitions(tools_with_conflicting_defs)
 
-        self.assertIn("Tool definition 'ConflictingType' has multiple schemas", str(context.exception))
+        self.assertIn(
+            "Tool definition 'ConflictingType' has multiple schemas",
+            str(context.exception),
+        )
         self.assertIn("which is not supported", str(context.exception))
 
     def test_http_error_handling_integration(self):
         """Test that conflicting tool definitions are caught in validation and return 400 error"""
         from unittest.mock import Mock
+
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionRequest,
+            Function,
+            Tool,
+        )
         from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, Tool, Function
-        
+
         # Create a mock tokenizer manager
         mock_tokenizer_manager = Mock()
         mock_tokenizer_manager.model_config = Mock(is_multimodal=False)
         mock_tokenizer_manager.server_args = Mock(enable_cache_report=False)
-        
+
         # Create a mock template manager
         mock_template_manager = Mock()
         mock_template_manager.chat_template_name = None
         mock_template_manager.jinja_template_content_format = "string"
-        
+
         # Create serving chat instance
         serving_chat = OpenAIServingChat(mock_tokenizer_manager, mock_template_manager)
-        
+
         # Create tools with conflicting definitions
         tools_with_conflicting_defs = [
             Tool(
@@ -413,19 +424,21 @@ class TestJsonSchemaConstraint(unittest.TestCase):
                 ),
             ),
         ]
-        
+
         # Create a request with conflicting tools
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "test"}],
             tools=tools_with_conflicting_defs,
-            tool_choice="required"
+            tool_choice="required",
         )
-        
+
         # Test that the validation catches the conflicting definitions
         error_msg = serving_chat._validate_request(request)
         self.assertIsNotNone(error_msg)
-        self.assertIn("Tool definition 'ConflictingType' has multiple schemas", error_msg)
+        self.assertIn(
+            "Tool definition 'ConflictingType' has multiple schemas", error_msg
+        )
         self.assertIn("which is not supported", error_msg)
 
 

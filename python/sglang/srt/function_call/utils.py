@@ -56,10 +56,11 @@ def _is_complete_json(input_str: str) -> bool:
     except JSONDecodeError:
         return False
 
+
 def validate_tool_definitions(tools: List[Tool]) -> None:
     """
     Validate that tool definitions don't have conflicting $defs.
-    
+
     Raises:
         ValueError: If there are conflicting tool definitions
     """

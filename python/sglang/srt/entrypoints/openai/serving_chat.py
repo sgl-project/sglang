@@ -39,7 +39,10 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.utils import get_json_schema_constraint, validate_tool_definitions
+from sglang.srt.function_call.utils import (
+    get_json_schema_constraint,
+    validate_tool_definitions,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -93,19 +96,16 @@ class OpenAIServingChat(OpenAIServingBase):
             for i, tool in enumerate(request.tools):
                 if not hasattr(tool.function, "name") or not tool.function.name:
                     return f"Tool {i} function is missing required 'name' field."
-                if not hasattr(tool.function, "parameters"):
-                    return f"Tool {i} function is missing required 'parameters' field."
                 try:
                     Draft202012Validator.check_schema(tool.function.parameters)
                 except SchemaError as e:
                     return (
                         f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
                     )
-            
+
             # Check for conflicting tool definitions when tool_choice is required or specific
-            if (
-                request.tool_choice == "required"
-                or isinstance(request.tool_choice, ToolChoice)
+            if request.tool_choice == "required" or isinstance(
+                request.tool_choice, ToolChoice
             ):
                 try:
                     validate_tool_definitions(request.tools)
@@ -227,9 +227,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice
                 )
             # Handle JSON schema constraint directly for required or named tool choice
-            if (
-                request.tool_choice == "required"
-                or isinstance(request.tool_choice, ToolChoice)
+            if request.tool_choice == "required" or isinstance(
+                request.tool_choice, ToolChoice
             ):
                 json_schema = get_json_schema_constraint(
                     request.tools, request.tool_choice
@@ -1089,9 +1088,8 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
             # Use JSON detector directly for required or named tool choice
-            if (
-                request.tool_choice == "required"
-                or isinstance(request.tool_choice, ToolChoice)
+            if request.tool_choice == "required" or isinstance(
+                request.tool_choice, ToolChoice
             ):
                 parser_dict[index] = JsonArrayParser()
             else:
