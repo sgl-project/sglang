@@ -899,6 +899,28 @@ class ForwardBatch:
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
 
+    def query_start_loc(self, *, device: str):
+        assert isinstance(device, str)
+        bs = self.batch_size
+        if self.forward_mode.is_decode_or_idle():
+            return torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+        elif self.forward_mode.is_extend():
+            if self.forward_mode.is_target_verify():
+                return torch.arange(
+                    0,
+                    self.input_ids.shape[0] + 1,
+                    step=self.spec_info.draft_token_num,
+                    dtype=torch.int32,
+                    device=self.input_ids.device,
+                )
+            else:
+                qsl = torch.empty((bs + 1,), dtype=torch.int32, device=device)
+                qsl[:bs] = self.extend_start_loc
+                qsl[bs] = self.extend_start_loc[-1] + self.extend_seq_lens[-1]
+                return qsl
+        else:
+            raise ValueError(f"Invalid forward mode: {self.forward_mode=}")
+
 
 def enable_num_token_non_padded(server_args):
     return get_moe_expert_parallel_world_size() > 1
