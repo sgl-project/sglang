@@ -181,12 +181,18 @@ class HiRadixCache(RadixCache):
             logger.warning(
                 f"prefetch_threshold must be an integer, got {type(prefetch_threshold).__name__}. Converting to int."
             )
-            prefetch_threshold = int(prefetch_threshold)
+            raise ValueError(
+                f"prefetch_threshold must be an integer, got {type(prefetch_threshold).__name__}"
+            )
+        prefetch_threshold = int(prefetch_threshold)
 
         # Validate prefetch_timeout_base is a float
         if not isinstance(prefetch_timeout_base, (int, float)):
             logger.warning(
                 f"prefetch_timeout_base must be a number, got {type(prefetch_timeout_base).__name__}. Converting to float."
+            )
+            raise ValueError(
+                f"prefetch_timeout_base must be a number, got {type(prefetch_timeout_base).__name__}"
             )
         prefetch_timeout_base = float(prefetch_timeout_base)
 
@@ -194,6 +200,9 @@ class HiRadixCache(RadixCache):
         if not isinstance(prefetch_timeout_per_ki_token, (int, float)):
             logger.warning(
                 f"prefetch_timeout_per_ki_token must be a number, got {type(prefetch_timeout_per_ki_token).__name__}. Converting to float."
+            )
+            raise ValueError(
+                f"prefetch_timeout_per_ki_token must be a number, got {type(prefetch_timeout_per_ki_token).__name__}"
             )
         prefetch_timeout_per_ki_token = float(prefetch_timeout_per_ki_token)
 
