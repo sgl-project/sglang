@@ -71,16 +71,13 @@ class StorageBackendFactory:
         **kwargs,
     ) -> HiCacheStorage:
         """Create a storage backend instance.
-
         Args:
             backend_name: Name of the backend to create
             storage_config: Storage configuration
             mem_pool_host: Memory pool host object
             **kwargs: Additional arguments passed to external backends
-
         Returns:
             Initialized storage backend instance
-
         Raises:
             ValueError: If backend is not registered and cannot be dynamically loaded
             ImportError: If backend module cannot be imported
@@ -163,20 +160,14 @@ class StorageBackendFactory:
         """Create built-in backend with original initialization logic."""
         if backend_name == "file":
             return backend_class(storage_config)
-
         elif backend_name == "nixl":
             return backend_class()
-
         elif backend_name == "mooncake":
             backend = backend_class(storage_config)
-            backend.register_buffer(mem_pool_host.kv_buffer)
-            # Mooncake requires page_first layout
-            if mem_pool_host.layout != "page_first":
-                raise ValueError(
-                    f"Mooncake backend requires page_first layout, got {mem_pool_host.layout}"
-                )
             return backend
-
+        elif backend_name == "aibrix":
+            backend = backend_class(storage_config, mem_pool_host)
+            return backend
         elif backend_name == "hf3fs":
             # Calculate bytes_per_page based on memory pool layout
             if mem_pool_host.layout == "page_first":
@@ -187,12 +178,9 @@ class StorageBackendFactory:
                 bytes_per_page = (
                     mem_pool_host.get_size_per_token() * mem_pool_host.page_size
                 )
-            else:
-                raise ValueError(f"Unknown memory pool layout: {mem_pool_host.layout}")
 
             dtype = mem_pool_host.dtype
             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
-
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -218,4 +206,10 @@ StorageBackendFactory.register_backend(
     "hf3fs",
     "sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs",
     "HiCacheHF3FS",
+)
+
+StorageBackendFactory.register_backend(
+    "aibrix",
+    "sglang.srt.mem_cache.storage.aibrix_kvcache.aibrix_kvcache_storage",
+    "AibrixKVCacheStorage",
 )

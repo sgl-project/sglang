@@ -2154,13 +2154,6 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix"],
-            default=ServerArgs.hicache_storage_backend,
-            help="The storage backend for hierarchical KV cache.",
-        )
-        parser.add_argument(
-            "--hicache-storage-backend",
-            type=str,
             choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
