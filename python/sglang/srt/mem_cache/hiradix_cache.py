@@ -165,17 +165,17 @@ class HiRadixCache(RadixCache):
             return False
         
     def calculate_node_value(self, node: TreeNode):
-        # 基于访问频率和最近访问时间
+        
         recency = time.monotonic() - node.last_access_time
         frequency = node.hit_count
 
-        # 价值公式：高频 + 近期 = 高价值
+        # high value = big size Node which is frequently & recently accessed
         value = frequency / (recency + 1)  # +1 避免除零
 
-        # 大节点价值更高（节省更多内存）
+        
         value *= len(node.value) 
-
-        return value 
+        # High value node should have small priority which can be process firstly
+        return -1 * value 
 
     def write_backup(self, node: TreeNode, priority=None, write_back=False):
         host_indices = self.cache_controller.write(
