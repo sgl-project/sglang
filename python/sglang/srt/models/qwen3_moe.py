@@ -663,7 +663,6 @@ class Qwen3MoeModel(Qwen2MoeModel):
         prefix: str = "",
     ) -> None:
         alt_stream = torch.cuda.Stream() if _is_cuda else None
-        print("Qwen3MoeModel")
         super().__init__(
             config=config,
             quant_config=quant_config,

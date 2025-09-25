@@ -51,7 +51,6 @@ from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
-
 # === Vision Encoder === #
 
 
@@ -255,8 +254,8 @@ class Qwen3VLMoeVisionModel(nn.Module):
     def __init__(
         self,
         vision_config: Qwen3VLVisionConfig,
-        quant_config: Optional[QuantizationConfig] = None,
         norm_eps: float = 1e-6,
+        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -270,7 +269,6 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
-
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
@@ -606,6 +604,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         config: Qwen3VLConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
 
@@ -619,7 +618,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("visual", prefix),
         )
 
-        self.model = Qwen3LLMModel(
+        print(getattr(config, "rms_norm_eps", 1e-6))
+        print("1111")
+
+        self.model = language_model_cls(
             config=config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
@@ -662,7 +664,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        print(f"get_image_feature")
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype

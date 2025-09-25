@@ -587,8 +587,8 @@ def embed_mm_inputs(
                 embedding, deepstack_embedding = (
                     multimodal_model.separate_deepstack_embeds(embedding)
                 )
-                print(f"{embedding.shape=}")
-                print(f"{deepstack_embedding.shape=}")
+                # print(f"{embedding.shape=}")
+                # print(f"{deepstack_embedding.shape=}")
                 deepstack_embeddings += [deepstack_embedding]
             modalities += [modality]
             embeddings += [embedding]

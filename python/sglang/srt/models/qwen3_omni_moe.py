@@ -13,22 +13,18 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
-import logging
 import math
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, MoeCausalLMOutputWithPast
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
-    eager_attention_forward,
 )
 
 from sglang.srt.configs.qwen3_omni import (
@@ -47,19 +43,13 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.mm_utils import general_mm_embed_routine
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_moe import Qwen3MoeAttention, Qwen3MoeDecoderLayer
+from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
-from sglang.srt.models.qwen3_vl_moe import (
-    Qwen3VLMoeForConditionalGeneration,
-    Qwen3VLMoeTextModel,
-)
-from sglang.srt.utils import add_prefix
-
-logger = logging.getLogger(__name__)
+from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from sglang.srt.utils import add_prefix, logger
+from transformers import PreTrainedModel
 
 
 @dataclass
@@ -73,84 +63,6 @@ class Qwen3OmniMoeThinkerCausalLMOutputWithPast(MoeCausalLMOutputWithPast):
     rope_deltas: Optional[torch.LongTensor] = None
 
 
-class Qwen3OmniMoeAudioAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config):
-        super().__init__()
-        self.embed_dim = config.d_model
-        self.num_heads = config.encoder_attention_heads
-        self.dropout = config.attention_dropout
-        self.head_dim = self.embed_dim // self.num_heads
-        self.num_key_value_groups = 1  # needed for eager attention
-        self.config = config
-
-        if (self.head_dim * self.num_heads) != self.embed_dim:
-            raise ValueError(
-                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = 0.0
-        self.is_decoder = False
-        self.is_causal = False
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        """Input shape: Batch x Time x Channel"""
-
-        seq_length, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states).reshape(
-            seq_length, self.num_heads, -1
-        )
-        key_states = self.k_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
-        value_states = self.v_proj(hidden_states).reshape(
-            seq_length, self.num_heads, -1
-        )
-
-        query_states = query_states.transpose(0, 1).unsqueeze(0)
-        key_states = key_states.transpose(0, 1).unsqueeze(0)
-        value_states = value_states.transpose(0, 1).unsqueeze(0)
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
-
-        attn_output, _ = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            cu_seq_lens_q=cu_seqlens,  # pass cu seq lens for FA2
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
-            is_causal=False,
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(seq_length, -1).contiguous()
-        attn_output = self.out_proj(attn_output)
-
-        return attn_output
-
-
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
     def __init__(
         self,
@@ -161,7 +73,6 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         super().__init__()
         embed_dim = config.d_model
         self.embed_dim = config.d_model
-        # self.self_attn = Qwen3OmniMoeAudioAttention(config)
         self.self_attn = VisionAttention(
             embed_dim=embed_dim,
             num_heads=config.encoder_attention_heads,
@@ -406,46 +317,6 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         hidden_states = self.proj2(hidden_states)
         return BaseModelOutput(last_hidden_state=hidden_states)
 
-    def padded_and_mask_function(
-        self, tensor_list, tensor_len, padding_value=0, padding_side="right"
-    ):
-        """
-        Pads a sequence of tensors to their maximum length on indicated `padding_side`.
-        Then prepares a mask so that pad tokens are not attended to.
-        """
-        max_len = tensor_len.max()
-        dim = tensor_list[0].shape[0]
-        padded_tensor = torch.full(
-            size=(len(tensor_list), dim, max_len),
-            fill_value=padding_value,
-            dtype=self.dtype,
-            device=tensor_list[0].device,
-        )
-
-        batch_mask = torch.zeros(
-            (len(tensor_len), max_len),
-            dtype=torch.long,
-            device=padded_tensor.device,
-        )
-        for i, length in enumerate(tensor_len):
-            batch_mask[i, :length] = 1
-            padded_tensor[i, :, :length] = tensor_list[i]
-
-        feature_lens_after_cnn = (tensor_len - 1) // 2 + 1
-        max_len_after_cnn = feature_lens_after_cnn.max()
-        batch_mask_after_cnn = torch.zeros(
-            (len(tensor_len), max_len_after_cnn),
-            dtype=torch.long,
-            device=padded_tensor.device,
-        )
-        for i, length in enumerate(feature_lens_after_cnn):
-            batch_mask_after_cnn[i, :length] = 1
-        return (
-            padded_tensor,
-            batch_mask.unsqueeze(1),
-            batch_mask_after_cnn.bool(),
-        )
-
     # Ignore copy
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         """
@@ -468,7 +339,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         use_postshuffle_norm=False,
     ) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.hidden_size = context_dim * (spatial_merge_size ** 2)
         self.use_postshuffle_norm = use_postshuffle_norm
         self.ln_q = RMSNorm(
             self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6
@@ -494,16 +365,6 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x expected shape: [S, B, context_dim]
-        # S, B, D = x.shape
-        # x2d = x.reshape(-1, D)
-        # x2d = self.ln_q(x2d)  # RMSNorm expects 2D
-        # x2d = x2d.view(-1, self.hidden_size)  # group into spatial_merge_unit
-        # mlp_fc1, mlp_act, mlp_fc2 = self.mlp
-        # x_parallel, _ = mlp_fc1(x2d)
-        # x_parallel = mlp_act(x_parallel)
-        # out, _ = mlp_fc2(x_parallel)
-        # return out
         x = (
             x.view(-1, self.hidden_size)
             if self.use_postshuffle_norm
@@ -531,7 +392,11 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
         prefix: str = None,
         **kwargs,
     ):
-        super().__init__(config, quant_config)
+        super().__init__(
+            vision_config=config,
+            quant_config=quant_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+        )
 
         self.merger = Qwen3OmniMoeVisionPatchMerger(
             dim=config.out_hidden_size,
@@ -569,12 +434,6 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
         return self.patch_embed.proj.weight.device
 
 
-class Qwen3OmniMoeThinkerTextAttention(Qwen3MoeAttention):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.sliding_window = None
-
-
 class Qwen3OmniMoeThinkerTextDecoderLayer(Qwen3MoeDecoderLayer):
     def __init__(
         self,
@@ -584,43 +443,14 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(Qwen3MoeDecoderLayer):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
-        super().__init__(config, layer_idx, quant_config)
-        self.config = config
-        self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        rms_norm_eps = config.rms_norm_eps
-        attention_bias = config.attention_bias
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
-        self.self_attn = Qwen3OmniMoeThinkerTextAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_idx,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            attention_bias=attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            dual_chunk_attention_config=dual_chunk_attention_config,
-            alt_stream=alt_stream,
-        )
+        super().__init__(config, layer_idx, quant_config, prefix, alt_stream)
 
 
 class Qwen3OmniMoeThinkerTextRotaryEmbedding(Qwen2_5_VisionRotaryEmbedding):
     pass
 
 
-class Qwen3OmniMoeThinkerTextModel(Qwen3VLMoeTextModel):
+class Qwen3OmniMoeThinkerTextModel(Qwen3MoeModel):
     config_class = Qwen3OmniMoeTextConfig
 
     def __init__(
@@ -640,12 +470,6 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3VLMoeTextModel):
         head_dim = config.hidden_size // config.num_attention_heads
         self.rotary_pos_emb = Qwen3OmniMoeThinkerTextRotaryEmbedding(head_dim // 2)
 
-    def _deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
-        visual_pos_masks = visual_pos_masks[..., 0]
-        return super()._deepstack_process(
-            hidden_states, visual_pos_masks, visual_embeds
-        )
-
 
 class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
     config: Qwen3OmniMoeThinkerConfig
@@ -661,27 +485,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
                 setattr(config, k, v)
         config.vocab_size = config.text_config.vocab_size
         super().__init__(config, quant_config, prefix)
-        self.config = config
         self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config)
         self.visual = Qwen3OmniMoeVisionEncoder(
             config.vision_config, quant_config=quant_config
         )
-        self.vocab_size = config.text_config.vocab_size
-
-        self.model = self.language_model
-        delattr(self, "language_model")
-
-        self.lm_head = nn.Linear(
-            config.text_config.hidden_size, config.text_config.vocab_size, bias=False
-        )
         self.pad_token_id = (
             self.config.pad_token_id if self.config.pad_token_id is not None else -1
         )
-        self.spatial_merge_size = config.vision_config.spatial_merge_size
-        self.rope_deltas = None
-        self.num_experts = config.text_config.num_experts
-        self.num_experts_per_tok = config.text_config.num_experts_per_tok
-        self.use_deepstack = {Modality.IMAGE: True}
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -719,48 +529,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
 
         return audio_features
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        get_embedding: bool = False,
-    ) -> Union[tuple, Qwen3OmniMoeThinkerCausalLMOutputWithPast]:
-        if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
-
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
-        # print(f"{forward_batch.contains_mm_inputs()=}")
-        # print(f"{forward_batch.mm_inputs=}")
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-            use_deepstack=self.use_deepstack,
-        )
-
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            return self.pooler(hidden_states, forward_batch)
-
 
 class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
     def __init__(
         self,
-        *,
         config: Qwen3VLMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -773,27 +545,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         )
         self.enable_talker = False
         self.pad_input_ids = self.thinker.pad_input_ids
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        get_embedding: bool = False,
-    ):
-        """Run forward pass for Qwen3-VL.
-
-        Args:
-            input_ids: Flattened (concatenated) input_ids corresponding to a
-                batch.
-            positions: Flattened (concatenated) position ids corresponding to a
-                batch.
-                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
-                opensource models), the shape will be `(3, seq_len)`,
-                otherwise it will be `(seq_len,).
-                (Use input_metadata.mrope_positions to replace it)
-        """
-        return self.thinker.forward(input_ids, positions, forward_batch, get_embedding)
+        self.forward = self.thinker.forward
 
     def load_fused_expert_weights(
         self,

@@ -217,7 +217,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen2_5_VLForConditionalGeneration,
         Qwen3VLForConditionalGeneration,
         Qwen3VLMoeForConditionalGeneration,
-        Qwen3VLMoeForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
     ]
 
@@ -261,7 +260,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        print(f"{request_obj=}")
+        # print(f"{request_obj=}")
 
         base_output = self.load_mm_data(
             prompt=input_text,
