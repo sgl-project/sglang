@@ -764,7 +764,7 @@ class HybridLinearAttentionBackend(AttentionBackend):
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
-def normal_decode_set_medadata(
+def normal_decode_set_metadata(
     metadata,
     req_to_token,
     req_to_constant,
