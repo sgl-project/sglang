@@ -661,6 +661,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=f"{prefix}.attn",
+            orig_context_len=getattr(
+                config, "orig_context_len", self.max_position_embeddings
+            ),
+            rope=self.rotary_emb,
         )
 
         # Qwen3Next all layers are sparse and have no nextn now
