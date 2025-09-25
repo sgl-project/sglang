@@ -171,7 +171,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
-    lm_head_fp32: bool = False
+    enable_fp32_lm_head: bool = False
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -1282,7 +1282,7 @@ class ServerArgs:
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
         )
         parser.add_argument(
-            "--lm-head-fp32",
+            "--enable-fp32-lm-head",
             action="store_true",
             help="If set, the LM head outputs (logits) are in FP32.",
         )

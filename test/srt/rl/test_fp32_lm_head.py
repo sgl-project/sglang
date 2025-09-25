@@ -31,53 +31,53 @@ class TestLMHeadFP32(unittest.TestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("needs CUDA GPU")
 
-    def _make_lp(self, vocab_size, enable_fp32):
+    def _make_logprocessor(self, vocab_size, enable_fp32):
         global_server_args_dict["enable_dp_lm_head"] = False
-        global_server_args_dict["enable_lm_head_fp32"] = enable_fp32
+        global_server_args_dict["enable_fp32_lm_head"] = enable_fp32
         cfg = SimpleNamespace(vocab_size=vocab_size, final_logit_softcapping=None)
         return LogitsProcessor(cfg, skip_all_gather=True, logit_scale=None)
 
-    def _run_case(self, hs_dtype, enable_fp32, w_dtype):
+    def _run_case(self, hidden_state_dtype, enable_fp32, weights_dtype):
         device = "cuda"
-        B, H, V = 2, 64, 128
-        hs = torch.randn(B, H, dtype=hs_dtype, device=device)
-        head = LMHeadStub(V, H, dtype=w_dtype, device=device)
+        BATCH_SIZE, HIDDEN_SIZE, VOCAB_SIZE = 2, 64, 128
+        hidden_state = torch.randn(BATCH_SIZE, HIDDEN_SIZE, dtype=hidden_state_dtype, device=device)
+        head = LMHeadStub(VOCAB_SIZE, HIDDEN_SIZE, dtype=weights_dtype, device=device)
         meta = DummyMeta()
-        lp = self._make_lp(V, enable_fp32)
+        logprocessor = self._make_logprocessor(VOCAB_SIZE, enable_fp32)
 
-        orig_mm = torch.matmul
-        orig_li = F.linear
+        original_matmul = torch.matmul
+        original_linear = F.linear
 
-        state = {"called": False, "op": None, "a": None, "b": None}
+        state = {"called": False, "operation": None, "a": None, "b": None}
 
         def probe_matmul(a, b, *args, **kw):
             if not state["called"]:
-                state.update(called=True, op="matmul", a=a.dtype, b=b.dtype)
-            return orig_mm(a, b, *args, **kw)
+                state.update(called=True, operation="matmul", a=a.dtype, b=b.dtype)
+            return original_matmul(a, b, *args, **kw)
 
         def probe_linear(x, w, bias=None):
             if not state["called"]:
-                state.update(called=True, op="linear", a=x.dtype, b=w.dtype)
-            return orig_li(x, w, bias)
+                state.update(called=True, ooperationp="linear", a=x.dtype, b=w.dtype)
+            return original_linear(x, w, bias)
 
         with patch("torch.matmul", new=probe_matmul), patch(
             "torch.nn.functional.linear", new=probe_linear
         ):
-            logits = lp._get_logits(hs, head, meta)
+            logits = logprocessor._get_logits(hidden_state, head, meta)
 
         self.assertEqual(logits.dtype, torch.float32)
-        self.assertEqual(hs.dtype, hs_dtype)
+        self.assertEqual(hidden_state.dtype, hidden_state_dtype)
         self.assertTrue(state["called"], "no call lm head matlmul/linear")
 
         return state["a"], state["b"]
 
     def test_flag_true_fp16_activations(self):
-        a, b = self._run_case(torch.float16, True, torch.float32)
+        a, b = self._run_case(torch.float16, True, torch.float16)
         self.assertEqual(a, torch.float32)
         self.assertEqual(b, torch.float32)
 
     def test_flag_true_bf16_activations(self):
-        a, b = self._run_case(torch.bfloat16, True, torch.float32)
+        a, b = self._run_case(torch.bfloat16, True, torch.bfloat16)
         self.assertEqual(a, torch.float32)
         self.assertEqual(b, torch.float32)
 
