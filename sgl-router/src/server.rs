@@ -28,7 +28,7 @@ use axum::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
@@ -400,7 +400,28 @@ async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Respo
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    state.router.get_worker_loads().await
+    let result =
+        WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
+            .await;
+
+    let loads: Vec<Value> = result
+        .loads
+        .iter()
+        .map(|info| {
+            json!({
+                "worker": &info.worker,
+                "load": info.load
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "workers": loads
+        })),
+    )
+        .into_response()
 }
 
 async fn create_worker(
