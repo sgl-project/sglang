@@ -632,16 +632,17 @@ class ServerArgs:
         Generate the list of batch sizes for CUDA graph capture based on cuda_graph_max_bs.
         This integrates the logic from cuda_graph_runner.py.
         """
-        if self.speculative_algorithm is None:
-            if self.disable_cuda_graph_padding:
-                capture_bs = list(range(1, self.cuda_graph_max_bs))
-            else:
-                # Normal case: [1, 2, 4, 8] + list(range(16, 257, 8)) + list(range(272, 512, 16)) + list(range(512, cuda_graph_max_bs))
-                capture_bs = (
-                    [1, 2, 4, 8] + list(range(16, 257, 8)) + list(range(272, 512, 16))
-                )
-                if self.cuda_graph_max_bs > 512:
-                    capture_bs += list(range(512, self.cuda_graph_max_bs))
+        # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
+        if self.disable_cuda_graph_padding:
+            capture_bs = list(range(1, self.cuda_graph_max_bs + 1))
+        elif self.speculative_algorithm is None:
+            # Normal case: [1, 2, 4, 8, 12] + list(range(16, 257, 8)) + list(range(272, 512, 16)) + list(range(512, cuda_graph_max_bs + 1))
+            capture_bs = (
+                [1, 2, 4, 8, 12]
+                + list(range(16, 257, 8))
+                + list(range(272, 512, 16))
+                + list(range(512, self.cuda_graph_max_bs + 1))
+            )
         else:
             # Spec decoding case: list(range(1, 9, 1)) + list(range(10, 33, 2)) + list(range(40, 64, 4)) + list(range(72, 257, 8))
             capture_bs = (
@@ -649,12 +650,8 @@ class ServerArgs:
                 + list(range(10, 33, 2))
                 + list(range(40, 64, 4))
                 + list(range(72, 257, 8))
+                + list(range(272, self.cuda_graph_max_bs + 1, 16))
             )
-            if self.cuda_graph_max_bs > 257:
-                capture_bs += list(range(272, self.cuda_graph_max_bs, 16))
-
-        # Filter batch sizes to ensure they don't exceed cuda_graph_max_bs
-        capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
         return capture_bs
 
