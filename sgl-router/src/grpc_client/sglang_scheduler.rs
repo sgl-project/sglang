@@ -109,29 +109,6 @@ impl SglangSchedulerClient {
         Ok(grpc_request)
     }
 
-    /// Handle n>1 sampling by creating multiple requests from a base request
-    pub fn handle_n_sampling(
-        &self,
-        base_request: proto::GenerateRequest,
-        n: usize,
-    ) -> Vec<proto::GenerateRequest> {
-        if n <= 1 {
-            return vec![base_request];
-        }
-
-        let base_request_id = &base_request.request_id;
-        let mut requests = Vec::with_capacity(n);
-
-        for i in 0..n {
-            let mut request = base_request.clone();
-            // Append suffix to request ID to distinguish multiple samples
-            request.request_id = format!("{}-{}", base_request_id, i);
-            requests.push(request);
-        }
-
-        requests
-    }
-
     /// Build gRPC SamplingParams from OpenAI request
     fn build_grpc_sampling_params(
         &self,

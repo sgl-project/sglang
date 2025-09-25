@@ -268,19 +268,10 @@ impl GrpcRouter {
             }
         };
 
-        // Step 7: Handle n>1 sampling (create multiple requests if needed)
-        let n = body.n.unwrap_or(1) as usize;
-        let grpc_requests = client.handle_n_sampling(base_request, n);
-
-        // Step 8: Handle streaming vs non-streaming
-        // TODO: For n>1, we need to handle multiple streams/responses
-        let first_request = grpc_requests.into_iter().next().unwrap();
-
         if body.stream {
-            self.handle_streaming_chat(client, first_request, body)
-                .await
+            self.handle_streaming_chat(client, base_request, body).await
         } else {
-            self.handle_non_streaming_chat(client, first_request, body)
+            self.handle_non_streaming_chat(client, base_request, body)
                 .await
         }
     }
