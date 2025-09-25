@@ -216,6 +216,18 @@ class DecodePreallocQueue:
             self.metadata_buffers.get_buf_infos()
         )
 
+        if hasattr(self.token_to_kv_pool, "get_extra_pool_buf_infos"):
+            extra_pool_data_ptrs, extra_pool_data_lens, extra_pool_item_lens = (
+                self.token_to_kv_pool.get_extra_pool_buf_infos()
+            )
+            kv_args.extra_pool_data_ptrs = extra_pool_data_ptrs
+            kv_args.extra_pool_data_lens = extra_pool_data_lens
+            kv_args.extra_pool_item_lens = extra_pool_item_lens
+        else:
+            kv_args.extra_pool_data_ptrs = []
+            kv_args.extra_pool_data_lens = []
+            kv_args.extra_pool_item_lens = []
+
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
@@ -413,6 +425,14 @@ class DecodePreallocQueue:
                 .cpu()
                 .numpy()
             )
+            if hasattr(self.req_to_token_pool, "rid_to_mamba_index_mapping"):
+                extra_pool_indices = [
+                    self.req_to_token_pool.rid_to_mamba_index_mapping[
+                        decode_req.req.rid
+                    ]
+                ]
+            else:
+                extra_pool_indices = None
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -421,7 +441,9 @@ class DecodePreallocQueue:
             page_indices = kv_to_page_indices(
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
-            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
+            decode_req.kv_receiver.init(
+                page_indices, decode_req.metadata_buffer_index, extra_pool_indices
+            )
             decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)

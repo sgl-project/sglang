@@ -145,6 +145,18 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
+        if hasattr(self.token_to_kv_pool, "get_extra_pool_buf_infos"):
+            extra_pool_data_ptrs, extra_pool_data_lens, extra_pool_item_lens = (
+                self.token_to_kv_pool.get_extra_pool_buf_infos()
+            )
+            kv_args.extra_pool_data_ptrs = extra_pool_data_ptrs
+            kv_args.extra_pool_data_lens = extra_pool_data_lens
+            kv_args.extra_pool_item_lens = extra_pool_item_lens
+        else:
+            kv_args.extra_pool_data_ptrs = []
+            kv_args.extra_pool_data_lens = []
+            kv_args.extra_pool_item_lens = []
+
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
             self.transfer_backend, KVClassType.MANAGER
         )
@@ -624,15 +636,21 @@ class SchedulerDisaggregationPrefillMixin:
             .numpy()
         )
         req.start_send_idx = end_idx
+        extra_pool_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
+            if hasattr(self.req_to_token_pool, "rid_to_mamba_index_mapping"):
+                extra_pool_indices = [
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[req.rid]
+                ]
+
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-        req.disagg_kv_sender.send(page_indices)
+        req.disagg_kv_sender.send(page_indices, extra_pool_indices)
 
     # PP
     @DynamicGradMode()

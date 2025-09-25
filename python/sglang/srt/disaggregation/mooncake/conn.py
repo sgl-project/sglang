@@ -58,6 +58,7 @@ class TransferKVChunk:
     index_slice: slice
     is_last: bool
     prefill_aux_index: Optional[int]
+    extra_pool_indices: Optional[List[int]]
 
 
 # decode
@@ -69,6 +70,7 @@ class TransferInfo:
     mooncake_session_id: str
     dst_kv_indices: npt.NDArray[np.int32]
     dst_aux_index: int
+    dst_extra_pool_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
 
@@ -78,9 +80,14 @@ class TransferInfo:
             is_dummy = True
             dst_kv_indices = np.array([], dtype=np.int32)
             dst_aux_index = None
+            dst_extra_pool_indices = []
         else:
             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
             dst_aux_index = int(msg[5].decode("ascii"))
+            if msg[6] == b"":
+                dst_extra_pool_indices = []
+            else:
+                dst_extra_pool_indices = list(np.frombuffer(msg[6], dtype=np.int32))
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -89,7 +96,8 @@ class TransferInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_indices=dst_kv_indices,
             dst_aux_index=dst_aux_index,
-            required_dst_info_num=int(msg[6].decode("ascii")),
+            dst_extra_pool_indices=dst_extra_pool_indices,
+            required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
         )
 
@@ -103,6 +111,7 @@ class KVArgsRegisterInfo:
     mooncake_session_id: str
     dst_kv_ptrs: list[int]
     dst_aux_ptrs: list[int]
+    dst_extra_pool_data_ptrs: list[int]
     dst_tp_rank: int
     dst_attn_tp_size: int
     dst_kv_item_len: int
@@ -116,9 +125,10 @@ class KVArgsRegisterInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            dst_tp_rank=int(msg[6].decode("ascii")),
-            dst_attn_tp_size=int(msg[7].decode("ascii")),
-            dst_kv_item_len=int(msg[8].decode("ascii")),
+            dst_extra_pool_data_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
+            dst_tp_rank=int(msg[7].decode("ascii")),
+            dst_attn_tp_size=int(msg[8].decode("ascii")),
+            dst_kv_item_len=int(msg[9].decode("ascii")),
         )
 
 
@@ -610,6 +620,26 @@ class MooncakeKVManager(CommonKVManager):
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
+    def send_extra(
+        self,
+        req: TransferInfo,
+        prefill_extra_pool_indice: list[int],
+        dst_extra_pool_data_ptrs: list[int],
+    ):
+        transfer_blocks = []
+        prefill_extra_pool_data_ptrs = self.kv_args.extra_pool_data_ptrs
+        prefill_extra_pool_item_lens = self.kv_args.extra_pool_item_lens
+
+        for i, dst_extra_pool_ptr in enumerate(dst_extra_pool_data_ptrs):
+            length = prefill_extra_pool_item_lens[i]
+            src_addr = (
+                prefill_extra_pool_data_ptrs[i] + length * prefill_extra_pool_indice
+            )
+            dst_addr = dst_extra_pool_data_ptrs[i] + length * req.dst_extra_pool_indices
+            transfer_blocks.append((src_addr, dst_addr, length))
+
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
@@ -719,6 +749,13 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last:
+                            if kv_chunk.extra_pool_indices:
+                                self.send_extra(
+                                    req,
+                                    kv_chunk.extra_pool_indices,
+                                    target_rank_registration_info.dst_extra_pool_data_ptrs,
+                                )
+
                             if self.pp_group.is_last_rank:
                                 # Only the last chunk we need to send the aux data
                                 ret = self.send_aux(
@@ -782,7 +819,7 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     continue
                 else:
-                    required_dst_info_num = int(waiting_req_bytes[6].decode("ascii"))
+                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
@@ -893,6 +930,7 @@ class MooncakeKVManager(CommonKVManager):
         index_slice: slice,
         is_last: bool,
         aux_index: Optional[int] = None,
+        extra_pool_indices: Optional[List[int]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -926,6 +964,7 @@ class MooncakeKVManager(CommonKVManager):
                 index_slice=index_slice,
                 is_last=is_last,
                 prefill_aux_index=aux_index,
+                extra_pool_indices=extra_pool_indices,
             )
         )
 
@@ -1006,6 +1045,7 @@ class MooncakeKVSender(CommonKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
+        extra_pool_indices: Optional[List[int]] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -1025,6 +1065,7 @@ class MooncakeKVSender(CommonKVSender):
                 index_slice,
                 True,
                 aux_index=self.aux_index,
+                extra_pool_indices=extra_pool_indices,
             )
 
     def poll(self) -> KVPoll:
@@ -1127,6 +1168,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
+            packed_extra_pool_data_ptrs = b"".join(
+                struct.pack("Q", ptr)
+                for ptr in self.kv_mgr.kv_args.extra_pool_data_ptrs
+            )
             # Note(shangming): No need to add pp rank here since pp is not supported on the decode side yet
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
@@ -1144,13 +1189,19 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         self.session_id.encode("ascii"),
                         packed_kv_data_ptrs,
                         packed_aux_data_ptrs,
+                        packed_extra_pool_data_ptrs,
                         dst_tp_rank,
                         dst_attn_tp_size,
                         dst_kv_item_len,
                     ]
                 )
 
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def init(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        extra_pool_indices: Optional[List[int]] = None,
+    ):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
@@ -1164,6 +1215,18 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         self.session_id.encode("ascii"),
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
+                        (
+                            (
+                                np.array(
+                                    extra_pool_indices,
+                                    dtype=np.int32,
+                                ).tobytes()
+                                if not is_dummy
+                                else b""
+                            )
+                            if extra_pool_indices
+                            else b""
+                        ),
                         str(self.required_dst_info_num).encode("ascii"),
                     ]
                 )

@@ -118,6 +118,7 @@ class MambaPool:
         device: str,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
+        self.num_mamba_layers = num_mamba_layers
         conv_state = torch.zeros(
             size=(num_mamba_layers, size + 1) + conv_state_shape,
             dtype=conv_dtype,
@@ -210,6 +211,23 @@ class MambaPool:
 
     def clear(self):
         self.free_slots = list(range(self.size))
+
+    def get_contiguous_buf_infos(self):
+        cached_states_len = self.mamba_cache.size(0)
+        data_ptrs, data_lens, item_lens = [], [], []
+        for state in range(cached_states_len):
+            data_ptrs += [
+                self.mamba_cache[state][i].data_ptr()
+                for i in range(self.num_mamba_layers)
+            ]
+            data_lens += [
+                self.mamba_cache[state][i].nbytes for i in range(self.num_mamba_layers)
+            ]
+            item_lens += [
+                self.mamba_cache[state][i][0].nbytes
+                for i in range(self.num_mamba_layers)
+            ]
+        return data_ptrs, data_lens, item_lens
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -697,6 +715,12 @@ class HybridLinearKVPool(KVCache):
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
+    def get_extra_pool_buf_infos(self):
+        mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
+            self.mamba_pool.get_contiguous_buf_infos()
+        )
+        return mamba_data_ptrs, mamba_data_lens, mamba_item_lens
+
     def _transfer_full_attention_id(self, layer_id: int):
         if layer_id not in self.full_attention_layer_id_mapping:
             raise ValueError(
@@ -800,6 +824,13 @@ class SWAKVPool(KVCache):
         kv_item_lens = full_kv_item_lens + swa_kv_item_lens
 
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_extra_pool_buf_infos(self):
+        swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
+            self.swa_kv_pool.get_contiguous_buf_infos()
+        )
+
+        return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
