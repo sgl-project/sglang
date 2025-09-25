@@ -265,9 +265,11 @@ class HybridLinearAttentionBackend(AttentionBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
-            metadata.linear_page_table = forward_batch.req_to_token_pool.req_to_constant[
-                forward_batch.req_pool_indices
-            ]
+            metadata.linear_page_table = (
+                forward_batch.req_to_token_pool.req_to_constant[
+                    forward_batch.req_pool_indices
+                ]
+            )
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             metadata.req_pool_indices = forward_batch.req_pool_indices
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
@@ -278,9 +280,11 @@ class HybridLinearAttentionBackend(AttentionBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
-            metadata.linear_page_table = forward_batch.req_to_token_pool.req_to_constant[
-                forward_batch.req_pool_indices
-            ]
+            metadata.linear_page_table = (
+                forward_batch.req_to_token_pool.req_to_constant[
+                    forward_batch.req_pool_indices
+                ]
+            )
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
@@ -298,7 +302,7 @@ class HybridLinearAttentionBackend(AttentionBackend):
         batch_seqlen_q = metadata.cu_seqlens_q[1:] - metadata.cu_seqlens_q[:-1]
         batch_seqlen_k = metadata.cu_seqlens_k[1:] - metadata.cu_seqlens_k[:-1]
         is_decode_req_tensor = torch.ones_like(forward_batch.seq_lens)
-        is_decode_req_tensor.masked_fill_(batch_seqlen_q==batch_seqlen_k, 0)
+        is_decode_req_tensor.masked_fill_(batch_seqlen_q == batch_seqlen_k, 0)
         metadata.is_decode_req_tensor = is_decode_req_tensor
         metadata.seqlens_q = metadata.cu_seqlens_q.diff()
 
@@ -698,9 +702,9 @@ class HybridLinearAttentionBackend(AttentionBackend):
             metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                 req_pool_indices, :
             ]
-            metadata.linear_page_table = self.decode_cuda_graph_metadata["linear_page_table"][
-                req_pool_indices
-            ]
+            metadata.linear_page_table = self.decode_cuda_graph_metadata[
+                "linear_page_table"
+            ][req_pool_indices]
             metadata.req_pool_indices = req_pool_indices
             # Precompute cumulative sequence lengths
             metadata.cu_seqlens_q = torch.arange(
@@ -778,6 +782,4 @@ def normal_decode_set_medadata(
     ]
     metadata.page_table[:, :max_seq_pages].copy_(page_indices // page_size)
     metadata.page_table[:, max_seq_pages:].fill_(0)
-    metadata.linear_page_table[:].copy_(req_to_constant[
-                req_pool_indices
-            ])
+    metadata.linear_page_table[:].copy_(req_to_constant[req_pool_indices])

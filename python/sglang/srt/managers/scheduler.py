@@ -1544,7 +1544,10 @@ class Scheduler(
                 self.req_to_token_pool.free(
                     self.chunked_req.req_pool_idx, free_mamba_cache=False
                 )
-            elif self.tp_worker.worker.model_runner.server_args.attention_backend == "bailing_hybrid_linear":
+            elif (
+                self.tp_worker.worker.model_runner.server_args.attention_backend
+                == "bailing_hybrid_linear"
+            ):
                 self.req_to_token_pool.free(
                     self.chunked_req.req_pool_idx, free_constant_cache=False
                 )

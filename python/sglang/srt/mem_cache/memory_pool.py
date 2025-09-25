@@ -101,6 +101,7 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size))
 
+
 class HybridLinearReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -124,7 +125,7 @@ class HybridLinearReqToTokenPool:
                 (size, max_context_len), dtype=torch.int32, device=device
             )
             self.req_to_constant = torch.full(
-                (size+1,), -1, dtype=torch.int32, device=device
+                (size + 1,), -1, dtype=torch.int32, device=device
             )
         self.rid_to_req = {}
         self.req_to_rid = {}
@@ -153,9 +154,11 @@ class HybridLinearReqToTokenPool:
                 pre_index = self.linear_free_slots.pop()
                 self.rid_to_req[rid] = pre_index
                 self.req_to_rid[pre_index] = rid
-            
+
             req_to_constant.append(pre_index)
-        self.req_to_constant[select_index] = torch.tensor(req_to_constant, dtype=torch.int32, device=self.device)
+        self.req_to_constant[select_index] = torch.tensor(
+            req_to_constant, dtype=torch.int32, device=self.device
+        )
 
         return select_index
 
@@ -169,7 +172,6 @@ class HybridLinearReqToTokenPool:
                 self.rid_to_req.pop(rid)
                 self.req_to_rid.pop(linear_free_index)
 
-
         else:
             self.free_slots.extend(free_index)
             if free_constant_cache:
@@ -180,12 +182,12 @@ class HybridLinearReqToTokenPool:
                     self.rid_to_req.pop(rid)
                     self.req_to_rid.pop(index)
 
-
     def clear(self):
         self.free_slots = list(range(self.size))
         self.linear_free_slots = list(range(self.size))
         self.rid_to_req = {}
         self.req_to_constant.fill_(-1)
+
 
 class MambaPool:
     def __init__(
