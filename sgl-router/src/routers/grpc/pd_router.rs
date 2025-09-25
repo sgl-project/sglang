@@ -4,7 +4,7 @@ use crate::config::types::RetryConfig;
 use crate::core::{
     BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
 };
-use crate::grpc::SglangSchedulerClient;
+use crate::grpc_client::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::reasoning_parser::ParserFactory;
