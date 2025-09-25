@@ -182,7 +182,7 @@ class ServerArgs:
 
     # Runtime options
     device: Optional[str] = None
-    dist_backend: Literal[None, "mooncake"] = None
+    enable_mooncake_dist_backend: bool = False
     tp_size: int = 1
     pp_size: int = 1
     max_micro_batch_size: Optional[int] = None
@@ -1205,11 +1205,9 @@ class ServerArgs:
             help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
-            "--dist-backend",
-            type=str,
-            default=ServerArgs.dist_backend,
-            choices=["mooncake"],
-            help="Use 'mooncake' to support fault-tolerant communication. Defaults to auto-detection if not specified.",
+            "--enable-mooncake-dist-backend",
+            action="store_true",
+            help="Enable Mooncake Backend to support fault-tolerant communication.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
