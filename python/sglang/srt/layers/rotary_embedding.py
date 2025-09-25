@@ -1087,21 +1087,11 @@ class MRotaryEmbedding(RotaryEmbedding):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
-    def forward_cpu(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(positions, query, key)
+    def forward_cpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
 
-    def forward_cuda(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(positions, query, key)
+    def forward_cuda(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
 
     def forward_npu(
         self,
