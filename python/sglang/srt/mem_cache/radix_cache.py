@@ -478,7 +478,7 @@ class RadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         value = []
-        match_history = [node]
+        match_history = [node] if align_split_size else None
         align_split_size = align_split_size and self.enable_deterministic_inference
 
         if align_split_size and len(key) < self.split_size:
@@ -489,7 +489,6 @@ class RadixCache(BasePrefixCache):
         def reconstruct_at_split_point(match_history, value_len):
             # reverse the search process to find the last node right above the split_size, split here
             split_point = value_len // self.split_size * self.split_size
-            print("value_len=", value_len, "split_point=", split_point)
             # rebuild value form history
             value = []
             current_value_len = 0
@@ -519,7 +518,8 @@ class RadixCache(BasePrefixCache):
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
-            match_history.append(child)
+            if align_split_size:
+                match_history.append(child)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
