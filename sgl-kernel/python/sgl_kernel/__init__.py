@@ -20,44 +20,118 @@ def _get_compute_capability():
     return properties.major * 10 + properties.minor
 
 
-def _get_ops_library():
-    """Get the appropriate ops library based on GPU architecture."""
+def _load_architecture_specific_ops():
+    """Load the appropriate common_ops library based on GPU architecture."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
     compute_capability = _get_compute_capability()
-    print(f"[sgl_kernel] Detected compute capability: {compute_capability}")
+    print(f"[sgl_kernel] GPU Detection: compute_capability = {compute_capability}")
 
-    if compute_capability is None:
-        return None
+    # Get the directory where sgl_kernel is installed
+    sgl_kernel_dir = Path(__file__).parent
+    print(f"[sgl_kernel] sgl_kernel directory: {sgl_kernel_dir}")
 
+    # Determine which version to load based on GPU architecture
     if compute_capability == 90:
-        # SM90 (Hopper/H100) - use fast math
-        try:
-            from sgl_kernel import common_ops_sm90
-            print("[sgl_kernel] Using common_ops_sm90 (fast math) for SM90")
-            return common_ops_sm90.ops.sgl_kernel_fast
-        except ImportError as e:
-            print(f"[sgl_kernel] Failed to import common_ops_sm90: {e}")
-            pass
+        ops_subdir = "sm90"
+        variant_name = "SM90 (Hopper/H100 with fast math optimization)"
+    elif compute_capability is not None:
+        ops_subdir = "sm100"
+        variant_name = f"SM{compute_capability} (precise math for compatibility)"
     else:
-        # SM100+ (Blackwell) or other architectures - use precise math
-        try:
-            from sgl_kernel import common_ops_sm100
-            print("[sgl_kernel] Using common_ops_sm100 (precise) for SM100+")
-            return common_ops_sm100.ops.sgl_kernel_precise
-        except ImportError as e:
-            print(f"[sgl_kernel] Failed to import common_ops_sm100: {e}")
-            pass
+        ops_subdir = "sm100"
+        variant_name = "CPU/No GPU detected (using precise math)"
 
-    # Final fallback for all cases
+    ops_path = sgl_kernel_dir / ops_subdir / "common_ops.so"
+    print(f"[sgl_kernel] Attempting to load {variant_name}")
+    print(f"[sgl_kernel] Looking for library at: {ops_path}")
+
+    # Try to load from the architecture-specific directory
+    if ops_path.exists():
+        print(f"[sgl_kernel] Found architecture-specific library: {ops_path}")
+        try:
+            # Load the module from specific path using importlib
+            spec = importlib.util.spec_from_file_location("common_ops", str(ops_path))
+            if spec is None:
+                raise ImportError(f"Could not create module spec for {ops_path}")
+
+            common_ops = importlib.util.module_from_spec(spec)
+            if spec.loader is None:
+                raise ImportError(f"Module spec has no loader for {ops_path}")
+
+            print(f"[sgl_kernel] Loading module from {ops_path}...")
+            spec.loader.exec_module(common_ops)
+            print(f"[sgl_kernel] ✓ Successfully loaded {variant_name}")
+            print(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
+            return common_ops
+
+        except Exception as e:
+            print(f"[sgl_kernel] ✗ Failed to load from {ops_path}: {type(e).__name__}: {e}")
+            # Continue to fallback
+    else:
+        print(f"[sgl_kernel] ✗ Architecture-specific library not found at {ops_path}")
+
+    # Try alternative directory (in case installation structure differs)
+    alt_path = sgl_kernel_dir / "common_ops.so"
+    print(f"[sgl_kernel] Attempting fallback: looking for {alt_path}")
+
+    if alt_path.exists():
+        print(f"[sgl_kernel] Found fallback library: {alt_path}")
+        try:
+            spec = importlib.util.spec_from_file_location("common_ops", str(alt_path))
+            if spec is None:
+                raise ImportError(f"Could not create module spec for {alt_path}")
+
+            common_ops = importlib.util.module_from_spec(spec)
+            if spec.loader is None:
+                raise ImportError(f"Module spec has no loader for {alt_path}")
+
+            print(f"[sgl_kernel] Loading fallback module from {alt_path}...")
+            spec.loader.exec_module(common_ops)
+            print(f"[sgl_kernel] ✓ Successfully loaded fallback library")
+            print(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
+            return common_ops
+
+        except Exception as e:
+            print(f"[sgl_kernel] ✗ Failed to load fallback from {alt_path}: {type(e).__name__}: {e}")
+    else:
+        print(f"[sgl_kernel] ✗ Fallback library not found at {alt_path}")
+
+    # Final attempt: try standard Python import (for backward compatibility)
+    print(f"[sgl_kernel] Final attempt: trying standard Python import 'common_ops'")
     try:
-        from sgl_kernel import common_ops
-        print("[sgl_kernel] Using common_ops (fallback)")
+        import common_ops
+        print(f"[sgl_kernel] ✓ Successfully imported via standard Python import")
+        print(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
         return common_ops
     except ImportError as e:
-        print(f"[sgl_kernel] CRITICAL: Failed to import any ops library: {e}")
-        raise ImportError("Could not import any sgl_kernel ops library (common_ops_sm90, common_ops_sm100, or common_ops)")
+        print(f"[sgl_kernel] ✗ Standard Python import failed: {e}")
+
+    # All attempts failed
+    error_msg = f"""
+[sgl_kernel] CRITICAL: Could not load any common_ops library!
+
+Attempted locations:
+1. Architecture-specific: {ops_path} - {'exists' if ops_path.exists() else 'missing'}
+2. Fallback location: {alt_path} - {'exists' if alt_path.exists() else 'missing'}
+3. Standard Python import: common_ops - failed
+
+GPU Info:
+- Compute capability: {compute_capability}
+- Expected variant: {variant_name}
+
+Please ensure sgl_kernel is properly installed with:
+pip install --upgrade sgl_kernel
+"""
+    print(error_msg)
+    raise ImportError(error_msg)
 
 # Initialize the ops library based on current GPU
-ops = _get_ops_library()
+print("[sgl_kernel] Initializing architecture-specific operator library...")
+common_ops = _load_architecture_specific_ops()
+print("[sgl_kernel] ✓ Operator library initialization complete")
 
 
 # copy & modify from torch/utils/cpp_extension.py

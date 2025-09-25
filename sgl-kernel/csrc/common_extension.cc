@@ -16,10 +16,9 @@ limitations under the License.
 #include <torch/all.h>
 #include <torch/library.h>
 
-#include "sgl_namespace_config.h"
 #include "sgl_kernel_ops.h"
 
-TORCH_LIBRARY_FRAGMENT(SGL_NAMESPACE, m) {
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/allreduce
    */
@@ -490,4 +489,8 @@ TORCH_LIBRARY_FRAGMENT(SGL_NAMESPACE, m) {
   m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
 }
 
-REGISTER_EXTENSION(common_ops)
+#ifdef USE_FAST_MATH
+REGISTER_EXTENSION(common_ops_sm90)
+#else
+REGISTER_EXTENSION(common_ops_sm100)
+#endif

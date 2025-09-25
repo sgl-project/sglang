@@ -329,39 +329,41 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
-# Build SM90 library with fast math optimization and custom namespace
-Python_add_library(common_ops_sm90 MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+# Build SM90 library with fast math optimization (same namespace, different directory)
+Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_definitions(common_ops_sm90 PRIVATE
-    SGL_NAMESPACE=sgl_kernel_fast
+target_compile_definitions(common_ops_sm90_build PRIVATE
     USE_FAST_MATH=1
 )
-target_compile_options(common_ops_sm90 PRIVATE
+target_compile_options(common_ops_sm90_build PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
 )
-target_include_directories(common_ops_sm90 PRIVATE
+target_include_directories(common_ops_sm90_build PRIVATE
     ${PROJECT_SOURCE_DIR}/csrc
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+# Set output name to common_ops.so (not common_ops_sm90.so)
+set_target_properties(common_ops_sm90_build PROPERTIES OUTPUT_NAME "common_ops")
 
-# Build SM100+ library with precise math and custom namespace
-Python_add_library(common_ops_sm100 MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+# Build SM100+ library with precise math (same namespace, different directory)
+Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_definitions(common_ops_sm100 PRIVATE
-    SGL_NAMESPACE=sgl_kernel_precise
+target_compile_definitions(common_ops_sm100_build PRIVATE
     USE_FAST_MATH=0
 )
-target_compile_options(common_ops_sm100 PRIVATE
+target_compile_options(common_ops_sm100_build PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
 )
-target_include_directories(common_ops_sm100 PRIVATE
+target_include_directories(common_ops_sm100_build PRIVATE
     ${PROJECT_SOURCE_DIR}/csrc
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+# Set output name to common_ops.so (not common_ops_sm100.so)
+set_target_properties(common_ops_sm100_build PROPERTIES OUTPUT_NAME "common_ops")
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
@@ -387,22 +389,24 @@ add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
-target_link_libraries(common_ops_sm90 PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-target_link_libraries(common_ops_sm100 PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
 # flash attention
-target_compile_definitions(common_ops_sm90 PRIVATE
+target_compile_definitions(common_ops_sm90_build PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
 )
-target_compile_definitions(common_ops_sm100 PRIVATE
+target_compile_definitions(common_ops_sm100_build PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
 )
 
-install(TARGETS common_ops_sm90 common_ops_sm100 LIBRARY DESTINATION sgl_kernel)
+# Install to different subdirectories
+install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
+install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file
