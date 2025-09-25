@@ -126,9 +126,6 @@ pub trait RouterTrait: Send + Sync + Debug {
         model_id: Option<&str>,
     ) -> Response;
 
-    /// Get worker loads (for monitoring)
-    async fn get_worker_loads(&self) -> Response;
-
     /// Get router type name
     fn router_type(&self) -> &'static str;
 

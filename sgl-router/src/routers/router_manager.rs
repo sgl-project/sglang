@@ -508,30 +508,6 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn get_worker_loads(&self) -> Response {
-        let workers = self.worker_registry.get_all();
-        let loads: Vec<serde_json::Value> = workers
-            .iter()
-            .map(|w| {
-                serde_json::json!({
-                    "url": w.url(),
-                    "model": w.model_id(),
-                    "load": w.load(),
-                    "is_healthy": w.is_healthy()
-                })
-            })
-            .collect();
-
-        (
-            StatusCode::OK,
-            serde_json::json!({
-                "workers": loads
-            })
-            .to_string(),
-        )
-            .into_response()
-    }
-
     fn router_type(&self) -> &'static str {
         "manager"
     }

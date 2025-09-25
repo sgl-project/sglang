@@ -1296,14 +1296,6 @@ impl super::super::RouterTrait for OpenAIRouter {
         }
     }
 
-    async fn get_worker_loads(&self) -> Response {
-        (
-            StatusCode::FORBIDDEN,
-            "get_worker_loads not supported for OpenAI router",
-        )
-            .into_response()
-    }
-
     fn router_type(&self) -> &'static str {
         "openai"
     }
