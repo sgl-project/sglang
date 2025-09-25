@@ -1,6 +1,6 @@
 //! Integration tests for PolicyRegistry with RouterManager
 
-use sglang_router_rs::config::{PolicyConfig, RouterConfig};
+use sglang_router_rs::config::PolicyConfig;
 use sglang_router_rs::core::WorkerRegistry;
 use sglang_router_rs::policies::PolicyRegistry;
 use sglang_router_rs::protocols::worker_spec::WorkerConfigRequest;
@@ -10,27 +10,15 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn test_policy_registry_with_router_manager() {
-    // Create RouterConfig
-    let config = RouterConfig {
-        enable_igw: true,
-        policy: PolicyConfig::RoundRobin,
-        ..Default::default()
-    };
-
     // Create HTTP client
-    let client = reqwest::Client::new();
+    let _client = reqwest::Client::new();
 
     // Create shared registries
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
     // Create RouterManager with shared registries
-    let _router_manager = RouterManager::new(
-        config,
-        client,
-        worker_registry.clone(),
-        policy_registry.clone(),
-    );
+    let _router_manager = RouterManager::new(worker_registry.clone());
 
     // Test adding workers with different models and policies
 

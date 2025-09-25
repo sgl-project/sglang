@@ -140,7 +140,7 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_flat_data_page(self, index) -> torch.Tensor:
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         """
         Get a flat data page from the host memory pool.
         """
@@ -461,16 +461,19 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def get_flat_data_page(self, index) -> torch.Tensor:
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":
-            return self.kv_buffer[:, :, index : index + self.page_size, :, :].flatten()
+            data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
-            return self.kv_buffer[:, index : index + self.page_size, :, :, :].flatten()
+            data_page = self.kv_buffer[:, index : index + self.page_size, :, :, :]
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
-            return self.kv_buffer[:, real_index : real_index + 1, :, :, :, :].flatten()
+            data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
+        if flat:
+            data_page = data_page.flatten()
+        return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(
@@ -507,9 +510,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_buffer_meta(self, keys, indices, local_rank):
+    def get_page_buffer_meta(self, indices):
+        """ "
+        meta data for zero copy
+        """
+        assert len(indices) % self.page_size == 0
         ptr_list = []
-        key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
         v_offset = (
@@ -519,48 +525,52 @@ class MHATokenToKVPoolHost(HostKVCache):
             * self.head_dim
             * self.dtype.itemsize
         )
-        for index in range(0, len(indices), self.page_size):
-            k_ptr = (
-                kv_buffer_data_ptr
-                + indices[index]
-                * self.layer_num
+        if self.layout == "layer_first":
+            for index in range(0, len(indices), self.page_size):
+                for layer_id in range(self.layer_num):
+                    k_ptr = (
+                        kv_buffer_data_ptr
+                        + indices[index]
+                        * self.head_num
+                        * self.head_dim
+                        * self.dtype.itemsize
+                        + layer_id
+                        * self.size
+                        * self.head_num
+                        * self.head_dim
+                        * self.dtype.itemsize
+                    )
+                    v_ptr = k_ptr + v_offset
+                    ptr_list.append(k_ptr)
+                    ptr_list.append(v_ptr)
+            element_size = (
+                self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
+            )
+            element_size_list = [element_size] * len(ptr_list)
+        elif self.layout in ["page_first", "page_first_direct"]:
+            for index in range(0, len(indices), self.page_size):
+                k_ptr = (
+                    kv_buffer_data_ptr
+                    + indices[index]
+                    * self.layer_num
+                    * self.head_num
+                    * self.head_dim
+                    * self.dtype.itemsize
+                )
+                v_ptr = k_ptr + v_offset
+                ptr_list.append(k_ptr)
+                ptr_list.append(v_ptr)
+            element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
                 * self.head_num
                 * self.head_dim
-                * self.dtype.itemsize
             )
-            v_ptr = k_ptr + v_offset
-            ptr_list.append(k_ptr)
-            ptr_list.append(v_ptr)
-            key_ = keys[index // self.page_size]
-            key_list.append(f"{key_}_{local_rank}_k")
-            key_list.append(f"{key_}_{local_rank}_v")
-        element_size = (
-            self.layer_num
-            * self.dtype.itemsize
-            * self.page_size
-            * self.head_num
-            * self.head_dim
-        )
-        element_size_list = [element_size] * len(key_list)
-        return key_list, ptr_list, element_size_list
-
-    def get_buffer_with_hash(self, keys, indices=None):
-        assert self.layout == "page_first"
-        assert indices is None or (len(keys) == (len(indices) // self.page_size))
-
-        key_list = []
-        buf_list = []
-
-        for i in range(len(keys)):
-            key = keys[i]
-            key_list.append(f"{key}-k")
-            key_list.append(f"{key}-v")
-            if indices is not None:
-                index = indices[i * self.page_size]
-                buf_list.append(self.k_buffer[index : index + self.page_size])
-                buf_list.append(self.v_buffer[index : index + self.page_size])
-
-        return key_list, buf_list, 2
+            element_size_list = [element_size] * len(ptr_list)
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        return ptr_list, element_size_list
 
 
 class MLATokenToKVPoolHost(HostKVCache):
@@ -736,16 +746,19 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def get_flat_data_page(self, index) -> torch.Tensor:
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":
-            return self.kv_buffer[:, index : index + self.page_size, :, :].flatten()
+            data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
-            return self.kv_buffer[index : index + self.page_size, :, :, :].flatten()
+            data_page = self.kv_buffer[index : index + self.page_size, :, :, :]
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
-            return self.kv_buffer[real_index : real_index + 1, :, :, :, :].flatten()
+            data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
+        if flat:
+            data_page = data_page.flatten()
+        return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(
@@ -787,40 +800,51 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_buffer_meta(self, keys, indices, local_rank):
+    def get_page_buffer_meta(self, indices):
+        """ "
+        meta data for zero copy
+        """
+        assert len(indices) % self.page_size == 0
         ptr_list = []
-        key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
-        for index in range(0, len(indices), self.page_size):
-            k_ptr = (
-                kv_buffer_data_ptr
-                + indices[index]
-                * self.layer_num
+        if self.layout == "layer_first":
+            for index in range(0, len(indices), self.page_size):
+                for layer_id in range(self.layer_num):
+                    k_ptr = (
+                        kv_buffer_data_ptr
+                        + indices[index]
+                        * (self.kv_lora_rank + self.qk_rope_head_dim)
+                        * self.dtype.itemsize
+                        + layer_id
+                        * self.size
+                        * (self.kv_lora_rank + self.qk_rope_head_dim)
+                        * self.dtype.itemsize
+                    )
+                    ptr_list.append(k_ptr)
+            element_size = (
+                self.dtype.itemsize
+                * self.page_size
                 * (self.kv_lora_rank + self.qk_rope_head_dim)
-                * self.dtype.itemsize
             )
-            ptr_list.append(k_ptr)
-            key_ = keys[index // self.page_size]
-            key_list.append(f"{key_}_k")
-        element_size = (
-            self.layer_num
-            * self.dtype.itemsize
-            * self.page_size
-            * (self.kv_lora_rank + self.qk_rope_head_dim)
-        )
-        element_size_list = [element_size] * len(key_list)
-        return key_list, ptr_list, element_size_list
-
-    def get_buffer_with_hash(self, keys, indices=None):
-        assert self.layout == "page_first"
-        assert indices is None or (len(keys) == (len(indices) // self.page_size))
-
-        buf_list = []
-
-        if indices is not None:
-            for i in range(len(keys)):
-                index = indices[i * self.page_size]
-                buf_list.append(self.kv_buffer[index : index + self.page_size])
-
-        return keys, buf_list, 1
+            element_size_list = [element_size] * len(ptr_list)
+        elif self.layout in ["page_first", "page_first_direct"]:
+            for index in range(0, len(indices), self.page_size):
+                k_ptr = (
+                    kv_buffer_data_ptr
+                    + indices[index]
+                    * self.layer_num
+                    * (self.kv_lora_rank + self.qk_rope_head_dim)
+                    * self.dtype.itemsize
+                )
+                ptr_list.append(k_ptr)
+            element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * (self.kv_lora_rank + self.qk_rope_head_dim)
+            )
+            element_size_list = [element_size] * len(ptr_list)
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        return ptr_list, element_size_list
