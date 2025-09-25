@@ -442,6 +442,8 @@ class ServerArgs:
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
         self.enable_pdmux = True
+        self.chunked_prefill_size = -1
+        self.disable_overlap_schedule = True
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
