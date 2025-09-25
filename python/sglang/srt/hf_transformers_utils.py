@@ -43,6 +43,7 @@ from sglang.srt.configs import (
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
+    NemotronHConfig,
     Qwen3NextConfig,
     Step3VLConfig,
 )
@@ -62,6 +63,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     LongcatFlashConfig.model_type: LongcatFlashConfig,
     Qwen3NextConfig.model_type: Qwen3NextConfig,
     DotsVLMConfig.model_type: DotsVLMConfig,
+    NemotronHConfig.model_type: NemotronHConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
