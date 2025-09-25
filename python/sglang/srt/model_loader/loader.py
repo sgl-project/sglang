@@ -60,7 +60,6 @@ from sglang.srt.model_loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.srt.model_loader.weight_utils import (
-    _BAR_FORMAT,
     default_weight_loader,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
