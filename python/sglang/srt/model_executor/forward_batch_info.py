@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from functools import total_ordering
+from functools import lru_cache, total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -926,6 +926,35 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+    @classmethod
+    @lru_cache(maxsize=128)
+    def _get_cached_arange(cls, bs: int, device_str: str) -> torch.Tensor:
+        """Cache torch.arange tensors for common batch sizes to avoid repeated allocation."""
+        device = torch.device(device_str)
+        return torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+
+    def query_start_loc(self, *, device: str):
+        assert isinstance(device, str)
+        bs = self.batch_size
+        if self.forward_mode.is_decode_or_idle():
+            return self._get_cached_arange(bs, str(device))
+        elif self.forward_mode.is_extend():
+            if self.forward_mode.is_target_verify():
+                return torch.arange(
+                    0,
+                    self.input_ids.shape[0] + 1,
+                    step=self.spec_info.draft_token_num,
+                    dtype=torch.int32,
+                    device=self.input_ids.device,
+                )
+            else:
+                qsl = torch.empty((bs + 1,), dtype=torch.int32, device=device)
+                qsl[:bs] = self.extend_start_loc
+                qsl[bs] = self.extend_start_loc[-1] + self.extend_seq_lens[-1]
+                return qsl
+        else:
+            raise ValueError(f"Invalid forward mode: {self.forward_mode=}")
 
 
 def enable_num_token_non_padded(server_args):
