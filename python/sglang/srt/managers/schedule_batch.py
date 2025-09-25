@@ -799,29 +799,32 @@ class Req:
             self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
             return
 
-        # Check stop strings
-        if len(self.sampling_params.stop_strs) > 0:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
+        # Check stop strings and stop regex patterns together
+        if (
+            len(self.sampling_params.stop_strs) > 0
+            or len(self.sampling_params.stop_regex_strs) > 0
+        ):
+            max_len_tail_str = max(
+                self.sampling_params.stop_str_max_len + 1,
+                self.sampling_params.stop_regex_max_len + 1,
             )
+            tail_str = self.tokenizer.decode(self.output_ids[-(max_len_tail_str + 1) :])
 
-            for stop_str in self.sampling_params.stop_strs:
-                if stop_str in tail_str or stop_str in self.decoded_text:
-                    self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                    return
+            # Check stop strings
+            if len(self.sampling_params.stop_strs) > 0:
+                for stop_str in self.sampling_params.stop_strs:
+                    if stop_str in tail_str or stop_str in self.decoded_text:
+                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                        return
 
-        # Check stop regex
-        if self.sampling_params.stop_regex_strs:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_regex_max_len + 1) :]
-            )
-
-            for stop_regex_str in self.sampling_params.stop_regex_strs:
-                if re.search(stop_regex_str, tail_str):
-                    self.finished_reason = FINISHED_MATCHED_REGEX(
-                        matched=stop_regex_str
-                    )
-                    return
+            # Check stop regex
+            if len(self.sampling_params.stop_regex_strs) > 0:
+                for stop_regex_str in self.sampling_params.stop_regex_strs:
+                    if re.search(stop_regex_str, tail_str):
+                        self.finished_reason = FINISHED_MATCHED_REGEX(
+                            matched=stop_regex_str
+                        )
+                        return
 
     def reset_for_retract(self):
         self.prefix_indices = []

@@ -180,7 +180,9 @@ class SamplingParams:
 
             stop_regex_max_len = 0
             for stop_regex in self.stop_regex_strs:
-                stop_regex_max_len = max(stop_regex_max_len, get_max_seq_length(stop_regex))
+                stop_regex_max_len = max(
+                    stop_regex_max_len, get_max_seq_length(stop_regex)
+                )
 
             self.stop_regex_max_len = stop_regex_max_len
 
