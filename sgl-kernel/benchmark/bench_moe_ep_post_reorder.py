@@ -63,7 +63,9 @@ def benchmark(batch_size, provider):
                 block_size,
             )
 
-        ms, min_ms, max_ms = triton.testing.do_bench(run_triton, quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+            run_triton, quantiles=quantiles
+        )
 
     else:
         raise ValueError(f"Unknown provider: {provider}")
