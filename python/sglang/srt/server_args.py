@@ -1544,7 +1544,7 @@ class ServerArgs:
             default=ServerArgs.tokenizer_metrics_allowed_custom_labels,
             help="The custom labels allowed for tokenizer metrics. The labels are specified via a dict in "
             "'--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': "
-            "'value2'} is allowed if '--tokenizer-metrics-allowed-labels label1 label2' is set.",
+            "'value2'} is allowed if '--tokenizer-metrics-allowed-custom-labels label1 label2' is set.",
         )
         parser.add_argument(
             "--bucket-time-to-first-token",
