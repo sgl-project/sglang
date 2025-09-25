@@ -20,6 +20,26 @@ def _get_compute_capability():
     return properties.major * 10 + properties.minor
 
 
+def _filter_compiled_extensions(file_list):
+    """Filter and prioritize compiled extensions over Python source files."""
+    compiled_extensions = [".so", ".pyd", ".dll"]  # Common compiled extension suffixes
+    compiled_files = []
+    other_files = []
+
+    for file_path in file_list:
+        path = Path(file_path)
+        # Check if it's a compiled extension (including complex names like .abi3.so, .cpython-312.so)
+        if any(
+            str(path).endswith(ext) or ext in str(path) for ext in compiled_extensions
+        ):
+            compiled_files.append(file_path)
+        else:
+            other_files.append(file_path)
+
+    # Return compiled files first, then others
+    return compiled_files + other_files
+
+
 def _load_architecture_specific_ops():
     """Load the appropriate common_ops library based on GPU architecture."""
     import importlib.util
@@ -46,16 +66,19 @@ def _load_architecture_specific_ops():
 
     # Look for the compiled module with any valid extension
     import glob
+
     ops_pattern = str(sgl_kernel_dir / ops_subdir / "common_ops.*")
-    matching_files = glob.glob(ops_pattern)
+    raw_matching_files = glob.glob(ops_pattern)
+    matching_files = _filter_compiled_extensions(raw_matching_files)
 
     print(f"[sgl_kernel] Attempting to load {variant_name}")
     print(f"[sgl_kernel] Looking for library matching pattern: {ops_pattern}")
-    print(f"[sgl_kernel] Found matching files: {matching_files}")
+    print(f"[sgl_kernel] Found files: {raw_matching_files}")
+    print(f"[sgl_kernel] Prioritized files: {matching_files}")
 
     # Try to load from the architecture-specific directory
     if matching_files:
-        ops_path = Path(matching_files[0])  # Use the first matching file
+        ops_path = Path(matching_files[0])  # Use the first prioritized file
         print(f"[sgl_kernel] Found architecture-specific library: {ops_path}")
         try:
             # Load the module from specific path using importlib
@@ -74,19 +97,25 @@ def _load_architecture_specific_ops():
             return common_ops
 
         except Exception as e:
-            print(f"[sgl_kernel] ✗ Failed to load from {ops_path}: {type(e).__name__}: {e}")
+            print(
+                f"[sgl_kernel] ✗ Failed to load from {ops_path}: {type(e).__name__}: {e}"
+            )
             # Continue to fallback
     else:
-        print(f"[sgl_kernel] ✗ Architecture-specific library not found matching pattern: {ops_pattern}")
+        print(
+            f"[sgl_kernel] ✗ Architecture-specific library not found matching pattern: {ops_pattern}"
+        )
 
     # Try alternative directory (in case installation structure differs)
     alt_pattern = str(sgl_kernel_dir / "common_ops.*")
-    alt_matching_files = glob.glob(alt_pattern)
+    raw_alt_files = glob.glob(alt_pattern)
+    alt_matching_files = _filter_compiled_extensions(raw_alt_files)
     print(f"[sgl_kernel] Attempting fallback: looking for pattern {alt_pattern}")
-    print(f"[sgl_kernel] Found fallback files: {alt_matching_files}")
+    print(f"[sgl_kernel] Found fallback files: {raw_alt_files}")
+    print(f"[sgl_kernel] Prioritized fallback files: {alt_matching_files}")
 
     if alt_matching_files:
-        alt_path = Path(alt_matching_files[0])  # Use the first matching file
+        alt_path = Path(alt_matching_files[0])  # Use the first prioritized file
         print(f"[sgl_kernel] Found fallback library: {alt_path}")
         try:
             spec = importlib.util.spec_from_file_location("common_ops", str(alt_path))
@@ -104,14 +133,19 @@ def _load_architecture_specific_ops():
             return common_ops
 
         except Exception as e:
-            print(f"[sgl_kernel] ✗ Failed to load fallback from {alt_path}: {type(e).__name__}: {e}")
+            print(
+                f"[sgl_kernel] ✗ Failed to load fallback from {alt_path}: {type(e).__name__}: {e}"
+            )
     else:
-        print(f"[sgl_kernel] ✗ Fallback library not found matching pattern: {alt_pattern}")
+        print(
+            f"[sgl_kernel] ✗ Fallback library not found matching pattern: {alt_pattern}"
+        )
 
     # Final attempt: try standard Python import (for backward compatibility)
     print(f"[sgl_kernel] Final attempt: trying standard Python import 'common_ops'")
     try:
         import common_ops
+
         print(f"[sgl_kernel] ✓ Successfully imported via standard Python import")
         print(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
         return common_ops
@@ -136,6 +170,7 @@ pip install --upgrade sgl_kernel
 """
     print(error_msg)
     raise ImportError(error_msg)
+
 
 # Initialize the ops library based on current GPU
 print("[sgl_kernel] Initializing architecture-specific operator library...")

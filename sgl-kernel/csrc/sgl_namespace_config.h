@@ -20,7 +20,7 @@ limitations under the License.
 // to avoid operator registration conflicts
 
 #ifndef SGL_NAMESPACE
-  #define SGL_NAMESPACE sgl_kernel  // Default namespace if not defined
+#define SGL_NAMESPACE sgl_kernel  // Default namespace if not defined
 #endif
 
 // Helper macros for string conversion

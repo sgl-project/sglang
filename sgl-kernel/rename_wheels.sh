@@ -21,8 +21,6 @@ for wheel in "${wheel_files[@]}"; do
     elif ls /usr/local/ | grep -q "12.8"; then
         new_wheel="${intermediate_wheel/-cp${cp_version}/+cu128-cp${cp_version}}"
     elif ls /usr/local/ | grep -q "12.9"; then
-        new_wheel="${intermediate_wheel/-cp${cp_version}/+cu129-cp${cp_version}}"
-    else
         new_wheel="$intermediate_wheel"
     fi
 
