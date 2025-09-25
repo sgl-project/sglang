@@ -270,13 +270,4 @@ def pytest_runtest_makereport(item, call):
     summary = _format_perf_summary(records)
     report.sections.append(("pd-perf", summary))
     if _PYTEST_HTML_ACTIVE:
-        report.pd_perf_summary = summary
-
-
-def pytest_html_results_table_html(report, data):  # pragma: no cover - optional plugin
-    summary = getattr(report, "pd_perf_summary", None)
-    if not summary:
-        return
-    from py.xml import html
-
-    data.append(html.div(html.pre(summary), class_="pd-perf-summary"))
+        setattr(report, "pd_perf_summary", summary)

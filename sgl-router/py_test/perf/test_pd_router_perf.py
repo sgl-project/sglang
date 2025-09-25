@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import pytest
 from py_test.perf.conftest import PolicyPerfRecord, build_perf_record
@@ -14,6 +15,12 @@ THRESHOLDS = {
     "input_throughput_mean_min": 10_000,
     "output_throughput_mean_min": 68.0,
 }
+
+
+pytestmark = pytest.mark.skipif(
+    os.getenv("PD_PERF_RUN") != "1",
+    reason="PD perf suite disabled",
+)
 
 
 @pytest.mark.perf

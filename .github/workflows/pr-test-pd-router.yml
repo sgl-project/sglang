@@ -153,6 +153,7 @@ jobs:
     - name: Run PD router performance tests
       env:
         PYTHONUNBUFFERED: "1"
+        PD_PERF_RUN: "1"
       run: |
         cd sgl-router
         pytest py_test/perf/test_pd_router_perf.py -m perf -vv -s --maxfail=1
