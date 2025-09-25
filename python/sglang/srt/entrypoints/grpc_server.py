@@ -489,7 +489,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 token_ids=output.get("token_ids", []),
                 prompt_tokens=meta_info.get("prompt_tokens", 0),
                 completion_tokens=meta_info.get("completion_tokens", 0),
-                cached_tokens=0,
+                cached_tokens=meta_info.get("cached_tokens", 0),
             ),
         )
 
