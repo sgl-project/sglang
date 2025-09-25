@@ -22,6 +22,7 @@ import ctypes
 import dataclasses
 import functools
 import importlib
+import inspect
 import io
 import ipaddress
 import itertools
@@ -174,6 +175,8 @@ def is_blackwell():
 
 @lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
     )
@@ -181,6 +184,8 @@ def is_sm100_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
     )
@@ -190,7 +195,7 @@ _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
-    # FIXME: move your environment variable to sglang.environ
+    # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name, default)
     value = value.lower()
 
@@ -208,7 +213,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
 
 
 def get_int_env_var(name: str, default: int = 0) -> int:
-    # FIXME: move your environment variable to sglang.environ
+    # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
@@ -511,6 +516,50 @@ def make_layers(
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
+
+
+cmo_stream = None
+
+
+def get_cmo_stream():
+    """
+    Cache Management Operation(CMO).
+    Launch a new stream to prefetch the weight of matmul when running other
+    AIV or communication kernels, aiming to overlap the memory access time.
+    """
+    global cmo_stream
+    if cmo_stream is None:
+        cmo_stream = torch.get_device_module().Stream()
+    return cmo_stream
+
+
+def prepare_weight_cache(handle, cache):
+    import torch_npu
+
+    NPU_PREFETCH_MAX_SIZE_BYTES = (
+        1000000000  # 1GB, a large value to prefetch entire weight
+    )
+    stream = get_cmo_stream()
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        if isinstance(cache, list):
+            for weight in cache:
+                torch_npu.npu_prefetch(
+                    weight,
+                    handle,
+                    NPU_PREFETCH_MAX_SIZE_BYTES,
+                )
+        else:
+            torch_npu.npu_prefetch(
+                cache,
+                handle,
+                NPU_PREFETCH_MAX_SIZE_BYTES,
+            )
+
+
+def wait_cmo_stream():
+    cur_stream = torch.get_device_module().current_stream()
+    cur_stream.wait_stream(get_cmo_stream())
 
 
 def set_random_seed(seed: int) -> None:
@@ -2005,48 +2054,11 @@ def set_uvicorn_logging_configs():
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
 
-def get_ip() -> str:
-    # SGLANG_HOST_IP env can be ignore
+def get_ip() -> Optional[str]:
     host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
     if host_ip:
         return host_ip
-
-    # IP is not set, try to get it from the network interface
-
-    # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        pass
-
-    # try ipv6
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        # Google's public DNS server, see
-        # https://developers.google.com/speed/public-dns/docs/using#addresses
-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        pass
-
-    # try  using hostname
-    hostname = socket.gethostname()
-    try:
-        ip_addr = socket.gethostbyname(hostname)
-        warnings.warn("using local ip address: {}".format(ip_addr))
-        return ip_addr
-    except Exception:
-        pass
-
-    warnings.warn(
-        "Failed to get the IP address, using 0.0.0.0 by default."
-        "The value can be set by the environment variable"
-        " SGLANG_HOST_IP or HOST_IP.",
-        stacklevel=2,
-    )
-    return "0.0.0.0"
+    return None
 
 
 def get_open_port() -> int:
@@ -2305,16 +2317,9 @@ def bind_or_assign(target, source):
         return source
 
 
-def get_local_ip_auto() -> str:
-    interface = os.environ.get("SGLANG_LOCAL_IP_NIC", None)
-    return (
-        get_local_ip_by_nic(interface)
-        if interface is not None
-        else get_local_ip_by_remote()
-    )
-
-
-def get_local_ip_by_nic(interface: str) -> str:
+def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
+    if not (interface := interface or os.environ.get("SGLANG_LOCAL_IP_NIC", None)):
+        return None
     try:
         import netifaces
     except ImportError as e:
@@ -2335,15 +2340,13 @@ def get_local_ip_by_nic(interface: str) -> str:
                 if ip and not ip.startswith("fe80::") and ip != "::1":
                     return ip.split("%")[0]
     except (ValueError, OSError) as e:
-        raise ValueError(
-            "Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
+        logger.warning(
+            f"{e} Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
         )
-
-    # Fallback
-    return get_local_ip_by_remote()
+    return None
 
 
-def get_local_ip_by_remote() -> str:
+def get_local_ip_by_remote() -> Optional[str]:
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -2368,7 +2371,49 @@ def get_local_ip_by_remote() -> str:
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
     except Exception:
-        raise ValueError("Can not get local ip")
+        logger.warning("Can not get local ip by remote")
+    return None
+
+
+def get_local_ip_auto(fallback: str = None) -> str:
+    """
+    Automatically detect the local IP address using multiple fallback strategies.
+
+    This function attempts to obtain the local IP address through several methods.
+    If all methods fail, it returns the specified fallback value or raises an exception.
+
+    Args:
+        fallback (str, optional): Fallback IP address to return if all detection
+            methods fail. For server applications, explicitly set this to
+            "0.0.0.0" (IPv4) or "::" (IPv6) to bind to all available interfaces.
+            Defaults to None.
+
+    Returns:
+        str: The detected local IP address, or the fallback value if detection fails.
+
+    Raises:
+        ValueError: If IP detection fails and no fallback value is provided.
+
+    Note:
+        The function tries detection methods in the following order:
+        1. Direct IP detection via get_ip()
+        2. Network interface enumeration via get_local_ip_by_nic()
+        3. Remote connection method via get_local_ip_by_remote()
+    """
+    if ip := get_ip():
+        return ip
+    logger.debug("get_ip failed")
+    # Fallback
+    if ip := get_local_ip_by_nic():
+        return ip
+    logger.debug("get_local_ip_by_nic failed")
+    # Fallback
+    if ip := get_local_ip_by_remote():
+        return ip
+    logger.debug("get_local_ip_by_remote failed")
+    if fallback:
+        return fallback
+    raise ValueError("Can not get local ip")
 
 
 def is_page_size_one(server_args):
@@ -3180,3 +3225,120 @@ def get_extend_input_len_swa_limit(
     #    and we can only free out-of-sliding-window kv indices after each prefill.
     # 3. page_size is because we want to have 1 token extra for generated tokens.
     return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
+
+
+class CachedKernel:
+    """
+    Wrapper that allows kernel[grid](...) syntax with caching based on a key function.
+
+    This wrapper caches compiled Triton kernels based on keys extracted by a
+    user-provided key function to avoid redundant compilations.
+    """
+
+    def __init__(self, fn, key_fn=None):
+        self.fn = fn
+        assert isinstance(fn, triton.runtime.jit.JITFunction)
+
+        original_fn = fn.fn
+        self.signature = inspect.signature(original_fn)
+        self.param_names = tuple(self.signature.parameters.keys())
+        self.num_args = len(self.param_names)
+
+        # Check that no parameters have default values
+        for name, param in self.signature.parameters.items():
+            assert (
+                param.default is inspect.Parameter.empty
+            ), f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+
+        functools.update_wrapper(self, original_fn)
+        self.kernel_cache = {}
+
+        # Store the key function
+        self.key_fn = key_fn
+
+    def __getitem__(self, grid):
+        """
+        Index with grid to get a launcher function.
+        Returns a launcher that will handle caching based on the key function.
+        """
+        assert (
+            isinstance(grid, tuple) and len(grid) <= 3
+        ), "Grid must be a tuple with at most 3 dimensions."
+
+        # Normalize grid once
+        if len(grid) < 3:
+            grid = grid + (1,) * (3 - len(grid))
+
+        def launcher(*args, **kwargs):
+            cache_key = self.key_fn(args, kwargs)
+
+            cached_kernel = self.kernel_cache.get(cache_key)
+
+            if cached_kernel is None:
+                # First time: compile and cache the kernel
+                cached_kernel = self.fn[grid](*args, **kwargs)
+                self.kernel_cache[cache_key] = cached_kernel
+                return cached_kernel
+            else:
+                # Use cached kernel
+                all_args = self._build_args(args, kwargs)
+                cached_kernel[grid](*all_args)
+                return cached_kernel
+
+        return launcher
+
+    def _build_args(self, args, kwargs):
+        """
+        Build the complete argument list for kernel invocation.
+        """
+        complete_args = list(args)
+
+        for i in range(len(args), self.num_args):
+            name = self.param_names[i]
+            value = kwargs.get(name, inspect.Parameter.empty)
+            if value is not inspect.Parameter.empty:
+                complete_args.append(value)
+            else:
+                raise ValueError(f"Missing argument: {name}")
+
+        return complete_args
+
+    def _clear_cache(self):
+        """
+        Clear the kernel cache for testing purposes.
+        """
+        self.kernel_cache.clear()
+
+
+def cached_triton_kernel(key_fn=None):
+    """
+    Decorator that enables key-based caching for Triton kernels using a key function.
+
+    It essentially bypasses Triton's built-in caching mechanism, allowing users to
+    define their own caching strategy based on kernel parameters. This helps reduce
+    the heavy overheads of Triton kernel launch when the kernel specialization dispatch
+    is simple.
+
+    Usage:
+        @cached_triton_kernel(key_fn=lambda args, kwargs: kwargs.get('BLOCK_SIZE', 1024))
+        @triton.jit
+        def my_kernel(x_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
+            ...
+
+        # Invoke normally
+        my_kernel[grid](x, y, BLOCK_SIZE=1024)
+
+    Args:
+        key_fn: A function that takes (args, kwargs) and returns the cache key(s).
+                The key can be a single value or a tuple of values.
+
+    Returns:
+        A decorator that wraps the kernel with caching functionality.
+
+    Note: Kernels with default parameter values are not supported and will raise an assertion error.
+    """
+
+    def decorator(fn):
+        return CachedKernel(fn, key_fn)
+
+    return decorator
