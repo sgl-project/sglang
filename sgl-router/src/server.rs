@@ -1,5 +1,5 @@
 use crate::{
-    config::{ConnectionMode, HistoryBackend, RouterConfig},
+    config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{WorkerManager, WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
@@ -121,16 +121,56 @@ async fn sink_handler() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn liveness(State(state): State<Arc<AppState>>) -> Response {
-    state.router.liveness()
+async fn liveness() -> Response {
+    (StatusCode::OK, "OK").into_response()
 }
 
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
-    state.router.readiness()
+    let workers = state.context.worker_registry.get_all();
+    let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
+
+    let is_ready = if state.context.router_config.enable_igw {
+        !healthy_workers.is_empty()
+    } else {
+        match &state.context.router_config.mode {
+            RoutingMode::PrefillDecode { .. } => {
+                let has_prefill = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }));
+                let has_decode = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Decode));
+                has_prefill && has_decode
+            }
+            RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
+            RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
+        }
+    };
+
+    if is_ready {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ready",
+                "healthy_workers": healthy_workers.len(),
+                "total_workers": workers.len()
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not ready",
+                "reason": "insufficient healthy workers"
+            })),
+        )
+            .into_response()
+    }
 }
 
-async fn health(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    state.router.health(req).await
+async fn health(_state: State<Arc<AppState>>) -> Response {
+    liveness().await
 }
 
 async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -311,7 +351,52 @@ async fn remove_worker(
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    state.router.flush_cache().await
+    match WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
+        .await
+    {
+        Ok(result) => {
+            if result.failed.is_empty() {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "success",
+                        "message": result.message,
+                        "workers_flushed": result.successful.len(),
+                        "total_http_workers": result.http_workers,
+                        "total_workers": result.total_workers
+                    })),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    Json(json!({
+                        "status": "partial_success",
+                        "message": result.message,
+                        "successful": result.successful,
+                        "failed": result.failed.into_iter().map(|(url, err)| json!({
+                            "worker": url,
+                            "error": err
+                        })).collect::<Vec<_>>(),
+                        "total_http_workers": result.http_workers,
+                        "total_workers": result.total_workers
+                    })),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => {
+            error!("Failed to flush cache: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": format!("Failed to flush cache: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
