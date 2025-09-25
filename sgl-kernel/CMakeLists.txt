@@ -275,6 +275,8 @@ set(SOURCES
     "csrc/elementwise/rope.cu"
     "csrc/common_extension.cc"
 
+    "csrc/quantization/gguf/gguf_kernel.cu"
+
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/dsv3_fused_a_gemm.cu"

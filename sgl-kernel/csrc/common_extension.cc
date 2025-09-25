@@ -108,6 +108,38 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
 
   /*
+   * From gguf quantiztion
+   */
+  m.def(
+      "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
+      "dtype) -> Tensor");
+  m.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
+
+  m.def(
+      "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
+      "-> Tensor");
+  m.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
+
+  m.def(
+      "ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
+  m.impl("ggml_mul_mat_a8", torch::kCUDA, &ggml_mul_mat_a8);
+
+  m.def(
+      "ggml_moe_a8(Tensor X, Tensor W, "
+      "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
+      "num_tokens_post_padded, "
+      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+  m.impl("ggml_moe_a8", torch::kCUDA, &ggml_moe_a8);
+
+  m.def(
+      "ggml_moe_a8_vec(Tensor X, Tensor W, "
+      "Tensor topk_ids, int top_k, "
+      "int type, SymInt row, SymInt tokens) -> Tensor");
+  m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
+
+  m.def("ggml_moe_get_block_size", &ggml_moe_get_block_size);
+
+  /*
    * From csrc/gemm
    */
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
