@@ -260,15 +260,6 @@ class ModelRunner:
         # Model-specific adjustment
         self.model_specific_adjustment()
 
-        # Global vars
-        global_server_args_dict.update(
-            {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
-            | {
-                # TODO it is indeed not a "server args"
-                "use_mla_backend": self.use_mla_backend,
-                "speculative_algorithm": self.spec_algorithm,
-            }
-        )
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -1710,16 +1701,8 @@ class ModelRunner:
 
     def _get_attention_backend(self):
         """Init attention kernel backend."""
-        self.decode_attention_backend_str = (
-            self.server_args.decode_attention_backend
-            if self.server_args.decode_attention_backend
-            else self.server_args.attention_backend
-        )
-        self.prefill_attention_backend_str = (
-            self.server_args.prefill_attention_backend
-            if self.server_args.prefill_attention_backend
-            else self.server_args.attention_backend
-        )
+        self.decode_attention_backend_str = global_server_args_dict["decode_attention_backend_str"]
+        self.prefill_attention_backend_str = global_server_args_dict["prefill_attention_backend_str"]
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
@@ -1748,12 +1731,6 @@ class ModelRunner:
                 self.server_args.attention_backend
             )
 
-        global_server_args_dict.update(
-            {
-                "decode_attention_backend": self.decode_attention_backend_str,
-                "prefill_attention_backend": self.prefill_attention_backend_str,
-            }
-        )
         return attn_backend
 
     def _get_attention_backend_from_str(self, backend_str: str):

@@ -428,7 +428,6 @@ class Scheduler(
         self.world_group = get_world_group()
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
-        global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
 
         # Hybrid memory pool
