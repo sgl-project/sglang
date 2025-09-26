@@ -13,9 +13,7 @@ use axum::{
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::RetryConfig;
-use crate::core::{
-    BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
-};
+use crate::core::{CircuitBreakerConfig, WorkerRegistry, WorkerType};
 use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
@@ -64,13 +62,9 @@ pub struct GrpcRouter {
 impl GrpcRouter {
     /// Create a new gRPC router
     pub async fn new(
-        worker_urls: Vec<String>,
         policy: Arc<dyn LoadBalancingPolicy>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
-        // Update metrics
-        RouterMetrics::set_active_workers(worker_urls.len());
-
         // Extract necessary components from context
         let tokenizer = ctx
             .tokenizer
@@ -99,33 +93,6 @@ impl GrpcRouter {
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Create Worker trait objects with gRPC connection mode and register them
-        // Workers will lazily initialize their gRPC clients on first use
-        for url in &worker_urls {
-            let worker = BasicWorkerBuilder::new(url.clone())
-                .worker_type(WorkerType::Regular)
-                .connection_mode(crate::core::ConnectionMode::Grpc { port: None })
-                .circuit_breaker_config(core_cb_config.clone())
-                .health_config(HealthConfig {
-                    timeout_secs: ctx.router_config.health_check.timeout_secs,
-                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                    endpoint: ctx.router_config.health_check.endpoint.clone(),
-                    failure_threshold: ctx.router_config.health_check.failure_threshold,
-                    success_threshold: ctx.router_config.health_check.success_threshold,
-                })
-                .build();
-
-            worker_registry.register(Arc::new(worker));
-            info!(
-                "Registered gRPC worker at {} (will connect on first use)",
-                url
-            );
-        }
-
-        if worker_urls.is_empty() {
-            return Err("No gRPC workers configured".to_string());
-        }
-
         // Get only gRPC workers from registry for policy initialization
         let workers = worker_registry.get_workers_filtered(
             None, // any model
@@ -134,13 +101,9 @@ impl GrpcRouter {
             false, // include unhealthy workers during initialization
         );
 
-        // Initialize policy with workers if needed
-        if let Some(cache_aware) = policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.init_workers(&workers);
-        }
+        // Update metrics
+        RouterMetrics::set_active_workers(workers.len());
+        info!("gRPC router found {} workers in registry", workers.len());
 
         // No need for local health checkers - WorkerRegistry handles health checking
 
