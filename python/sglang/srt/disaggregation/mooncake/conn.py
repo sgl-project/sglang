@@ -635,7 +635,9 @@ class MooncakeKVManager(CommonKVManager):
             src_addr = (
                 prefill_extra_pool_data_ptrs[i] + length * prefill_extra_pool_indice[0]
             )
-            dst_addr = dst_extra_pool_data_ptrs[i] + length * req.dst_extra_pool_indices[0]
+            dst_addr = (
+                dst_extra_pool_data_ptrs[i] + length * req.dst_extra_pool_indices[0]
+            )
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
