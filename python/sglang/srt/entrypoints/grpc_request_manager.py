@@ -282,6 +282,7 @@ class GrpcRequestManager:
         obj.rid = request_id
 
         # Create and register request state
+        # TODO: support log_request
         state = GrpcReqState(
             request_id=request_id,
             grpc_context=grpc_context,
