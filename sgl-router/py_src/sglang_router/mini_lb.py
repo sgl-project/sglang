@@ -126,7 +126,7 @@ class MiniLoadBalancer:
             ]
 
             for bootstrap_room in bootstrap_room_list:
-                trace_slice_end("mini_lb_luanch", bootstrap_room, auto_next_anon=True)
+                trace_slice_end("mini_lb_launch", bootstrap_room, auto_next_anon=True)
 
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
@@ -199,7 +199,7 @@ class MiniLoadBalancer:
 
                 for bootstrap_room in bootstrap_room_list:
                     trace_slice_end(
-                        "mini_lb_luanch", bootstrap_room, auto_next_anon=True
+                        "mini_lb_launch", bootstrap_room, auto_next_anon=True
                     )
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
                 prefill_response, decode_response = await asyncio.gather(*tasks)
@@ -443,7 +443,7 @@ async def handle_completion_request(request_data: dict):
 def _generate_bootstrap_room():
     bootstrap_room = random.randint(0, 2**63 - 1)
     trace_req_start(bootstrap_room, bootstrap_room, role="router")
-    trace_slice_start("mini_lb_luanch", bootstrap_room)
+    trace_slice_start("mini_lb_launch", bootstrap_room)
     return bootstrap_room
 
 
