@@ -57,20 +57,18 @@ def _is_complete_json(input_str: str) -> bool:
         return False
 
 
-def get_and_validate_tool_schema_defs(tools: List[Tool], validate: bool) -> dict:
+def _get_tool_schema_defs(tools: List[Tool]) -> dict:
     """
-    Get consolidated $defs from all tools, optionally validating for conflicts.
+    Get consolidated $defs from all tools, validating for conflicts.
 
     Args:
         tools: List of tools to process
-        validate: If True, validate for conflicting $defs and raise ValueError if found.
-                If False, return the consolidated $defs without validation.
 
     Returns:
         Dictionary of consolidated $defs from all tools
 
     Raises:
-        ValueError: If validate=True and conflicting $defs are found
+        ValueError: If conflicting $defs are found
     """
     all_defs = {}
     for tool in tools:
@@ -78,7 +76,7 @@ def get_and_validate_tool_schema_defs(tools: List[Tool], validate: bool) -> dict
             continue
         defs = tool.function.parameters.get("$defs", {})
         for def_name, def_schema in defs.items():
-            if validate and def_name in all_defs and all_defs[def_name] != def_schema:
+            if def_name in all_defs and all_defs[def_name] != def_schema:
                 raise ValueError(
                     f"Tool definition '{def_name}' has "
                     "multiple schemas, which is not "
@@ -87,6 +85,20 @@ def get_and_validate_tool_schema_defs(tools: List[Tool], validate: bool) -> dict
             else:
                 all_defs[def_name] = def_schema
     return all_defs
+
+
+def _get_tool_schema(tool: Tool) -> dict:
+    return {
+        "properties": {
+            "name": {"type": "string", "enum": [tool.function.name]},
+            "parameters": (
+                tool.function.parameters
+                if tool.function.parameters
+                else {"type": "object", "properties": {}}
+            ),
+        },
+        "required": ["name", "parameters"],
+    }
 
 
 def get_json_schema_constraint(
@@ -102,19 +114,6 @@ def get_json_schema_constraint(
         JSON schema dict, or None if no valid tools found
     """
 
-    def get_tool_schema(tool):
-        return {
-            "properties": {
-                "name": {"type": "string", "enum": [tool.function.name]},
-                "parameters": (
-                    tool.function.parameters
-                    if tool.function.parameters
-                    else {"type": "object", "properties": {}}
-                ),
-            },
-            "required": ["name", "parameters"],
-        }
-
     if isinstance(tool_choice, ToolChoice):
         # For specific function choice, return the user's parameters schema directly
         fn_name = tool_choice.function.name
@@ -124,7 +123,7 @@ def get_json_schema_constraint(
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 1,
-                    "items": get_tool_schema(tool),
+                    "items": _get_tool_schema(tool),
                 }
         return None
     elif tool_choice == "required":
@@ -133,10 +132,10 @@ def get_json_schema_constraint(
             "minItems": 1,
             "items": {
                 "type": "object",
-                "anyOf": [get_tool_schema(tool) for tool in tools],
+                "anyOf": [_get_tool_schema(tool) for tool in tools],
             },
         }
-        json_schema_defs = get_and_validate_tool_schema_defs(tools, validate=False)
+        json_schema_defs = _get_tool_schema_defs(tools)
         if json_schema_defs:
             json_schema["$defs"] = json_schema_defs
         return json_schema

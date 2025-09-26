@@ -15,7 +15,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.utils import (
-    get_and_validate_tool_schema_defs,
+    _get_tool_schema_defs,
     get_json_schema_constraint,
 )
 
@@ -187,9 +187,9 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         ]
 
         try:
-            get_and_validate_tool_schema_defs(tools_with_defs, validate=True)
+            _get_tool_schema_defs(tools_with_defs)
         except ValueError as e:
-            self.fail(f"Validation should not raise ValueError, but got: {e}")
+            self.fail(f"Should not raise ValueError, but got: {e}")
 
         schema = get_json_schema_constraint(tools_with_defs, "required")
 
@@ -315,9 +315,7 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         ]
 
         with self.assertRaises(ValueError) as context:
-            get_and_validate_tool_schema_defs(
-                tools_with_conflicting_defs, validate=True
-            )
+            _get_tool_schema_defs(tools_with_conflicting_defs)
 
         self.assertIn(
             "Tool definition 'ConflictingType' has multiple schemas",
@@ -346,9 +344,9 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         ]
 
         try:
-            get_and_validate_tool_schema_defs(tools_with_empty_defs, validate=True)
+            _get_tool_schema_defs(tools_with_empty_defs)
         except ValueError as e:
-            self.fail(f"Validation should not raise ValueError, but got: {e}")
+            self.fail(f"Should not raise ValueError, but got: {e}")
 
         schema = get_json_schema_constraint(tools_with_empty_defs, "required")
         self.assertIsNotNone(schema)
@@ -358,7 +356,7 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         self.assertNotIn("$defs", schema)
 
     def test_tools_with_identical_defs(self):
-        """Test different tools with same $defs names but identical schemas (should pass validation)"""
+        """Test different tools with same $defs names but identical schemas (should not raise exception)"""
         tools_with_identical_defs = [
             Tool(
                 type="function",
@@ -411,10 +409,10 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         ]
 
         try:
-            get_and_validate_tool_schema_defs(tools_with_identical_defs, validate=True)
+            _get_tool_schema_defs(tools_with_identical_defs)
         except ValueError as e:
             self.fail(
-                f"Validation should not raise ValueError for identical schemas, but got: {e}"
+                f"Should not raise ValueError for identical schemas, but got: {e}"
             )
 
         # Also test that schema generation works
@@ -482,9 +480,9 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         ]
 
         try:
-            get_and_validate_tool_schema_defs(tools_with_nested_defs, validate=True)
+            _get_tool_schema_defs(tools_with_nested_defs)
         except ValueError as e:
-            self.fail(f"Validation should not raise ValueError, but got: {e}")
+            self.fail(f"Should not raise ValueError, but got: {e}")
 
         schema = get_json_schema_constraint(tools_with_nested_defs, "required")
         self.assertIsNotNone(schema)
@@ -554,9 +552,9 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         ]
 
         try:
-            get_and_validate_tool_schema_defs(mixed_tools, validate=True)
+            _get_tool_schema_defs(mixed_tools)
         except ValueError as e:
-            self.fail(f"Validation should not raise ValueError, but got: {e}")
+            self.fail(f"Should not raise ValueError, but got: {e}")
 
         schema = get_json_schema_constraint(mixed_tools, "required")
         self.assertIsNotNone(schema)
@@ -603,9 +601,9 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         ]
 
         try:
-            get_and_validate_tool_schema_defs(tools_with_unused_defs, validate=True)
+            _get_tool_schema_defs(tools_with_unused_defs)
         except ValueError as e:
-            self.fail(f"Validation should not raise ValueError, but got: {e}")
+            self.fail(f"Should not raise ValueError, but got: {e}")
 
         schema = get_json_schema_constraint(tools_with_unused_defs, "required")
         self.assertIsNotNone(schema)

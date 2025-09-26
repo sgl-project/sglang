@@ -39,10 +39,7 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.utils import (
-    get_and_validate_tool_schema_defs,
-    get_json_schema_constraint,
-)
+from sglang.srt.function_call.utils import get_json_schema_constraint
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -100,13 +97,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     except SchemaError as e:
                         return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
 
-            # Check for conflicting tool definitions when tool_choice is required.
-            # Specific tool requests only have one tool so conflicts are not possible
-            if request.tool_choice == "required":
-                try:
-                    get_and_validate_tool_schema_defs(request.tools, validate=True)
-                except ValueError as e:
-                    return str(e)
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
         if (
@@ -928,7 +918,6 @@ class OpenAIServingChat(OpenAIServingBase):
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
-
             try:
                 # For required tool choice, we expect a JSON array of tool calls
                 tool_call_data = json.loads(text)
@@ -963,11 +952,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, self.tool_call_parser)
         if parser.has_tool_call(text):
-            # Set finish reason to tool_calls since we detected tool calls
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
-
             try:
                 text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = []
