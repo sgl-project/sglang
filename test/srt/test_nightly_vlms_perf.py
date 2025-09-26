@@ -1,6 +1,5 @@
 import os
 import subprocess
-import time
 import unittest
 import warnings
 
@@ -42,7 +41,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "512"))
-        cls.full_report = f"## {cls.__name__}\n"
+        cls.full_report = f"## {cls.__name__}\n" + BenchmarkResult.help_str()
 
     def test_bench_one_batch(self):
         all_benchmark_results = []

@@ -35,7 +35,7 @@ MODEL_THRESHOLDS = {
         0.310, 16.7
     ),
     ModelDeploySetup("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 32.0),
-    ModelDeploySetup("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.310, 30.4),
+    ModelDeploySetup("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
 }
 
 

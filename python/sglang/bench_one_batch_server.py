@@ -62,6 +62,15 @@ class BenchmarkResult(BaseModel):
     acc_length: Optional[float] = None
     profile_links: Optional[ProfileLinks] = None
 
+    @staticmethod
+    def help_str() -> str:
+        return f"""
+Note: To view the traces through perfetto-ui, please:
+1. use Google Chrome
+2. enable popup
+
+"""
+
     def to_markdown_row(
         self, trace_dir, base_url: str = "", relay_base: str = ""
     ) -> str:

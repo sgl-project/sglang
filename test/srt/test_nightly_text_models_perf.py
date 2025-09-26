@@ -34,7 +34,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
         os.makedirs(PROFILE_DIR, exist_ok=True)
-        cls.full_report = f"## {cls.__name__}\n"
+        cls.full_report = f"## {cls.__name__}\n" + BenchmarkResult.help_str()
 
     def test_bench_one_batch(self):
         all_benchmark_results = []
