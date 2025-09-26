@@ -37,7 +37,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
-from torch.distributed import Backend, ProcessGroup, ProcessGroupNCCL
+from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.utils import (
     direct_register_custom_op,
