@@ -341,16 +341,17 @@ class RadixCache(BasePrefixCache):
             page_aligned_len + 1 if self.is_eagle else page_aligned_len
         )
 
+        old_prefix_len = len(req.prefix_indices)
+        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+            # prefix_indices attached partial part (for page_size > 1) and one unmatched token (for EAGLE)
+            old_prefix_len -= 1
+
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
             RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
             page_aligned_kv_indices,
         )
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[req.last_matched_prefix_len : new_prefix_len]
-        )
-
-        req.last_matched_prefix_len = new_prefix_len
+        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -384,23 +385,23 @@ class RadixCache(BasePrefixCache):
         )
         page_aligned_token_ids = token_ids[:page_aligned_token_len]
 
+        old_prefix_len = len(req.prefix_indices)
+
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
             RadixKey(page_aligned_token_ids, req.extra_key),
             page_aligned_kv_indices,
             chunked=chunked,
         )
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[req.last_matched_prefix_len : new_prefix_len]
-        )
+        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(
             RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key)
         )
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.last_matched_prefix_len, len(new_indices))),
-            new_indices[req.last_matched_prefix_len :],
+            (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
+            new_indices[old_prefix_len:],
         )
 
         # The last_matched_prefix_len is not always equal to len(req.prefix_indices)
