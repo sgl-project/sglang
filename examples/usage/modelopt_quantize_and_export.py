@@ -10,10 +10,16 @@ import argparse
 import os
 from typing import Optional
 
+import torch
+
 import sglang as sgl
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.parallel_state import (
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from sglang.srt.model_loader.loader import get_model_loader
 
 
@@ -81,6 +87,27 @@ def quantize_and_export_model(
     print(f"📥 Input model: {model_path}")
     print(f"📤 Export directory: {export_dir}")
     print(f"⚙️  Quantization method: {quantization_method}")
+
+    # Initialize minimal distributed environment for single GPU quantization
+    if not torch.distributed.is_initialized():
+        print("🔧 Initializing distributed environment...")
+        # Set up environment variables for single-process distributed
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "12355"  # Use a different port than tests
+        os.environ["LOCAL_RANK"] = "0"
+
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            backend="nccl" if device == "cuda" else "gloo",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
 
     # Configure model loading with ModelOpt quantization and export
     model_config = ModelConfig(
