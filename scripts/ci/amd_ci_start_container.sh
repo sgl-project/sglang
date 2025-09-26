@@ -83,6 +83,12 @@ else
   DEVICE_FLAG="--device /dev/dri"
 fi
 
+# Set up persistent cache directory for Hugging Face models
+CACHE_DIR="${CACHE_DIR:-/opt/sglang-ci-cache}"
+echo "Setting up cache directory: ${CACHE_DIR}"
+mkdir -p "${CACHE_DIR}/huggingface"
+echo "Cache directory ready at: ${CACHE_DIR}"
+
 
 # Find the latest image
 find_latest_image() {
@@ -122,10 +128,13 @@ docker pull "${IMAGE}"
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
+  -v "${CACHE_DIR}/huggingface:/root/.cache/huggingface" \
   --ipc=host --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
   -e HF_TOKEN="${HF_TOKEN:-}" \
+  -e HF_HOME="/root/.cache/huggingface" \
+  -e TRANSFORMERS_CACHE="/root/.cache/huggingface/hub" \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
   --name ci_sglang \

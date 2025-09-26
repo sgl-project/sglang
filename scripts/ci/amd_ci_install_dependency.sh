@@ -47,3 +47,17 @@ docker cp ./dummy-grok ci_sglang:/
 
 docker exec ci_sglang pip install huggingface_hub[hf_xet]
 docker exec ci_sglang pip install pytest
+
+# Report Hugging Face cache status
+echo "=== Hugging Face Cache Status ==="
+docker exec ci_sglang bash -c "
+if [ -d /root/.cache/huggingface/hub ]; then
+  echo 'Cache directory exists'
+  echo 'Cache size:' \$(du -sh /root/.cache/huggingface/hub 2>/dev/null || echo '0')
+  echo 'Cached models:' \$(ls -1 /root/.cache/huggingface/hub 2>/dev/null | grep -c 'models--' || echo '0')
+else
+  echo 'Cache directory will be created on first model download'
+fi
+echo 'HF_HOME=' \$HF_HOME
+echo 'TRANSFORMERS_CACHE=' \$TRANSFORMERS_CACHE
+"
