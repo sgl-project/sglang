@@ -31,7 +31,6 @@ from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
-    determine_attention_backends,
     get_device,
     get_device_memory_capacity,
     is_cuda,
@@ -437,6 +436,19 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    def get_attention_backends(server_args):
+        prefill_attention_backend_str = (
+            server_args.prefill_attention_backend
+            if server_args.prefill_attention_backend
+            else server_args.attention_backend
+        )
+        decode_attention_backend_str = (
+            server_args.decode_attention_backend
+            if server_args.decode_attention_backend
+            else server_args.attention_backend
+        )
+        return prefill_attention_backend_str, decode_attention_backend_str
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -637,9 +649,7 @@ class ServerArgs:
                     self.attention_backend = "triton"
 
             supported_backends = ["triton", "trtllm_mha", "fa3", "fa4"]
-            prefill_attn_backend, decode_attn_backend = determine_attention_backends(
-                self
-            )
+            prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
                 and decode_attn_backend in supported_backends
