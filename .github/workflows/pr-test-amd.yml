@@ -36,12 +36,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
-
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -68,12 +62,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
-
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -98,12 +86,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
-
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -127,12 +109,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
 
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
@@ -174,12 +150,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
-
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -213,12 +183,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
 
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
@@ -265,12 +229,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
-
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -294,12 +252,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
 
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
@@ -325,12 +277,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
-
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -355,12 +301,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
-
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -384,12 +324,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Initialize model cache
-        run: |
-          sudo mkdir -p /opt/sglang-ci-cache/huggingface
-          sudo chmod -R 777 /opt/sglang-ci-cache
-          echo "Cache directory initialized at /opt/sglang-ci-cache"
 
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh

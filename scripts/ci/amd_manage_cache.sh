@@ -4,20 +4,37 @@ set -euo pipefail
 
 CACHE_DIR="${CACHE_DIR:-/opt/sglang-ci-cache}"
 
+# Set up sudo handling
+if [[ "$EUID" -eq 0 ]]; then
+  SUDO=""
+else
+  SUDO="sudo"
+fi
+
 case "${1:-}" in
   init)
     echo "Initializing AMD CI model cache..."
-    if [[ "$EUID" -eq 0 ]]; then
-      # Running as root
-      mkdir -p "${CACHE_DIR}/huggingface"
-      chmod -R 777 "${CACHE_DIR}"
+
+    # Check if cache directory already exists and has correct permissions
+    if [ -d "${CACHE_DIR}/huggingface" ]; then
+      echo "Cache directory already exists at ${CACHE_DIR}"
+
+      # Check and fix permissions if needed
+      current_perms=$(stat -c "%a" "${CACHE_DIR}" 2>/dev/null || echo "unknown")
+      if [ "${current_perms}" != "777" ]; then
+        echo "Fixing cache directory permissions..."
+        ${SUDO} chmod -R 777 "${CACHE_DIR}" 2>/dev/null || true
+      else
+        echo "Cache directory permissions are correct"
+      fi
     else
-      # Running as non-root, use sudo
-      sudo mkdir -p "${CACHE_DIR}/huggingface"
-      sudo chmod -R 777 "${CACHE_DIR}"
+      echo "Creating cache directory..."
+      ${SUDO} mkdir -p "${CACHE_DIR}/huggingface"
+      ${SUDO} chmod -R 777 "${CACHE_DIR}"
+      echo "Cache directory created at ${CACHE_DIR}"
     fi
-    echo "Cache directory initialized at ${CACHE_DIR}"
-    echo "Permissions set to allow Docker container access"
+
+    echo "Cache initialization complete"
     ;;
 
   status)
@@ -46,21 +63,37 @@ case "${1:-}" in
 
   clean-old)
     echo "Cleaning up old cache files (not accessed in 30 days)..."
-    if [ -d "${CACHE_DIR}" ]; then
-      old_files_count=$(find "${CACHE_DIR}" -type f -atime +30 2>/dev/null | wc -l || echo "0")
-      if [ "${old_files_count}" -gt 0 ]; then
-        echo "Found ${old_files_count} old files to remove"
-        if [[ "$EUID" -eq 0 ]]; then
-          find "${CACHE_DIR}" -type f -atime +30 -delete 2>/dev/null || true
-        else
-          sudo find "${CACHE_DIR}" -type f -atime +30 -delete 2>/dev/null || true
-        fi
-        echo "Old files removed"
+
+    # Safety check: ensure we're operating on the correct cache directory
+    if [ ! -d "${CACHE_DIR}" ]; then
+      echo "Cache directory does not exist: ${CACHE_DIR}"
+      exit 0
+    fi
+
+    # Additional safety: verify this looks like our cache directory
+    if [ ! -d "${CACHE_DIR}/huggingface" ]; then
+      echo "Warning: Directory ${CACHE_DIR} does not appear to be a HuggingFace cache directory"
+      echo "Expected to find ${CACHE_DIR}/huggingface subdirectory"
+      exit 1
+    fi
+
+    # Count files before cleanup (with error handling)
+    old_files_count=$(find "${CACHE_DIR}" -type f -atime +30 2>/dev/null | wc -l 2>/dev/null || echo "0")
+
+    if [ "${old_files_count}" -gt 0 ]; then
+      echo "Found ${old_files_count} old files to remove"
+
+      # Perform cleanup with error handling
+      if ${SUDO} find "${CACHE_DIR}" -type f -atime +30 -delete 2>/dev/null; then
+        echo "Old files removed successfully"
+
+        # Clean up empty directories
+        ${SUDO} find "${CACHE_DIR}" -type d -empty -delete 2>/dev/null || true
       else
-        echo "No old files found"
+        echo "Warning: Some files could not be removed (may be in use)"
       fi
     else
-      echo "Cache directory does not exist"
+      echo "No old files found to clean up"
     fi
     ;;
 
@@ -80,9 +113,7 @@ case "${1:-}" in
       -v "${CACHE_DIR}/huggingface:/root/.cache/huggingface" \
       -e HF_HOME="/root/.cache/huggingface" \
       -e TRANSFORMERS_CACHE="/root/.cache/huggingface/hub" \
-      python:3.10-slim bash -c "
-      pip install huggingface_hub transformers torch --quiet
-      python3 -c \"
+      python:3.10-slim bash -c 'pip install huggingface_hub transformers torch --quiet && python3 -' <<'EOF'
 from huggingface_hub import snapshot_download
 import os
 
@@ -101,8 +132,7 @@ for model in models:
     except Exception as e:
         print(f'✗ Failed to cache {model}: {e}')
         continue
-      \"
-      "
+EOF
     echo "Model preloading completed"
     ;;
 

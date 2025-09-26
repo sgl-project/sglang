@@ -11,6 +11,52 @@ else
   echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
 fi
 
+# Check disk space and conditionally manage cache
+echo "Checking available disk space..."
+cache_parent_dir="${CACHE_DIR:-/opt/sglang-ci-cache}"
+
+# Robust disk space check with fallbacks
+available_gb=0
+if df "$cache_parent_dir" >/dev/null 2>&1; then
+  # Try to get available space in GB
+  available_gb=$(df "$cache_parent_dir" | awk 'NR==2 {print int($4/1024/1024)}' 2>/dev/null || echo "0")
+elif [ -d "$cache_parent_dir" ]; then
+  # Fallback: check parent directory if cache dir doesn't exist yet
+  available_gb=$(df "$(dirname "$cache_parent_dir")" | awk 'NR==2 {print int($4/1024/1024)}' 2>/dev/null || echo "0")
+else
+  # Final fallback: check root filesystem
+  available_gb=$(df / | awk 'NR==2 {print int($4/1024/1024)}' 2>/dev/null || echo "0")
+fi
+
+echo "Available disk space: ${available_gb}GB"
+
+# Cache management is disabled by default, only enable if ENABLE_CACHE=true
+if [[ "${ENABLE_CACHE:-false}" == "true" ]]; then
+  echo "Cache management enabled via ENABLE_CACHE=true"
+  echo "Initializing model cache..."
+  bash "$(dirname "$0")/amd_manage_cache.sh" init
+
+  if [ "${available_gb}" -lt 20 ]; then
+    echo "Low disk space detected (${available_gb}GB). Running cleanup..."
+    bash "$(dirname "$0")/amd_manage_cache.sh" clean-old
+
+    # Re-check after cleanup
+    available_gb=$(df "$cache_parent_dir" | awk 'NR==2 {print int($4/1024/1024)}' 2>/dev/null || echo "0")
+    echo "Available disk space after cleanup: ${available_gb}GB"
+
+    if [ "${available_gb}" -lt 10 ]; then
+      echo "Warning: Still low on disk space (${available_gb}GB). Cache operations may be limited." >&2
+    fi
+  else
+    echo "Disk space is sufficient for cache operations"
+  fi
+else
+  echo "Cache management disabled by default (set ENABLE_CACHE=true to enable)"
+  if [ "${available_gb}" -lt 10 ]; then
+    echo "Warning: Low disk space detected (${available_gb}GB). Consider enabling cache cleanup." >&2
+  fi
+fi
+
 # Install the required dependencies in CI.
 docker exec ci_sglang pip install --upgrade pip
 docker exec ci_sglang pip uninstall sgl-kernel -y || true
@@ -50,14 +96,13 @@ docker exec ci_sglang pip install pytest
 
 # Report Hugging Face cache status
 echo "=== Hugging Face Cache Status ==="
-docker exec ci_sglang bash -c "
-if [ -d /root/.cache/huggingface/hub ]; then
-  echo 'Cache directory exists'
-  echo 'Cache size:' \$(du -sh /root/.cache/huggingface/hub 2>/dev/null || echo '0')
-  echo 'Cached models:' \$(ls -1 /root/.cache/huggingface/hub 2>/dev/null | grep -c 'models--' || echo '0')
+if [[ "${ENABLE_CACHE:-false}" == "true" ]]; then
+  bash "$(dirname "$0")/amd_manage_cache.sh" status
 else
-  echo 'Cache directory will be created on first model download'
+  echo "Cache management disabled - no cache status available"
 fi
+docker exec ci_sglang bash -c "
+echo 'Container cache info:'
 echo 'HF_HOME=' \$HF_HOME
 echo 'TRANSFORMERS_CACHE=' \$TRANSFORMERS_CACHE
 "
