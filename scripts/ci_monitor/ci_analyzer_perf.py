@@ -12,6 +12,7 @@ import sys
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd
@@ -81,6 +82,15 @@ class SGLangPerfAnalyzer:
             "input_throughput_token_s": r"Input token throughput \(tok/s\):\s*([\d.]+)",
         }
         
+        # Pre-compile regex patterns for better performance
+        self.compiled_patterns = {
+            name: re.compile(pattern, re.IGNORECASE) 
+            for name, pattern in self.perf_patterns.items()
+        }
+        
+        # Pre-compile test pattern
+        self.test_pattern = re.compile(r"python3 -m unittest (test_bench_\w+\.TestBench\w+\.test_\w+)")
+        
         # Setup matplotlib fonts and styles
         self._setup_matplotlib()
 
@@ -147,7 +157,7 @@ class SGLangPerfAnalyzer:
         return pr_test_runs
 
     def get_job_logs(self, run_id: int, job_name: str) -> Optional[str]:
-        """Get logs for specific job"""
+        """Get logs for specific job with early exit optimization"""
         try:
             # First get job list
             jobs_url = f"{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/jobs"
@@ -155,14 +165,17 @@ class SGLangPerfAnalyzer:
             response.raise_for_status()
             jobs_data = response.json()
             
-            # Find matching job
+            # Find matching job with early exit
             target_job = None
             for job in jobs_data.get("jobs", []):
                 if job_name in job.get("name", ""):
+                    # Early exit if job failed or was skipped
+                    if job.get("conclusion") not in ["success", "neutral"]:
+                        return None
                     target_job = job
                     break
             
-            if not target_job or target_job.get("conclusion") != "success":
+            if not target_job:
                 return None
                 
             # Get logs
@@ -173,8 +186,32 @@ class SGLangPerfAnalyzer:
             return response.text
             
         except Exception as e:
-            print(f"Failed to get job {job_name} logs: {e}")
+            # Reduce verbose error logging for common failures
+            if "404" not in str(e):
+                print(f"Failed to get job {job_name} logs: {e}")
             return None
+
+    def get_all_job_logs_parallel(self, run_id: int) -> Dict[str, Optional[str]]:
+        """Get logs for all performance jobs in parallel"""
+        def fetch_job_logs(job_name: str) -> tuple[str, Optional[str]]:
+            """Fetch logs for a single job"""
+            logs = self.get_job_logs(run_id, job_name)
+            return job_name, logs
+        
+        results = {}
+        with ThreadPoolExecutor(max_workers=8) as executor:  # Increased concurrent requests
+            # Submit all job log requests
+            future_to_job = {
+                executor.submit(fetch_job_logs, job_name): job_name 
+                for job_name in self.performance_jobs
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_job):
+                job_name, logs = future.result()
+                results[job_name] = logs
+                
+        return results
 
     def parse_performance_data(self, log_content: str, job_name: str) -> Dict[str, Dict[str, str]]:
         """Parse specified performance data from logs"""
@@ -188,9 +225,8 @@ class SGLangPerfAnalyzer:
         if not target_tests:
             return test_data
         
-        # Find all unittest tests
-        test_pattern = r"python3 -m unittest (test_bench_\w+\.TestBench\w+\.test_\w+)"
-        test_matches = re.findall(test_pattern, log_content)
+        # Find all unittest tests using pre-compiled pattern
+        test_matches = self.test_pattern.findall(log_content)
         
         for test_match in test_matches:
             test_name = test_match.split('.')[-1]  # Extract test name
@@ -207,9 +243,9 @@ class SGLangPerfAnalyzer:
                 perf_data = {}
                 
                 for metric_name in target_metrics:
-                    if metric_name in self.perf_patterns:
-                        pattern = self.perf_patterns[metric_name]
-                        matches = re.findall(pattern, test_section, re.IGNORECASE)
+                    if metric_name in self.compiled_patterns:
+                        compiled_pattern = self.compiled_patterns[metric_name]
+                        matches = compiled_pattern.findall(test_section)
                         if matches:
                             perf_data[metric_name] = matches[-1]  # Take the last match
                 
@@ -267,12 +303,11 @@ class SGLangPerfAnalyzer:
             if pull_requests:
                 run_info["pr_number"] = pull_requests[0].get("number")
             
+            # Get all job logs in parallel
+            all_job_logs = self.get_all_job_logs_parallel(run.get("id"))
+            
             # Process each performance test job
-            for job_name in self.performance_jobs:
-                print(f"  Processing job: {job_name}")
-                
-                # Get job logs
-                logs = self.get_job_logs(run.get("id"), job_name)
+            for job_name, logs in all_job_logs.items():
                 if not logs:
                     continue
                     
@@ -290,7 +325,7 @@ class SGLangPerfAnalyzer:
                     all_test_data[full_test_name].append(test_entry)
                     print(f"    Found {test_name} performance data: {list(perf_data.keys())}")
                         
-                time.sleep(0.1)  # Avoid API rate limiting
+            time.sleep(0.2)  # Slightly longer delay between runs to be API-friendly
                 
         return all_test_data
 
@@ -332,8 +367,9 @@ class SGLangPerfAnalyzer:
             self._write_csv_table(table_file, test_name, data_list)
             
             # Generate corresponding chart
+            print(f"    Generating chart for {test_name}...")
             self._generate_chart(table_file, test_name, data_list, job_dir)
-            
+
         print("Performance tables and charts generation completed!")
 
     def _write_csv_table(self, file_path: str, test_name: str, data_list: List[Dict]):
@@ -363,11 +399,22 @@ class SGLangPerfAnalyzer:
                 for col in columns:
                     value = entry.get(col, "")
                     if col == "created_at" and value:
-                        # Format time
+                        # Format time to consistent format
                         try:
-                            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                            value = dt.strftime("%Y-%m-%d %H:%M")
+                            # Handle ISO 8601 format: "2025-09-26T11:16:40Z"
+                            if 'T' in value and 'Z' in value:
+                                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                                value = dt.strftime("%Y-%m-%d %H:%M")
+                            # If already in desired format, keep it
+                            elif len(value) == 16 and ' ' in value:
+                                # Validate format
+                                datetime.strptime(value, "%Y-%m-%d %H:%M")
+                            else:
+                                # Try to parse and reformat
+                                dt = datetime.fromisoformat(value)
+                                value = dt.strftime("%Y-%m-%d %H:%M")
                         except:
+                            # If all parsing fails, keep original value
                             pass
                     elif col == "pr_number" and value:
                         value = f"#{value}"
@@ -378,7 +425,10 @@ class SGLangPerfAnalyzer:
 
     def _generate_chart(self, csv_file_path: str, test_name: str, data_list: List[Dict], output_dir: str):
         """Generate corresponding time series charts for tables"""
+        print(f"      Starting chart generation for {test_name} with {len(data_list)} data points")
+        
         if not data_list or len(data_list) < 2:
+            print(f"      Skipping chart for {test_name}: insufficient data ({len(data_list) if data_list else 0} records)")
             return
             
         try:
@@ -396,7 +446,10 @@ class SGLangPerfAnalyzer:
                         perf_metrics.append(key)
             
             if not perf_metrics:
+                print(f"      Skipping chart for {test_name}: no performance metrics found")
                 return
+                
+            print(f"      Found performance metrics: {perf_metrics}")
                 
             # Parse data
             for entry in data_list:
@@ -404,26 +457,63 @@ class SGLangPerfAnalyzer:
                 try:
                     time_str = entry.get("created_at", "")
                     if time_str:
-                        # Format: "2025-09-26 08:43"
-                        timestamp = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
-                        timestamps.append(timestamp)
+                        # Handle different time formats
+                        timestamp = None
                         
-                        # Collect metric data
-                        for metric in perf_metrics:
-                            if metric not in metrics_data:
-                                metrics_data[metric] = []
-                            
-                            value = entry.get(metric, "")
+                        # Try ISO 8601 format first (from GitHub API): "2025-09-26T11:16:40Z"
+                        if 'T' in time_str and 'Z' in time_str:
                             try:
-                                numeric_value = float(value)
-                                metrics_data[metric].append(numeric_value)
+                                # Parse and convert to naive datetime (remove timezone info)
+                                dt_with_tz = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                                timestamp = dt_with_tz.replace(tzinfo=None)
                             except:
-                                metrics_data[metric].append(None)
+                                # Fallback for older Python versions
+                                timestamp = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%SZ")
+                        
+                        # Try CSV format: "2025-09-26 08:43"
+                        elif ' ' in time_str and len(time_str) == 16:
+                            timestamp = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+                        
+                        # Try other common formats
+                        else:
+                            formats_to_try = [
+                                "%Y-%m-%d %H:%M:%S",
+                                "%Y-%m-%dT%H:%M:%S",
+                                "%Y-%m-%d",
+                            ]
+                            for fmt in formats_to_try:
+                                try:
+                                    timestamp = datetime.strptime(time_str, fmt)
+                                    break
+                                except:
+                                    continue
+                        
+                        if timestamp:
+                            timestamps.append(timestamp)
+                            
+                            # Collect metric data
+                            for metric in perf_metrics:
+                                if metric not in metrics_data:
+                                    metrics_data[metric] = []
+                                
+                                value = entry.get(metric, "")
+                                try:
+                                    numeric_value = float(value)
+                                    metrics_data[metric].append(numeric_value)
+                                except:
+                                    metrics_data[metric].append(None)
+                        else:
+                            print(f"      Failed to parse timestamp format: '{time_str}'")
+                            
                 except Exception as e:
+                    print(f"      Error processing entry: {e}")
                     continue
             
             if not timestamps:
+                print(f"      Skipping chart for {test_name}: no valid timestamps found")
                 return
+                
+            print(f"      Parsed {len(timestamps)} timestamps")
                 
             # Sort by time
             sorted_data = sorted(zip(timestamps, *[metrics_data[m] for m in perf_metrics]))
@@ -437,6 +527,7 @@ class SGLangPerfAnalyzer:
                 valid_data = [(t, v) for t, v in zip(timestamps, values) if v is not None]
                 
                 if len(valid_data) < 2:
+                    print(f"      Skipping chart for {test_name}_{metric}: insufficient valid data ({len(valid_data)} points)")
                     continue
                     
                 valid_timestamps, valid_values = zip(*valid_data)
@@ -468,10 +559,12 @@ class SGLangPerfAnalyzer:
                 plt.savefig(chart_path, dpi=300, bbox_inches='tight')
                 plt.close()
                 
-                print(f"  Generated chart: {chart_path}")
+                print(f"      Generated chart: {chart_path}")
                 
         except Exception as e:
-            print(f"  Failed to generate chart {test_name}: {e}")
+            print(f"      Failed to generate chart for {test_name}: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _format_metric_name(self, metric: str) -> str:
         """Format metric name for display"""
