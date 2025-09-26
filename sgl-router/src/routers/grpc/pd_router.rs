@@ -1,9 +1,9 @@
 // PD (Prefill-Decode) gRPC Router Implementation
 
 use crate::config::types::RetryConfig;
-use crate::core::{CircuitBreakerConfig, WorkerRegistry, WorkerType};
+use crate::core::{WorkerRegistry, WorkerType};
 use crate::metrics::RouterMetrics;
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::PolicyRegistry;
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
 use crate::tokenizer::traits::Tokenizer;
@@ -21,36 +21,20 @@ use tracing::info;
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
 #[allow(dead_code)] // Fields will be used once implementation is complete
 pub struct GrpcPDRouter {
-    /// Centralized worker registry
     worker_registry: Arc<WorkerRegistry>,
-    /// Centralized policy registry
     policy_registry: Arc<PolicyRegistry>,
-    /// Load balancing policy for prefill
-    prefill_policy: Arc<dyn LoadBalancingPolicy>,
-    /// Load balancing policy for decode
-    decode_policy: Arc<dyn LoadBalancingPolicy>,
-    /// Tokenizer for handling text encoding/decoding
     tokenizer: Arc<dyn Tokenizer>,
-    /// Reasoning parser factory for structured reasoning outputs
     reasoning_parser_factory: ParserFactory,
-    /// Tool parser registry for function/tool calls
     tool_parser_registry: &'static ParserRegistry,
-    /// Configuration
-    timeout_secs: u64,
-    interval_secs: u64,
+
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
-    circuit_breaker_config: CircuitBreakerConfig,
 }
 
 impl GrpcPDRouter {
     /// Create a new gRPC PD router
-    pub async fn new(
-        prefill_policy: Arc<dyn LoadBalancingPolicy>,
-        decode_policy: Arc<dyn LoadBalancingPolicy>,
-        ctx: &Arc<crate::server::AppContext>,
-    ) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<crate::server::AppContext>) -> Result<Self, String> {
         // Get registries from context
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
@@ -100,17 +84,12 @@ impl GrpcPDRouter {
         Ok(GrpcPDRouter {
             worker_registry,
             policy_registry,
-            prefill_policy,
-            decode_policy,
             tokenizer,
             reasoning_parser_factory,
             tool_parser_registry,
-            timeout_secs: ctx.router_config.worker_startup_timeout_secs,
-            interval_secs: ctx.router_config.worker_startup_check_interval_secs,
             dp_aware: ctx.router_config.dp_aware,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
-            circuit_breaker_config: crate::core::CircuitBreakerConfig::default(),
         })
     }
 }
@@ -134,8 +113,6 @@ impl std::fmt::Debug for GrpcPDRouter {
         f.debug_struct("GrpcPDRouter")
             .field("prefill_workers_count", &prefill_workers.len())
             .field("decode_workers_count", &decode_workers.len())
-            .field("timeout_secs", &self.timeout_secs)
-            .field("interval_secs", &self.interval_secs)
             .field("dp_aware", &self.dp_aware)
             .finish()
     }
