@@ -1109,7 +1109,7 @@ class ServerArgs:
                 os.environ["NCCL_ALGO"] = "allreduce:tree"
                 self.disable_custom_all_reduce = True
                 logger.warning(
-                    "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 2."
+                    "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                 )
 
     def _handle_other_validations(self):
