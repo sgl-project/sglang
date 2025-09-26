@@ -489,6 +489,4 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
 }
 
-// Always register as common_ops regardless of compilation flags
-// The USE_FAST_MATH flag affects kernel behavior, not module name
 REGISTER_EXTENSION(common_ops)

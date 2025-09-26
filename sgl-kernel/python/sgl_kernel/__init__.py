@@ -220,7 +220,6 @@ if torch.version.cuda is not None:
     if cuda_include.exists():
         ctypes.CDLL(str(cuda_include), mode=ctypes.RTLD_GLOBAL)
 
-# Architecture-specific library loading handled by _get_ops_library()
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     cutlass_mla_decode,
