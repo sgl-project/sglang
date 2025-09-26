@@ -641,7 +641,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_metadata_buffers.set_buf(req)
             if hasattr(self.req_to_token_pool, "rid_to_mamba_index_mapping"):
                 extra_pool_indices = [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[req.rid]
+                    self.req_to_token_pool.rid_to_mamba_index_mapping[req.rid]
                 ]
 
         page_indices = kv_to_page_indices(kv_indices, page_size)

@@ -213,7 +213,7 @@ class MambaPool:
         self.free_slots = list(range(self.size))
 
     def get_contiguous_buf_infos(self):
-        cached_states_len = self.mamba_cache.size(0)
+        cached_states_len = len(self.mamba_cache)
         data_ptrs, data_lens, item_lens = [], [], []
         for state in range(cached_states_len):
             data_ptrs += [
