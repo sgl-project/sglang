@@ -122,6 +122,9 @@ message GenerateRequest {
 
   // For load balancing
   int32 dp_balance_id = 17;
+
+  // Whether client wants streaming response
+  bool stream = 18;
 }
 
 message TokenizedInput {
@@ -163,8 +166,8 @@ message GenerateResponse {
 }
 
 message GenerateStreamChunk {
-  // Generated token
-  int32 token_id = 1;
+  // Generated tokens (incremental chunk)
+  repeated int32 token_ids = 1;
 
   // Cumulative counts
   int32 prompt_tokens = 2;

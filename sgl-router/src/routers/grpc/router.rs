@@ -203,6 +203,7 @@ impl GrpcRouter {
         debug!("Selected worker: {}", worker.url());
 
         // Step 2: Get gRPC client for worker (fail fast if can't connect)
+        // TODO(CahterineSue): manage grpc connection in worker. (it should be simpler here)
         let client = match self.get_or_create_grpc_client(worker.url()).await {
             Ok(c) => c,
             Err(e) => {
@@ -249,7 +250,7 @@ impl GrpcRouter {
 
         // Step 6: Build the base gRPC request
         let request_id = format!("chatcmpl-{}", Uuid::new_v4());
-        let base_request = match client.build_generate_request(
+        let request = match client.build_generate_request(
             request_id,
             body,
             processed_messages.text.clone(),
@@ -268,11 +269,11 @@ impl GrpcRouter {
             }
         };
 
+        // Step 7: Handle streaming vs non-streaming
         if body.stream {
-            self.handle_streaming_chat(client, base_request, body).await
+            self.handle_streaming_chat(client, request, body).await
         } else {
-            self.handle_non_streaming_chat(client, base_request, body)
-                .await
+            self.handle_non_streaming_chat(client, request, body).await
         }
     }
 
