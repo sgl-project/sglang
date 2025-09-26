@@ -74,16 +74,6 @@ if should_use_flashinfer_trtllm_moe():
 logger = logging.getLogger(__name__)
 
 
-def _is_fp4_quantization_enabled():
-    """Check if ModelOpt FP4 quantization is enabled."""
-    try:
-        # Use the same simple check that works for class selection
-        quantization = global_server_args_dict.get("quantization")
-        return quantization == "modelopt_fp4"
-    except:
-        return False
-
-
 def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
     # Guess tokens per expert assuming perfect expert distribution first.
     num_tokens_per_expert = (num_tokens * top_k) // num_experts
@@ -504,14 +494,8 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
-        # ModelOptNvFp4FusedMoEMethod uses max of global expert scaling factors for input scaling factor
-        load_global_experts = (
-            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
-            and "input_scale" in weight_name
-        )
-
         global_expert_location_metadata = get_global_expert_location_metadata()
-        if global_expert_location_metadata is None or load_global_experts:
+        if global_expert_location_metadata is None:
             self._weight_loader_impl(
                 param=param,
                 loaded_weight=loaded_weight,
@@ -548,10 +532,12 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        # WARN: This makes the `expert_id` mean "local" and "global" in different cases
+        if not getattr(param, "_sglang_require_global_experts", False):
+            expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+            if expert_id == -1:
+                return
 
-        expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-        if expert_id == -1:
-            return
         self._weight_loader_impl(
             param=param,
             loaded_weight=loaded_weight,
@@ -589,7 +575,10 @@ class FusedMoE(torch.nn.Module):
             )
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if should_use_flashinfer_trtllm_moe():
+        if (
+            should_use_flashinfer_trtllm_moe()
+            and self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"
+        ):
             shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
         WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]

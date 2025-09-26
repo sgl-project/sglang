@@ -4,8 +4,9 @@ pub mod logging;
 use std::collections::HashMap;
 
 pub mod core;
+pub mod data_connector;
 #[cfg(feature = "grpc-client")]
-pub mod grpc;
+pub mod grpc_client;
 pub mod mcp;
 pub mod metrics;
 pub mod middleware;
@@ -229,6 +230,8 @@ impl Router {
             enable_igw: self.enable_igw,
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
+            history_backend: config::HistoryBackend::Memory,
+            oracle: None,
         })
     }
 }

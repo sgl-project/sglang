@@ -25,14 +25,12 @@ pub struct BackoffCalculator;
 impl BackoffCalculator {
     /// Calculate backoff delay for a given attempt index (0-based).
     pub fn calculate_delay(config: &RetryConfig, attempt: u32) -> Duration {
-        // Base exponential backoff
         let pow = config.backoff_multiplier.powi(attempt as i32);
         let mut delay_ms = (config.initial_backoff_ms as f32 * pow) as u64;
         if delay_ms > config.max_backoff_ms {
             delay_ms = config.max_backoff_ms;
         }
 
-        // Apply jitter in range [-j, +j]
         let jitter = config.jitter_factor.clamp(0.0, 1.0);
         if jitter > 0.0 {
             let mut rng = rand::rng();
@@ -77,14 +75,12 @@ impl RetryExecutor {
             match operation(attempt).await {
                 Ok(val) => return Ok(val),
                 Err(_) => {
-                    // Use the number of failures so far (0-indexed) to compute delay,
-                    // so the first retry uses `initial_backoff_ms`.
                     let is_last = attempt + 1 >= max;
                     if is_last {
                         return Err(RetryError::MaxRetriesExceeded);
                     }
                     let delay = BackoffCalculator::calculate_delay(config, attempt);
-                    attempt += 1; // advance to the next attempt after computing delay
+                    attempt += 1;
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -144,14 +140,11 @@ impl RetryExecutor {
             }
 
             if is_last {
-                // Exhausted retries
                 on_exhausted();
                 return response;
             }
 
-            // Backoff before next attempt
             let next_attempt = attempt + 1;
-            // Compute delay based on the number of failures so far (0-indexed)
             let delay = BackoffCalculator::calculate_delay(config, attempt);
             debug!(
                 attempt = attempt,
@@ -194,22 +187,18 @@ mod tests {
             backoff_multiplier: 2.0,
             jitter_factor: 0.0,
         };
-        // attempt=0 => 100ms
         assert_eq!(
             BackoffCalculator::calculate_delay(&cfg, 0),
             Duration::from_millis(100)
         );
-        // attempt=1 => 200ms
         assert_eq!(
             BackoffCalculator::calculate_delay(&cfg, 1),
             Duration::from_millis(200)
         );
-        // attempt=2 => 400ms -> capped to 250ms
         assert_eq!(
             BackoffCalculator::calculate_delay(&cfg, 2),
             Duration::from_millis(250)
         );
-        // large attempt still capped
         assert_eq!(
             BackoffCalculator::calculate_delay(&cfg, 10),
             Duration::from_millis(250)
@@ -225,7 +214,6 @@ mod tests {
             backoff_multiplier: 2.0,
             jitter_factor: 0.5,
         };
-        // attempt=2 => base 400ms, jitter in [0.5x, 1.5x]
         let base = 400.0;
         for _ in 0..50 {
             let d = BackoffCalculator::calculate_delay(&cfg, 2).as_millis() as f32;
@@ -261,7 +249,7 @@ mod tests {
 
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), 42);
-        assert_eq!(calls.load(Ordering::Relaxed), 3); // 2 fails + 1 success
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
@@ -309,7 +297,7 @@ mod tests {
                     }
                 }
             },
-            |res, _attempt| !res.status().is_success(), // retry until success
+            |res, _attempt| !res.status().is_success(),
             {
                 let backoffs = backoffs.clone();
                 move |_delay, _next_attempt| {
@@ -326,7 +314,7 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(calls.load(Ordering::Relaxed), 3); // 2 fails + 1 success
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
         assert_eq!(backoffs.load(Ordering::Relaxed), 2);
         assert_eq!(exhausted.load(Ordering::Relaxed), 0);
     }
@@ -347,7 +335,7 @@ mod tests {
                     async move { (StatusCode::BAD_REQUEST, "bad").into_response() }
                 }
             },
-            |_res, _attempt| false, // never retry
+            |_res, _attempt| false,
             {
                 let backoffs = backoffs.clone();
                 move |_delay, _next_attempt| {
@@ -385,7 +373,7 @@ mod tests {
                     async move { (StatusCode::SERVICE_UNAVAILABLE, "fail").into_response() }
                 }
             },
-            |_res, _attempt| true, // keep retrying
+            |_res, _attempt| true,
             {
                 let backoffs = backoffs.clone();
                 move |_delay, _next_attempt| {

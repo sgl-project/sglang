@@ -46,7 +46,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        a49a78ffefc86a87160dfe0ccc3a3a2d1622c918
+    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -81,7 +81,7 @@ FetchContent_Populate(repo-triton)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        018b551825c8e5579206e6eb9d3229fa679202b3
+    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -309,6 +309,7 @@ set(SOURCES
     "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
+    "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
@@ -318,6 +319,7 @@ set(SOURCES
     "csrc/kvcacheio/transfer.cu"
 
     "csrc/speculative/eagle_utils.cu"
+    "csrc/speculative/lookahead_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
 
