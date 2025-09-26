@@ -202,12 +202,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                     ),
                                 ),
                             )
-                        elif batch_output.get("finished", False):
-                            yield self._create_completion_response(
-                                request.request_id, batch_output
-                            )
                         else:
-                            yield self._create_chunk_response(
+                            # All non-error batch outputs are final responses
+                            yield self._create_completion_response(
                                 request.request_id, batch_output
                             )
                 else:
