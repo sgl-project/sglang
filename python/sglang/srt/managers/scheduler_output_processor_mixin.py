@@ -173,8 +173,21 @@ class SchedulerOutputProcessorMixin:
             self.set_next_batch_sampling_info_done(batch)
 
         else:  # embedding or reward model
+            is_sparse = getattr(self.server_args, "use_bge_m3_sparse", False)
+
             embeddings, bid = result.embeddings, result.bid
-            embeddings = embeddings.tolist()
+
+            if is_sparse:
+                batches, token_ids = embeddings.indices()
+                vals = embeddings.values()
+
+                embeddings = [{} for _ in range(embeddings.size(0))]
+                for batch_num, token_id, value in zip(
+                    batches.tolist(), token_ids.tolist(), vals.tolist()
+                ):
+                    embeddings[batch_num][token_id] = value
+            else:
+                embeddings = embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):

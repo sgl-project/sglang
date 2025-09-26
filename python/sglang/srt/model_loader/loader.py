@@ -228,10 +228,19 @@ def _initialize_model(
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping
     )
-    return model_class(
-        config=model_config.hf_config,
-        quant_config=quant_config,
-    )
+
+    # Build kwargs conditionally
+    kwargs = {
+        "config": model_config.hf_config,
+        "quant_config": quant_config,
+    }
+
+    # Only add use_bge_m3_sparse to kwargs if it is set in model_config
+    if getattr(model_config, "use_bge_m3_sparse", False):
+        kwargs["use_bge_m3_sparse"] = model_config.use_bge_m3_sparse
+        kwargs["model_path"] = model_config.model_path
+
+    return model_class(**kwargs)
 
 
 class BaseModelLoader(ABC):
