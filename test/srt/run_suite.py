@@ -180,9 +180,9 @@ suites = {
 # Add AMD tests
 suite_amd = {
     "per-commit-amd": [
-        # TestFile("hicache/test_hicache.py", 116),              # Temporily disabled due to timeout
-        # TestFile("hicache/test_hicache_mla.py", 1316),         # Temporily disabled due to timeout
-        # TestFile("hicache/test_hicache_storage.py", 429),      # Temporily disabled due to timeout
+        # TestFile("hicache/test_hicache.py", 116),              # Temporarily disabled due to timeout
+        # TestFile("hicache/test_hicache_mla.py", 1316),         # Temporarily disabled due to timeout
+        # TestFile("hicache/test_hicache_storage.py", 429),      # Temporarily disabled due to timeout
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 129),
