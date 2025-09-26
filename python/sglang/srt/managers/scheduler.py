@@ -371,6 +371,7 @@ class Scheduler(
                 nccl_port=port_args.nccl_port,
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
+                moe_ep_rank=moe_ep_rank,
             )
         elif self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
