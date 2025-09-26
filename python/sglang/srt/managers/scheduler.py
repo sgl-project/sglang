@@ -1394,8 +1394,6 @@ class Scheduler(
                 self.tokenizer, "think_end_id", None
             ) in getattr(req, "origin_input_ids", [])
             key = (key[0], key[1], may_can_reasoning)
-            req._may_can_reasoning = may_can_reasoning
-
             value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
             req.grammar = value
 

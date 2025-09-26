@@ -173,14 +173,14 @@ class BaseGrammarBackend:
             grammar.grammar_stats.compilation_time = time.perf_counter() - s
         return grammar
 
-    def get_cached_or_future_value(self, key):
+    def get_cached_or_future_value(self, key: Tuple[str, str, bool]):
         value = self.cache.get(key)
         if value:
             return value.copy(), True
         value = self.executor.submit(self._init_value_dispatch, key)
         return value, False
 
-    def set_cache(self, key, value: BaseGrammarObject):
+    def set_cache(self, key: Tuple[str, str, bool], value: BaseGrammarObject):
         self.cache[key] = value
 
     def reset(self):
