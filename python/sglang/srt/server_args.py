@@ -151,9 +151,6 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
-    dtype: str = "auto"
-    kv_cache_dtype: str = "auto"
-    quantization: Optional[str] = None
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
     modelopt_checkpoint_save_path: Optional[str] = None
