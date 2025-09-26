@@ -392,7 +392,7 @@ class Function(BaseModel):
     """Function descriptions."""
 
     description: Optional[str] = Field(default=None, examples=[None])
-    name: Optional[str] = None
+    name: str
     parameters: Optional[object] = None
     strict: bool = False
 

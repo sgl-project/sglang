@@ -94,14 +94,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # Validate tool definitions
         if request.tools:
             for i, tool in enumerate(request.tools):
-                if not hasattr(tool.function, "name") or not tool.function.name:
-                    return f"Tool {i} function is missing required 'name' field."
-                try:
-                    Draft202012Validator.check_schema(tool.function.parameters)
-                except SchemaError as e:
-                    return (
-                        f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
-                    )
+                if tool.function.parameters is not None:
+                    try:
+                        Draft202012Validator.check_schema(tool.function.parameters)
+                    except SchemaError as e:
+                        return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
 
             # Check for conflicting tool definitions when tool_choice is required.
             # Specific tool requests only have one tool so conflicts are not possible
