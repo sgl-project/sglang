@@ -168,10 +168,8 @@ class TestModelOptModelLoader(CustomTestCase):
 
                 # Verify the error message contains expected information
                 error_msg = str(context.exception)
-                self.assertIn(
-                    "Invalid modelopt_quant choice: 'invalid_quant'", error_msg
-                )
-                self.assertIn("Available choices in QUANT_CFG_CHOICES", error_msg)
+                self.assertIn("Invalid quantization choice: 'invalid_quant'", error_msg)
+                self.assertIn("Available choices:", error_msg)
 
     @patch("sglang.srt.model_loader.loader.logger")
     def test_missing_modelopt_import(self, mock_logger):
@@ -200,7 +198,7 @@ class TestModelOptModelLoader(CustomTestCase):
                 # Verify error logging
                 mock_logger.error.assert_called_with(
                     "NVIDIA Model Optimizer (modelopt) library not found. "
-                    "Please install it to use 'modelopt_quant' feature."
+                    "Please install it to use ModelOpt quantization."
                 )
 
     def test_quantization_config_attribute_validation(self):
@@ -744,7 +742,7 @@ class TestModelOptModelLoader(CustomTestCase):
         config_fp4 = ModelConfig(
             model_path=self.model_path, quantization="modelopt_fp4"
         )
-        self.assertEqual(config_fp4._get_modelopt_quant_type(), "fp4")
+        self.assertEqual(config_fp4._get_modelopt_quant_type(), "nvfp4")
 
         # Test auto-detection
         config_auto = ModelConfig(model_path=self.model_path, quantization="modelopt")

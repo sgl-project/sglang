@@ -142,7 +142,7 @@ class TestModelOptExport(unittest.TestCase):
 
             # Assert
             mock_restore.assert_called_once_with(self.mock_model, self.checkpoint_dir)
-            mock_export.assert_called_once_with(self.mock_model, self.export_dir)
+            mock_export.assert_called_once_with(self.mock_model, self.export_dir, None)
 
     @patch("modelopt.torch.quantization.quantize")
     @patch("modelopt.torch.quantization.print_quant_summary")
@@ -182,7 +182,7 @@ class TestModelOptExport(unittest.TestCase):
             mock_quantize.assert_called_once_with(
                 self.mock_model, self.mock_quant_cfg, forward_loop=mock_calibrate_loop
             )
-            mock_export.assert_called_once_with(self.mock_model, self.export_dir)
+            mock_export.assert_called_once_with(self.mock_model, self.export_dir, None)
 
     def test_setup_quantization_without_export(self):
         """Test quantization setup without export path specified."""
