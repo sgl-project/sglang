@@ -1,7 +1,7 @@
 use super::{CircuitBreaker, WorkerError, WorkerResult};
 use crate::core::CircuitState;
 use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder};
-use crate::grpc::SglangSchedulerClient;
+use crate::grpc_client::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
 use futures;
