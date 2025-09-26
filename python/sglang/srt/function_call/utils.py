@@ -57,22 +57,28 @@ def _is_complete_json(input_str: str) -> bool:
         return False
 
 
-def validate_tool_definitions(tools: List[Tool]) -> None:
+def get_and_validate_tool_schema_defs(tools: List[Tool], validate: bool) -> dict:
     """
-    Validate that tool definitions don't have conflicting $defs.
+    Get consolidated $defs from all tools, optionally validating for conflicts.
+
+    Args:
+        tools: List of tools to process
+        validate: If True, validate for conflicting $defs and raise ValueError if found.
+                If False, return the consolidated $defs without validation.
+
+    Returns:
+        Dictionary of consolidated $defs from all tools
 
     Raises:
-        ValueError: If there are conflicting tool definitions
+        ValueError: If validate=True and conflicting $defs are found
     """
     all_defs = {}
     for tool in tools:
         if tool.function.parameters is None:
             continue
-        # Make a copy to avoid modifying original
-        params = tool.function.parameters.copy()
-        defs = params.pop("$defs", {})
+        defs = tool.function.parameters.get("$defs", {})
         for def_name, def_schema in defs.items():
-            if def_name in all_defs and all_defs[def_name] != def_schema:
+            if validate and def_name in all_defs and all_defs[def_name] != def_schema:
                 raise ValueError(
                     f"Tool definition '{def_name}' has "
                     "multiple schemas, which is not "
@@ -80,6 +86,7 @@ def validate_tool_definitions(tools: List[Tool]) -> None:
                 )
             else:
                 all_defs[def_name] = def_schema
+    return all_defs
 
 
 def get_json_schema_constraint(
@@ -121,21 +128,6 @@ def get_json_schema_constraint(
                 }
         return None
     elif tool_choice == "required":
-        # Validate tool definitions first
-        validate_tool_definitions(tools)
-
-        def get_tool_schema_defs(tools):
-            all_defs = {}
-            for tool in tools:
-                if tool.function.parameters is None:
-                    continue
-                # Make a copy to avoid modifying original
-                params = tool.function.parameters.copy()
-                defs = params.pop("$defs", {})
-                for def_name, def_schema in defs.items():
-                    all_defs[def_name] = def_schema
-            return all_defs
-
         json_schema = {
             "type": "array",
             "minItems": 1,
@@ -144,7 +136,7 @@ def get_json_schema_constraint(
                 "anyOf": [get_tool_schema(tool) for tool in tools],
             },
         }
-        json_schema_defs = get_tool_schema_defs(tools)
+        json_schema_defs = get_and_validate_tool_schema_defs(tools, validate=False)
         if json_schema_defs:
             json_schema["$defs"] = json_schema_defs
         return json_schema

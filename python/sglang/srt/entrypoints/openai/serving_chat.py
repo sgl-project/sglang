@@ -40,8 +40,8 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
+    get_and_validate_tool_schema_defs,
     get_json_schema_constraint,
-    validate_tool_definitions,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -103,12 +103,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
                     )
 
-            # Check for conflicting tool definitions when tool_choice is required or specific
-            if request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
-            ):
+            # Check for conflicting tool definitions when tool_choice is required.
+            # Specific tool requests only have one tool so conflicts are not possible
+            if request.tool_choice == "required":
                 try:
-                    validate_tool_definitions(request.tools)
+                    get_and_validate_tool_schema_defs(request.tools, validate=True)
                 except ValueError as e:
                     return str(e)
         max_output_tokens = request.max_completion_tokens or request.max_tokens

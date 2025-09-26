@@ -1,4 +1,3 @@
-# ...existing code...
 """
 Tests for JSON schema constraint functionality used by JsonArrayParser
 """
@@ -16,8 +15,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.utils import (
+    get_and_validate_tool_schema_defs,
     get_json_schema_constraint,
-    validate_tool_definitions,
 )
 
 
@@ -187,6 +186,11 @@ class TestJsonSchemaConstraint(unittest.TestCase):
             ),
         ]
 
+        try:
+            get_and_validate_tool_schema_defs(tools_with_defs, validate=True)
+        except ValueError as e:
+            self.fail(f"Validation should not raise ValueError, but got: {e}")
+
         schema = get_json_schema_constraint(tools_with_defs, "required")
 
         self.assertIsNotNone(schema)
@@ -194,50 +198,6 @@ class TestJsonSchemaConstraint(unittest.TestCase):
 
         self.assertIn("$defs", schema)
         self.assertIn("NestedType", schema["$defs"])
-
-    def test_tools_with_conflicting_defs(self):
-        """Test schema generation with conflicting $defs"""
-        tools_with_conflicting_defs = [
-            Tool(
-                type="function",
-                function=Function(
-                    name="tool1",
-                    description="Tool 1",
-                    parameters={
-                        "type": "object",
-                        "properties": {},
-                        "$defs": {
-                            "ConflictingType": {
-                                "type": "object",
-                                "properties": {"value": {"type": "string"}},
-                            },
-                        },
-                    },
-                ),
-            ),
-            Tool(
-                type="function",
-                function=Function(
-                    name="tool2",
-                    description="Tool 2",
-                    parameters={
-                        "type": "object",
-                        "properties": {},
-                        "$defs": {
-                            "ConflictingType": {
-                                "type": "object",
-                                "properties": {"value": {"type": "number"}},
-                            },
-                        },
-                    },
-                ),
-            ),
-        ]
-
-        with self.assertRaises(ValueError) as context:
-            get_json_schema_constraint(tools_with_conflicting_defs, "required")
-
-        self.assertIn("multiple schemas", str(context.exception))
 
     def test_tools_without_parameters(self):
         """Test schema generation with tools that have no parameters"""
@@ -355,7 +315,9 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         ]
 
         with self.assertRaises(ValueError) as context:
-            validate_tool_definitions(tools_with_conflicting_defs)
+            get_and_validate_tool_schema_defs(
+                tools_with_conflicting_defs, validate=True
+            )
 
         self.assertIn(
             "Tool definition 'ConflictingType' has multiple schemas",
@@ -363,44 +325,60 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         )
         self.assertIn("which is not supported", str(context.exception))
 
-    def test_http_error_handling_integration(self):
-        """Test that conflicting tool definitions are caught in validation and return 400 error"""
-        from unittest.mock import Mock
-
-        from sglang.srt.entrypoints.openai.protocol import (
-            ChatCompletionRequest,
-            Function,
-            Tool,
-        )
-        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-
-        # Create a mock tokenizer manager
-        mock_tokenizer_manager = Mock()
-        mock_tokenizer_manager.model_config = Mock(is_multimodal=False)
-        mock_tokenizer_manager.server_args = Mock(enable_cache_report=False)
-
-        # Create a mock template manager
-        mock_template_manager = Mock()
-        mock_template_manager.chat_template_name = None
-        mock_template_manager.jinja_template_content_format = "string"
-
-        # Create serving chat instance
-        serving_chat = OpenAIServingChat(mock_tokenizer_manager, mock_template_manager)
-
-        # Create tools with conflicting definitions
-        tools_with_conflicting_defs = [
+    def test_tools_with_empty_defs(self):
+        """Test tools with empty $defs objects"""
+        tools_with_empty_defs = [
             Tool(
                 type="function",
                 function=Function(
-                    name="tool1",
-                    description="Tool 1",
+                    name="empty_defs_tool",
+                    description="Tool with empty $defs",
                     parameters={
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "data": {"type": "string"},
+                        },
+                        "required": ["data"],
+                        "$defs": {},
+                    },
+                ),
+            ),
+        ]
+
+        try:
+            get_and_validate_tool_schema_defs(tools_with_empty_defs, validate=True)
+        except ValueError as e:
+            self.fail(f"Validation should not raise ValueError, but got: {e}")
+
+        schema = get_json_schema_constraint(tools_with_empty_defs, "required")
+        self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
+        # Should not have $defs section when empty
+        self.assertNotIn("$defs", schema)
+
+    def test_tools_with_identical_defs(self):
+        """Test different tools with same $defs names but identical schemas (should pass validation)"""
+        tools_with_identical_defs = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="weather_tool",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {"$ref": "#/$defs/Location"},
+                        },
+                        "required": ["location"],
                         "$defs": {
-                            "ConflictingType": {
+                            "Location": {
                                 "type": "object",
-                                "properties": {"value": {"type": "string"}},
+                                "properties": {
+                                    "lat": {"type": "number"},
+                                    "lon": {"type": "number"},
+                                },
+                                "required": ["lat", "lon"],
                             },
                         },
                     },
@@ -409,15 +387,22 @@ class TestJsonSchemaConstraint(unittest.TestCase):
             Tool(
                 type="function",
                 function=Function(
-                    name="tool2",
-                    description="Tool 2",
+                    name="address_tool",
+                    description="Get address information",
                     parameters={
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "address": {"$ref": "#/$defs/Location"},
+                        },
+                        "required": ["address"],
                         "$defs": {
-                            "ConflictingType": {
+                            "Location": {
                                 "type": "object",
-                                "properties": {"value": {"type": "number"}},
+                                "properties": {
+                                    "lat": {"type": "number"},
+                                    "lon": {"type": "number"},
+                                },
+                                "required": ["lat", "lon"],
                             },
                         },
                     },
@@ -425,21 +410,210 @@ class TestJsonSchemaConstraint(unittest.TestCase):
             ),
         ]
 
-        # Create a request with conflicting tools
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "test"}],
-            tools=tools_with_conflicting_defs,
-            tool_choice="required",
-        )
+        try:
+            get_and_validate_tool_schema_defs(tools_with_identical_defs, validate=True)
+        except ValueError as e:
+            self.fail(
+                f"Validation should not raise ValueError for identical schemas, but got: {e}"
+            )
 
-        # Test that the validation catches the conflicting definitions
-        error_msg = serving_chat._validate_request(request)
-        self.assertIsNotNone(error_msg)
-        self.assertIn(
-            "Tool definition 'ConflictingType' has multiple schemas", error_msg
-        )
-        self.assertIn("which is not supported", error_msg)
+        # Also test that schema generation works
+        schema = get_json_schema_constraint(tools_with_identical_defs, "required")
+        self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
+        # Verify both tools are present
+        tool_names = [
+            item["properties"]["name"]["enum"][0] for item in schema["items"]["anyOf"]
+        ]
+        self.assertIn("weather_tool", tool_names)
+        self.assertIn("address_tool", tool_names)
+
+        # Should have $defs with Location
+        self.assertIn("$defs", schema)
+        self.assertIn("Location", schema["$defs"])
+
+    def test_tools_with_nested_defs(self):
+        """Test tools with nested $defs"""
+        tools_with_nested_defs = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="complex_tool",
+                    description="Tool with nested $defs",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "user": {"$ref": "#/$defs/User"},
+                            "settings": {"$ref": "#/$defs/Settings"},
+                        },
+                        "required": ["user"],
+                        "$defs": {
+                            "User": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "profile": {"$ref": "#/$defs/Profile"},
+                                },
+                                "required": ["id"],
+                            },
+                            "Profile": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "email": {"type": "string", "format": "email"},
+                                },
+                                "required": ["name"],
+                            },
+                            "Settings": {
+                                "type": "object",
+                                "properties": {
+                                    "theme": {
+                                        "type": "string",
+                                        "enum": ["light", "dark"],
+                                    },
+                                    "notifications": {"type": "boolean"},
+                                },
+                            },
+                        },
+                    },
+                ),
+            ),
+        ]
+
+        try:
+            get_and_validate_tool_schema_defs(tools_with_nested_defs, validate=True)
+        except ValueError as e:
+            self.fail(f"Validation should not raise ValueError, but got: {e}")
+
+        schema = get_json_schema_constraint(tools_with_nested_defs, "required")
+        self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
+        # Verify all $defs are properly included
+        self.assertIn("$defs", schema)
+        self.assertIn("User", schema["$defs"])
+        self.assertIn("Profile", schema["$defs"])
+        self.assertIn("Settings", schema["$defs"])
+
+    def test_mixed_tools_with_and_without_defs(self):
+        """Test mixed tools with and without $defs"""
+        mixed_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="simple_tool",
+                    description="Simple tool without $defs",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="complex_tool",
+                    description="Complex tool with $defs",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "data": {"$ref": "#/$defs/DataType"},
+                        },
+                        "required": ["data"],
+                        "$defs": {
+                            "DataType": {
+                                "type": "object",
+                                "properties": {
+                                    "value": {"type": "string"},
+                                    "metadata": {"type": "object"},
+                                },
+                                "required": ["value"],
+                            },
+                        },
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="another_simple_tool",
+                    description="Another simple tool",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer"},
+                        },
+                        "required": ["id"],
+                    },
+                ),
+            ),
+        ]
+
+        try:
+            get_and_validate_tool_schema_defs(mixed_tools, validate=True)
+        except ValueError as e:
+            self.fail(f"Validation should not raise ValueError, but got: {e}")
+
+        schema = get_json_schema_constraint(mixed_tools, "required")
+        self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
+        # Should have $defs from the complex tool
+        self.assertIn("$defs", schema)
+        self.assertIn("DataType", schema["$defs"])
+
+        # Should have all three tools
+        tool_names = [
+            item["properties"]["name"]["enum"][0] for item in schema["items"]["anyOf"]
+        ]
+        self.assertEqual(len(tool_names), 3)
+        self.assertIn("simple_tool", tool_names)
+        self.assertIn("complex_tool", tool_names)
+        self.assertIn("another_simple_tool", tool_names)
+
+    def test_tools_with_defs_but_no_refs(self):
+        """Test tools with $defs but no $ref usage"""
+        tools_with_unused_defs = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="unused_defs_tool",
+                    description="Tool with $defs but no $ref usage",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "data": {"type": "string"},
+                        },
+                        "required": ["data"],
+                        "$defs": {
+                            "UnusedType": {
+                                "type": "object",
+                                "properties": {
+                                    "value": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                ),
+            ),
+        ]
+
+        try:
+            get_and_validate_tool_schema_defs(tools_with_unused_defs, validate=True)
+        except ValueError as e:
+            self.fail(f"Validation should not raise ValueError, but got: {e}")
+
+        schema = get_json_schema_constraint(tools_with_unused_defs, "required")
+        self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+
+        # Should still include $defs even if not referenced
+        self.assertIn("$defs", schema)
+        self.assertIn("UnusedType", schema["$defs"])
 
 
 if __name__ == "__main__":

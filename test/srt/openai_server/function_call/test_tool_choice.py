@@ -722,6 +722,77 @@ class TestToolChoiceLlama32(CustomTestCase):
         error_msg = str(context.exception).lower()
         self.assertIn("invalid 'parameters' schema", error_msg)
 
+    def test_conflicting_defs_required_tool_choice(self):
+        """Test that conflicting $defs with required tool_choice returns 400 error"""
+        conflicting_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool1",
+                    "description": "Tool 1 with conflicting $defs",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "data": {"$ref": "#/$defs/DataType"},
+                        },
+                        "required": ["data"],
+                        "$defs": {
+                            "DataType": {
+                                "type": "object",
+                                "properties": {"value": {"type": "string"}},
+                                "required": ["value"],
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool2",
+                    "description": "Tool 2 with conflicting $defs",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "data": {"$ref": "#/$defs/DataType"},
+                        },
+                        "required": ["data"],
+                        "$defs": {
+                            "DataType": {  # Different definition for DataType
+                                "type": "object",
+                                "properties": {"value": {"type": "number"}},
+                                "required": ["value"],
+                            },
+                        },
+                    },
+                },
+            },
+        ]
+
+        messages = [
+            {
+                "role": "user",
+                "content": "Test the conflicting tools",
+            }
+        ]
+
+        # Should raise BadRequestError due to conflicting $defs
+        with self.assertRaises(openai.BadRequestError) as context:
+            self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                max_tokens=100,
+                temperature=0.1,
+                tools=conflicting_tools,
+                tool_choice="required",
+                stream=False,
+            )
+
+        # Verify the error message indicates conflicting tool definitions
+        error_msg = str(context.exception).lower()
+        self.assertIn("multiple schemas", error_msg)
+        self.assertIn("not supported", error_msg)
+
 
 class TestToolChoiceQwen25(TestToolChoiceLlama32):
     """Test tool_choice functionality with Qwen2.5 model"""
