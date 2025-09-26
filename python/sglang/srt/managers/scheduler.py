@@ -72,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    DestroyWeightsUpdateGroupReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -116,6 +117,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
     Req,
+    RequestStage,
     ScheduleBatch,
     global_server_args_dict,
 )
@@ -143,7 +145,6 @@ from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.lora_radix_cache import LoRARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -170,6 +171,7 @@ from sglang.srt.utils import (
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
+    get_int_env_var,
     get_zmq_socket,
     is_cpu,
     kill_itself_when_parent_died,
@@ -242,6 +244,13 @@ class Scheduler(
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
+        self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.schedule_low_priority_values_first = (
+            server_args.schedule_low_priority_values_first
+        )
+        self.priority_scheduling_preemption_threshold = (
+            server_args.priority_scheduling_preemption_threshold
+        )
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -250,7 +259,7 @@ class Scheduler(
         self.enable_metrics_for_all_schedulers = (
             server_args.enable_metrics_for_all_schedulers
         )
-        self.enable_kv_cache_events = server_args.kv_events_config is not None
+        self.enable_kv_cache_events = server_args.kv_events_config and tp_rank == 0
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -376,6 +385,18 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+        elif self.spec_algorithm.is_lookahead():
+            from sglang.srt.speculative.lookahead_worker import LOOKAHEADWorker
+
+            self.draft_worker = LOOKAHEADWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
         else:
             self.draft_worker = None
 
@@ -486,7 +507,12 @@ class Scheduler(
             self.schedule_policy,
             self.tree_cache,
             self.enable_hierarchical_cache,
+            self.enable_priority_scheduling,
+            self.schedule_low_priority_values_first,
         )
+        # Enable preemption for priority scheduling.
+        self.try_preemption = self.enable_priority_scheduling
+
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
@@ -527,8 +553,10 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
-        self.init_kv_events(server_args.kv_events_config)
         self.init_dp_balance(dp_balance_meta)
+
+        if self.enable_kv_cache_events:
+            self.init_kv_events(server_args.kv_events_config)
 
         # Init disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -538,6 +566,9 @@ class Scheduler(
 
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
+
+        # Init prefill kv split size when deterministic inference is enabled with various attention backends
+        self.init_deterministic_inference_config()
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -553,6 +584,7 @@ class Scheduler(
                 (CloseSessionReqInput, self.close_session),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
+                (DestroyWeightsUpdateGroupReqInput, self.destroy_weights_update_group),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqInput,
                     self.init_weights_send_group_for_remote_instance,
@@ -581,6 +613,23 @@ class Scheduler(
                 (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
                 (GetLoadReqInput, self.get_load),
             ]
+        )
+
+    def init_deterministic_inference_config(self):
+        """Initialize deterministic inference configuration for different attention backends."""
+        if not self.server_args.enable_deterministic_inference:
+            self.truncation_align_size = None
+            return
+
+        backend_sizes = {
+            "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
+            "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
+        }
+        env_var, default_size = backend_sizes.get(
+            self.server_args.attention_backend, (None, None)
+        )
+        self.truncation_align_size = (
+            get_int_env_var(env_var, default_size) if env_var else None
         )
 
     def init_tokenizer(self):
@@ -654,6 +703,7 @@ class Scheduler(
                         else self.tp_cpu_group
                     ),
                     page_size=self.page_size,
+                    eviction_policy=server_args.radix_eviction_policy,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
@@ -679,19 +729,6 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                 )
-            elif self.enable_lora:
-                assert (
-                    not self.enable_hierarchical_cache
-                ), "LoRA radix cache doesn't support hierarchical cache"
-                assert (
-                    self.schedule_policy == "fcfs"
-                ), "LoRA radix cache only supports FCFS policy"
-                self.tree_cache = LoRARadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
                     LMCRadixCache,
@@ -706,6 +743,7 @@ class Scheduler(
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
+                    eviction_policy=server_args.radix_eviction_policy,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -714,6 +752,7 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
+                    eviction_policy=server_args.radix_eviction_policy,
                 )
 
         self.decode_mem_cache_buf_multiplier = (
@@ -722,8 +761,8 @@ class Scheduler(
             else (
                 server_args.speculative_num_draft_tokens
                 + (
-                    server_args.speculative_eagle_topk
-                    * server_args.speculative_num_steps
+                    (server_args.speculative_eagle_topk or 1)
+                    * (server_args.speculative_num_steps or 1)
                 )
             )
         )
@@ -766,7 +805,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 draft_token_to_kv_pool=(
                     None
-                    if self.draft_worker is None
+                    if self.draft_worker is None or self.spec_algorithm.is_lookahead()
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
@@ -803,7 +842,7 @@ class Scheduler(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 draft_token_to_kv_pool=(
                     None
-                    if self.draft_worker is None
+                    if self.draft_worker is None or self.spec_algorithm.is_lookahead()
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
@@ -1149,20 +1188,6 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
 
-            # If it is a work request, accept or reject the request based on the request queue size.
-            if is_work_request(recv_req):
-                if len(self.waiting_queue) + 1 > self.max_queued_requests:
-                    abort_req = AbortReq(
-                        recv_req.rid,
-                        finished_reason={
-                            "type": "abort",
-                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "The request queue is full.",
-                        },
-                    )
-                    self.send_to_tokenizer.send_pyobj(abort_req)
-                    continue
-
             # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
             if isinstance(recv_req, MultiTokenizerWrapper):
                 worker_id = recv_req.worker_id
@@ -1232,6 +1257,10 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
+                priority=recv_req.priority,
+                metrics_collector=(
+                    self.metrics_collector if self.enable_metrics else None
+                ),
             )
             req.tokenizer = self.tokenizer
 
@@ -1378,6 +1407,9 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
+            self._set_or_validate_priority(req)
+            if self._abort_on_queued_limit(req):
+                return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             trace_slice_end("process req", req.rid, auto_next_anon=True)
@@ -1404,7 +1436,70 @@ class Scheduler(
             # If this is a decode server, we put the request to the decode pending prealloc queue
             self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
         else:
-            self.waiting_queue.extend(reqs)
+            for req in reqs:
+                self._set_or_validate_priority(req)
+                if not self._abort_on_queued_limit(req):
+                    self.waiting_queue.append(req)
+
+    def _set_or_validate_priority(self, req: Req):
+        """Set the default priority value, or abort the request based on the priority scheduling mode."""
+        if self.enable_priority_scheduling and req.priority is None:
+            if self.schedule_low_priority_values_first:
+                req.priority = sys.maxsize
+            else:
+                req.priority = -sys.maxsize - 1
+        elif not self.enable_priority_scheduling and req.priority is not None:
+            abort_req = AbortReq(
+                req.rid,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": "Using priority is disabled for this server. Please send a new request without a priority.",
+                },
+            )
+            self.send_to_tokenizer.send_pyobj(abort_req)
+
+    def _abort_on_queued_limit(self, recv_req: Req) -> bool:
+        """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
+        if (
+            self.max_queued_requests is None
+            or len(self.waiting_queue) + 1 <= self.max_queued_requests
+        ):
+            return False
+
+        # Reject the incoming request by default.
+        req_to_abort = recv_req
+        message = "The request queue is full."
+        if self.enable_priority_scheduling:
+            # With priority scheduling, consider aboritng an existing request based on the priority.
+            # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
+            # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
+            # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
+            direction = 1 if self.schedule_low_priority_values_first else -1
+            key_fn = lambda item: (
+                direction * item[1].priority,
+                item[1].queue_time_start,
+            )
+            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
+            abort_existing_req = (
+                direction * recv_req.priority < direction * candidate_req.priority
+            )
+            if abort_existing_req:
+                self.waiting_queue.pop(idx)
+                req_to_abort = candidate_req
+                message = "The request is aborted by a higher priority request."
+
+        self.send_to_tokenizer.send_pyobj(
+            AbortReq(
+                req_to_abort.rid,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+            )
+        )
+        return req_to_abort.rid == recv_req.rid
 
     def handle_embedding_request(
         self,
@@ -1416,6 +1511,7 @@ class Scheduler(
             recv_req.input_ids,
             recv_req.sampling_params,
             token_type_ids=recv_req.token_type_ids,
+            priority=recv_req.priority,
         )
         req.tokenizer = self.tokenizer
 
@@ -1676,6 +1772,10 @@ class Scheduler(
         if self.grammar_queue:
             self.move_ready_grammar_requests()
 
+        if self.try_preemption:
+            # Reset batch_is_full to try preemption with a prefill adder.
+            self.running_batch.batch_is_full = False
+
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -1688,7 +1788,11 @@ class Scheduler(
         # as the space for the chunked request has just been released.
         # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
-        if self.get_num_allocatable_reqs(running_bs) <= 0 and not self.chunked_req:
+        if (
+            self.get_num_allocatable_reqs(running_bs) <= 0
+            and not self.chunked_req
+            and not self.try_preemption
+        ):
             self.running_batch.batch_is_full = True
             return None
 
@@ -1708,6 +1812,7 @@ class Scheduler(
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
+            self.priority_scheduling_preemption_threshold,
         )
 
         if self.chunked_req is not None:
@@ -1728,15 +1833,19 @@ class Scheduler(
                 self.running_batch.batch_is_full = True
                 break
 
+            running_bs = len(self.running_batch.reqs) - len(adder.preempt_list)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
-                break
-
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
+
+            if self.running_batch.batch_is_full:
+                if not self.try_preemption:
+                    break
+                if not adder.preempt_to_schedule(req, self.server_args):
                     break
 
             if self.enable_hicache_storage:
@@ -1746,7 +1855,11 @@ class Scheduler(
                     continue
 
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=(self.chunked_req is not None),
+                truncation_align_size=self.truncation_align_size,
+            )
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -1768,10 +1881,13 @@ class Scheduler(
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
                 req.queue_time_end = time.perf_counter()
+                req.add_latency(RequestStage.PREFILL_WAITING)
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
+        if adder.preempt_list:
+            self._extend_requests_to_queue(adder.preempt_list)
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
@@ -2267,9 +2383,8 @@ class Scheduler(
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
 
-            if not self.spec_algorithm.is_none():
-                self.draft_worker.model_runner.req_to_token_pool.clear()
-                self.draft_worker.model_runner.token_to_kv_pool_allocator.clear()
+            if self.draft_worker:
+                self.draft_worker.clear_cache_pool()
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0
