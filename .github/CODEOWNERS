@@ -8,9 +8,9 @@
 /python/sglang/srt/disaggregation/mooncake @ShangmingCai
 /python/sglang/srt/disaggregation/ascend @ping1jing2
 /python/sglang/srt/distributed @yizhang2077 @merrymercy
-/python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy
+/python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy @JustinTong0323
 /python/sglang/srt/eplb @fzyzcjy
-/python/sglang/srt/function_call @CatherineSue
+/python/sglang/srt/function_call @CatherineSue @JustinTong0323
 /python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock @HaiShaw @ch-wan @BBuf @kushanam @Edwardf0t1
 /python/sglang/srt/layers/attention @ping1jing2
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang
