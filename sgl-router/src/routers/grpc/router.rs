@@ -202,12 +202,23 @@ impl GrpcRouter {
 
         debug!("Selected worker: {}", worker.url());
 
-        // Step 2: Get gRPC client for worker (fail fast if can't connect)
-        // TODO(CahterineSue): manage grpc connection in worker. (it should be simpler here)
-        let client = match self.get_or_create_grpc_client(worker.url()).await {
-            Ok(c) => c,
+        // Step 2: Get gRPC client from worker
+        let client = match worker.get_grpc_client().await {
+            Ok(Some(client_arc)) => {
+                // Clone the client from inside the Arc<Mutex<>>
+                let client = client_arc.lock().await.clone();
+                client
+            }
+            Ok(None) => {
+                error!("Selected worker is not a gRPC worker");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Selected worker is not configured for gRPC",
+                )
+                    .into_response();
+            }
             Err(e) => {
-                error!("Failed to get gRPC client: {}", e);
+                error!("Failed to get gRPC client from worker: {}", e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to get gRPC client: {}", e),
@@ -550,18 +561,6 @@ impl GrpcRouter {
         // TODO: Implement actual constraint generation logic
         // For now, return None as this is placeholder implementation
         None
-    }
-
-    /// Get or create a gRPC client for the worker
-    async fn get_or_create_grpc_client(
-        &self,
-        worker_url: &str,
-    ) -> Result<SglangSchedulerClient, String> {
-        // TODO: move to worker
-        debug!("Creating new gRPC client for worker: {}", worker_url);
-        SglangSchedulerClient::connect(worker_url)
-            .await
-            .map_err(|e| format!("Failed to connect to gRPC server: {}", e))
     }
 
     /// Placeholder for streaming handler (to be implemented in Phase 2)
