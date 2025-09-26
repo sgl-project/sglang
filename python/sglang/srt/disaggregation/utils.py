@@ -107,7 +107,9 @@ class MetadataBuffers:
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
-
+            self.cached_tokens = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
             self.output_token_logprobs_val = torch.zeros(
                 (size, 16), dtype=torch.float32, device=device
             )
@@ -127,6 +129,7 @@ class MetadataBuffers:
     def get_buf_infos(self):
         ptrs = [
             self.output_ids.data_ptr(),
+            self.cached_tokens.data_ptr(),
             self.output_token_logprobs_val.data_ptr(),
             self.output_token_logprobs_idx.data_ptr(),
             self.output_top_logprobs_val.data_ptr(),
@@ -135,6 +138,7 @@ class MetadataBuffers:
         ]
         data_lens = [
             self.output_ids.nbytes,
+            self.cached_tokens.nbytes,
             self.output_token_logprobs_val.nbytes,
             self.output_token_logprobs_idx.nbytes,
             self.output_top_logprobs_val.nbytes,
@@ -143,6 +147,7 @@ class MetadataBuffers:
         ]
         item_lens = [
             self.output_ids[0].nbytes,
+            self.cached_tokens[0].nbytes,
             self.output_token_logprobs_val[0].nbytes,
             self.output_token_logprobs_idx[0].nbytes,
             self.output_top_logprobs_val[0].nbytes,
@@ -154,6 +159,7 @@ class MetadataBuffers:
     def get_buf(self, idx: int):
         return (
             self.output_ids[idx],
+            self.cached_tokens[idx],
             self.output_token_logprobs_val[idx],
             self.output_token_logprobs_idx[idx],
             self.output_top_logprobs_val[idx],
@@ -164,6 +170,7 @@ class MetadataBuffers:
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
