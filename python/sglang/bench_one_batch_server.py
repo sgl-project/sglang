@@ -28,7 +28,7 @@ from sglang.bench_serving import get_tokenizer, sample_random_requests
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_blackwell, kill_process_tree
+from sglang.srt.utils import is_blackwell, is_cuda_alike, is_xpu, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 
@@ -181,8 +181,13 @@ def run_one_case(
 
     profile_link = None
     if profile:
+        activities = ["CPU"]
+        if is_cuda_alike():
+            activities.append("GPU")
+        if is_xpu():
+            activities.append("XPU")
         profile_link: str = run_profile(
-            url, profile_steps, ["CPU", "GPU"], None, None, profile_by_stage
+            url, profile_steps, activities, None, None, profile_by_stage
         )
 
     tic = time.perf_counter()
