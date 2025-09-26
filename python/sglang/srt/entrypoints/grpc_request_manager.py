@@ -319,14 +319,11 @@ class GrpcRequestManager:
                         yield response
 
                     # Non-streaming: yield final response with accumulated tokens from state
-                    if (
-                        isinstance(response, dict)
-                        and response.get("finished", False)
-                        and not is_stream
-                    ):
-                        final_response = response.copy()
-                        final_response["token_ids"] = state.output_ids
-                        yield final_response
+                    if isinstance(response, dict) and response.get("finished", False):
+                        if not is_stream:
+                            final_response = response.copy()
+                            final_response["token_ids"] = state.output_ids
+                            yield final_response
                         break
 
                 except asyncio.TimeoutError:
