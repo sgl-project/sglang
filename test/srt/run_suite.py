@@ -287,7 +287,7 @@ suite_amd = {
     ],
     "per-commit-2-gpu-amd": [
         TestFile("lora/test_lora_tp.py", 116),
-        TestFile("rl/test_update_weights_from_distributed.py", 103),
+        TestFile("rl/test_update_weights_from_distributed.py", 200),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         # TestFile("test_patch_torch.py", 19), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
