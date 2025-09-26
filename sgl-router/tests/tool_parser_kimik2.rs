@@ -6,7 +6,6 @@ use sglang_router_rs::tool_parser::{KimiK2Parser, ParseState, StreamResult, Tool
 async fn test_kimik2_complete_parsing() {
     let parser = KimiK2Parser::new();
 
-    // Test single tool call
     let input = r#"Let me help you with that.
 <|tool_calls_section_begin|>
 <|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location": "Tokyo", "units": "celsius"}<|tool_call_end|>
@@ -17,7 +16,6 @@ The weather in Tokyo is..."#;
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].function.name, "get_weather");
 
-    // Verify arguments
     let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
     assert_eq!(args["location"], "Tokyo");
     assert_eq!(args["units"], "celsius");
@@ -42,7 +40,6 @@ async fn test_kimik2_multiple_tools() {
 async fn test_kimik2_with_whitespace() {
     let parser = KimiK2Parser::new();
 
-    // Test with extra whitespace
     let input = r#"<|tool_calls_section_begin|>
 <|tool_call_begin|> functions.test:0 <|tool_call_argument_begin|> {"key": "value", "num": 42} <|tool_call_end|>
 <|tool_calls_section_end|>"#;
@@ -114,7 +111,6 @@ fn test_kimik2_format_detection() {
 async fn test_kimik2_sequential_indices() {
     let parser = KimiK2Parser::new();
 
-    // Test with proper sequential indexing
     let input = r#"<|tool_calls_section_begin|>
 <|tool_call_begin|>functions.first:0<|tool_call_argument_begin|>{"param": "a"}<|tool_call_end|>
 <|tool_call_begin|>functions.second:1<|tool_call_argument_begin|>{"param": "b"}<|tool_call_end|>

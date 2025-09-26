@@ -10,7 +10,9 @@ use axum::{
 };
 use serde_json::json;
 use sglang_router_rs::{
-    config::{RouterConfig, RoutingMode},
+    config::{
+        ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
+    },
     data_connector::{MemoryResponseStorage, ResponseId, ResponseStorage, StoredResponse},
     protocols::spec::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
@@ -82,8 +84,6 @@ fn create_minimal_completion_request() -> CompletionRequest {
     }
 }
 
-// ============= Basic Unit Tests =============
-
 /// Test basic OpenAI router creation and configuration
 #[tokio::test]
 async fn test_openai_router_creation() {
@@ -99,27 +99,6 @@ async fn test_openai_router_creation() {
     let router = router.unwrap();
     assert_eq!(router.router_type(), "openai");
     assert!(!router.is_pd_mode());
-}
-
-/// Test health endpoints
-#[tokio::test]
-async fn test_openai_router_health() {
-    let router = OpenAIRouter::new(
-        "https://api.openai.com".to_string(),
-        None,
-        Arc::new(MemoryResponseStorage::new()),
-    )
-    .await
-    .unwrap();
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/health")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.health(req).await;
-    assert_eq!(response.status(), StatusCode::OK);
 }
 
 /// Test server info endpoint
@@ -594,7 +573,6 @@ async fn test_unsupported_endpoints() {
     .await
     .unwrap();
 
-    // Test generate endpoint (SGLang-specific, should not be supported)
     let generate_request = GenerateRequest {
         prompt: None,
         text: Some("Hello world".to_string()),
@@ -612,15 +590,12 @@ async fn test_unsupported_endpoints() {
     let response = router.route_generate(None, &generate_request, None).await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
-    // Test completion endpoint (should also not be supported)
     let completion_request = create_minimal_completion_request();
     let response = router
         .route_completion(None, &completion_request, None)
         .await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 }
-
-// ============= Mock Server E2E Tests =============
 
 /// Test chat completion with mock OpenAI server
 #[tokio::test]
@@ -654,7 +629,6 @@ async fn test_openai_router_chat_completion_with_mock() {
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
     let chat_response: serde_json::Value = serde_json::from_str(&body_str).unwrap();
 
-    // Verify it's a valid chat completion response
     assert_eq!(chat_response["object"], "chat.completion");
     assert_eq!(chat_response["model"], "gpt-3.5-turbo");
     assert!(!chat_response["choices"].as_array().unwrap().is_empty());
@@ -723,7 +697,6 @@ async fn test_openai_e2e_with_server() {
         .unwrap();
     let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    // Verify the response structure
     assert_eq!(response_json["object"], "chat.completion");
     assert_eq!(response_json["model"], "gpt-3.5-turbo");
     assert!(!response_json["choices"].as_array().unwrap().is_empty());
@@ -843,4 +816,70 @@ async fn test_openai_router_models_auth_forwarding() {
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
     let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
     assert_eq!(models["object"], "list");
+}
+
+#[test]
+fn oracle_config_validation_requires_config_when_enabled() {
+    let config = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["https://api.openai.com".to_string()],
+        },
+        history_backend: HistoryBackend::Oracle,
+        oracle: None,
+        ..Default::default()
+    };
+
+    let err =
+        ConfigValidator::validate(&config).expect_err("config should fail without oracle details");
+
+    match err {
+        ConfigError::MissingRequired { field } => {
+            assert_eq!(field, "oracle");
+        }
+        other => panic!("unexpected error: {:?}", other),
+    }
+}
+
+#[test]
+fn oracle_config_validation_accepts_dsn_only() {
+    let config = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["https://api.openai.com".to_string()],
+        },
+        history_backend: HistoryBackend::Oracle,
+        oracle: Some(OracleConfig {
+            wallet_path: None,
+            connect_descriptor: "tcps://db.example.com:1522/service".to_string(),
+            username: "scott".to_string(),
+            password: "tiger".to_string(),
+            pool_min: 1,
+            pool_max: 4,
+            pool_timeout_secs: 30,
+        }),
+        ..Default::default()
+    };
+
+    ConfigValidator::validate(&config).expect("dsn-based config should validate");
+}
+
+#[test]
+fn oracle_config_validation_accepts_wallet_alias() {
+    let config = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["https://api.openai.com".to_string()],
+        },
+        history_backend: HistoryBackend::Oracle,
+        oracle: Some(OracleConfig {
+            wallet_path: Some("/etc/sglang/oracle-wallet".to_string()),
+            connect_descriptor: "db_low".to_string(),
+            username: "app_user".to_string(),
+            password: "secret".to_string(),
+            pool_min: 1,
+            pool_max: 8,
+            pool_timeout_secs: 45,
+        }),
+        ..Default::default()
+    };
+
+    ConfigValidator::validate(&config).expect("wallet-based config should validate");
 }

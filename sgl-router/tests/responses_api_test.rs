@@ -44,7 +44,6 @@ fn test_responses_request_creation() {
         repetition_penalty: 1.0,
     };
 
-    // Test GenerationRequest trait implementation
     assert!(!request.is_stream());
     assert_eq!(request.get_model(), Some("test-model"));
     let routing_text = request.extract_text_for_routing();
@@ -139,7 +138,6 @@ fn test_usage_conversion() {
         8
     );
 
-    // Test reverse conversion
     let back_to_usage = response_usage.to_usage_info();
     assert_eq!(back_to_usage.prompt_tokens, 15);
     assert_eq!(back_to_usage.completion_tokens, 25);
@@ -152,7 +150,6 @@ fn test_reasoning_param_default() {
         effort: Some(ReasoningEffort::Medium),
     };
 
-    // Test JSON serialization/deserialization preserves default
     let json = serde_json::to_string(&param).unwrap();
     let parsed: ResponseReasoningParam = serde_json::from_str(&json).unwrap();
 
@@ -197,7 +194,6 @@ fn test_json_serialization() {
         repetition_penalty: 1.2,
     };
 
-    // Test that everything can be serialized to JSON and back
     let json = serde_json::to_string(&request).expect("Serialization should work");
     let parsed: ResponsesRequest =
         serde_json::from_str(&json).expect("Deserialization should work");

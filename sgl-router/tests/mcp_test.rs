@@ -1,7 +1,6 @@
 // This test suite validates the complete MCP implementation against the
 // functionality required for SGLang responses API integration.
 //
-// Test Coverage:
 // - Core MCP server functionality
 // - Tool session management (individual and multi-tool)
 // - Tool execution and error handling
@@ -26,7 +25,6 @@ async fn create_mock_server() -> MockMCPServer {
 
 #[tokio::test]
 async fn test_mcp_server_initialization() {
-    // Test that we can create an empty configuration
     let config = McpConfig { servers: vec![] };
 
     // Should fail with no servers
@@ -329,7 +327,6 @@ async fn test_tool_info_structure() {
 
 #[tokio::test]
 async fn test_sse_connection() {
-    // Test with a non-existent command using STDIO to avoid retry delays
     // This tests that SSE configuration is properly handled even when connection fails
     let config = McpConfig {
         servers: vec![McpServerConfig {
@@ -351,8 +348,6 @@ async fn test_sse_connection() {
 
 #[tokio::test]
 async fn test_transport_types() {
-    // Test different transport configurations
-
     // HTTP/Streamable transport
     let http_config = McpServerConfig {
         name: "http_server".to_string(),
@@ -444,7 +439,6 @@ async fn test_complete_workflow() {
     // 7. Clean shutdown
     manager.shutdown().await;
 
-    // Verify all required capabilities for responses API integration
     let capabilities = [
         "MCP server initialization",
         "Tool server connection and discovery",

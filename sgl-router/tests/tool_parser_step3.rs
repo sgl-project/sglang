@@ -6,7 +6,6 @@ use sglang_router_rs::tool_parser::{ParseState, Step3Parser, StreamResult, ToolP
 async fn test_step3_complete_parsing() {
     let parser = Step3Parser::new();
 
-    // Test single tool call
     let input = r#"Let me help you.
 <｜tool_calls_begin｜>
 <｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="search">
@@ -20,7 +19,6 @@ Here are the results..."#;
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].function.name, "search");
 
-    // Verify arguments
     let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
     assert_eq!(args["query"], "rust programming");
     assert_eq!(args["limit"], 10);
@@ -127,7 +125,6 @@ fn test_step3_format_detection() {
 async fn test_step3_nested_steptml() {
     let parser = Step3Parser::new();
 
-    // Test with complex parameter values
     let input = r#"<｜tool_calls_begin｜>
 <｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="config">
 <steptml:parameter name="settings">{"nested": {"key": "value"}}</steptml:parameter>
@@ -148,7 +145,6 @@ async fn test_step3_nested_steptml() {
 async fn test_step3_python_literals() {
     let parser = Step3Parser::new();
 
-    // Test Python-style literals
     let input = r#"<｜tool_calls_begin｜>
 <｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="test">
 <steptml:parameter name="bool_true">True</steptml:parameter>
@@ -211,7 +207,6 @@ async fn test_json_parameter_values() {
 async fn test_step3_parameter_with_angle_brackets() {
     let parser = Step3Parser::new();
 
-    // Test parameter value containing < character
     let input = r#"<｜tool_calls_begin｜>
 <｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="compare">
 <steptml:parameter name="expression">a < b && b > c</steptml:parameter>
@@ -223,7 +218,6 @@ async fn test_step3_parameter_with_angle_brackets() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].function.name, "compare");
 
-    // Verify the parameter value was parsed correctly
     let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
     assert_eq!(args["expression"], "a < b && b > c");
     assert_eq!(args["context"], "comparison test");
@@ -233,7 +227,6 @@ async fn test_step3_parameter_with_angle_brackets() {
 async fn test_step3_empty_function_name() {
     let parser = Step3Parser::new();
 
-    // Test empty function name
     let input = r#"<｜tool_calls_begin｜>
 <｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="">
 <steptml:parameter name="param">value</steptml:parameter>
