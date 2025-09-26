@@ -527,13 +527,13 @@ impl GrpcRouter {
         let mut chunk_text = String::new();
 
         for &token_id in token_ids {
-            match stop_decoder
-                .process_token(token_id)
-                .unwrap_or_else(|e| {
-                    debug!("Error processing token {}: {}. Treating as Held.", token_id, e);
-                    SequenceDecoderOutput::Held
-                })
-            {
+            match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
+                debug!(
+                    "Error processing token {}: {}. Treating as Held.",
+                    token_id, e
+                );
+                SequenceDecoderOutput::Held
+            }) {
                 SequenceDecoderOutput::Text(text) => {
                     chunk_text.push_str(&text);
                 }
