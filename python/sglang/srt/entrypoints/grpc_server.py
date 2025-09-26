@@ -188,7 +188,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 grpc_context=context,
             )
 
-            # Stream outputs from the generator
             async for output in response_generator:
                 # Handle batch responses (for n>1 non-streaming)
                 if isinstance(output, list):
@@ -212,7 +211,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 request.request_id, batch_output
                             )
                 else:
-                    # Handle single responses (for n=1 or n>1 streaming)
+                    # Handle single response (for streaming or n=1 non-streaming)
                     if "error" in output:
                         yield sglang_scheduler_pb2.GenerateResponse(
                             request_id=request.request_id,
@@ -224,12 +223,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                             ),
                         )
                     elif output.get("finished", False):
-                        # Send completion
                         yield self._create_completion_response(
                             request.request_id, output
                         )
                     else:
-                        # Send chunk
                         yield self._create_chunk_response(request.request_id, output)
 
         except Exception as e:
