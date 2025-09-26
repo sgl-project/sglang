@@ -193,7 +193,7 @@ def _launch_worker_process(
         "--port",
         str(port),
         "--log-level",
-        "--warning"
+        "warning",
     ]
 
     if role == "prefill" and bootstrap_port is not None:
