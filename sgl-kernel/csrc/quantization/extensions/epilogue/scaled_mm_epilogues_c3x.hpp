@@ -13,7 +13,7 @@
    EVTCompute::Arguments struct.
 */
 
-namespace vllm::c3x {
+namespace sglang::c3x {
 
 using namespace cute;
 
@@ -410,4 +410,4 @@ struct ScaledEpilogueArray : private ScaledEpilogueBase<ElementAcc, ElementD, Ep
   }
 };
 
-};  // namespace vllm::c3x
+};  // namespace sglang::c3x

@@ -14,20 +14,20 @@ import jinja2
 
 # yapf conflicts with isort for this block
 # yapf: disable
-from vllm_cutlass_library_extension import (
+from cutlass_library_extension import (
     DataType,
     EpilogueScheduleTag,
     EpilogueScheduleType,
     MixedInputKernelScheduleType,
+    SGLANGDataType,
+    SGLANGDataTypeNames,
+    SGLANGDataTypeSGLANGScalarTypeTag,
+    SGLANGDataTypeSize,
+    SGLANGDataTypeTag,
+    SGLANGDataTypeTorchDataTypeTag,
+    SGLANGKernelScheduleTag,
     TileSchedulerTag,
     TileSchedulerType,
-    VLLMDataType,
-    VLLMDataTypeNames,
-    VLLMDataTypeSize,
-    VLLMDataTypeTag,
-    VLLMDataTypeTorchDataTypeTag,
-    VLLMDataTypeVLLMScalarTypeTag,
-    VLLMKernelScheduleTag,
 )
 
 # yapf: enable
@@ -91,7 +91,7 @@ torch::Tensor mm_dispatch(MMArgs args) {
   {% for impl_config in impl_configs %}
   {% set t = impl_config.types -%}
   {% set type_sig = gen_type_sig(t) -%}
-  if (args.b_type == {{VLLMScalarTypeTag[t.b]}}
+  if (args.b_type == {{SGLANGScalarTypeTag[t.b]}}
       && a_type == {{TorchTypeTag[t.a]}}
       && out_type == {{TorchTypeTag[t.out]}}
       && {%if t.b_group_scale != void -%}
@@ -139,7 +139,7 @@ std::vector<std::string> supported_schedules_dispatch(
     {% for impl_config in impl_configs %}
     {% set t = impl_config.types -%}
     {% set schs = impl_config.schedules -%}
-    if (args.b_type == {{VLLMScalarTypeTag[t.b]}}
+    if (args.b_type == {{SGLANGScalarTypeTag[t.b]}}
         && args.a_type == {{TorchTypeTag[t.a]}}
         && out_type == {{TorchTypeTag[t.out]}}
         && {%if t.b_group_scale != void -%}
@@ -266,7 +266,7 @@ class ScheduleConfig:
 @dataclass(frozen=True)
 class TypeConfig:
     a: DataType
-    b: Union[DataType, VLLMDataType]
+    b: Union[DataType, SGLANGDataType]
     b_group_scale: DataType
     b_group_zeropoint: DataType
     b_channel_scale: DataType
@@ -300,7 +300,7 @@ def generate_sch_sig(schedule_config: ScheduleConfig) -> str:
         + f"x{schedule_config.cluster_shape_mnk[1]}"
         + f"x{schedule_config.cluster_shape_mnk[2]}"
     )
-    kernel_schedule = VLLMKernelScheduleTag[schedule_config.kernel_schedule].split(
+    kernel_schedule = SGLANGKernelScheduleTag[schedule_config.kernel_schedule].split(
         "::"
     )[-1]
     epilogue_schedule = EpilogueScheduleTag[schedule_config.epilogue_schedule].split(
@@ -333,7 +333,7 @@ def generate_type_signature(kernel_types: TypeConfig):
     return str(
         "".join(
             [
-                VLLMDataTypeNames[getattr(kernel_types, field.name)]
+                SGLANGDataTypeNames[getattr(kernel_types, field.name)]
                 for field in fields(TypeConfig)
             ]
         )
@@ -344,7 +344,7 @@ def generate_type_option_name(kernel_types: TypeConfig):
     return ", ".join(
         [
             f"{field.name.replace('b_', 'with_')+'_type'}="
-            + VLLMDataTypeNames[getattr(kernel_types, field.name)]
+            + SGLANGDataTypeNames[getattr(kernel_types, field.name)]
             for field in fields(TypeConfig)
         ]
     )
@@ -386,10 +386,10 @@ def unsigned_type_with_bitwidth(num_bits):
 
 template_globals = {
     "void": DataType.void,
-    "DataTypeTag": VLLMDataTypeTag,
-    "VLLMScalarTypeTag": VLLMDataTypeVLLMScalarTypeTag,
-    "TorchTypeTag": VLLMDataTypeTorchDataTypeTag,
-    "KernelScheduleTag": VLLMKernelScheduleTag,
+    "DataTypeTag": SGLANGDataTypeTag,
+    "SGLANGScalarTypeTag": SGLANGDataTypeSGLANGScalarTypeTag,
+    "TorchTypeTag": SGLANGDataTypeTorchDataTypeTag,
+    "KernelScheduleTag": SGLANGKernelScheduleTag,
     "EpilogueScheduleTag": EpilogueScheduleTag,
     "TileSchedulerTag": TileSchedulerTag,
     "to_cute_constant": to_cute_constant,
@@ -432,7 +432,7 @@ def create_sources(impl_configs: list[ImplConfig], num_impl_files=16):
         prepack_types.append(
             PrepackTypeConfig(
                 a=impl_config.types.a,
-                b_num_bits=VLLMDataTypeSize[impl_config.types.b],
+                b_num_bits=SGLANGDataTypeSize[impl_config.types.b],
                 convert=convert_type,
                 accumulator=impl_config.types.accumulator,
             )
@@ -617,7 +617,7 @@ def generate():
             accumulator=DataType.f32,
             group_layout=DataType.s32,
         )
-        for b in (VLLMDataType.u4b8, VLLMDataType.u8b128)
+        for b in (SGLANGDataType.u4b8, SGLANGDataType.u8b128)
         for a in (DataType.f16, DataType.bf16)
     )
 
@@ -650,7 +650,7 @@ def generate():
     AWQ_w4a8_kernel_type_configs_no_zp = list(
         TypeConfig(
             a=DataType.e4m3,
-            b=VLLMDataType.u4b8,
+            b=SGLANGDataType.u4b8,
             b_group_scale=a,
             b_group_zeropoint=DataType.void,
             b_channel_scale=DataType.void,
@@ -751,7 +751,7 @@ def generate():
         *(
             TypeConfig(
                 a=DataType.e4m3,
-                b=VLLMDataType.u4b8,
+                b=SGLANGDataType.u4b8,
                 b_group_scale=b_group_scale,
                 b_group_zeropoint=DataType.void,
                 b_channel_scale=DataType.f32,
@@ -766,7 +766,7 @@ def generate():
         *(
             TypeConfig(
                 a=DataType.e4m3,
-                b=VLLMDataType.u4b8,
+                b=SGLANGDataType.u4b8,
                 b_group_scale=b_group_scale,
                 b_group_zeropoint=DataType.void,
                 b_channel_scale=DataType.void,
@@ -782,7 +782,7 @@ def generate():
         *(
             TypeConfig(
                 a=DataType.e4m3,
-                b=VLLMDataType.u4b8,
+                b=SGLANGDataType.u4b8,
                 b_group_scale=b_group_scale,
                 b_group_zeropoint=DataType.void,
                 b_channel_scale=DataType.f32,
@@ -797,7 +797,7 @@ def generate():
         *(
             TypeConfig(
                 a=DataType.e4m3,
-                b=VLLMDataType.u4b8,
+                b=SGLANGDataType.u4b8,
                 b_group_scale=b_group_scale,
                 b_group_zeropoint=DataType.void,
                 b_channel_scale=DataType.void,

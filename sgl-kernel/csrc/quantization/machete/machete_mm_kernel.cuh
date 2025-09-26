@@ -21,7 +21,7 @@
 #include "quantization/extensions/cute_utils.cuh"
 #include "quantization/extensions/epilogue/scaled_mm_epilogues_c3x.hpp"
 #include "quantization/extensions/torch_utils.hpp"
-#include "quantization/extensions/vllm_numeric_conversion.cuh"
+#include "quantization/extensions/numeric_conversion.cuh"
 #include "machete_collective_builder.cuh"
 #include "machete_interleaving_utils.cuh"
 #include "machete_prepacked_layout.cuh"
@@ -127,7 +127,7 @@ struct MacheteKernelTemplate {
       "Currently token and channel scales (if present) must be the same type");
 
   // Currently only supports float scales
-  using ChTokScalesEpilogue = typename vllm::c3x::ScaledEpilogue<ElementAccumulator, ElementD, TileShape>;
+  using ChTokScalesEpilogue = typename sglang::c3x::ScaledEpilogue<ElementAccumulator, ElementD, TileShape>;
   static_assert(
       (with_channel_scales || with_token_scales) ||
           (std::is_same_v<ElementSChannel, float> && std::is_same_v<ElementSToken, float>),
@@ -159,7 +159,7 @@ struct MacheteKernelTemplate {
       EpilogueSchedule,
       EVTCompute>::CollectiveOp;
 
-  using CollectiveMainloop = typename cutlass::gemm::collective::VLLMCollectiveBuilder<
+  using CollectiveMainloop = typename cutlass::gemm::collective::SGLANGCollectiveBuilder<
       cutlass::gemm::collective::MacheteKernelTag,
       ArchTag,
       OperatorClass,

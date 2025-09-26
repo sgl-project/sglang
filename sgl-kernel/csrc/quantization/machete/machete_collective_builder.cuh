@@ -1,7 +1,7 @@
 #pragma once
 
 #include "machete_mainloop.cuh"
-#include "quantization/extensions/vllm_collective_builder.cuh"
+#include "quantization/extensions/collective_builder.cuh"
 
 namespace cutlass::gemm::collective {
 using namespace cute;
@@ -20,7 +20,7 @@ template <
     class ClusterShape_MNK,
     class StageCountType,
     class KernelScheduleType>
-struct VLLMCollectiveBuilder<
+struct SGLANGCollectiveBuilder<
     MacheteKernelTag,
     arch::Sm90,
     arch::OpClassTensorOp,

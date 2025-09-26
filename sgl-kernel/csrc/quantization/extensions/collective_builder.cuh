@@ -128,7 +128,7 @@ struct CollectiveBuilder<
 };
 
 //
-// VLLMCollectiveBuilder is a wrapper around CollectiveBuilder that allows for
+// SGLANGCollectiveBuilder is a wrapper around CollectiveBuilder that allows for
 // for custom kernel tags, allowing you to build custom collectives. Without
 // touching the cutlass library headers, using `CutlassKernelTag` will mean it
 // will resort to using the standard cutlass collective builder.
@@ -154,7 +154,7 @@ template <
     class StageCountType,
     class KernelScheduleType,
     class Enable = void>
-struct VLLMCollectiveBuilder {
+struct SGLANGCollectiveBuilder {
   static_assert(sizeof(ElementA) == 0, "Could not build a collective for given parameters.");
 };
 
@@ -172,7 +172,7 @@ template <
     class ClusterShape_MNK,
     class StageCountType,
     class KernelScheduleType>
-struct VLLMCollectiveBuilder<
+struct SGLANGCollectiveBuilder<
     CutlassKernelTag,
     ArchTag,
     OpClass,

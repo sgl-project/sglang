@@ -4,8 +4,8 @@
 #include <torch/all.h>
 
 #include "machete_mm_kernel.cuh"
-#include "quantization/extensions/scalar_type.hpp"
 #include "quantization/extensions/torch_utils.hpp"
+#include "scalar_type.hpp"
 
 namespace machete {
 
@@ -13,7 +13,7 @@ struct MMArgs {
   torch::Tensor const& A;
   torch::Tensor const& B;
   torch::Tensor& D;
-  vllm::ScalarType const& b_type;
+  sglang::ScalarType const& b_type;
   std::optional<at::ScalarType> const& maybe_out_type;
   std::optional<torch::Tensor> const& maybe_group_scales;
   std::optional<torch::Tensor> const& maybe_group_zeros;
@@ -28,7 +28,7 @@ struct MMArgs {
 
 struct SupportedSchedulesArgs {
   at::ScalarType a_type;
-  vllm::ScalarType b_type;
+  sglang::ScalarType b_type;
   std::optional<at::ScalarType> maybe_group_scales_type;
   std::optional<at::ScalarType> maybe_group_zeros_type;
   std::optional<at::ScalarType> maybe_channel_scales_type;

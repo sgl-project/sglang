@@ -1,15 +1,15 @@
 #pragma once
 
 #include "machete_prepack_kernel.cuh"
-#include "quantization/extensions/scalar_type.hpp"
 #include "quantization/extensions/torch_utils.hpp"
+#include "scalar_type.hpp"
 
 namespace machete {
 
 struct PrepackBArgs {
   torch::Tensor const& B;
   at::ScalarType a_type;
-  vllm::ScalarType b_type;
+  sglang::ScalarType b_type;
   std::optional<at::ScalarType> maybe_group_scales_type;
 };
 

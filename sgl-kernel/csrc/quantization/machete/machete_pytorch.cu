@@ -1,12 +1,12 @@
 #include "machete_mm_launcher.cuh"
 #include "machete_prepack_launcher.cuh"
-#include "quantization/extensions/scalar_type.hpp"
+#include "scalar_type.hpp"
 
 // Adapted form https://github.com/vllm-project/vllm/blob/main/csrc/quantization/machete/machete_pytorch.cu
 
 namespace machete {
 
-using namespace vllm;
+using namespace sglang;
 
 std::vector<std::string> supported_schedules(
     at::ScalarType a_type,
