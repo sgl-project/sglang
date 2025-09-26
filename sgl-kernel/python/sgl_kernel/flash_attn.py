@@ -160,6 +160,19 @@ def flash_attn_with_kvcache(
         assert (
             k is None and v is None
         ), "FA4 does not support updating KV cache in-place."
+        assert (
+            rotary_cos is None
+            and rotary_sin is None
+            and rotary_interleaved is None
+            and rotary_seqlens is None
+        ), "FA4 does not support rotary embedding."
+        assert (
+            cache_batch_idx is None and cache_leftpad is None
+        ), "FA4 does not support non-consecutive batch indices or left padding."
+        assert (
+            q_descale is None and k_descale is None and v_descale is None
+        ), "FA4 does not support descale."
+
         if window_size == (-1, -1):
             window_size = (None, None)
         return flash_attn_varlen_func_v4(
