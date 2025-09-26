@@ -17,10 +17,10 @@ use crate::config::types::RetryConfig;
 use crate::core::{
     BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
 };
-use crate::grpc::{proto, SglangSchedulerClient};
+use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{ChatCompletionRequest, ResponseFormat, StringOrArray};
+use crate::protocols::spec::{ChatCompletionRequest, StringOrArray};
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
 use crate::tokenizer::traits::Tokenizer;
@@ -203,6 +203,7 @@ impl GrpcRouter {
         debug!("Selected worker: {}", worker.url());
 
         // Step 2: Get gRPC client for worker (fail fast if can't connect)
+        // TODO(CahterineSue): manage grpc connection in worker. (it should be simpler here)
         let client = match self.get_or_create_grpc_client(worker.url()).await {
             Ok(c) => c,
             Err(e) => {
@@ -241,51 +242,77 @@ impl GrpcRouter {
         debug!("Tokenized {} tokens from input", token_ids.len());
 
         // Step 5: Build tool constraints if needed
-        let structural_tag = if let Some(tools) = &body.tools {
+        let tool_call_constraint = if let Some(tools) = &body.tools {
             self.generate_tool_constraints(tools, &body.tool_choice, &body.model)
         } else {
             None
         };
 
-        // Step 6: Build SamplingParams for gRPC
-        let sampling_params = match self.build_grpc_sampling_params(body, structural_tag) {
-            Ok(params) => params,
+        // Step 6: Build the base gRPC request
+        let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+        let request = match client.build_generate_request(
+            request_id,
+            body,
+            processed_messages.text.clone(),
+            token_ids.into_iter().map(|id| id as i32).collect(),
+            processed_messages.multimodal_inputs,
+            tool_call_constraint, // Pass the full tuple (type, value)
+        ) {
+            Ok(request) => request,
             Err(e) => {
-                error!("Failed to build sampling parameters: {}", e);
+                error!("Failed to build gRPC request: {}", e);
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("Invalid sampling parameters: {}", e),
+                    format!("Invalid request parameters: {}", e),
                 )
                     .into_response();
             }
         };
 
-        // Step 7: Create GenerateRequest
-        let grpc_request = proto::GenerateRequest {
-            request_id: format!("chatcmpl-{}", Uuid::new_v4()),
-            tokenized: Some(proto::TokenizedInput {
-                original_text: processed_messages.text.clone(),
-                input_ids: token_ids.into_iter().map(|id| id as i32).collect(),
-            }),
-            mm_inputs: processed_messages.multimodal_inputs,
-            sampling_params: Some(sampling_params),
-            return_logprob: body.logprobs,
-            logprob_start_len: -1,
-            top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
-            return_hidden_states: body.return_hidden_states,
-            ..Default::default()
-        };
-
-        // Step 8: Handle streaming vs non-streaming
+        // Step 7: Handle streaming vs non-streaming
         if body.stream {
-            self.handle_streaming_chat(client, grpc_request, body).await
+            self.handle_streaming_chat(client, request, body).await
         } else {
-            self.handle_non_streaming_chat(client, grpc_request, body)
-                .await
+            self.handle_non_streaming_chat(client, request, body).await
         }
     }
 
     // ============ Helper Methods ============
+    /// Select a worker for the request
+    fn select_worker_for_request(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+    ) -> Option<Arc<dyn crate::core::Worker>> {
+        // Get workers for the specified model, filtered by connection mode
+        let workers = self.worker_registry.get_workers_filtered(
+            model_id,
+            Some(WorkerType::Regular),
+            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            false, // get all workers, we'll filter by is_available() next
+        );
+
+        // Filter by availability (health + circuit breaker)
+        let available: Vec<Arc<dyn crate::core::Worker>> = workers
+            .iter()
+            .filter(|w| w.is_available())
+            .cloned()
+            .collect();
+
+        if available.is_empty() {
+            return None;
+        }
+
+        // Get the appropriate policy for this model
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        // Select worker using the policy
+        let idx = policy.select_worker(&available, text)?;
+        Some(available[idx].clone())
+    }
 
     /// Process chat messages and apply template
     fn process_chat_messages(
@@ -512,137 +539,17 @@ impl GrpcRouter {
         Ok(())
     }
 
-    /// Build gRPC SamplingParams from OpenAI request
-    fn build_grpc_sampling_params(
-        &self,
-        request: &ChatCompletionRequest,
-        structural_tag: Option<String>,
-    ) -> Result<proto::SamplingParams, String> {
-        let stop_sequences = self.extract_stop_strings(request);
-
-        // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
-        // If neither is specified, use None to let the backend decide the default
-        #[allow(deprecated)]
-        let max_new_tokens = request
-            .max_completion_tokens
-            .or(request.max_tokens)
-            .map(|v| v as i32);
-
-        // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
-        let skip_special_tokens = if request.tools.is_some() {
-            match &request.tool_choice {
-                Some(crate::protocols::spec::ToolChoice::Value(
-                    crate::protocols::spec::ToolChoiceValue::None,
-                )) => request.skip_special_tokens,
-                Some(_) => false, // tool_choice is not "none"
-                None => false, // TODO: this assumes tool_choice defaults to "auto" when tools present
-            }
-        } else {
-            request.skip_special_tokens
-        };
-
-        #[allow(deprecated)]
-        Ok(proto::SamplingParams {
-            temperature: request.temperature.unwrap_or(1.0),
-            top_p: request.top_p.unwrap_or(1.0),
-            top_k: request.top_k.unwrap_or(-1),
-            min_p: request.min_p.unwrap_or(0.0),
-            frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
-            presence_penalty: request.presence_penalty.unwrap_or(0.0),
-            repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
-            max_new_tokens,
-            stop: stop_sequences,
-            stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
-            skip_special_tokens,
-            n: request.n.unwrap_or(1) as i32,
-            structural_tag: structural_tag.unwrap_or_default(),
-            constraint: self.build_constraint(request)?,
-            ..Default::default()
-        })
-    }
-
-    /// Extract stop strings from request
-    fn extract_stop_strings(&self, request: &ChatCompletionRequest) -> Vec<String> {
-        match &request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        }
-    }
-
-    /// Build constraint for structured generation
-    fn build_constraint(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
-        if let Some(ResponseFormat::JsonSchema { json_schema }) = &request.response_format {
-            let schema_str = serde_json::to_string(&json_schema.schema)
-                .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
-            return Ok(Some(proto::sampling_params::Constraint::JsonSchema(
-                schema_str,
-            )));
-        }
-
-        if let Some(ebnf) = &request.ebnf {
-            return Ok(Some(proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
-            )));
-        }
-
-        if let Some(regex) = &request.regex {
-            return Ok(Some(proto::sampling_params::Constraint::Regex(
-                regex.clone(),
-            )));
-        }
-
-        Ok(None)
-    }
-
     /// Generate tool constraints for structured generation
     fn generate_tool_constraints(
         &self,
         _tools: &[crate::protocols::spec::Tool],
         _tool_choice: &Option<crate::protocols::spec::ToolChoice>,
         model: &str,
-    ) -> Option<String> {
+    ) -> Option<(String, String)> {
         let _parser = self.tool_parser_registry.get_parser(model)?;
+        // TODO: Implement actual constraint generation logic
+        // For now, return None as this is placeholder implementation
         None
-    }
-
-    /// Select a worker for the request
-    fn select_worker_for_request(
-        &self,
-        model_id: Option<&str>,
-        text: Option<&str>,
-    ) -> Option<Arc<dyn crate::core::Worker>> {
-        // Get workers for the specified model, filtered by connection mode
-        let workers = self.worker_registry.get_workers_filtered(
-            model_id,
-            Some(WorkerType::Regular),
-            Some(crate::core::ConnectionMode::Grpc { port: None }),
-            false, // get all workers, we'll filter by is_available() next
-        );
-
-        // Filter by availability (health + circuit breaker)
-        let available: Vec<Arc<dyn crate::core::Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if available.is_empty() {
-            return None;
-        }
-
-        // Get the appropriate policy for this model
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
-        // Select worker using the policy
-        let idx = policy.select_worker(&available, text)?;
-        Some(available[idx].clone())
     }
 
     /// Get or create a gRPC client for the worker
@@ -650,6 +557,7 @@ impl GrpcRouter {
         &self,
         worker_url: &str,
     ) -> Result<SglangSchedulerClient, String> {
+        // TODO: move to worker
         debug!("Creating new gRPC client for worker: {}", worker_url);
         SglangSchedulerClient::connect(worker_url)
             .await
