@@ -33,8 +33,6 @@ pub use traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as Tokeniz
 
 pub use huggingface::HuggingFaceTokenizer;
 
-pub use chat_template::ChatMessage;
-
 pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
 
 /// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations

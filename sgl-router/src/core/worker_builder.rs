@@ -2,7 +2,7 @@ use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use super::worker::{
     BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
 };
-use crate::grpc::client::SglangSchedulerClient;
+use crate::grpc_client::SglangSchedulerClient;
 use std::collections::HashMap;
 
 /// Builder for creating BasicWorker instances with fluent API
@@ -100,7 +100,7 @@ impl BasicWorkerBuilder {
             atomic::{AtomicBool, AtomicUsize},
             Arc,
         };
-        use tokio::sync::Mutex;
+        use tokio::sync::{Mutex, RwLock};
 
         let metadata = WorkerMetadata {
             url: self.url.clone(),
@@ -111,6 +111,10 @@ impl BasicWorkerBuilder {
             health_config: self.health_config,
         };
 
+        let grpc_client = Arc::new(RwLock::new(
+            self.grpc_client.map(|client| Arc::new(Mutex::new(client))),
+        ));
+
         BasicWorker {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
@@ -119,7 +123,7 @@ impl BasicWorkerBuilder {
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
-            grpc_client: self.grpc_client.map(|client| Arc::new(Mutex::new(client))),
+            grpc_client,
         }
     }
 }
