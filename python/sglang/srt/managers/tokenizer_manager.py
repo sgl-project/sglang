@@ -78,6 +78,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporter
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -279,6 +280,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
         self.log_request_metadata = self.get_log_request_metadata()
+        # Initialize performance metrics loggers with proper skip names
+        self.request_metrics_exporters = self._create_request_metrics_exporters()
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
@@ -894,6 +897,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                     logger.info(msg)
 
+                # Asynchronously write performance metrics for this request using all configured `RequestMetricsExporter`s.
+                for metrics_exporter in self.request_metrics_exporters:
+                    asyncio.create_task(metrics_exporter.write_record(obj, out))
+
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     finish_reason = out["meta_info"]["finish_reason"]
@@ -1194,6 +1201,40 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     f"Invalid --log-requests-level: {self.log_requests_level=}"
                 )
         return max_length, skip_names, out_skip_names
+
+    def _create_request_metrics_exporters(self) -> List[RequestMetricsExporter]:
+        """Create and configure RequestMetricsExporter based on server args."""
+        metrics_exporters = []
+
+        # For metrics exporting, skip the same names from `self.log_request_metadata` config
+        # used in stdout output filtering to maintain consistency.
+        _, obj_skip_names, out_skip_names = self.log_request_metadata
+
+        from sglang.srt.managers.request_metrics_exporter import (
+            create_request_metrics_exporters,
+        )
+
+        metrics_exporters.extend(
+            create_request_metrics_exporters(
+                self.server_args, obj_skip_names, out_skip_names
+            )
+        )
+
+        # Import additional RequestMetricsExporter from private fork if available; skip otherwise.
+        try:
+            from sglang.private.managers.request_metrics_exporter_factory import (
+                create_request_metrics_exporter,
+            )
+
+            metrics_exporters.extend(
+                create_request_metrics_exporter(
+                    self.server_args, obj_skip_names, out_skip_names
+                )
+            )
+        except ImportError:
+            pass
+
+        return metrics_exporters
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         if obj.log_requests is not None:

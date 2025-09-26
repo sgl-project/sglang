@@ -228,6 +228,10 @@ class ServerArgs:
     enable_trace: bool = False
     oltp_traces_endpoint: str = "localhost:4317"
 
+    # RequestMetricsExporter configuration
+    export_metrics_to_file: bool = False
+    export_metrics_to_file_dir: Optional[str] = None
+
     # API related
     api_key: Optional[str] = None
     served_model_name: Optional[str] = None
@@ -509,6 +513,9 @@ class ServerArgs:
 
         # Handle deterministic inference.
         self._handle_deterministic_inference()
+
+        # Handle exporting request-level metrics.
+        self._handle_request_metrics_exporters()
 
         # Handle any other necessary validations.
         self._handle_other_validations()
@@ -1124,6 +1131,13 @@ class ServerArgs:
                 "Currently deterministic inference is only tested on dense models. Please be cautious when using it on MoE models."
             )
 
+    def _handle_request_metrics_exporters(self):
+        """Handle arguments for configuring `RequestMetricsExporter` usage."""
+        if self.export_metrics_to_file and self.export_metrics_to_file_dir is None:
+            raise ValueError(
+                "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
+            )
+
     def _handle_other_validations(self):
         pass
 
@@ -1636,6 +1650,19 @@ class ServerArgs:
             type=str,
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
+        )
+
+        # RequestMetricsExporter configuration
+        parser.add_argument(
+            "--export-metrics-to-file",
+            action="store_true",
+            help="Export performance metrics for each request to local file (e.g. for forwarding to external systems).",
+        )
+        parser.add_argument(
+            "--export-metrics-to-file-dir",
+            type=str,
+            default=ServerArgs.export_metrics_to_file_dir,
+            help="Directory path for writing performance metrics files (required when --export-metrics-to-file is enabled).",
         )
 
         # API related
