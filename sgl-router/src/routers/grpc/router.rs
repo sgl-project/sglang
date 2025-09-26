@@ -660,17 +660,27 @@ impl GrpcRouter {
                 // Token IDs are now u32, no conversion needed
                 let mut final_text = String::new();
 
-                if let Ok(outputs) = stop_decoder.process_tokens(&complete.output_ids) {
-                    for output in outputs {
-                        match output {
-                            SequenceDecoderOutput::Text(text) => final_text.push_str(&text),
-                            SequenceDecoderOutput::StoppedWithText(text) => {
-                                final_text.push_str(&text);
-                                break;
+                match stop_decoder.process_tokens(&complete.output_ids) {
+                    Ok(outputs) => {
+                        for output in outputs {
+                            match output {
+                                SequenceDecoderOutput::Text(text) => final_text.push_str(&text),
+                                SequenceDecoderOutput::StoppedWithText(text) => {
+                                    final_text.push_str(&text);
+                                    break;
+                                }
+                                SequenceDecoderOutput::Stopped => break,
+                                SequenceDecoderOutput::Held => {}
                             }
-                            SequenceDecoderOutput::Stopped => break,
-                            SequenceDecoderOutput::Held => {}
                         }
+                    }
+                    Err(e) => {
+                        error!("Failed to process tokens: {}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to process tokens: {}", e),
+                        )
+                            .into_response();
                     }
                 }
 
