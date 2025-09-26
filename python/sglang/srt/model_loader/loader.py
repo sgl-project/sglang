@@ -1966,15 +1966,10 @@ class ModelOptModelLoader(DefaultModelLoader):
                 model_config=model_config, device_config=device_config
             )
 
-        # Determine workflow based on quantize_and_serve flag
-        quantize_and_serve = getattr(model_config, "quantize_and_serve", False)
-
-        if quantize_and_serve:
-            logger.info("Quantize-and-serve mode: Will quantize and serve immediately")
-            return self._quantize_and_serve_workflow(model_config, device_config)
-        else:
-            logger.info("Standard quantization mode: Will quantize and export/save")
-            return self._standard_quantization_workflow(model_config, device_config)
+        # TODO: Quantize-and-serve mode has been disabled at the ModelConfig level
+        # All quantization now uses the standard workflow (quantize + export/save)
+        logger.info("Standard quantization mode: Will quantize and export/save")
+        return self._standard_quantization_workflow(model_config, device_config)
 
     def _standard_quantization_workflow(
         self, model_config: ModelConfig, device_config: DeviceConfig
