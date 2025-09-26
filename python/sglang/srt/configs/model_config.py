@@ -597,11 +597,11 @@ class ModelConfig:
 
         # Quantize-and-serve mode is currently disabled due to compatibility issues
         raise NotImplementedError(
-            "❌ Quantize-and-serve mode is currently disabled due to compatibility issues.\n\n"
-            "🔧 Please use the separate quantize-then-deploy workflow:\n"
-            "   1. Quantize: python examples/usage/modelopt_quantize_and_export.py quantize --model-path <model> --export-dir <output>\n"
-            "   2. Deploy: python -m sglang.launch_server --model-path <output> --quantization modelopt --disable-cuda-graph\n\n"
-            "ℹ️  This approach is more reliable and production-ready."
+            "Quantize-and-serve mode is currently disabled due to compatibility issues.\n\n"
+            "Please use the separate quantize-then-deploy workflow:\n"
+            "1. Quantize: python examples/usage/modelopt_quantize_and_export.py quantize --model-path <model> --export-dir <output>\n"
+            "2. Deploy: python -m sglang.launch_server --model-path <output> --quantization modelopt --disable-cuda-graph\n\n"
+            "This approach is more reliable and production-ready."
         )
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
