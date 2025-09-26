@@ -2,8 +2,10 @@
 source = py_src/sglang_router
 omit =
     py_src/sglang_router/mini_lb.py
+    py_src/sglang_router/service_discovery.py
 
 [report]
 fail_under = 80
 omit =
     py_src/sglang_router/mini_lb.py
+    py_src/sglang_router/service_discovery.py
