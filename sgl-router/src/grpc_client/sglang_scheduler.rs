@@ -223,7 +223,6 @@ mod tests {
 
     #[test]
     fn test_proto_types_compilation() {
-        // Test that protobuf types can be constructed
         let health_req = proto::HealthCheckRequest {
             tokenized: Some(proto::TokenizedInput {
                 original_text: "test".to_string(),
@@ -320,8 +319,6 @@ mod tests {
     }
 
     // TODO: SessionParams not in current proto - skip test
-    // #[test]
-    // fn test_session_params() { ... }
 
     #[test]
     fn test_embed_request() {
@@ -349,7 +346,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_connect_invalid_endpoint() {
-        // Test connecting to an invalid endpoint should return error
         let result = SglangSchedulerClient::connect("invalid://endpoint").await;
         assert!(result.is_err());
     }
@@ -365,7 +361,6 @@ mod tests {
         assert_eq!(tokenized.input_ids, vec![1, 15043, 1917, 2]);
     }
 
-    // Test response type construction
     #[test]
     fn test_generate_stream_chunk() {
         let chunk = proto::GenerateStreamChunk {
@@ -383,6 +378,4 @@ mod tests {
     }
 
     // TODO: ModelInfo not in current proto - skip test
-    // #[test]
-    // fn test_model_info() { ... }
 }
