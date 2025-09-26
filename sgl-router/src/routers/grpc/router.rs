@@ -1,8 +1,6 @@
 // gRPC Router Implementation
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
@@ -14,21 +12,25 @@ use axum::{
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::RetryConfig;
-use crate::core::{
-    BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
-};
+use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
 use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::metrics::RouterMetrics;
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::PolicyRegistry;
+use crate::protocols::spec::ChatMessage;
 use crate::protocols::spec::{ChatCompletionRequest, StringOrArray};
+use crate::protocols::spec::{
+    CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, ResponsesGetParams,
+    ResponsesRequest, Tool, ToolChoice,
+};
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserRegistry;
-use uuid::Uuid;
-
+use crate::server::AppContext;
 use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
+use crate::tokenizer::traits::Tokenizer;
+use crate::tokenizer::HuggingFaceTokenizer;
+use crate::tool_parser::ParserRegistry;
 use serde_json::Value;
+use uuid::Uuid;
 
 // Data structures for processing
 #[derive(Debug)]
@@ -39,39 +41,21 @@ pub struct ProcessedMessages {
 }
 
 /// gRPC router implementation for SGLang
-#[allow(dead_code)] // Fields will be used once implementation is complete
+#[allow(dead_code)]
 pub struct GrpcRouter {
-    /// Centralized worker registry
     worker_registry: Arc<WorkerRegistry>,
-    /// Centralized policy registry
     policy_registry: Arc<PolicyRegistry>,
-    /// Load balancing policy
-    policy: Arc<dyn LoadBalancingPolicy>,
-    /// Tokenizer for handling text encoding/decoding
     tokenizer: Arc<dyn Tokenizer>,
-    /// Reasoning parser factory for structured reasoning outputs
     reasoning_parser_factory: ParserFactory,
-    /// Tool parser registry for function/tool calls
     tool_parser_registry: &'static ParserRegistry,
-    /// Configuration
-    timeout_secs: u64,
-    interval_secs: u64,
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
-    circuit_breaker_config: CircuitBreakerConfig,
 }
 
 impl GrpcRouter {
     /// Create a new gRPC router
-    pub async fn new(
-        worker_urls: Vec<String>,
-        policy: Arc<dyn LoadBalancingPolicy>,
-        ctx: &Arc<crate::server::AppContext>,
-    ) -> Result<Self, String> {
-        // Update metrics
-        RouterMetrics::set_active_workers(worker_urls.len());
-
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         // Extract necessary components from context
         let tokenizer = ctx
             .tokenizer
@@ -87,93 +71,28 @@ impl GrpcRouter {
             .tool_parser_registry
             .ok_or_else(|| "gRPC router requires tool parser registry".to_string())?;
 
-        // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
-        let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
-        let core_cb_config = CircuitBreakerConfig {
-            failure_threshold: circuit_breaker_config.failure_threshold,
-            success_threshold: circuit_breaker_config.success_threshold,
-            timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
-            window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
-        };
-
-        // Create gRPC clients for each worker
-        let mut grpc_clients = HashMap::new();
-        for url in &worker_urls {
-            match SglangSchedulerClient::connect(url).await {
-                Ok(client) => {
-                    grpc_clients.insert(url.clone(), client);
-                    info!("Connected to gRPC worker at {}", url);
-                }
-                Err(e) => {
-                    warn!("Failed to connect to gRPC worker at {}: {}", url, e);
-                    // Continue with other workers
-                }
-            }
-        }
-
-        if grpc_clients.is_empty() {
-            return Err("Failed to connect to any gRPC workers".to_string());
-        }
-
-        // Get registries from context
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Create Worker trait objects with gRPC connection mode and register them
-        for url in &worker_urls {
-            if let Some(client) = grpc_clients.remove(url) {
-                let worker = BasicWorkerBuilder::new(url.clone())
-                    .worker_type(WorkerType::Regular)
-                    .connection_mode(crate::core::ConnectionMode::Grpc { port: None })
-                    .circuit_breaker_config(core_cb_config.clone())
-                    .health_config(HealthConfig {
-                        timeout_secs: ctx.router_config.health_check.timeout_secs,
-                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                        endpoint: ctx.router_config.health_check.endpoint.clone(),
-                        failure_threshold: ctx.router_config.health_check.failure_threshold,
-                        success_threshold: ctx.router_config.health_check.success_threshold,
-                    })
-                    .grpc_client(client)
-                    .build();
-
-                // Register worker in the centralized registry
-                worker_registry.register(Arc::new(worker));
-            } else {
-                warn!("No gRPC client for worker {}, skipping", url);
-            }
-        }
-
-        // Get only gRPC workers from registry for policy initialization
         let workers = worker_registry.get_workers_filtered(
-            None, // any model
+            None,
             Some(WorkerType::Regular),
-            Some(crate::core::ConnectionMode::Grpc { port: None }),
-            false, // include unhealthy workers during initialization
+            Some(ConnectionMode::Grpc { port: None }),
+            false,
         );
 
-        // Initialize policy with workers if needed
-        if let Some(cache_aware) = policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.init_workers(&workers);
-        }
-
-        // No need for local health checkers - WorkerRegistry handles health checking
+        RouterMetrics::set_active_workers(workers.len());
+        info!("gRPC router found {} workers in registry", workers.len());
 
         Ok(GrpcRouter {
             worker_registry,
             policy_registry,
-            policy,
             tokenizer,
             reasoning_parser_factory,
             tool_parser_registry,
-            timeout_secs: ctx.router_config.worker_startup_timeout_secs,
-            interval_secs: ctx.router_config.worker_startup_check_interval_secs,
             dp_aware: ctx.router_config.dp_aware,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
-            circuit_breaker_config: core_cb_config,
         })
     }
 
@@ -202,12 +121,23 @@ impl GrpcRouter {
 
         debug!("Selected worker: {}", worker.url());
 
-        // Step 2: Get gRPC client for worker (fail fast if can't connect)
-        // TODO(CahterineSue): manage grpc connection in worker. (it should be simpler here)
-        let client = match self.get_or_create_grpc_client(worker.url()).await {
-            Ok(c) => c,
+        // Step 2: Get gRPC client from worker
+        let client = match worker.get_grpc_client().await {
+            Ok(Some(client_arc)) => {
+                // Clone the client from inside the Arc<Mutex<>>
+                let client = client_arc.lock().await.clone();
+                client
+            }
+            Ok(None) => {
+                error!("Selected worker is not a gRPC worker");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Selected worker is not configured for gRPC",
+                )
+                    .into_response();
+            }
             Err(e) => {
-                error!("Failed to get gRPC client: {}", e);
+                error!("Failed to get gRPC client from worker: {}", e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to get gRPC client: {}", e),
@@ -283,17 +213,17 @@ impl GrpcRouter {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
-    ) -> Option<Arc<dyn crate::core::Worker>> {
+    ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
             model_id,
             Some(WorkerType::Regular),
-            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            Some(ConnectionMode::Grpc { port: None }),
             false, // get all workers, we'll filter by is_available() next
         );
 
         // Filter by availability (health + circuit breaker)
-        let available: Vec<Arc<dyn crate::core::Worker>> = workers
+        let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
             .cloned()
@@ -320,10 +250,10 @@ impl GrpcRouter {
         request: &ChatCompletionRequest,
     ) -> Result<ProcessedMessages, String> {
         // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
-        let formatted_text = if let Some(hf_tokenizer) =
-            self.tokenizer
-                .as_any()
-                .downcast_ref::<crate::tokenizer::HuggingFaceTokenizer>()
+        let formatted_text = if let Some(hf_tokenizer) = self
+            .tokenizer
+            .as_any()
+            .downcast_ref::<HuggingFaceTokenizer>()
         {
             // Get content format and transform messages accordingly
             let content_format = hf_tokenizer.chat_template_content_format();
@@ -426,9 +356,9 @@ impl GrpcRouter {
 
     /// Process messages based on content format for ANY message type
     fn process_content_format(
-        messages: &[crate::protocols::spec::ChatMessage],
-        content_format: crate::tokenizer::chat_template::ChatTemplateContentFormat,
-    ) -> Result<Vec<serde_json::Value>, String> {
+        messages: &[ChatMessage],
+        content_format: ChatTemplateContentFormat,
+    ) -> Result<Vec<Value>, String> {
         messages
             .iter()
             .map(|message| {
@@ -498,7 +428,7 @@ impl GrpcRouter {
 
     /// Process tool call arguments in messages
     /// Per Transformers docs, tool call arguments in assistant messages should be dicts
-    fn process_tool_call_arguments(messages: &mut [serde_json::Value]) -> Result<(), String> {
+    fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
         for msg in messages {
             // Early return if not assistant message
             let role = msg.get("role").and_then(|v| v.as_str());
@@ -542,26 +472,14 @@ impl GrpcRouter {
     /// Generate tool constraints for structured generation
     fn generate_tool_constraints(
         &self,
-        _tools: &[crate::protocols::spec::Tool],
-        _tool_choice: &Option<crate::protocols::spec::ToolChoice>,
+        _tools: &[Tool],
+        _tool_choice: &Option<ToolChoice>,
         model: &str,
     ) -> Option<(String, String)> {
         let _parser = self.tool_parser_registry.get_parser(model)?;
         // TODO: Implement actual constraint generation logic
         // For now, return None as this is placeholder implementation
         None
-    }
-
-    /// Get or create a gRPC client for the worker
-    async fn get_or_create_grpc_client(
-        &self,
-        worker_url: &str,
-    ) -> Result<SglangSchedulerClient, String> {
-        // TODO: move to worker
-        debug!("Creating new gRPC client for worker: {}", worker_url);
-        SglangSchedulerClient::connect(worker_url)
-            .await
-            .map_err(|e| format!("Failed to connect to gRPC server: {}", e))
     }
 
     /// Placeholder for streaming handler (to be implemented in Phase 2)
@@ -594,8 +512,6 @@ impl std::fmt::Debug for GrpcRouter {
         let stats = self.worker_registry.stats();
         f.debug_struct("GrpcRouter")
             .field("workers_count", &stats.total_workers)
-            .field("timeout_secs", &self.timeout_secs)
-            .field("interval_secs", &self.interval_secs)
             .field("dp_aware", &self.dp_aware)
             .finish()
     }
@@ -631,7 +547,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::GenerateRequest,
+        _body: &GenerateRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -640,7 +556,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &crate::protocols::spec::ChatCompletionRequest,
+        body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await
@@ -649,7 +565,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_completion(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::CompletionRequest,
+        _body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -658,7 +574,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_responses(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::ResponsesRequest,
+        _body: &ResponsesRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -668,7 +584,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _response_id: &str,
-        _params: &crate::protocols::spec::ResponsesGetParams,
+        _params: &ResponsesGetParams,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -680,7 +596,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::EmbeddingRequest,
+        _body: &EmbeddingRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -689,7 +605,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_rerank(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::RerankRequest,
+        _body: &RerankRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
