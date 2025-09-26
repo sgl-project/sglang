@@ -63,19 +63,10 @@ class OpenAIServingBase(ABC):
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
         except ValueError as e:
-            # Check if this is a tool schema conflict error
-            if "Tool definition" in str(e) and "multiple schemas" in str(e):
-                return self.create_error_response(
-                    message=str(e),
-                    err_type="BadRequest",
-                    status_code=400,
-                )
-            # For other ValueErrors, treat as internal server error
-            logger.exception(f"Error in request: {e}")
             return self.create_error_response(
-                message=f"Internal server error: {str(e)}",
-                err_type="InternalServerError",
-                status_code=500,
+                message=str(e),
+                err_type="BadRequest",
+                status_code=400,
             )
         except Exception as e:
             logger.exception(f"Error in request: {e}")
