@@ -3222,6 +3222,20 @@ def get_extend_input_len_swa_limit(
     return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
 
 
+def determine_attention_backends(server_args):
+    prefill_attention_backend_str = (
+        server_args.prefill_attention_backend
+        if server_args.prefill_attention_backend
+        else server_args.attention_backend
+    )
+    decode_attention_backend_str = (
+        server_args.decode_attention_backend
+        if server_args.decode_attention_backend
+        else server_args.attention_backend
+    )
+    return prefill_attention_backend_str, decode_attention_backend_str
+
+
 class CachedKernel:
     """
     Wrapper that allows kernel[grid](...) syntax with caching based on a key function.

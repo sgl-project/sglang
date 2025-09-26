@@ -122,6 +122,7 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
+    determine_attention_backends,
     dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
@@ -1710,15 +1711,8 @@ class ModelRunner:
 
     def _get_attention_backend(self):
         """Init attention kernel backend."""
-        self.decode_attention_backend_str = (
-            self.server_args.decode_attention_backend
-            if self.server_args.decode_attention_backend
-            else self.server_args.attention_backend
-        )
-        self.prefill_attention_backend_str = (
-            self.server_args.prefill_attention_backend
-            if self.server_args.prefill_attention_backend
-            else self.server_args.attention_backend
+        self.prefill_attention_backend_str, self.decode_attention_backend_str = (
+            determine_attention_backends(self.server_args)
         )
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (
