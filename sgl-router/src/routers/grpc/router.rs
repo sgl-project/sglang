@@ -1,8 +1,6 @@
 // gRPC Router Implementation
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
@@ -14,21 +12,25 @@ use axum::{
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::RetryConfig;
-use crate::core::{
-    BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
-};
-use crate::grpc::{proto, SglangSchedulerClient};
+use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
+use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::metrics::RouterMetrics;
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{ChatCompletionRequest, ResponseFormat, StringOrArray};
+use crate::policies::PolicyRegistry;
+use crate::protocols::spec::ChatMessage;
+use crate::protocols::spec::{ChatCompletionRequest, StringOrArray};
+use crate::protocols::spec::{
+    CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, ResponsesGetParams,
+    ResponsesRequest, Tool, ToolChoice,
+};
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserRegistry;
-use uuid::Uuid;
-
+use crate::server::AppContext;
 use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
+use crate::tokenizer::traits::Tokenizer;
+use crate::tokenizer::HuggingFaceTokenizer;
+use crate::tool_parser::ParserRegistry;
 use serde_json::Value;
+use uuid::Uuid;
 
 // Data structures for processing
 #[derive(Debug)]
@@ -39,39 +41,21 @@ pub struct ProcessedMessages {
 }
 
 /// gRPC router implementation for SGLang
-#[allow(dead_code)] // Fields will be used once implementation is complete
+#[allow(dead_code)]
 pub struct GrpcRouter {
-    /// Centralized worker registry
     worker_registry: Arc<WorkerRegistry>,
-    /// Centralized policy registry
     policy_registry: Arc<PolicyRegistry>,
-    /// Load balancing policy
-    policy: Arc<dyn LoadBalancingPolicy>,
-    /// Tokenizer for handling text encoding/decoding
     tokenizer: Arc<dyn Tokenizer>,
-    /// Reasoning parser factory for structured reasoning outputs
     reasoning_parser_factory: ParserFactory,
-    /// Tool parser registry for function/tool calls
     tool_parser_registry: &'static ParserRegistry,
-    /// Configuration
-    timeout_secs: u64,
-    interval_secs: u64,
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
-    circuit_breaker_config: CircuitBreakerConfig,
 }
 
 impl GrpcRouter {
     /// Create a new gRPC router
-    pub async fn new(
-        worker_urls: Vec<String>,
-        policy: Arc<dyn LoadBalancingPolicy>,
-        ctx: &Arc<crate::server::AppContext>,
-    ) -> Result<Self, String> {
-        // Update metrics
-        RouterMetrics::set_active_workers(worker_urls.len());
-
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         // Extract necessary components from context
         let tokenizer = ctx
             .tokenizer
@@ -87,93 +71,28 @@ impl GrpcRouter {
             .tool_parser_registry
             .ok_or_else(|| "gRPC router requires tool parser registry".to_string())?;
 
-        // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
-        let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
-        let core_cb_config = CircuitBreakerConfig {
-            failure_threshold: circuit_breaker_config.failure_threshold,
-            success_threshold: circuit_breaker_config.success_threshold,
-            timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
-            window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
-        };
-
-        // Create gRPC clients for each worker
-        let mut grpc_clients = HashMap::new();
-        for url in &worker_urls {
-            match SglangSchedulerClient::connect(url).await {
-                Ok(client) => {
-                    grpc_clients.insert(url.clone(), client);
-                    info!("Connected to gRPC worker at {}", url);
-                }
-                Err(e) => {
-                    warn!("Failed to connect to gRPC worker at {}: {}", url, e);
-                    // Continue with other workers
-                }
-            }
-        }
-
-        if grpc_clients.is_empty() {
-            return Err("Failed to connect to any gRPC workers".to_string());
-        }
-
-        // Get registries from context
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Create Worker trait objects with gRPC connection mode and register them
-        for url in &worker_urls {
-            if let Some(client) = grpc_clients.remove(url) {
-                let worker = BasicWorkerBuilder::new(url.clone())
-                    .worker_type(WorkerType::Regular)
-                    .connection_mode(crate::core::ConnectionMode::Grpc { port: None })
-                    .circuit_breaker_config(core_cb_config.clone())
-                    .health_config(HealthConfig {
-                        timeout_secs: ctx.router_config.health_check.timeout_secs,
-                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                        endpoint: ctx.router_config.health_check.endpoint.clone(),
-                        failure_threshold: ctx.router_config.health_check.failure_threshold,
-                        success_threshold: ctx.router_config.health_check.success_threshold,
-                    })
-                    .grpc_client(client)
-                    .build();
-
-                // Register worker in the centralized registry
-                worker_registry.register(Arc::new(worker));
-            } else {
-                warn!("No gRPC client for worker {}, skipping", url);
-            }
-        }
-
-        // Get only gRPC workers from registry for policy initialization
         let workers = worker_registry.get_workers_filtered(
-            None, // any model
+            None,
             Some(WorkerType::Regular),
-            Some(crate::core::ConnectionMode::Grpc { port: None }),
-            false, // include unhealthy workers during initialization
+            Some(ConnectionMode::Grpc { port: None }),
+            false,
         );
 
-        // Initialize policy with workers if needed
-        if let Some(cache_aware) = policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.init_workers(&workers);
-        }
-
-        // No need for local health checkers - WorkerRegistry handles health checking
+        RouterMetrics::set_active_workers(workers.len());
+        info!("gRPC router found {} workers in registry", workers.len());
 
         Ok(GrpcRouter {
             worker_registry,
             policy_registry,
-            policy,
             tokenizer,
             reasoning_parser_factory,
             tool_parser_registry,
-            timeout_secs: ctx.router_config.worker_startup_timeout_secs,
-            interval_secs: ctx.router_config.worker_startup_check_interval_secs,
             dp_aware: ctx.router_config.dp_aware,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
-            circuit_breaker_config: core_cb_config,
         })
     }
 
@@ -202,11 +121,23 @@ impl GrpcRouter {
 
         debug!("Selected worker: {}", worker.url());
 
-        // Step 2: Get gRPC client for worker (fail fast if can't connect)
-        let client = match self.get_or_create_grpc_client(worker.url()).await {
-            Ok(c) => c,
+        // Step 2: Get gRPC client from worker
+        let client = match worker.get_grpc_client().await {
+            Ok(Some(client_arc)) => {
+                // Clone the client from inside the Arc<Mutex<>>
+                let client = client_arc.lock().await.clone();
+                client
+            }
+            Ok(None) => {
+                error!("Selected worker is not a gRPC worker");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Selected worker is not configured for gRPC",
+                )
+                    .into_response();
+            }
             Err(e) => {
-                error!("Failed to get gRPC client: {}", e);
+                error!("Failed to get gRPC client from worker: {}", e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to get gRPC client: {}", e),
@@ -247,41 +178,32 @@ impl GrpcRouter {
             None
         };
 
-        // Step 6: Build SamplingParams for gRPC
-        let sampling_params = match self.build_grpc_sampling_params(body, tool_call_constraint) {
-            Ok(params) => params,
+        // Step 6: Build the base gRPC request
+        let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+        let request = match client.build_generate_request(
+            request_id,
+            body,
+            processed_messages.text.clone(),
+            token_ids.into_iter().map(|id| id as i32).collect(),
+            processed_messages.multimodal_inputs,
+            tool_call_constraint, // Pass the full tuple (type, value)
+        ) {
+            Ok(request) => request,
             Err(e) => {
-                error!("Failed to build sampling parameters: {}", e);
+                error!("Failed to build gRPC request: {}", e);
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("Invalid sampling parameters: {}", e),
+                    format!("Invalid request parameters: {}", e),
                 )
                     .into_response();
             }
         };
 
-        // Step 7: Create GenerateRequest
-        let grpc_request = proto::GenerateRequest {
-            request_id: format!("chatcmpl-{}", Uuid::new_v4()),
-            tokenized: Some(proto::TokenizedInput {
-                original_text: processed_messages.text.clone(),
-                input_ids: token_ids.into_iter().map(|id| id as i32).collect(),
-            }),
-            mm_inputs: processed_messages.multimodal_inputs,
-            sampling_params: Some(sampling_params),
-            return_logprob: body.logprobs,
-            logprob_start_len: -1,
-            top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
-            return_hidden_states: body.return_hidden_states,
-            ..Default::default()
-        };
-
-        // Step 8: Handle streaming vs non-streaming
+        // Step 7: Handle streaming vs non-streaming
         if body.stream {
-            self.handle_streaming_chat(client, grpc_request, body).await
+            self.handle_streaming_chat(client, request, body).await
         } else {
-            self.handle_non_streaming_chat(client, grpc_request, body)
-                .await
+            self.handle_non_streaming_chat(client, request, body).await
         }
     }
 
@@ -291,17 +213,17 @@ impl GrpcRouter {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
-    ) -> Option<Arc<dyn crate::core::Worker>> {
+    ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
             model_id,
             Some(WorkerType::Regular),
-            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            Some(ConnectionMode::Grpc { port: None }),
             false, // get all workers, we'll filter by is_available() next
         );
 
         // Filter by availability (health + circuit breaker)
-        let available: Vec<Arc<dyn crate::core::Worker>> = workers
+        let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
             .cloned()
@@ -328,10 +250,10 @@ impl GrpcRouter {
         request: &ChatCompletionRequest,
     ) -> Result<ProcessedMessages, String> {
         // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
-        let formatted_text = if let Some(hf_tokenizer) =
-            self.tokenizer
-                .as_any()
-                .downcast_ref::<crate::tokenizer::HuggingFaceTokenizer>()
+        let formatted_text = if let Some(hf_tokenizer) = self
+            .tokenizer
+            .as_any()
+            .downcast_ref::<HuggingFaceTokenizer>()
         {
             // Get content format and transform messages accordingly
             let content_format = hf_tokenizer.chat_template_content_format();
@@ -434,9 +356,9 @@ impl GrpcRouter {
 
     /// Process messages based on content format for ANY message type
     fn process_content_format(
-        messages: &[crate::protocols::spec::ChatMessage],
-        content_format: crate::tokenizer::chat_template::ChatTemplateContentFormat,
-    ) -> Result<Vec<serde_json::Value>, String> {
+        messages: &[ChatMessage],
+        content_format: ChatTemplateContentFormat,
+    ) -> Result<Vec<Value>, String> {
         messages
             .iter()
             .map(|message| {
@@ -506,7 +428,7 @@ impl GrpcRouter {
 
     /// Process tool call arguments in messages
     /// Per Transformers docs, tool call arguments in assistant messages should be dicts
-    fn process_tool_call_arguments(messages: &mut [serde_json::Value]) -> Result<(), String> {
+    fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
         for msg in messages {
             // Early return if not assistant message
             let role = msg.get("role").and_then(|v| v.as_str());
@@ -547,134 +469,17 @@ impl GrpcRouter {
         Ok(())
     }
 
-    /// Build gRPC SamplingParams from OpenAI request
-    fn build_grpc_sampling_params(
-        &self,
-        request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
-    ) -> Result<proto::SamplingParams, String> {
-        let stop_sequences = self.extract_stop_strings(request);
-
-        // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
-        // If neither is specified, use None to let the backend decide the default
-        #[allow(deprecated)]
-        let max_new_tokens = request
-            .max_completion_tokens
-            .or(request.max_tokens)
-            .map(|v| v as i32);
-
-        // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
-        let skip_special_tokens = if request.tools.is_some() {
-            match &request.tool_choice {
-                Some(crate::protocols::spec::ToolChoice::Value(
-                    crate::protocols::spec::ToolChoiceValue::None,
-                )) => request.skip_special_tokens,
-                Some(_) => false, // tool_choice is not "none"
-                None => false, // TODO: this assumes tool_choice defaults to "auto" when tools present
-            }
-        } else {
-            request.skip_special_tokens
-        };
-
-        #[allow(deprecated)]
-        Ok(proto::SamplingParams {
-            temperature: request.temperature.unwrap_or(1.0),
-            top_p: request.top_p.unwrap_or(1.0),
-            top_k: request.top_k.unwrap_or(-1),
-            min_p: request.min_p.unwrap_or(0.0),
-            frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
-            presence_penalty: request.presence_penalty.unwrap_or(0.0),
-            repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
-            max_new_tokens,
-            stop: stop_sequences,
-            stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
-            skip_special_tokens,
-            n: request.n.unwrap_or(1) as i32,
-            constraint: self.build_constraint(request, tool_call_constraint)?,
-            ..Default::default()
-        })
-    }
-
-    /// Extract stop strings from request
-    fn extract_stop_strings(&self, request: &ChatCompletionRequest) -> Vec<String> {
-        match &request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        }
-    }
-
-    /// Build constraint for structured generation
-    fn build_constraint(
-        &self,
-        request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
-    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
-        let mut constraints = Vec::new();
-
-        if let Some(ResponseFormat::JsonSchema { json_schema }) = &request.response_format {
-            let schema_str = serde_json::to_string(&json_schema.schema)
-                .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
-        }
-
-        if let Some(ebnf) = &request.ebnf {
-            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
-            ));
-        }
-
-        if let Some(regex) = &request.regex {
-            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
-        }
-
-        // Handle tool call constraint
-        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
-            if !constraints.is_empty() {
-                return Err("Constrained decoding is not compatible with tool calls.".to_string());
-            }
-            let tool_constraint = match constraint_type.as_str() {
-                "structural_tag" => {
-                    proto::sampling_params::Constraint::StructuralTag(constraint_value)
-                }
-                "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
-                "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
-                "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
-                _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
-            };
-            constraints.push(tool_constraint);
-        }
-
-        match constraints.len() {
-            0 => Ok(None),
-            1 => Ok(constraints.pop()),
-            _ => Err("Multiple constraints are not allowed.".to_string()),
-        }
-    }
-
     /// Generate tool constraints for structured generation
     fn generate_tool_constraints(
         &self,
-        _tools: &[crate::protocols::spec::Tool],
-        _tool_choice: &Option<crate::protocols::spec::ToolChoice>,
+        _tools: &[Tool],
+        _tool_choice: &Option<ToolChoice>,
         model: &str,
     ) -> Option<(String, String)> {
         let _parser = self.tool_parser_registry.get_parser(model)?;
         // TODO: Implement actual constraint generation logic
         // For now, return None as this is placeholder implementation
         None
-    }
-
-    /// Get or create a gRPC client for the worker
-    async fn get_or_create_grpc_client(
-        &self,
-        worker_url: &str,
-    ) -> Result<SglangSchedulerClient, String> {
-        // TODO: move to worker
-        debug!("Creating new gRPC client for worker: {}", worker_url);
-        SglangSchedulerClient::connect(worker_url)
-            .await
-            .map_err(|e| format!("Failed to connect to gRPC server: {}", e))
     }
 
     /// Placeholder for streaming handler (to be implemented in Phase 2)
@@ -707,8 +512,6 @@ impl std::fmt::Debug for GrpcRouter {
         let stats = self.worker_registry.stats();
         f.debug_struct("GrpcRouter")
             .field("workers_count", &stats.total_workers)
-            .field("timeout_secs", &self.timeout_secs)
-            .field("interval_secs", &self.interval_secs)
             .field("dp_aware", &self.dp_aware)
             .finish()
     }
@@ -744,7 +547,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::GenerateRequest,
+        _body: &GenerateRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -753,7 +556,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &crate::protocols::spec::ChatCompletionRequest,
+        body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await
@@ -762,7 +565,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_completion(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::CompletionRequest,
+        _body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -771,7 +574,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_responses(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::ResponsesRequest,
+        _body: &ResponsesRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -781,7 +584,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _response_id: &str,
-        _params: &crate::protocols::spec::ResponsesGetParams,
+        _params: &ResponsesGetParams,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -793,7 +596,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::EmbeddingRequest,
+        _body: &EmbeddingRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -802,7 +605,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_rerank(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::RerankRequest,
+        _body: &RerankRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
