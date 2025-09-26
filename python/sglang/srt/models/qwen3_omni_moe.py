@@ -30,10 +30,6 @@ from sglang.srt.configs.qwen3_omni import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_rank,
-)
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -45,6 +41,7 @@ from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.models.qwen3_vl_moe import (
     Qwen3MoeLLMModel,
     Qwen3VLMoeForConditionalGeneration,
+    load_fused_expert_weights,
 )
 from sglang.srt.utils import add_prefix, logger
 
@@ -491,49 +488,6 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         self.pad_input_ids = self.thinker.pad_input_ids
         self.forward = self.thinker.forward
 
-    def load_fused_expert_weights(
-        self,
-        name: str,
-        params_dict: dict,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        num_experts: int,
-    ):
-        param = params_dict[name]
-        # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-        weight_loader = param.weight_loader
-        ep_rank = get_tensor_model_parallel_rank()
-        ep_size = get_moe_expert_parallel_world_size()
-        if ep_size == 1:
-            for expert_id in range(num_experts):
-                curr_expert_weight = loaded_weight[expert_id]
-                weight_loader(
-                    param,
-                    curr_expert_weight,
-                    name,
-                    shard_id,
-                    expert_id,
-                )
-        else:
-            experts_per_ep = num_experts // ep_size
-            start_expert = ep_rank * experts_per_ep
-            end_expert = (
-                (ep_rank + 1) * experts_per_ep
-                if ep_rank != ep_size - 1
-                else num_experts
-            )
-
-            for idx, expert_id in enumerate(range(start_expert, end_expert)):
-                curr_expert_weight = loaded_weight[expert_id]
-                weight_loader(
-                    param,
-                    curr_expert_weight,
-                    name,
-                    shard_id,
-                    idx,
-                )
-        return True
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -638,14 +592,14 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                         loaded_weight = loaded_weight.transpose(-1, -2)  # no bias
                         if "experts.gate_up_proj" in name:
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
-                            self.load_fused_expert_weights(
+                            load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight[0],
                                 "w1",
                                 num_experts,
                             )
-                            self.load_fused_expert_weights(
+                            load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight[1],
@@ -653,7 +607,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                                 num_experts,
                             )
                         else:
-                            self.load_fused_expert_weights(
+                            load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight,
@@ -705,15 +659,6 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                         logger.warning(
                             f"Loaded weight with {name=} not found in params_dict"
                         )
-
-        # TODO mimic deepseek
-        # Lazy initialization of expert weights cache to avoid slowing down load_weights
-        # if not hasattr(self, "routed_experts_weights_of_layer"):
-        #     self.routed_experts_weights_of_layer = {
-        #         layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-        #         for layer_id in range(self.start_layer, self.end_layer)
-        #         if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
-        #     }
 
 
 EntryClass = Qwen3OmniMoeForConditionalGeneration

@@ -125,6 +125,47 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         return hidden_states, aux_hidden_states
 
 
+def load_fused_expert_weights(
+    name: str,
+    params_dict: dict,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    num_experts: int,
+):
+    param = params_dict[name]
+    # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+    weight_loader = param.weight_loader
+    ep_rank = get_tensor_model_parallel_rank()
+    ep_size = get_moe_expert_parallel_world_size()
+    if ep_size == 1:
+        for expert_id in range(num_experts):
+            curr_expert_weight = loaded_weight[expert_id]
+            weight_loader(
+                param,
+                curr_expert_weight,
+                name,
+                shard_id,
+                expert_id,
+            )
+    else:
+        experts_per_ep = num_experts // ep_size
+        start_expert = ep_rank * experts_per_ep
+        end_expert = (
+            (ep_rank + 1) * experts_per_ep if ep_rank != ep_size - 1 else num_experts
+        )
+
+        for idx, expert_id in enumerate(range(start_expert, end_expert)):
+            curr_expert_weight = loaded_weight[expert_id]
+            weight_loader(
+                param,
+                curr_expert_weight,
+                name,
+                shard_id,
+                idx,
+            )
+    return True
+
+
 class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(
         self,
@@ -134,49 +175,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         language_model_cls=Qwen3MoeLLMModel,
     ):
         super().__init__(config, quant_config, prefix, language_model_cls)
-
-    def load_fused_expert_weights(
-        self,
-        name: str,
-        params_dict: dict,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        num_experts: int,
-    ):
-        param = params_dict[name]
-        # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-        weight_loader = param.weight_loader
-        ep_rank = get_tensor_model_parallel_rank()
-        ep_size = get_moe_expert_parallel_world_size()
-        if ep_size == 1:
-            for expert_id in range(num_experts):
-                curr_expert_weight = loaded_weight[expert_id]
-                weight_loader(
-                    param,
-                    curr_expert_weight,
-                    name,
-                    shard_id,
-                    expert_id,
-                )
-        else:
-            experts_per_ep = num_experts // ep_size
-            start_expert = ep_rank * experts_per_ep
-            end_expert = (
-                (ep_rank + 1) * experts_per_ep
-                if ep_rank != ep_size - 1
-                else num_experts
-            )
-
-            for idx, expert_id in enumerate(range(start_expert, end_expert)):
-                curr_expert_weight = loaded_weight[expert_id]
-                weight_loader(
-                    param,
-                    curr_expert_weight,
-                    name,
-                    shard_id,
-                    idx,
-                )
-        return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -276,14 +274,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         loaded_weight = loaded_weight.transpose(-1, -2)  # no bias
                         if "experts.gate_up_proj" in name:
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
-                            self.load_fused_expert_weights(
+                            load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight[0],
                                 "w1",
                                 num_experts,
                             )
-                            self.load_fused_expert_weights(
+                            load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight[1],
@@ -291,7 +289,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 num_experts,
                             )
                         else:
-                            self.load_fused_expert_weights(
+                            load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight,
