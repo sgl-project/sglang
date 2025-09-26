@@ -1,8 +1,8 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use sglang_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig,
-    RoutingMode,
+    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig,
+    RouterConfig, RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
@@ -314,9 +314,46 @@ struct CliArgs {
     #[arg(long)]
     tokenizer_path: Option<String>,
 
-    /// History backend configuration (memory or none)
-    #[arg(long, default_value = "memory", value_parser = ["memory", "none"])]
+    /// History backend configuration (memory, none, or oracle)
+    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle"])]
     history_backend: String,
+
+    /// Directory containing the Oracle ATP wallet/config files (optional)
+    #[arg(long, env = "ATP_WALLET_PATH")]
+    oracle_wallet_path: Option<String>,
+
+    /// Wallet TNS alias to use (e.g. `<db_name>_low`)
+    #[arg(long, env = "ATP_TNS_ALIAS")]
+    oracle_tns_alias: Option<String>,
+
+    /// Oracle connection descriptor / DSN (e.g. `tcps://host:port/service_name`)
+    #[arg(long, env = "ATP_DSN")]
+    oracle_dsn: Option<String>,
+
+    /// Oracle ATP username
+    #[arg(long, env = "ATP_USER")]
+    oracle_user: Option<String>,
+
+    /// Oracle ATP password
+    #[arg(long, env = "ATP_PASSWORD")]
+    oracle_password: Option<String>,
+
+    /// Minimum number of pooled ATP connections (defaults to 1 when omitted)
+    #[arg(long, env = "ATP_POOL_MIN")]
+    oracle_pool_min: Option<usize>,
+
+    /// Maximum number of pooled ATP connections (defaults to 16 when omitted)
+    #[arg(long, env = "ATP_POOL_MAX")]
+    oracle_pool_max: Option<usize>,
+
+    /// Connection acquisition timeout in seconds (defaults to 30 when omitted)
+    #[arg(long, env = "ATP_POOL_TIMEOUT_SECS")]
+    oracle_pool_timeout_secs: Option<u64>,
+}
+
+enum OracleConnectSource {
+    Dsn { descriptor: String },
+    Wallet { path: String, alias: String },
 }
 
 impl CliArgs {
@@ -362,6 +399,87 @@ impl CliArgs {
             },
             _ => PolicyConfig::RoundRobin, // Fallback
         }
+    }
+
+    fn resolve_oracle_connect_details(&self) -> ConfigResult<OracleConnectSource> {
+        if let Some(dsn) = self.oracle_dsn.clone() {
+            return Ok(OracleConnectSource::Dsn { descriptor: dsn });
+        }
+
+        let wallet_path = self
+            .oracle_wallet_path
+            .clone()
+            .ok_or(ConfigError::MissingRequired {
+                field: "oracle_wallet_path or ATP_WALLET_PATH".to_string(),
+            })?;
+
+        let tns_alias = self
+            .oracle_tns_alias
+            .clone()
+            .ok_or(ConfigError::MissingRequired {
+                field: "oracle_tns_alias or ATP_TNS_ALIAS".to_string(),
+            })?;
+
+        Ok(OracleConnectSource::Wallet {
+            path: wallet_path,
+            alias: tns_alias,
+        })
+    }
+
+    fn build_oracle_config(&self) -> ConfigResult<OracleConfig> {
+        let (wallet_path, connect_descriptor) = match self.resolve_oracle_connect_details()? {
+            OracleConnectSource::Dsn { descriptor } => (None, descriptor),
+            OracleConnectSource::Wallet { path, alias } => (Some(path), alias),
+        };
+        let username = self
+            .oracle_user
+            .clone()
+            .ok_or(ConfigError::MissingRequired {
+                field: "oracle_user or ATP_USER".to_string(),
+            })?;
+        let password = self
+            .oracle_password
+            .clone()
+            .ok_or(ConfigError::MissingRequired {
+                field: "oracle_password or ATP_PASSWORD".to_string(),
+            })?;
+
+        let pool_min = self
+            .oracle_pool_min
+            .unwrap_or_else(OracleConfig::default_pool_min);
+        let pool_max = self
+            .oracle_pool_max
+            .unwrap_or_else(OracleConfig::default_pool_max);
+
+        if pool_min == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle_pool_min".to_string(),
+                value: pool_min.to_string(),
+                reason: "pool minimum must be at least 1".to_string(),
+            });
+        }
+
+        if pool_max < pool_min {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle_pool_max".to_string(),
+                value: pool_max.to_string(),
+                reason: "pool maximum must be greater than or equal to minimum".to_string(),
+            });
+        }
+
+        let pool_timeout_secs = self
+            .oracle_pool_timeout_secs
+            .unwrap_or_else(OracleConfig::default_pool_timeout_secs);
+
+        Ok(OracleConfig {
+            wallet_path,
+            connect_descriptor,
+            username,
+            password,
+            pool_min,
+            pool_max,
+            pool_timeout_secs,
+        })
     }
 
     /// Convert CLI arguments to RouterConfig
@@ -459,6 +577,18 @@ impl CliArgs {
             _ => Self::determine_connection_mode(&all_urls),
         };
 
+        let history_backend = match self.history_backend.as_str() {
+            "none" => HistoryBackend::None,
+            "oracle" => HistoryBackend::Oracle,
+            _ => HistoryBackend::Memory,
+        };
+
+        let oracle = if history_backend == HistoryBackend::Oracle {
+            Some(self.build_oracle_config()?)
+        } else {
+            None
+        };
+
         // Build RouterConfig
         Ok(RouterConfig {
             mode,
@@ -511,10 +641,8 @@ impl CliArgs {
             rate_limit_tokens_per_second: None,
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
-            history_backend: match self.history_backend.as_str() {
-                "none" => HistoryBackend::None,
-                _ => HistoryBackend::Memory,
-            },
+            history_backend,
+            oracle,
         })
     }
 
