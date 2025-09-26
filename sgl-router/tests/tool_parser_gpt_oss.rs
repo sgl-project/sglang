@@ -6,7 +6,6 @@ use sglang_router_rs::tool_parser::{GptOssParser, ParseState, StreamResult, Tool
 async fn test_gpt_oss_complete_parsing() {
     let parser = GptOssParser::new();
 
-    // Test single tool call
     let input = r#"Let me search for that information.
 <|channel|>commentary to=functions.search<|constrain|>json<|message|>{"query": "rust programming", "limit": 10}<|call|>
 Here are the results..."#;
@@ -15,7 +14,6 @@ Here are the results..."#;
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].function.name, "search");
 
-    // Verify arguments
     let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
     assert_eq!(args["query"], "rust programming");
     assert_eq!(args["limit"], 10);
@@ -38,7 +36,6 @@ async fn test_gpt_oss_multiple_tools() {
 async fn test_gpt_oss_with_namespace() {
     let parser = GptOssParser::new();
 
-    // Test with different namespace patterns
     let input = r#"<|channel|>commentary to=api.users.create<|constrain|>json<|message|>{"name": "John", "email": "john@example.com"}<|call|>
 <|channel|>commentary to=tools.calculator.add<|constrain|>json<|message|>{"x": 10, "y": 20}<|call|>"#;
 
@@ -52,7 +49,6 @@ async fn test_gpt_oss_with_namespace() {
 async fn test_gpt_oss_with_assistant_prefix() {
     let parser = GptOssParser::new();
 
-    // Test with <|start|>assistant prefix
     let input = r#"<|start|>assistant<|channel|>commentary to=functions.test<|constrain|>json<|message|>{"key": "value"}<|call|>"#;
 
     let result = parser.parse_complete(input).await.unwrap();
@@ -64,7 +60,6 @@ async fn test_gpt_oss_with_assistant_prefix() {
 async fn test_gpt_oss_empty_args() {
     let parser = GptOssParser::new();
 
-    // Test with empty arguments
     let input =
         r#"<|channel|>commentary to=functions.get_time<|constrain|>json<|message|>{}<|call|>"#;
 
@@ -130,7 +125,6 @@ fn test_gpt_oss_format_detection() {
 async fn test_gpt_oss_with_whitespace() {
     let parser = GptOssParser::new();
 
-    // Test with whitespace after function name
     let input = r#"<|channel|>commentary to=functions.test  <|constrain|>json<|message|>{"key": "value"}<|call|>"#;
 
     let result = parser.parse_complete(input).await.unwrap();
@@ -142,7 +136,6 @@ async fn test_gpt_oss_with_whitespace() {
 async fn test_gpt_oss_complex_json() {
     let parser = GptOssParser::new();
 
-    // Test with complex nested JSON
     let input = r#"<|channel|>commentary to=functions.process<|constrain|>json<|message|>{
     "nested": {
         "data": [1, 2, 3],

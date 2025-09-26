@@ -957,7 +957,6 @@ impl RouterTrait for PDRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // Test model generation capability by selecting a random pair and testing them
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
@@ -972,7 +971,6 @@ impl RouterTrait for PDRouter {
             }
         };
 
-        // Test prefill server's health_generate
         let prefill_url = format!("{}/health_generate", prefill.url());
         let (prefill_result, decode_result) = tokio::join!(
             self.client.get(&prefill_url).send(),
