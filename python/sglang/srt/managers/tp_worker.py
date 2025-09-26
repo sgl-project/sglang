@@ -264,7 +264,6 @@ class TpModelWorker:
                 logits_uncond = logits_output.next_token_logits[uncond_idx]
 
                 cfg_weight = model_worker_batch.cfg_weights[cond_idx]
-                assert cfg_weight == model_worker_batch.cfg_weights[uncond_idx]
                 cfg_logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
 
                 # Replace logits for both requests in a CFG pair

@@ -531,8 +531,10 @@ class GenerateReqInput:
         """Normalize CFG parameters for batch processing."""
         if self.cfg_params is None:
             self.cfg_params = [{}] * num
-        else:
-            assert self.batch_size == len(self.cfg_params)
+        elif isinstance(self.cfg_params, dict):
+            self.cfg_params = [self.cfg_params] * num
+        else:  # Already a list
+            self.cfg_params = self.cfg_params * self.parallel_sample_num
 
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
