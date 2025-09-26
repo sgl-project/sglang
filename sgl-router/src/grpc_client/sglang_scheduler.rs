@@ -13,6 +13,7 @@ pub mod proto {
 // package sglang.grpc.scheduler; generates a nested module structure
 
 /// gRPC client for SGLang scheduler
+#[derive(Clone)]
 pub struct SglangSchedulerClient {
     client: proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
 }
@@ -103,6 +104,7 @@ impl SglangSchedulerClient {
             logprob_start_len: -1,
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: body.return_hidden_states,
+            stream: body.stream,
             ..Default::default()
         };
 
@@ -367,14 +369,14 @@ mod tests {
     #[test]
     fn test_generate_stream_chunk() {
         let chunk = proto::GenerateStreamChunk {
-            token_id: 1234,
+            token_ids: vec![1234, 5678],
             prompt_tokens: 5,
             completion_tokens: 2,
             cached_tokens: 3,
             ..Default::default()
         };
 
-        assert_eq!(chunk.token_id, 1234);
+        assert_eq!(chunk.token_ids, vec![1234, 5678]);
         assert_eq!(chunk.prompt_tokens, 5);
         assert_eq!(chunk.completion_tokens, 2);
         assert_eq!(chunk.cached_tokens, 3);
