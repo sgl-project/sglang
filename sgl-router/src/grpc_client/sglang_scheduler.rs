@@ -20,7 +20,7 @@ pub struct SglangSchedulerClient {
 
 impl SglangSchedulerClient {
     /// Create a new client and connect to the scheduler
-    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
         // Convert grpc:// to http:// for tonic
@@ -41,10 +41,11 @@ impl SglangSchedulerClient {
     }
 
     /// Submit a generation request (returns streaming response)
-    pub async fn generate_stream(
+    pub async fn generate(
         &mut self,
         req: proto::GenerateRequest,
-    ) -> Result<tonic::Streaming<proto::GenerateResponse>, Box<dyn std::error::Error>> {
+    ) -> Result<tonic::Streaming<proto::GenerateResponse>, Box<dyn std::error::Error + Send + Sync>>
+    {
         let request = Request::new(req);
         let response = self.client.generate(request).await?;
         Ok(response.into_inner())
@@ -53,7 +54,7 @@ impl SglangSchedulerClient {
     /// Perform health check
     pub async fn health_check(
         &mut self,
-    ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error>> {
+    ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending health check request");
         let request = Request::new(proto::HealthCheckRequest {
             tokenized: Some(proto::TokenizedInput {
@@ -72,7 +73,7 @@ impl SglangSchedulerClient {
         &mut self,
         request_id: String,
         reason: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let request = Request::new(proto::AbortRequest { request_id, reason });
 
         self.client.abort(request).await?;
