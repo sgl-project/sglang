@@ -114,7 +114,9 @@ def benchmark_sampling(batch_size, vocab_size, p, provider):
             filter_apply_order="joint",
         )
 
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=[0.5, 0.2, 0.8])
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        fn, quantiles=[0.5, 0.2, 0.8]
+    )
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 

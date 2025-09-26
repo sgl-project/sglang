@@ -1187,7 +1187,7 @@ class MRotaryEmbedding(RotaryEmbedding):
 
                         time_tensor_long = time_tensor.long()
                         t_index = time_tensor_long.flatten()
-                    elif model_type == "qwen2_vl":
+                    elif model_type in ("qwen2_vl", "qwen3_vl", "qwen3_vl_moe"):
                         t_index = (
                             torch.arange(llm_grid_t)
                             .view(-1, 1)

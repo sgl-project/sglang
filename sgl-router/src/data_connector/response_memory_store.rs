@@ -74,13 +74,16 @@ impl ResponseStorage for MemoryResponseStorage {
 
         // Store the response
         store.responses.insert(response_id.clone(), response);
+        tracing::info!("memory_store_size" = store.responses.len());
 
         Ok(response_id)
     }
 
     async fn get_response(&self, response_id: &ResponseId) -> Result<Option<StoredResponse>> {
         let store = self.store.read();
-        Ok(store.responses.get(response_id).cloned())
+        let result = store.responses.get(response_id).cloned();
+        tracing::info!("memory_get_response" = %response_id.0, found = result.is_some());
+        Ok(result)
     }
 
     async fn delete_response(&self, response_id: &ResponseId) -> Result<()> {
@@ -199,6 +202,20 @@ pub struct MemoryStoreStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_store_with_custom_id() {
+        let store = MemoryResponseStorage::new();
+        let mut response = StoredResponse::new("Input".to_string(), "Output".to_string(), None);
+        response.id = ResponseId::from_string("resp_custom".to_string());
+        store.store_response(response.clone()).await.unwrap();
+        let retrieved = store
+            .get_response(&ResponseId::from_string("resp_custom".to_string()))
+            .await
+            .unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().output, "Output");
+    }
 
     #[tokio::test]
     async fn test_memory_store_basic() {

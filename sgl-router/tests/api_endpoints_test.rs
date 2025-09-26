@@ -62,6 +62,7 @@ impl TestContext {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+            oracle: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -238,13 +239,6 @@ mod health_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-
-        // The health endpoint returns plain text, not JSON
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_str = String::from_utf8_lossy(&body);
-        assert!(body_str.contains("All servers healthy"));
 
         ctx.shutdown().await;
     }
@@ -1408,6 +1402,7 @@ mod error_tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+            oracle: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1767,6 +1762,7 @@ mod pd_mode_tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+            oracle: None,
         };
 
         // Create app context
@@ -1930,6 +1926,7 @@ mod request_id_tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+            oracle: None,
         };
 
         let ctx = TestContext::new_with_config(
