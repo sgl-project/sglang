@@ -135,7 +135,6 @@ void rmsnorm_kernel_impl(
   });
 }
 
-
 template <typename scalar_t>
 void gemma3_rmsnorm_kernel_4d_impl(
     scalar_t* __restrict__ output,
@@ -349,7 +348,7 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
         hidden_size,
         input_strideN,
         [](float x) { return x; },
-        [](Vec x) {return x;},
+        [](Vec x) { return x; },
         eps);
   });
   return output;
@@ -381,7 +380,7 @@ at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) 
         hidden_size,
         input_strideN,
         [](float x) { return x + 1; },
-        [one_vec](Vec x) {return x + one_vec;},
+        [one_vec](Vec x) { return x + one_vec; },
         eps);
   });
   return output;
@@ -415,7 +414,7 @@ at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps)
           hidden_size,
           input_strideN,
           [](float x) { return x + 1; },
-          [one_vec](Vec x) {return x + one_vec;},
+          [one_vec](Vec x) { return x + one_vec; },
           eps);
     });
   } else {
@@ -482,7 +481,7 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
         hidden_size,
         input_strideN,
         [](float x) { return x; },
-        [](Vec x) {return x;},
+        [](Vec x) { return x; },
         eps);
   });
 }
@@ -522,7 +521,7 @@ void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Te
         hidden_size,
         input_strideN,
         [](float x) { return x + 1; },
-        [one_vec](Vec x) {return x + one_vec;},
+        [one_vec](Vec x) { return x + one_vec; },
         eps);
   });
 }
