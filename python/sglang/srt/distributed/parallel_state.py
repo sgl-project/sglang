@@ -1468,9 +1468,6 @@ def initialize_model_parallel(
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
             _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
-        if _TP.ca_comm:
-            _TP.ca_comm.disabled = True
-            _PDMUX_PREFILL_TP_GROUP.ca_comm.disabled = True
 
     moe_ep_size = expert_model_parallel_size
     moe_tp_size = tensor_model_parallel_size // moe_ep_size
