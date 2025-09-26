@@ -195,7 +195,7 @@ _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
-    # FIXME: move your environment variable to sglang.environ
+    # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name, default)
     value = value.lower()
 
@@ -213,7 +213,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
 
 
 def get_int_env_var(name: str, default: int = 0) -> int:
-    # FIXME: move your environment variable to sglang.environ
+    # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
@@ -2054,13 +2054,6 @@ def set_uvicorn_logging_configs():
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
 
-def get_ip() -> Optional[str]:
-    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
-    if host_ip:
-        return host_ip
-    return None
-
-
 def get_open_port() -> int:
     port = os.getenv("SGLANG_PORT")
     if port is not None:
@@ -2400,8 +2393,10 @@ def get_local_ip_auto(fallback: str = None) -> str:
         2. Network interface enumeration via get_local_ip_by_nic()
         3. Remote connection method via get_local_ip_by_remote()
     """
-    if ip := get_ip():
-        return ip
+    # Try environment variable
+    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
+    if host_ip:
+        return host_ip
     logger.debug("get_ip failed")
     # Fallback
     if ip := get_local_ip_by_nic():
