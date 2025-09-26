@@ -359,5 +359,6 @@ if __name__ == "__main__":
         ImageOpenAITestMixin,
         VideoOpenAITestMixin,
         AudioOpenAITestMixin,
+        OmniOpenAITestMixin,
     )
     unittest.main()
