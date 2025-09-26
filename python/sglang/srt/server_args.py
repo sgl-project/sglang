@@ -545,11 +545,10 @@ class ServerArgs:
                     # T4, 4080. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
                     reserved_mem = (2.8 + parallel_size / 10) * 1024
                 elif gpu_mem < 50 * 1024:
-                    # A10, L40, 4090, 5090. (chunked_prefill_size 2k, cuda_graph_max_bs 16)
+                    # A10, L40, 4090, 5090. (chunked_prefill_size 2k, cuda_graph_max_bs 16 if tp < 4 else 80)
                     reserved_mem = (2.8 + parallel_size / 10) * 1024
                 elif gpu_mem < 90 * 1024:
-                    # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs -)
-                    # if tp >= 4, cuda_graph_max_bs 512, else 256
+                    # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
                     reserved_mem = (12 + parallel_size / 2) * 1024
                 elif gpu_mem < 100 * 1024:
                     # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
