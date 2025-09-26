@@ -259,6 +259,8 @@ class MambaMixer2(torch.nn.Module):
                 n_groups, self.tp_size)
             self.n_groups = n_groups + groups
 
+
+
         self.groups_ssm_state_size = self.n_groups * self.ssm_state_size
         self.conv_dim = intermediate_size + 2 * self.groups_ssm_state_size
 
@@ -291,19 +293,28 @@ class MambaMixer2(torch.nn.Module):
             # This is the n_groups == 1 case,
             # where we need to duplicate groups if TP>1.
 
-            self.conv1d = ColumnParallelLinear(
+            self.conv1d = MergedColumnParallelLinear(
                 input_size=conv_kernel_size,
-                output_size=self.conv_dim,
+                output_sizes=[
+                    intermediate_size,
+                    self.groups_ssm_state_size,
+                    self.groups_ssm_state_size,
+                ],
                 bias=use_conv_bias,
                 quant_config=None,
                 prefix=f"{prefix}.conv1d",
             )
 
-            self.in_proj = ColumnParallelLinear(
+            self.in_proj = MergedColumnParallelLinear(
                 input_size=hidden_size,
-                output_size=intermediate_size + self.conv_dim + self.num_heads,
+                output_sizes=[
+                    intermediate_size,
+                    intermediate_size,
+                    self.groups_ssm_state_size,
+                    self.groups_ssm_state_size,
+                    self.num_heads,
+                ],
                 bias=use_bias,
-                quant_config=quant_config,
                 prefix=f"{prefix}.in_proj",
             )
 
