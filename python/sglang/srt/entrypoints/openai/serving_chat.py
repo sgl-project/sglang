@@ -803,7 +803,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tools,
                     finish_reason,
                     request.tool_choice,
-                    history_tool_calls_cnt
+                    history_tool_calls_cnt,
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -941,7 +941,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     call_info = ToolCallItem(
                         tool_index=i,  # Use the loop index as tool_index
                         name=tool["name"],
-                        parameters=json.dumps(tool["parameters"], ensure_ascii=False)
+                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
                     )
                     tool_id = self._process_tool_call_id(
                         call_info, history_tool_calls_cnt
