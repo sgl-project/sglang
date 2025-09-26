@@ -6,7 +6,6 @@ use sglang_router_rs::tool_parser::{Glm4MoeParser, ParseState, StreamResult, Too
 async fn test_glm4_complete_parsing() {
     let parser = Glm4MoeParser::new();
 
-    // Test single tool call
     let input = r#"Let me search for that.
 <tool_call>get_weather
 <arg_key>city</arg_key>
@@ -20,7 +19,6 @@ The weather will be..."#;
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].function.name, "get_weather");
 
-    // Verify arguments
     let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
     assert_eq!(args["city"], "Beijing");
     assert_eq!(args["date"], "2024-12-25");
@@ -51,7 +49,6 @@ async fn test_glm4_multiple_tools() {
 async fn test_glm4_type_conversion() {
     let parser = Glm4MoeParser::new();
 
-    // Test various value types
     let input = r#"<tool_call>process
 <arg_key>count</arg_key>
 <arg_value>42</arg_value>
@@ -132,7 +129,6 @@ fn test_glm4_format_detection() {
 async fn test_glm4_python_literal_values() {
     let parser = Glm4MoeParser::new();
 
-    // Test Python-style boolean values
     let input = r#"<tool_call>config
 <arg_key>debug</arg_key>
 <arg_value>True</arg_value>
