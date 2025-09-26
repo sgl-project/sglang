@@ -815,13 +815,10 @@ class SWAKVPool(KVCache):
         full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (
             self.full_kv_pool.get_contiguous_buf_infos()
         )
-        swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
-            self.swa_kv_pool.get_contiguous_buf_infos()
-        )
 
-        kv_data_ptrs = full_kv_data_ptrs + swa_kv_data_ptrs
-        kv_data_lens = full_kv_data_lens + swa_kv_data_lens
-        kv_item_lens = full_kv_item_lens + swa_kv_item_lens
+        kv_data_ptrs = full_kv_data_ptrs
+        kv_data_lens = full_kv_data_lens
+        kv_item_lens = full_kv_item_lens
 
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
