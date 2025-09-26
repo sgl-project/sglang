@@ -31,6 +31,7 @@ import psutil
 import setproctitle
 import torch
 import zmq
+from sgl_kernel import spatial
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
@@ -148,6 +149,13 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.multiplex.multiplexing import SchedulerMultiplexMixin
+from sglang.srt.multiplex.pdmux_context import (
+    get_sm_counts,
+    get_stream_groups,
+    initialize_stream_groups,
+    load_pdmux_config,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -219,6 +227,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerMultiplexMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -254,6 +263,7 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
@@ -322,6 +332,17 @@ class Scheduler(
         if self.current_scheduler_metrics_enabled():
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
+            )
+
+        if self.enable_pdmux:
+            # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
+            self.pdmux_config = load_pdmux_config(server_args.pdmux_config_path)
+            initialize_stream_groups(gpu_id, self.pdmux_config)
+            self.stream_groups = get_stream_groups()
+            self.sm_counts = get_sm_counts()
+            self.real_sm_group_num = len(self.stream_groups)
+            logger.info(
+                f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
             )
 
         # Init tokenizer
@@ -462,6 +483,8 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
+        # The current split prefill batch
+        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -1993,7 +2016,15 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none():
+            if self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                (
+                    logits_output,
+                    next_token_ids,
+                    can_run_cuda_graph,
+                    model_worker_batch,
+                ) = self.tp_worker.forward_batch_split_prefill(batch)
+                bid = model_worker_batch.bid
+            elif self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
 
                 if self.pp_group.is_last_rank:
@@ -2072,7 +2103,7 @@ class Scheduler(
                     thread_finish_flag=req.finished(),
                 )
 
-        elif batch.forward_mode.is_extend():
+        elif batch.forward_mode.is_extend() or batch.forward_mode.is_split_prefill():
             self.process_batch_result_prefill(batch, result, launch_done)
             for req in batch.reqs:
                 trace_slice(
@@ -2833,7 +2864,9 @@ def run_scheduler_process(
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
-            if server_args.pp_size > 1:
+            if scheduler.enable_pdmux:
+                scheduler.event_loop_pdmux()
+            elif server_args.pp_size > 1:
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap()
