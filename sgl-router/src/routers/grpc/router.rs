@@ -96,8 +96,6 @@ impl GrpcRouter {
         })
     }
 
-    // ============ Chat Implementation ============
-
     /// Main route_chat implementation
     async fn route_chat_impl(
         &self,
@@ -207,7 +205,6 @@ impl GrpcRouter {
         }
     }
 
-    // ============ Helper Methods ============
     /// Select a worker for the request
     fn select_worker_for_request(
         &self,
@@ -809,7 +806,6 @@ mod tests {
 
     #[test]
     fn test_transform_messages_mixed_content_types() {
-        // Test with both text and multimodal content
         let messages = vec![
             ChatMessage::User {
                 role: "user".to_string(),
@@ -833,7 +829,6 @@ mod tests {
             },
         ];
 
-        // Test String format
         let result_string =
             GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::String)
                 .unwrap();
@@ -842,7 +837,6 @@ mod tests {
         assert_eq!(result_string[0]["content"].as_str().unwrap(), "Plain text");
         assert_eq!(result_string[1]["content"].as_str().unwrap(), "With image");
 
-        // Test OpenAI format
         let result_openai =
             GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::OpenAI)
                 .unwrap();
