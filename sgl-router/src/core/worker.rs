@@ -220,6 +220,16 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .get("chat_template")
             .map(|s| s.as_str())
     }
+
+    /// Get or create a gRPC client for this worker
+    /// Returns None for HTTP workers, Some(client) for gRPC workers
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>>;
+
+    /// Reset the gRPC client connection (for reconnection scenarios)
+    /// No-op for HTTP workers
+    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+        Ok(())
+    }
 }
 
 /// Connection mode for worker communication
@@ -411,29 +421,44 @@ impl Worker for BasicWorker {
                 }
             }
             ConnectionMode::Grpc { .. } => {
-                if let Some(grpc_client) = &self.grpc_client {
-                    let mut client = grpc_client.lock().await;
-                    match client.health_check().await {
-                        Ok(response) => {
-                            tracing::debug!(
-                                "gRPC health check succeeded for {}: healthy={}",
-                                self.metadata.url,
+                // Use the new get_grpc_client() method
+                match self.get_grpc_client().await {
+                    Ok(Some(grpc_client)) => {
+                        let mut client = grpc_client.lock().await;
+                        match client.health_check().await {
+                            Ok(response) => {
+                                tracing::debug!(
+                                    "gRPC health check succeeded for {}: healthy={}",
+                                    self.metadata.url,
+                                    response.healthy
+                                );
                                 response.healthy
-                            );
-                            response.healthy
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "gRPC health check RPC failed for {}: {:?}",
-                                self.metadata.url,
-                                e
-                            );
-                            false
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "gRPC health check RPC failed for {}: {:?}",
+                                    self.metadata.url,
+                                    e
+                                );
+                                false
+                            }
                         }
                     }
-                } else {
-                    tracing::error!("No gRPC client available for worker {}", self.metadata.url);
-                    false
+                    Ok(None) => {
+                        tracing::error!(
+                            "Worker {} is not a gRPC worker but has gRPC connection mode",
+                            self.metadata.url
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to get gRPC client for worker {}: {:?}",
+                            self.metadata.url,
+                            e
+                        );
+                        false
+                    }
                 }
             }
         };
@@ -501,6 +526,42 @@ impl Worker for BasicWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
+    }
+
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>> {
+        match self.metadata.connection_mode {
+            ConnectionMode::Http => Ok(None),
+            ConnectionMode::Grpc { .. } => {
+                // If we already have a client, return it
+                if let Some(ref client) = self.grpc_client {
+                    return Ok(Some(client.clone()));
+                }
+
+                // For lazy initialization, we would need to change grpc_client to be mutable
+                // For now, return error if no client exists (will be initialized during worker creation)
+                Err(WorkerError::ConnectionFailed {
+                    url: self.metadata.url.clone(),
+                    reason:
+                        "gRPC client not initialized. Client should be set during worker creation"
+                            .to_string(),
+                })
+            }
+        }
+    }
+
+    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+        match self.metadata.connection_mode {
+            ConnectionMode::Http => Ok(()),
+            ConnectionMode::Grpc { .. } => {
+                // For now, we can't reset the client since it's not mutable
+                // This would require changing the grpc_client field to use RwLock or OnceCell
+                // which we'll do in a future iteration
+                tracing::warn!(
+                    "gRPC client reset not yet implemented - requires mutable client storage"
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -629,6 +690,14 @@ impl Worker for DPAwareWorker {
 
     fn endpoint_url(&self, route: &str) -> String {
         format!("{}{}", self.base_url, route)
+    }
+
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>> {
+        self.base_worker.get_grpc_client().await
+    }
+
+    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+        self.base_worker.reset_grpc_client().await
     }
 }
 

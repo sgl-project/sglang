@@ -13,6 +13,7 @@ pub mod proto {
 // package sglang.grpc.scheduler; generates a nested module structure
 
 /// gRPC client for SGLang scheduler
+#[derive(Clone)]
 pub struct SglangSchedulerClient {
     client: proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
 }
