@@ -1828,11 +1828,11 @@ class ModelOptModelLoader(DefaultModelLoader):
                         self._export_modelopt_checkpoint(
                             model, export_path, original_model_path
                         )
-                        print(
+                        rank0_log(
                             f"Quantized model exported to HuggingFace format at {export_path}"
                         )
                     except Exception as e:
-                        print(
+                        rank0_log(
                             f"Warning: Failed to export quantized model to {export_path}: {e}"
                         )
                 return
@@ -1889,11 +1889,11 @@ class ModelOptModelLoader(DefaultModelLoader):
                     self._export_modelopt_checkpoint(
                         model, export_path, original_model_path
                     )
-                    print(
+                    rank0_log(
                         f"Quantized model exported to HuggingFace format at {export_path}"
                     )
                 except Exception as e:
-                    print(
+                    rank0_log(
                         f"Warning: Failed to export quantized model to {export_path}: {e}"
                     )
 
@@ -1942,9 +1942,9 @@ class ModelOptModelLoader(DefaultModelLoader):
                     model_path, trust_remote_code=trust_remote_code
                 )
                 tokenizer.save_pretrained(export_path)
-                print(f"Tokenizer exported to {export_path}")
+                rank0_log(f"Tokenizer exported to {export_path}")
             except Exception as e:
-                print(f"Warning: Failed to export tokenizer: {e}")
+                rank0_log(f"Warning: Failed to export tokenizer: {e}")
 
     def load_model(
         self,
