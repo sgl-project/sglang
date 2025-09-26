@@ -70,6 +70,9 @@ pub struct RouterConfig {
     /// History backend configuration (memory or none, default: memory)
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
+    /// Oracle history backend configuration (required when `history_backend` = "oracle")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle: Option<OracleConfig>,
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -84,6 +87,70 @@ pub enum HistoryBackend {
     Memory,
     /// No history storage
     None,
+    /// Oracle ATP-backed storage
+    Oracle,
+}
+
+/// Oracle history backend configuration
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct OracleConfig {
+    /// Directory containing the ATP wallet or TLS config files (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_path: Option<String>,
+    /// Connection descriptor / DSN (e.g. `tcps://host:port/service`)
+    pub connect_descriptor: String,
+    /// Database username
+    pub username: String,
+    /// Database password
+    pub password: String,
+    /// Minimum number of pooled connections to keep ready
+    #[serde(default = "default_pool_min")]
+    pub pool_min: usize,
+    /// Maximum number of pooled connections
+    #[serde(default = "default_pool_max")]
+    pub pool_max: usize,
+    /// Maximum time to wait for a connection from the pool (seconds)
+    #[serde(default = "default_pool_timeout_secs")]
+    pub pool_timeout_secs: u64,
+}
+
+impl OracleConfig {
+    pub fn default_pool_min() -> usize {
+        default_pool_min()
+    }
+
+    pub fn default_pool_max() -> usize {
+        default_pool_max()
+    }
+
+    pub fn default_pool_timeout_secs() -> u64 {
+        default_pool_timeout_secs()
+    }
+}
+
+fn default_pool_min() -> usize {
+    1
+}
+
+fn default_pool_max() -> usize {
+    16
+}
+
+fn default_pool_timeout_secs() -> u64 {
+    30
+}
+
+impl std::fmt::Debug for OracleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OracleConfig")
+            .field("wallet_path", &self.wallet_path)
+            .field("connect_descriptor", &self.connect_descriptor)
+            .field("username", &self.username)
+            .field("pool_min", &self.pool_min)
+            .field("pool_max", &self.pool_max)
+            .field("pool_timeout_secs", &self.pool_timeout_secs)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -381,6 +448,7 @@ impl Default for RouterConfig {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            oracle: None,
         }
     }
 }
@@ -948,6 +1016,7 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            oracle: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1012,6 +1081,7 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            oracle: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1072,6 +1142,7 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            oracle: None,
         };
 
         assert!(config.has_service_discovery());

@@ -31,27 +31,13 @@ if not (_is_npu or _is_xpu):
 logger = logging.getLogger(__name__)
 
 
-class MemoryStateInt(IntEnum):
-    IDLE = 0
-    RESERVED = 1
-    PROTECTED = 2
-    SYNCED = 3
-    BACKUP = 4
+def synchronized(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with self.lock:
+            return func(self, *args, **kwargs)
 
-
-def synchronized(debug_only=False):
-    def _decorator(func):
-        @wraps(func)
-        def wrapper(self, *args, **kwargs):
-            if (not debug_only) or self.debug:
-                with self.lock:
-                    return func(self, *args, **kwargs)
-            else:
-                return True
-
-        return wrapper
-
-    return _decorator
+    return wrapper
 
 
 class HostKVCache(abc.ABC):
@@ -110,7 +96,6 @@ class HostKVCache(abc.ABC):
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
-        self.debug = logger.isEnabledFor(logging.DEBUG)
         self.clear()
 
     @abc.abstractmethod
@@ -161,7 +146,7 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
-    @synchronized()
+    @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros(
@@ -172,7 +157,7 @@ class HostKVCache(abc.ABC):
     def available_size(self):
         return len(self.free_slots)
 
-    @synchronized()
+    @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert (
             need_size % self.page_size == 0
@@ -183,91 +168,12 @@ class HostKVCache(abc.ABC):
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
-        if self.debug:
-            self.mem_state[select_index] = MemoryStateInt.RESERVED
-
         return select_index
 
-    @synchronized()
+    @synchronized
     def free(self, indices: torch.Tensor) -> int:
         self.free_slots = torch.cat([self.free_slots, indices])
-        if self.debug:
-            self.mem_state[indices] = MemoryStateInt.IDLE
         return len(indices)
-
-    @synchronized(debug_only=True)
-    def get_state(self, indices: torch.Tensor) -> MemoryStateInt:
-        assert len(indices) > 0, "The indices should not be empty"
-        states = self.mem_state[indices]
-        assert (
-            states == states[0]
-        ).all(), "The memory slots should have the same state {}".format(states)
-        return MemoryStateInt(states[0].item())
-
-    @synchronized(debug_only=True)
-    def is_reserved(self, indices: torch.Tensor) -> bool:
-        return self.get_state(indices) == MemoryStateInt.RESERVED
-
-    @synchronized(debug_only=True)
-    def is_protected(self, indices: torch.Tensor) -> bool:
-        return self.get_state(indices) == MemoryStateInt.PROTECTED
-
-    @synchronized(debug_only=True)
-    def is_synced(self, indices: torch.Tensor) -> bool:
-        return self.get_state(indices) == MemoryStateInt.SYNCED
-
-    @synchronized(debug_only=True)
-    def is_backup(self, indices: torch.Tensor) -> bool:
-        return self.get_state(indices) == MemoryStateInt.BACKUP
-
-    @synchronized(debug_only=True)
-    def update_backup(self, indices: torch.Tensor):
-        if not self.is_synced(indices):
-            raise ValueError(
-                f"The host memory slots should be in SYNCED state before turning into BACKUP. "
-                f"Current state: {self.get_state(indices)}"
-            )
-        self.mem_state[indices] = MemoryStateInt.BACKUP
-
-    @synchronized(debug_only=True)
-    def update_prefetch(self, indices: torch.Tensor):
-        if not self.is_reserved(indices):
-            raise ValueError(
-                f"The host memory slots should be in RESERVED state before turning into BACKUP. "
-                f"Current state: {self.get_state(indices)}"
-            )
-        self.mem_state[indices] = MemoryStateInt.BACKUP
-
-    @synchronized(debug_only=True)
-    def update_synced(self, indices: torch.Tensor):
-        self.mem_state[indices] = MemoryStateInt.SYNCED
-
-    @synchronized(debug_only=True)
-    def protect_write(self, indices: torch.Tensor):
-        if not self.is_reserved(indices):
-            raise ValueError(
-                f"The host memory slots should be RESERVED before write operations. "
-                f"Current state: {self.get_state(indices)}"
-            )
-        self.mem_state[indices] = MemoryStateInt.PROTECTED
-
-    @synchronized(debug_only=True)
-    def protect_load(self, indices: torch.Tensor):
-        if not self.is_backup(indices):
-            raise ValueError(
-                f"The host memory slots should be in BACKUP state before load operations. "
-                f"Current state: {self.get_state(indices)}"
-            )
-        self.mem_state[indices] = MemoryStateInt.PROTECTED
-
-    @synchronized(debug_only=True)
-    def complete_io(self, indices: torch.Tensor):
-        if not self.is_protected(indices):
-            raise ValueError(
-                f"The host memory slots should be PROTECTED during I/O operations. "
-                f"Current state: {self.get_state(indices)}"
-            )
-        self.mem_state[indices] = MemoryStateInt.SYNCED
 
 
 class MHATokenToKVPoolHost(HostKVCache):

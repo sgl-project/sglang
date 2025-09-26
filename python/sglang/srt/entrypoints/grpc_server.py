@@ -266,7 +266,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     prompt_tokens=result.get("prompt_tokens", 0),
                     cached_tokens=0,
                     embedding_dim=len(result["embedding"]),
-                    generation_time=time.time() - self.start_time,
                 ),
             )
 
@@ -438,6 +437,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         regex = None
         json_schema = None
         ebnf_grammar = None
+        structural_tag = None
 
         if grpc_params.HasField("regex"):
             regex = grpc_params.regex
@@ -445,6 +445,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             json_schema = grpc_params.json_schema
         elif grpc_params.HasField("ebnf_grammar"):
             ebnf_grammar = grpc_params.ebnf_grammar
+        elif grpc_params.HasField("structural_tag"):
+            structural_tag = grpc_params.structural_tag
 
         return SGLSamplingParams(
             temperature=grpc_params.temperature or 1.0,
@@ -465,6 +467,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             regex=regex,
             json_schema=json_schema,
             ebnf=ebnf_grammar,
+            structural_tag=structural_tag,
             n=grpc_params.n or 1,
             ignore_eos=grpc_params.ignore_eos,
         )
@@ -473,16 +476,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self, request_id: str, output: Dict
     ) -> sglang_scheduler_pb2.GenerateResponse:
         """Create a streaming chunk response."""
+        meta_info = output.get("meta_info", {})
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
             chunk=sglang_scheduler_pb2.GenerateStreamChunk(
                 token_id=output["token_ids"][-1] if output.get("token_ids") else 0,
-                text=output.get("text", ""),
-                prompt_tokens=0,
-                completion_tokens=len(output.get("token_ids", [])),
+                prompt_tokens=meta_info.get("prompt_tokens", 0),
+                completion_tokens=meta_info.get("completion_tokens", 0),
                 cached_tokens=0,
-                generation_time=time.time() - self.start_time,
-                queue_time=0.0,
             ),
         )
 
@@ -503,8 +504,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             request_id=request_id,
             complete=sglang_scheduler_pb2.GenerateComplete(
                 output_ids=output.get("token_ids", []),
-                output_text=output.get("text", ""),
                 finish_reason=finish_reason,
+                prompt_tokens=meta_info.get("prompt_tokens", 0),
+                completion_tokens=meta_info.get(
+                    "completion_tokens", len(output.get("token_ids", []))
+                ),
+                cached_tokens=meta_info.get("cached_tokens", 0),
             ),
         )
 
