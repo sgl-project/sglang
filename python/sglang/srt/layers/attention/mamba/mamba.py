@@ -360,6 +360,27 @@ class MambaMixer2(torch.nn.Module):
                 },
             )
 
+            if quant_config is None:
+                # - quant layers do not have a weight loader
+                delattr(self.in_proj.weight, "weight_loader")
+                set_weight_attrs(
+                    self.in_proj.weight,
+                    {
+                        "weight_loader":
+                        mamba_v2_sharded_weight_loader(
+                            [
+                                intermediate_settings,  # for gate
+                                intermediate_settings,
+                                group_shard_settings,
+                                group_shard_settings,
+                                head_settings,  # for dt
+                            ],
+                            self.tp_size,
+                            tp_rank,
+                        )
+                    },
+                )
+
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
         # `ColumnParallelLinear` and `MergedColumnParallelLinear`,
@@ -482,7 +503,7 @@ class MambaMixer2(torch.nn.Module):
         preallocated_ssm_out = torch.empty(
             [
                 projected_states.shape[0],
-                self.num_heads * self.head_dim
+                (self.num_heads * self.head_dim) // self.tp_size
             ],
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -554,7 +575,7 @@ class MambaMixer2(torch.nn.Module):
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
             ssm_state[state_indices_tensor] = varlen_state.permute(0, 3, 2, 1)
         elif forward_batch.forward_mode.is_decode():
-            num_decodes = len(query_start_loc) -1
+            num_decodes = len(query_start_loc) - 1
             # 2. Convolution sequence transformation
             hidden_states_B_C = causal_conv1d_update(
                 hidden_states_B_C,
@@ -583,8 +604,13 @@ class MambaMixer2(torch.nn.Module):
             # - mamba_cache_params.ssm_state's slots will be selected
             #   using state_indices_tensor_d
             # NOTE: final output is an in-place update of out tensor
-            #print(hidden_states.shape, hidden_states_B_C.shape, conv_state.shape, ssm_state.shape, state_indices_tensor, state_indices_tensor.shape)
-            #exit(0)
+            # print(hidden_states.shape, hidden_states_B_C.shape, ssm_state.shape)
+            # tp 1:
+            # torch.Size([4, 48, 64]) torch.Size([129, 256, 64, 48])
+
+            # tp 2:
+            # torch.Size([4, 24, 64]) torch.Size([129, 128, 64, 48]) 
+            # exit(0)
             selective_state_update(
                 ssm_state.permute(0, 3, 2, 1),
                 hidden_states,
@@ -607,10 +633,7 @@ class MambaMixer2(torch.nn.Module):
         # GatedRMSNorm internally applying SiLU to the gate
         # SiLU is applied internally before normalization, unlike standard
         # norm usage
-        hidden_states = self.norm(preallocated_ssm_out,
-                                    gate)
-
-            
+        hidden_states = self.norm(preallocated_ssm_out, gate)
 
         # 5. Final linear projection
         output[:], _ = self.out_proj(hidden_states)
