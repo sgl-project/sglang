@@ -30,6 +30,7 @@ class PyNcclCommunicator:
         group: Union[ProcessGroup, StatelessProcessGroup],
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
+        use_current_stream: bool = False,
     ):
         """
         Args:
@@ -74,6 +75,7 @@ class PyNcclCommunicator:
 
         self.available = True
         self.disabled = False
+        self.use_current_stream = use_current_stream
 
         self.nccl_version = self.nccl.ncclGetRawVersion()
         if self.rank == 0:
@@ -123,6 +125,14 @@ class PyNcclCommunicator:
         # when we are using CUDA graph.
         self.disabled = True
 
+    def _get_stream(self, stream):
+        if stream is None:
+            if self.use_current_stream:
+                stream = torch.cuda.current_stream()
+            else:
+                stream = self.stream
+        return stream
+
     def all_reduce(
         self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None
     ):
@@ -135,8 +145,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
-        if stream is None:
-            stream = self.stream
+        stream = self._get_stream(stream)
         self.nccl.ncclAllReduce(
             buffer_type(tensor.data_ptr()),
             buffer_type(tensor.data_ptr()),
@@ -163,8 +172,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
         )
-        if stream is None:
-            stream = self.stream
+        stream = self._get_stream(stream)
 
         if sizes is not None:
             split_offset = 0
@@ -210,8 +218,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
         )
-        if stream is None:
-            stream = self.stream
+        stream = self._get_stream(stream)
 
         if sizes is not None:
             split_offset = 0
@@ -249,8 +256,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
-        if stream is None:
-            stream = self.stream
+        stream = self._get_stream(stream)
         self.nccl.ncclSend(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -267,8 +273,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
-        if stream is None:
-            stream = self.stream
+        stream = self._get_stream(stream)
         self.nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -285,8 +290,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
-        if stream is None:
-            stream = self.stream
+        stream = self._get_stream(stream)
         if src == self.rank:
             sendbuff = buffer_type(tensor.data_ptr())
             # NCCL requires the sender also to have a receive buffer
