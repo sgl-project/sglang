@@ -54,11 +54,39 @@ jobs:
           cd scripts/ci_monitor
           python ci_analyzer_perf.py --token $GITHUB_TOKEN --limit 500 --output-dir performance_tables_$(date +%Y%m%d_%H%M%S)
 
-      - name: Upload Analysis Results
+      - name: Create Performance Tables ZIP
+        run: |
+          cd scripts/ci_monitor
+          # Create ZIP of performance_tables directory
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+          if ls -d performance_tables_* 1> /dev/null 2>&1; then
+            # Get the performance_tables directory name
+            PERF_DIR=$(ls -d performance_tables_* | head -1)
+
+            # Create ZIP file
+            zip -r "performance_tables_${TIMESTAMP}.zip" "${PERF_DIR}"
+
+            echo "Created ZIP: performance_tables_${TIMESTAMP}.zip"
+            echo "ZIP contents:"
+            unzip -l "performance_tables_${TIMESTAMP}.zip"
+
+            # Move to root for upload
+            mv "performance_tables_${TIMESTAMP}.zip" ../../
+          else
+            echo "No performance_tables directory found"
+          fi
+
+      - name: Upload Performance Tables
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-tables-${{ github.run_number }}
+          path: performance_tables_*.zip
+          retention-days: 30
+
+      - name: Upload CI Analysis Results
         uses: actions/upload-artifact@v4
         with:
           name: ci-analysis-results-${{ github.run_number }}
-          path: |
-            scripts/ci_monitor/ci_analysis_*.json
-            scripts/ci_monitor/performance_tables_*
+          path: scripts/ci_monitor/ci_analysis_*.json
           retention-days: 30
