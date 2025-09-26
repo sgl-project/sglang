@@ -9,6 +9,7 @@ from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.longcat_detector import LongCatDetector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -523,6 +524,7 @@ class TestEBNFGeneration(unittest.TestCase):
         self.qwen3_coder_detector = Qwen3CoderDetector()
         self.kimik2_detector = KimiK2Detector()
         self.glm45_detector = Glm4MoeDetector()
+        self.longcat_detector = LongCatDetector()
 
     def test_pythonic_detector_ebnf(self):
         """Test that the PythonicDetector generates valid EBNF."""
@@ -683,6 +685,23 @@ class TestEBNFGeneration(unittest.TestCase):
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
 
+    def test_longcat_detector_ebnf(self):
+        """Test that the LongCatDetector generates valid EBNF."""
+        ebnf = self.longcat_detector.build_ebnf(self.tools)
+        self.assertIsNotNone(ebnf)
+
+        # Check that the EBNF contains expected patterns
+        self.assertIn("<longcat_tool_call>", ebnf)
+        self.assertIn('\\"name\\"" ":" "\\"get_weather\\"', ebnf)
+        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+
+        # Validate that the EBNF can be compiled by GrammarCompiler
+        try:
+            ctx = self.grammar_compiler.compile_grammar(ebnf)
+            self.assertIsNotNone(ctx, "EBNF should be valid and compile successfully")
+        except RuntimeError as e:
+            self.fail(f"Failed to compile EBNF: {e}")
+
     def test_weather_function_optional_parameter_handling(self):
         """Test that weather function with optional unit parameter generates correct EBNF without trailing commas."""
         # Create a weather tool with required location and optional unit
@@ -712,6 +731,7 @@ class TestEBNFGeneration(unittest.TestCase):
             "llama32": self.llama32_detector,
             "mistral": self.mistral_detector,
             "qwen25": self.qwen25_detector,
+            "longcat": self.longcat_detector,
         }
 
         for name, detector in detectors.items():
@@ -768,6 +788,7 @@ class TestEBNFGeneration(unittest.TestCase):
             "llama32": self.llama32_detector,
             "mistral": self.mistral_detector,
             "qwen25": self.qwen25_detector,
+            "longcat": self.longcat_detector,
         }
 
         for name, detector in json_detectors.items():
@@ -856,6 +877,7 @@ class TestEBNFGeneration(unittest.TestCase):
             "llama32": self.llama32_detector,
             "mistral": self.mistral_detector,
             "qwen25": self.qwen25_detector,
+            "longcat": self.longcat_detector,
         }
 
         for name, detector in json_detectors.items():
