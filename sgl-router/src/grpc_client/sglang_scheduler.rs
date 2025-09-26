@@ -86,7 +86,7 @@ impl SglangSchedulerClient {
         request_id: String,
         body: &ChatCompletionRequest,
         processed_text: String,
-        token_ids: Vec<i32>,
+        token_ids: Vec<u32>,
         multimodal_inputs: Option<proto::MultimodalInputs>,
         tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
     ) -> Result<proto::GenerateRequest, String> {
