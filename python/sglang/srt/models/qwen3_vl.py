@@ -353,10 +353,10 @@ class Qwen3_VisionTransformer(nn.Module):
         patch_pos_embeds_permute = []
         m_size = self.spatial_merge_size
 
+        embeds = torch.arange(num_grid_per_side*num_grid_per_side, device=self.pos_embed.weight.device)
+        embeds = self.pos_embed(embeds).permute(1, 0).reshape(1, -1, num_grid_per_side, num_grid_per_side)
         for t, h, w in grid_thw:
-            pos_embed = torch.arange(num_grid_per_side*num_grid_per_side, device=self.pos_embed.weight.device)
-            pos_embed = self.pos_embed(pos_embed).permute(1, 0).reshape(1, -1, num_grid_per_side, num_grid_per_side)
-            pos_embed = torch.nn.functional.interpolate(pos_embed, size = (h,w), mode='bilinear')
+            pos_embed = torch.nn.functional.interpolate(embeds, size = (h,w), mode='bilinear')
             pos_embed = pos_embed.reshape(-1,
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
