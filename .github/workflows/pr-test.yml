@@ -108,9 +108,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
-
       - name: Cleanup
         run: |
           ls -alh sgl-kernel/dist || true
@@ -137,13 +134,8 @@ jobs:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
 
       - name: Cleanup
         run: |
@@ -174,14 +166,9 @@ jobs:
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
-    env:
-      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -216,9 +203,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
-
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -251,11 +235,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Hugging Face Login
-        run: |
-          echo ${{ secrets.HF_TOKEN }}
-          pip install -U "huggingface_hub[cli]" && huggingface-cli login --token $HF_TOKEN
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -290,9 +269,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
-
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -326,9 +302,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
-
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -357,9 +330,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -422,9 +392,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
-
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -477,9 +444,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -540,9 +504,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
-
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -574,9 +535,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -610,9 +568,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
-
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -641,9 +596,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -675,9 +627,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'

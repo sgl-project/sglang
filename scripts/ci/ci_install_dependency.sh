@@ -91,3 +91,6 @@ fi
 
 # Show current packages
 $PIP_CMD list
+
+
+pip install -U "huggingface_hub[cli]" && hf auth login --token $HF_TOKEN
