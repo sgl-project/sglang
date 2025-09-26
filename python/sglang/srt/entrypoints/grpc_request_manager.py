@@ -4,6 +4,7 @@ Mimics TokenizerManager's state management and ZMQ communication patterns.
 """
 
 import asyncio
+import copy
 import dataclasses
 import logging
 import os
@@ -11,6 +12,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Union
 
 import grpc
@@ -79,11 +81,9 @@ class GrpcReqState:
     last_completion_tokens: int = 1
 
     # Streaming state
-    last_output_offset: int = 0
     stream_finished: bool = False
 
-    # Output accumulation
-    text: str = ""
+    # Token accumulation (for non-streaming)
     output_ids: List[int] = dataclasses.field(default_factory=list)
     input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
     input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
@@ -139,8 +139,6 @@ class GrpcRequestManager:
         self.is_pause_cond = asyncio.Condition()
 
         # Metrics
-        self.request_counter = 0
-        self.request_counter_lock = asyncio.Lock()
         self.last_receive_tstamp = time.time()
 
         # Crash dump for debugging
@@ -158,22 +156,133 @@ class GrpcRequestManager:
         obj: TokenizedGenerateReqInput,
         request_id: Optional[str] = None,
         grpc_context: Optional[grpc.aio.ServicerContext] = None,
-    ) -> asyncio.Queue:
+    ):
         """
-        Submit a generation request to the scheduler.
-        Returns a queue for streaming outputs.
+        Submit a generation request to the scheduler with n>1 parallel sampling support.
+
+        This method implements the same two-phase approach as tokenizer_manager.py:
+        1. Phase 1: Send prefix caching request (max_new_tokens=0)
+        2. Phase 2: Send n generation requests that reuse the cached prefix
+
+        Yields individual responses for streaming, or aggregated responses for non-streaming.
         """
+        n = getattr(obj.sampling_params, "n", 1)
+
+        if n <= 1:
+            async for response in self._handle_single_request(
+                obj, request_id, grpc_context
+            ):
+                yield response
+            return
+
+        # N>1 handling - two-phase approach
+        logger.debug(f"Multiple sampling request (n={n}), using two-phase approach")
+
+        # Generate base request ID if not provided
+        if request_id is None:
+            base_request_id = f"grpc-{uuid.uuid4().hex}"
+        else:
+            base_request_id = request_id
+
+        # Phase 1: Cache the common prefix
+        logger.debug(f"Phase 1: Caching prefix for request {base_request_id}")
+        prefix_obj = copy.copy(obj)
+        prefix_obj.sampling_params = copy.copy(obj.sampling_params)
+        prefix_obj.sampling_params.max_new_tokens = 0  # Prefill-only
+        prefix_obj.sampling_params.n = 1  # Don't replicate prefix request
+
+        # Send prefix caching request and consume response
+        async for _ in self._handle_single_request(
+            prefix_obj, f"{base_request_id}-prefix", grpc_context
+        ):
+            # Consume prefix response (usually just one chunk with finish_reason)
+            pass
+
+        logger.debug(f"Phase 1 completed: Prefix cached for {base_request_id}")
+
+        # Phase 2: Generate n parallel requests
+        logger.debug(f"Phase 2: Generating {n} parallel requests")
+        generators = []
+        request_ids = []
+
+        for i in range(n):
+            # Create individual generation request
+            gen_obj = copy.copy(obj)
+            gen_obj.sampling_params = copy.copy(obj.sampling_params)
+            gen_obj.sampling_params.n = 1  # Each request generates 1 response
+
+            gen_request_id = f"{base_request_id}-{i}"
+            request_ids.append(gen_request_id)
+
+            # Start generation request
+            generators.append(
+                self._handle_single_request(gen_obj, gen_request_id, grpc_context)
+            )
+
+        # Handle response aggregation
+        is_stream = getattr(obj, "stream", False)
+
+        if not is_stream:
+            # Non-streaming: collect all responses and return as batch
+            logger.debug(f"Non-streaming mode: collecting {n} responses")
+            responses = []
+            for generator in generators:
+                async for response in generator:
+                    responses.append(response)
+            yield responses  # Return all responses as a batch
+        else:
+            # Streaming mode: multiplex responses with index for ordering
+            logger.debug(f"Streaming mode: multiplexing {n} streams")
+            rid_to_index = {rid: i for i, rid in enumerate(request_ids)}
+
+            # Create async tasks for all generators
+            task_map = {}
+            for generator in generators:
+                task = asyncio.create_task(generator.__anext__())
+                task_map[task] = generator
+
+            # Process responses as they arrive
+            while task_map:
+                done, _ = await asyncio.wait(
+                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                )
+
+                for task in done:
+                    generator = task_map.pop(task)
+                    try:
+                        response = await task
+
+                        # Add index for client-side ordering
+                        if isinstance(response, dict) and "meta_info" in response:
+                            response_rid = response["meta_info"].get("id", "")
+                            if response_rid in rid_to_index:
+                                response["index"] = rid_to_index[response_rid]
+
+                        yield response
+
+                        # Create next task for this generator
+                        next_task = asyncio.create_task(generator.__anext__())
+                        task_map[next_task] = generator
+
+                    except StopAsyncIteration:
+                        # This generator is finished
+                        pass
+
+    async def _handle_single_request(
+        self,
+        obj: TokenizedGenerateReqInput,
+        request_id: Optional[str] = None,
+        grpc_context: Optional[grpc.aio.ServicerContext] = None,
+    ):
+        """Handle a single request - core implementation without n>1 logic."""
         # Generate request ID if not provided
         if request_id is None:
-            async with self.request_counter_lock:
-                request_id = f"grpc-{self.request_counter}"
-                self.request_counter += 1
+            request_id = f"grpc-{uuid.uuid4().hex}"
 
         obj.rid = request_id
 
+        # Create and register request state
         # TODO: support log_request
-
-        # Create request state
         state = GrpcReqState(
             request_id=request_id,
             grpc_context=grpc_context,
@@ -189,19 +298,51 @@ class GrpcRequestManager:
             state.session_id = obj.session_params.session_id
             state.is_session_request = True
 
-        # Register state
         self.rid_to_state[request_id] = state
         self.record_request_for_crash_dump(obj)
 
-        # Send to scheduler via ZMQ
         try:
+            # Send to scheduler - let exceptions bubble up to grpc_server.py
             await self._send_to_scheduler(obj)
-        except Exception as e:
-            # Clean up on failure
-            del self.rid_to_state[request_id]
-            raise RuntimeError(f"Failed to send request to scheduler: {e}")
 
-        return state.out_queue
+            is_stream = getattr(obj, "stream", False)
+
+            while True:
+                # Client cancelled - notify scheduler and exit
+                if grpc_context and grpc_context.cancelled():
+                    await self.abort_request(request_id)
+                    return
+
+                try:
+                    response = await asyncio.wait_for(state.out_queue.get(), timeout=4)
+
+                    if is_stream:
+                        yield response
+
+                    # Non-streaming: yield final response with accumulated tokens from state
+                    if isinstance(response, dict) and response.get("finished", False):
+                        if not is_stream:
+                            final_response = response.copy()
+                            final_response["token_ids"] = state.output_ids
+                            yield final_response
+                        break
+
+                except asyncio.TimeoutError:
+                    # Timeout waiting for response - abort and cleanup
+                    logger.warning(
+                        f"Timeout waiting for response for request {request_id}"
+                    )
+                    await self.abort_request(request_id)
+                    return
+
+        finally:
+            # Always clean up request state when exiting
+            self._cleanup_request_state(request_id)
+
+    def _cleanup_request_state(self, request_id: str):
+        """Clean up local request state (does not notify scheduler)."""
+        if request_id in self.rid_to_state:
+            del self.rid_to_state[request_id]
 
     async def embedding_request(
         self,
@@ -214,9 +355,7 @@ class GrpcRequestManager:
         """
         # Generate request ID if not provided
         if request_id is None:
-            async with self.request_counter_lock:
-                request_id = f"grpc-embed-{self.request_counter}"
-                self.request_counter += 1
+            request_id = f"grpc-embed-{uuid.uuid4().hex}"
 
         obj.rid = request_id
 
@@ -355,7 +494,6 @@ class GrpcRequestManager:
             # Extract output for this request
             output_data = {
                 "request_id": rid,
-                "text": batch_out.decoded_texts[i] if batch_out.decoded_texts else "",
                 "token_ids": batch_out.output_ids[i] if batch_out.output_ids else [],
                 "finished": batch_out.finished_reasons[i] is not None,
                 "meta_info": {
@@ -366,6 +504,9 @@ class GrpcRequestManager:
                         batch_out.completion_tokens[i]
                         if batch_out.completion_tokens
                         else 0
+                    ),
+                    "cached_tokens": (
+                        batch_out.cached_tokens[i] if batch_out.cached_tokens else 0
                     ),
                     "finish_reason": (
                         str(batch_out.finished_reasons[i])
@@ -389,15 +530,10 @@ class GrpcRequestManager:
                     ),
                 }
 
-            # Update state
-            if output_data["text"]:
-                state.text += output_data["text"][state.last_output_offset :]
-                state.last_output_offset = len(output_data["text"])
-
+            # Update state for accumulation
             if output_data["token_ids"]:
                 state.output_ids.extend(output_data["token_ids"])
 
-            # Send to output queue
             await state.out_queue.put(output_data)
 
             # Handle completion
