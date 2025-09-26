@@ -9,6 +9,7 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
@@ -401,7 +402,7 @@ class AscendAttnBackend(AttentionBackend):
                 antiquant_scale=None,
                 sparse_mode=0,
             )
-            output = torch.zeros_like(q_nope, dtype=q.dtype, device=q.device)
+            output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
             softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
 
             torch_npu.npu_fused_infer_attention_score.out(
@@ -437,6 +438,10 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        if is_mla_preprocess_enabled():
+            # MLAPO does saving kv_cache
+            save_kv_cache = False
+
         if self.graph_mode:
             return self.forward_decode_graph(
                 q,

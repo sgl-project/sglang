@@ -179,7 +179,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             capture_bs = (
                 list(range(1, 9))
                 + list(range(10, 33, 2))
-                + list(range(40, 64, 8))
+                + list(range(40, 65, 8))
                 + list(range(80, 161, 16))
             )
 
