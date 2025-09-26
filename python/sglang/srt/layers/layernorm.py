@@ -42,7 +42,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 
-if _is_cuda:
+if _is_cuda or _is_xpu:
     if _is_flashinfer_available:
         from flashinfer.norm import fused_add_rmsnorm
     else:
@@ -194,6 +194,19 @@ class RMSNorm(CustomOp):
         else:
             return x, residual
 
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+        if residual is not None:
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
+        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+        return out
+
     def forward_cpu(
         self,
         x: torch.Tensor,
@@ -299,6 +312,19 @@ class GemmaRMSNorm(CustomOp):
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x if residual is None else (x, residual)
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            gemma_fused_add_rmsnorm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
+            return x, residual
+        out = gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
+        return out
 
 
 class Gemma3RMSNorm(CustomOp):
