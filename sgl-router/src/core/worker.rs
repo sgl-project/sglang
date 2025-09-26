@@ -9,7 +9,7 @@ use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -337,8 +337,8 @@ pub struct BasicWorker {
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
-    /// Optional gRPC client for gRPC workers
-    pub grpc_client: Option<Arc<Mutex<SglangSchedulerClient>>>,
+    /// Lazily initialized gRPC client for gRPC workers
+    pub grpc_client: Arc<RwLock<Option<Arc<Mutex<SglangSchedulerClient>>>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -347,7 +347,7 @@ impl fmt::Debug for BasicWorker {
             .field("metadata", &self.metadata)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
-            .field("has_grpc_client", &self.grpc_client.is_some())
+            .field("grpc_client", &"<RwLock>")
             .finish()
     }
 }
@@ -421,7 +421,7 @@ impl Worker for BasicWorker {
                 }
             }
             ConnectionMode::Grpc { .. } => {
-                // Use the new get_grpc_client() method
+                // Use the new get_grpc_client() method for lazy initialization
                 match self.get_grpc_client().await {
                     Ok(Some(grpc_client)) => {
                         let mut client = grpc_client.lock().await;
@@ -532,19 +532,45 @@ impl Worker for BasicWorker {
         match self.metadata.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc { .. } => {
-                // If we already have a client, return it
-                if let Some(ref client) = self.grpc_client {
+                {
+                    let client_guard = self.grpc_client.read().await;
+                    if let Some(ref client) = *client_guard {
+                        return Ok(Some(client.clone()));
+                    }
+                }
+
+                let mut client_guard = self.grpc_client.write().await;
+
+                if let Some(ref client) = *client_guard {
                     return Ok(Some(client.clone()));
                 }
 
-                // For lazy initialization, we would need to change grpc_client to be mutable
-                // For now, return error if no client exists (will be initialized during worker creation)
-                Err(WorkerError::ConnectionFailed {
-                    url: self.metadata.url.clone(),
-                    reason:
-                        "gRPC client not initialized. Client should be set during worker creation"
-                            .to_string(),
-                })
+                tracing::info!(
+                    "Lazily initializing gRPC client for worker: {}",
+                    self.metadata.url
+                );
+                match SglangSchedulerClient::connect(&self.metadata.url).await {
+                    Ok(client) => {
+                        let client_arc = Arc::new(Mutex::new(client));
+                        *client_guard = Some(client_arc.clone());
+                        tracing::info!(
+                            "Successfully connected gRPC client for worker: {}",
+                            self.metadata.url
+                        );
+                        Ok(Some(client_arc))
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to connect gRPC client for worker {}: {}",
+                            self.metadata.url,
+                            e
+                        );
+                        Err(WorkerError::ConnectionFailed {
+                            url: self.metadata.url.clone(),
+                            reason: format!("Failed to connect to gRPC server: {}", e),
+                        })
+                    }
+                }
             }
         }
     }
@@ -553,12 +579,11 @@ impl Worker for BasicWorker {
         match self.metadata.connection_mode {
             ConnectionMode::Http => Ok(()),
             ConnectionMode::Grpc { .. } => {
-                // For now, we can't reset the client since it's not mutable
-                // This would require changing the grpc_client field to use RwLock or OnceCell
-                // which we'll do in a future iteration
-                tracing::warn!(
-                    "gRPC client reset not yet implemented - requires mutable client storage"
-                );
+                let mut client_guard = self.grpc_client.write().await;
+                if client_guard.is_some() {
+                    tracing::info!("Resetting gRPC client for worker: {}", self.metadata.url);
+                    *client_guard = None;
+                }
                 Ok(())
             }
         }
