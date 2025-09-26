@@ -104,7 +104,7 @@ jobs:
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -135,7 +135,7 @@ jobs:
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -169,7 +169,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -198,7 +198,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
@@ -231,7 +231,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
@@ -264,7 +264,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
@@ -297,7 +297,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
@@ -330,7 +330,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -391,7 +391,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -444,7 +444,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -503,7 +503,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -535,7 +535,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -567,7 +567,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -596,7 +596,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -625,7 +625,7 @@ jobs:
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-b200-runner
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ secrets.TEST_HF_TOKEN }}
     strategy:
       fail-fast: false
     steps:
