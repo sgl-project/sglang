@@ -56,5 +56,6 @@ class TestIntelAMXAttnBackend(CustomTestCase):
     def test_latency_qwen_model(self):
         return DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
+
 if __name__ == "__main__":
     unittest.main()

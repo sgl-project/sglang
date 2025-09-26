@@ -44,6 +44,7 @@ jobs:
         run: |
           docker exec main_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
           docker exec main_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
+          docker exec main_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
           docker exec main_sglang_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
           docker exec main_sglang_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
