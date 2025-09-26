@@ -155,6 +155,7 @@ impl SglangSchedulerClient {
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens,
             ignore_eos: request.ignore_eos,
+            no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1) as i32,
             constraint: self.build_constraint(request, tool_call_constraint)?,
             ..Default::default()
