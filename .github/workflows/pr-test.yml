@@ -253,7 +253,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Hugging Face Login
-        run: pip install -U "huggingface_hub[cli]" && huggingface-cli login --token ${{ secrets.HF_TOKEN }}
+        run: |
+          echo ${{ secrets.HF_TOKEN }}
+          pip install -U "huggingface_hub[cli]" && huggingface-cli login --token $HF_TOKEN
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
