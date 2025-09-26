@@ -316,12 +316,29 @@ class LogitsProcessor(nn.Module):
             sample_indices = None
             input_logprob_indices = None
         else:
-            # Input logprobs are required.
+            # Prefill with input logprobs.
             # Find 4 different indices.
             # 1. pruned_states: hidden states that we want logprobs from.
             # 2. sample_indices: Indices that have sampled tokens.
             # 3. input_logprob_indices: Indices that have input logprob tokens.
             # 4. token_to_seq_idx: map each token to its sequence index
+            #
+            # Example
+            # -------
+            # Suppose a batch (flattened by sequence):
+            # [t00, t01, t02, t03, t10, t11, t12, t13, t14, t20, t21, t22, t23, t24, t25]
+            # extend_seq_lens_cpu           = [4, 5, 6]
+            # extend_logprob_start_lens_cpu = [0, 5, 3]
+            #
+            # Then, the results are:
+            # pruned_states         -> [t00, t01, t02, t03, t14, t23, t24, t25]
+            # sample_indices        -> [3, 4, 7]
+            # input_logprob_indices -> [0, 1, 2, 3, 5, 6, 7]
+            # token_to_seq_idx      -> [0, 0, 0, 0, 1, 2, 2, 2]
+            #
+            # If LOGITS_PROCESSER_CHUNK_SIZE = 3, the chunks will be computed in a chunked manner:
+            # [t00, t01, t02], [t03, t14, t23], [t24, t25]
+
             sample_index_pt = -1
             sample_indices = []
             input_logprob_indices_pt = 0
@@ -571,6 +588,14 @@ class LogitsProcessor(nn.Module):
             chunk_states = pruned_states[start_idx:end_idx]
             chunk_logits = self._get_logits(chunk_states, lm_head, logits_metadata)
 
+            # Initialize sampled_logits on first chunk
+            if i == 0:
+                sampled_logits = torch.empty(
+                    (sample_indices.shape[0], chunk_logits.shape[1]),
+                    dtype=chunk_logits.dtype,
+                    device=chunk_logits.device,
+                )
+
             # If there are no input logprobs in this chunk, skip
             if chunk_indices.numel() == 0:
                 continue
@@ -625,12 +650,6 @@ class LogitsProcessor(nn.Module):
             chunk_sample_mask = (sample_indices >= start_idx) & (
                 sample_indices < end_idx
             )
-            if i == 0:  # Initialize sampled_logits on first chunk
-                sampled_logits = torch.empty(
-                    (sample_indices.shape[0], chunk_logits.shape[1]),
-                    dtype=chunk_logits.dtype,
-                    device=chunk_logits.device,
-                )
             if chunk_sample_mask.any():
                 chunk_sample_indices = sample_indices[chunk_sample_mask] - start_idx
                 sampled_logits[chunk_sample_mask] = chunk_logits[chunk_sample_indices]
@@ -810,6 +829,9 @@ class LogitsProcessor(nn.Module):
         Returns:
             int: Number of remaining tokens to process in next chunk
         """
+        # No sequences in the chunk
+        if logprobs.shape[0] == 0:
+            return 0
 
         max_k = max(logits_metadata.top_logprobs_nums)
         ret = logprobs.topk(max_k, dim=1)
@@ -822,18 +844,21 @@ class LogitsProcessor(nn.Module):
         pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice]
 
         for n, (k, pruned_len) in enumerate(zip(top_k_nums, pruned_lens)):
-            # Adjust pruned length for first sequence
             if n == 0:
+                # For the first sequence, adjust the pruned length
                 pruned_len -= split_pruned_len
             else:
+                # After the first sequence, no split in the middle
                 split_pruned_len = 0
 
             if pruned_len <= 0:
-                if n == 0:
-                    input_top_logprobs_val.append([])
-                    input_top_logprobs_idx.append([])
+                # if pruned length is less than or equal to 0,
+                # there is no top-k logprobs to process
+                input_top_logprobs_val.append([])
+                input_top_logprobs_idx.append([])
                 continue
 
+            # Get the top-k logprobs
             val = []
             idx = []
             for j in range(pruned_len):
@@ -841,15 +866,18 @@ class LogitsProcessor(nn.Module):
                 if pt + j >= len(values):
                     next_split_pruned_len = split_pruned_len + j
                     break
+                # Append the top-k logprobs
                 val.append(values[pt + j][:k])
                 idx.append(indices[pt + j][:k])
 
-            if split_pruned_len <= 0 and len(val) > 0:
-                input_top_logprobs_val.append(val)
-                input_top_logprobs_idx.append(idx)
-            else:
-                input_top_logprobs_val[-1].extend(val)
-                input_top_logprobs_idx[-1].extend(idx)
+            # Append or extend based on whether the sequence was split across chunks
+            if len(val) > 0:
+                if split_pruned_len > 0:
+                    input_top_logprobs_val[-1].extend(val)
+                    input_top_logprobs_idx[-1].extend(idx)
+                else:
+                    input_top_logprobs_val.append(val)
+                    input_top_logprobs_idx.append(idx)
 
             pt += pruned_len
         return next_split_pruned_len
@@ -899,6 +927,11 @@ class LogitsProcessor(nn.Module):
         Returns:
             int: Number of remaining tokens to process in next chunk
         """
+
+        # No sequences in the chunk
+        if logprobs.shape[0] == 0:
+            return 0
+
         pt = 0
         next_split_pruned_len = 0
         token_ids_logprobs_chunk = logits_metadata.token_ids_logprobs[chunk_slice]
@@ -917,11 +950,13 @@ class LogitsProcessor(nn.Module):
                 split_pruned_len = 0
 
             if pruned_len <= 0:
-                if n == 0:
-                    input_token_ids_logprobs_val.append([])
-                    input_token_ids_logprobs_idx.append([])
+                # if pruned length is less than or equal to 0,
+                # there is no token ids logprobs to process
+                input_token_ids_logprobs_val.append([])
+                input_token_ids_logprobs_idx.append([])
                 continue
 
+            # Get the token ids logprobs
             val = []
             idx = []
             for j in range(pruned_len):
@@ -933,12 +968,14 @@ class LogitsProcessor(nn.Module):
                     val.append(logprobs[pt + j, token_ids].tolist())
                     idx.append(token_ids)
 
-            if split_pruned_len <= 0 and len(val) > 0:
-                input_token_ids_logprobs_val.append(val)
-                input_token_ids_logprobs_idx.append(idx)
-            elif len(val) > 0:
-                input_token_ids_logprobs_val[-1].extend(val)
-                input_token_ids_logprobs_idx[-1].extend(idx)
+            # Append or extend based on whether the sequence was split across chunks
+            if len(val) > 0:
+                if split_pruned_len > 0:
+                    input_token_ids_logprobs_val[-1].extend(val)
+                    input_token_ids_logprobs_idx[-1].extend(idx)
+                else:
+                    input_token_ids_logprobs_val.append(val)
+                    input_token_ids_logprobs_idx.append(idx)
 
             pt += pruned_len
         return next_split_pruned_len
