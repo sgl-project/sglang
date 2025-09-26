@@ -1359,7 +1359,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
         if (
             forward_batch.mha_merge_prefix_extend
-            and sum(forward_batch.extend_prefix_lens_cpu) != 0
+            and any(forward_batch.extend_prefix_lens_cpu)
         ):
             kv_a, k_pe = self._get_mla_kv_buffer(
                 forward_batch.fetch_kv_indices(), q.dtype, forward_batch
