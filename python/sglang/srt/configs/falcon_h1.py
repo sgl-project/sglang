@@ -24,7 +24,8 @@ from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_size, get_tensor_model_parallel_world_size
+from sglang.srt.layers.attention.mamba.mamba_utils import MambaStateShapeCalculator
 
 logger = logging.get_logger(__name__)
 
@@ -310,17 +311,29 @@ class FalconH1Config(PretrainedConfig):
 
     @property
     def hybrid_gdn_params(self):
-        world_size = get_attention_tp_size()
-        conv_dim = self.mamba_d_ssm + 2 * self.mamba_n_groups * self.mamba_d_state
+        world_size = get_tensor_model_parallel_world_size()
+
+        n_groups = self.mamba_n_groups
+        if self.mamba_n_groups % world_size != 0:
+            # - for TP we shard conv_dim by sharding on n_groups,
+            # - but if n_groups cannot divide tp_size, we need to
+            #   extend some extra groups
+            extra_groups = MambaStateShapeCalculator.extra_groups_for_head_shards(
+                self.mamba_n_groups, world_size)
+            n_groups += extra_groups
+
+        conv_dim = self.mamba_d_ssm + 2 * n_groups * self.mamba_d_state
+        
         conv_state_shape = (
             divide(conv_dim, world_size),
             self.mamba_d_conv - 1,
         )
 
+        # we TP-ize on the heads dimension
         temporal_state_shape = (
-            divide(self.mamba_d_state, world_size),
+            self.mamba_d_state,
             self.mamba_d_head,
-            self.mamba_n_heads,
+            divide(self.mamba_n_heads, world_size),
         )
         conv_dtype = torch.bfloat16
         dtype_map = {

@@ -573,7 +573,9 @@ class FalconH1ForCausalLM(nn.Module):
                 weight_loader = getattr(
                     param, "weight_loader", default_weight_loader
                 )
+                
                 weight_loader(param, loaded_weight)
+                
             loaded_params.add(name)
         return loaded_params
 
