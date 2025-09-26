@@ -220,7 +220,7 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.logit_scale = logit_scale
         self.use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
-        self.use__fp32_lm_head = global_server_args_dict["enable_fp32_lm_head"]
+        self.use_fp32_lm_head = global_server_args_dict["enable_fp32_lm_head"]
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
