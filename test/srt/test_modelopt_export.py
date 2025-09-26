@@ -144,8 +144,8 @@ class TestModelOptExport(unittest.TestCase):
             mock_restore.assert_called_once_with(self.mock_model, self.checkpoint_dir)
             mock_export.assert_called_once_with(self.mock_model, self.export_dir)
 
-    @patch("modelopt.torch.quantization.mtq.quantize")
-    @patch("modelopt.torch.quantization.mtq.print_quant_summary")
+    @patch("modelopt.torch.quantization.quantize")
+    @patch("modelopt.torch.quantization.print_quant_summary")
     @patch("modelopt.torch.quantization.utils.is_quantized")
     @patch("modelopt.torch.utils.dataset_utils.get_dataset_dataloader")
     @patch("modelopt.torch.utils.dataset_utils.create_forward_loop")
@@ -205,13 +205,143 @@ class TestModelOptExport(unittest.TestCase):
         """Test that ModelConfig properly handles export path."""
         # Arrange & Act
         model_config = ModelConfig(
-            model_path="test/model",
+            model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             modelopt_quant="fp8",
             modelopt_export_path=self.export_dir,
         )
 
         # Assert
         self.assertEqual(model_config.modelopt_export_path, self.export_dir)
+
+    def test_quantize_and_serve_config_validation(self):
+        """Test quantize_and_serve configuration validation."""
+        # Test valid configuration
+        model_config = ModelConfig(
+            model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            quantization="modelopt_fp8",
+            quantize_and_serve=True,
+        )
+        self.assertTrue(model_config.quantize_and_serve)
+
+        # Test invalid configuration - no quantization
+        with self.assertRaises(ValueError) as context:
+            ModelConfig(
+                model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                quantize_and_serve=True,
+            )
+        self.assertIn("requires ModelOpt quantization", str(context.exception))
+
+    def test_quantize_and_serve_with_pre_quantized_model(self):
+        """Test that quantize_and_serve fails with pre-quantized models."""
+        with patch.object(ModelConfig, "_is_already_quantized", return_value=True):
+            with self.assertRaises(ValueError) as context:
+                ModelConfig(
+                    model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                    quantization="modelopt_fp8",
+                    quantize_and_serve=True,
+                )
+            self.assertIn(
+                "cannot be used with pre-quantized models", str(context.exception)
+            )
+
+    def test_quantize_and_serve_workflow_selection(self):
+        """Test that quantize_and_serve selects the correct workflow."""
+        with patch(
+            "modelopt.torch.quantization.utils.is_quantized", return_value=False
+        ):
+            with patch.object(
+                self.model_loader, "_quantize_and_serve_workflow"
+            ) as mock_serve:
+                with patch.object(self.model_loader, "_load_modelopt_base_model"):
+                    mock_serve.return_value = Mock()
+
+                    # Create model config with quantize_and_serve=True
+                    model_config = ModelConfig(
+                        model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                        quantization="modelopt_fp8",
+                        quantize_and_serve=True,
+                    )
+                    device_config = DeviceConfig()
+
+                    # Act
+                    self.model_loader.load_model(
+                        model_config=model_config,
+                        device_config=device_config,
+                    )
+
+                    # Assert
+                    mock_serve.assert_called_once_with(model_config, device_config)
+
+    def test_standard_workflow_selection(self):
+        """Test that standard workflow is selected by default."""
+        with patch(
+            "modelopt.torch.quantization.utils.is_quantized", return_value=False
+        ):
+            with patch.object(
+                self.model_loader, "_standard_quantization_workflow"
+            ) as mock_standard:
+                with patch.object(self.model_loader, "_load_modelopt_base_model"):
+                    mock_standard.return_value = Mock()
+
+                    # Create model config without quantize_and_serve
+                    model_config = ModelConfig(
+                        model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                        quantization="modelopt_fp8",
+                        quantize_and_serve=False,
+                    )
+                    device_config = DeviceConfig()
+
+                    # Act
+                    self.model_loader.load_model(
+                        model_config=model_config,
+                        device_config=device_config,
+                    )
+
+                    # Assert
+                    mock_standard.assert_called_once_with(model_config, device_config)
+
+    @patch("modelopt.torch.quantization.quantize")
+    @patch("modelopt.torch.quantization.utils.is_quantized")
+    @patch("modelopt.torch.utils.dataset_utils.get_dataset_dataloader")
+    @patch("modelopt.torch.utils.dataset_utils.create_forward_loop")
+    def test_quantize_and_serve_workflow_no_export(
+        self, mock_create_loop, mock_get_dataloader, mock_is_quantized, mock_quantize
+    ):
+        """Test that quantize-and-serve workflow doesn't export."""
+        # Arrange
+        mock_is_quantized.return_value = False
+        mock_dataloader = Mock()
+        mock_get_dataloader.return_value = mock_dataloader
+        mock_calibrate_loop = Mock()
+        mock_create_loop.return_value = mock_calibrate_loop
+        mock_quantize.return_value = None
+
+        model_config = ModelConfig(
+            model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            quantization="modelopt_fp8",
+            quantize_and_serve=True,
+            modelopt_export_path=self.export_dir,  # Should be ignored
+        )
+        device_config = DeviceConfig()
+
+        with patch.object(
+            self.model_loader, "_setup_modelopt_quantization"
+        ) as mock_setup:
+            with patch.object(
+                self.model_loader, "_load_modelopt_base_model"
+            ) as mock_load_base:
+                mock_load_base.return_value = self.mock_model
+
+                # Act
+                result = self.model_loader._quantize_and_serve_workflow(
+                    model_config, device_config
+                )
+
+                # Assert
+                mock_setup.assert_called_once()
+                args, kwargs = mock_setup.call_args
+                self.assertIsNone(kwargs.get("export_path"))  # No export in serve mode
+                self.assertIsNotNone(result)
 
     def test_validate_export_success(self):
         """Test validation of a valid export directory."""
@@ -370,7 +500,7 @@ class TestModelOptExportIntegration(unittest.TestCase):
         mock_model.return_value = Mock(spec=torch.nn.Module)
 
         model_config = ModelConfig(
-            model_path="test/model",
+            model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             modelopt_quant="fp8",
             modelopt_export_path=self.export_dir,
         )
