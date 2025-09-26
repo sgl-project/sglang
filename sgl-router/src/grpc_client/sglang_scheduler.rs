@@ -13,6 +13,7 @@ pub mod proto {
 // package sglang.grpc.scheduler; generates a nested module structure
 
 /// gRPC client for SGLang scheduler
+#[derive(Clone)]
 pub struct SglangSchedulerClient {
     client: proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
 }
@@ -103,6 +104,7 @@ impl SglangSchedulerClient {
             logprob_start_len: -1,
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: body.return_hidden_states,
+            stream: body.stream,
             ..Default::default()
         };
 
@@ -221,7 +223,6 @@ mod tests {
 
     #[test]
     fn test_proto_types_compilation() {
-        // Test that protobuf types can be constructed
         let health_req = proto::HealthCheckRequest {
             tokenized: Some(proto::TokenizedInput {
                 original_text: "test".to_string(),
@@ -318,8 +319,6 @@ mod tests {
     }
 
     // TODO: SessionParams not in current proto - skip test
-    // #[test]
-    // fn test_session_params() { ... }
 
     #[test]
     fn test_embed_request() {
@@ -347,7 +346,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_connect_invalid_endpoint() {
-        // Test connecting to an invalid endpoint should return error
         let result = SglangSchedulerClient::connect("invalid://endpoint").await;
         assert!(result.is_err());
     }
@@ -363,24 +361,21 @@ mod tests {
         assert_eq!(tokenized.input_ids, vec![1, 15043, 1917, 2]);
     }
 
-    // Test response type construction
     #[test]
     fn test_generate_stream_chunk() {
         let chunk = proto::GenerateStreamChunk {
-            token_id: 1234,
+            token_ids: vec![1234, 5678],
             prompt_tokens: 5,
             completion_tokens: 2,
             cached_tokens: 3,
             ..Default::default()
         };
 
-        assert_eq!(chunk.token_id, 1234);
+        assert_eq!(chunk.token_ids, vec![1234, 5678]);
         assert_eq!(chunk.prompt_tokens, 5);
         assert_eq!(chunk.completion_tokens, 2);
         assert_eq!(chunk.cached_tokens, 3);
     }
 
     // TODO: ModelInfo not in current proto - skip test
-    // #[test]
-    // fn test_model_info() { ... }
 }
