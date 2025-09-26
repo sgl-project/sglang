@@ -496,25 +496,23 @@ impl GrpcRouter {
         let mut builder = StopSequenceDecoderBuilder::new(self.tokenizer.clone())
             .skip_special_tokens(original_request.skip_special_tokens);
 
-        if original_request.no_stop_trim {
-            // Don't trim - include stop sequences and tokens IDs in visible
-            for seq in stop_sequences {
-                builder = builder.visible_stop_sequence(seq);
-            }
-            if let Some(stop_token_ids) = &original_request.stop_token_ids {
-                for &token_id in stop_token_ids {
-                    builder = builder.visible_stop_token(token_id);
-                }
-            }
-        } else {
-            // Trim - exclude stop sequences and token IDs from output (default behavior)
-            for seq in stop_sequences {
-                builder = builder.stop_sequence(seq);
-            }
-            if let Some(stop_token_ids) = &original_request.stop_token_ids {
-                for &token_id in stop_token_ids {
-                    builder = builder.stop_token(token_id);
-                }
+        // Add stop sequences (visible if no_stop_trim is true, hidden otherwise)
+        for seq in stop_sequences {
+            builder = if original_request.no_stop_trim {
+                builder.visible_stop_sequence(seq)
+            } else {
+                builder.stop_sequence(seq)
+            };
+        }
+
+        // Add stop token IDs (visible if no_stop_trim is true, hidden otherwise)
+        if let Some(stop_token_ids) = &original_request.stop_token_ids {
+            for &token_id in stop_token_ids {
+                builder = if original_request.no_stop_trim {
+                    builder.visible_stop_token(token_id)
+                } else {
+                    builder.stop_token(token_id)
+                };
             }
         }
 
