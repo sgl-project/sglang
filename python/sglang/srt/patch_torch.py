@@ -21,6 +21,7 @@ from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
+
 def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
 
