@@ -87,7 +87,7 @@ class TransferInfo:
             if msg[6] == b"":
                 dst_extra_pool_indices = []
             else:
-                dst_extra_pool_indices = list(np.frombuffer(msg[6], dtype=np.int32))
+                dst_extra_pool_indices = list(np.frombuffer(msg[6], dtype=np.int64))
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -635,6 +635,7 @@ class MooncakeKVManager(CommonKVManager):
             src_addr = (
                 prefill_extra_pool_data_ptrs[i] + length * prefill_extra_pool_indice[0]
             )
+            logger.info(f"{dst_extra_pool_data_ptrs[i]=}, {length=}, {req.dst_extra_pool_indices[0]=}")
             dst_addr = (
                 dst_extra_pool_data_ptrs[i] + length * req.dst_extra_pool_indices[0]
             )
@@ -1221,7 +1222,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             (
                                 np.array(
                                     extra_pool_indices,
-                                    dtype=np.int32,
+                                    dtype=np.int64,
                                 ).tobytes()
                                 if not is_dummy
                                 else b""

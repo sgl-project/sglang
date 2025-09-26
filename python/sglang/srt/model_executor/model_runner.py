@@ -1489,12 +1489,36 @@ class ModelRunner:
                 extra_max_context_len += self.server_args.speculative_num_draft_tokens
 
             if self.server_args.disaggregation_mode == "decode":
-                from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+                from sglang.srt.disaggregation.decode import DecodeReqToTokenPool, HybridDecodeReqToTokenPool
 
                 # subscribe memory for pre-allocated requests
                 # if max_num_reqs <= 32, we pre-allocate 2x requests
                 pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
-                self.req_to_token_pool = DecodeReqToTokenPool(
+                if self.is_hybrid_gdn:
+                    config = self.model_config.hf_config
+                    (
+                        conv_state_shape,
+                        temporal_state_shape,
+                        conv_dtype,
+                        ssm_dtype,
+                        mamba_layers,
+                    ) = config.hybrid_gdn_params
+                    self.req_to_token_pool = HybridDecodeReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        conv_state_shape=conv_state_shape,
+                        temporal_state_shape=temporal_state_shape,
+                        conv_dtype=conv_dtype,
+                        ssm_dtype=ssm_dtype,
+                        mamba_layers=mamba_layers,
+                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        pre_alloc_size=pre_alloc_size,
+                    )
+                else:
+                    self.req_to_token_pool = DecodeReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
@@ -1623,6 +1647,7 @@ class ModelRunner:
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    mamba_pool=self.req_to_token_pool.mamba_pool
                 )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(

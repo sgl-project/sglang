@@ -48,7 +48,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool, HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
@@ -139,6 +139,7 @@ class HybridDecodeReqToTokenPool(HybridReqToTokenPool):
         pre_alloc_size: int,
     ):
         DecodeReqToTokenPool.__init__(
+            self,
             size=size,
             max_context_len=max_context_len,
             device=device,
@@ -566,7 +567,11 @@ class DecodePreallocQueue:
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
-        req_pool_indices = self.req_to_token_pool.alloc(1)
+        if hasattr(self.req_to_token_pool, "rid_to_mamba_index_mapping"):
+            self.req_to_token_pool.alloc(1, [req])
+        else:
+            self.req_to_token_pool.alloc(1)
+        req_pool_indices = self.req_to_token_pool.alloc(1, [req])
 
         assert (
             req_pool_indices is not None
