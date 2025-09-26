@@ -15,7 +15,7 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
 from functools import lru_cache, partial
-from typing import Callable, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -27,7 +27,11 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+from sglang.srt.configs.qwen3_vl import (
+    Qwen3VLConfig,
+    Qwen3VLTextConfig,
+    Qwen3VLVisionConfig,
+)
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -39,14 +43,22 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2_vl import Qwen2VLVideoInputs
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
 
 # === Vision Encoder === #
 
@@ -196,7 +208,7 @@ class Qwen3_VisionBlock(nn.Module):
         return x
 
 
-class Qwen3_VisionPatchMerger(nn.Module):
+class Qwen3VLMoeVisionPatchMerger(nn.Module):
 
     def __init__(
         self,
@@ -246,7 +258,7 @@ class Qwen3_VisionPatchMerger(nn.Module):
         return out
 
 
-class Qwen3_VisionTransformer(nn.Module):
+class Qwen3VLMoeVisionModel(nn.Module):
 
     def __init__(
         self,
@@ -263,10 +275,10 @@ class Qwen3_VisionTransformer(nn.Module):
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size**2
         self.temporal_patch_size = vision_config.temporal_patch_size
+        # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
-
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
@@ -286,7 +298,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 for layer_idx in range(vision_config.depth)
             ]
         )
-        self.merger = Qwen3_VisionPatchMerger(
+        self.merger = Qwen3VLMoeVisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=self.hidden_size,
             norm_layer=norm_layer,
@@ -297,7 +309,7 @@ class Qwen3_VisionTransformer(nn.Module):
 
         self.deepstack_merger_list = nn.ModuleList(
             [
-                Qwen3_VisionPatchMerger(
+                Qwen3VLMoeVisionPatchMerger(
                     dim=vision_config.out_hidden_size,
                     context_dim=self.hidden_size,
                     spatial_merge_size=self.spatial_merge_size,
@@ -460,7 +472,6 @@ class Qwen3_VisionTransformer(nn.Module):
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
-        # max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
         x = x.unsqueeze(1)
 
         deepstack_feature_lists = []
@@ -519,15 +530,13 @@ class Qwen3LLMModel(Qwen3Model):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        super().__init__(
-            config=config.text_config, quant_config=quant_config, prefix=prefix
-        )
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         if not self.pp_group.is_first_rank:
             assert self.start_layer >= len(
                 config.vision_config.deepstack_visual_indexes
             ), "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
 
-        self.hidden_size = config.text_config.hidden_size
+        self.hidden_size = config.hidden_size
         self.deepstack_embed_to_decoder_layer = range(
             len(config.vision_config.deepstack_visual_indexes)
         )
@@ -607,26 +616,27 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         config: Qwen3VLConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
 
-        self.config = config.text_config
-        self.visual = Qwen3_VisionTransformer(
+        self.config: Qwen3VLConfig = config
+        self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
             quant_config=quant_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("visual", prefix),
         )
 
-        self.model = Qwen3LLMModel(
-            config=config,
+        self.model = language_model_cls(
+            config=config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
 
-        if config.tie_word_embeddings:
+        if config.text_config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
@@ -635,7 +645,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = "mrope_section" in self.config.text_config.rope_scaling
 
         self.logits_processor = LogitsProcessor(config.text_config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -645,17 +655,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # deepstack
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-
-    @property
-    def use_deepstack(self) -> bool:
-        return hasattr(self, "deepstack_visual_indexes")
+        self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
     def separate_deepstack_embeds(self, embedding):
         assert (
             embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
         ), f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
 
-        separate_index = self.config.hidden_size
+        separate_index = self.config.text_config.hidden_size
         input_embeds = embedding[:, :separate_index]
         input_deepstack_embeds = embedding[:, separate_index:]
         return input_embeds, input_deepstack_embeds

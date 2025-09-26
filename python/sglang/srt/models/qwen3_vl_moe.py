@@ -14,50 +14,24 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
-from functools import lru_cache, partial
-from typing import Callable, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
+from functools import lru_cache
+from typing import Iterable, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
-from transformers import BatchFeature
-from transformers.activations import ACT2FN
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-)
 
-from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeVisionConfig
+from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
-    get_pp_group,
     get_tensor_model_parallel_rank,
 )
 from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    general_mm_embed_routine,
-)
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputs,
-    global_server_args_dict,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
-from sglang.srt.models.qwen3_vl import (
-    Qwen3_VisionTransformer,
-    Qwen3VLForConditionalGeneration,
-)
-from sglang.srt.utils import add_prefix
+from sglang.srt.models.qwen3_moe import Qwen3MoeModel
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 logger = logging.getLogger(__name__)
 
@@ -68,27 +42,15 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
     def __init__(
         self,
         *,
-        config: Qwen3VLMoeConfig,
+        config: Qwen3VLMoeTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-
         self.hidden_size = config.hidden_size
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
-
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds
 
     def forward(
         self,
@@ -128,7 +90,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             )
 
             # process deepstack
-            if input_deepstack_embeds is not None and layer_idx in range(3):
+            if input_deepstack_embeds is not None and layer_idx < 3:
                 sep = self.hidden_size * layer_idx
                 hidden_states = (
                     hidden_states
@@ -158,98 +120,12 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
 class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(
         self,
-        *,
         config: Qwen3VLMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        language_model_cls=Qwen3MoeLLMModel,
     ):
-        super(Qwen3VLForConditionalGeneration, self).__init__()
-        self.config = config.text_config
-
-        self.visual = Qwen3_VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-        )
-
-        self.model = Qwen3MoeLLMModel(
-            config=config.text_config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.text_config.vocab_size,
-                config.text_config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
-
-        self.logits_processor = LogitsProcessor(config.text_config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-
-        # deepstack
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
-        self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-
-    @property
-    def use_deepstack(self) -> bool:
-        return hasattr(self, "deepstack_visual_indexes")
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        get_embedding: bool = False,
-    ):
-        """Run forward pass for Qwen3-VL.
-
-        Args:
-            input_ids: Flattened (concatenated) input_ids corresponding to a
-                batch.
-            positions: Flattened (concatenated) position ids corresponding to a
-                batch.
-                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
-                opensource models), the shape will be `(3, seq_len)`,
-                otherwise it will be `(seq_len,).
-                (Use input_metadata.mrope_positions to replace it)
-        """
-        if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
-
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
-
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-            use_deepstack=self.use_deepstack,
-        )
-
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            return self.pooler(hidden_states, forward_batch)
+        super().__init__(config, quant_config, prefix, language_model_cls)
 
     def load_fused_expert_weights(
         self,
@@ -338,8 +214,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self._cached_params_dict = dict(self.named_parameters())
         params_dict = self._cached_params_dict
         for name, loaded_weight in weights:
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+            name = name.replace(r"model.language_model.", r"model.")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
