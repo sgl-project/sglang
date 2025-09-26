@@ -594,6 +594,7 @@ impl GrpcRouter {
                     if should_stop {
                         break;
                     }
+                    continue;
                 }
                 Some(proto::generate_response::Response::Complete(_complete)) => {
                     // Flush any remaining text
@@ -627,95 +628,77 @@ impl GrpcRouter {
     ) -> Response {
         let mut stop_decoder = self.create_stop_decoder(original_request);
 
+        // Small helpers to log + return a uniform 500
+        let fail_str = |msg: &'static str| -> Response {
+            error!("{}", msg);
+            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+        };
+        let fail_fmt = |prefix: &str, e: &dyn std::fmt::Display| -> Response {
+            error!("{}{}", prefix, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{}{}", prefix, e),
+            )
+                .into_response()
+        };
+
+        // Start generation
+        let mut stream = match client.generate(request).await {
+            Ok(s) => s,
+            Err(e) => return fail_fmt("Failed to start generation: ", &e),
+        };
+
         // Get the single Complete response
-        let response = match client.generate(request).await {
-            Ok(mut stream) => match stream.next().await {
-                Some(Ok(gen_response)) => gen_response,
-                Some(Err(e)) => {
-                    error!("Failed to get GenerateResponse: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to get GenerateResponse: {}", e),
-                    )
-                        .into_response();
-                }
-                None => {
-                    error!("No response from server");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "No response from server")
-                        .into_response();
-                }
-            },
-            Err(e) => {
-                error!("Failed to start generation: {}", e);
+        let gen_response = match stream.next().await {
+            Some(Ok(r)) => r,
+            Some(Err(e)) => return fail_fmt("Failed to get GenerateResponse: ", &e),
+            None => return fail_str("No response from server"),
+        };
+
+        // Extract the expected variant early
+        let complete = match gen_response.response {
+            Some(proto::generate_response::Response::Complete(c)) => c,
+            Some(proto::generate_response::Response::Error(err)) => {
+                error!("Generation failed: {}", err.message);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to start generation: {}", e),
+                    format!("Generation failed: {}", err.message),
                 )
                     .into_response();
             }
+            Some(proto::generate_response::Response::Chunk(_)) => {
+                return fail_str("Unexpected chunk response for non-streaming request")
+            }
+            None => return fail_str("Empty response from server"),
         };
 
-        match response.response {
-            Some(proto::generate_response::Response::Complete(complete)) => {
-                // Token IDs are now u32, no conversion needed
-                let mut final_text = String::new();
+        // Decode tokens
+        let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
+            Ok(o) => o,
+            Err(e) => return fail_fmt("Failed to process tokens: ", &e),
+        };
 
-                match stop_decoder.process_tokens(&complete.output_ids) {
-                    Ok(outputs) => {
-                        for output in outputs {
-                            match output {
-                                SequenceDecoderOutput::Text(text) => final_text.push_str(&text),
-                                SequenceDecoderOutput::StoppedWithText(text) => {
-                                    final_text.push_str(&text);
-                                    break;
-                                }
-                                SequenceDecoderOutput::Stopped => break,
-                                SequenceDecoderOutput::Held => {}
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to process tokens: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to process tokens: {}", e),
-                        )
-                            .into_response();
-                    }
+        // Accumulate text with early breaks
+        let mut final_text = String::new();
+        for output in outputs {
+            match output {
+                SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
+                SequenceDecoderOutput::StoppedWithText(t) => {
+                    final_text.push_str(&t);
+                    break;
                 }
-
-                // Flush any remaining text
-                if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
-                    final_text.push_str(&text);
-                }
-                // TODO: Create proper OpenAI-compatible response
-                (StatusCode::OK, format!("Final text: {}", final_text)).into_response()
-            }
-            Some(proto::generate_response::Response::Error(error)) => {
-                error!("Generation failed: {}", error.message);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Generation failed: {}", error.message),
-                )
-                    .into_response()
-            }
-            Some(proto::generate_response::Response::Chunk(_)) => {
-                error!("Unexpected chunk response for non-streaming request");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Unexpected chunk response for non-streaming request",
-                )
-                    .into_response()
-            }
-            None => {
-                error!("Empty response from server");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Empty response from server",
-                )
-                    .into_response()
+                SequenceDecoderOutput::Stopped => break,
+                SequenceDecoderOutput::Held => {}
             }
         }
+
+        // Flush remaining text
+        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+            final_text.push_str(&t);
+        }
+
+        // TODO: Create proper OpenAI-compatible response
+        (StatusCode::OK, format!("Final text: {}", final_text)).into_response()
     }
 }
 
