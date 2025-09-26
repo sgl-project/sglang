@@ -9,7 +9,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_musa
 
 
 def is_cuda_v2():
@@ -86,6 +86,14 @@ def get_cuda_info():
             cuda_info.update(_get_cuda_version_info())
 
         return cuda_info
+    elif is_musa():
+        cuda_info = {"MUSA available": torch.cuda.is_available()}
+
+        if cuda_info["MUSA available"]:
+            cuda_info.update(_get_gpu_info())
+            cuda_info.update(_get_cuda_version_info())
+
+        return cuda_info
 
 
 def _get_gpu_info():
@@ -130,11 +138,21 @@ def _get_cuda_version_info():
 
         return cuda_info
     elif is_hip():
-        from torch.utils.cpp_extension import ROCM_HOME as ROCM_HOME
+        from torch.utils.cpp_extension import ROCM_HOME
 
         cuda_info = {"ROCM_HOME": ROCM_HOME}
 
         if ROCM_HOME and os.path.isdir(ROCM_HOME):
+            cuda_info.update(_get_nvcc_info())
+            cuda_info.update(_get_cuda_driver_version())
+
+        return cuda_info
+    elif is_musa():
+        from torch_musa.utils.musa_extension import MUSA_HOME
+
+        cuda_info = {"MUSA_HOME": MUSA_HOME}
+
+        if MUSA_HOME and os.path.isdir(MUSA_HOME):
             cuda_info.update(_get_nvcc_info())
             cuda_info.update(_get_cuda_driver_version())
 
@@ -184,6 +202,23 @@ def _get_nvcc_info():
             }
         except subprocess.SubprocessError:
             return {"HIPCC": "Not Available"}
+    elif is_musa():
+        from torch_musa.utils.musa_extension import MUSA_HOME
+
+        try:
+            mcc = os.path.join(MUSA_HOME, "bin/mcc")
+            mcc_output = (
+                subprocess.check_output(f'"{mcc}" --version', shell=True)
+                .decode("utf-8")
+                .strip()
+            )
+            return {
+                "MCC": mcc_output[
+                    mcc_output.rfind("mcc version") : mcc_output.rfind("Target")
+                ].strip()
+            }
+        except subprocess.SubprocessError:
+            return {"MCC": "Not Available"}
     else:
         return {"NVCC": "Not Available"}
 
@@ -226,6 +261,24 @@ def _get_cuda_driver_version():
             return {"ROCM Driver Version": ver}
         except subprocess.SubprocessError:
             return {"ROCM Driver Version": "Not Available"}
+    elif is_musa():
+        try:
+            output = subprocess.check_output(
+                [
+                    "mthreads-gmi",
+                    "-q",
+                ],
+                text=True,
+            )
+            ver = "Not Found"
+            for line in output.splitlines():
+                if "Driver Version" in line:
+                    ver = line.split(":", 1)[1].strip()
+                    break
+
+            return {"MUSA Driver Version": ver}
+        except subprocess.SubprocessError:
+            return {"MUSA Driver Version": "Not Available"}
     else:
         return {"CUDA Driver Version": "Not Available"}
 
@@ -250,6 +303,18 @@ def get_gpu_topology():
         try:
             result = subprocess.run(
                 ["rocm-smi", "--showtopotype"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            return "\n" + result.stdout if result.returncode == 0 else None
+        except subprocess.SubprocessError:
+            return None
+    elif is_musa():
+        try:
+            result = subprocess.run(
+                ["mthreads-gmi", "topo", "-m"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -289,6 +354,8 @@ def check_env():
             env_info["NVIDIA Topology"] = gpu_topo
         elif is_hip():
             env_info["AMD Topology"] = gpu_topo
+        elif is_musa():
+            env_info["MTHREADS Topology"] = gpu_topo
 
     hypervisor_vendor = get_hypervisor_vendor()
     if hypervisor_vendor:
