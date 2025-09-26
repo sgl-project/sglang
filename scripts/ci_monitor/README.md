@@ -551,7 +551,7 @@ Total performance records collected: 1,247
 
 Performance test breakdown:
   performance-test-1-gpu-part-1: 7 tests, 423 records
-  performance-test-1-gpu-part-2: 5 tests, 387 records  
+  performance-test-1-gpu-part-2: 5 tests, 387 records
   performance-test-2-gpu: 6 tests, 437 records
 
 Generated files:
@@ -616,7 +616,7 @@ Both CI and Performance analyzers are available as a GitHub Actions workflow tha
 - Generates detailed failure reports
 - Uploads analysis results as JSON artifacts
 
-### Performance Analysis  
+### Performance Analysis
 - Analyzes the last 1000 PR Test runs (configurable)
 - Generates performance trend data and charts
 - Uploads CSV tables and PNG charts as artifacts
@@ -634,7 +634,7 @@ You can manually trigger the workflow from the GitHub Actions tab with custom pa
 
 The workflow generates and uploads the following artifacts:
 - **CI Analysis**: JSON files with failure analysis data
-- **Performance Analysis**: 
+- **Performance Analysis**:
   - CSV files with performance metrics organized by test type
   - PNG charts showing performance trends over time
   - Directory structure: `performance_tables_{timestamp}/`
