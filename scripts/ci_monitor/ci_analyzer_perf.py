@@ -5,6 +5,7 @@ Collect performance data based on actual log format
 """
 
 import argparse
+import base64
 import csv
 import os
 import re
@@ -108,6 +109,10 @@ class SGLangPerfAnalyzer:
 
         # Setup matplotlib fonts and styles
         self._setup_matplotlib()
+        
+        # GitHub data repository settings
+        self.data_repo = "sglang-bot/sglang-ci-data"
+        self.data_branch = "main"
 
     def _setup_matplotlib(self):
         """Setup matplotlib fonts and styles"""
@@ -682,6 +687,74 @@ class SGLangPerfAnalyzer:
 
         print("\n" + "=" * 60)
 
+    def upload_file_to_github(self, file_path: str, github_path: str, commit_message: str) -> bool:
+        """Upload a file to GitHub repository"""
+        try:
+            # Read file content
+            with open(file_path, 'rb') as f:
+                content = f.read()
+            
+            # Encode content to base64
+            content_encoded = base64.b64encode(content).decode('utf-8')
+            
+            # Check if file exists to get SHA
+            check_url = f"{self.base_url}/repos/{self.data_repo}/contents/{github_path}"
+            check_response = self.session.get(check_url)
+            
+            sha = None
+            if check_response.status_code == 200:
+                sha = check_response.json().get('sha')
+            
+            # Prepare upload data
+            upload_data = {
+                "message": commit_message,
+                "content": content_encoded,
+                "branch": self.data_branch
+            }
+            
+            if sha:
+                upload_data["sha"] = sha
+            
+            # Upload file
+            response = self.session.put(check_url, json=upload_data)
+            response.raise_for_status()
+            
+            print(f"    ✅ Uploaded: {github_path}")
+            return True
+            
+        except Exception as e:
+            print(f"    ❌ Failed to upload {github_path}: {e}")
+            return False
+
+    def upload_performance_data_to_github(self, output_dir: str):
+        """Upload performance_tables to GitHub with original structure"""
+        print("📤 Uploading performance data to GitHub...")
+        
+        # Generate timestamp for this upload
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        uploaded_count = 0
+        
+        # Upload all files maintaining original structure
+        for root, dirs, files in os.walk(output_dir):
+            for file in files:
+                local_path = os.path.join(root, file)
+                
+                # Keep original directory structure
+                rel_path = os.path.relpath(local_path, output_dir)
+                github_path = f"performance_data/{timestamp}/{rel_path}".replace("\\", "/")
+                
+                # Upload file
+                commit_msg = f"Add performance data: {rel_path} ({timestamp})"
+                if self.upload_file_to_github(local_path, github_path, commit_msg):
+                    uploaded_count += 1
+        
+        print(f"📤 Uploaded {uploaded_count} files to GitHub")
+        
+        # Print access info
+        base_url = f"https://github.com/{self.data_repo}/tree/{self.data_branch}/performance_data/{timestamp}"
+        print(f"🔗 View uploaded data at: {base_url}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="SGLang CI Performance Analyzer")
@@ -696,6 +769,11 @@ def main():
         "--output-dir",
         default="performance_tables",
         help="Output directory (default: performance_tables)",
+    )
+    parser.add_argument(
+        "--upload-to-github",
+        action="store_true",
+        help="Upload results to sglang-bot/sglang-ci-data repository",
     )
 
     args = parser.parse_args()
@@ -717,6 +795,10 @@ def main():
         # Generate performance tables
         analyzer.generate_performance_tables(test_data, args.output_dir)
 
+        # Upload to GitHub if requested
+        if args.upload_to_github:
+            analyzer.upload_performance_data_to_github(args.output_dir)
+        
         # Generate summary report
         analyzer.generate_summary_report(test_data)
 
