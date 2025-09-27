@@ -313,7 +313,7 @@ pub struct ChatCompletionRequest {
 
     /// Specific token IDs to use as stop conditions
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
     #[serde(default)]
@@ -564,7 +564,7 @@ pub struct CompletionRequest {
 
     /// Specific token IDs to use as stop conditions
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
     #[serde(default)]
@@ -1864,7 +1864,7 @@ pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_stop_trim: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
