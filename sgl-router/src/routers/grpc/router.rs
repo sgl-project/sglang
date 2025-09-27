@@ -818,12 +818,10 @@ impl GrpcRouter {
             }
         }
 
-        // Step 3: Map finish reason from proto to OpenAI format
+        // Step 3: Map finish reason from proto to OpenAI format and extract matched
         let finish_reason_str = match proto::generate_complete::FinishReason::try_from(final_finish_reason) {
             Ok(proto::generate_complete::FinishReason::Stop) => "stop",
             Ok(proto::generate_complete::FinishReason::Length) => "length",
-            Ok(proto::generate_complete::FinishReason::EosToken) => "stop",
-            Ok(proto::generate_complete::FinishReason::StopStr) => "stop",
             Ok(proto::generate_complete::FinishReason::Abort) => "abort",
             _ => "stop", // Default fallback
         };
@@ -833,6 +831,17 @@ impl GrpcRouter {
             "tool_calls"
         } else {
             finish_reason_str
+        };
+
+        // Extract matched_stop information from proto
+        let matched_stop = match &complete.matched_stop {
+            Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => {
+                Some(serde_json::Value::Number(serde_json::Number::from(*token_id)))
+            }
+            Some(proto::generate_complete::MatchedStop::MatchedStopStr(stop_str)) => {
+                Some(serde_json::Value::String(stop_str.clone()))
+            }
+            None => None,
         };
 
         // Step 4: Build ChatCompletionMessage (proper response message type)
@@ -849,7 +858,7 @@ impl GrpcRouter {
             message: chat_message,
             logprobs: None,
             finish_reason: Some(final_finish_reason_str.to_string()),
-            matched_stop: None,
+            matched_stop,
             hidden_states: None,
         };
 

@@ -179,18 +179,14 @@ class GenerateStreamChunk(_message.Message):
     def __init__(self, token_ids: _Optional[_Iterable[int]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., logprobs: _Optional[_Union[LogProbs, _Mapping]] = ..., hidden_states: _Optional[_Iterable[float]] = ...) -> None: ...
 
 class GenerateComplete(_message.Message):
-    __slots__ = ("output_ids", "finish_reason", "prompt_tokens", "completion_tokens", "cached_tokens", "all_logprobs", "all_hidden_states")
+    __slots__ = ("output_ids", "finish_reason", "prompt_tokens", "completion_tokens", "cached_tokens", "all_logprobs", "all_hidden_states", "matched_token_id", "matched_stop_str")
     class FinishReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         STOP: _ClassVar[GenerateComplete.FinishReason]
         LENGTH: _ClassVar[GenerateComplete.FinishReason]
-        EOS_TOKEN: _ClassVar[GenerateComplete.FinishReason]
-        STOP_STR: _ClassVar[GenerateComplete.FinishReason]
         ABORT: _ClassVar[GenerateComplete.FinishReason]
     STOP: GenerateComplete.FinishReason
     LENGTH: GenerateComplete.FinishReason
-    EOS_TOKEN: GenerateComplete.FinishReason
-    STOP_STR: GenerateComplete.FinishReason
     ABORT: GenerateComplete.FinishReason
     OUTPUT_IDS_FIELD_NUMBER: _ClassVar[int]
     FINISH_REASON_FIELD_NUMBER: _ClassVar[int]
@@ -199,6 +195,8 @@ class GenerateComplete(_message.Message):
     CACHED_TOKENS_FIELD_NUMBER: _ClassVar[int]
     ALL_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     ALL_HIDDEN_STATES_FIELD_NUMBER: _ClassVar[int]
+    MATCHED_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
+    MATCHED_STOP_STR_FIELD_NUMBER: _ClassVar[int]
     output_ids: _containers.RepeatedScalarFieldContainer[int]
     finish_reason: GenerateComplete.FinishReason
     prompt_tokens: int
@@ -206,7 +204,9 @@ class GenerateComplete(_message.Message):
     cached_tokens: int
     all_logprobs: _containers.RepeatedCompositeFieldContainer[LogProbs]
     all_hidden_states: _containers.RepeatedCompositeFieldContainer[HiddenStates]
-    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., finish_reason: _Optional[_Union[GenerateComplete.FinishReason, str]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., all_logprobs: _Optional[_Iterable[_Union[LogProbs, _Mapping]]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ...) -> None: ...
+    matched_token_id: int
+    matched_stop_str: str
+    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., finish_reason: _Optional[_Union[GenerateComplete.FinishReason, str]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., all_logprobs: _Optional[_Iterable[_Union[LogProbs, _Mapping]]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ..., matched_token_id: _Optional[int] = ..., matched_stop_str: _Optional[str] = ...) -> None: ...
 
 class GenerateError(_message.Message):
     __slots__ = ("message", "http_status_code", "details")

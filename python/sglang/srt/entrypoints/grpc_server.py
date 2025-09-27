@@ -492,13 +492,33 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> sglang_scheduler_pb2.GenerateResponse:
         """Create a completion response."""
 
-        # Determine finish reason
-        finish_reason = sglang_scheduler_pb2.GenerateComplete.STOP
+        # Extract meta info and finish reason details
         meta_info = output.get("meta_info", {})
-        if meta_info.get("finish_reason") == "length":
-            finish_reason = sglang_scheduler_pb2.GenerateComplete.LENGTH
-        elif meta_info.get("finish_reason") == "eos_token":
-            finish_reason = sglang_scheduler_pb2.GenerateComplete.EOS_TOKEN
+        finish_reason_data = meta_info.get("finish_reason")
+
+        # Determine finish reason from the type field
+        finish_reason = sglang_scheduler_pb2.GenerateComplete.STOP
+        if finish_reason_data:
+            if isinstance(finish_reason_data, dict):
+                finish_reason_type = finish_reason_data.get("type")
+            else:
+                # Handle legacy string format
+                finish_reason_type = finish_reason_data
+
+            if finish_reason_type == "length":
+                finish_reason = sglang_scheduler_pb2.GenerateComplete.LENGTH
+            elif finish_reason_type == "abort":
+                finish_reason = sglang_scheduler_pb2.GenerateComplete.ABORT
+            # All other types (stop, eos_token, etc.) default to STOP
+
+        # Extract matched_stop information
+        matched_stop_kwargs = {}
+        if isinstance(finish_reason_data, dict) and "matched" in finish_reason_data:
+            matched = finish_reason_data["matched"]
+            if isinstance(matched, int):
+                matched_stop_kwargs["matched_token_id"] = matched
+            elif isinstance(matched, str):
+                matched_stop_kwargs["matched_stop_str"] = matched
 
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
@@ -510,6 +530,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     "completion_tokens", len(output.get("token_ids", []))
                 ),
                 cached_tokens=meta_info.get("cached_tokens", 0),
+                **matched_stop_kwargs,
             ),
         )
 
