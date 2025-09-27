@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton.language as tl
 
+from sglang.srt.layers.activation import apply_glu_activation_for_moe, get_activation
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -491,31 +492,10 @@ def fused_experts_impl(
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
         )
-        if activation == "silu":
-            if gemm1_alpha is not None:
-                assert gemm1_limit is not None
-                intermediate_cache2 = swiglu_with_alpha_and_limit(
-                    intermediate_cache1.view(-1, N),
-                    gemm1_alpha,
-                    gemm1_limit,
-                )
-            elif _is_cuda or _is_hip:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-        elif activation == "gelu":
-            assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
-            assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_cuda or _is_hip:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-        else:
-            raise ValueError(f"Unsupported activation: {activation=}")
+        spec = get_activation(activation, alpha=gemm1_alpha, limit=gemm1_limit)
+        apply_glu_activation_for_moe(
+            intermediate_cache1.view(-1, N), intermediate_cache2, spec
+        )
 
         invoke_fused_moe_kernel(
             intermediate_cache2,
