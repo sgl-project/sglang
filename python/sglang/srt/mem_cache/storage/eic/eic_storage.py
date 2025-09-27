@@ -153,7 +153,7 @@ class FlexibleKVCacheMemoryPool:
 
 
 class EICStorage(HiCacheStorage):
-    def __init__(self, memory_pool_host: HostKVCache, hicache_config: HiCacheStorageConfig):
+    def __init__(self, hicache_config: HiCacheStorageConfig, memory_pool_host: HostKVCache):
         global G_EnableKVSetGPUDirect, G_EnableKVGetGPUDirect
         global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity
 
