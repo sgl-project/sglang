@@ -1,8 +1,5 @@
 import logging
-import os
-import threading
-import time
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -13,9 +10,8 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_lookahead.lookahead_cache import LookaheadCache
-from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+from sglang.srt.speculative.lookahead_info import LookaheadVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
 

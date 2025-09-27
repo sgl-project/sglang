@@ -817,7 +817,7 @@ class CudaGraphRunner:
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
         ):
-            from sglang.srt.speculative.eagle_utils import EagleVerifyInput
+            from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
@@ -839,7 +839,7 @@ class CudaGraphRunner:
                 )
 
         elif self.model_runner.spec_algorithm.is_lookahead():
-            from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+            from sglang.srt.speculative.lookahead_info import LookaheadVerifyInput
 
             spec_info = LookaheadVerifyInput(
                 draft_token=None,

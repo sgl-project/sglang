@@ -67,15 +67,13 @@ from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -953,9 +951,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[
-        Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-    ] = None
+    spec_info: Optional[SpecInput] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1984,9 +1980,7 @@ class ModelWorkerBatch:
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[
-        Union[EagleVerifyInput, EagleDraftInput, LookaheadVerifyInput]
-    ] = None
+    spec_info: Optional[SpecInput] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
