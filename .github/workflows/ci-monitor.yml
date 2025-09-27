@@ -52,7 +52,7 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           cd scripts/ci_monitor
-          python ci_analyzer_perf.py --token $GITHUB_TOKEN --limit 500 --output-dir performance_tables_$(date +%Y%m%d_%H%M%S) --upload-to-github
+          python ci_analyzer_perf.py --token $GITHUB_TOKEN --limit 1000 --output-dir performance_tables_$(date +%Y%m%d_%H%M%S) --upload-to-github
 
       - name: Upload Analysis Results
         uses: actions/upload-artifact@v4
