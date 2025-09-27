@@ -34,7 +34,6 @@ impl Default for WorkerId {
     }
 }
 
-/// Type alias for the model index to reduce complexity
 type ModelIndex = Arc<DashMap<String, Arc<RwLock<Vec<Arc<dyn Worker>>>>>>;
 
 /// Worker registry with model-based indexing
@@ -54,8 +53,7 @@ pub struct WorkerRegistry {
 
     /// Workers indexed by connection mode
     connection_workers: Arc<DashMap<ConnectionMode, Vec<WorkerId>>>,
-
-    /// URL to worker ID mapping (for backward compatibility)
+    /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
 }
 
@@ -461,14 +459,12 @@ mod tests {
         // Register worker (WorkerFactory returns Box<dyn Worker>, convert to Arc)
         let worker_id = registry.register(Arc::from(worker));
 
-        // Verify registration
         assert!(registry.get(&worker_id).is_some());
         assert!(registry.get_by_url("http://worker1:8080").is_some());
         assert_eq!(registry.get_by_model("llama-3-8b").len(), 1);
         assert_eq!(registry.get_by_type(&WorkerType::Regular).len(), 1);
         assert_eq!(registry.get_by_connection(&ConnectionMode::Http).len(), 1);
 
-        // Test stats
         let stats = registry.stats();
         assert_eq!(stats.total_workers, 1);
         assert_eq!(stats.total_models, 1);
@@ -521,27 +517,22 @@ mod tests {
         registry.register(Arc::from(worker2));
         registry.register(Arc::from(worker3));
 
-        // Test get_by_model_fast for llama-3
         let llama_workers = registry.get_by_model_fast("llama-3");
         assert_eq!(llama_workers.len(), 2);
         let urls: Vec<String> = llama_workers.iter().map(|w| w.url().to_string()).collect();
         assert!(urls.contains(&"http://worker1:8080".to_string()));
         assert!(urls.contains(&"http://worker2:8080".to_string()));
 
-        // Test get_by_model_fast for gpt-4
         let gpt_workers = registry.get_by_model_fast("gpt-4");
         assert_eq!(gpt_workers.len(), 1);
         assert_eq!(gpt_workers[0].url(), "http://worker3:8080");
 
-        // Test get_by_model_fast for non-existent model
         let unknown_workers = registry.get_by_model_fast("unknown-model");
         assert_eq!(unknown_workers.len(), 0);
 
-        // Test that both get_by_model and get_by_model_fast return same results
         let llama_workers_slow = registry.get_by_model("llama-3");
         assert_eq!(llama_workers.len(), llama_workers_slow.len());
 
-        // Test removal updates the model index
         registry.remove_by_url("http://worker1:8080");
         let llama_workers_after = registry.get_by_model_fast("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
