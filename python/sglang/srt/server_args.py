@@ -630,8 +630,6 @@ class ServerArgs:
             model_config = ModelConfig.from_server_args(self)
             if model_config.is_multimodal:
                 self.adjust_mem_fraction_for_vlm(model_config)
-        else:
-            self.mem_fraction_static = 0.85
 
         # Set cuda graph batch sizes
         if self.cuda_graph_bs is None:
