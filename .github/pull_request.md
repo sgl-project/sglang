@@ -144,7 +144,7 @@ Output throughput: 3841.140 token/s (original)
 
 (sglang) root@nb-1365100433987193600-amrnhavl9gjk:/z_data/syxin/hanrui/sglang_fork/test# python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 Downloading from https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl to /tmp/test.jsonl
-/tmp/test.jsonl: 732kB [00:00, 8.45MB/s]                                                                                                                            
+/tmp/test.jsonl: 732kB [00:00, 8.45MB/s]
 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 200/200 [00:21<00:00,  9.12it/s]
 Accuracy: 0.535
 Invalid: 0.160
