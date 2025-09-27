@@ -40,3 +40,23 @@ in the GitHub search bar.
 | **Phi-4-multimodal-instruct**  | `microsoft/Phi-4-multimodal-instruct` | `phi-4-mm`   | Phi-4-multimodal-instruct is the multimodal variant of the Phi-4-mini model, enhanced with LoRA for improved multimodal capabilities. It supports text, vision and audio modalities in SGLang. |
 | **MiMo-VL** (7B)           | `XiaomiMiMo/MiMo-VL-7B-RL`                 | `mimo-vl`        | Xiaomi's compact yet powerful vision-language model featuring a native resolution ViT encoder for fine-grained visual details, an MLP projector for cross-modal alignment, and the MiMo-7B language model optimized for complex reasoning tasks. |
 | **GLM-4.5V** (106B) /  **GLM-4.1V**(9B)           | `zai-org/GLM-4.5V`                   | `glm-4v`         | GLM-4.5V and GLM-4.1V-Thinking: Towards Versatile Multimodal Reasoning with Scalable Reinforcement Learning                                                                                                                                                                                                      |
+
+## Bidirectional Attention in Multimodal Model Serving
+**Note for serving the Gemma-3 multimodal model**:
+
+As mentioned in [Welcome Gemma 3: Google's all new multimodal, multilingual, long context open LLM
+](https://huggingface.co/blog/gemma3#multimodality), Gemma-3 employs bidirectional attention between image tokens during the prefill phase. Currently, SGLang only supports bidirectional attention when using the Triton Attention Backend. Note, however, that SGLang's current bidirectional attention implementation is incompatible with both CUDA Graph and Chunked Prefill.
+
+To enable bidirectional attention, you can use the `TritonAttnBackend` while disabling CUDA Graph and Chunked Prefill. Example launch command:
+```shell
+python -m sglang.launch_server \
+  --model-path google/gemma-3-4b-it \
+  --host 0.0.0.0 --port 30000 \
+  --enable-multimodal \
+  --dtype bfloat16 --triton-attention-reduce-in-fp32 \
+  --attention-backend triton \ # Use Triton attention backend
+  --disable-cuda-graph \ # Disable Cuda Graph
+  --chunked-prefill-size -1 # Disable Chunked Prefill
+```
+
+If higher serving performance is required and a certain degree of accuracy loss is acceptable, you may choose to use other attention backends, and you can also enable features like CUDA Graph and Chunked Prefill for better performance, but note that the model will fall back to using causal attention instead of bidirectional attention.
