@@ -225,6 +225,7 @@ class EAGLEWorker(TpModelWorker):
             "flashmla": self._create_flashmla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
+            "nsa": self._create_nsa_decode_backend,
         }
 
         return self._create_backend(
@@ -247,6 +248,7 @@ class EAGLEWorker(TpModelWorker):
             "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
+            "nsa": self._create_nsa_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -313,6 +315,15 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
+    def _create_nsa_decode_backend(self):
+        from sglang.srt.layers.attention.nsa_backend import (
+            NativeSparseAttnMultiStepBackend,
+        )
+
+        return NativeSparseAttnMultiStepBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
     def _create_trtllm_mha_decode_backend(self):
         from sglang.srt.layers.attention.trtllm_mha_backend import (
             TRTLLMHAAttnMultiStepDraftBackend,
@@ -351,6 +362,13 @@ class EAGLEWorker(TpModelWorker):
             )
 
             return FlashInferMLAAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_nsa_prefill_backend(self):
+        from sglang.srt.layers.attention.nsa_backend import (
+            NativeSparseAttnBackend,
+        )
+
+        return NativeSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_triton_prefill_backend(self):
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
