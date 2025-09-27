@@ -387,9 +387,12 @@ impl OpenAIRouter {
                             // Reflect the client's requested store preference in the response body
                             obj.insert("store".to_string(), Value::Bool(original_body.store));
                         }
+
+                        let mut final_response_json = openai_response_json;
+
                         if let Some(mcp) = active_mcp {
                             if let Some((call_id, tool_name, args_json_str)) =
-                                Self::extract_function_call(&openai_response_json)
+                                Self::extract_function_call(&final_response_json)
                             {
                                 info!(
                                     "Detected function call: name={}, call_id={}, args={}",
@@ -445,9 +448,9 @@ impl OpenAIRouter {
                                     })
                                     .await
                                 {
-                                    Ok(mut final_json) => {
+                                    Ok(mut resumed_json) => {
                                         if !call_ok {
-                                            if let Some(obj) = final_json.as_object_mut() {
+                                            if let Some(obj) = resumed_json.as_object_mut() {
                                                 let metadata_value =
                                                     obj.entry("metadata").or_insert_with(|| {
                                                         Value::Object(serde_json::Map::new())
@@ -464,33 +467,7 @@ impl OpenAIRouter {
                                                 }
                                             }
                                         }
-                                        Self::mask_tools_as_mcp(&mut final_json, original_body);
-
-                                        if original_body.store {
-                                            if let Err(e) = self
-                                                .store_response_internal(&final_json, original_body)
-                                                .await
-                                            {
-                                                warn!("Failed to store response: {}", e);
-                                            }
-                                        }
-
-                                        return match serde_json::to_string(&final_json) {
-                                            Ok(json_str) => (
-                                                StatusCode::OK,
-                                                [("content-type", "application/json")],
-                                                json_str,
-                                            )
-                                                .into_response(),
-                                            Err(e) => {
-                                                error!("Failed to serialize response: {}", e);
-                                                (
-                                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                                    json!({"error": {"message": "Failed to serialize response", "type": "internal_error"}}).to_string(),
-                                                )
-                                                    .into_response()
-                                            }
-                                        };
+                                        final_response_json = resumed_json;
                                     }
                                     Err(err) => {
                                         warn!("Failed to resume with tool result: {}", err);
@@ -518,17 +495,17 @@ impl OpenAIRouter {
                             }
                         }
 
-                        Self::mask_tools_as_mcp(&mut openai_response_json, original_body);
+                        Self::mask_tools_as_mcp(&mut final_response_json, original_body);
                         if original_body.store {
                             if let Err(e) = self
-                                .store_response_internal(&openai_response_json, original_body)
+                                .store_response_internal(&final_response_json, original_body)
                                 .await
                             {
                                 warn!("Failed to store response: {}", e);
                             }
                         }
 
-                        match serde_json::to_string(&openai_response_json) {
+                        match serde_json::to_string(&final_response_json) {
                             Ok(json_str) => (
                                 StatusCode::OK,
                                 [("content-type", "application/json")],
