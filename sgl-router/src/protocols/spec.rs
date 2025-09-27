@@ -683,6 +683,33 @@ pub struct CompletionStreamChoice {
 pub struct ResponseTool {
     #[serde(rename = "type")]
     pub r#type: ResponseToolType,
+    // MCP-specific fields (used when type == "mcp")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_approval: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+impl Default for ResponseTool {
+    fn default() -> Self {
+        Self {
+            r#type: ResponseToolType::WebSearchPreview,
+            server_url: None,
+            authorization: None,
+            server_label: None,
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -690,6 +717,7 @@ pub struct ResponseTool {
 pub enum ResponseToolType {
     WebSearchPreview,
     CodeInterpreter,
+    Mcp,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
