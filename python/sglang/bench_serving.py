@@ -32,6 +32,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
+import pandas as pd
 import requests
 from tqdm.asyncio import tqdm
 from transformers import (
@@ -704,6 +705,16 @@ def get_dataset(args, tokenizer):
             apply_chat_template=args.apply_chat_template,
             random_sample=True,
         )
+    elif args.dataset_name == "burstgpt":
+        assert not tokenize_prompt
+        input_requests = sample_burstgpt_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            random_seed=args.seed,
+            tokenizer=tokenizer,
+            prompt_suffix=args.prompt_suffix,
+            apply_chat_template=args.apply_chat_template,
+        )
     elif args.dataset_name == "mooncake":
         # For mooncake, we don't generate the prompts here.
         # We just load the raw trace data. The async generator will handle the rest.
@@ -776,6 +787,7 @@ class BenchmarkMetrics:
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+BURSTGPT_URL = "https://huggingface.co/datasets/lzzmm/BurstGPT/resolve/main/data/BurstGPT_without_fails_1.csv"
 MOONCAKE_DATASET_URL = {
     "mooncake": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl",
     "conversation": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl",
@@ -914,6 +926,64 @@ async def get_mooncake_request_over_time(
             # We use a placeholder because we don't know the real response
             placeholder_response = " ".join(["story"] * output_len_per_round)
             chat_history.append({"role": "assistant", "content": placeholder_response})
+
+
+def sample_burstgpt_requests(
+    dataset_path: str,
+    num_requests: int,
+    random_seed: int,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_suffix: Optional[str] = "",
+    apply_chat_template: bool = True,
+) -> List[DatasetRow]:
+
+    if not dataset_path:
+        dataset_path = download_and_cache_file(BURSTGPT_URL)
+
+    df = pd.read_csv(dataset_path)
+
+    gpt4_df = df[df["Model"] == "GPT-4"]
+    # Remove the failed requests (i.e., response length is 0)
+    gpt4_df = gpt4_df[gpt4_df["Response tokens"] > 0]
+    # Randomly sample num_requests from the dataset
+    if num_requests <= len(gpt4_df):
+        gpt4_df = gpt4_df.sample(n=num_requests, random_state=random_seed)
+    else:
+        gpt4_df = gpt4_df.sample(n=num_requests, random_state=random_seed, replace=True)
+    # Convert the dataframe to a list of tuples
+    dataset = gpt4_df.values.tolist()
+    input_requests = []
+    for i in range(num_requests):
+        input_len = int(dataset[i][2])
+        output_len = int(dataset[i][3])
+        prompt = tokenizer.decode(
+            [(i + j) % tokenizer.vocab_size for j in range(input_len)]
+        )
+
+        if prompt_suffix:
+            prompt = (
+                remove_suffix(prompt, ASSISTANT_SUFFIX)
+                + prompt_suffix
+                + ASSISTANT_SUFFIX
+            )
+
+        if apply_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            prompt = prompt.replace(tokenizer.bos_token, "")
+
+        input_requests.append(
+            DatasetRow(
+                prompt=prompt,
+                prompt_len=input_len,
+                output_len=output_len,
+                image_data=None,
+            )
+        )
+    return input_requests
 
 
 def sample_mmmu_requests(
@@ -2175,6 +2245,7 @@ if __name__ == "__main__":
             "random-ids",
             "generated-shared-prefix",
             "mmmu",
+            "burstgpt",
             "random-image",
             "mooncake",
         ],
