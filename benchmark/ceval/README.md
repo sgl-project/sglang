@@ -1,6 +1,6 @@
 ## Download data
 ```
-git lfs clone https://huggingface.co/datasets/ceval/ceval-exam
+git clone https://huggingface.co/datasets/ceval/ceval-exam
 ```
 
 ## Run benchmark
