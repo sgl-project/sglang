@@ -233,7 +233,15 @@ class FlashInferAttnBackend(AttentionBackend):
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_simple_verify()
+        ):
+            if (
+                forward_batch.forward_mode.is_simple_verify()
+                and forward_batch.simple_eagle_skip_attn_backend_init
+            ):
+                return
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -348,7 +356,7 @@ class FlashInferAttnBackend(AttentionBackend):
             Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
         ],
     ):
-        if forward_mode.is_decode_or_idle():
+        if forward_mode.is_decode_or_idle() or forward_mode.is_simple_verify():
             decode_wrappers = []
             for i in range(self.num_wrappers):
                 decode_wrappers.append(
@@ -378,13 +386,18 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
-            for i in range(self.num_wrappers):
-                decode_wrappers[i].begin_forward = partial(
-                    fast_decode_plan, decode_wrappers[i]
-                )
-        elif forward_mode.is_target_verify():
+            if not forward_mode.is_simple_verify():
+                for i in range(self.num_wrappers):
+                    decode_wrappers[i].begin_forward = partial(
+                        fast_decode_plan, decode_wrappers[i]
+                    )
+        elif forward_mode.is_target_verify() or forward_mode.is_simple_draft():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
+                if not forward_mode.is_simple_draft():
+                    custom_mask_buf = self.cuda_graph_custom_mask
+                else:
+                    custom_mask_buf = None
                 prefill_wrappers.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -394,7 +407,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        custom_mask_buf=self.cuda_graph_custom_mask,
+                        custom_mask_buf=custom_mask_buf,
                         mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
                     )
                 )
@@ -458,7 +471,7 @@ class FlashInferAttnBackend(AttentionBackend):
         ],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        if forward_mode.is_decode_or_idle():
+        if forward_mode.is_decode_or_idle() or forward_mode.is_simple_verify():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -470,7 +483,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
-        elif forward_mode.is_target_verify():
+        elif forward_mode.is_target_verify() or forward_mode.is_simple_draft():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -837,6 +850,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
             )
         else:
+            seq_lens_cpu = None
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
