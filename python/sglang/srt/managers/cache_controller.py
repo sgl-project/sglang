@@ -236,6 +236,14 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
+def get_hash_str_with_extra_tag(get_hash_str, extra_tag):
+    def wrapper(*args, **kwargs):
+        base_hash = get_hash_str(*args, **kwargs)
+        return f"{extra_tag}_{base_hash}"
+
+    return wrapper
+
+
 class HiCacheController:
 
     def __init__(
@@ -268,6 +276,17 @@ class HiCacheController:
             self.storage_config = self._generate_storage_config(
                 model_name, storage_backend_extra_config
             )
+
+            extra_backend_tag = (
+                self.storage_config.extra_config.get("extra_backend_tag", "")
+                if self.storage_config.extra_config
+                else ""
+            )
+            if bool(extra_backend_tag):
+                self.get_hash_str = get_hash_str_with_extra_tag(
+                    self.get_hash_str, extra_backend_tag
+                )
+
             # for MLA models, only one rank needs to backup the KV cache
             self.backup_skip = (
                 self.storage_config.is_mla_model
