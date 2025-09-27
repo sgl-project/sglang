@@ -303,7 +303,6 @@ impl OpenAIRouter {
                 let mut tools_json = Vec::new();
                 let tools = mcp.list_tools();
                 for t in tools {
-                    info!("Injecting MCP function tool: {} from {}", t.name, t.server);
                     let parameters = t.parameters.clone().unwrap_or(serde_json::json!({
                         "type": "object",
                         "properties": {},
@@ -324,7 +323,6 @@ impl OpenAIRouter {
                 }
             }
         }
-        info!("Forwarding payload to upstream: {}", payload);
         let request_builder = self.client.post(&url).json(&payload);
 
         // Apply headers with filtering
@@ -348,8 +346,20 @@ impl OpenAIRouter {
                 // Parse the response
                 match response.json::<Value>().await {
                     Ok(mut openai_response_json) => {
-                        info!("Received upstream response: {}", openai_response_json);
-
+                        if let Some(prev_id) = original_previous_response_id {
+                            if let Some(obj) = openai_response_json.as_object_mut() {
+                                let should_insert = obj
+                                    .get("previous_response_id")
+                                    .map(|v| v.is_null())
+                                    .unwrap_or(true);
+                                if should_insert {
+                                    obj.insert(
+                                        "previous_response_id".to_string(),
+                                        Value::String(prev_id),
+                                    );
+                                }
+                            }
+                        }
 
                         if let Some(obj) = openai_response_json.as_object_mut() {
                             if !obj.contains_key("instructions") {
@@ -374,10 +384,6 @@ impl OpenAIRouter {
                             // Reflect the client's requested store preference in the response body
                             obj.insert("store".to_string(), Value::Bool(original_body.store));
                         }
-
-                        // Minimal MCP integration (PR1): if MCP is configured and upstream
-                        // produced a single function call item, execute it, resume once,
-                        // attach metadata.mcp, and persist the final response.
                         if let Some(mcp) = active_mcp {
                             if let Some((call_id, tool_name, args_json_str)) =
                                 Self::extract_function_call(&openai_response_json)
@@ -411,10 +417,6 @@ impl OpenAIRouter {
                                         ),
                                     };
 
-                                info!(
-                                    "Resuming upstream with tool_result for {} ({})",
-                                    tool_name, call_id
-                                );
                                 match self
                                     .resume_with_tool_result(
                                         &url,
@@ -1052,7 +1054,6 @@ impl OpenAIRouter {
 
         let output_str = serde_json::to_string(&result)
             .unwrap_or_else(|_| "{\"ok\":true}".to_string());
-        info!("MCP tool call result: {}", output_str);
         Ok((server_name, output_str))
     }
 
@@ -1112,7 +1113,6 @@ impl OpenAIRouter {
         // Ensure non-streaming and no store to upstream
         obj.insert("stream".to_string(), Value::Bool(false));
         obj.insert("store".to_string(), Value::Bool(false));
-        info!("Resuming with payload to upstream: {}", payload2);
         let mut req = self.client.post(url).json(&payload2);
         if let Some(headers) = headers {
             req = apply_request_headers(headers, req, true);
