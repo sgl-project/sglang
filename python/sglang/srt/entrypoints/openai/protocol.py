@@ -16,7 +16,7 @@
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, TypeAlias, Union
+from typing import Any, Dict, List, NamedTuple, Optional, TypeAlias, Union
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -228,11 +228,15 @@ class CompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[Union[List[str], str]] = None
+    # Cache salt for request caching
+    cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
 
-    # For customer metric labels
-    customer_labels: Optional[Dict[str, str]] = None
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -388,7 +392,7 @@ class Function(BaseModel):
     """Function descriptions."""
 
     description: Optional[str] = Field(default=None, examples=[None])
-    name: Optional[str] = None
+    name: str
     parameters: Optional[object] = None
     strict: bool = False
 
@@ -545,6 +549,10 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[Union[List[str], str]] = None
+    # Cache salt for request caching
+    cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -778,6 +786,13 @@ class ResponsesRequest(BaseModel):
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
     )
     priority: int = Field(default=0, description="Request priority")
+    extra_key: Optional[str] = Field(
+        default=None,
+        description="Extra key for classifying the request (e.g. cache_salt)",
+    )
+    cache_salt: Optional[str] = Field(
+        default=None, description="Cache salt for request caching"
+    )
 
     # SGLang-specific sampling parameters
     frequency_penalty: float = 0.0
@@ -926,6 +941,16 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[Any] = None
+
+
+class ToolCallProcessingResult(NamedTuple):
+    """Result of processing tool calls in a response."""
+
+    tool_calls: Optional[
+        List[Any]
+    ]  # List of ToolCall objects or None if parsing failed
+    remaining_text: str  # Text remaining after parsing tool calls
+    finish_reason: Dict[str, Any]  # Updated finish reason dictionary
 
 
 class ResponseReasoningTextContent(BaseModel):
