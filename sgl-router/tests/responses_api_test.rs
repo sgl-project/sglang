@@ -131,8 +131,6 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
-
-
     // Cleanup
     worker.stop().await;
     mcp.stop().await;
