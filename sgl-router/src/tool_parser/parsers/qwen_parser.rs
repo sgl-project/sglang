@@ -140,9 +140,14 @@ impl ToolParser for QwenParser {
 
         for (index, captures) in matches.iter().enumerate() {
             if let Some(json_str) = captures.get(1) {
-                if let Ok(value) = serde_json::from_str::<Value>(json_str.as_str().trim()) {
-                    if let Some(tool) = self.parse_single_object(&value, index)? {
-                        tools.push(tool);
+                match serde_json::from_str::<Value>(json_str.as_str().trim()) {
+                    Ok(value) => {
+                        if let Some(tool) = self.parse_single_object(&value, index)? {
+                            tools.push(tool);
+                        }
+                    }
+                    Err(_) => {
+                        // JSON parsing failed, might be incomplete
                     }
                 }
             }

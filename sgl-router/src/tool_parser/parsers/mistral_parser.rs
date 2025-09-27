@@ -173,8 +173,13 @@ impl ToolParser for MistralParser {
                 String::new()
             };
 
-            let tools = self.parse_json_array(json_array)?;
-            Ok((normal_text_before, tools))
+            match self.parse_json_array(json_array) {
+                Ok(tools) => Ok((normal_text_before, tools)),
+                Err(_) => {
+                    // If JSON parsing fails, return the original text as normal text
+                    Ok((text.to_string(), vec![]))
+                }
+            }
         } else {
             // Markers present but no complete array found
             Ok((text.to_string(), vec![]))
