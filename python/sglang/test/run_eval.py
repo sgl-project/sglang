@@ -68,7 +68,7 @@ def run_eval(args):
         categories = getattr(args, "categories", None)
         if categories:
             categories = categories.split(",")
-        
+
         eval_obj = LongBenchV2Eval(
             data_source=data_source,
             num_examples=args.num_examples,
@@ -77,6 +77,11 @@ def run_eval(args):
             max_context_length=getattr(args, "max_context_length", None),
             min_context_length=getattr(args, "min_context_length", None),
         )
+    elif args.eval_name == "mmmu":
+        # VLM MMMU evaluation with fixed 100 examples by default
+        from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
+
+        eval_obj = MMMUVLMEval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
@@ -141,13 +146,29 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--reasoning-effort", type=str)
-    
+
     # LongBench-v2 specific arguments
-    parser.add_argument("--dataset-path", type=str, help="Path to dataset file or HuggingFace dataset name for LongBench-v2")
-    parser.add_argument("--categories", type=str, help="Comma-separated list of categories to evaluate for LongBench-v2")
-    parser.add_argument("--max-context-length", type=int, help="Maximum context length in tokens for LongBench-v2")
-    parser.add_argument("--min-context-length", type=int, help="Minimum context length in tokens for LongBench-v2")
-    
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        help="Path to dataset file or HuggingFace dataset name for LongBench-v2",
+    )
+    parser.add_argument(
+        "--categories",
+        type=str,
+        help="Comma-separated list of categories to evaluate for LongBench-v2",
+    )
+    parser.add_argument(
+        "--max-context-length",
+        type=int,
+        help="Maximum context length in tokens for LongBench-v2",
+    )
+    parser.add_argument(
+        "--min-context-length",
+        type=int,
+        help="Minimum context length in tokens for LongBench-v2",
+    )
+
     args = parser.parse_args()
 
     run_eval(args)

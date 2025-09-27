@@ -14,7 +14,7 @@ LongBench-v2 is a benchmark designed to assess the ability of Large Language Mod
 ## Task Categories
 
 1. **Single-Document QA**: Question answering within a single long document
-2. **Multi-Document QA**: Cross-document reasoning and synthesis  
+2. **Multi-Document QA**: Cross-document reasoning and synthesis
 3. **Long In-Context Learning**: Few-shot learning with long examples
 4. **Long-Dialogue History**: Understanding long conversation histories
 5. **Code Repository Understanding**: Analysis of large codebases
@@ -105,7 +105,7 @@ eval_obj = LongBenchV2Eval(
     num_examples=100
 )
 
-# Load from local CSV file  
+# Load from local CSV file
 eval_obj = LongBenchV2Eval(
     data_source="/path/to/longbench_v2.csv"
 )
@@ -120,7 +120,7 @@ The expected format for LongBench-v2 examples:
     "context": "Long context text...",
     "question": "Question about the context",
     "A": "First choice",
-    "B": "Second choice", 
+    "B": "Second choice",
     "C": "Third choice",
     "D": "Fourth choice",
     "answer": "A",
@@ -151,7 +151,7 @@ Alternative format with choices as list:
 
 Each task category gets its own metric:
 - `single_document_qa`: Accuracy on single-document QA tasks
-- `multi_document_qa`: Accuracy on multi-document QA tasks  
+- `multi_document_qa`: Accuracy on multi-document QA tasks
 - `long_in_context_learning`: Accuracy on in-context learning tasks
 - `long_dialogue_history`: Accuracy on dialogue understanding tasks
 - `code_repo_understanding`: Accuracy on code analysis tasks
@@ -160,7 +160,7 @@ Each task category gets its own metric:
 ### Context Length Metrics
 
 - `short_context`: Accuracy on contexts < 32k tokens
-- `medium_context`: Accuracy on contexts 32k-128k tokens  
+- `medium_context`: Accuracy on contexts 32k-128k tokens
 - `long_context`: Accuracy on contexts > 128k tokens
 
 ## Performance Considerations
@@ -199,7 +199,7 @@ pip install pandas    # For CSV file support
 Typical performance ranges for different model sizes:
 
 - **Small models (7B)**: 35-45% accuracy
-- **Medium models (13-30B)**: 45-55% accuracy  
+- **Medium models (13-30B)**: 45-55% accuracy
 - **Large models (70B+)**: 55-65% accuracy
 - **Human experts**: 53.7% accuracy
 
