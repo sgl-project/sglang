@@ -40,7 +40,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict,GlobaServerlArgs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -92,6 +92,9 @@ class TpModelWorker:
             ),
             is_draft_model=is_draft_worker,
         )
+
+        # Global vars
+        GlobaServerlArgs.from_server_args(server_args=server_args,model_config=self.model_config)
 
         self.model_runner = ModelRunner(
             model_config=self.model_config,
