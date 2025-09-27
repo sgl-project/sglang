@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.afd.afd_type import afd_is_attn
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -23,6 +24,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
+from sglang.srt.layers.moe.token_dispatcher import StepMeshATTN, StepMeshFFN
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -32,7 +34,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.offloader import get_offloader
 from sglang.srt.utils import (
     ceil_div,
@@ -888,7 +890,153 @@ class DeepEPMoE(EPMoE):
             raise ValueError(f"Not Supported DeepEP format {dispatch_output.format}")
 
 
+class AFDDispatcher(object):
+    def __init__(
+        self,
+        layer_id: int,
+        group: GroupCoordinator,
+    ):
+        backend = global_server_args_dict.get("afd_transfer_backend")
+        assert backend == "stepmesh", f"{backend} is not supperted"
+
+        self.attn = StepMeshATTN(layer_id, group)
+        self.ffn = StepMeshFFN(layer_id, group)
+
+    def attn_send(self, p: PPProxyTensors):
+        return self.attn.send(p)
+
+    def attn_recv(self):
+        return self.attn.recv()
+
+    def ffn_send(self, x: torch.Tensor):
+        return self.ffn.send(x)
+
+    def ffn_recv(self):
+        return self.ffn.recv()
+
+
+class AFDATTNMoE(torch.nn.Module):
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        gemm1_alpha: Optional[float] = None,
+        gemm1_clamp_limit: Optional[float] = None,
+        with_bias: bool = False,
+    ):
+        super().__init__()
+
+        from sglang.srt.distributed.parallel_state import get_local_group
+
+        self.afd_dispatcher = AFDDispatcher(
+            layer_id,
+            group=get_local_group(),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        forward_batch: ForwardBatch,
+    ):
+        p = PPProxyTensors(
+            {
+                "hidden_states": hidden_states,
+                "topk_weights": topk_output.topk_weights,
+                "topk_ids": topk_output.topk_ids,
+                "router_logits": topk_output.router_logits,
+                "forward_batch": forward_batch,
+            }
+        )
+
+        self.attn_send(p)
+        return self.attn_recv()
+
+    def attn_send(self, p: PPProxyTensors):
+        return self.afd_dispatcher.attn_send(p)
+
+    def attn_recv(self):
+        return self.afd_dispatcher.attn_recv()
+
+
+class AFDFFNMoE(FusedMoE):
+    """
+    MoE Expert Parallel Impl for AFD
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        gemm1_alpha: Optional[float] = None,
+        gemm1_clamp_limit: Optional[float] = None,
+        with_bias: bool = False,
+    ):
+        super().__init__(
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_fused_shared_experts=num_fused_shared_experts,
+            layer_id=layer_id,
+            top_k=top_k,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            activation=activation,
+            routed_scaling_factor=routed_scaling_factor,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            with_bias=with_bias,
+        )
+
+        from sglang.srt.distributed.parallel_state import get_local_group
+
+        self.afd_dispatcher = AFDDispatcher(
+            layer_id,
+            group=get_local_group(),
+        )
+
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        hidden_states, topk_output = self.ffn_recv()
+
+        output = super().forward(hidden_states, topk_output)
+
+        self.ffn_send(output)
+
+        return hidden_states
+
+    def ffn_send(self, x: torch.Tensor):
+        return self.afd_dispatcher.ffn_send(x)
+
+    def ffn_recv(self):
+        return self.afd_dispatcher.ffn_recv()
+
+
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
+    if global_server_args_dict.get("afd_role"):
+        if afd_is_attn():
+            return AFDATTNMoE
+        else:
+            return AFDFFNMoE
+
     if get_moe_a2a_backend().is_deepep():
         return DeepEPMoE
 

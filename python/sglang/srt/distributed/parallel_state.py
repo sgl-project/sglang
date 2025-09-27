@@ -1271,6 +1271,14 @@ def get_moe_tp_group() -> GroupCoordinator:
     return _MOE_TP
 
 
+_LOCAL_GROUP: Optional[GroupCoordinator] = None
+
+
+def get_local_group() -> GroupCoordinator:
+    assert _LOCAL_GROUP is not None, "local group is not initialized"
+    return _LOCAL_GROUP
+
+
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
 
@@ -1518,6 +1526,29 @@ def initialize_model_parallel(
         backend,
         use_custom_allreduce=False,
         group_name="pp",
+    )
+
+
+def initialize_local_group(
+    nnodes: int,
+    pp_size: int,
+    tp_size: int,
+) -> None:
+    total = tp_size * pp_size
+    n_per_node = total // nnodes
+
+    groups = []
+    for i in range(nnodes):
+        groups.append(range(i * n_per_node, (i + 1) * n_per_node))
+
+    global _LOCAL_GROUP
+    assert _LOCAL_GROUP is None, "local group is already initialized"
+
+    _LOCAL_GROUP = init_model_parallel_group(
+        groups,
+        get_world_group().local_rank,
+        torch.distributed.get_backend(get_world_group().device_group),
+        group_name="local",
     )
 
 
