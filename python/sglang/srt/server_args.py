@@ -108,6 +108,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Other platforms
     "intel_amx",
     "ascend",
+    "bailing_hybrid_linear",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv"]

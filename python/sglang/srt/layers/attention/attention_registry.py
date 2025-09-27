@@ -190,3 +190,12 @@ def create_hybrid_linear_attn_backend(runner):
     return HybridLinearAttnBackend(
         full_attn_backend, linear_attn_backend, full_attn_layers
     )
+
+
+@register_attention_backend("bailing_hybrid_linear")
+def create_bailing_hybrid_linear_backend(runner):
+    from sglang.srt.layers.attention.bailing_hybrid_linear_backend import (
+        HybridLinearAttentionBackend,
+    )
+
+    return HybridLinearAttentionBackend(runner)
