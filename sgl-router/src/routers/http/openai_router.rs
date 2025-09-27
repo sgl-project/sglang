@@ -1149,12 +1149,7 @@ impl OpenAIRouter {
 
         obj.insert(
             "input".to_string(),
-            Value::Array(vec![
-                Value::Object(user_item.as_object().cloned().unwrap()),
-                Value::Object(system_item.as_object().cloned().unwrap()),
-                Value::Object(func_item.as_object().cloned().unwrap()),
-                Value::Object(tool_item.as_object().cloned().unwrap()),
-            ]),
+            Value::Array(vec![user_item, system_item, func_item, tool_item]),
         );
 
         // Ensure non-streaming and no store to upstream

@@ -647,12 +647,20 @@ async fn responses_handler(
         // If tools are provided and this is the first call (no previous_response_id),
         // emit a single function_tool_call to trigger the router's MCP flow.
         let has_tools = payload.get("tools").is_some();
-        let has_prev = payload
-            .get("previous_response_id")
-            .and_then(|v| v.as_str())
-            .is_some();
+        let has_function_output = payload
+            .get("input")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "function_call_output")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
 
-        if has_tools && !has_prev {
+        if has_tools && !has_function_output {
             let rid = format!("resp-{}", Uuid::new_v4());
             Json(json!({
                 "id": rid,
@@ -670,8 +678,7 @@ async fn responses_handler(
                 "usage": null
             }))
             .into_response()
-        } else if has_prev {
-            // Second call after tool_result injection: return a completed assistant message
+        } else if has_tools && has_function_output {
             Json(json!({
                 "id": format!("resp-{}", Uuid::new_v4()),
                 "object": "response",

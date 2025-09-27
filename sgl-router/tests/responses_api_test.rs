@@ -131,6 +131,56 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("Failed to parse response JSON");
+
+    let output = body_json
+        .get("output")
+        .and_then(|v| v.as_array())
+        .expect("response output missing");
+    assert!(!output.is_empty(), "expected at least one output item");
+
+    let final_text = output
+        .iter()
+        .rev()
+        .filter_map(|entry| entry.get("content"))
+        .filter_map(|content| content.as_array())
+        .flat_map(|parts| parts.iter())
+        .filter_map(|part| part.get("text"))
+        .filter_map(|v| v.as_str())
+        .next();
+
+    if let Some(text) = final_text {
+        assert_eq!(text, "Tool result consumed; here is the final answer.");
+    } else {
+        let call_entry = output.iter().find(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("function_tool_call".into()))
+        });
+        assert!(call_entry.is_some(), "missing function tool call entry");
+        if let Some(entry) = call_entry {
+            assert_eq!(
+                entry.get("status").and_then(|v| v.as_str()),
+                Some("in_progress"),
+                "function call should be in progress when no content is returned"
+            );
+        }
+    }
+
+    let tools = body_json
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .expect("tools array missing");
+    assert_eq!(tools.len(), 1);
+    let tool = tools.first().unwrap();
+    assert_eq!(tool.get("type").and_then(|v| v.as_str()), Some("mcp"));
+    assert_eq!(
+        tool.get("server_label").and_then(|v| v.as_str()),
+        Some("mock")
+    );
+
     // Cleanup
     worker.stop().await;
     mcp.stop().await;
