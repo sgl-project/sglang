@@ -781,6 +781,146 @@ class SGLangPerfAnalyzer:
         base_url = f"https://github.com/{self.data_repo}/tree/{self.data_branch}/performance_data/{timestamp}"
         print(f"🔗 View uploaded data at: {base_url}")
 
+        # Generate GitHub Actions summary
+        self._generate_github_summary(output_dir, timestamp)
+
+    def _generate_github_summary(self, output_dir: str, timestamp: str):
+        """Generate GitHub Actions summary with performance data"""
+        try:
+            # Check if running in GitHub Actions
+            github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if not github_step_summary:
+                print("ℹ️  Not running in GitHub Actions, skipping summary generation")
+                return
+
+            print("📊 Generating GitHub Actions summary...")
+
+            # Collect all CSV and PNG files
+            csv_files = []
+            png_files = []
+
+            for root, dirs, files in os.walk(output_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(file_path, output_dir)
+
+                    if file.endswith(".csv"):
+                        csv_files.append((file_path, rel_path))
+                    elif file.endswith(".png"):
+                        png_files.append((file_path, rel_path))
+
+            # Sort files by job and test name
+            csv_files.sort(key=lambda x: x[1])
+            png_files.sort(key=lambda x: x[1])
+
+            # Generate markdown summary
+            summary_lines = []
+            summary_lines.append("# 📊 SGLang Performance Analysis Report")
+            summary_lines.append("")
+            summary_lines.append(f"**Analysis Timestamp:** {timestamp}")
+            summary_lines.append(f"**Total CSV Files:** {len(csv_files)}")
+            summary_lines.append(f"**Total Chart Files:** {len(png_files)}")
+            summary_lines.append("")
+
+            # GitHub data repository link
+            base_url = f"https://github.com/{self.data_repo}/tree/{self.data_branch}/performance_data/{timestamp}"
+            summary_lines.append(f"🔗 **[View All Data on GitHub]({base_url})**")
+            summary_lines.append("")
+
+            # Group by job
+            job_groups = {}
+            for csv_path, rel_path in csv_files:
+                # Extract job name from path: job_summary/test_name.csv
+                parts = rel_path.split("/")
+                if len(parts) >= 2:
+                    job_name = parts[0].replace("_summary", "")
+                    test_name = parts[1].replace(".csv", "")
+
+                    if job_name not in job_groups:
+                        job_groups[job_name] = []
+                    job_groups[job_name].append((csv_path, test_name, rel_path))
+
+            # Generate summary for each job
+            for job_name in sorted(job_groups.keys()):
+                summary_lines.append(f"## 🚀 {job_name}")
+                summary_lines.append("")
+
+                tests = job_groups[job_name]
+                tests.sort(key=lambda x: x[1])  # Sort by test name
+
+                for csv_path, test_name, rel_path in tests:
+                    summary_lines.append(f"### 📈 {test_name}")
+
+                    # Add CSV data preview
+                    try:
+                        with open(csv_path, "r", encoding="utf-8") as f:
+                            lines = f.readlines()
+                            if len(lines) > 1:  # Has header and data
+                                summary_lines.append("")
+                                summary_lines.append("**Recent Performance Data:**")
+                                summary_lines.append("")
+
+                                # Show header
+                                header = lines[0].strip()
+                                summary_lines.append(
+                                    f"| {' | '.join(header.split(','))} |"
+                                )
+                                summary_lines.append(
+                                    f"| {' | '.join(['---'] * len(header.split(',')))} |"
+                                )
+
+                                # Show last 5 records
+                                data_lines = lines[1:]
+                                for line in data_lines[-5:]:
+                                    if line.strip():
+                                        summary_lines.append(
+                                            f"| {' | '.join(line.strip().split(','))} |"
+                                        )
+
+                                summary_lines.append("")
+                    except Exception as e:
+                        summary_lines.append(f"*Error reading CSV data: {e}*")
+                        summary_lines.append("")
+
+                    # Add chart image if exists
+                    test_prefix = rel_path.replace(".csv", "")
+                    matching_charts = [
+                        (png_path, png_rel)
+                        for png_path, png_rel in png_files
+                        if png_rel.startswith(test_prefix)
+                    ]
+
+                    for png_path, chart_rel_path in matching_charts:
+                        chart_url = f"https://github.com/{self.data_repo}/raw/{self.data_branch}/performance_data/{timestamp}/{chart_rel_path}"
+                        # Extract metric name from filename: test_name_metric_name.png
+                        filename = os.path.basename(chart_rel_path)
+                        metric_name = filename.replace(f"{test_name}_", "").replace(
+                            ".png", ""
+                        )
+                        summary_lines.append(
+                            f"**{self._format_metric_name(metric_name)} Trend:**"
+                        )
+                        summary_lines.append("")
+                        summary_lines.append(
+                            f"![{test_name}_{metric_name}]({chart_url})"
+                        )
+                        summary_lines.append("")
+
+                    summary_lines.append("---")
+                    summary_lines.append("")
+
+            # Write summary to GitHub Actions
+            with open(github_step_summary, "w", encoding="utf-8") as f:
+                f.write("\n".join(summary_lines))
+
+            print("✅ GitHub Actions summary generated successfully")
+
+        except Exception as e:
+            print(f"❌ Failed to generate GitHub Actions summary: {e}")
+            import traceback
+
+            traceback.print_exc()
+
 
 def main():
     parser = argparse.ArgumentParser(description="SGLang CI Performance Analyzer")
