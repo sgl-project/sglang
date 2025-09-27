@@ -79,6 +79,7 @@ ALL_MODELS = [
         skip_long_prompt=True,
     ),
     ModelCase("facebook/opt-125m", skip_long_prompt=True),
+    ModelCase("bigcode/starcoder2-7b"),
     ModelCase(
         "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5",
         tp_size=2,
