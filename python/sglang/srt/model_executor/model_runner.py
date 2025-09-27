@@ -140,6 +140,7 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     parse_connector_type,
+    reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
 )
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -828,6 +829,15 @@ class ModelRunner:
             f"dtype={self.dtype}, "
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
+        )
+
+        # Pre-expand RoPE cache before CUDA Graph capture
+        reserve_rope_cache_for_long_sequences(
+            self.model,
+            self.server_args,
+            self.model_config,
+            self.req_to_token_pool,
+            logger,
         )
 
         # Handle the case where some ranks do not finish loading.
