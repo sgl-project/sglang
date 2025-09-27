@@ -732,6 +732,28 @@ class SGLangPerfAnalyzer:
         """Upload performance_tables to GitHub with original structure"""
         print("📤 Uploading performance data to GitHub...")
 
+        # Check if target repository exists
+        repo_url = f"{self.base_url}/repos/{self.data_repo}"
+        try:
+            repo_response = self.session.get(repo_url)
+            if repo_response.status_code == 404:
+                print(
+                    f"❌ Repository {self.data_repo} does not exist or is not accessible"
+                )
+                print("   Please ensure:")
+                print("   1. The repository exists")
+                print("   2. Your GitHub token has access to this repository")
+                print("   3. Your token has 'contents:write' permission")
+                return
+            elif repo_response.status_code != 200:
+                print(
+                    f"❌ Failed to access repository {self.data_repo}: {repo_response.status_code}"
+                )
+                return
+        except Exception as e:
+            print(f"❌ Error checking repository: {e}")
+            return
+
         # Generate timestamp for this upload
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
