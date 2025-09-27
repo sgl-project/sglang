@@ -251,7 +251,7 @@ suite_amd = {
         TestFile("test_triton_sliding_window.py", 250),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_wave_attention_kernels.py", 2),
-        TestFile("test_wave_attention_backend.py", 150),
+        # TestFile("test_wave_attention_backend.py", 150), # Temporarily disable due to # 10819
     ],
     "per-commit-amd-mi35x": [
         TestFile("test_mla.py", 242),
