@@ -494,6 +494,23 @@ impl OpenAIRouter {
                                     }
                                     Err(err) => {
                                         warn!("Failed to resume with tool result: {}", err);
+                                        let error_body = json!({
+                                            "error": {
+                                                "message": format!(
+                                                    "Failed to resume with tool result: {}",
+                                                    err
+                                                ),
+                                                "type": "internal_error",
+                                            }
+                                        })
+                                        .to_string();
+
+                                        return (
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            [("content-type", "application/json")],
+                                            error_body,
+                                        )
+                                            .into_response();
                                     }
                                 }
                             } else {
@@ -1116,8 +1133,8 @@ impl OpenAIRouter {
             .await
             .map_err(|e| format!("tool call failed: {}", e))?;
 
-        let output_str =
-            serde_json::to_string(&result).unwrap_or_else(|_| "{\"ok\":true}".to_string());
+        let output_str = serde_json::to_string(&result)
+            .map_err(|e| format!("Failed to serialize tool result: {}", e))?;
         Ok((server_name, output_str))
     }
 
