@@ -95,9 +95,10 @@ class SchedulerProfilerMixin:
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def start_profile(
-        self, stage: Optional[ForwardMode] = None
+        self, stage: Optional[ForwardMode | bool] = None
     ) -> ProfileReqOutput | None:
-        stage_str = f" for {stage.name}" if stage else ""
+        stage_name = stage.name if isinstance(stage, ForwardMode) else stage.__str__()
+        stage_str = f" for {stage_name}" if stage else ""
         logger.info(
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
         )

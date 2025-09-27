@@ -51,7 +51,6 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-
 # Define constants
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -550,7 +549,8 @@ class ServerArgs:
                     reserved_mem = (2.8 + parallel_size / 10) * 1024
                 elif gpu_mem < 90 * 1024:
                     # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
-                    reserved_mem = (12 + parallel_size / 2) * 1024
+                    # adjusted to make sure meta-llama/Llama-3.1-70B-Instruct can be launched
+                    reserved_mem = (10.5 + parallel_size / 2) * 1024
                 elif gpu_mem < 100 * 1024:
                     # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
                     reserved_mem = (15 + parallel_size / 2) * 1024
