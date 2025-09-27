@@ -347,6 +347,7 @@ class ModelRunner:
         if self.is_hybrid_gdn:
             logger.warning("Hybrid GDN model detected, disable radix cache")
             self.server_args.disable_radix_cache = True
+            self.server_args.full_attention_backend = self.server_args.attention_backend
             self.server_args.attention_backend = "hybrid_linear_attn"
             if self.server_args.max_mamba_cache_size is None:
                 if self.server_args.max_running_requests is not None:
@@ -1746,6 +1747,12 @@ class ModelRunner:
             logger.warning(
                 f"Warning: Attention backend specified by --attention-backend or default backend might be overridden."
                 f"The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
+            )
+        elif self.is_draft_worker and hasattr(
+            self.server_args, "full_attention_backend"
+        ):
+            attn_backend = self._get_attention_backend_from_str(
+                self.server_args.full_attention_backend
             )
         else:
             attn_backend = self._get_attention_backend_from_str(
