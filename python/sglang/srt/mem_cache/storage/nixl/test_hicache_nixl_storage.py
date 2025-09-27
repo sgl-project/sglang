@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlFileManager,
@@ -31,8 +32,22 @@ class TestNixlUnified(unittest.TestCase):
         # Create instances
         self.file_manager = NixlFileManager(self.test_dir)
         self.registration = NixlRegistration(self.mock_agent)
+
+        # Create storage config for testing
+        self.storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=2,
+            is_mla_model=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+        )
+
         try:
-            self.hicache = HiCacheNixl(file_path=self.test_dir, plugin="POSIX")
+            self.hicache = HiCacheNixl(
+                storage_config=self.storage_config,
+                file_path=self.test_dir,
+                plugin="POSIX",
+            )
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
 
