@@ -190,6 +190,7 @@ class ServerArgs:
 
     # Runtime options
     device: Optional[str] = None
+    enable_mooncake_dist_backend: bool = False
     tp_size: int = 1
     pp_size: int = 1
     max_micro_batch_size: Optional[int] = None
@@ -298,7 +299,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake"] = "none"
     moe_runner_backend: Literal[
         "auto",
         "triton",
@@ -472,7 +473,7 @@ class ServerArgs:
 
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
-        self._handle_deepep_moe()
+        self._handle_a2a_moe()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
 
@@ -885,7 +886,7 @@ class ServerArgs:
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-    def _handle_deepep_moe(self):
+    def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
@@ -893,6 +894,12 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.moe_a2a_backend == "mooncake":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
     def _handle_eplb_and_dispatch(self):
@@ -1460,6 +1467,11 @@ class ServerArgs:
             type=str,
             default=ServerArgs.device,
             help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
+        )
+        parser.add_argument(
+            "--enable-mooncake-dist-backend",
+            action="store_true",
+            help="Enable Mooncake Backend to support fault-tolerant communication.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -2032,7 +2044,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep"],
+            choices=["none", "deepep", "mooncake"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
