@@ -651,35 +651,92 @@ impl GrpcRouter {
             Err(e) => return fail_fmt("Failed to start generation: ", &e),
         };
 
-        // Get the single Complete response
-        let gen_response = match stream.next().await {
-            Some(Ok(r)) => r,
-            Some(Err(e)) => return fail_fmt("Failed to get GenerateResponse: ", &e),
-            None => return fail_str("No response from server"),
+        // Collect all responses (for n>1 support)
+        let mut all_responses = Vec::new();
+        while let Some(response) = stream.next().await {
+            match response {
+                Ok(gen_response) => {
+                    match gen_response.response {
+                        Some(proto::generate_response::Response::Complete(complete)) => {
+                            all_responses.push(complete);
+                        }
+                        Some(proto::generate_response::Response::Error(err)) => {
+                            error!("Generation failed for one choice: {}", err.message);
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Generation failed: {}", err.message),
+                            )
+                                .into_response();
+                        }
+                        Some(proto::generate_response::Response::Chunk(_)) => {
+                            return fail_str("Unexpected chunk response for non-streaming request")
+                        }
+                        None => return fail_str("Empty response from server"),
+                    }
+                }
+                Err(e) => return fail_fmt("Failed to get GenerateResponse: ", &e),
+            }
+        }
+
+        if all_responses.is_empty() {
+            return fail_str("No responses from server");
+        }
+
+        // Process each response into a ChatChoice
+        let mut choices = Vec::new();
+        for (index, complete) in all_responses.iter().enumerate() {
+            match self.process_single_choice(complete, index, original_request, &mut stop_decoder).await {
+                Ok(choice) => choices.push(choice),
+                Err(e) => {
+                    error!("Failed to process choice {}: {}", index, e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to process choice {}: {}", index, e),
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        // Aggregate usage information from all responses
+        let total_prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
+        let total_completion_tokens: u32 = all_responses.iter().map(|r| r.completion_tokens as u32).sum();
+        let usage = Usage {
+            prompt_tokens: total_prompt_tokens,
+            completion_tokens: total_completion_tokens,
+            total_tokens: total_prompt_tokens + total_completion_tokens,
+            completion_tokens_details: None,
         };
 
-        // Extract the expected variant early
-        let complete = match gen_response.response {
-            Some(proto::generate_response::Response::Complete(c)) => c,
-            Some(proto::generate_response::Response::Error(err)) => {
-                error!("Generation failed: {}", err.message);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Generation failed: {}", err.message),
-                )
-                    .into_response();
-            }
-            Some(proto::generate_response::Response::Chunk(_)) => {
-                return fail_str("Unexpected chunk response for non-streaming request")
-            }
-            None => return fail_str("Empty response from server"),
+        // Build final ChatCompletionResponse
+        let response = ChatCompletionResponse {
+            id: format!("chatcmpl-{}", Uuid::new_v4()),
+            object: "chat.completion".to_string(),
+            created: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            model: original_request.model.clone(),
+            choices,
+            usage: Some(usage),
+            system_fingerprint: None,
         };
 
+        // Serialize and return JSON response
+        Json(response).into_response()
+    }
+
+    /// Process a single GenerateComplete response into a ChatChoice
+    async fn process_single_choice(
+        &self,
+        complete: &proto::GenerateComplete,
+        index: usize,
+        original_request: &ChatCompletionRequest,
+        stop_decoder: &mut crate::tokenizer::stop::StopSequenceDecoder,
+    ) -> Result<ChatChoice, String> {
         // Decode tokens
-        let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
-            Ok(o) => o,
-            Err(e) => return fail_fmt("Failed to process tokens: ", &e),
-        };
+        let outputs = stop_decoder.process_tokens(&complete.output_ids)
+            .map_err(|e| format!("Failed to process tokens: {}", e))?;
 
         // Accumulate text with early breaks
         let mut final_text = String::new();
@@ -715,12 +772,7 @@ impl GrpcRouter {
                         processed_text = result.normal_text;
                     }
                     Err(e) => {
-                        error!("Reasoning parsing error: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Failed to parse reasoning content",
-                        )
-                            .into_response();
+                        return Err(format!("Reasoning parsing error: {}", e));
                     }
                 }
             }
@@ -736,8 +788,7 @@ impl GrpcRouter {
             _ => true,
         };
 
-        if tool_choice_enabled && original_request.tools.is_some()
-        {
+        if tool_choice_enabled && original_request.tools.is_some() {
             if let Some(parser) = self.tool_parser_registry.get_parser(&original_request.model) {
                 match parser.parse_complete(&processed_text).await {
                     Ok(parsed_tool_calls) => {
@@ -792,17 +843,9 @@ impl GrpcRouter {
             reasoning_content: reasoning_text,
         };
 
-        // Step 5: Build Usage information
-        let usage = Usage {
-            prompt_tokens: complete.prompt_tokens as u32,
-            completion_tokens: complete.completion_tokens as u32,
-            total_tokens: (complete.prompt_tokens + complete.completion_tokens) as u32,
-            completion_tokens_details: None,
-        };
-
-        // Step 6: Build ChatChoice
+        // Step 5: Build ChatChoice
         let choice = ChatChoice {
-            index: 0,
+            index: index as u32,
             message: chat_message,
             logprobs: None,
             finish_reason: Some(final_finish_reason_str.to_string()),
@@ -810,22 +853,7 @@ impl GrpcRouter {
             hidden_states: None,
         };
 
-        // Step 7: Build ChatCompletionResponse
-        let response = ChatCompletionResponse {
-            id: format!("chatcmpl-{}", Uuid::new_v4()),
-            object: "chat.completion".to_string(),
-            created: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            model: original_request.model.clone(),
-            choices: vec![choice],
-            usage: Some(usage),
-            system_fingerprint: None,
-        };
-
-        // Step 8: Serialize and return JSON response
-        Json(response).into_response()
+        Ok(choice)
     }
 }
 
