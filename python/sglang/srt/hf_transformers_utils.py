@@ -44,6 +44,7 @@ from sglang.srt.configs import (
     LongcatFlashConfig,
     MultiModalityConfig,
     Qwen3NextConfig,
+    FalconH1Config,
     Step3VLConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
@@ -61,6 +62,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     Step3VLConfig.model_type: Step3VLConfig,
     LongcatFlashConfig.model_type: LongcatFlashConfig,
     Qwen3NextConfig.model_type: Qwen3NextConfig,
+    FalconH1Config.model_type: FalconH1Config,
     DotsVLMConfig.model_type: DotsVLMConfig,
 }
 
