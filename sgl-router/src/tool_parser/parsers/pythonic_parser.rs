@@ -260,7 +260,7 @@ impl PythonicParser {
 
 #[async_trait]
 impl ToolParser for PythonicParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         let cleaned = Self::strip_special_tokens(text);
 
         // Extract tool calls using bracket counting
@@ -318,9 +318,9 @@ impl ToolParser for PythonicParser {
                 }
             }
 
-            Ok(calls)
+            Ok((String::new(), calls)) // TODO: Implement proper normal text extraction
         } else {
-            Ok(vec![])
+            Ok((text.to_string(), vec![]))
         }
     }
 
@@ -336,11 +336,11 @@ impl ToolParser for PythonicParser {
         // Try to parse if we have a complete tool call
         let cleaned = Self::strip_special_tokens(&state.buffer);
         if self.extract_tool_calls(&cleaned).is_some() {
-            let result = self.parse_complete(&state.buffer).await?;
-            if !result.is_empty() {
+            let (_normal_text, tools) = self.parse_complete(&state.buffer).await?;
+            if !tools.is_empty() {
                 state.buffer.clear();
                 return Ok(StreamResult::ToolComplete(
-                    result.into_iter().next().unwrap(),
+                    tools.into_iter().next().unwrap(),
                 ));
             }
         }
@@ -369,11 +369,11 @@ mod tests {
         let parser = PythonicParser::new();
         let input = r#"[search_web(query="Rust programming", max_results=5)]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "search_web");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "search_web");
 
-        let args: Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+        let args: Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
         assert_eq!(args["query"], "Rust programming");
         assert_eq!(args["max_results"], 5);
     }
@@ -383,10 +383,10 @@ mod tests {
         let parser = PythonicParser::new();
         let input = r#"[get_weather(city="Tokyo"), search(query="news")]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert_eq!(result[1].function.name, "search");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert_eq!(tools[1].function.name, "search");
     }
 
     #[tokio::test]
@@ -394,10 +394,10 @@ mod tests {
         let parser = PythonicParser::new();
         let input = r#"[test(flag=True, disabled=False, optional=None)]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
 
-        let args: Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+        let args: Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
         assert_eq!(args["flag"], true);
         assert_eq!(args["disabled"], false);
         assert_eq!(args["optional"], Value::Null);
@@ -408,11 +408,11 @@ mod tests {
         let parser = PythonicParser::new();
         let input = r#"<|python_start|>[calculate(x=10, y=20)]<|python_end|>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "calculate");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "calculate");
 
-        let args: Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+        let args: Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
         assert_eq!(args["x"], 10);
         assert_eq!(args["y"], 20);
     }
@@ -422,11 +422,11 @@ mod tests {
         let parser = PythonicParser::new();
         let input = r#"[get_weather(city="London", units="celsius")]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
 
-        let args: Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+        let args: Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
         assert_eq!(args["city"], "London");
         assert_eq!(args["units"], "celsius");
     }

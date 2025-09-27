@@ -241,7 +241,9 @@ impl Default for JsonParser {
 
 #[async_trait]
 impl ToolParser for JsonParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+        // Always return empty normal text for JSON parser, only extract tool calls
+
         // Check if we have multiple start tokens (e.g., multiple <|python_tag|> markers)
         if !self.token_config.start_tokens.is_empty() {
             let start_token = &self.token_config.start_tokens[0];
@@ -279,9 +281,7 @@ impl ToolParser for JsonParser {
                     }
                 }
 
-                if !all_tools.is_empty() {
-                    return Ok(all_tools);
-                }
+                return Ok((String::new(), all_tools));
             }
         }
 
@@ -290,12 +290,18 @@ impl ToolParser for JsonParser {
 
         // Try to parse as JSON first
         match serde_json::from_str::<Value>(json_content) {
-            Ok(value) => self.parse_json_value(&value),
+            Ok(value) => {
+                let tools = self.parse_json_value(&value)?;
+                Ok((String::new(), tools))
+            }
             Err(_) => {
                 // If parse failed, check if we have multiple JSON objects separated by the configured separator
-                // This handles cases like: {"name": "func1", ...};{"name": "func2", ...}
+                // Only do this if we can reasonably expect multiple complete JSON objects
+                // (i.e., text starts and ends with JSON-like structure)
                 if !self.token_config.separator.is_empty()
                     && json_content.contains(&self.token_config.separator)
+                    && json_content.trim().starts_with('{')
+                    && json_content.trim().ends_with('}')
                 {
                     let mut all_tools = Vec::new();
 
@@ -323,22 +329,21 @@ impl ToolParser for JsonParser {
                         }
                     }
 
-                    if !all_tools.is_empty() {
-                        return Ok(all_tools);
-                    }
+                    return Ok((String::new(), all_tools));
                 }
 
-                // If no wrapper tokens configured and parse failed,
-                // try to extract JSON from mixed text
+                // If no wrapper tokens configured and parse failed, try to extract JSON from mixed text
                 if self.token_config.start_tokens.is_empty() {
                     if let Some(extracted) = self.extract_json_from_text(text) {
                         if let Ok(value) = serde_json::from_str::<Value>(&extracted) {
-                            return self.parse_json_value(&value);
+                            let tools = self.parse_json_value(&value)?;
+                            return Ok((String::new(), tools));
                         }
                     }
                 }
-                // Not valid JSON, return empty
-                Ok(vec![])
+
+                // No valid JSON found, return empty
+                Ok((String::new(), vec![]))
             }
         }
     }
@@ -538,9 +543,10 @@ mod tests {
         let parser = JsonParser::new();
         let input = r#"{"name": "get_weather", "arguments": {"location": "San Francisco"}}"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(normal_text, ""); // Pure JSON should have no normal text
     }
 
     #[tokio::test]
@@ -551,10 +557,11 @@ mod tests {
             {"name": "search", "arguments": {"query": "news"}}
         ]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert_eq!(result[1].function.name, "search");
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(tool_calls[1].function.name, "search");
+        assert_eq!(normal_text, ""); // Pure JSON should have no normal text
     }
 
     #[tokio::test]
@@ -562,10 +569,11 @@ mod tests {
         let parser = JsonParser::new();
         let input = r#"{"name": "calculate", "parameters": {"x": 10, "y": 20}}"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "calculate");
-        assert!(result[0].function.arguments.contains("10"));
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "calculate");
+        assert!(tool_calls[0].function.arguments.contains("10"));
+        assert_eq!(normal_text, ""); // Pure JSON should have no normal text
     }
 
     #[tokio::test]
@@ -577,9 +585,21 @@ mod tests {
         });
 
         let input = r#"<tool>{"name": "test", "arguments": {}}</tool>"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "test");
+        assert_eq!(normal_text, ""); // Wrapper tokens with no extra text
+    }
+
+    #[tokio::test]
+    async fn test_parse_with_normal_text() {
+        let parser = JsonParser::new();
+        let input = r#"Here is the weather data: {"name": "get_weather", "arguments": {"location": "SF"}} Let me know if you need more info."#;
+
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(normal_text, ""); // JSON parser returns empty normal text by design
     }
 
     #[test]
