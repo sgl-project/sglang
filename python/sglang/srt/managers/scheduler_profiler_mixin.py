@@ -97,7 +97,9 @@ class SchedulerProfilerMixin:
     def start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
-        stage_str = f" for {stage.__str__()}" if stage else ""
+        stage_str = (
+            f" for {stage.name}" if stage and isinstance(stage, ForwardMode) else ""
+        )
         logger.info(
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
         )
@@ -181,7 +183,9 @@ class SchedulerProfilerMixin:
         if not Path(self.torch_profiler_output_dir).exists():
             Path(self.torch_profiler_output_dir).mkdir(parents=True, exist_ok=True)
 
-        stage_suffix = f"-{stage.__str__()}" if stage else ""
+        stage_suffix = (
+            f"-{stage.name}" if stage and isinstance(stage, ForwardMode) else ""
+        )
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
