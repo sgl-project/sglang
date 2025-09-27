@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -296,6 +297,10 @@ class TpModelWorkerClient:
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
         return self.worker.unload_lora_adapter(recv_req)
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        """Update weights from IPC for checkpoint-engine integration."""
+        return self.worker.update_weights_from_ipc(recv_req)
 
     def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
         return self.worker.can_run_lora_batch(lora_ids)
