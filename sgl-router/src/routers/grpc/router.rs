@@ -738,6 +738,7 @@ impl GrpcRouter {
         original_request: &ChatCompletionRequest,
         stop_decoder: &mut crate::tokenizer::stop::StopSequenceDecoder,
     ) -> Result<ChatChoice, String> {
+        stop_decoder.reset();
         // Decode tokens
         let outputs = stop_decoder
             .process_tokens(&complete.output_ids)
