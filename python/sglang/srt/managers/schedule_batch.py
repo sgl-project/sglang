@@ -1735,7 +1735,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
-                has_been_filtered=self.forward_mode.is_target_verify()
+                has_been_filtered=self.forward_mode.is_target_verify(),
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
