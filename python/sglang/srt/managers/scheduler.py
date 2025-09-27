@@ -899,8 +899,9 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 for req in batch.reqs:
-                    trace_event("schedule", req.rid)
+                    trace_event("schedule", req.rid, attrs=attrs)
 
             if batch:
                 result = self.run_batch(batch)
@@ -924,8 +925,9 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
                 for req in batch.reqs:
-                    trace_event("schedule", req.rid)
+                    trace_event("schedule", req.rid, attrs=attrs)
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -1433,7 +1435,7 @@ class Scheduler(
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
-            trace_slice_end("process req", req.rid, auto_next_anon=True)
+            trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
@@ -2087,7 +2089,7 @@ class Scheduler(
             self.process_batch_result_decode(batch, result, launch_done)
             for req in batch.reqs:
                 trace_slice(
-                    "decode loop",
+                    RequestStage.DECODE_LOOP,
                     req.rid,
                     auto_next_anon=not req.finished(),
                     thread_finish_flag=req.finished(),
@@ -2095,13 +2097,7 @@ class Scheduler(
 
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)
-            for req in batch.reqs:
-                trace_slice(
-                    "prefill",
-                    req.rid,
-                    auto_next_anon=not req.finished(),
-                    thread_finish_flag=req.finished(),
-                )
+
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
@@ -2795,10 +2791,13 @@ def run_scheduler_process(
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
     if server_args.enable_trace:
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.disaggregation_mode == "null":
-            thread_label = "Scheduler"
-            trace_set_thread_info(thread_label, tp_rank, dp_rank)
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        thread_label = "Scheduler"
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill Scheduler"
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode Scheduler"
+        trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
     if (numa_node := server_args.numa_node) is not None:
         numa_bind_to_node(numa_node[gpu_id])

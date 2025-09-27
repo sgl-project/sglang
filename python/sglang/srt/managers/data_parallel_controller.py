@@ -37,11 +37,19 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, RequestStage
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.utils import DPBalanceMeta
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.tracing.trace import (
+    process_tracing_init,
+    trace_get_proc_propagate_context,
+    trace_set_proc_propagate_context,
+    trace_set_thread_info,
+    trace_slice_end,
+    trace_slice_start,
+)
 from sglang.srt.utils import (
     bind_port,
     configure_logger,
@@ -403,7 +411,26 @@ class DataParallelController:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+
+                if isinstance(
+                    recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                ):
+                    trace_set_proc_propagate_context(
+                        recv_req.rid, recv_req.trace_context
+                    )
+                    trace_slice_start(RequestStage.DC_DISPATCH, recv_req.rid)
+                    recv_req.trace_context = trace_get_proc_propagate_context(
+                        recv_req.rid
+                    )
+
                 self._request_dispatcher(recv_req)
+
+                if isinstance(
+                    recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                ):
+                    trace_slice_end(
+                        RequestStage.DC_DISPATCH, recv_req.rid, thread_finish_flag=True
+                    )
 
 
 def run_data_parallel_controller_process(
@@ -412,6 +439,14 @@ def run_data_parallel_controller_process(
     pipe_writer,
 ):
     kill_itself_when_parent_died()
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        thread_label = "DP Controller"
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill DP Controller"
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode DP Controller"
+        trace_set_thread_info(thread_label)
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     configure_logger(server_args)
