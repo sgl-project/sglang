@@ -45,5 +45,11 @@ docker exec -w / ci_sglang mkdir -p /dummy-grok
 mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
 docker cp ./dummy-grok ci_sglang:/
 
-docker exec ci_sglang pip install huggingface_hub[hf_xet]
 docker exec ci_sglang pip install pytest
+
+# Install the required dependencies for HF
+docker exec ci_sglang pip install huggingface_hub[hf_xet]
+if [ -n "${HF_TOKEN:-}" ]; then
+  docker exec -e HF_TOKEN="${HF_TOKEN}" ci_sglang \
+    bash -lc 'pip install -U "huggingface_hub[cli]" && hf auth login --token "$HF_TOKEN"'
+fi

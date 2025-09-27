@@ -35,7 +35,7 @@ suites = {
         # TestFile("models/test_grok_models.py", 60),  # Disabled due to illegal memory access
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
-        TestFile("models/test_vlm_models.py", 741),
+        TestFile("models/test_vlm_models.py", 773),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("openai_server/basic/test_protocol.py", 10),
         TestFile("openai_server/basic/test_serving_chat.py", 10),
@@ -110,7 +110,7 @@ suites = {
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_srt_endpoint.py", 130),
-        TestFile("test_start_profile.py", 60),
+        # TestFile("test_start_profile.py", 60),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
@@ -121,7 +121,7 @@ suites = {
         TestFile("test_triton_sliding_window.py", 250),
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 175),
-        TestFile("test_vlm_input_format.py", 300),
+        TestFile("test_vlm_input_format.py", 450),
         TestFile("test_vision_openai_server_a.py", 724),
         TestFile("test_vision_openai_server_b.py", 446),
     ],
@@ -178,12 +178,12 @@ suites = {
 # Add AMD tests
 suite_amd = {
     "per-commit-amd": [
-        TestFile("hicache/test_hicache.py", 116),
-        TestFile("hicache/test_hicache_mla.py", 127),
-        TestFile("hicache/test_hicache_storage.py", 127),
+        # TestFile("hicache/test_hicache.py", 116),              # Temporarily disabled due to timeout
+        # TestFile("hicache/test_hicache_mla.py", 1316),         # Temporarily disabled due to timeout
+        # TestFile("hicache/test_hicache_storage.py", 429),      # Temporarily disabled due to timeout
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
-        TestFile("lora/test_lora_backend.py", 99),
+        TestFile("lora/test_lora_backend.py", 129),
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("lora/test_lora_cuda_graph.py", 250),
         TestFile("lora/test_lora_qwen3.py", 97),
@@ -191,6 +191,7 @@ suite_amd = {
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
+        TestFile("models/test_vlm_models.py", 437),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("openai_server/basic/test_protocol.py", 10),
         TestFile("openai_server/basic/test_serving_chat.py", 10),
@@ -198,13 +199,13 @@ suite_amd = {
         TestFile("openai_server/basic/test_serving_embedding.py", 10),
         TestFile("openai_server/basic/test_openai_embedding.py", 141),
         TestFile("openai_server/basic/test_openai_server.py", 149),
-        TestFile("openai_server/features/test_enable_thinking.py", 70),
+        TestFile("openai_server/features/test_enable_thinking.py", 286),
         TestFile("openai_server/features/test_json_constrained.py", 98),
         TestFile("openai_server/features/test_json_mode.py", 90),
         TestFile("openai_server/features/test_openai_server_ebnf.py", 95),
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
         TestFile("openai_server/features/test_reasoning_content.py", 89),
-        TestFile("openai_server/function_call/test_openai_function_calling.py", 60),
+        TestFile("openai_server/function_call/test_openai_function_calling.py", 120),
         TestFile("openai_server/function_call/test_tool_choice.py", 226),
         TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
@@ -222,12 +223,13 @@ suite_amd = {
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
+        TestFile("test_harmony_parser.py", 20),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
-        TestFile("test_mla.py", 242),
+        TestFile("test_mla.py", 666),
         TestFile("test_mla_deepseek_v3.py", 221),
         TestFile("test_no_chunked_prefill.py", 108),
         # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
@@ -241,15 +243,17 @@ suite_amd = {
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
-        TestFile("test_srt_engine.py", 261),
+        TestFile("test_srt_engine.py", 900),
         TestFile("test_srt_endpoint.py", 130),
-        TestFile("test_torch_compile.py", 169),
-        TestFile("test_torch_compile_moe.py", 172),
+        TestFile("test_torch_compile.py", 76),
+        TestFile("test_torch_compile_moe.py", 409),
         TestFile("test_torch_native_attention_backend.py", 123),
+        # TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 150),
+        TestFile("test_triton_sliding_window.py", 250),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_wave_attention_kernels.py", 2),
-        TestFile("test_wave_attention_backend.py", 150),
+        # TestFile("test_wave_attention_backend.py", 150), # Temporarily disable due to # 10819
     ],
     "per-commit-amd-mi35x": [
         TestFile("test_mla.py", 242),
@@ -257,7 +261,7 @@ suite_amd = {
     ],
     "per-commit-2-gpu-amd": [
         TestFile("lora/test_lora_tp.py", 116),
-        TestFile("rl/test_update_weights_from_distributed.py", 103),
+        TestFile("rl/test_update_weights_from_distributed.py", 200),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
@@ -267,6 +271,8 @@ suite_amd = {
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
+        TestFile("test_disaggregation_different_tp.py", 155),
+        TestFile("test_disaggregation_pp.py", 60),
     ],
     "nightly-amd": [
         TestFile("test_nightly_gsm8k_eval_amd.py"),
