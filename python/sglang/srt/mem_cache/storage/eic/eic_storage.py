@@ -11,7 +11,11 @@ import torch
 import yaml
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig, HiCacheStorageExtraInfo
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorage,
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
+)
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
@@ -153,7 +157,9 @@ class FlexibleKVCacheMemoryPool:
 
 
 class EICStorage(HiCacheStorage):
-    def __init__(self, hicache_config: HiCacheStorageConfig, memory_pool_host: HostKVCache):
+    def __init__(
+        self, hicache_config: HiCacheStorageConfig, memory_pool_host: HostKVCache
+    ):
         global G_EnableKVSetGPUDirect, G_EnableKVGetGPUDirect
         global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity
 
@@ -265,7 +271,9 @@ class EICStorage(HiCacheStorage):
         self.page_size = self.memory_pool_host.page_size
         self.use_zero_copy = self.memory_pool_host.layout == "page_first"
         if not self.use_zero_copy:
-            self.kv_cache_shape = self.memory_pool_host.get_data_page(0, flat=True).shape
+            self.kv_cache_shape = self.memory_pool_host.get_data_page(
+                0, flat=True
+            ).shape
             if self.enable_kv_set_direct:
                 self.kv_cache_write_mem_pool = FlexibleKVCacheMemoryPool(
                     self.connection, self.kv_cache_shape, self.kv_cache_dtype, "cpu"
@@ -329,6 +337,7 @@ class EICStorage(HiCacheStorage):
             return self.zero_copy_batch_set([key], [target_location])
         else:
             return self.generic_batch_set([key], [value])
+
     # target_locations and target_sizes are not used for now
     def batch_set(
         self,
@@ -355,7 +364,7 @@ class EICStorage(HiCacheStorage):
             return self.zero_copy_batch_get([key], [target_location])
         else:
             return self.generic_batch_get([key], [target_location])
-     
+
     # use for v1 interface, and shound not be called directly
     def batch_get(
         self,
@@ -370,7 +379,7 @@ class EICStorage(HiCacheStorage):
             return self.zero_copy_batch_get(keys, target_locations)
         else:
             return self.generic_batch_get(keys, target_locations)
-    
+
     def _batch_exists_impl(self, keys) -> List[bool]:
         if len(keys) == 0:
             return 0
@@ -387,11 +396,14 @@ class EICStorage(HiCacheStorage):
             exist_option.ns = self.eic_namespace
             status_code, exist_outcome = self.connection.mexist(keys_vec, exist_option)
             if status_code != eic.StatusCode.SUCCESS:
-                logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
+                logger.error(
+                    f"eic exists {len(keys)} failed, status_code {status_code}"
+                )
                 result.extend([False] * len(batch_keys))
             for err_code in exist_outcome.status_codes:
                 result.append(err_code == eic.StatusCode.SUCCESS)
         return result
+
     def exists(self, key) -> bool:
         exist_num = self.batch_exists([key])
         return exist_num == 1
@@ -419,11 +431,11 @@ class EICStorage(HiCacheStorage):
             keys_vec.append(eic_key)
         del_option = eic.DelOption()
         self.connection.mdel(keys_vec, del_option)
-    
+
     def clear(self) -> None:
-        return 
-    
-    # Not used for now 
+        return
+
+    # Not used for now
     def _filter_kv_cache(self, total_len) -> Tuple[int, int]:
         mean_len = total_len // self.world_size
         remainder = total_len % self.world_size
@@ -433,9 +445,7 @@ class EICStorage(HiCacheStorage):
         logger.debug(f"start: {start}, end: {end}, tp_keys_len: {tp_keys_len}")
         return start, end
 
-    def zero_copy_batch_set(
-        self, keys: List[str], values: List[torch.Tensor]
-    ) -> bool:
+    def zero_copy_batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
         logger.debug(f"eic zero copy set {len(keys)} keys")
         if len(keys) == 0:
             return True
@@ -692,12 +702,15 @@ class EICStorage(HiCacheStorage):
         # use memory pool directly or dummy page
         values = (
             [
-                self.memory_pool_host.get_data_page(host_indices[i * self.page_size], flat=False)
+                self.memory_pool_host.get_data_page(
+                    host_indices[i * self.page_size], flat=False
+                )
                 for i in range(page_num)
             ]
             if self.use_zero_copy
             else [
-                self.memory_pool_host.get_dummy_flat_data_page() for _ in range(page_num)
+                self.memory_pool_host.get_dummy_flat_data_page()
+                for _ in range(page_num)
             ]
         )
 
@@ -742,7 +755,9 @@ class EICStorage(HiCacheStorage):
         page_num = len(host_indices) // self.page_size
         flat = not self.use_zero_copy
         values = [
-            self.memory_pool_host.get_data_page(host_indices[i * self.page_size], flat=flat)
+            self.memory_pool_host.get_data_page(
+                host_indices[i * self.page_size], flat=flat
+            )
             for i in range(page_num)
         ]
 
