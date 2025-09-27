@@ -10,8 +10,8 @@ mod common;
 use common::mock_mcp_server::MockMCPServer;
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConnectionMode, HealthCheckConfig, PolicyConfig,
-    RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConnectionMode, HealthCheckConfig, PolicyConfig, RetryConfig,
+    RouterConfig, RoutingMode,
 };
 use sglang_router_rs::routers::RouterFactory;
 use sglang_router_rs::server::AppContext;

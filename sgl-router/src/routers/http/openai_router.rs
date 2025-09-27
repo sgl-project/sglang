@@ -1133,11 +1133,11 @@ impl OpenAIRouter {
             "role": "user",
             "content": args.original_body.input.clone()
         });
-
+        // temp system message since currently only support 1 turn of mcp function call
         let system_item = serde_json::json!({
             "type": "message",
             "role": "system",
-            "content": "please resume with the following tool result, and answer user's question directly"
+            "content": "please resume with the following tool result, and answer user's question directly, don't trigger any more tool calls"
         });
 
         let func_item = serde_json::json!({
@@ -1192,6 +1192,9 @@ impl OpenAIRouter {
         }
         // After resume, mask tools as MCP if request used MCP
         Self::mask_tools_as_mcp(&mut v, args.original_body);
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("store".to_string(), Value::Bool(args.original_body.store));
+        }
         Ok(v)
     }
 }
