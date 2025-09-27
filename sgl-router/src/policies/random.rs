@@ -75,7 +75,6 @@ mod tests {
             ),
         ];
 
-        // Test multiple selections to ensure randomness
         let mut counts = HashMap::new();
         for _ in 0..100 {
             if let Some(idx) = policy.select_worker(&workers, None) {
