@@ -45,7 +45,8 @@ impl PythonicParser {
     }
 
     /// Extract tool calls using bracket counting (similar to MistralParser)
-    fn extract_tool_calls(&self, text: &str) -> Option<String> {
+    /// Returns extracted tool call group with [] and normal content
+    fn extract_tool_calls(&self, text: &str) -> Option<(String, String)> {
         // Find the start of a tool call list - look for [ followed by a function name
         let chars: Vec<char> = text.chars().collect();
 
@@ -103,7 +104,11 @@ impl PythonicParser {
                                 // Found the matching bracket
                                 let extracted: String = chars[start_idx..=i].iter().collect();
                                 if extracted.contains('(') && extracted.contains(')') {
-                                    return Some(extracted);
+                                    // Calculate normal text by removing the tool call portion
+                                    let before = &text[..start_idx];
+                                    let after = &text[(i + 1)..];
+                                    let normal_text = format!("{}{}", before, after);
+                                    return Some((extracted, normal_text));
                                 }
                             }
                         }
@@ -264,7 +269,7 @@ impl ToolParser for PythonicParser {
         let cleaned = Self::strip_special_tokens(text);
 
         // Extract tool calls using bracket counting
-        if let Some(tool_calls_text) = self.extract_tool_calls(&cleaned) {
+        if let Some((tool_calls_text, normal_text)) = self.extract_tool_calls(&cleaned) {
             // Remove the outer brackets
             let tool_calls_str = &tool_calls_text[1..tool_calls_text.len() - 1];
 
@@ -318,7 +323,7 @@ impl ToolParser for PythonicParser {
                 }
             }
 
-            Ok((String::new(), calls)) // TODO: Implement proper normal text extraction
+            Ok((normal_text, calls))
         } else {
             Ok((text.to_string(), vec![]))
         }
@@ -429,5 +434,34 @@ mod tests {
         let args: Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
         assert_eq!(args["city"], "London");
         assert_eq!(args["units"], "celsius");
+    }
+
+    #[tokio::test]
+    async fn test_normal_text_extraction() {
+        let parser = PythonicParser::new();
+
+        // Test with text before and after
+        let input = r#"Please check the weather [get_weather(city="Tokyo")] and let me know."#;
+        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert_eq!(normal_text, "Please check the weather  and let me know.");
+
+        // Test with only normal text (no tool calls)
+        let input_no_tools = "This is just normal text without any tool calls.";
+        let (normal_text, tools) = parser.parse_complete(input_no_tools).await.unwrap();
+
+        assert_eq!(tools.len(), 0);
+        assert_eq!(normal_text, input_no_tools);
+
+        // Test with multiple tool calls in single bracket group and normal text
+        let input_multiple = r#"First, [search(query="rust"), calculate(x=5, y=10)] please."#;
+        let (normal_text, tools) = parser.parse_complete(input_multiple).await.unwrap();
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "search");
+        assert_eq!(tools[1].function.name, "calculate");
+        assert_eq!(normal_text, "First,  please.");
     }
 }
