@@ -208,6 +208,10 @@ async def async_request_openai_completions(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
+
+        if request_func_input.image_data:
+            payload.update({"image_data": request_func_input.image_data})
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
