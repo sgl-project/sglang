@@ -200,6 +200,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         env_vars = {
             "MOONCAKE_MASTER": f"127.0.0.1:{cls.mooncake_master_port}",
             "MOONCAKE_PROTOCOL": "rdma",
+            "MC_MS_AUTO_DISC": "0",
             "MOONCAKE_DEVICE": "mlx5_roce0,mlx5_roce1",
             "MOONCAKE_TE_META_DATA_SERVER": f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4294967296",  # 4 GiB

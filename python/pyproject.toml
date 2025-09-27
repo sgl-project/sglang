@@ -57,16 +57,17 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.24",
-  "sgl-kernel==0.3.10",
+  "sgl-kernel==0.3.12",
   "torch==2.8.0",
   "torchaudio==2.8.0",
   "torchvision",
   "cuda-python",
-  "flashinfer_python==0.3.1",
+  "flashinfer_python==0.4.0rc1",
   "openai==1.99.1",
   "tiktoken",
   "anthropic>=0.20.0",
   "torch_memory_saver==0.0.8",
+  "nvidia-cutlass-dsl==4.2.0",
 ]
 
 [project.optional-dependencies]
@@ -89,9 +90,9 @@ tracing = [
     "opentelemetry-exporter-otlp-proto-grpc",
 ]
 all = ["sglang[test]", "sglang[decord]"]
-blackwell = ["nvidia-cutlass-dsl==4.2.0", "sglang[test]", "sglang[decord]"]
-blackwell_aarch64 = ["nvidia-cutlass-dsl==4.2.0", "sglang[test]"]
-dev = ["sglang[test]"]
+blackwell = ["sglang[test]", "sglang[decord]"]
+blackwell_aarch64 = ["sglang[test]"]
+dev = ["sglang[test]", "sglang[decord]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
@@ -102,6 +103,8 @@ dev = ["sglang[test]"]
   "srt/layers/moe/fused_moe_triton/configs/*/*.json",
   "srt/layers/quantization/configs/*.json",
   "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
+  "srt/speculative/cpp_lookahead/*.cpp",
+  "srt/speculative/cpp_lookahead/*.h",
 ]
 
 [tool.setuptools.packages.find]
