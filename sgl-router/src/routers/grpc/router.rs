@@ -17,19 +17,20 @@ use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::metrics::RouterMetrics;
 use crate::policies::PolicyRegistry;
 use crate::protocols::spec::ChatMessage;
-use crate::protocols::spec::{ChatCompletionRequest, StringOrArray};
 use crate::protocols::spec::{
-    CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, ResponsesGetParams,
-    ResponsesRequest, Tool, ToolChoice,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+    ResponsesGetParams, ResponsesRequest, StringOrArray, Tool, ToolChoice,
 };
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
 use crate::server::AppContext;
 use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
+use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoderBuilder};
 use crate::tokenizer::traits::Tokenizer;
 use crate::tokenizer::HuggingFaceTokenizer;
 use crate::tool_parser::ParserRegistry;
 use serde_json::Value;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 // Data structures for processing
@@ -182,7 +183,7 @@ impl GrpcRouter {
             request_id,
             body,
             processed_messages.text.clone(),
-            token_ids.into_iter().map(|id| id as i32).collect(),
+            token_ids,
             processed_messages.multimodal_inputs,
             tool_call_constraint, // Pass the full tuple (type, value)
         ) {
@@ -479,28 +480,225 @@ impl GrpcRouter {
         None
     }
 
-    /// Placeholder for streaming handler (to be implemented in Phase 2)
-    async fn handle_streaming_chat(
+    /// Create a StopSequenceDecoder from the chat completion request
+    fn create_stop_decoder(
         &self,
-        _client: SglangSchedulerClient,
-        _request: proto::GenerateRequest,
-        _original_request: &ChatCompletionRequest,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Streaming not yet implemented").into_response()
+        original_request: &ChatCompletionRequest,
+    ) -> crate::tokenizer::stop::StopSequenceDecoder {
+        // Extract stop sequences from request
+        let stop_sequences: Vec<String> = match &original_request.stop {
+            Some(StringOrArray::String(s)) => vec![s.clone()],
+            Some(StringOrArray::Array(arr)) => arr.clone(),
+            None => vec![],
+        };
+
+        // Build stop sequence decoder
+        let mut builder = StopSequenceDecoderBuilder::new(self.tokenizer.clone())
+            .skip_special_tokens(original_request.skip_special_tokens);
+
+        // Add stop sequences (visible if no_stop_trim is true, hidden otherwise)
+        for seq in stop_sequences {
+            builder = if original_request.no_stop_trim {
+                builder.visible_stop_sequence(seq)
+            } else {
+                builder.stop_sequence(seq)
+            };
+        }
+
+        // Add stop token IDs (visible if no_stop_trim is true, hidden otherwise)
+        if let Some(stop_token_ids) = &original_request.stop_token_ids {
+            for &token_id in stop_token_ids {
+                builder = if original_request.no_stop_trim {
+                    builder.visible_stop_token(token_id)
+                } else {
+                    builder.stop_token(token_id)
+                };
+            }
+        }
+
+        builder.build()
     }
 
-    /// Placeholder for non-streaming handler (to be implemented in Phase 3)
+    /// Process a chunk of tokens through the stop decoder
+    fn process_chunk_tokens(
+        stop_decoder: &mut crate::tokenizer::stop::StopSequenceDecoder,
+        token_ids: &[u32],
+    ) -> (String, bool) {
+        let mut chunk_text = String::new();
+
+        for &token_id in token_ids {
+            match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
+                debug!(
+                    "Error processing token {}: {}. Treating as Held.",
+                    token_id, e
+                );
+                SequenceDecoderOutput::Held
+            }) {
+                SequenceDecoderOutput::Text(text) => {
+                    chunk_text.push_str(&text);
+                }
+                SequenceDecoderOutput::StoppedWithText(text) => {
+                    chunk_text.push_str(&text);
+                    return (chunk_text, true); // Return text and signal to stop
+                }
+                SequenceDecoderOutput::Stopped => {
+                    return (chunk_text, true); // Return text and signal to stop
+                }
+                SequenceDecoderOutput::Held => {
+                    // Text held for potential stop sequence match
+                }
+            }
+        }
+        (chunk_text, false) // Return text and continue processing
+    }
+
+    /// Submit request and handle streaming response for chat completions route
+    async fn handle_streaming_chat(
+        &self,
+        mut client: SglangSchedulerClient,
+        request: proto::GenerateRequest,
+        original_request: &ChatCompletionRequest,
+    ) -> Response {
+        let mut stop_decoder = self.create_stop_decoder(original_request);
+
+        // Process streaming tokens
+        let mut grpc_stream = match client.generate(request).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("Failed to start generation: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Generation failed: {}", e),
+                )
+                    .into_response();
+            }
+        };
+
+        let mut decoded_text = String::new();
+
+        while let Some(response) = grpc_stream.next().await {
+            let gen_response = match response {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("Stream error: {}", e);
+                    break;
+                }
+            };
+
+            match gen_response.response {
+                Some(proto::generate_response::Response::Chunk(chunk)) => {
+                    // Process tokens and check if we should stop
+                    let (chunk_text, should_stop) =
+                        Self::process_chunk_tokens(&mut stop_decoder, &chunk.token_ids);
+                    decoded_text.push_str(&chunk_text);
+                    if should_stop {
+                        break;
+                    }
+                    continue;
+                }
+                Some(proto::generate_response::Response::Complete(_complete)) => {
+                    // Flush any remaining text
+                    if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
+                        if !text.is_empty() {
+                            decoded_text.push_str(&text);
+                            debug!("Flushed text: {}", text);
+                        }
+                    }
+                    break;
+                }
+                Some(proto::generate_response::Response::Error(error)) => {
+                    error!("Generation error: {}", error.message);
+                    break;
+                }
+                None => continue,
+            }
+        }
+
+        // TODO: Replace with proper SSE streaming response
+        // For now, return the complete decoded text
+        (StatusCode::OK, format!("Decoded text: {}", decoded_text)).into_response()
+    }
+
+    /// Submit request and handle non-streaming response for chat completions route
     async fn handle_non_streaming_chat(
         &self,
-        _client: SglangSchedulerClient,
-        _request: proto::GenerateRequest,
-        _original_request: &ChatCompletionRequest,
+        mut client: SglangSchedulerClient,
+        request: proto::GenerateRequest,
+        original_request: &ChatCompletionRequest,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Non-streaming not yet implemented",
-        )
-            .into_response()
+        let mut stop_decoder = self.create_stop_decoder(original_request);
+
+        // Small helpers to log + return a uniform 500
+        let fail_str = |msg: &'static str| -> Response {
+            error!("{}", msg);
+            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+        };
+        let fail_fmt = |prefix: &str, e: &dyn std::fmt::Display| -> Response {
+            error!("{}{}", prefix, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{}{}", prefix, e),
+            )
+                .into_response()
+        };
+
+        // Start generation
+        let mut stream = match client.generate(request).await {
+            Ok(s) => s,
+            Err(e) => return fail_fmt("Failed to start generation: ", &e),
+        };
+
+        // Get the single Complete response
+        let gen_response = match stream.next().await {
+            Some(Ok(r)) => r,
+            Some(Err(e)) => return fail_fmt("Failed to get GenerateResponse: ", &e),
+            None => return fail_str("No response from server"),
+        };
+
+        // Extract the expected variant early
+        let complete = match gen_response.response {
+            Some(proto::generate_response::Response::Complete(c)) => c,
+            Some(proto::generate_response::Response::Error(err)) => {
+                error!("Generation failed: {}", err.message);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Generation failed: {}", err.message),
+                )
+                    .into_response();
+            }
+            Some(proto::generate_response::Response::Chunk(_)) => {
+                return fail_str("Unexpected chunk response for non-streaming request")
+            }
+            None => return fail_str("Empty response from server"),
+        };
+
+        // Decode tokens
+        let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
+            Ok(o) => o,
+            Err(e) => return fail_fmt("Failed to process tokens: ", &e),
+        };
+
+        // Accumulate text with early breaks
+        let mut final_text = String::new();
+        for output in outputs {
+            match output {
+                SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
+                SequenceDecoderOutput::StoppedWithText(t) => {
+                    final_text.push_str(&t);
+                    break;
+                }
+                SequenceDecoderOutput::Stopped => break,
+                SequenceDecoderOutput::Held => {}
+            }
+        }
+
+        // Flush remaining text
+        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+            final_text.push_str(&t);
+        }
+
+        // TODO: Create proper OpenAI-compatible response
+        (StatusCode::OK, format!("Final text: {}", final_text)).into_response()
     }
 }
 
