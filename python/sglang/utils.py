@@ -6,7 +6,6 @@ import logging
 import os
 import random
 import socket
-import ssl
 import subprocess
 import sys
 import time
@@ -156,15 +155,7 @@ def http_request(
             data = bytes(dumps(json), encoding="utf-8")
 
         try:
-            if sys.version_info >= (3, 13):
-                # Python 3.13+: Use SSL context (cafile removed)
-                if verify and isinstance(verify, str):
-                    context = ssl.create_default_context(cafile=verify)
-                else:
-                    context = ssl.create_default_context()
-                resp = urllib.request.urlopen(req, data=data, context=context)
-            else:
-                resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            resp = urllib.request.urlopen(req, data=data, cafile=verify)
             return HttpResponse(resp)
         except urllib.error.HTTPError as e:
             return HttpResponse(e)

@@ -36,7 +36,7 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
-    def match_prefix(self, key: Any, **kwargs) -> MatchResult:
+    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         pass
 
     @abstractmethod

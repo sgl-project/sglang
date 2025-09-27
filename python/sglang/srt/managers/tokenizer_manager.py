@@ -185,7 +185,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
 
         if self.model_config.is_multimodal:
-            import_processors("sglang.srt.multimodal.processors")
+            import_processors()
             try:
                 _processor = get_processor(
                     server_args.tokenizer_path,
@@ -320,8 +320,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 "model_name": self.server_args.served_model_name,
                 # TODO: Add lora name/path in the future,
             }
-            if server_args.tokenizer_metrics_allowed_custom_labels:
-                for label in server_args.tokenizer_metrics_allowed_custom_labels:
+            if server_args.tokenizer_metrics_allowed_customer_labels:
+                for label in server_args.tokenizer_metrics_allowed_customer_labels:
                     labels[label] = ""
             self.metrics_collector = TokenizerMetricsCollector(
                 server_args=server_args,
@@ -750,7 +750,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
-                extra_key=obj.extra_key,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1633,10 +1632,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else 0
         )
 
-        custom_labels = getattr(state.obj, "custom_labels", None)
+        customer_labels = getattr(state.obj, "customer_labels", None)
         labels = (
-            {**self.metrics_collector.labels, **custom_labels}
-            if custom_labels
+            {**self.metrics_collector.labels, **customer_labels}
+            if customer_labels
             else self.metrics_collector.labels
         )
         if (

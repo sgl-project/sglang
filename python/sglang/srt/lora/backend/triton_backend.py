@@ -11,18 +11,12 @@ from sglang.srt.lora.triton_ops import (
 )
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import ServerArgs
 
 
 class TritonLoRABackend(BaseLoRABackend):
     name = "triton"
 
-    def __init__(
-        self,
-        max_loras_per_batch: int,
-        device: torch.device,
-        **kwargs,
-    ):
+    def __init__(self, max_loras_per_batch: int, device: torch.device):
         super().__init__(max_loras_per_batch, device)
 
     def run_lora_a_sgemm(
@@ -36,7 +30,7 @@ class TritonLoRABackend(BaseLoRABackend):
         weights: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs,
+        **kwargs
     ) -> torch.Tensor:
         return sgemm_lora_b_fwd(x, weights, self.batch_info, base_output)
 
@@ -49,7 +43,7 @@ class TritonLoRABackend(BaseLoRABackend):
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs,
+        **kwargs
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
@@ -75,7 +69,7 @@ class TritonLoRABackend(BaseLoRABackend):
         gate_up_lora_b: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs,
+        **kwargs
     ) -> torch.Tensor:
 
         # x: (s, input_dim)

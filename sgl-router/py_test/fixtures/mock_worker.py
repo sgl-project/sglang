@@ -139,8 +139,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         )
 
     @app.get("/get_load")
-    async def get_load(request: Request):
-        check_api_key(request)
+    async def get_load():
         return JSONResponse({"load": _inflight})
 
     def make_json_response(obj: dict, status_code: int = 200) -> JSONResponse:

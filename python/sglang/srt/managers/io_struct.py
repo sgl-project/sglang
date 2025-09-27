@@ -84,8 +84,6 @@ class GenerateReqInput:
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
     rid: Optional[Union[List[str], str]] = None
-    # Extra key for classifying the request (e.g. cache_salt)
-    extra_key: Optional[Union[List[str], str]] = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -143,8 +141,8 @@ class GenerateReqInput:
     # Image gen grpc migration
     return_bytes: bool = False
 
-    # For custom metric labels
-    custom_labels: Optional[Dict[str, str]] = None
+    # For customer metric labels
+    customer_labels: Optional[Dict[str, str]] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -607,9 +605,6 @@ class TokenizedGenerateReqInput:
 
     # Priority for the request
     priority: Optional[int] = None
-
-    # Extra key for classifying the request (e.g. cache_salt)
-    extra_key: Optional[str] = None
 
     # Image gen grpc migration
     return_bytes: bool = False

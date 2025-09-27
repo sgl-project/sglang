@@ -2,6 +2,7 @@ from functools import lru_cache
 from typing import Optional, Union
 
 import torch
+import torch.nn as nn
 
 try:
     from sgl_kernel import flash_ops

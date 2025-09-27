@@ -97,7 +97,6 @@ fn default_completion_request() -> CompletionRequest {
         lora_path: None,
         session_params: None,
         return_hidden_states: false,
-        sampling_seed: None,
         other: serde_json::Map::new(),
     }
 }

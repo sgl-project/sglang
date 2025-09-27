@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -56,10 +55,6 @@ pub struct StoredResponse {
 
     /// Model used for generation
     pub model: Option<String>,
-
-    /// Raw OpenAI response payload
-    #[serde(default)]
-    pub raw_response: Value,
 }
 
 impl StoredResponse {
@@ -75,7 +70,6 @@ impl StoredResponse {
             created_at: chrono::Utc::now(),
             user: None,
             model: None,
-            raw_response: Value::Null,
         }
     }
 }
@@ -181,9 +175,3 @@ pub trait ResponseStorage: Send + Sync {
 
 /// Type alias for shared storage
 pub type SharedResponseStorage = Arc<dyn ResponseStorage>;
-
-impl Default for StoredResponse {
-    fn default() -> Self {
-        Self::new(String::new(), String::new(), None)
-    }
-}

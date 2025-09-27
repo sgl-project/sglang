@@ -249,7 +249,7 @@ class RouterArgs:
             f"--{prefix}log-level",
             type=str,
             default="info",
-            choices=["debug", "info", "warn", "error"],
+            choices=["debug", "info", "warning", "error", "critical"],
             help="Set the logging level. If not specified, defaults to INFO.",
         )
         parser.add_argument(

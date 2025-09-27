@@ -19,10 +19,8 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Optional, Union
 
-import numpy as np
 import torch
 
-from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
 logger = logging.getLogger(__name__)

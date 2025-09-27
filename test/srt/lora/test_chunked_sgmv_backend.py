@@ -10,16 +10,7 @@ from sglang.srt.lora.triton_ops import (
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
 )
-from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
-from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
 from sglang.srt.lora.utils import LoRABatchInfo
-
-CHUNK_SIZE = 16
-
-
-def reset_kernel_cache():
-    _chunked_lora_shrink_kernel._clear_cache()
-    _chunked_lora_expand_kernel._clear_cache()
 
 
 def safe_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -352,15 +343,9 @@ class TestChunkedSGMV(unittest.TestCase):
         )
 
         # Create a minimal backend instance to access _get_segments_info
-        mock_server_args = type(
-            "ServerArgs", (object,), {"max_lora_chunk_size": "MOCK_NEVER_USED"}
-        )
-        mock_backend = ChunkedSgmvLoRABackend(
-            max_loras_per_batch=8, device=self.device, server_args=mock_server_args
-        )
+        mock_backend = ChunkedSgmvLoRABackend(max_loras_per_batch=8, device=self.device)
         weight_indices_list, seg_indptr = mock_backend._get_segments_info(
-            weights_reordered,
-            chunk_size=CHUNK_SIZE,
+            weights_reordered
         )
 
         scalings = [1.0] * len(unique_loras)
@@ -392,7 +377,7 @@ class TestChunkedSGMV(unittest.TestCase):
             lora_ranks=lora_ranks_tensor,
             scalings=scalings_tensor,
             seg_lens=seq_lens_tensor,  # Original sequence lengths for reference
-            max_len=CHUNK_SIZE,
+            max_len=max(seq_lengths) if seq_lengths else 0,
             permutation=permutation_tensor,  # Token reordering permutation
         )
 
@@ -443,10 +428,6 @@ class TestChunkedSGMV(unittest.TestCase):
         List[str],
     ]:
         """Create test batch with specified composition and mode"""
-
-        # Reset kernel cache to avoid cross-test contamination
-        reset_kernel_cache()
-
         seq_lengths = self.generate_sequence_lengths(
             batch_size, batch_mode, 1, self.max_seq_len
         )
@@ -534,7 +515,6 @@ class TestChunkedSGMV(unittest.TestCase):
             batch_info,
             self.slice_offsets,
             self.max_slice_size,
-            base_output=None,
         )
         reference_expand = reference_sgmv_expand(
             reference_shrink,
@@ -614,7 +594,6 @@ class TestChunkedSGMV(unittest.TestCase):
                     batch_info,
                     self.slice_offsets,
                     self.max_slice_size,
-                    base_output=None,
                 )
                 reference_expand = reference_sgmv_expand(
                     intermediate,

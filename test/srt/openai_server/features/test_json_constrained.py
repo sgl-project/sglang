@@ -51,10 +51,10 @@ def setup_class(cls, backend: str):
     )
 
 
-class TestJSONConstrained(CustomTestCase):
+class TestJSONConstrainedOutlinesBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, backend="xgrammar")
+        setup_class(cls, backend="outlines")
 
     @classmethod
     def tearDownClass(cls):
@@ -137,13 +137,13 @@ class TestJSONConstrained(CustomTestCase):
             list(executor.map(self.run_decode, json_schemas))
 
 
-class TestJSONConstrainedOutlinesBackend(TestJSONConstrained):
+class TestJSONConstrainedXGrammarBackend(TestJSONConstrainedOutlinesBackend):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, backend="outlines")
+        setup_class(cls, backend="xgrammar")
 
 
-class TestJSONConstrainedLLGuidanceBackend(TestJSONConstrained):
+class TestJSONConstrainedLLGuidanceBackend(TestJSONConstrainedOutlinesBackend):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, backend="llguidance")

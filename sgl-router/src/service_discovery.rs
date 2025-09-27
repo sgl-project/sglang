@@ -1,6 +1,4 @@
-use crate::core::WorkerManager;
-use crate::protocols::worker_spec::WorkerConfigRequest;
-use crate::server::AppContext;
+use crate::routers::RouterTrait;
 
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
@@ -177,7 +175,7 @@ impl PodInfo {
 
 pub async fn start_service_discovery(
     config: ServiceDiscoveryConfig,
-    app_context: Arc<AppContext>,
+    router: Arc<dyn RouterTrait>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
     // Don't initialize anything if service discovery is disabled
     if !config.enabled {
@@ -279,13 +277,13 @@ pub async fn start_service_discovery(
 
             // Clone again for the next closure
             let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
-            let app_context_clone = Arc::clone(&app_context);
+            let router_clone = Arc::clone(&router);
             let config_clone2 = Arc::clone(&config_arc);
 
             match filtered_stream
                 .try_for_each(move |pod| {
                     let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
-                    let app_context_inner = Arc::clone(&app_context_clone);
+                    let router_inner = Arc::clone(&router_clone);
                     let config_inner = Arc::clone(&config_clone2);
 
                     async move {
@@ -296,15 +294,16 @@ pub async fn start_service_discovery(
                                 handle_pod_deletion(
                                     &pod_info,
                                     tracked_pods_inner,
-                                    app_context_inner,
+                                    router_inner,
                                     port,
+                                    config_inner.pd_mode,
                                 )
                                 .await;
                             } else {
                                 handle_pod_event(
                                     &pod_info,
                                     tracked_pods_inner,
-                                    app_context_inner,
+                                    router_inner,
                                     port,
                                     config_inner.pd_mode,
                                 )
@@ -348,7 +347,7 @@ pub async fn start_service_discovery(
 async fn handle_pod_event(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
-    app_context: Arc<AppContext>,
+    router: Arc<dyn RouterTrait>,
     port: u16,
     pd_mode: bool,
 ) {
@@ -381,43 +380,34 @@ async fn handle_pod_event(
                 pod_info.name, pod_info.pod_type, worker_url
             );
 
-            // Build worker config based on pod type and routing mode
-            let worker_type = if pd_mode {
-                match &pod_info.pod_type {
-                    Some(PodType::Prefill) => Some("prefill".to_string()),
-                    Some(PodType::Decode) => Some("decode".to_string()),
-                    Some(PodType::Regular) | None => None,
+            // Handle PD mode with specific pod types
+            let result = if pd_mode && pod_info.pod_type.is_some() {
+                // Need to import PDRouter type
+                use crate::routers::http::pd_router::PDRouter;
+
+                // Try to downcast to PDRouter
+                if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
+                    match &pod_info.pod_type {
+                        Some(PodType::Prefill) => pd_router
+                            .add_prefill_server(worker_url.clone(), pod_info.bootstrap_port)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Some(PodType::Decode) => pd_router
+                            .add_decode_server(worker_url.clone())
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Some(PodType::Regular) | None => {
+                            // Fall back to regular add_worker for regular pods
+                            router.add_worker(&worker_url).await
+                        }
+                    }
+                } else {
+                    Err("PD mode enabled but router is not a PDRouter".to_string())
                 }
             } else {
-                None
+                // Regular mode or no pod type specified
+                router.add_worker(&worker_url).await
             };
-
-            // Only set bootstrap_port for prefill workers in PD mode
-            let bootstrap_port = if pd_mode {
-                match &pod_info.pod_type {
-                    Some(PodType::Prefill) => pod_info.bootstrap_port,
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            let config = WorkerConfigRequest {
-                url: worker_url.clone(),
-                model_id: None,
-                worker_type,
-                priority: None,
-                cost: None,
-                labels: HashMap::new(),
-                bootstrap_port,
-                tokenizer_path: None,
-                reasoning_parser: None,
-                tool_parser: None,
-                chat_template: None,
-                api_key: None,
-            };
-
-            let result = WorkerManager::add_worker_from_config(&config, &app_context).await;
 
             match result {
                 Ok(_) => {
@@ -438,8 +428,9 @@ async fn handle_pod_event(
 async fn handle_pod_deletion(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
-    app_context: Arc<AppContext>,
+    router: Arc<dyn RouterTrait>,
     port: u16,
+    pd_mode: bool,
 ) {
     let worker_url = pod_info.worker_url(port);
 
@@ -460,8 +451,35 @@ async fn handle_pod_deletion(
             pod_info.name, pod_info.pod_type, worker_url
         );
 
-        if let Err(e) = WorkerManager::remove_worker(&worker_url, &app_context) {
-            error!("Failed to remove worker {}: {}", worker_url, e);
+        // Handle PD mode removal
+        if pd_mode && pod_info.pod_type.is_some() {
+            use crate::routers::http::pd_router::PDRouter;
+
+            // Try to downcast to PDRouter for PD-specific removal
+            if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
+                match &pod_info.pod_type {
+                    Some(PodType::Prefill) => {
+                        if let Err(e) = pd_router.remove_prefill_server(&worker_url).await {
+                            error!("Failed to remove prefill server {}: {}", worker_url, e);
+                        }
+                    }
+                    Some(PodType::Decode) => {
+                        if let Err(e) = pd_router.remove_decode_server(&worker_url).await {
+                            error!("Failed to remove decode server {}: {}", worker_url, e);
+                        }
+                    }
+                    Some(PodType::Regular) | None => {
+                        // Fall back to regular remove_worker
+                        router.remove_worker(&worker_url);
+                    }
+                }
+            } else {
+                // PD mode but not a PDRouter, use generic removal
+                router.remove_worker(&worker_url);
+            }
+        } else {
+            // Regular mode removal
+            router.remove_worker(&worker_url);
         }
     } else {
         // This case might occur if a pod is deleted before it was ever marked healthy and added.
@@ -559,10 +577,12 @@ mod tests {
         }
     }
 
-    // Helper to create an AppContext instance for testing event handlers
-    async fn create_test_app_context() -> Arc<AppContext> {
+    // Helper to create a Router instance for testing event handlers
+    async fn create_test_router() -> Arc<dyn RouterTrait> {
         use crate::config::RouterConfig;
         use crate::middleware::TokenBucket;
+        use crate::routers::http::router::Router;
+        use crate::server::AppContext;
 
         // Create a minimal RouterConfig for testing with very short timeout
         let router_config = RouterConfig {
@@ -571,7 +591,7 @@ mod tests {
         }; // Very short timeout for tests
 
         // Create AppContext with minimal components
-        Arc::new(AppContext {
+        let app_context = Arc::new(AppContext {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Arc::new(TokenBucket::new(1000, 1000)),
@@ -584,8 +604,10 @@ mod tests {
             tool_parser_registry: None,     // HTTP mode doesn't need tool parser
             router_manager: None,           // Test doesn't need router manager
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
-            load_monitor: None,
-        })
+        });
+
+        let router = Router::new(&app_context).await.unwrap();
+        Arc::new(router) as Arc<dyn RouterTrait>
     }
 
     // Helper to create a PD config for testing
@@ -887,7 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_pod_event_add_unhealthy_pod() {
-        let app_context = create_test_app_context().await;
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "pod1".into(),
@@ -902,18 +924,21 @@ mod tests {
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
-            Arc::clone(&app_context),
+            Arc::clone(&router),
             port,
             false, // pd_mode = false
         )
         .await;
 
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!router
+            .get_worker_urls()
+            .contains(&pod_info.worker_url(port)));
     }
 
     #[tokio::test]
     async fn test_handle_pod_deletion_non_existing_pod() {
-        let app_context = create_test_app_context().await;
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "pod1".into(),
@@ -928,17 +953,19 @@ mod tests {
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
-            Arc::clone(&app_context),
+            Arc::clone(&router),
             port,
+            false, // pd_mode = false
         )
         .await;
 
         assert!(tracked_pods.lock().unwrap().is_empty());
+        assert!(router.get_worker_urls().is_empty());
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_event_prefill_pod() {
-        let app_context = create_test_app_context().await;
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "prefill-pod".into(),
@@ -951,23 +978,23 @@ mod tests {
         let port = 8080u16;
 
         // This test validates the structure but won't actually add workers since
-        // the test worker URL won't be reachable
+        // we're using a regular router instead of PD router
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
-            Arc::clone(&app_context),
+            Arc::clone(&router),
             port,
-            true, // pd_mode = true for PD pod
+            false, // pd_mode = false, so it should fallback to regular handling
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_config will fail for non-running server
+        // Pod should not be tracked since router.add_worker will fail for non-running server
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_event_decode_pod() {
-        let app_context = create_test_app_context().await;
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "decode-pod".into(),
@@ -982,19 +1009,19 @@ mod tests {
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
-            Arc::clone(&app_context),
+            Arc::clone(&router),
             port,
-            true, // pd_mode = true for PD pod
+            false, // pd_mode = false, so it should fallback to regular handling
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_config will fail for non-running server
+        // Pod should not be tracked since router.add_worker will fail for non-running server
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_tracked_pod() {
-        let app_context = create_test_app_context().await;
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "test-pod".into(),
@@ -1016,8 +1043,9 @@ mod tests {
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
-            Arc::clone(&app_context),
+            Arc::clone(&router),
             port,
+            false, // pd_mode = false
         )
         .await;
 
@@ -1027,7 +1055,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_untracked_pod() {
-        let app_context = create_test_app_context().await;
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "untracked-pod".into(),
@@ -1044,8 +1072,9 @@ mod tests {
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
-            Arc::clone(&app_context),
+            Arc::clone(&router),
             port,
+            true, // pd_mode = true
         )
         .await;
 
@@ -1055,7 +1084,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unified_handler_regular_mode() {
-        let app_context = create_test_app_context().await;
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "regular-pod".into(),
@@ -1071,19 +1100,19 @@ mod tests {
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
-            Arc::clone(&app_context),
+            Arc::clone(&router),
             port,
             false, // pd_mode = false
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_url will fail for non-running server
+        // Pod should not be tracked since router.add_worker will fail for non-running server
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
     }
 
     #[tokio::test]
     async fn test_unified_handler_pd_mode_with_prefill() {
-        let app_context = create_test_app_context().await;
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "prefill-pod".into(),
@@ -1099,19 +1128,19 @@ mod tests {
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
-            Arc::clone(&app_context),
+            Arc::clone(&router),
             port,
             true, // pd_mode = true
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_config will fail for non-running server
+        // Pod should not be tracked since router.add_pd_worker will fail for regular router
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
     }
 
     #[tokio::test]
     async fn test_unified_handler_deletion_with_pd_mode() {
-        let app_context = create_test_app_context().await;
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "decode-pod".into(),
@@ -1134,8 +1163,9 @@ mod tests {
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
-            Arc::clone(&app_context),
+            Arc::clone(&router),
             port,
+            true, // pd_mode = true
         )
         .await;
 

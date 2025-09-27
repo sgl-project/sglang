@@ -12,12 +12,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_device_core_count,
-    get_int_env_var,
-    next_power_of_2,
-)
+from sglang.srt.utils import get_bool_env_var, get_device_core_count, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -99,25 +94,7 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
-
-        # Decide whether enable deterministic inference with batch-invariant operations
-        self.enable_deterministic = (
-            model_runner.server_args.enable_deterministic_inference
-        )
-
-        # Configure deterministic inference settings
-        if self.enable_deterministic:
-            # Use fixed split tile size for batch invariance
-            self.split_tile_size = get_int_env_var(
-                "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256
-            )
-            # Set static_kv_splits to False to use deterministic logic instead
-            self.static_kv_splits = False
-        else:
-            self.split_tile_size = (
-                model_runner.server_args.triton_attention_split_tile_size
-            )
-
+        self.split_tile_size = model_runner.server_args.triton_attention_split_tile_size
         if self.split_tile_size is not None:
             self.max_kv_splits = (
                 self.max_context_len + self.split_tile_size - 1
@@ -177,23 +154,13 @@ class TritonAttnBackend(AttentionBackend):
             num_group * num_seq == num_token
         ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
 
-        # Legacy dynamic splitting logic (non-deterministic)
-        if (
-            self.static_kv_splits or self.device_core_count <= 0
-        ) and not self.enable_deterministic:
+        if self.static_kv_splits or self.device_core_count <= 0:
             num_kv_splits.fill_(self.max_kv_splits)
             return
 
-        # deterministic
-        if self.split_tile_size is not None and self.enable_deterministic:
-            # expand seq_lens to match num_token
-            if num_group > 1:
-                expanded_seq_lens = seq_lens.repeat_interleave(num_group)
-            else:
-                expanded_seq_lens = seq_lens
-
+        if self.split_tile_size is not None:
             num_kv_splits[:] = (
-                expanded_seq_lens + self.split_tile_size - 1
+                seq_lens + self.split_tile_size - 1
             ) // self.split_tile_size
             return
 

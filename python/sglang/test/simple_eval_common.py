@@ -136,7 +136,7 @@ class ChatCompletionSampler(SamplerBase):
                 self._pack_message("system", self.system_message)
             ] + message_list
         trial = 0
-        while trial < 6:  # 126 seconds in total
+        while True:
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,

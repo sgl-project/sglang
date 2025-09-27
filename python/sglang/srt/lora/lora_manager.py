@@ -37,7 +37,6 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.managers.io_struct import LoRAUpdateResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
 
 logger = logging.getLogger(__name__)
@@ -57,7 +56,6 @@ class LoRAManager:
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
-        server_args: Optional[ServerArgs] = None,
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -74,7 +72,6 @@ class LoRAManager:
         self.lora_backend: BaseLoRABackend = backend_type(
             max_loras_per_batch=max_loras_per_batch,
             device=self.device,
-            server_args=server_args,
         )
 
         # Initialize mutable internal state of the LoRAManager.
