@@ -544,7 +544,7 @@ class MambaMixer2(torch.nn.Module):
                          -1),
                 chunk_size=chunk_size,
                 D=self.D,
-                z=None,
+                z=None, 
                 dt_bias=self.dt_bias,
                 # seq_idx=seq_idx_p,
                 # chunk_indices=chunk_indices_p,
