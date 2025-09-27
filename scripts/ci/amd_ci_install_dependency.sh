@@ -31,12 +31,12 @@ fi
 echo "Available disk space: ${available_gb}GB"
 
 # Cache management is disabled by default, only enable if ENABLE_CACHE=true
-if [[ "${ENABLE_CACHE:-false}" == "true" ]]; then
+if [[ "${ENABLE_CACHE:-true}" == "true" ]]; then
   echo "Cache management enabled via ENABLE_CACHE=true"
   echo "Initializing model cache..."
   bash "$(dirname "$0")/amd_manage_cache.sh" init
 
-  if [ "${available_gb}" -lt 20 ]; then
+  if [ "${available_gb}" -lt 40 ]; then
     echo "Low disk space detected (${available_gb}GB). Running cleanup..."
     bash "$(dirname "$0")/amd_manage_cache.sh" clean-old
 
@@ -44,7 +44,7 @@ if [[ "${ENABLE_CACHE:-false}" == "true" ]]; then
     available_gb=$(df "$cache_parent_dir" | awk 'NR==2 {print int($4/1024/1024)}' 2>/dev/null || echo "0")
     echo "Available disk space after cleanup: ${available_gb}GB"
 
-    if [ "${available_gb}" -lt 10 ]; then
+    if [ "${available_gb}" -lt 20 ]; then
       echo "Warning: Still low on disk space (${available_gb}GB). Cache operations may be limited." >&2
     fi
   else
@@ -52,7 +52,7 @@ if [[ "${ENABLE_CACHE:-false}" == "true" ]]; then
   fi
 else
   echo "Cache management disabled by default (set ENABLE_CACHE=true to enable)"
-  if [ "${available_gb}" -lt 10 ]; then
+  if [ "${available_gb}" -lt 20 ]; then
     echo "Warning: Low disk space detected (${available_gb}GB). Consider enabling cache cleanup." >&2
   fi
 fi
