@@ -393,10 +393,7 @@ class CPUGraphRunner:
         assert (
             model_runner.spec_algorithm == SpeculativeAlgorithm.NONE
         ), "CPUGraphRunner does not support speculative inference yet."
-        # TODO add compile support for encoder-decoder models
-        assert (
-            not self.is_encoder_decoder
-        ), "CPUGraphRunner does not support encoder-decoder models yet."
+
         assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
@@ -407,6 +404,7 @@ class CPUGraphRunner:
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
+        self.encoder_len_fill_value = 0
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_graph_seq_len_fill_value()
         )
@@ -434,6 +432,12 @@ class CPUGraphRunner:
                 dtype=torch.bool,
                 device=self.device,
             )
+            if self.is_encoder_decoder:
+                self.encoder_lens = torch.full(
+                    (self.max_bs,), self.encoder_len_fill_value, dtype=torch.int64
+                )
+            else:
+                self.encoder_lens = None
 
         # Capture
         try:
@@ -445,6 +449,13 @@ class CPUGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         is_bs_supported = forward_batch.batch_size in self.graphs
+
+        is_encoder_lens_supported = (
+            torch.all(forward_batch.encoder_lens > 0)
+            or torch.all(forward_batch.encoder_lens == 0)
+            if self.is_encoder_decoder
+            else True
+        )
 
         requested_capture_hidden_mode = max(
             forward_batch.capture_hidden_mode,
@@ -460,7 +471,11 @@ class CPUGraphRunner:
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
 
-        return is_bs_supported and capture_hidden_mode_matches
+        return (
+            is_bs_supported
+            and capture_hidden_mode_matches
+            and is_encoder_lens_supported
+        )
 
     def capture(self) -> None:
         capture_range = (
@@ -499,6 +514,10 @@ class CPUGraphRunner:
         positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :bs]
         self.num_token_non_padded[...] = num_tokens
+        if self.is_encoder_decoder:
+            encoder_lens = self.encoder_lens[:bs]
+        else:
+            encoder_lens = None
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -517,6 +536,8 @@ class CPUGraphRunner:
             attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
+            encoder_lens=encoder_lens,
+            encoder_lens_cpu=encoder_lens,
             return_logprob=False,
             positions=positions,
             mrope_positions=mrope_positions,
