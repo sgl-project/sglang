@@ -79,7 +79,10 @@ class TestLogprobsDense(unittest.TestCase):
         chunk_size = kwargs.pop("chunk_size", None)
         if chunk_size is not None:
             print(f"Setting SGLANG_LOGITS_PROCESSER_CHUNK_SIZE to {chunk_size}")
+            os.environ["SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"] = "True"
             os.environ["SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"] = str(chunk_size)
+        else:
+            os.environ["SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"] = "False"
 
         # Create engine with merged configuration
         engine_config = {**DEFAULT_ENGINE_CONFIG, **kwargs}

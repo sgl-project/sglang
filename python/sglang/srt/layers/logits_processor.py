@@ -50,21 +50,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import dump_to_file, is_npu, use_intel_amx_backend
+from sglang.srt.utils import dump_to_file, is_npu, use_intel_amx_backend,get_int_env_var,get_bool_env_var
 
-# When computing the input and output tokens logprobs, if the number of rows of
-# the logprobs is too large, the peak memory usage will exceed the available
-# memory and cause OOM. So we split the logprobs into multiple chunks to limit the
-# peak memory usage.
-# The default chunk size is 2048, which means we split the logprobs into chunks
-# of 2048 rows. If the logprobs shape is [10000, 150000], we will split the
-# logprobs into 10000 / 2048 = 5 chunks.
-# This only take effect when we enable the logprobs in the request. We can set
-# the chunk size by setting this environment variable.
-LOGITS_PROCESSER_CHUNK_SIZE = max(
-    int(os.environ.get("SGLANG_LOGITS_PROCESSER_CHUNK_SIZE", "2048")),
-    1,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +257,13 @@ class LogitsProcessor(nn.Module):
             "debug_tensor_dump_output_folder", None
         )
 
+        # enable chunked logprobs processing
+        self.enable_logprobs_chunk = get_bool_env_var("SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK")
+        # chunk size for logprobs processing
+        self.logprobs_chunk_size = get_int_env_var(
+            "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE", 2048
+        )
+
     def forward(
         self,
         input_ids,
@@ -330,13 +324,13 @@ class LogitsProcessor(nn.Module):
             # extend_seq_lens_cpu           = [4, 5, 6]
             # extend_logprob_start_lens_cpu = [0, 5, 3]
             #
-            # Then, the results are:
+            # Then, the indices are:
             # pruned_states         -> [t00, t01, t02, t03, t14, t23, t24, t25]
             # sample_indices        -> [3, 4, 7]
             # input_logprob_indices -> [0, 1, 2, 3, 5, 6, 7]
             # token_to_seq_idx      -> [0, 0, 0, 0, 1, 2, 2, 2]
             #
-            # If LOGITS_PROCESSER_CHUNK_SIZE = 3, the chunks will be computed in a chunked manner:
+            # If chunk is enabled and chunk_size = 3, the chunks will be computed in a chunked manner:
             # [t00, t01, t02], [t03, t14, t23], [t24, t25]
 
             sample_index_pt = -1
@@ -454,14 +448,18 @@ class LogitsProcessor(nn.Module):
                 pruned_lens,
             )
 
-        # If the number of tokens is less than the chunk size, or all-gather DP
-        # attention is enabled, we process the input logprobs in the old way with
-        # no chunking. In the dp attention case, chunking can be enabled by setting
-        # "enable_dp_lm_head" in the config.
-        if (
-            pruned_states.shape[0] <= LOGITS_PROCESSER_CHUNK_SIZE
+        # Determine whether to use chunked or non-chunked logits processing.
+        # Skip chunking if:
+        # 1. Chunking is disabled
+        # 2. Total count is below chunk size threshold
+        # 3. DP attention all-gather is enabled (can use "enable_dp_lm_head" to enable chunking)
+        should_skip_chunking = (
+            not self.enable_logprobs_chunk
+            or pruned_states.shape[0] <= self.logprobs_chunk_size
             or self.do_tensor_parallel_all_gather_dp_attn
-        ):
+        )
+
+        if should_skip_chunking:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -550,7 +548,7 @@ class LogitsProcessor(nn.Module):
         """
 
         # The peak memory usage is proportional to the chunk size.
-        chunk_size = LOGITS_PROCESSER_CHUNK_SIZE
+        chunk_size = self.logprobs_chunk_size
         total_size = pruned_states.shape[0]
         num_chunks = (total_size + chunk_size - 1) // chunk_size
 
@@ -934,12 +932,12 @@ class LogitsProcessor(nn.Module):
 
         pt = 0
         next_split_pruned_len = 0
-        token_ids_logprobs_chunk = logits_metadata.token_ids_logprobs[chunk_slice]
+        token_ids_logprobs = logits_metadata.token_ids_logprobs[chunk_slice]
         pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice]
 
         for n, (token_ids, pruned_len) in enumerate(
             zip(
-                token_ids_logprobs_chunk,
+                token_ids_logprobs,
                 pruned_lens,
             )
         ):
