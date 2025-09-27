@@ -23,7 +23,7 @@ import logging
 import threading
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
 
@@ -42,7 +42,12 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    Req,
+    RequestStage,
+    ScheduleBatch,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -140,8 +145,10 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
-        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(
+        kv_manager_class: Type[BaseKVManager] = get_kv_class(
+            self.transfer_backend, KVClassType.MANAGER
+        )
+        kv_manager: BaseKVManager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
@@ -168,6 +175,7 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
         )
         self._process_req(req)
+        req.add_latency(RequestStage.PREFILL_PREPARE)
         self.queue.append(req)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
@@ -238,6 +246,8 @@ class PrefillBootstrapQueue:
                 self.scheduler.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 continue
 
             # KV.WaitingForInput - init here
@@ -252,6 +262,8 @@ class PrefillBootstrapQueue:
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+
+            req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
 
@@ -400,6 +412,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                req.add_latency(RequestStage.PREFILL_FORWARD)
                 self.disagg_prefill_inflight_queue.append(req)
                 if (
                     logits_output is not None
@@ -408,9 +421,16 @@ class SchedulerDisaggregationPrefillMixin:
                     last_hidden_index = (
                         hidden_state_offset + extend_input_len_per_req[i] - 1
                     )
-                    req.hidden_states_tensor = (
-                        logits_output.hidden_states[last_hidden_index].cpu().clone()
-                    )
+                    req.output_topk_p = batch.spec_info.topk_p[i]
+                    req.output_topk_index = batch.spec_info.topk_index[i]
+                    if self.spec_algorithm.is_eagle3():
+                        req.hidden_states_tensor = (
+                            batch.spec_info.hidden_states[i].cpu().clone()
+                        )
+                    else:
+                        req.hidden_states_tensor = (
+                            logits_output.hidden_states[last_hidden_index].cpu().clone()
+                        )
                     hidden_state_offset += extend_input_len_per_req[i]
                 else:
                     req.hidden_states_tensor = None
@@ -522,6 +542,8 @@ class SchedulerDisaggregationPrefillMixin:
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 done_reqs.append(req)
+                if self.enable_metrics:
+                    self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 assert False, f"Unexpected polling state {poll=}"
 
@@ -533,6 +555,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
         for req in done_reqs:
             req: Req
+            req.add_latency(RequestStage.PREFILL_TRANSFER_KV_CACHE)
             self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
             req.metadata_buffer_index = -1
 
@@ -563,7 +586,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Move the chunked request out of the batch so that we can merge
                 # only finished requests to running_batch.
                 self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-                self.tree_cache.cache_unfinished_req(self.chunked_req)
+                self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
                 if self.enable_overlap:
                     # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                     self.chunked_req.tmp_end_idx = min(

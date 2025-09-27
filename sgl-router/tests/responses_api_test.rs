@@ -1,8 +1,10 @@
 // Integration test for Responses API
 
-use sglang_router_rs::protocols::common::GenerationRequest;
-use sglang_router_rs::protocols::openai::responses::request::ResponseInput;
-use sglang_router_rs::protocols::openai::responses::*;
+use sglang_router_rs::protocols::spec::{
+    GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus,
+    ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
+    ToolChoiceValue, Truncation, UsageInfo,
+};
 
 #[test]
 fn test_responses_request_creation() {
@@ -24,7 +26,7 @@ fn test_responses_request_creation() {
         store: true,
         stream: false,
         temperature: Some(0.7),
-        tool_choice: ToolChoice::Auto,
+        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
         tools: vec![ResponseTool {
             r#type: ResponseToolType::WebSearchPreview,
         }],
@@ -42,7 +44,6 @@ fn test_responses_request_creation() {
         repetition_penalty: 1.0,
     };
 
-    // Test GenerationRequest trait implementation
     assert!(!request.is_stream());
     assert_eq!(request.get_model(), Some("test-model"));
     let routing_text = request.extract_text_for_routing();
@@ -67,7 +68,7 @@ fn test_sampling_params_conversion() {
         store: true, // Use default true
         stream: false,
         temperature: Some(0.8),
-        tool_choice: ToolChoice::Auto,
+        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
         tools: vec![],
         top_logprobs: 0, // Use default 0
         top_p: Some(0.95),
@@ -137,7 +138,6 @@ fn test_usage_conversion() {
         8
     );
 
-    // Test reverse conversion
     let back_to_usage = response_usage.to_usage_info();
     assert_eq!(back_to_usage.prompt_tokens, 15);
     assert_eq!(back_to_usage.completion_tokens, 25);
@@ -150,7 +150,6 @@ fn test_reasoning_param_default() {
         effort: Some(ReasoningEffort::Medium),
     };
 
-    // Test JSON serialization/deserialization preserves default
     let json = serde_json::to_string(&param).unwrap();
     let parsed: ResponseReasoningParam = serde_json::from_str(&json).unwrap();
 
@@ -177,7 +176,7 @@ fn test_json_serialization() {
         store: false,
         stream: true,
         temperature: Some(0.9),
-        tool_choice: ToolChoice::Required,
+        tool_choice: ToolChoice::Value(ToolChoiceValue::Required),
         tools: vec![ResponseTool {
             r#type: ResponseToolType::CodeInterpreter,
         }],
@@ -195,7 +194,6 @@ fn test_json_serialization() {
         repetition_penalty: 1.2,
     };
 
-    // Test that everything can be serialized to JSON and back
     let json = serde_json::to_string(&request).expect("Serialization should work");
     let parsed: ResponsesRequest =
         serde_json::from_str(&json).expect("Deserialization should work");

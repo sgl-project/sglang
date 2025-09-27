@@ -1,14 +1,15 @@
+from __future__ import annotations
+
 import copy
 import json
 import logging
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -32,13 +33,17 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.jinja_template_utils import process_content_for_template_format
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.template_manager import TemplateManager
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.template_manager import TemplateManager
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +58,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -81,12 +87,26 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"This model supports at most {server_context_length} completion tokens."
             )
 
+        if request.response_format and request.response_format.type == "json_schema":
+            schema = getattr(request.response_format.json_schema, "schema_", None)
+            if schema is None:
+                return "schema_ is required for json_schema response format request."
+
         return None
 
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
+        raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        reasoning_effort = (
+            request.chat_template_kwargs.pop("reasoning_effort", None)
+            if request.chat_template_kwargs
+            else None
+        )
+        if reasoning_effort is not None:
+            request.reasoning_effort = reasoning_effort
+
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
@@ -109,6 +129,9 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
+        # Extract custom labels from raw request headers
+        custom_labels = self.extract_custom_labels(raw_request)
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -127,6 +150,9 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
+            extra_key=self._compute_extra_key(request),
+            priority=request.priority,
+            custom_labels=custom_labels,
         )
 
         return adapted_request, request
@@ -135,6 +161,16 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        is_gpt_oss = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
+        )
+
+        # GptOss model needs to keep special tokens for harmony parsing
+        if is_gpt_oss:
+            request.skip_special_tokens = False
+
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
@@ -149,10 +185,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             else:
                 tools = [item.function.model_dump() for item in request.tools]
-
-            tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-            parser = FunctionCallParser(request.tools, tool_call_parser)
-            tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+            if self.tool_call_parser:
+                parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                tool_call_constraint = parser.get_structure_constraint(
+                    request.tool_choice
+                )
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -194,6 +231,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_data,
                 modalities,
             )
+
+            # per the Transformers docs & maintainers, tool call arguments in
+            # assistant-role messages with tool_calls need to be dicts not JSON str -
+            # this is how tool-use chat templates will expect them moving forwards
+            # so, for messages that have tool_calls, parse the string (which we get
+            # from openAI format) to dict
+            if (
+                processed_msg["role"] == "assistant"
+                and "tool_calls" in processed_msg
+                and isinstance(processed_msg["tool_calls"], list)
+            ):
+                for item in processed_msg["tool_calls"]:
+                    if "arguments" in item["function"] and isinstance(
+                        item["function"]["arguments"], str
+                    ):
+                        item["function"]["arguments"] = json.loads(
+                            item["function"]["arguments"]
+                        )
+
             openai_compatible_messages.append(processed_msg)
 
         # Handle assistant prefix for continue_final_message
@@ -495,7 +551,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
-                if request.tool_choice != "none" and request.tools:
+                if (
+                    request.tool_choice != "none"
+                    and request.tools
+                    and self.tool_call_parser
+                ):
                     async for chunk in self._process_tool_call_stream(
                         index,
                         delta,
@@ -685,10 +745,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle tool calls
             tool_calls = None
-            if request.tool_choice != "none" and request.tools:
-                tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+            if (
+                request.tool_choice != "none"
+                and request.tools
+                and self.tool_call_parser
+            ):
+                history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, tool_call_parser, finish_reason
+                    text, request.tools, finish_reason, history_tool_calls_cnt
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -778,30 +842,55 @@ class OpenAIServingChat(OpenAIServingBase):
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
         return ChoiceLogprobs(content=token_logprobs)
 
+    def _process_tool_call_id(
+        self,
+        call_item: ToolCallItem,
+        history_tool_calls_cnt: int,
+    ) -> str:
+        """Process for generating a new and unique `tool_call_id`"""
+        if self.tool_call_parser != "kimi_k2":
+            # A simple uuid is sufficient for all models except for Kimi-K2.
+            tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+            return tool_call_id
+        else:
+            # Align with Kimi-K2 format: functions.{name}:{index}
+            # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
+            # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
+            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
+            logger.debug(
+                f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
+            )
+            return tool_call_id
+
     def _process_tool_calls(
         self,
         text: str,
         tools: List[Any],
-        tool_call_parser: Optional[str],
         finish_reason: Dict[str, Any],
+        history_tool_calls_cnt: int = 0,
     ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
         """Process tool calls in the response"""
-        parser = FunctionCallParser(tools, tool_call_parser)
+        parser = FunctionCallParser(tools, self.tool_call_parser)
         if parser.has_tool_call(text):
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
             try:
                 text, call_info_list = parser.parse_non_stream(text)
-                tool_calls = [
-                    ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:24]}",
-                        function=FunctionResponse(
-                            name=call_info.name, arguments=call_info.parameters
-                        ),
+                tool_calls = []
+                for call_info in call_info_list:
+                    tool_id = self._process_tool_call_id(
+                        call_info, history_tool_calls_cnt
                     )
-                    for call_info in call_info_list
-                ]
+                    tool_calls.append(
+                        ToolCall(
+                            id=tool_id,
+                            index=getattr(call_info, "tool_index", None),
+                            function=FunctionResponse(
+                                name=call_info.name, arguments=call_info.parameters
+                            ),
+                        )
+                    )
                 return tool_calls, text, finish_reason
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
@@ -848,6 +937,26 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
+    def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
+        """Counts the number of tool calls in the request's message history.
+
+        NOTE: This method is only useful for models that include self-increasing
+        history tool call idx in tool calls id, such as kimi-k2
+
+        Args:
+            request: The chat completion request object.
+
+        Returns:
+            The total number of tool calls in the history, or 0 if not applicable.
+        """
+        messages = getattr(request, "messages", [])
+        idx = 0
+        for msg in messages:
+            if msg.role == "assistant":
+                tool_calls = getattr(msg, "tool_calls", None)
+                idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
+        return idx
+
     def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
         """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
 
@@ -859,12 +968,15 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             The boolean value of 'enable_thinking' if found, otherwise False.
         """
-        if (
-            hasattr(request, "chat_template_kwargs")
-            and request.chat_template_kwargs
-            and request.chat_template_kwargs.get("enable_thinking") is not None
-        ):
-            return request.chat_template_kwargs.get("enable_thinking")
+        if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
+            # For Qwen3 models, `enable_thinking` is supported.
+            if request.chat_template_kwargs.get("enable_thinking") is not None:
+                return request.chat_template_kwargs.get("enable_thinking")
+            # For DeepSeek-V3.1 models, `thinking` is supported.
+            elif request.chat_template_kwargs.get("thinking") is not None:
+                return request.chat_template_kwargs.get("thinking")
+            else:
+                return False
         return False
 
     async def _process_tool_call_stream(
@@ -880,7 +992,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in parser_dict:
             parser_dict[index] = FunctionCallParser(
                 tools=request.tools,
-                tool_call_parser=self.tokenizer_manager.server_args.tool_call_parser,
+                tool_call_parser=self.tool_call_parser,
             )
         parser = parser_dict[index]
 
@@ -902,6 +1014,7 @@ class OpenAIServingChat(OpenAIServingBase):
             yield f"data: {chunk.model_dump_json()}\n\n"
 
         # Yield tool calls
+        history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for call_item in calls:
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
@@ -909,7 +1022,9 @@ class OpenAIServingChat(OpenAIServingBase):
             # Tool call ID should be generated only once per tool call
             if call_item.name:
                 # First chunk: include ID and function name
-                tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                tool_call_id = self._process_tool_call_id(
+                    call_item, history_tool_calls_cnt
+                )
                 function_name = call_item.name
             else:
                 # Subsequent chunks: null ID and name for argument deltas

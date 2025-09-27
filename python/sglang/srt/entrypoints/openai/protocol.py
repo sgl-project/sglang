@@ -35,6 +35,8 @@ from pydantic import (
 )
 from typing_extensions import Literal
 
+DEFAULT_MODEL_NAME = "default"
+
 
 class ModelCard(BaseModel):
     """Model cards."""
@@ -108,6 +110,23 @@ class JsonSchemaResponseFormat(BaseModel):
     strict: Optional[bool] = False
 
 
+class ResponseFormat(BaseModel):
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: Optional[JsonSchemaResponseFormat] = None
+
+
+class StructuresResponseFormat(BaseModel):
+    begin: str
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    end: str
+
+
+class StructuralTagResponseFormat(BaseModel):
+    type: Literal["structural_tag"]
+    structures: List[StructuresResponseFormat]
+    triggers: List[str]
+
+
 class FileRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/files/create
     file: bytes  # The File object (not file name) to be uploaded
@@ -166,7 +185,7 @@ class BatchResponse(BaseModel):
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
     echo: bool = False
@@ -200,6 +219,7 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -208,6 +228,15 @@ class CompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[Union[List[str], str]] = None
+    # Cache salt for request caching
+    cache_salt: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
+
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -314,7 +343,7 @@ class FunctionResponse(BaseModel):
     """Function response."""
 
     name: Optional[str] = None
-    arguments: Optional[str] = None
+    arguments: Optional[str | Dict[str, Any]] = None
 
 
 class ToolCall(BaseModel):
@@ -327,7 +356,7 @@ class ToolCall(BaseModel):
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant", "tool"]
+    role: Literal["system", "assistant", "tool", "function"]
     content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
         default=None
     )
@@ -341,9 +370,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
     def _normalize_role(cls, v):
         if isinstance(v, str):
             v_lower = v.lower()
-            if v_lower not in {"system", "assistant", "tool"}:
+            if v_lower not in {"system", "assistant", "tool", "function"}:
                 raise ValueError(
-                    "'role' must be one of 'system', 'assistant', or 'tool' (case-insensitive)."
+                    "'role' must be one of 'system', 'assistant', 'tool', or 'function' (case-insensitive)."
                 )
             return v_lower
         raise ValueError("'role' must be a string")
@@ -357,23 +386,6 @@ class ChatCompletionMessageUserParam(BaseModel):
 ChatCompletionMessageParam = Union[
     ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam
 ]
-
-
-class ResponseFormat(BaseModel):
-    type: Literal["text", "json_object", "json_schema"]
-    json_schema: Optional[JsonSchemaResponseFormat] = None
-
-
-class StructuresResponseFormat(BaseModel):
-    begin: str
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    end: str
-
-
-class StructuralTagResponseFormat(BaseModel):
-    type: Literal["structural_tag"]
-    structures: List[StructuresResponseFormat]
-    triggers: List[str]
 
 
 class Function(BaseModel):
@@ -409,7 +421,7 @@ class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
@@ -444,7 +456,7 @@ class ChatCompletionRequest(BaseModel):
         description="Constrains effort on reasoning for reasoning models. "
         "'low' is the least effort, 'high' is the most effort. Reducing reasoning effort can "
         "result in faster responses and fewer tokens used on reasoning in a response. "
-        "Currently only supported for OpenAI models.",
+        "Currently only supported for OpenAI models in the harmony path, i.e GPT-OSS models.",
     )
 
     @model_validator(mode="before")
@@ -455,6 +467,66 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_reasoning_inputs(cls, values: Dict):
+        r = values.get("reasoning")
+        if r is None:
+            return values
+
+        if isinstance(r, dict):
+            effort = r.get("effort") or r.get("reasoning_effort")
+            if effort in {"low", "medium", "high"}:
+                values["reasoning_effort"] = effort
+
+            enabled = (
+                r.get("enabled")
+                if r.get("enabled") is not None
+                else r.get("enable", False)
+            )
+            if isinstance(enabled, str):
+                enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
+            if enabled:
+                ctk = values.get("chat_template_kwargs")
+                if not isinstance(ctk, dict):
+                    ctk = {}
+                ctk.setdefault("thinking", True)
+                values["chat_template_kwargs"] = ctk
+
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_json_schema(cls, values):
+        response_format = values.get("response_format")
+        if not response_format:
+            return values
+
+        if response_format.get("type") != "json_schema":
+            return values
+
+        schema = response_format.pop("schema", None)
+        json_schema = response_format.get("json_schema")
+
+        if json_schema:
+            return values
+
+        if schema:
+            name_ = schema.get("title", "Schema")
+            strict_ = False
+            if "properties" in schema and "strict" in schema["properties"]:
+                item = schema["properties"].pop("strict", None)
+                if item and item.get("default", False):
+                    strict_ = True
+
+            response_format["json_schema"] = {
+                "name": name_,
+                "schema": schema,
+                "strict": strict_,
+            }
+
         return values
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -477,11 +549,17 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[Union[List[str], str]] = None
+    # Cache salt for request caching
+    cache_salt: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For PD disaggregation
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
 
 
 class ChatMessage(BaseModel):
@@ -571,13 +649,15 @@ class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
     input: EmbeddingInput
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     encoding_format: str = "float"
     dimensions: Optional[int] = None
     user: Optional[str] = None
 
     # The request id.
     rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
 
 class EmbeddingObject(BaseModel):
@@ -605,7 +685,7 @@ class ScoringRequest(BaseModel):
     )
     apply_softmax: bool = False
     item_first: bool = False
-    model: str
+    model: str = DEFAULT_MODEL_NAME
 
 
 class ScoringResponse(BaseModel):
@@ -706,6 +786,13 @@ class ResponsesRequest(BaseModel):
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
     )
     priority: int = Field(default=0, description="Request priority")
+    extra_key: Optional[str] = Field(
+        default=None,
+        description="Extra key for classifying the request (e.g. cache_salt)",
+    )
+    cache_salt: Optional[str] = Field(
+        default=None, description="Cache salt for request caching"
+    )
 
     # SGLang-specific sampling parameters
     frequency_penalty: float = 0.0
@@ -737,8 +824,8 @@ class ResponsesRequest(BaseModel):
         else:
             max_tokens = default_max_tokens
 
-        # Avoid exceed the context length by minus 1 token
-        max_tokens -= 1
+        # Avoid exceed the context length by minus 2 token
+        max_tokens -= 2
 
         # Get parameters with defaults
         temperature = self.temperature

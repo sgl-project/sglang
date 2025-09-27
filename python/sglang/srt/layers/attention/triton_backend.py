@@ -12,12 +12,25 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import get_bool_env_var, get_device_core_count, next_power_of_2
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_device_core_count,
+    get_int_env_var,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+
+
+def logit_capping_mod(logit_capping_method, logit_cap):
+    # positive logit_cap -> tanh cap
+    if logit_capping_method == "tanh":
+        return logit_cap
+    else:
+        raise ValueError()
 
 
 @dataclass
@@ -72,7 +85,13 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        if model_runner.is_hybrid_gdn:
+            # For hybrid linear models, layer_id = 0 may not be full attention
+            self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
+        else:
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
+                -1
+            ]
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
@@ -80,6 +99,29 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+
+        # Decide whether enable deterministic inference with batch-invariant operations
+        self.enable_deterministic = (
+            model_runner.server_args.enable_deterministic_inference
+        )
+
+        # Configure deterministic inference settings
+        if self.enable_deterministic:
+            # Use fixed split tile size for batch invariance
+            self.split_tile_size = get_int_env_var(
+                "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256
+            )
+            # Set static_kv_splits to False to use deterministic logic instead
+            self.static_kv_splits = False
+        else:
+            self.split_tile_size = (
+                model_runner.server_args.triton_attention_split_tile_size
+            )
+
+        if self.split_tile_size is not None:
+            self.max_kv_splits = (
+                self.max_context_len + self.split_tile_size - 1
+            ) // self.split_tile_size
 
         # Check arguments
         assert not (
@@ -135,8 +177,24 @@ class TritonAttnBackend(AttentionBackend):
             num_group * num_seq == num_token
         ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
 
-        if self.static_kv_splits or self.device_core_count <= 0:
+        # Legacy dynamic splitting logic (non-deterministic)
+        if (
+            self.static_kv_splits or self.device_core_count <= 0
+        ) and not self.enable_deterministic:
             num_kv_splits.fill_(self.max_kv_splits)
+            return
+
+        # deterministic
+        if self.split_tile_size is not None and self.enable_deterministic:
+            # expand seq_lens to match num_token
+            if num_group > 1:
+                expanded_seq_lens = seq_lens.repeat_interleave(num_group)
+            else:
+                expanded_seq_lens = seq_lens
+
+            num_kv_splits[:] = (
+                expanded_seq_lens + self.split_tile_size - 1
+            ) // self.split_tile_size
             return
 
         if num_seq < 256:
@@ -718,6 +776,8 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
+
         causal = True
         if layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -750,10 +810,11 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.mask_indptr,
             self.forward_metadata.max_extend_len,
             layer.scaling,
-            layer.logit_cap,
+            logit_cap=logits_soft_cap,
             sliding_window_size=sliding_window_size,
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
+            xai_temperature_len=layer.xai_temperature_len,
         )
         return o
 
@@ -776,6 +837,8 @@ class TritonAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
+
+        logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -801,8 +864,9 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.num_kv_splits,
             self.max_kv_splits,
             layer.scaling,
-            layer.logit_cap,
+            logit_cap=logits_soft_cap,
             sinks=sinks,
+            xai_temperature_len=layer.xai_temperature_len,
         )
         return o
 

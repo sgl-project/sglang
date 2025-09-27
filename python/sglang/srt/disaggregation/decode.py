@@ -24,7 +24,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
 import torch
 from torch.distributed import ProcessGroup
@@ -45,7 +45,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
@@ -218,8 +218,10 @@ class DecodePreallocQueue:
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
-        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(
+        kv_manager_class: Type[BaseKVManager] = get_kv_class(
+            self.transfer_backend, KVClassType.MANAGER
+        )
+        kv_manager: BaseKVManager = kv_manager_class(
             kv_args,
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
@@ -248,9 +250,10 @@ class DecodePreallocQueue:
                 mgr=self.kv_manager,
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
-                data_parallel_rank=req.data_parallel_rank,
+                prefill_dp_rank=req.data_parallel_rank,
             )
 
+            req.add_latency(RequestStage.DECODE_PREPARE)
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -334,6 +337,8 @@ class DecodePreallocQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -417,6 +422,7 @@ class DecodePreallocQueue:
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
             decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
+            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -595,21 +601,29 @@ class DecodeTransferQueue:
                 # unlock the kv cache or it will have memory leak
                 self.tree_cache.cache_finished_req(decode_req.req)
                 indices_to_remove.add(i)
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
 
                 idx = decode_req.metadata_buffer_index
                 (
                     output_id,
+                    cached_tokens,
                     output_token_logprobs_val,
                     output_token_logprobs_idx,
                     output_top_logprobs_val,
                     output_top_logprobs_idx,
+                    output_topk_p,
+                    output_topk_index,
                     output_hidden_states,
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())
+                decode_req.req.cached_tokens = cached_tokens[0].item()
                 if not self.spec_algorithm.is_none():
+                    decode_req.req.output_topk_p = output_topk_p
+                    decode_req.req.output_topk_index = output_topk_index
                     decode_req.req.hidden_states_tensor = output_hidden_states
                 if decode_req.req.return_logprob:
                     decode_req.req.output_token_logprobs_val.append(
@@ -656,6 +670,7 @@ class DecodeTransferQueue:
         for i in indices_to_remove:
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
+            self.queue[i].req.add_latency(RequestStage.DECODE_TRANSFERRED)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -698,12 +713,15 @@ class SchedulerDisaggregationDecodeMixin:
             elif prepare_mlp_sync_flag:
                 batch, _ = self._prepare_idle_batch_and_run(None)
 
-            if batch is None and (
+            queue_size = (
                 len(self.waiting_queue)
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
-                == 0
-            ):
+            )
+            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                queue_size += len(self.decode_offload_manager.ongoing_offload)
+
+            if batch is None and queue_size == 0:
                 self.self_check_during_idle()
 
             self.last_batch = batch
@@ -772,12 +790,15 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 self.process_batch_result(tmp_batch, tmp_result)
 
-            if batch is None and (
+            queue_size = (
                 len(self.waiting_queue)
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
-                == 0
-            ):
+            )
+            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                queue_size += len(self.decode_offload_manager.ongoing_offload)
+
+            if batch is None and queue_size == 0:
                 self.self_check_during_idle()
 
             self.last_batch = batch
@@ -847,6 +868,7 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
+                req.add_latency(RequestStage.DECODE_WAITING)
                 req.init_next_round_input(self.tree_cache)
             else:
                 waiting_queue.append(req)
@@ -880,9 +902,21 @@ class SchedulerDisaggregationDecodeMixin:
             # if there are still retracted requests, we do not allocate new requests
             return
 
-        req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
-        self.disagg_decode_transfer_queue.extend(req_conns)
-        alloc_reqs = (
-            self.disagg_decode_transfer_queue.pop_transferred()
-        )  # the requests which kv has arrived
-        self.waiting_queue.extend(alloc_reqs)
+        if not hasattr(self, "polling_count"):
+            self.polling_count = 0
+            self.polling_interval = (
+                self.server_args.disaggregation_decode_polling_interval
+            )
+
+        self.polling_count = (self.polling_count + 1) % self.polling_interval
+
+        if self.polling_count % self.polling_interval == 0:
+            req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
+            self.disagg_decode_transfer_queue.extend(req_conns)
+            alloc_reqs = (
+                self.disagg_decode_transfer_queue.pop_transferred()
+            )  # the requests which kv has arrived
+            self.waiting_queue.extend(alloc_reqs)
+
+        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            self.decode_offload_manager.check_offload_progress()

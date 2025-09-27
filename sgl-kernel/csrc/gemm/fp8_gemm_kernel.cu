@@ -1212,7 +1212,11 @@ torch::Tensor fp8_scaled_mm(
   auto sm_version = getSMVersion();
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
-  if (sm_version >= 100) {
+  if (sm_version == 100
+#if CUDA_VERSION >= 12090
+      || sm_version == 103
+#endif
+  ) {
     if (out_dtype == torch::kBFloat16) {
       sm100_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {

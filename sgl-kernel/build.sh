@@ -15,7 +15,6 @@ echo "ARCH:  $ARCH"
 if [ ${ARCH} = "aarch64" ]; then
    LIBCUDA_ARCH="sbsa"
    BUILDER_NAME="pytorch/manylinuxaarch64-builder"
-   CMAKE_BUILD_PARALLEL_LEVEL=16
 else
    LIBCUDA_ARCH=${ARCH}
    BUILDER_NAME="pytorch/manylinux2_28-builder"
@@ -40,6 +39,7 @@ docker run --rm \
    export CMAKE_VERSION_MAJOR=3.31
    export CMAKE_VERSION_MINOR=1
    # Setting these flags to reduce OOM chance only on ARM
+   export CMAKE_BUILD_PARALLEL_LEVEL=$(( $(nproc)/3 < 48 ? $(nproc)/3 : 48 ))
    if [ \"${ARCH}\" = \"aarch64\" ]; then
       export CUDA_NVCC_FLAGS=\"-Xcudafe --threads=2\"
       export MAKEFLAGS='-j2'

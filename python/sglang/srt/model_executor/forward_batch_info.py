@@ -132,6 +132,9 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.IDLE
         )
 
+    def is_cpu_graph(self):
+        return self == ForwardMode.DECODE
+
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
 
@@ -241,6 +244,9 @@ class ForwardBatch:
     prefix_chunk_num_tokens: Optional[List[int]] = None
     # KV Indices for each chunk
     prefix_chunk_kv_indices: Optional[List[torch.Tensor]] = None
+    # For MLA chunked prefix cache used in chunked prefill
+    # Tell attention backend whether lse needs to be returned
+    mha_return_lse: Optional[bool] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -438,7 +444,13 @@ class ForwardBatch:
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
         if model_runner.model_is_mrope:
-            ret._compute_mrope_positions(model_runner, batch)
+            if (
+                ret.spec_info is not None
+                and getattr(ret.spec_info, "positions", None) is not None
+            ):
+                ret._compute_spec_mrope_positions(model_runner, batch)
+            else:
+                ret._compute_mrope_positions(model_runner, batch)
 
         # Init lora information
         if model_runner.server_args.enable_lora:
@@ -504,6 +516,52 @@ class ForwardBatch:
             or self.contains_image_inputs()
         )
 
+    def _compute_spec_mrope_positions(
+        self, model_runner: ModelRunner, batch: ModelWorkerBatch
+    ):
+        # TODO support batched deltas
+        batch_size = self.seq_lens.shape[0]
+        device = model_runner.device
+        mm_inputs = batch.multimodal_inputs
+
+        if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
+            mrope_deltas = []
+            extend_lens = []
+            for batch_idx in range(batch_size):
+                extend_seq_len = batch.extend_seq_lens[batch_idx]
+                extend_lens.append(extend_seq_len)
+                mrope_delta = (
+                    torch.zeros(1, dtype=torch.int64)
+                    if mm_inputs[batch_idx] is None
+                    else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
+                )
+                mrope_deltas.append(mrope_delta.to(device=device))
+            position_chunks = torch.split(batch.spec_info.positions, extend_lens)
+            mrope_positions_list = [
+                pos_chunk + delta
+                for pos_chunk, delta in zip(position_chunks, mrope_deltas)
+            ]
+            next_input_positions = (
+                torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
+            )
+
+        else:  # target_verify or draft_decode
+            seq_positions = batch.spec_info.positions.view(batch_size, -1)
+            mrope_deltas = [
+                (
+                    torch.tensor([0], dtype=torch.int64)
+                    if mm_inputs[i] is None
+                    else mm_inputs[i].mrope_position_delta.squeeze(0)
+                )
+                for i in range(batch_size)
+            ]
+            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            next_input_positions = (
+                (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+            )
+
+        self.mrope_positions = next_input_positions
+
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
@@ -513,24 +571,23 @@ class ForwardBatch:
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
-                mrope_position_deltas = (
-                    [0]
-                    if mm_input is None
-                    else flatten_nested_list(mm_input.mrope_position_delta.tolist())
-                )
-                next_input_positions = []
-                for mrope_position_delta in mrope_position_deltas:
-                    # batched deltas needs to be processed separately
-                    # Convert list of lists to tensor with shape [3, seq_len]
-                    next_input_positions += [
-                        MRotaryEmbedding.get_next_input_positions(
-                            mrope_position_delta,
-                            int(self.seq_lens[batch_idx]) - 1,
-                            int(self.seq_lens[batch_idx]),
-                        )
-                    ]
                 # 3 * N
-                mrope_positions_list[batch_idx] = torch.cat(next_input_positions, dim=1)
+                if mm_input is None:
+                    mrope_positions_list[batch_idx] = torch.full(
+                        (3, 1),
+                        self.seq_lens[batch_idx] - 1,
+                        dtype=torch.int64,
+                        device=model_runner.device,
+                    )
+                else:
+                    mrope_position_deltas = mm_input.mrope_position_delta.flatten().to(
+                        model_runner.device, non_blocking=True
+                    )
+                    mrope_positions_list[batch_idx] = (
+                        (mrope_position_deltas + self.seq_lens[batch_idx] - 1)
+                        .unsqueeze(0)
+                        .repeat(3, 1)
+                    )
             elif self.forward_mode.is_extend():
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
@@ -629,7 +686,9 @@ class ForwardBatch:
                 (global_num_tokens[i] - 1) // attn_tp_size + 1
             ) * attn_tp_size
 
-        dp_padding_mode = DpPaddingMode.get_dp_padding_mode(global_num_tokens)
+        dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
+            self.is_extend_in_batch, global_num_tokens
+        )
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
