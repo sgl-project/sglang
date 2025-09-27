@@ -432,25 +432,18 @@ class MambaMixer2(torch.nn.Module):
         state_indices_tensor = attn_metadata.mamba_cache_indices
         chunk_size = self.chunk_size
 
-        # query_start_loc: cummulative seq length of the sequences in the batch
-
         conv_state, ssm_state, *rest = mamba_backend.req_to_token_pool.get_mamba_params(
             self.layer_id
         )
 
         assert ssm_state.size(1) == self.ssm_state_size, \
             f"dstate must be {self.ssm_state_size}, got {ssm_state.size(1)}"
-
-        # conv_state = conv_states[forward_batch.req_pool_indices].transpose(-1, -2)
-        # ssm_state = ssm_states[forward_batch.req_pool_indices]
+        
         query_start_loc = attn_metadata.query_start_loc
 
         chunk_size = self.chunk_size
 
-        # TODO: support prefill
-        # seq_idx_p = None
-        # chunk_indices_p = None
-        # chunk_offsets_p = None
+        # TODO: properly support this
         prep_initial_states = False
 
         # 1. Gated MLP's linear projection
@@ -482,12 +475,6 @@ class MambaMixer2(torch.nn.Module):
             dim=-1,
         )
 
-        # num_prefills = attn_metadata.num_prefills  # request count
-        # num_decodes = attn_metadata.num_decode_tokens  # token count (=request)
-        # num_prefill_tokens = attn_metadata.num_prefill_tokens  # token count
-
-        # num_decodes = forward_batch.global_num_tokens  # token count (=request)
-         # token count
         preallocated_ssm_out = torch.empty(
             [
                 projected_states.shape[0],
@@ -546,9 +533,6 @@ class MambaMixer2(torch.nn.Module):
                 D=self.D,
                 z=None, 
                 dt_bias=self.dt_bias,
-                # seq_idx=seq_idx_p,
-                # chunk_indices=chunk_indices_p,
-                # chunk_offsets=chunk_offsets_p,
                 cu_seqlens=query_start_loc,
                 initial_states=initial_states,
                 return_varlen_states=True,
