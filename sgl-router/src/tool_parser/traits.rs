@@ -9,7 +9,8 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait ToolParser: Send + Sync {
     /// Parse complete tool calls from final output
-    async fn parse_complete(&self, output: &str) -> ToolParserResult<Vec<ToolCall>>;
+    /// Returns (remaining_normal_text, tool_calls) tuple
+    async fn parse_complete(&self, output: &str) -> ToolParserResult<(String, Vec<ToolCall>)>;
 
     /// Parse tool calls from model output (streaming)
     async fn parse_incremental(
