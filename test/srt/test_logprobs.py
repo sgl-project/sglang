@@ -25,7 +25,7 @@ if torch.version.hip is not None:
     DENSE_TOLERANCE_MEAN_DIFF = 0.1
 elif torch.version.cuda is not None:
     print("Running on NVIDIA CUDA GPU")
-    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000.pkl"
+    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000_deterministic.pkl"
     DENSE_TOLERANCE_MAX_DIFF = 1.5
     DENSE_TOLERANCE_MEAN_DIFF = 0.1
 else:
@@ -45,6 +45,8 @@ DEFAULT_ENGINE_CONFIG = {
     "random_seed": 42,
     "skip_tokenizer_init": True,
     "mem_fraction_static": 0.8,
+    "enable_deterministic_inference": True,
+    "attention_backend": "fa3",
 }
 
 
