@@ -46,7 +46,7 @@ class TestNixlUnified(unittest.TestCase):
             self.hicache = HiCacheNixl(
                 storage_config=self.storage_config,
                 file_path=self.test_dir,
-                plugin="POSIX"
+                plugin="POSIX",
             )
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
