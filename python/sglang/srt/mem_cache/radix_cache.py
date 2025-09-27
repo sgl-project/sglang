@@ -248,7 +248,8 @@ class RadixCache(BasePrefixCache):
                 to expose a precise boundary; this structural refinement improves
                 subsequent match efficiency and does not duplicate data.
         """
-        if self.disable or len(key) == 0:
+
+        def empty_match_result():
             return MatchResult(
                 device_indices=torch.empty(
                     (0,),
@@ -259,9 +260,15 @@ class RadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
+        if self.disable or len(key) == 0:
+            return empty_match_result()
+
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
+
+        if len(key) == 0:
+            return empty_match_result()
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
@@ -555,7 +562,7 @@ class RadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        self.evictable_size_ -= len(node.key)
+        self.evictable_size_ -= len(node.value)
 
     def _total_size_helper(self):
         total_size = 0
