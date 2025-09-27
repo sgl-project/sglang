@@ -89,7 +89,6 @@ fn test_chat_template_with_tokens() {
 
 #[test]
 fn test_llama_style_template() {
-    // Test a Llama-style chat template
     let template = r#"
 {%- if messages[0]['role'] == 'system' -%}
     {%- set system_message = messages[0]['content'] -%}
@@ -160,7 +159,6 @@ fn test_llama_style_template() {
 
 #[test]
 fn test_chatml_template() {
-    // Test a ChatML-style template
     let template = r#"
 {%- for message in messages %}
     {{- '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n' }}
@@ -241,13 +239,11 @@ assistant:
         .map(|msg| serde_json::to_value(msg).unwrap())
         .collect();
 
-    // Test without generation prompt
     let result = processor
         .apply_chat_template(&json_messages, ChatTemplateParams::default())
         .unwrap();
     assert_eq!(result.trim(), "user: Test");
 
-    // Test with generation prompt
     let result_with_prompt = processor
         .apply_chat_template(
             &json_messages,
@@ -275,7 +271,6 @@ fn test_empty_messages_template() {
 
 #[test]
 fn test_content_format_detection() {
-    // Test string format detection
     let string_template = r#"
 {%- for message in messages -%}
 {{ message.role }}: {{ message.content }}
@@ -286,7 +281,6 @@ fn test_content_format_detection() {
         ChatTemplateContentFormat::String
     );
 
-    // Test OpenAI format detection
     let openai_template = r#"
 {%- for message in messages -%}
   {%- for content in message.content -%}
@@ -302,7 +296,6 @@ fn test_content_format_detection() {
 
 #[test]
 fn test_template_with_multimodal_content() {
-    // Test that multimodal messages work correctly when serialized to JSON
     let template = r#"
 {%- for message in messages %}
 {{ message.role }}:

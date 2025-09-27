@@ -21,21 +21,18 @@ fn test_parse_state_new() {
 fn test_parse_state_process_char() {
     let mut state = ParseState::new();
 
-    // Test bracket tracking
     state.process_char('{');
     assert_eq!(state.bracket_depth, 1);
 
     state.process_char('}');
     assert_eq!(state.bracket_depth, 0);
 
-    // Test string tracking
     state.process_char('"');
     assert!(state.in_string);
 
     state.process_char('"');
     assert!(!state.in_string);
 
-    // Test escape handling
     state.process_char('"');
     state.process_char('\\');
     assert!(state.escape_next);
@@ -63,10 +60,8 @@ fn test_token_config() {
 fn test_parser_registry() {
     let registry = ParserRegistry::new();
 
-    // Test has default mappings
     assert!(!registry.list_mappings().is_empty());
 
-    // Test model pattern matching
     let mappings = registry.list_mappings();
     let has_gpt = mappings.iter().any(|(m, _)| m.starts_with("gpt"));
     assert!(has_gpt);
@@ -76,10 +71,8 @@ fn test_parser_registry() {
 fn test_parser_registry_pattern_matching() {
     let mut registry = ParserRegistry::new_for_testing();
 
-    // Test that model mappings work by checking the list
     registry.map_model("test-model", "json");
 
-    // Verify through list_mappings
     let mappings = registry.list_mappings();
     let has_test = mappings
         .iter()
@@ -112,25 +105,21 @@ fn test_tool_call_serialization() {
 fn test_partial_json_parser() {
     let parser = PartialJson::default();
 
-    // Test complete JSON
     let input = r#"{"name": "test", "value": 42}"#;
     let (value, consumed) = parser.parse_value(input).unwrap();
     assert_eq!(value["name"], "test");
     assert_eq!(value["value"], 42);
     assert_eq!(consumed, input.len());
 
-    // Test incomplete JSON object
     let input = r#"{"name": "test", "value": "#;
     let (value, _consumed) = parser.parse_value(input).unwrap();
     assert_eq!(value["name"], "test");
     assert!(value["value"].is_null());
 
-    // Test incomplete string
     let input = r#"{"name": "tes"#;
     let (value, _consumed) = parser.parse_value(input).unwrap();
     assert_eq!(value["name"], "tes");
 
-    // Test incomplete array
     let input = r#"[1, 2, "#;
     let (value, _consumed) = parser.parse_value(input).unwrap();
     assert!(value.is_array());
@@ -193,11 +182,9 @@ fn test_compute_diff() {
 
 #[test]
 fn test_stream_result_variants() {
-    // Test Incomplete
     let result = StreamResult::Incomplete;
     matches!(result, StreamResult::Incomplete);
 
-    // Test ToolName
     let result = StreamResult::ToolName {
         index: 0,
         name: "test".to_string(),
@@ -209,7 +196,6 @@ fn test_stream_result_variants() {
         panic!("Expected ToolName variant");
     }
 
-    // Test ToolComplete
     let tool = ToolCall {
         id: "123".to_string(),
         r#type: "function".to_string(),
@@ -255,7 +241,6 @@ fn test_partial_tool_call() {
 async fn test_json_parser_complete_single() {
     let parser = JsonParser::new();
 
-    // Test single tool call with arguments
     let input = r#"{"name": "get_weather", "arguments": {"location": "San Francisco", "units": "celsius"}}"#;
     let result = parser.parse_complete(input).await.unwrap();
 
@@ -269,7 +254,6 @@ async fn test_json_parser_complete_single() {
 async fn test_json_parser_complete_array() {
     let parser = JsonParser::new();
 
-    // Test array of tool calls
     let input = r#"[
         {"name": "get_weather", "arguments": {"location": "SF"}},
         {"name": "get_news", "arguments": {"query": "technology"}}
@@ -286,7 +270,6 @@ async fn test_json_parser_complete_array() {
 async fn test_json_parser_with_parameters() {
     let parser = JsonParser::new();
 
-    // Test with "parameters" instead of "arguments"
     let input = r#"{"name": "calculate", "parameters": {"x": 10, "y": 20, "operation": "add"}}"#;
     let result = parser.parse_complete(input).await.unwrap();
 
@@ -299,7 +282,6 @@ async fn test_json_parser_with_parameters() {
 
 #[tokio::test]
 async fn test_json_parser_with_tokens() {
-    // Test with custom wrapper tokens
     let parser = JsonParser::with_config(TokenConfig {
         start_tokens: vec!["[TOOL_CALLS] [".to_string()],
         end_tokens: vec!["]".to_string()],
@@ -315,7 +297,6 @@ async fn test_json_parser_with_tokens() {
 
 #[tokio::test]
 async fn test_multiline_json_with_tokens() {
-    // Test that regex with (?s) flag properly handles multi-line JSON
     let parser = JsonParser::with_config(TokenConfig {
         start_tokens: vec!["<tool>".to_string()],
         end_tokens: vec!["</tool>".to_string()],
@@ -342,7 +323,6 @@ async fn test_multiline_json_with_tokens() {
 
 #[tokio::test]
 async fn test_multiline_json_array() {
-    // Test multi-line JSON array without wrapper tokens
     let parser = JsonParser::new();
 
     let input = r#"[
@@ -390,7 +370,6 @@ async fn test_json_parser_streaming() {
     let parser = JsonParser::new();
     let mut state = ParseState::new();
 
-    // Test with complete JSON
     let full_json = r#"{"name": "get_weather", "arguments": {"location": "San Francisco"}}"#;
 
     let result = parser
@@ -417,7 +396,6 @@ async fn test_registry_with_json_parser() {
     // Should get JSON parser for OpenAI models
     let parser = registry.get_parser("gpt-4-turbo").unwrap();
 
-    // Test that the parser works
     let input = r#"{"name": "test", "arguments": {"x": 1}}"#;
     let result = parser.parse_complete(input).await.unwrap();
     assert_eq!(result.len(), 1);
@@ -677,7 +655,6 @@ mod edge_cases {
 
     #[tokio::test]
     async fn test_multiple_token_pairs_with_conflicts() {
-        // Test with overlapping token patterns
         let parser = JsonParser::with_config(TokenConfig {
             start_tokens: vec!["<<".to_string(), "<tool>".to_string()],
             end_tokens: vec![">>".to_string(), "</tool>".to_string()],
@@ -708,7 +685,6 @@ mod edge_cases {
     async fn test_streaming_with_partial_chunks() {
         let parser = JsonParser::new();
 
-        // Test 1: Very incomplete JSON (just opening brace) should return Incomplete
         let mut state1 = ParseState::new();
         let partial = r#"{"#;
         let result = parser
@@ -720,7 +696,6 @@ mod edge_cases {
             "Should return Incomplete for just opening brace"
         );
 
-        // Test 2: Complete JSON should return ToolComplete
         let mut state2 = ParseState::new();
         let complete = r#"{"name": "get_weather", "arguments": {"location": "SF"}}"#;
         let result = parser
@@ -738,7 +713,6 @@ mod edge_cases {
             _ => panic!("Expected ToolComplete for complete JSON"),
         }
 
-        // Test 3: Partial JSON with name
         // The PartialJson parser can complete partial JSON by filling in missing values
         let mut state3 = ParseState::new();
         let partial_with_name = r#"{"name": "test", "argum"#;
@@ -863,7 +837,6 @@ mod stress_tests {
 
     #[tokio::test]
     async fn test_concurrent_parser_usage() {
-        // Test that parser can be used concurrently
         let parser = std::sync::Arc::new(JsonParser::new());
 
         let mut handles = vec![];
