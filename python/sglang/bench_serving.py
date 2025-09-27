@@ -668,7 +668,7 @@ def get_dataset(args, tokenizer):
             num_prompts=args.num_prompts,
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
-            dataset_path=args.dataset_name,
+            dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
             return_text=not tokenize_prompt,
         )
