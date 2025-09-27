@@ -788,7 +788,7 @@ impl GrpcRouter {
         }
 
         // Step 2: Handle tool call parsing
-        let mut tool_calls: Option<Vec<serde_json::Value>> = None;
+        let mut tool_calls: Option<Vec<crate::protocols::spec::ToolCall>> = None;
 
         // Check if tool calls should be processed
         let tool_choice_enabled = !matches!(
@@ -806,21 +806,22 @@ impl GrpcRouter {
                 match parser.parse_complete(&processed_text).await {
                     Ok(parsed_tool_calls) => {
                         if !parsed_tool_calls.is_empty() {
-                            // Convert to JSON format expected by OpenAI
-                            let tool_calls_json: Result<Vec<_>, _> = parsed_tool_calls
+                            let spec_tool_calls = parsed_tool_calls
                                 .into_iter()
-                                .map(|tc| serde_json::to_value(&tc))
+                                .map(|tc| crate::protocols::spec::ToolCall {
+                                    id: tc.id,
+                                    tool_type: "function".to_string(),
+                                    function: crate::protocols::spec::FunctionCallResponse {
+                                        name: tc.function.name,
+                                        arguments: Some(
+                                            serde_json::to_string(&tc.function.arguments)
+                                                .unwrap_or_else(|_| "{}".to_string()),
+                                        ),
+                                    },
+                                })
                                 .collect();
-
-                            match tool_calls_json {
-                                Ok(calls) => {
-                                    tool_calls = Some(calls);
-                                    processed_text = String::new();
-                                }
-                                Err(e) => {
-                                    error!("Failed to serialize tool calls: {}", e);
-                                }
-                            }
+                            tool_calls = Some(spec_tool_calls);
+                            processed_text = String::new();
                         }
                     }
                     Err(e) => {
@@ -860,8 +861,7 @@ impl GrpcRouter {
             } else {
                 Some(processed_text)
             },
-            tool_calls: tool_calls
-                .and_then(|calls| serde_json::from_value(serde_json::Value::Array(calls)).ok()),
+            tool_calls,
             reasoning_content: reasoning_text,
         };
 
