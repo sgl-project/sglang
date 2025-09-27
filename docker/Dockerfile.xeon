@@ -35,11 +35,12 @@ RUN pip config set global.index-url https://download.pytorch.org/whl/cpu && \
 
 RUN git clone https://github.com/sgl-project/sglang.git && \
     cd sglang && \
-    rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml && \
     git checkout ${VER_SGLANG} && \
-    pip install -e "python[all_cpu]" && \
+    cd python && \
+    cp pyproject_cpu.toml pyproject.toml && \
+    pip install . && \
     pip install torch==${VER_TORCH} torchvision==${VER_TORCHVISION} triton==${VER_TRITON} --force-reinstall && \
-    cd sgl-kernel && \
+    cd ../sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
     pip install .
 
