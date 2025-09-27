@@ -804,7 +804,7 @@ impl GrpcRouter {
                 .get_parser(&original_request.model)
             {
                 match parser.parse_complete(&processed_text).await {
-                    Ok(parsed_tool_calls) => {
+                    Ok((normal_text, parsed_tool_calls)) => {
                         if !parsed_tool_calls.is_empty() {
                             let spec_tool_calls = parsed_tool_calls
                                 .into_iter()
@@ -821,7 +821,7 @@ impl GrpcRouter {
                                 })
                                 .collect();
                             tool_calls = Some(spec_tool_calls);
-                            processed_text = String::new();
+                            processed_text = normal_text;
                         }
                     }
                     Err(e) => {
