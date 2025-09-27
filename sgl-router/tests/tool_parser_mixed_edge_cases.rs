@@ -10,8 +10,6 @@ use sglang_router_rs::tool_parser::{
 
 #[tokio::test]
 async fn test_mixed_formats_in_text() {
-    // Test that parsers correctly ignore other formats' markers
-
     let json_parser = JsonParser::new();
     let input = r#"
     Some text with [TOOL_CALLS] marker that shouldn't trigger.
@@ -37,8 +35,6 @@ async fn test_mixed_formats_in_text() {
 
 #[tokio::test]
 async fn test_format_markers_in_string_content() {
-    // Test that format markers inside string content don't interfere
-
     let pythonic_parser = PythonicParser::new();
     let input = r#"[echo(text="Use [TOOL_CALLS] and <tool_call> in text")]"#;
 
@@ -101,7 +97,6 @@ async fn test_multiple_sequential_calls_different_formats() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].function.name, "call1");
 
-    // Test plain JSON separately
     let input2 = r#"{"name": "call2", "arguments": {"x": 1}}"#;
     let result2 = llama_parser.parse_complete(input2).await.unwrap();
     assert_eq!(result2.len(), 1);
@@ -133,7 +128,6 @@ async fn test_empty_and_whitespace_variations() {
 async fn test_special_json_values() {
     let json_parser = JsonParser::new();
 
-    // Test various special JSON values
     let input = r#"{
         "name": "test_special",
         "arguments": {
@@ -183,8 +177,6 @@ async fn test_parser_recovery_after_invalid_input() {
 
 #[tokio::test]
 async fn test_boundary_cases_for_extraction() {
-    // Test edge cases in JSON extraction from text
-
     let json_parser = JsonParser::new();
 
     // JSON at the very beginning
@@ -259,7 +251,6 @@ async fn test_mistral_with_pretty_json() {
 async fn test_qwen_with_cdata_like_content() {
     let parser = QwenParser::new();
 
-    // Test with content that looks like CDATA but isn't
     // Note: QwenParser expects exactly "<tool_call>\n" with the newline
     let input = r#"<tool_call>
 {"name": "process", "arguments": {"xml": "<![CDATA[some data]]>"}}
