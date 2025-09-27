@@ -317,14 +317,16 @@ impl ToolParser for JsonParser {
                     && json_content.trim().ends_with('}')
                 {
                     let mut all_tools = Vec::new();
-                    let mut all_normal_text = String::new();
 
                     // Split by separator and try to parse each part
                     let parts: Vec<&str> =
                         json_content.split(&self.token_config.separator).collect();
+                    let mut normal_parts = Vec::new();
+
                     for part in parts {
                         let trimmed = part.trim();
                         if trimmed.is_empty() {
+                            normal_parts.push(trimmed.to_string());
                             continue;
                         }
 
@@ -333,6 +335,7 @@ impl ToolParser for JsonParser {
                             if let Ok(tools) = self.parse_json_value(&value) {
                                 all_tools.extend(tools);
                             }
+                            normal_parts.push(trimmed.to_string());
                         } else if let Some((extracted, part_normal_text)) =
                             self.extract_json_from_text(trimmed)
                         {
@@ -342,11 +345,14 @@ impl ToolParser for JsonParser {
                                     all_tools.extend(tools);
                                 }
                             }
-                            all_normal_text.push_str(&part_normal_text);
+                            normal_parts.push(part_normal_text);
                         } else {
-                            all_normal_text.push_str(trimmed);
+                            normal_parts.push(trimmed.to_string());
                         }
                     }
+
+                    // Rejoin with the original separator to preserve it
+                    let all_normal_text = normal_parts.join(&self.token_config.separator);
 
                     return Ok((all_normal_text, all_tools));
                 }

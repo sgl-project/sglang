@@ -17,7 +17,7 @@ async fn test_json_parser_invalid_json_returns_as_normal_text() {
     assert_eq!(tools.len(), 0);
     assert_eq!(
         normal_text,
-        r#"{"name": "test""arguments": invalid json here}"#
+        r#"{"name": "test", "arguments": invalid json here}"#
     );
 
     // Plain text with no JSON structure should be returned as normal text
@@ -248,7 +248,7 @@ async fn test_almost_valid_tool_calls() {
     assert_eq!(tools.len(), 0);
     assert_eq!(
         normal_text,
-        r#"{"name": "test""arguments": {"key": "value}}"#
+        r#"{"name": "test", "arguments": {"key": "value}}"#
     );
 
     // Extra comma
@@ -256,12 +256,12 @@ async fn test_almost_valid_tool_calls() {
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     // Some JSON parsers might accept trailing commas
     if tools.is_empty() {
-        assert_eq!(normal_text, r#"{"name": "test""arguments": ,}"#);
+        assert_eq!(normal_text, r#"{"name": "test", "arguments": ,}"#);
     }
 
     // Wrong quote types
     let input = r#"{'name': 'test', 'arguments': {}}"#;
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 0); // Standard JSON requires double quotes
-    assert_eq!(normal_text, r#"{'name': 'test''arguments': }"#);
+    assert_eq!(normal_text, r#"{'name': 'test', 'arguments': }"#);
 }
