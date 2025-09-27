@@ -6,7 +6,15 @@ import torch
 from sglang.srt import operations
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.operations import Operation
+from sglang.srt.operations import (
+    FunctionAdapter,
+    Operation,
+    StreamOperation,
+    COMPUTE,
+    COPY,
+    BEFORE,
+    AFTER,
+)
 
 
 @dataclass
@@ -51,6 +59,15 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
+        elif layer_name == "LlamaDecoderLayer" or layer_name ==  "Qwen3DecoderLayer":
+            return OperationsStrategy.concat(
+                [
+                    _compute_dense_layer_operations_strategy_tbo(
+                        layer, forward_mode
+                    )
+                    for layer in layers
+                ]
+            )
         else:
             raise NotImplementedError
 
@@ -58,6 +75,93 @@ class OperationsStrategy:
 def _assert_all_same(items: List):
     assert all(item == items[0] for item in items)
     return items[0]
+
+
+# -------------------------------- Strategy for TBO_Dense ---------------------------------------
+
+
+def _compute_dense_layer_operations_strategy_tbo(
+    layer: torch.nn.Module,
+    forward_mode: ForwardMode,
+) -> OperationsStrategy:
+    if forward_mode == ForwardMode.EXTEND:
+        return _compute_dense_layer_operations(layer)
+    else:
+        raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+
+def _compute_dense_layer_operations(layer):
+    input_layernorm = layer.input_layernorm
+    self_attn = layer.self_attn
+    post_attention_layernorm = layer.post_attention_layernorm
+    mlp = layer.mlp
+    input_ln_wrapper = FunctionAdapter.layernorm_forward_wrapper(input_layernorm)
+    attn_wrapper = FunctionAdapter.attention_forward_wrapper(self_attn)
+    post_ln_wrapper = FunctionAdapter.layernorm_forward_wrapper(
+        post_attention_layernorm
+    )
+    allreduce_wrapper = FunctionAdapter.allreduce_forward_wrapper()
+    mlp_wrapper = FunctionAdapter.mlp_forward_wrapper(mlp)
+    return OperationsStrategy(
+        operations=[
+            StreamOperation(
+                [input_ln_wrapper, attn_wrapper],
+                stream_name=COMPUTE,
+                wait_for=[COPY],
+                wait_timing=AFTER,
+                batch_id=0,
+            ),
+            StreamOperation(
+                [allreduce_wrapper],
+                stream_name=COPY,
+                wait_for=[COMPUTE],
+                wait_timing=BEFORE,
+                batch_id=0,
+            ),
+            StreamOperation(
+                [input_ln_wrapper, attn_wrapper],
+                stream_name=COMPUTE,
+                wait_for=[COPY],
+                wait_timing=AFTER,
+                batch_id=1,
+            ),
+            StreamOperation(
+                [allreduce_wrapper],
+                stream_name=COPY,
+                wait_for=[COMPUTE],
+                wait_timing=BEFORE,
+                batch_id=1,
+            ),
+            StreamOperation(
+                [post_ln_wrapper, mlp_wrapper],
+                stream_name=COMPUTE,
+                wait_for=[COPY],
+                wait_timing=AFTER,
+                batch_id=0,
+            ),
+            StreamOperation(
+                [allreduce_wrapper],
+                stream_name=COPY,
+                wait_for=[COMPUTE],
+                wait_timing=BEFORE,
+                batch_id=0,
+            ),
+            StreamOperation(
+                [post_ln_wrapper, mlp_wrapper],
+                stream_name=COMPUTE,
+                wait_for=[COPY],
+                wait_timing=AFTER,
+                batch_id=1,
+            ),
+            StreamOperation(
+                [allreduce_wrapper],
+                stream_name=COPY,
+                wait_for=[COMPUTE],
+                wait_timing=BEFORE,
+                batch_id=1,
+            ),
+        ],
+    )
 
 
 # -------------------------------- Strategy for DeepSeek ---------------------------------------

@@ -28,7 +28,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.operations import execute_operations, execute_overlapped_operations
+from sglang.srt.operations import (
+    execute_operations,
+    execute_overlapped_operations,
+    execute_stream_operations,
+)
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import BumpAllocator, get_bool_env_var, is_hip
@@ -447,6 +451,36 @@ class TboDPAttentionPreparer:
         return all(value == x[0] for value in x)
 
 
+class TboStreamPreparer:
+    def prepare_split_index(
+        self,
+        batch: ScheduleBatch,
+    ):
+        self.enable_two_batch_overlap = is_tbo_enabled()
+        if batch is not None:
+            token_num_per_seq = get_token_num_per_seq(
+                forward_mode=batch.forward_mode, spec_info=batch.spec_info
+            )
+            if batch.forward_mode.is_extend():
+                num_tokens = batch.extend_num_tokens
+                self.local_tbo_split_seq_index = compute_split_seq_index(
+                    forward_mode=batch.forward_mode,
+                    num_tokens=num_tokens,
+                    extend_lens=batch.extend_lens,
+                    token_num_per_seq=token_num_per_seq,
+                )
+            else:
+                self.local_tbo_split_seq_index = None
+            local_can_run_tbo = self.local_tbo_split_seq_index is not None
+        else:
+            self.local_tbo_split_seq_index = 0
+            local_can_run_tbo = True
+        can_run_tbo = self.enable_two_batch_overlap and local_can_run_tbo
+        tbo_split_seq_index = self.local_tbo_split_seq_index if can_run_tbo else None
+        global_forward_mode = ForwardMode.EXTEND if can_run_tbo else None
+        return tbo_split_seq_index, global_forward_mode
+
+
 class TboForwardBatchPreparer:
     @classmethod
     def prepare(cls, batch: ForwardBatch, is_draft_worker: bool = False):
@@ -788,9 +822,10 @@ def model_forward_maybe_tbo(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
-    input_data_scatter_mode: ScatterMode,
     residual: Optional[torch.Tensor],
+    input_data_scatter_mode: ScatterMode = None,
     zero_allocator: Optional[BumpAllocator] = None,
+    stream_operate=False,
 ):
     inputs = dict(
         positions=positions,
@@ -799,7 +834,10 @@ def model_forward_maybe_tbo(
         residual=residual,
         zero_allocator=zero_allocator,
     )
-    layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
+    try:
+        layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
+    except (IndexError, AttributeError):
+        layer_input_scatter_mode = None
     operations_strategy = OperationsStrategy.init_new_tbo(
         layers, forward_batch.global_forward_mode
     )
@@ -809,6 +847,7 @@ def model_forward_maybe_tbo(
             operations_strategy=operations_strategy,
             input_data_scatter_mode=input_data_scatter_mode,
             layer_input_scatter_mode=layer_input_scatter_mode,
+            stream_operate=stream_operate,
         )
     else:
         return _model_forward_non_tbo(inputs, operations_strategy)
@@ -819,11 +858,13 @@ def _model_forward_tbo(
     operations_strategy: OperationsStrategy,
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
+    stream_operate=False,
 ):
     inputs_arr = _model_forward_tbo_split_inputs(
         **inputs,
         input_data_scatter_mode=input_data_scatter_mode,
         layer_input_scatter_mode=layer_input_scatter_mode,
+        skip_redistribution=stream_operate,
     )
     del inputs
 
@@ -836,11 +877,16 @@ def _model_forward_tbo(
     )
 
     with context:
-        outputs_arr = execute_overlapped_operations(
-            inputs_arr=inputs_arr,
-            operations_arr=[operations_strategy.operations] * 2,
-            delta_stages=[0, operations_strategy.tbo_delta_stages],
-        )
+        if stream_operate:
+            outputs_arr = execute_stream_operations(
+                inputs_arr=inputs_arr, operations=operations_strategy.operations
+            )
+        else:
+            outputs_arr = execute_overlapped_operations(
+                inputs_arr=inputs_arr,
+                operations_arr=[operations_strategy.operations] * 2,
+                delta_stages=[0, operations_strategy.tbo_delta_stages],
+            )
 
     return _model_forward_tbo_merge_outputs(*outputs_arr)
 
@@ -858,7 +904,17 @@ def _model_forward_tbo_split_inputs(
     zero_allocator: Optional[BumpAllocator],
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
+    skip_redistribution: bool,
 ) -> List[Dict]:
+    if skip_redistribution:
+        return _model_forward_tbo_split_inputs_raw(
+            hidden_states=hidden_states,
+            residual=residual,
+            positions=positions,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
+
     tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
 
