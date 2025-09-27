@@ -89,13 +89,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 return f"Tool '{tool_name}' not found in tools list."
 
         # Validate tool definitions
-        if request.tools:
-            for i, tool in enumerate(request.tools):
-                if tool.function.parameters is not None:
-                    try:
-                        Draft202012Validator.check_schema(tool.function.parameters)
-                    except SchemaError as e:
-                        return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+        for i, tool in enumerate(request.tools or []):
+            if tool.function.parameters is None:
+                continue
+            try:
+                Draft202012Validator.check_schema(tool.function.parameters)
+            except SchemaError as e:
+                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
