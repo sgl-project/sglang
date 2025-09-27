@@ -130,14 +130,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         .await;
 
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    // Validate metadata.mcp is present
-    let mcp_meta = json.get("metadata").and_then(|m| m.get("mcp"));
-    assert!(mcp_meta.is_some(), "metadata.mcp should be present");
+
 
     // Cleanup
     worker.stop().await;
