@@ -26,7 +26,7 @@ elif torch.version.cuda is not None:
     print("Running on NVIDIA CUDA GPU")
     DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000_deterministic.pkl"
     DENSE_TOLERANCE_MAX_DIFF = 1e-8
-    DENSE_TOLERANCE_MEAN_DIFF =1e-8
+    DENSE_TOLERANCE_MEAN_DIFF = 1e-8
 else:
     print("No GPU backend (CPU only)")
 
