@@ -577,22 +577,17 @@ class ServerArgs:
                     else:
                         self.cuda_graph_max_bs = 512
                 reserved_mem = (12 + parallel_size / 2) * 1024
-            elif gpu_mem < 100 * 1024:
-                # H20
-                # (chunked_prefill_size 8k, cuda_graph_max_bs 512)
-                if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 8192
-                if self.cuda_graph_max_bs is None:
-                    self.cuda_graph_max_bs = 512
-                reserved_mem = (15 + parallel_size / 2) * 1024
             elif gpu_mem < 160 * 1024:
-                # H200
-                # (chunked_prefill_size 8k, cuda_graph_max_bs 512)
+                # H20, H200
+                # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 8192
                 if self.cuda_graph_max_bs is None:
-                    self.cuda_graph_max_bs = 512
-                reserved_mem = (15 + parallel_size / 2) * 1024
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 256
+                    else:
+                        self.cuda_graph_max_bs = 512
+                reserved_mem = (12 + parallel_size / 2) * 1024
             else:
                 # B200, MI300
                 # (chunked_prefill_size 16k, cuda_graph_max_bs 512)
