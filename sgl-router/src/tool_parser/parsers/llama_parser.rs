@@ -48,6 +48,7 @@ impl ToolParser for LlamaParser {
 
         if !tools.is_empty() {
             // Extract normal text before the python tag
+            // JsonParser doesn't preserve normal text for single start tokens, so we do it manually
             let normal_text = if let Some(tag_pos) = text.find("<|python_tag|>") {
                 text[..tag_pos].to_string()
             } else {
