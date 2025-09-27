@@ -367,8 +367,8 @@ impl ToolParser for JsonParser {
                     }
                 }
 
-                // No valid JSON found, return content as normal text
-                Ok((json_content.to_string(), vec![]))
+                // No valid JSON found, return original text as normal text
+                Ok((text.to_string(), vec![]))
             }
         }
     }
@@ -645,6 +645,20 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].function.name, "test");
         assert_eq!(normal_text, ""); // Wrapper tokens with no extra text
+    }
+
+    #[tokio::test]
+    async fn test_parse_with_start_token_invalid_json() {
+        let parser = JsonParser::with_config(TokenConfig {
+            start_tokens: vec!["<|python_tag|>".to_string()],
+            end_tokens: vec!["".to_string()],
+            separator: ";".to_string(),
+        });
+
+        let input = r#"Hello world <|python_tag|>this is not valid json at all"#;
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 0);
+        assert_eq!(normal_text, input); // Should return entire original text when JSON parsing fails
     }
 
     #[tokio::test]
