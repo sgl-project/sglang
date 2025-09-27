@@ -84,7 +84,7 @@ else
 fi
 
 # Set up persistent cache directory for Hugging Face models
-CACHE_DIR="${CACHE_DIR:-/opt/sglang-ci-cache}"
+CACHE_DIR="${CACHE_DIR:-$HOME/.sglang-ci-cache}"
 echo "Setting up cache directory: ${CACHE_DIR}"
 mkdir -p "${CACHE_DIR}/huggingface"
 echo "Cache directory ready at: ${CACHE_DIR}"

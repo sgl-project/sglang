@@ -2,35 +2,18 @@
 # Script to manage AMD CI model cache
 set -euo pipefail
 
-CACHE_DIR="${CACHE_DIR:-/opt/sglang-ci-cache}"
-
-# Set up sudo handling
-if [[ "$EUID" -eq 0 ]]; then
-  SUDO=""
-else
-  SUDO="sudo"
-fi
+CACHE_DIR="${CACHE_DIR:-$HOME/.sglang-ci-cache}"
 
 case "${1:-}" in
   init)
     echo "Initializing AMD CI model cache..."
 
-    # Check if cache directory already exists and has correct permissions
+    # Check if cache directory already exists
     if [ -d "${CACHE_DIR}/huggingface" ]; then
       echo "Cache directory already exists at ${CACHE_DIR}"
-
-      # Check and fix permissions if needed
-      current_perms=$(stat -c "%a" "${CACHE_DIR}" 2>/dev/null || echo "unknown")
-      if [ "${current_perms}" != "777" ]; then
-        echo "Fixing cache directory permissions..."
-        ${SUDO} chmod -R 777 "${CACHE_DIR}" 2>/dev/null || true
-      else
-        echo "Cache directory permissions are correct"
-      fi
     else
       echo "Creating cache directory..."
-      ${SUDO} mkdir -p "${CACHE_DIR}/huggingface"
-      ${SUDO} chmod -R 777 "${CACHE_DIR}"
+      mkdir -p "${CACHE_DIR}/huggingface"
       echo "Cache directory created at ${CACHE_DIR}"
     fi
 
@@ -84,11 +67,11 @@ case "${1:-}" in
       echo "Found ${old_files_count} old files to remove"
 
       # Perform cleanup with error handling
-      if ${SUDO} find "${CACHE_DIR}" -type f -atime +30 -delete 2>/dev/null; then
+      if find "${CACHE_DIR}" -type f -atime +30 -delete 2>/dev/null; then
         echo "Old files removed successfully"
 
         # Clean up empty directories
-        ${SUDO} find "${CACHE_DIR}" -type d -empty -delete 2>/dev/null || true
+        find "${CACHE_DIR}" -type d -empty -delete 2>/dev/null || true
       else
         echo "Warning: Some files could not be removed (may be in use)"
       fi

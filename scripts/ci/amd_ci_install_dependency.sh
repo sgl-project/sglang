@@ -13,7 +13,7 @@ fi
 
 # Check disk space and conditionally manage cache
 echo "Checking available disk space..."
-cache_parent_dir="${CACHE_DIR:-/opt/sglang-ci-cache}"
+cache_parent_dir="${CACHE_DIR:-$HOME/.sglang-ci-cache}"
 
 # Robust disk space check with fallbacks
 available_gb=0
