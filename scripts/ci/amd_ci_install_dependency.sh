@@ -49,7 +49,3 @@ docker exec ci_sglang pip install pytest
 
 # Install the required dependencies for HF
 docker exec ci_sglang pip install huggingface_hub[hf_xet]
-if [ -n "${HF_TOKEN:-}" ]; then
-  docker exec -e HF_TOKEN="${HF_TOKEN}" ci_sglang \
-    bash -lc 'pip install -U "huggingface_hub[cli]" && hf auth login --token "$HF_TOKEN"'
-fi
