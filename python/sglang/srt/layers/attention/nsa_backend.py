@@ -149,7 +149,14 @@ NSA_DECODE_IMPL: _NSA_IMPL_T
 
 
 class NativeSparseAttnBackend(AttentionBackend):
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        skip_prefill: bool = False,
+        speculative_step_id=0,
+        topk=0,
+        speculative_num_steps=0,
+    ):
         super().__init__()
         self.forward_metadata: NSAMetadata
         self.device = model_runner.device
@@ -204,33 +211,68 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         return page_table[:, strided_indices] // page_size
 
+        # For speculative decoding
+        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = (
+            model_runner.server_args.speculative_num_draft_tokens
+        )
+        self.speculative_step_id = speculative_step_id
+        assert (
+            self.topk <= 1
+        ), "NSA backend only supports topk = 1 for speculative decoding"
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
-        assert (
-            forward_batch.spec_info is None
-        ), "Spec decoding is not supported for NSA backend now"
-        cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
-        cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-        assert forward_batch.seq_lens_cpu is not None
-        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
-        page_table = forward_batch.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices, :max_seqlen_k
-        ]
-
         if forward_batch.forward_mode.is_decode_or_idle():
-            extend_seq_lens_cpu = [1] * batch_size
-            max_seqlen_q = 1
-            cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
-            seqlens_expanded = cache_seqlens_int32
+            if forward_batch.spec_info is not None:
+                # Draft Decode
+                assert self.topk <= 1
+                cache_seqlens_int32 = (
+                    forward_batch.seq_lens + (self.speculative_step_id + 1)
+                ).to(torch.int32)
+                max_seqlen_k = forward_batch.seq_lens_cpu.max().item() + (
+                    self.speculative_step_id + 1
+                )
+                cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+                max_seqlen_q = 1
+                cu_seqlens_q = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device=device
+                )
+                page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :max_seqlen_k
+                ]
+                extend_seq_lens_cpu = [1] * batch_size
+            else:
+                # Normal Decode
+                cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
+                cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+                assert forward_batch.seq_lens_cpu is not None
+                max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+                page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :max_seqlen_k
+                ]
+                extend_seq_lens_cpu = [1] * batch_size
+                max_seqlen_q = 1
+                cu_seqlens_q = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device=device
+                )
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
                 and forward_batch.extend_prefix_lens_cpu is not None
             ), "All of them must not be None"
+            cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
+            cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+            assert forward_batch.seq_lens_cpu is not None
+            max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+            page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, :max_seqlen_k
+            ]
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert forward_batch.extend_seq_lens is not None
             if any(forward_batch.extend_prefix_lens_cpu):
