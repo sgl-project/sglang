@@ -99,7 +99,7 @@ FetchContent_Populate(repo-flash-attention)
 FetchContent_Declare(
     repo-flash-attention-origin
     GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
-    GIT_TAG        203b9b3dba39d5d08dffb49c09aa622984dff07d
+    GIT_TAG        5c1627a7a1cda9c32cb9b937a053564e663f81bc
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention-origin)
