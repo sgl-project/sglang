@@ -525,18 +525,23 @@ class ServerArgs:
         """
         Configure GPU memory-dependent settings including mem_fraction_static,
         chunked_prefill_size, cuda_graph_max_bs, and cuda_graph_bs.
+
+        Heuristics:
+        GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
+        mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
+
+        We want mem_fraction_static to be as large as possible but still has enough room
+        for activations and cuda graph buffers. We use the following heuristics to
+        compute the needed size for activations and cuda graph buffers:
+        - The size of the activation depends on the chunked_prefill_size and model size.
+        - The size of cuda graph buffers depends on the cuda graph capture range and model size.
+        For GPUs with more memory, we use a larger chunked_prefill_size and
+        capture more cuda graphs, so they need to reserve more memory.
+
+        Currently, use some hardcoded values such as 2.8GB or 12GB for activations and cuda graph buffers.
+        In the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
         if gpu_mem is not None:
-            # GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
-            # mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
-
-            # We want mem_fraction_static to be as large as possible but still has enough room
-            # for activations and cuda graph buffers. We use the following heuristic to
-            # compute the needed size for activations and cuda graph buffers:
-            # - The size of the activation depends on the chunked_prefill_size and model size.
-            # - The size of cuda graph buffers depends on the cuda graph capture range and model size.
-            # For GPUs with more memory, we use a larger chunked_prefill_size and
-            # capture more cuda graphs, so they need to reserve more memory.
             parallel_size = self.tp_size * self.pp_size
 
             if gpu_mem < 20 * 1024:
@@ -575,11 +580,11 @@ class ServerArgs:
             elif gpu_mem < 100 * 1024:
                 # H20
                 # (chunked_prefill_size 8k, cuda_graph_max_bs 512)
-                reserved_mem = (15 + parallel_size / 2) * 1024
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 8192
                 if self.cuda_graph_max_bs is None:
                     self.cuda_graph_max_bs = 512
+                reserved_mem = (15 + parallel_size / 2) * 1024
             elif gpu_mem < 160 * 1024:
                 # H200
                 # (chunked_prefill_size 8k, cuda_graph_max_bs 512)
@@ -595,14 +600,14 @@ class ServerArgs:
                     self.chunked_prefill_size = 16384
                 if self.cuda_graph_max_bs is None:
                     self.cuda_graph_max_bs = 512
-                reserved_mem = 32 * 1024
+                reserved_mem = (20 + parallel_size / 2) * 1024
         else:
             # Fallback defaults when gpu_mem is None
             if self.chunked_prefill_size is None:
                 self.chunked_prefill_size = 4096
             if self.cuda_graph_max_bs is None:
                 self.cuda_graph_max_bs = 160
-            reserved_mem = 4 * 1024
+            reserved_mem = (4 + parallel_size / 10) * 1024
 
         if self.mem_fraction_static is None:
             # draft model and larger cuda graph buffers
