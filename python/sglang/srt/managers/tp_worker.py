@@ -263,6 +263,7 @@ class TpModelWorker:
                 if (
                     model_worker_batch.is_prefill_only
                     and model_worker_batch.return_logprob
+                    and logits_output.next_token_logits is not None
                 ):
                     # Compute logprobs without full sampling
                     self.model_runner.compute_logprobs_only(
