@@ -13,6 +13,7 @@ import unittest
 import numpy as np
 import torch
 
+from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -51,6 +52,7 @@ class TestForwardSplitPrefill(CustomTestCase):
 
         # Load model and tokenizer
         cls.model_config = ModelConfig.from_server_args(cls.server_args)
+        cls.device_config = DeviceConfig("cuda")
         cls.model_runner = ModelRunner(
             model_config=cls.model_config,
             mem_fraction_static=cls.server_args.mem_fraction_static,
