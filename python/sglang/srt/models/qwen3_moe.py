@@ -358,7 +358,7 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
-        self.supported_rope_type = (
+        self.compatible_with_fused_kv_buffer = (
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
         )
 
@@ -431,7 +431,7 @@ class Qwen3MoeAttention(nn.Module):
                     forward_batch=forward_batch,
                 )
                 if enable_fused_set_kv_buffer(forward_batch)
-                and self.supported_rope_type
+                and self.compatible_with_fused_kv_buffer
                 else None
             ),
         )
@@ -445,7 +445,8 @@ class Qwen3MoeAttention(nn.Module):
         attn_output = self.attn(
             *inner_state,
             save_kv_cache=not (
-                enable_fused_set_kv_buffer(forward_batch) and self.supported_rope_type
+                enable_fused_set_kv_buffer(forward_batch)
+                and self.compatible_with_fused_kv_buffer
             ),
         )
         output, _ = self.o_proj(attn_output)
