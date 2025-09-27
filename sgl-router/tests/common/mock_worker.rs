@@ -646,7 +646,18 @@ async fn responses_handler(
     } else {
         // If tools are provided and this is the first call (no previous_response_id),
         // emit a single function_tool_call to trigger the router's MCP flow.
-        let has_tools = payload.get("tools").is_some();
+        let has_tools = payload
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|tool| {
+                    tool.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "function")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
         let has_function_output = payload
             .get("input")
             .and_then(|v| v.as_array())
