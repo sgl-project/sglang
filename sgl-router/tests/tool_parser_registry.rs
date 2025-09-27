@@ -126,7 +126,6 @@ async fn test_unknown_model_fallback() {
 async fn test_pattern_specificity() {
     let registry = ParserRegistry::new();
 
-    // Test that more specific patterns take precedence
     // llama-4* should match before llama-*
     let parser = registry.get_parser("llama-4-70b").unwrap();
     assert!(parser.detect_format(r#"[test_function(x=1)]"#)); // Pythonic format
@@ -139,7 +138,6 @@ async fn test_pattern_specificity() {
 async fn test_real_world_model_outputs() {
     let registry = ParserRegistry::new();
 
-    // Test with realistic outputs from different models
     let test_cases = vec![
         (
             "gpt-4",
