@@ -6,8 +6,8 @@ use crate::data_connector::{ResponseId, SharedResponseStorage, StoredResponse};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
-    ResponseStatus, ResponseTextFormat, ResponsesGetParams, ResponsesRequest, ResponsesResponse,
-    ResponseTool, ResponseToolType, TextFormatType,
+    ResponseStatus, ResponseTextFormat, ResponseTool, ResponseToolType, ResponsesGetParams,
+    ResponsesRequest, ResponsesResponse, TextFormatType,
 };
 use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
 use async_trait::async_trait;
@@ -26,7 +26,7 @@ use std::{
     collections::HashMap,
     io,
     sync::{atomic::AtomicBool, Arc},
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -295,7 +295,10 @@ impl OpenAIRouter {
                         });
                         if arr.is_empty() {
                             obj.remove("tools");
-                            obj.insert("tool_choice".to_string(), Value::String("none".to_string()));
+                            obj.insert(
+                                "tool_choice".to_string(),
+                                Value::String("none".to_string()),
+                            );
                         }
                     }
                 }
@@ -393,45 +396,74 @@ impl OpenAIRouter {
                                     tool_name, call_id, args_json_str
                                 );
 
-                                let (started_ts, server_name, ok, output_str, err_msg) =
-                                    match Self::execute_mcp_call(mcp, &tool_name, &args_json_str).await {
-                                        Ok((server, out)) => (
-                                            SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs() as i64,
-                                            server,
-                                            true,
-                                            out,
-                                            None,
-                                        ),
-                                        Err(err) => (
-                                            SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs() as i64,
-                                            String::new(),
+                                let call_started = SystemTime::now();
+                                let call_result =
+                                    Self::execute_mcp_call(mcp, &tool_name, &args_json_str).await;
+                                let call_duration_ms =
+                                    call_started.elapsed().unwrap_or_default().as_millis();
+
+                                let (output_payload, call_ok, call_error) = match call_result {
+                                    Ok((server, out)) => {
+                                        info!(
+                                            call_id = %call_id,
+                                            tool_name = %tool_name,
+                                            server = %server,
+                                            duration_ms = call_duration_ms,
+                                            "MCP tool call succeeded"
+                                        );
+                                        (out, true, None)
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            call_id = %call_id,
+                                            tool_name = %tool_name,
+                                            duration_ms = call_duration_ms,
+                                            error = %err,
+                                            "MCP tool call failed"
+                                        );
+                                        (
+                                            serde_json::json!({
+                                                "error": err
+                                            })
+                                            .to_string(),
                                             false,
-                                            String::new(),
                                             Some(err),
-                                        ),
-                                    };
+                                        )
+                                    }
+                                };
 
                                 match self
-                                    .resume_with_tool_result(
-                                        &url,
+                                    .resume_with_tool_result(ResumeWithToolArgs {
+                                        url: &url,
                                         headers,
-                                        &payload,
-                                        &openai_response_json,
-                                        &call_id,
-                                        &tool_name,
-                                        &args_json_str,
-                                        &output_str,
+                                        original_payload: &payload,
+                                        call_id: &call_id,
+                                        tool_name: &tool_name,
+                                        args_json_str: &args_json_str,
+                                        output_str: &output_payload,
                                         original_body,
-                                    )
+                                    })
                                     .await
                                 {
                                     Ok(mut final_json) => {
+                                        if !call_ok {
+                                            if let Some(obj) = final_json.as_object_mut() {
+                                                let metadata_value =
+                                                    obj.entry("metadata").or_insert_with(|| {
+                                                        Value::Object(serde_json::Map::new())
+                                                    });
+                                                if let Some(metadata) =
+                                                    metadata_value.as_object_mut()
+                                                {
+                                                    if let Some(err_msg) = call_error.as_ref() {
+                                                        metadata.insert(
+                                                            "mcp_error".to_string(),
+                                                            Value::String(err_msg.clone()),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
                                         Self::mask_tools_as_mcp(&mut final_json, original_body);
 
                                         if original_body.store {
@@ -516,15 +548,17 @@ impl OpenAIRouter {
 
     /// Build a request-scoped MCP manager from request tools, if present.
     async fn mcp_manager_from_request_tools(
-        tools: &Vec<ResponseTool>,
+        tools: &[ResponseTool],
     ) -> Option<Arc<crate::mcp::McpClientManager>> {
-        let mcp_tool = tools
+        let tool = tools
             .iter()
-            .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some());
-        let Some(tool) = mcp_tool else { return None; };
+            .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
         let server_url = tool.server_url.as_ref()?.trim().to_string();
         if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
-            warn!("Ignoring MCP server_url with unsupported scheme: {}", server_url);
+            warn!(
+                "Ignoring MCP server_url with unsupported scheme: {}",
+                server_url
+            );
             return None;
         }
         let name = tool
@@ -533,9 +567,15 @@ impl OpenAIRouter {
             .unwrap_or_else(|| "request-mcp".to_string());
         let token = tool.authorization.clone();
         let transport = if server_url.contains("/sse") {
-            crate::mcp::McpTransport::Sse { url: server_url, token }
+            crate::mcp::McpTransport::Sse {
+                url: server_url,
+                token,
+            }
         } else {
-            crate::mcp::McpTransport::Streamable { url: server_url, token }
+            crate::mcp::McpTransport::Streamable {
+                url: server_url,
+                token,
+            }
         };
         let cfg = crate::mcp::McpConfig {
             servers: vec![crate::mcp::McpServerConfig { name, transport }],
@@ -980,6 +1020,17 @@ impl OpenAIRouter {
     }
 }
 
+struct ResumeWithToolArgs<'a> {
+    url: &'a str,
+    headers: Option<&'a HeaderMap>,
+    original_payload: &'a Value,
+    call_id: &'a str,
+    tool_name: &'a str,
+    args_json_str: &'a str,
+    output_str: &'a str,
+    original_body: &'a ResponsesRequest,
+}
+
 impl OpenAIRouter {
     fn extract_function_call(resp: &Value) -> Option<(String, String, String)> {
         let output = resp.get("output")?.as_array()?;
@@ -987,8 +1038,15 @@ impl OpenAIRouter {
             let obj = item.as_object()?;
             let t = obj.get("type")?.as_str()?;
             if t == "function_tool_call" || t == "function_call" {
-                let call_id = obj.get("call_id").and_then(|v| v.as_str()).map(|s| s.to_string())
-                    .or_else(|| obj.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))?;
+                let call_id = obj
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        obj.get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })?;
                 let name = obj.get("name")?.as_str()?.to_string();
                 let arguments = obj.get("arguments")?.as_str()?.to_string();
                 return Some((call_id, name, arguments));
@@ -1004,7 +1062,9 @@ impl OpenAIRouter {
             .tools
             .iter()
             .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some());
-        let Some(t) = mcp_tool else { return; };
+        let Some(t) = mcp_tool else {
+            return;
+        };
 
         let mut m = serde_json::Map::new();
         m.insert("type".to_string(), Value::String("mcp".to_string()));
@@ -1015,7 +1075,10 @@ impl OpenAIRouter {
             m.insert("server_url".to_string(), Value::String(url.clone()));
         }
         if let Some(desc) = &t.server_description {
-            m.insert("server_description".to_string(), Value::String(desc.clone()));
+            m.insert(
+                "server_description".to_string(),
+                Value::String(desc.clone()),
+            );
         }
         if let Some(req) = &t.require_approval {
             m.insert("require_approval".to_string(), Value::String(req.clone()));
@@ -1029,7 +1092,8 @@ impl OpenAIRouter {
 
         if let Some(obj) = resp.as_object_mut() {
             obj.insert("tools".to_string(), Value::Array(vec![Value::Object(m)]));
-            obj.entry("tool_choice").or_insert(Value::String("auto".to_string()));
+            obj.entry("tool_choice")
+                .or_insert(Value::String("auto".to_string()));
         }
     }
 
@@ -1038,8 +1102,8 @@ impl OpenAIRouter {
         tool_name: &str,
         args_json_str: &str,
     ) -> Result<(String, String), String> {
-        let args_value: Value = serde_json::from_str(args_json_str)
-            .map_err(|e| format!("parse tool args: {}", e))?;
+        let args_value: Value =
+            serde_json::from_str(args_json_str).map_err(|e| format!("parse tool args: {}", e))?;
         let args_obj = args_value.as_object().cloned();
 
         let server_name = mcp_mgr
@@ -1052,24 +1116,13 @@ impl OpenAIRouter {
             .await
             .map_err(|e| format!("tool call failed: {}", e))?;
 
-        let output_str = serde_json::to_string(&result)
-            .unwrap_or_else(|_| "{\"ok\":true}".to_string());
+        let output_str =
+            serde_json::to_string(&result).unwrap_or_else(|_| "{\"ok\":true}".to_string());
         Ok((server_name, output_str))
     }
 
-    async fn resume_with_tool_result(
-        &self,
-        url: &str,
-        headers: Option<&HeaderMap>,
-        original_payload: &Value,
-        first_response: &Value,
-        call_id: &str,
-        tool_name: &str,
-        args_json_str: &str,
-        output_str: &str,
-        original_body: &ResponsesRequest,
-    ) -> Result<Value, String> {
-        let mut payload2 = original_payload.clone();
+    async fn resume_with_tool_result(&self, args: ResumeWithToolArgs<'_>) -> Result<Value, String> {
+        let mut payload2 = args.original_payload.clone();
         let obj = payload2
             .as_object_mut()
             .ok_or_else(|| "payload not an object".to_string())?;
@@ -1078,7 +1131,7 @@ impl OpenAIRouter {
         let user_item = serde_json::json!({
             "type": "message",
             "role": "user",
-            "content": original_body.input.clone()
+            "content": args.original_body.input.clone()
         });
 
         let system_item = serde_json::json!({
@@ -1089,15 +1142,15 @@ impl OpenAIRouter {
 
         let func_item = serde_json::json!({
             "type": "function_call",
-            "call_id": call_id,
-            "name": tool_name,
-            "arguments": args_json_str
+            "call_id": args.call_id,
+            "name": args.tool_name,
+            "arguments": args.args_json_str
         });
         // Build tool result item as function_call_output per OpenAI Responses spec
         let tool_item = serde_json::json!({
             "type": "function_call_output",
-            "call_id": call_id,
-            "output": output_str
+            "call_id": args.call_id,
+            "output": args.output_str
         });
 
         obj.insert(
@@ -1106,15 +1159,15 @@ impl OpenAIRouter {
                 Value::Object(user_item.as_object().cloned().unwrap()),
                 Value::Object(system_item.as_object().cloned().unwrap()),
                 Value::Object(func_item.as_object().cloned().unwrap()),
-                Value::Object(tool_item.as_object().cloned().unwrap())
+                Value::Object(tool_item.as_object().cloned().unwrap()),
             ]),
         );
 
         // Ensure non-streaming and no store to upstream
         obj.insert("stream".to_string(), Value::Bool(false));
         obj.insert("store".to_string(), Value::Bool(false));
-        let mut req = self.client.post(url).json(&payload2);
-        if let Some(headers) = headers {
+        let mut req = self.client.post(args.url).json(&payload2);
+        if let Some(headers) = args.headers {
             req = apply_request_headers(headers, req, true);
         }
         let resp = req
@@ -1131,14 +1184,14 @@ impl OpenAIRouter {
             .await
             .map_err(|e| format!("parse resume response: {}", e))?;
 
-        if let Some(instr) = &original_body.instructions {
+        if let Some(instr) = &args.original_body.instructions {
             if let Some(obj) = v.as_object_mut() {
                 obj.entry("instructions")
                     .or_insert(Value::String(instr.clone()));
             }
         }
         // After resume, mask tools as MCP if request used MCP
-        Self::mask_tools_as_mcp(&mut v, original_body);
+        Self::mask_tools_as_mcp(&mut v, args.original_body);
         Ok(v)
     }
 }

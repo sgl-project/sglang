@@ -8,10 +8,13 @@ use sglang_router_rs::protocols::spec::{
 
 mod common;
 use common::mock_mcp_server::MockMCPServer;
-use common::mock_worker::{MockWorker, MockWorkerConfig, WorkerType, HealthStatus};
+use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
+use sglang_router_rs::config::{
+    CircuitBreakerConfig, ConnectionMode, HealthCheckConfig, PolicyConfig,
+    RetryConfig, RouterConfig, RoutingMode,
+};
 use sglang_router_rs::routers::RouterFactory;
 use sglang_router_rs::server::AppContext;
-use sglang_router_rs::config::{RoutingMode, RouterConfig, ConnectionMode, PolicyConfig, HealthCheckConfig, RetryConfig, CircuitBreakerConfig, MetricsConfig};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -40,7 +43,9 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 
     // Build router config (HTTP OpenAI mode)
     let router_cfg = RouterConfig {
-        mode: RoutingMode::OpenAI { worker_urls: vec![worker_url] },
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec![worker_url],
+        },
         connection_mode: ConnectionMode::Http,
         policy: PolicyConfig::Random,
         host: "127.0.0.1".to_string(),
@@ -75,7 +80,9 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 
     // Create router and context
     let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx)).await.expect("router");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
     let req = ResponsesRequest {
@@ -158,7 +165,10 @@ fn test_responses_request_creation() {
         stream: false,
         temperature: Some(0.7),
         tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool { r#type: ResponseToolType::WebSearchPreview, ..Default::default() }],
+        tools: vec![ResponseTool {
+            r#type: ResponseToolType::WebSearchPreview,
+            ..Default::default()
+        }],
         top_logprobs: 5,
         top_p: Some(0.9),
         truncation: Truncation::Disabled,
@@ -306,7 +316,10 @@ fn test_json_serialization() {
         stream: true,
         temperature: Some(0.9),
         tool_choice: ToolChoice::Value(ToolChoiceValue::Required),
-        tools: vec![ResponseTool { r#type: ResponseToolType::CodeInterpreter, ..Default::default() }],
+        tools: vec![ResponseTool {
+            r#type: ResponseToolType::CodeInterpreter,
+            ..Default::default()
+        }],
         top_logprobs: 10,
         top_p: Some(0.8),
         truncation: Truncation::Auto,
