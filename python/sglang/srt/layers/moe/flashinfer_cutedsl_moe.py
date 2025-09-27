@@ -30,6 +30,9 @@ def flashinfer_cutedsl_moe_masked(
     w2_blockscale: torch.Tensor,
     w2_alpha,
     masked_m: torch.Tensor,
+    down_sm_count: Optional[int] = None,
+    down_signals: Optional[torch.Tensor] = None,
+    down_start_event: Optional[torch.cuda.Event] = None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -138,6 +141,9 @@ def flashinfer_cutedsl_moe_masked(
         masked_m,
     )
 
+    if down_start_event is not None:
+        down_start_event.record()
+
     # Gemm2
     out = torch.empty_like(hidden_states)
     out = out.permute(1, 2, 0)  # requirement of kernel
@@ -152,5 +158,13 @@ def flashinfer_cutedsl_moe_masked(
         sf_vec_size=sf_vec_size,
         alpha=w2_alpha.view(1, 1, num_experts),
         alpha_dtype=get_cute_dtype(w2_alpha),
+        **(
+            dict(
+                sm_count=down_sm_count,
+                dst_signals=down_signals,
+            )
+            if down_sm_count is not None or down_signals is not None
+            else {}
+        ),
     )  # in logical [m, k, l]
     return out.permute(2, 0, 1)
