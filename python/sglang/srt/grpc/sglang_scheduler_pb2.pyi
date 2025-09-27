@@ -3,7 +3,6 @@ import datetime
 from google.protobuf import timestamp_pb2 as _timestamp_pb2
 from google.protobuf import struct_pb2 as _struct_pb2
 from google.protobuf.internal import containers as _containers
-from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from collections.abc import Iterable as _Iterable, Mapping as _Mapping
@@ -180,14 +179,6 @@ class GenerateStreamChunk(_message.Message):
 
 class GenerateComplete(_message.Message):
     __slots__ = ("output_ids", "finish_reason", "prompt_tokens", "completion_tokens", "cached_tokens", "all_logprobs", "all_hidden_states", "matched_token_id", "matched_stop_str")
-    class FinishReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
-        __slots__ = ()
-        STOP: _ClassVar[GenerateComplete.FinishReason]
-        LENGTH: _ClassVar[GenerateComplete.FinishReason]
-        ABORT: _ClassVar[GenerateComplete.FinishReason]
-    STOP: GenerateComplete.FinishReason
-    LENGTH: GenerateComplete.FinishReason
-    ABORT: GenerateComplete.FinishReason
     OUTPUT_IDS_FIELD_NUMBER: _ClassVar[int]
     FINISH_REASON_FIELD_NUMBER: _ClassVar[int]
     PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
@@ -198,7 +189,7 @@ class GenerateComplete(_message.Message):
     MATCHED_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
     MATCHED_STOP_STR_FIELD_NUMBER: _ClassVar[int]
     output_ids: _containers.RepeatedScalarFieldContainer[int]
-    finish_reason: GenerateComplete.FinishReason
+    finish_reason: str
     prompt_tokens: int
     completion_tokens: int
     cached_tokens: int
@@ -206,7 +197,7 @@ class GenerateComplete(_message.Message):
     all_hidden_states: _containers.RepeatedCompositeFieldContainer[HiddenStates]
     matched_token_id: int
     matched_stop_str: str
-    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., finish_reason: _Optional[_Union[GenerateComplete.FinishReason, str]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., all_logprobs: _Optional[_Iterable[_Union[LogProbs, _Mapping]]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ..., matched_token_id: _Optional[int] = ..., matched_stop_str: _Optional[str] = ...) -> None: ...
+    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., finish_reason: _Optional[str] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., all_logprobs: _Optional[_Iterable[_Union[LogProbs, _Mapping]]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ..., matched_token_id: _Optional[int] = ..., matched_stop_str: _Optional[str] = ...) -> None: ...
 
 class GenerateError(_message.Message):
     __slots__ = ("message", "http_status_code", "details")

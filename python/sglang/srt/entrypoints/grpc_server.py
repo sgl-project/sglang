@@ -496,8 +496,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         meta_info = output.get("meta_info", {})
         finish_reason_data = meta_info.get("finish_reason")
 
-        # Determine finish reason from the type field
-        finish_reason = sglang_scheduler_pb2.GenerateComplete.STOP
+        # Determine finish reason, default is stop
+        finish_reason = "stop"
         if finish_reason_data:
             if isinstance(finish_reason_data, dict):
                 finish_reason_type = finish_reason_data.get("type")
@@ -506,10 +506,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 finish_reason_type = finish_reason_data
 
             if finish_reason_type == "length":
-                finish_reason = sglang_scheduler_pb2.GenerateComplete.LENGTH
+                finish_reason = "length"
             elif finish_reason_type == "abort":
-                finish_reason = sglang_scheduler_pb2.GenerateComplete.ABORT
-            # All other types (stop, eos_token, etc.) default to STOP
+                finish_reason = "abort"
 
         # Extract matched_stop information
         matched_stop_kwargs = {}

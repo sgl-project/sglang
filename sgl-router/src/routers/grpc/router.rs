@@ -19,9 +19,9 @@ use crate::metrics::RouterMetrics;
 use crate::policies::PolicyRegistry;
 use crate::protocols::spec::ChatMessage;
 use crate::protocols::spec::{
-    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, EmbeddingRequest,
-    GenerateRequest, RerankRequest, ResponsesGetParams, ResponsesRequest, StringOrArray, Tool,
-    ToolChoice, Usage,
+    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
+    CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, ResponsesGetParams,
+    ResponsesRequest, StringOrArray, Tool, ToolChoice, Usage,
 };
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
@@ -655,25 +655,23 @@ impl GrpcRouter {
         let mut all_responses = Vec::new();
         while let Some(response) = stream.next().await {
             match response {
-                Ok(gen_response) => {
-                    match gen_response.response {
-                        Some(proto::generate_response::Response::Complete(complete)) => {
-                            all_responses.push(complete);
-                        }
-                        Some(proto::generate_response::Response::Error(err)) => {
-                            error!("Generation failed for one choice: {}", err.message);
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Generation failed: {}", err.message),
-                            )
-                                .into_response();
-                        }
-                        Some(proto::generate_response::Response::Chunk(_)) => {
-                            return fail_str("Unexpected chunk response for non-streaming request")
-                        }
-                        None => return fail_str("Empty response from server"),
+                Ok(gen_response) => match gen_response.response {
+                    Some(proto::generate_response::Response::Complete(complete)) => {
+                        all_responses.push(complete);
                     }
-                }
+                    Some(proto::generate_response::Response::Error(err)) => {
+                        error!("Generation failed for one choice: {}", err.message);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Generation failed: {}", err.message),
+                        )
+                            .into_response();
+                    }
+                    Some(proto::generate_response::Response::Chunk(_)) => {
+                        return fail_str("Unexpected chunk response for non-streaming request")
+                    }
+                    None => return fail_str("Empty response from server"),
+                },
                 Err(e) => return fail_fmt("Failed to get GenerateResponse: ", &e),
             }
         }
@@ -685,7 +683,10 @@ impl GrpcRouter {
         // Process each response into a ChatChoice
         let mut choices = Vec::new();
         for (index, complete) in all_responses.iter().enumerate() {
-            match self.process_single_choice(complete, index, original_request, &mut stop_decoder).await {
+            match self
+                .process_single_choice(complete, index, original_request, &mut stop_decoder)
+                .await
+            {
                 Ok(choice) => choices.push(choice),
                 Err(e) => {
                     error!("Failed to process choice {}: {}", index, e);
@@ -700,7 +701,10 @@ impl GrpcRouter {
 
         // Aggregate usage information from all responses
         let total_prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
-        let total_completion_tokens: u32 = all_responses.iter().map(|r| r.completion_tokens as u32).sum();
+        let total_completion_tokens: u32 = all_responses
+            .iter()
+            .map(|r| r.completion_tokens as u32)
+            .sum();
         let usage = Usage {
             prompt_tokens: total_prompt_tokens,
             completion_tokens: total_completion_tokens,
@@ -735,7 +739,8 @@ impl GrpcRouter {
         stop_decoder: &mut crate::tokenizer::stop::StopSequenceDecoder,
     ) -> Result<ChatChoice, String> {
         // Decode tokens
-        let outputs = stop_decoder.process_tokens(&complete.output_ids)
+        let outputs = stop_decoder
+            .process_tokens(&complete.output_ids)
             .map_err(|e| format!("Failed to process tokens: {}", e))?;
 
         // Accumulate text with early breaks
@@ -763,7 +768,10 @@ impl GrpcRouter {
 
         // Check if reasoning parsing is enabled and separate_reasoning is requested
         if original_request.separate_reasoning {
-            if let Ok(mut parser) = self.reasoning_parser_factory.create(&original_request.model) {
+            if let Ok(mut parser) = self
+                .reasoning_parser_factory
+                .create(&original_request.model)
+            {
                 match parser.detect_and_parse_reasoning(&processed_text) {
                     Ok(result) => {
                         if !result.reasoning_text.is_empty() {
@@ -780,16 +788,20 @@ impl GrpcRouter {
 
         // Step 2: Handle tool call parsing
         let mut tool_calls: Option<Vec<serde_json::Value>> = None;
-        let final_finish_reason = complete.finish_reason;
 
         // Check if tool calls should be processed
-        let tool_choice_enabled = match &original_request.tool_choice {
-            Some(ToolChoice::Value(crate::protocols::spec::ToolChoiceValue::None)) => false,
-            _ => true,
-        };
+        let tool_choice_enabled = !matches!(
+            &original_request.tool_choice,
+            Some(ToolChoice::Value(
+                crate::protocols::spec::ToolChoiceValue::None
+            ))
+        );
 
         if tool_choice_enabled && original_request.tools.is_some() {
-            if let Some(parser) = self.tool_parser_registry.get_parser(&original_request.model) {
+            if let Some(parser) = self
+                .tool_parser_registry
+                .get_parser(&original_request.model)
+            {
                 match parser.parse_complete(&processed_text).await {
                     Ok(parsed_tool_calls) => {
                         if !parsed_tool_calls.is_empty() {
@@ -818,13 +830,8 @@ impl GrpcRouter {
             }
         }
 
-        // Step 3: Map finish reason from proto to OpenAI format and extract matched
-        let finish_reason_str = match proto::generate_complete::FinishReason::try_from(final_finish_reason) {
-            Ok(proto::generate_complete::FinishReason::Stop) => "stop",
-            Ok(proto::generate_complete::FinishReason::Length) => "length",
-            Ok(proto::generate_complete::FinishReason::Abort) => "abort",
-            _ => "stop", // Default fallback
-        };
+        // Step 3: Use finish reason directly from proto (already OpenAI-compatible string)
+        let finish_reason_str = &complete.finish_reason;
 
         // Override finish reason if we have tool calls
         let final_finish_reason_str = if tool_calls.is_some() {
@@ -835,9 +842,9 @@ impl GrpcRouter {
 
         // Extract matched_stop information from proto
         let matched_stop = match &complete.matched_stop {
-            Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => {
-                Some(serde_json::Value::Number(serde_json::Number::from(*token_id)))
-            }
+            Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => Some(
+                serde_json::Value::Number(serde_json::Number::from(*token_id)),
+            ),
             Some(proto::generate_complete::MatchedStop::MatchedStopStr(stop_str)) => {
                 Some(serde_json::Value::String(stop_str.clone()))
             }
@@ -847,8 +854,13 @@ impl GrpcRouter {
         // Step 4: Build ChatCompletionMessage (proper response message type)
         let chat_message = ChatCompletionMessage {
             role: "assistant".to_string(),
-            content: if processed_text.is_empty() { None } else { Some(processed_text) },
-            tool_calls: tool_calls.and_then(|calls| serde_json::from_value(serde_json::Value::Array(calls)).ok()),
+            content: if processed_text.is_empty() {
+                None
+            } else {
+                Some(processed_text)
+            },
+            tool_calls: tool_calls
+                .and_then(|calls| serde_json::from_value(serde_json::Value::Array(calls)).ok()),
             reasoning_content: reasoning_text,
         };
 

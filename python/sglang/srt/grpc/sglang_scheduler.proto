@@ -185,16 +185,8 @@ message GenerateComplete {
   // Final output
   repeated uint32 output_ids = 1;
 
-  // Finish reason
-  enum FinishReason {
-    // The model generated a stop sequence.
-    STOP = 0;
-    // The model reached the maximum generation length.
-    LENGTH = 1;
-    // The request was aborted by the user or system.
-    ABORT = 2;
-  }
-  FinishReason finish_reason = 2;
+  // Finish reason as OpenAI-compatible string ("stop", "length", "abort")
+  string finish_reason = 2;
 
   // Token usage counts
   int32 prompt_tokens = 3;
