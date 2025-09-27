@@ -134,7 +134,7 @@ class GenerateReqInput:
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
 
-    # Label for the request
+    # (Deprecated, please use custom_labels) Label for the request
     label: Optional[str] = None
 
     # Priority for the request
@@ -143,8 +143,8 @@ class GenerateReqInput:
     # Image gen grpc migration
     return_bytes: bool = False
 
-    # For customer metric labels
-    customer_labels: Optional[Dict[str, str]] = None
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
 
     def contains_mm_input(self) -> bool:
         return (

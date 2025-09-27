@@ -25,20 +25,17 @@ async fn test_json_with_xml_style_wrapper() {
 
 #[tokio::test]
 async fn test_json_with_multiple_wrapper_pairs() {
-    // Test with multiple start/end token pairs
     let parser = JsonParser::with_config(TokenConfig {
         start_tokens: vec!["<tool>".to_string(), "<<TOOL>>".to_string()],
         end_tokens: vec!["</tool>".to_string(), "<</TOOL>>".to_string()],
         separator: ", ".to_string(),
     });
 
-    // Test first pair
     let input1 = r#"<tool>{"name": "tool1", "arguments": {}}</tool>"#;
     let result1 = parser.parse_complete(input1).await.unwrap();
     assert_eq!(result1.len(), 1);
     assert_eq!(result1[0].function.name, "tool1");
 
-    // Test second pair
     let input2 = r#"<<TOOL>>{"name": "tool2", "arguments": {}}<</TOOL>>"#;
     let result2 = parser.parse_complete(input2).await.unwrap();
     assert_eq!(result2.len(), 1);
@@ -47,7 +44,6 @@ async fn test_json_with_multiple_wrapper_pairs() {
 
 #[tokio::test]
 async fn test_json_with_only_start_token() {
-    // Test when only start token is provided (no end token)
     let parser = JsonParser::with_config(TokenConfig {
         start_tokens: vec![">>>FUNCTION:".to_string()],
         end_tokens: vec!["".to_string()], // Empty end token
@@ -232,7 +228,6 @@ async fn test_json_incomplete_wrapper_tokens() {
 
 #[tokio::test]
 async fn test_json_empty_wrapper_tokens() {
-    // Test with empty wrapper tokens (should behave like default)
     let parser = JsonParser::with_config(TokenConfig {
         start_tokens: vec![],
         end_tokens: vec![],

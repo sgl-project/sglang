@@ -102,7 +102,6 @@ impl PythonicParser {
                             if bracket_count == 0 {
                                 // Found the matching bracket
                                 let extracted: String = chars[start_idx..=i].iter().collect();
-                                // Verify this actually contains a function call
                                 if extracted.contains('(') && extracted.contains(')') {
                                     return Some(extracted);
                                 }

@@ -35,7 +35,7 @@ suites = {
         # TestFile("models/test_grok_models.py", 60),  # Disabled due to illegal memory access
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
-        TestFile("models/test_vlm_models.py", 437),
+        TestFile("models/test_vlm_models.py", 741),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("openai_server/basic/test_protocol.py", 10),
         TestFile("openai_server/basic/test_serving_chat.py", 10),
@@ -93,7 +93,7 @@ suites = {
         TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 234),
-        TestFile("test_original_logprobs.py", 200),
+        TestFile("test_original_logprobs.py", 41),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_priority_scheduling.py", 100),
@@ -164,9 +164,6 @@ suites = {
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 371),
-    ],
-    "nightly": [
-        TestFile("test_nightly_gsm8k_eval.py"),
     ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
@@ -244,7 +241,7 @@ suite_amd = {
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_srt_endpoint.py", 130),
-        TestFile("test_torch_compile.py", 76),
+        TestFile("test_torch_compile.py", 169),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_triton_attention_backend.py", 150),

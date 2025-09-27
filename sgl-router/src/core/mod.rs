@@ -25,5 +25,5 @@ pub use worker::{
     Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
-pub use worker_manager::{DpInfo, ServerInfo, WorkerManager};
+pub use worker_manager::{DpInfo, LoadMonitor, ServerInfo, WorkerManager};
 pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};

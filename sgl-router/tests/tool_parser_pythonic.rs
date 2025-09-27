@@ -180,7 +180,6 @@ These functions will provide the information you need."#;
 async fn test_pythonic_nested_brackets_in_lists() {
     let parser = PythonicParser::new();
 
-    // Test nested brackets within list arguments
     let input = r#"[process_matrix(data=[[1, 2], [3, 4]], labels=["row[0]", "row[1]"])]"#;
 
     let result = parser.parse_complete(input).await.unwrap();
@@ -196,7 +195,6 @@ async fn test_pythonic_nested_brackets_in_lists() {
 async fn test_pythonic_nested_brackets_in_dicts() {
     let parser = PythonicParser::new();
 
-    // Test nested brackets within dictionary arguments
     let input =
         r#"[analyze(config={"patterns": ["[a-z]+", "[0-9]+"], "nested": {"list": [1, [2, 3]]}})]"#;
 
@@ -213,7 +211,6 @@ async fn test_pythonic_nested_brackets_in_dicts() {
 async fn test_pythonic_mixed_quotes() {
     let parser = PythonicParser::new();
 
-    // Test mixed quote types in arguments
     let input = r#"[format_text(single='Hello', double="World", mixed="It's \"quoted\"")]"#;
 
     let result = parser.parse_complete(input).await.unwrap();
@@ -230,7 +227,6 @@ async fn test_pythonic_mixed_quotes() {
 async fn test_pythonic_complex_nesting() {
     let parser = PythonicParser::new();
 
-    // Test complex nested structures
     let input = r#"[transform(
         matrix=[[1, [2, 3]], [4, [5, [6, 7]]]],
         operations=[{"type": "scale", "factor": [2, 3]}, {"type": "rotate", "angle": 90}],
@@ -250,7 +246,6 @@ async fn test_pythonic_complex_nesting() {
 
 #[tokio::test]
 async fn test_parse_streaming_no_brackets() {
-    // Test parsing text with no brackets (no tool calls)
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -268,7 +263,6 @@ async fn test_parse_streaming_no_brackets() {
 
 #[tokio::test]
 async fn test_parse_streaming_complete_tool_call() {
-    // Test parsing a complete tool call
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -289,7 +283,6 @@ async fn test_parse_streaming_complete_tool_call() {
 
 #[tokio::test]
 async fn test_parse_streaming_text_before_tool_call() {
-    // Test parsing text that appears before a tool call
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -308,7 +301,6 @@ async fn test_parse_streaming_text_before_tool_call() {
 
 #[tokio::test]
 async fn test_parse_streaming_partial_tool_call() {
-    // Test parsing a partial tool call that spans multiple chunks
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -340,7 +332,6 @@ async fn test_parse_streaming_partial_tool_call() {
 
 #[tokio::test]
 async fn test_parse_streaming_bracket_without_text_before() {
-    // Test parsing a tool call that starts at the beginning of the text
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -359,7 +350,6 @@ async fn test_parse_streaming_bracket_without_text_before() {
 
 #[tokio::test]
 async fn test_parse_streaming_text_after_tool_call() {
-    // Test parsing text that appears after a tool call
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -379,7 +369,6 @@ async fn test_parse_streaming_text_after_tool_call() {
 
 #[tokio::test]
 async fn test_parse_streaming_multiple_tool_calls() {
-    // Test parsing multiple tool calls in sequence
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -401,7 +390,6 @@ async fn test_parse_streaming_multiple_tool_calls() {
 
 #[tokio::test]
 async fn test_parse_streaming_opening_bracket_only() {
-    // Test parsing text with only an opening bracket but no closing bracket
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -418,7 +406,6 @@ async fn test_parse_streaming_opening_bracket_only() {
 
 #[tokio::test]
 async fn test_parse_streaming_nested_brackets() {
-    // Test parsing tool calls with nested brackets in arguments
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -439,7 +426,6 @@ async fn test_parse_streaming_nested_brackets() {
 
 #[tokio::test]
 async fn test_parse_streaming_nested_brackets_dict() {
-    // Test parsing tool calls with nested dictionaries and lists
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -460,7 +446,6 @@ async fn test_parse_streaming_nested_brackets_dict() {
 
 #[tokio::test]
 async fn test_parse_streaming_multiple_tools_with_nested_brackets() {
-    // Test parsing multiple tool calls with nested brackets
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -480,7 +465,6 @@ async fn test_parse_streaming_multiple_tools_with_nested_brackets() {
 
 #[tokio::test]
 async fn test_parse_streaming_partial_nested_brackets() {
-    // Test parsing partial tool calls with nested brackets across chunks
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -514,7 +498,6 @@ async fn test_parse_streaming_partial_nested_brackets() {
 
 #[tokio::test]
 async fn test_parse_streaming_with_python_start_and_end_token() {
-    // Test parsing a message that starts with <|python_start|> and <|python_end|> across chunks
     let parser = PythonicParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -544,7 +527,6 @@ async fn test_parse_streaming_with_python_start_and_end_token() {
 
 #[tokio::test]
 async fn test_detect_and_parse_with_python_start_and_end_token() {
-    // Test parsing a message that starts with <|python_start|> and contains a valid tool call
     let parser = PythonicParser::new();
 
     let text = "User wants to get the weather in Mars. <|python_start|>[get_weather(location='Mars', unit='celsius')]<|python_end|> In this way we will get the weather in Mars.";

@@ -235,8 +235,8 @@ class CompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
-    # For customer metric labels
-    customer_labels: Optional[Dict[str, str]] = None
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
 
     @field_validator("max_tokens")
     @classmethod
