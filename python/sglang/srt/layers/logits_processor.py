@@ -624,10 +624,13 @@ class LogitsProcessor(nn.Module):
 
             # Get the logprob of top-k tokens
             if logits_metadata.extend_return_top_logprob:
+                top_k_nums = logits_metadata.top_logprobs_nums[chunk_slice]
+                pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice]
                 split_len_topk = self.get_top_logprobs_chunk(
                     chunk_input_logprobs,
                     logits_metadata,
-                    chunk_slice,
+                    top_k_nums,
+                    pruned_lens,
                     input_top_logprobs_val,
                     input_top_logprobs_idx,
                     split_len_topk,
@@ -635,10 +638,13 @@ class LogitsProcessor(nn.Module):
 
             # Get the logprob of given token id
             if logits_metadata.extend_token_ids_logprob:
+                token_ids_logprobs = logits_metadata.token_ids_logprobs[chunk_slice]
+                pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice]
                 split_len_token_ids = self.get_token_ids_logprobs_chunk(
                     chunk_input_logprobs,
                     logits_metadata,
-                    chunk_slice,
+                    token_ids_logprobs,
+                    pruned_lens,
                     input_token_ids_logprobs_val,
                     input_token_ids_logprobs_idx,
                     split_len_token_ids,
@@ -809,17 +815,19 @@ class LogitsProcessor(nn.Module):
     def get_top_logprobs_chunk(
         logprobs: torch.Tensor,
         logits_metadata: LogitsMetadata,
-        chunk_slice: slice,
+        top_k_nums: List[int],
+        pruned_lens: List[int],
         input_top_logprobs_val: List,
         input_top_logprobs_idx: List,
         split_pruned_len: int,
-    ):
+    ) -> int:
         """Get top-k logprobs for each sequence in the chunk.
 
         Args:
             logprobs: Log probabilities tensor of shape [seq_len, vocab_size]
             logits_metadata: Metadata containing top-k and pruned length info
-            chunk_slice: Slice of sequences to process
+            top_k_nums: List of top-k numbers for each sequence
+            pruned_lens: List of pruned lengths for each sequence
             input_top_logprobs_val: List to store top-k logprob values
             input_top_logprobs_idx: List to store top-k token indices
             split_pruned_len: Length of pruned tokens from previous chunk
@@ -838,9 +846,6 @@ class LogitsProcessor(nn.Module):
 
         pt = 0
         next_split_pruned_len = 0
-        top_k_nums = logits_metadata.top_logprobs_nums[chunk_slice]
-        pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice]
-
         for n, (k, pruned_len) in enumerate(zip(top_k_nums, pruned_lens)):
             if n == 0:
                 # For the first sequence, adjust the pruned length
@@ -907,7 +912,8 @@ class LogitsProcessor(nn.Module):
     def get_token_ids_logprobs_chunk(
         logprobs: torch.Tensor,
         logits_metadata: LogitsMetadata,
-        chunk_slice: slice,
+        token_ids_logprobs: List[int],
+        pruned_lens: List[int],
         input_token_ids_logprobs_val: List,
         input_token_ids_logprobs_idx: List,
         split_pruned_len: int = 0,
@@ -917,7 +923,8 @@ class LogitsProcessor(nn.Module):
         Args:
             logprobs: Log probabilities tensor of shape [seq_len, vocab_size]
             logits_metadata: Metadata containing token IDs and pruned length info
-            chunk_slice: Slice of sequences to process
+            token_ids_logprobs: List of token IDs for each sequence
+            pruned_lens: List of pruned lengths for each sequence
             input_token_ids_logprobs_val: List to store token logprob values
             input_token_ids_logprobs_idx: List to store token indices
             split_pruned_len: Length of pruned tokens from previous chunk
@@ -932,9 +939,6 @@ class LogitsProcessor(nn.Module):
 
         pt = 0
         next_split_pruned_len = 0
-        token_ids_logprobs = logits_metadata.token_ids_logprobs[chunk_slice]
-        pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice]
-
         for n, (token_ids, pruned_len) in enumerate(
             zip(
                 token_ids_logprobs,
