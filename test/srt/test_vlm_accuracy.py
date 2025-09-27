@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
+from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.managers.mm_utils import embed_mm_inputs, init_embedding_cache
@@ -146,6 +147,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
     def get_sglang_model(self):
         self.model_runner = ModelRunner(
             model_config=ModelConfig(self.model_path, model_override_args="{}"),
+            device_config=DeviceConfig("cuda"),
             mem_fraction_static=0.8,
             gpu_id=0,
             tp_rank=0,
