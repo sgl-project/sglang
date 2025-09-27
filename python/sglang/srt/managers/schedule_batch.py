@@ -114,6 +114,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deterministic_inference",
     "nsa_prefill",
     "nsa_decode",
+    "multi_item_scoring_delimiter",
 ]
 
 # Put some global args for easy access
