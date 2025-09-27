@@ -8,6 +8,7 @@ use axum::{
     extract::Request,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use tracing::{debug, error, info, warn};
 
@@ -18,8 +19,9 @@ use crate::metrics::RouterMetrics;
 use crate::policies::PolicyRegistry;
 use crate::protocols::spec::ChatMessage;
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest, StringOrArray, Tool, ToolChoice,
+    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, EmbeddingRequest,
+    GenerateRequest, RerankRequest, ResponsesGetParams, ResponsesRequest, StringOrArray, Tool,
+    ToolChoice, Usage,
 };
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
@@ -30,6 +32,7 @@ use crate::tokenizer::traits::Tokenizer;
 use crate::tokenizer::HuggingFaceTokenizer;
 use crate::tool_parser::ParserRegistry;
 use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -697,8 +700,132 @@ impl GrpcRouter {
             final_text.push_str(&t);
         }
 
-        // TODO: Create proper OpenAI-compatible response
-        (StatusCode::OK, format!("Final text: {}", final_text)).into_response()
+        // Step 1: Handle reasoning content parsing
+        let mut reasoning_text: Option<String> = None;
+        let mut processed_text = final_text;
+
+        // Check if reasoning parsing is enabled and separate_reasoning is requested
+        if original_request.separate_reasoning {
+            if let Ok(mut parser) = self.reasoning_parser_factory.create(&original_request.model) {
+                match parser.detect_and_parse_reasoning(&processed_text) {
+                    Ok(result) => {
+                        if !result.reasoning_text.is_empty() {
+                            reasoning_text = Some(result.reasoning_text);
+                        }
+                        processed_text = result.normal_text;
+                    }
+                    Err(e) => {
+                        error!("Reasoning parsing error: {}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to parse reasoning content",
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+
+        // Step 2: Handle tool call parsing
+        let mut tool_calls: Option<Vec<serde_json::Value>> = None;
+        let final_finish_reason = complete.finish_reason;
+
+        // Check if tool calls should be processed
+        let tool_choice_enabled = match &original_request.tool_choice {
+            Some(ToolChoice::Value(crate::protocols::spec::ToolChoiceValue::None)) => false,
+            _ => true,
+        };
+
+        if tool_choice_enabled && original_request.tools.is_some()
+        {
+            if let Some(parser) = self.tool_parser_registry.get_parser(&original_request.model) {
+                match parser.parse_complete(&processed_text).await {
+                    Ok(parsed_tool_calls) => {
+                        if !parsed_tool_calls.is_empty() {
+                            // Convert to JSON format expected by OpenAI
+                            let tool_calls_json: Result<Vec<_>, _> = parsed_tool_calls
+                                .into_iter()
+                                .map(|tc| serde_json::to_value(&tc))
+                                .collect();
+
+                            match tool_calls_json {
+                                Ok(calls) => {
+                                    tool_calls = Some(calls);
+                                    processed_text = String::new();
+                                }
+                                Err(e) => {
+                                    error!("Failed to serialize tool calls: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Tool call parsing error: {}", e);
+                        // Continue without tool calls rather than failing
+                    }
+                }
+            }
+        }
+
+        // Step 3: Map finish reason from proto to OpenAI format
+        let finish_reason_str = match proto::generate_complete::FinishReason::try_from(final_finish_reason) {
+            Ok(proto::generate_complete::FinishReason::Stop) => "stop",
+            Ok(proto::generate_complete::FinishReason::Length) => "length",
+            Ok(proto::generate_complete::FinishReason::EosToken) => "stop",
+            Ok(proto::generate_complete::FinishReason::StopStr) => "stop",
+            Ok(proto::generate_complete::FinishReason::Abort) => "abort",
+            _ => "stop", // Default fallback
+        };
+
+        // Override finish reason if we have tool calls
+        let final_finish_reason_str = if tool_calls.is_some() {
+            "tool_calls"
+        } else {
+            finish_reason_str
+        };
+
+        // Step 4: Build ChatCompletionMessage (proper response message type)
+        let chat_message = ChatCompletionMessage {
+            role: "assistant".to_string(),
+            content: if processed_text.is_empty() { None } else { Some(processed_text) },
+            tool_calls: tool_calls.and_then(|calls| serde_json::from_value(serde_json::Value::Array(calls)).ok()),
+            reasoning_content: reasoning_text,
+        };
+
+        // Step 5: Build Usage information
+        let usage = Usage {
+            prompt_tokens: complete.prompt_tokens as u32,
+            completion_tokens: complete.completion_tokens as u32,
+            total_tokens: (complete.prompt_tokens + complete.completion_tokens) as u32,
+            completion_tokens_details: None,
+        };
+
+        // Step 6: Build ChatChoice
+        let choice = ChatChoice {
+            index: 0,
+            message: chat_message,
+            logprobs: None,
+            finish_reason: Some(final_finish_reason_str.to_string()),
+            matched_stop: None,
+            hidden_states: None,
+        };
+
+        // Step 7: Build ChatCompletionResponse
+        let response = ChatCompletionResponse {
+            id: format!("chatcmpl-{}", Uuid::new_v4()),
+            object: "chat.completion".to_string(),
+            created: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            model: original_request.model.clone(),
+            choices: vec![choice],
+            usage: Some(usage),
+            system_fingerprint: None,
+        };
+
+        // Step 8: Serialize and return JSON response
+        Json(response).into_response()
     }
 }
 
