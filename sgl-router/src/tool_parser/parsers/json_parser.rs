@@ -88,7 +88,7 @@ impl JsonParser {
         content.trim()
     }
 
-    /// Try to extract a JSON object or array from text that may contain other content
+    /// Try to extract a first valid JSON object or array from text that may contain other content
     /// Returns (json_string, normal_text) where normal_text is text before and after the JSON
     fn extract_json_from_text(&self, text: &str) -> Option<(String, String)> {
         let mut in_string = false;
@@ -130,9 +130,18 @@ impl JsonParser {
                     if stack.is_empty() {
                         let s = start.unwrap();
                         let e = i + ch.len_utf8();
-                        let json = text[s..e].to_string();
-                        let normal = format!("{}{}", &text[..s], &text[e..]);
-                        return Some((json, normal));
+                        let potential_json = &text[s..e];
+
+                        // Validate that this is actually valid JSON before returning
+                        if serde_json::from_str::<Value>(potential_json).is_ok() {
+                            let json = potential_json.to_string();
+                            let normal = format!("{}{}", &text[..s], &text[e..]);
+                            return Some((json, normal));
+                        } else {
+                            // Not valid JSON, reset and continue looking
+                            start = None;
+                            continue;
+                        }
                     }
                 }
                 _ => {}
