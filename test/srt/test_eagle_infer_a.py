@@ -70,6 +70,7 @@ class TestEAGLEEngine(CustomTestCase):
                     self._test_eos_token(engine)
                     self._test_acc_length(engine)
                 finally:
+                    engine.flush_cache()  # check engine alive
                     engine.shutdown()
                 print("=" * 100)
 

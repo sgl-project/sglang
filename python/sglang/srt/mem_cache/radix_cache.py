@@ -386,6 +386,9 @@ class RadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_token_len]
 
         old_prefix_len = len(req.prefix_indices)
+        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+            # prefix_indices attached partial part (for page_size > 1) and one unmatched token (for EAGLE)
+            old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
