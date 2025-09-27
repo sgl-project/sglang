@@ -302,6 +302,7 @@ class EAGLEDraftCudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
+            self.positions.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
