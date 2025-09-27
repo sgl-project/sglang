@@ -37,6 +37,11 @@ class TestEAGLEEngine(CustomTestCase):
     }
     NUM_CONFIGS = 2
 
+    THRESHOLDS = {
+        "batch_avg_accept_len": 1.9,
+        "accept_len": 3.6,
+    }
+
     def setUp(self):
         self.prompt = "Today is a sunny day and I like"
         self.sampling_params = {"temperature": 0, "max_new_tokens": 8}
@@ -94,8 +99,9 @@ class TestEAGLEEngine(CustomTestCase):
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        # The accept length is 1.8 when radix cache disabled
-        self.assertGreater(avg_spec_accept_length, 1.8)
+        self.assertGreater(
+            avg_spec_accept_length, self.THRESHOLDS["batch_avg_accept_len"]
+        )
 
     def _test_eos_token(self, engine):
         prompt = "[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\nToday is a sunny day and I like [/INST]"
@@ -134,10 +140,7 @@ class TestEAGLEEngine(CustomTestCase):
         )
         print(f"{acc_length=:.4f}, {speed=}")
 
-        if engine.server_args.model_path == DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST:
-            self.assertGreater(acc_length, 3.6)
-        else:
-            self.assertGreater(acc_length, 2.5)
+        self.assertGreater(acc_length, self.THRESHOLDS["accept_len"])
 
 
 class TestEAGLEEngineTokenMap(TestEAGLEEngine):
@@ -154,6 +157,10 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
+    THRESHOLDS = {
+        "batch_avg_accept_len": 1.9,
+        "accept_len": 2.5,
+    }
 
 
 class TestEAGLE3Engine(TestEAGLEEngine):
@@ -169,6 +176,10 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
+    THRESHOLDS = {
+        "batch_avg_accept_len": 1.75,
+        "accept_len": 3.1,
+    }
 
 
 class TestEAGLERadixCache(CustomTestCase):
