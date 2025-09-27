@@ -374,8 +374,8 @@ def get_processor(
         **kwargs,
     )
 
-    # fix: for Qwen2-VL model, inject default 'size' if not provided.
-    if config.model_type in {"qwen2_vl"}:
+    # fix: for Qwen2-VL and Sarashina2Vision models, inject default 'size' if not provided.
+    if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 

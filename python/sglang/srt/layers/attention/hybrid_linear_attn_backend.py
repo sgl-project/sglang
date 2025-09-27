@@ -13,9 +13,6 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.layers.attention.mamba.causal_conv1d import (
-    causal_conv1d_fn as causal_conv1d_fn_sgl,
-)
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -26,9 +23,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.qwen3_next import Qwen3HybridLinearDecoderLayer, fused_gdn_gating
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cuda, is_npu
 
-if is_npu():
+if is_cuda():
+    from sglang.srt.layers.attention.mamba.causal_conv1d import (
+        causal_conv1d_fn as causal_conv1d_fn_cuda,
+    )
+
+    causal_conv1d_fn = causal_conv1d_fn_cuda
+elif is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update_npu,
@@ -350,7 +353,7 @@ class MambaAttnBackend(AttentionBackend):
                 mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
             )
         else:
-            mixed_qkv = causal_conv1d_fn_sgl(
+            mixed_qkv = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 bias,
@@ -359,6 +362,7 @@ class MambaAttnBackend(AttentionBackend):
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
 
         key_split_dim = key_dim // attn_tp_size
@@ -583,36 +587,15 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         # Compute common indices once to avoid duplication
         last_steps_all = (accepted_length - 1).to(torch.int64)
-        valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
-        last_steps = last_steps_all[valid_mask].to(torch.int64)
+        valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
+        last_steps = last_steps_all[valid_mask].to(torch.int64)  # [N]
 
-        if valid_state_indices.numel() > 0:
-            chunk = 256
-            num_valid = valid_state_indices.numel()
+        # scatter into ssm_states at the chosen cache lines
+        ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
+            :, valid_state_indices, last_steps
+        ].to(ssm_states.dtype, copy=False)
 
-            # SSM state updates
-            for i in range(0, num_valid, chunk):
-                idx = valid_state_indices[i : i + chunk]
-                steps = last_steps[i : i + chunk]
-                # per (cache line, step)
-                for j in range(idx.numel()):
-                    ci = idx[j].item()
-                    st = steps[j].item()
-                    ssm_states[:, ci, :].copy_(
-                        intermediate_state_cache[:, ci, st].to(
-                            ssm_states.dtype, copy=False
-                        )
-                    )
-
-            # Conv window updates
-            for i in range(0, num_valid, chunk):
-                idx = valid_state_indices[i : i + chunk]
-                steps = last_steps[i : i + chunk]
-                for j in range(idx.numel()):
-                    ci = idx[j].item()
-                    st = steps[j].item()
-                    conv_states[:, ci, :, :].copy_(
-                        intermediate_conv_window_cache[:, ci, st].to(
-                            conv_states.dtype, copy=False
-                        )
-                    )
+        # Scatter into conv_states at the chosen cache lines
+        conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
+            :, valid_state_indices, last_steps
+        ].to(conv_states.dtype, copy=False)
