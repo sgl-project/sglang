@@ -53,6 +53,7 @@ class FalconH1MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        layer_id: int,
         mlp_multipliers: List[float],
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -80,7 +81,8 @@ class FalconH1MLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
-        
+        self.layer_id = layer_id
+
         self.intermediate_size = intermediate_size
         self.tp_size = get_tensor_model_parallel_world_size()
 
@@ -220,6 +222,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            layer_id=layer_id,
             mlp_multipliers=config.mlp_multipliers,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),

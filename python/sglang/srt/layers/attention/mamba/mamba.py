@@ -231,7 +231,7 @@ class MambaMixer2(torch.nn.Module):
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
         self.tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_tensor_model_parallel_rank()
 
         assert (num_heads % self.tp_size == 0
                 ), "Tensor parallel world size must divide num heads."
@@ -263,60 +263,34 @@ class MambaMixer2(torch.nn.Module):
 
         self.groups_ssm_state_size = self.n_groups * self.ssm_state_size
         self.conv_dim = intermediate_size + 2 * self.groups_ssm_state_size
+        
+        self.conv1d = MergedColumnParallelLinear(
+            input_size=conv_kernel_size,
+            output_sizes=[
+                intermediate_size,
+                self.groups_ssm_state_size,
+                self.groups_ssm_state_size,
+            ],
+            bias=use_conv_bias,
+            quant_config=None,
+            prefix=f"{prefix}.conv1d",
+        )
 
-        if n_groups % self.tp_size == 0:
-            self.conv1d = MergedColumnParallelLinear(
-                input_size=conv_kernel_size,
-                output_sizes=[
-                    intermediate_size,
-                    self.groups_ssm_state_size,
-                    self.groups_ssm_state_size,
-                ],
-                bias=use_conv_bias,
-                quant_config=None,
-                prefix=f"{prefix}.conv1d",
-            )
-
-            self.in_proj = MergedColumnParallelLinear(
-                input_size=hidden_size,
-                output_sizes=[
-                    intermediate_size,
-                    intermediate_size,
-                    self.groups_ssm_state_size,
-                    self.groups_ssm_state_size,
-                    self.num_heads,
-                ],
-                bias=use_bias,
-                prefix=f"{prefix}.in_proj",
-            )
-        else:
+        self.in_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[
+                intermediate_size,
+                intermediate_size,
+                self.groups_ssm_state_size,
+                self.groups_ssm_state_size,
+                self.num_heads,
+            ],
+            bias=use_bias,
+            prefix=f"{prefix}.in_proj",
+        )
+        if n_groups % self.tp_size != 0:
             # This is the n_groups == 1 case,
             # where we need to duplicate groups if TP>1.
-
-            self.conv1d = MergedColumnParallelLinear(
-                input_size=conv_kernel_size,
-                output_sizes=[
-                    intermediate_size,
-                    self.groups_ssm_state_size,
-                    self.groups_ssm_state_size,
-                ],
-                bias=use_conv_bias,
-                quant_config=None,
-                prefix=f"{prefix}.conv1d",
-            )
-
-            self.in_proj = MergedColumnParallelLinear(
-                input_size=hidden_size,
-                output_sizes=[
-                    intermediate_size,
-                    intermediate_size,
-                    self.groups_ssm_state_size,
-                    self.groups_ssm_state_size,
-                    self.num_heads,
-                ],
-                bias=use_bias,
-                prefix=f"{prefix}.in_proj",
-            )
 
             # - because in_proj is a concatenation of 3 weights, we
             #   need to interleave them before sharding
@@ -349,7 +323,7 @@ class MambaMixer2(torch.nn.Module):
                             group_shard_settings,
                         ],
                         self.tp_size,
-                        tp_rank,
+                        self.tp_rank,
                     )
                 },
             )
@@ -366,7 +340,7 @@ class MambaMixer2(torch.nn.Module):
                             group_shard_settings,
                         ],
                         self.tp_size,
-                        tp_rank,
+                        self.tp_rank,
                     )
                 },
             )
@@ -387,7 +361,7 @@ class MambaMixer2(torch.nn.Module):
                                 head_settings,  # for dt
                             ],
                             self.tp_size,
-                            tp_rank,
+                            self.tp_rank,
                         )
                     },
                 )
@@ -423,6 +397,7 @@ class MambaMixer2(torch.nn.Module):
             input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
+            reduce_results = False,
         )
 
         self.norm = Mixer2RMSNormGated(intermediate_size,
@@ -463,6 +438,9 @@ class MambaMixer2(torch.nn.Module):
             self.layer_id
         )
 
+        assert ssm_state.size(1) == self.ssm_state_size, \
+            f"dstate must be {self.ssm_state_size}, got {ssm_state.size(1)}"
+
         # conv_state = conv_states[forward_batch.req_pool_indices].transpose(-1, -2)
         # ssm_state = ssm_states[forward_batch.req_pool_indices]
         query_start_loc = attn_metadata.query_start_loc
@@ -490,7 +468,6 @@ class MambaMixer2(torch.nn.Module):
             ],
             dim=-1,
         )
-
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
                                                self.conv1d.weight.size(2))
 
@@ -615,13 +592,6 @@ class MambaMixer2(torch.nn.Module):
             # - mamba_cache_params.ssm_state's slots will be selected
             #   using state_indices_tensor_d
             # NOTE: final output is an in-place update of out tensor
-            # print(hidden_states.shape, hidden_states_B_C.shape, ssm_state.shape)
-            # tp 1:
-            # torch.Size([4, 48, 64]) torch.Size([129, 256, 64, 48])
-
-            # tp 2:
-            # torch.Size([4, 24, 64]) torch.Size([129, 128, 64, 48]) 
-            # exit(0)
             selective_state_update(
                 ssm_state.permute(0, 3, 2, 1),
                 hidden_states,
