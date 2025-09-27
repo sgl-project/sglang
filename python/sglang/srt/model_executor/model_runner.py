@@ -345,8 +345,6 @@ class ModelRunner:
                 self.is_hybrid = self.model_config.is_hybrid = True
 
         if self.is_hybrid_gdn:
-            logger.warning("Hybrid GDN model detected, disable radix cache")
-            self.server_args.disable_radix_cache = True
             self.server_args.attention_backend = "hybrid_linear_attn"
             if self.server_args.max_mamba_cache_size is None:
                 if self.server_args.max_running_requests is not None:
@@ -1423,7 +1421,8 @@ class ModelRunner:
                 4096,
             )
         if self.is_hybrid_gdn:
-            max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size)
+            # for mamba cache radix, it need be divided by 4 (magic number now). (yizhang2077)
+            max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size // 4)
 
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             if self.is_draft_worker:
@@ -1513,6 +1512,7 @@ class ModelRunner:
                 ) = config.hybrid_gdn_params
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
+                    mamba_size=self.server_args.max_mamba_cache_size,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,

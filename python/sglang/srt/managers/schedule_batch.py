@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -502,6 +503,7 @@ class Req:
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
+        self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
 
         # Check finish
         self.tokenizer = None
@@ -696,6 +698,11 @@ class Req:
             ) = tree_cache.match_prefix(
                 key=RadixKey(
                     token_ids=self.adjust_max_prefix_ids(), extra_key=self.extra_key
+                ),
+                **(
+                    {"req": self, "cow_mamba": True}
+                    if isinstance(tree_cache, MambaRadixCache)
+                    else {}
                 ),
             )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
@@ -1013,6 +1020,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def alloc_req_slots(self, num_reqs: int, reqs: Optional[List[Req]] = None):
         if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
+            if mamba_available_size < num_reqs:
+                if self.tree_cache is not None and isinstance(
+                    self.tree_cache, MambaRadixCache
+                ):
+                    mamba_num = max(0, num_reqs - mamba_available_size)
+                    self.tree_cache.evict_mamba(mamba_num)
             req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
         else:
             req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
