@@ -321,14 +321,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             logger.info(f"Sending health check request to request manager...")
 
             # Submit and wait for response
-            output_queue = await self.request_manager.generate_request(
+            output_generator = self.request_manager.generate_request(
                 health_request, request_id=rid
             )
 
             try:
-                # Wait for response with configurable timeout
+                # Get first response with timeout
                 response = await asyncio.wait_for(
-                    output_queue.get(), timeout=HEALTH_CHECK_TIMEOUT
+                    output_generator.__anext__(), timeout=HEALTH_CHECK_TIMEOUT
                 )
 
                 # Clean up
