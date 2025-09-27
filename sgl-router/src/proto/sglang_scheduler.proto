@@ -38,7 +38,7 @@ message SamplingParams {
 
   optional int32 max_new_tokens = 8;
   repeated string stop = 9;
-  repeated int32 stop_token_ids = 10;
+  repeated uint32 stop_token_ids = 10;
   bool skip_special_tokens = 11;
   bool spaces_between_special_tokens = 12;
 
@@ -98,7 +98,7 @@ message GenerateRequest {
   bool return_logprob = 5;
   int32 logprob_start_len = 6;
   int32 top_logprobs_num = 7;
-  repeated int32 token_ids_logprob = 8;
+  repeated uint32 token_ids_logprob = 8;
   bool return_hidden_states = 9;
 
   // For disaggregated serving
@@ -129,7 +129,7 @@ message GenerateRequest {
 
 message TokenizedInput {
   string original_text = 1;  // For reference
-  repeated int32 input_ids = 2;
+  repeated uint32 input_ids = 2;
 }
 
 message MultimodalInputs {
@@ -167,7 +167,7 @@ message GenerateResponse {
 
 message GenerateStreamChunk {
   // Generated tokens (incremental chunk)
-  repeated int32 token_ids = 1;
+  repeated uint32 token_ids = 1;
 
   // Cumulative counts
   int32 prompt_tokens = 2;
@@ -183,22 +183,10 @@ message GenerateStreamChunk {
 
 message GenerateComplete {
   // Final output
-  repeated int32 output_ids = 1;
+  repeated uint32 output_ids = 1;
 
-  // Finish reason
-  enum FinishReason {
-    // The model generated a stop sequence.
-    STOP = 0;
-    // The model reached the maximum generation length.
-    LENGTH = 1;
-    // The model generated an end-of-sequence (EOS) token.
-    EOS_TOKEN = 2;
-    // The model generated a user-provided stop string.
-    STOP_STR = 3;
-    // The request was aborted by the user or system.
-    ABORT = 4;
-  }
-  FinishReason finish_reason = 2;
+  // Finish reason as OpenAI-compatible string ("stop", "length", "abort")
+  string finish_reason = 2;
 
   // Token usage counts
   int32 prompt_tokens = 3;
@@ -210,6 +198,12 @@ message GenerateComplete {
 
   // All hidden states if requested
   repeated HiddenStates all_hidden_states = 7;
+
+  // Matched stop information (for stop sequences)
+  oneof matched_stop {
+    uint32 matched_token_id = 8;
+    string matched_stop_str = 9;
+  }
 }
 
 message GenerateError {

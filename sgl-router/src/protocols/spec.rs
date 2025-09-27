@@ -313,7 +313,7 @@ pub struct ChatCompletionRequest {
 
     /// Specific token IDs to use as stop conditions
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
     #[serde(default)]
@@ -423,10 +423,25 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: Option<String>,
 }
 
+/// Response message structure for ChatCompletionResponse (different from request ChatMessage)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatCompletionMessage {
+    pub role: String, // Always "assistant" for responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Reasoning content for O1-style models (SGLang extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    // Note: function_call is deprecated and not included
+    // Note: refusal, annotations, audio are not added yet
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatChoice {
     pub index: u32,
-    pub message: ChatMessage,
+    pub message: ChatCompletionMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>, // "stop", "length", "tool_calls", "content_filter", "function_call"
@@ -564,7 +579,7 @@ pub struct CompletionRequest {
 
     /// Specific token IDs to use as stop conditions
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
     #[serde(default)]
@@ -1864,7 +1879,7 @@ pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_stop_trim: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

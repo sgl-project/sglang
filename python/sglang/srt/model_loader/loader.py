@@ -54,6 +54,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    trigger_transferring_weights_request,
+)
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     post_load_weights,
@@ -76,9 +79,6 @@ from sglang.srt.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
-)
-from sglang.srt.remote_instance_weight_loader_utils import (
-    trigger_transferring_weights_request,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -1420,7 +1420,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             f"load format {load_config.load_format}"
         )
 
-        model_weights = f"instance://{model_config.remote_instance_weight_loader_seed_instance_ip}:{model_config.remote_instance_weight_loader_send_weights_group_ports[model_config.tp_rank]}"
+        model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
 
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
@@ -1442,11 +1442,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
     def load_model_from_remote_instance(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
+        load_config = self.load_config
         instance_ip = socket.gethostbyname(socket.gethostname())
         start_build_group_tic = time.time()
         client.build_group(
             gpu_id=device_config.gpu_id,
-            tp_rank=model_config.tp_rank,
+            tp_rank=load_config.tp_rank,
             instance_ip=instance_ip,
         )
         torch.cuda.synchronize()
@@ -1455,13 +1456,13 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             f"finish building group for remote instance, time used: {(end_build_group_tic - start_build_group_tic):.4f}s"
         )
 
-        if model_config.tp_rank == 0:
+        if load_config.tp_rank == 0:
             t = threading.Thread(
                 target=trigger_transferring_weights_request,
                 args=(
-                    model_config.remote_instance_weight_loader_seed_instance_ip,
-                    model_config.remote_instance_weight_loader_seed_instance_service_port,
-                    model_config.remote_instance_weight_loader_send_weights_group_ports,
+                    load_config.remote_instance_weight_loader_seed_instance_ip,
+                    load_config.remote_instance_weight_loader_seed_instance_service_port,
+                    load_config.remote_instance_weight_loader_send_weights_group_ports,
                     instance_ip,
                 ),
             )
