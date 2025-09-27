@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.configs.compilation_config import CompilationConfig
+from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
@@ -92,8 +94,17 @@ class TpModelWorker:
             is_draft_model=is_draft_worker,
         )
 
+        # TODO(yuan-luo) hard-code compilation_config and device_config for POC,
+        # will refine in the former version.
+        self.compilation_config = CompilationConfig.from_server_args(
+            server_args,
+        )
+        self.device_config = DeviceConfig("cuda")
+
         self.model_runner = ModelRunner(
             model_config=self.model_config,
+            compilation_config=self.compilation_config,
+            device_config=self.device_config,
             mem_fraction_static=server_args.mem_fraction_static,
             gpu_id=gpu_id,
             tp_rank=tp_rank,

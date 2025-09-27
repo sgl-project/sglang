@@ -29,6 +29,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.compilation_config import CompilationConfig, CompilationLevel
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
@@ -106,7 +107,7 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner, torch_compile
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
@@ -146,6 +147,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     set_cuda_arch,
     slow_rank_detector,
+    supports_dynamo,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -212,6 +214,8 @@ class ModelRunner:
     def __init__(
         self,
         model_config: ModelConfig,
+        compilation_config: CompilationConfig,
+        device_config: DeviceConfig,
         mem_fraction_static: float,
         gpu_id: int,
         tp_rank: int,
@@ -239,6 +243,8 @@ class ModelRunner:
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.model_config = model_config
+        self.compilation_config = compilation_config
+        self.device_config = device_config
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
@@ -789,7 +795,7 @@ class ModelRunner:
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
-                device_config=DeviceConfig(self.device, self.gpu_id),
+                device_config=self.device_config,
             )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
@@ -852,6 +858,14 @@ class ModelRunner:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+
+        if (
+            self.compilation_config.level == CompilationLevel.DYNAMO_AS_IS
+            and supports_dynamo()
+        ):
+            # TODO(yuan-luo): compile model in fullgraph
+            # self.model.compile(fullgraph=True, backend=backend)
+            return
 
     def update_expert_location(
         self,
@@ -1825,6 +1839,13 @@ class ModelRunner:
             return
 
         if self.device != "cpu" and self.server_args.disable_cuda_graph:
+            if self.server_args.enable_torch_compile:
+                torch_compile(
+                    self.model,
+                    self.compilation_config,
+                    self.model_config,
+                    self.device_config,
+                )
             return
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:

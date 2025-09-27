@@ -80,6 +80,7 @@ import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
+from packaging.version import Version
 from PIL import Image
 from starlette.routing import Mount
 from torch import nn
@@ -2211,6 +2212,14 @@ def set_cuda_arch():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+# Using dynamo with SGLang doesn't really work well with PyTorch versions < 2.4.0.
+# In particular, the FakeScalarType is not supported for earlier versions of
+# PyTorch which breaks dynamo for any ops registered using ScalarType.
+def supports_dynamo() -> bool:
+    base_torch_version = Version(Version(torch.__version__).base_version)
+    return base_torch_version >= Version("2.4.0")
 
 
 def next_power_of_2(n: int):
