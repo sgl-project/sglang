@@ -167,7 +167,7 @@ def cutlass_w4a8_moe(
     )
 
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
-    silu_and_mul(c1, intermediate)
+    apply_glu_activation_for_moe(c1, intermediate, get_activation("silu"))
 
     intermediate_q = torch.empty(
         intermediate.shape, dtype=torch.float8_e4m3fn, device=device

@@ -15,7 +15,11 @@
 
 import logging
 import math
-from typing import Optional
+
+# === MoE Activation Registry & Unified Apply (minimal, no new files) ===
+# Unified activation spec + runtime apply helper for MoE GLU activations.
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -39,6 +43,123 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.utils import resolve_obj_by_qualname
+
+
+@dataclass(frozen=True)
+class ActivationSpec:
+    name: str
+    alpha: Optional[float] = None
+    limit: Optional[float] = None
+    up_shift: float = 0.0
+
+    @property
+    def is_fastpath(self) -> bool:
+        return (
+            self.name in ("silu", "gelu")
+            and self.alpha is None
+            and self.limit is None
+            and self.up_shift == 0.0
+        )
+
+
+_ACT_REG: Dict[str, Callable[..., ActivationSpec]] = {}
+
+
+def register_activation(name: str, builder: Callable[..., ActivationSpec]) -> None:
+    _ACT_REG[name] = builder
+
+
+def get_activation(name: str, **kwargs) -> ActivationSpec:
+    name = name.lower()
+    b = _ACT_REG.get(name)
+    if b is None:
+        return ActivationSpec(
+            name=name,
+            **{k: v for k, v in kwargs.items() if k in ("alpha", "limit", "up_shift")},
+        )
+    return b(**kwargs)
+
+
+register_activation("silu", lambda **kw: ActivationSpec("silu"))
+register_activation("gelu", lambda **kw: ActivationSpec("gelu"))
+register_activation(
+    "swish",
+    lambda alpha=None, limit=None, up_shift=0.0, **kw: ActivationSpec(
+        "swish", alpha=alpha, limit=limit, up_shift=up_shift
+    ),
+)
+register_activation(
+    "swiglu",
+    lambda alpha=None, limit=None, up_shift=1.0, **kw: ActivationSpec(
+        "swiglu", alpha=alpha, limit=limit, up_shift=up_shift
+    ),
+)
+register_activation(
+    "geglu",
+    lambda limit=None, up_shift=0.0, **kw: ActivationSpec(
+        "geglu", alpha=None, limit=limit, up_shift=up_shift
+    ),
+)
+register_activation(
+    "reglu",
+    lambda limit=None, up_shift=0.0, **kw: ActivationSpec(
+        "reglu", alpha=None, limit=limit, up_shift=up_shift
+    ),
+)
+
+
+def _apply_glu_python(x2d: torch.Tensor, spec: ActivationSpec) -> torch.Tensor:
+    d = x2d.shape[-1] // 2
+    gate = x2d[..., :d]
+    up = x2d[..., d:]
+    if spec.limit is not None:
+        gate = gate.clamp(min=None, max=spec.limit)
+        up = up.clamp(min=-spec.limit, max=spec.limit)
+    n = spec.name
+    if n in ("silu", "swish"):
+        beta = 1.0 if spec.alpha is None else spec.alpha
+        act = gate * torch.sigmoid(beta * gate)
+        return act * (up + spec.up_shift)
+    if n == "swiglu":
+        alpha = 1.0 if spec.alpha is None else spec.alpha
+        act = gate * torch.sigmoid(alpha * gate)
+        return act * (up + spec.up_shift)
+    if n in ("gelu", "geglu"):
+        act = F.gelu(gate)
+        return act * (up + spec.up_shift)
+    if n == "reglu":
+        act = F.relu(gate)
+        return act * (up + spec.up_shift)
+    # Fallback: silu-glu
+    act = F.silu(gate)
+    return act * (up + spec.up_shift)
+
+
+def apply_glu_activation_for_moe(
+    x2d: torch.Tensor, out2d: torch.Tensor, spec: ActivationSpec
+) -> torch.Tensor:
+    if spec.is_fastpath:
+        if spec.name == "silu":
+            if _is_cuda or _is_xpu or _is_hip:
+                silu_and_mul(x2d, out2d)
+            elif _is_cpu_amx_available:
+                out2d.copy_(torch.ops.sgl_kernel.silu_and_mul_cpu(x2d))
+            else:
+                d = x2d.shape[-1] // 2
+                out2d.copy_(F.silu(x2d[..., :d]) * x2d[..., d:])
+            return out2d
+        if spec.name == "gelu":
+            if _is_cuda or _is_xpu or _is_hip:
+                gelu_and_mul(x2d, out2d)
+            elif _is_cpu_amx_available:
+                out2d.copy_(torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x2d))
+            else:
+                d = x2d.shape[-1] // 2
+                out2d.copy_(F.gelu(x2d[..., :d]) * x2d[..., d:])
+            return out2d
+    out2d.copy_(_apply_glu_python(x2d, spec))
+    return out2d
+
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
