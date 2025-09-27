@@ -262,6 +262,7 @@ endif()
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/allreduce/mscclpp_allreduce.cu"
+    "csrc/allreduce_rmsnorm_fusion/fused_kernels.cu"
     "csrc/attention/cascade.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
