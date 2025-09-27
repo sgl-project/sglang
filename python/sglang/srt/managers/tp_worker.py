@@ -91,7 +91,6 @@ class TpModelWorker:
                 else server_args.speculative_draft_model_revision
             ),
             is_draft_model=is_draft_worker,
-            tp_rank=tp_rank,
         )
 
         self.model_runner = ModelRunner(
@@ -270,9 +269,7 @@ class TpModelWorker:
                         logits_output, model_worker_batch
                     )
             else:
-                next_token_ids = self.model_runner.sample(
-                    logits_output, model_worker_batch
-                )
+                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
 
             return logits_output, next_token_ids, can_run_cuda_graph
         else:
