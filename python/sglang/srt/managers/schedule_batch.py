@@ -1733,7 +1733,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
-            self.spec_info.filter_batch(keep_indices_device)
+            self.spec_info.filter_batch(
+                new_indices=keep_indices_device,
+                has_been_filtered=self.forward_mode.is_target_verify()
+            )
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
