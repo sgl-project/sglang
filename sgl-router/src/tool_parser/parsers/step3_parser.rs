@@ -209,8 +209,20 @@ impl ToolParser for Step3Parser {
 
         // Check for tool markers
         if !self.has_tool_markers(&state.buffer) {
-            // No markers found, return as incomplete
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = state.buffer.clone();
+            state.buffer.clear();
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("<｜tool_calls_begin｜>") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text = state.buffer[..marker_pos].to_string();
+                state.buffer = state.buffer[marker_pos..].to_string();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Look for start of tool calls

@@ -190,7 +190,20 @@ impl ToolParser for QwenParser {
 
         // Check if we have the start marker
         if !self.has_tool_markers(&state.buffer) {
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = state.buffer.clone();
+            state.buffer.clear();
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("<tool_call>") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text = state.buffer[..marker_pos].to_string();
+                state.buffer = state.buffer[marker_pos..].to_string();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Find start and end positions
@@ -212,7 +225,13 @@ impl ToolParser for QwenParser {
                         }
                     }
                     Err(_) => {
-                        // JSON parsing failed, might be incomplete
+                        // JSON parsing failed, might be incomplete or malformed
+                        // If we have what looks like a complete tool call block, treat as normal text
+                        if state.buffer[start_pos..end_pos].contains("\n</tool_call>") {
+                            let malformed_text = state.buffer[..end_pos].to_string();
+                            state.buffer = state.buffer[end_pos..].to_string();
+                            return Ok(StreamResult::NormalText(malformed_text));
+                        }
                     }
                 }
             } else {

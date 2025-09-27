@@ -152,9 +152,27 @@ impl ToolParser for KimiK2Parser {
             self.has_tool_markers(&state.buffer) || state.buffer.contains("<|tool_call_begin|>");
 
         if !has_tool_call {
-            // No markers found, clear buffer and return
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = state.buffer.clone();
             state.buffer.clear();
-            return Ok(StreamResult::Incomplete);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("<|tool_calls_section_begin|>") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text = state.buffer[..marker_pos].to_string();
+                state.buffer = state.buffer[marker_pos..].to_string();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
+        } else if let Some(marker_pos) = state.buffer.find("<|tool_call_begin|>") {
+            if marker_pos > 0 {
+                // We have text before the individual tool call marker - extract it as normal text
+                let normal_text = state.buffer[..marker_pos].to_string();
+                state.buffer = state.buffer[marker_pos..].to_string();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Try to match streaming pattern
