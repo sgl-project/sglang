@@ -44,6 +44,9 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+    DecodeKVCacheOffloadManager,
+)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -756,6 +759,24 @@ class Scheduler(
                     is_eagle=self.spec_algorithm.is_eagle(),
                 )
 
+        if (
+            server_args.disaggregation_mode == "decode"
+            and server_args.disaggregation_decode_enable_offload_kvcache
+        ):
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=(
+                    self.attn_tp_cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_cpu_group
+                ),
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
+            )
+        else:
+            self.decode_offload_manager = None
+
         self.decode_mem_cache_buf_multiplier = (
             1
             if self.spec_algorithm.is_none()
@@ -786,7 +807,7 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=self.model_config.hf_text_config.hidden_size,
-                dtype=self.model_config.dtype,
+                hidden_states_dtype=self.model_config.dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -835,7 +856,7 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=self.model_config.hf_text_config.hidden_size,
-                dtype=self.model_config.dtype,
+                hidden_states_dtype=self.model_config.dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
