@@ -73,7 +73,6 @@ class TestHf3fsBackendAccuracy(HiCacheStorage3FSBackendBaseMixin, CustomTestCase
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
         server_args, env_vars = super()._get_additional_server_args_and_env()
-        server_args["--hicache-mem-layout"] = "page_first"
         server_args["--hicache-ratio"] = 1.5
         server_args["--tp-size"] = 2
         return server_args, env_vars
