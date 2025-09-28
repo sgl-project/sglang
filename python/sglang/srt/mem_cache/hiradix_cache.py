@@ -156,13 +156,13 @@ class HiRadixCache(RadixCache):
                 extra_config = json.loads(storage_backend_extra_config)
             except Exception as e:
                 logger.error(f"Invalid backend extra config JSON: {e}")
-                raise
+                raise e
 
-        prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
-        prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)
+        prefetch_threshold = extra_config.pop("prefetch_threshold", 256)  # tokens
+        prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)  # seconds
         prefetch_timeout_per_ki_token = extra_config.pop(
             "prefetch_timeout_per_ki_token", 0.25
-        )
+        )  # seconds per 1024 tokens
 
         if not isinstance(prefetch_threshold, int):
             raise ValueError(
