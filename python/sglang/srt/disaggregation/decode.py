@@ -614,12 +614,16 @@ class DecodeTransferQueue:
                     output_token_logprobs_idx,
                     output_top_logprobs_val,
                     output_top_logprobs_idx,
+                    output_topk_p,
+                    output_topk_index,
                     output_hidden_states,
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())
                 decode_req.req.cached_tokens = cached_tokens[0].item()
                 if not self.spec_algorithm.is_none():
+                    decode_req.req.output_topk_p = output_topk_p
+                    decode_req.req.output_topk_index = output_topk_index
                     decode_req.req.hidden_states_tensor = output_hidden_states
                 if decode_req.req.return_logprob:
                     decode_req.req.output_token_logprobs_val.append(

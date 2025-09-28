@@ -16,7 +16,7 @@
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, TypeAlias, Union
+from typing import Any, Dict, List, NamedTuple, Optional, TypeAlias, Union
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -392,7 +392,7 @@ class Function(BaseModel):
     """Function descriptions."""
 
     description: Optional[str] = Field(default=None, examples=[None])
-    name: Optional[str] = None
+    name: str
     parameters: Optional[object] = None
     strict: bool = False
 
@@ -941,6 +941,16 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[Any] = None
+
+
+class ToolCallProcessingResult(NamedTuple):
+    """Result of processing tool calls in a response."""
+
+    tool_calls: Optional[
+        List[Any]
+    ]  # List of ToolCall objects or None if parsing failed
+    remaining_text: str  # Text remaining after parsing tool calls
+    finish_reason: Dict[str, Any]  # Updated finish reason dictionary
 
 
 class ResponseReasoningTextContent(BaseModel):
