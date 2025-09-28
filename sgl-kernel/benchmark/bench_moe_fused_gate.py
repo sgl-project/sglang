@@ -35,7 +35,12 @@ def biased_grouped_topk_org_fuse_kernel(
     return moe_fused_gate(scores, bias, num_expert_group, topk_group, topk)
 
 
-seq_length_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
+# CI environment uses simplified parameters
+if IS_CI:
+    seq_length_range = [5000]  # Only test one sequence length in CI
+else:
+    seq_length_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
+
 configs = [(sq,) for sq in seq_length_range]
 
 
