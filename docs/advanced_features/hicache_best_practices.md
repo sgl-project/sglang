@@ -67,7 +67,7 @@ HiCache supports multiple storage backends through a clean, generic interface:
 # Page-first: Optimized for I/O efficiency with zero-copy (recommended with kernel backend)
 --hicache-mem-layout page_first
 
-# Page-first-direct: Optimized for direct I/O operations (used with direct backend)
+# Page-first-direct: Optimized for direct I/O operations (Compatible with fa3 and same zero-copy performance as page_first)
 --hicache-mem-layout page_first_direct
 
 # Layer-first
@@ -136,7 +136,10 @@ python3 -m sglang.launch_server \
   --page-size 64 \
   --enable-hierarchical-cache \
   --hicache-ratio 2 \
+  --hicache-mem-layout page_first \
+  --hicache-io-backend kernel \
   --hicache-storage-backend mooncake \
+  --hicache-write-policy write_through \
   --hicache-storage-prefetch-policy timeout
 ```
 
