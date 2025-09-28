@@ -523,23 +523,27 @@ class ServerArgs:
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
-        Configure GPU memory-dependent settings including mem_fraction_static,
-        chunked_prefill_size, cuda_graph_max_bs, and cuda_graph_bs.
+        Configure GPU memory-dependent settings including
+        chunked_prefill_size, cuda_graph_max_bs, and mem_fraction_static.
 
-        Heuristics:
-        GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
-        mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
+        Here are our heuristics:
+        - Set chunked_prefill_size and cuda_graph_max_bs based on the GPU memory capacity.
+          This is because GPUs with more memory are generally more powerful, we need to use a larger
+          chunked_prefill_size and a larger cuda_graph_max_bs to fully utilize the GPU.
+        - Then set mem_fraction_static based on chunked_prefill_size and cuda_graph_max_bs.
 
-        We want mem_fraction_static to be as large as possible but still has enough room
-        for activations and cuda graph buffers. We use the following heuristics to
-        compute the needed size for activations and cuda graph buffers:
-        - The size of the activation depends on the chunked_prefill_size and model size.
-        - The size of cuda graph buffers depends on the cuda graph capture range and model size.
-        For GPUs with more memory, we use a larger chunked_prefill_size and
-        capture more cuda graphs, so they need to reserve more memory.
+          GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
 
-        Currently, use some hardcoded values such as 2.8GB or 12GB for activations and cuda graph buffers.
-        In the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
+          The argument mem_fraction_static is defined as (model weights + KV cache pool) / GPU memory capacity,
+          or equivalently, mem_fraction_static = (GPU memory capacity - activations - cuda graph buffers) / GPU memory capacity.
+
+          In order to compute mem_fraction_static, we need to estimate the size of activations and cuda graph buffers.
+          The activation memory is proportional to the chunked_prefill_size.
+          The cuda graph memory is proportional to the cuda_graph_max_bs.
+          We use reserved_mem = chunked_prefill_size * 1.5 + cuda_graph_max_bs * 1.5 to estimate the size of activations and cuda graph buffers in GB.
+          and set mem_fraction_static = (GPU memory capacity - reserved_mem) / GPU memory capacity.
+
+          The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
@@ -612,7 +616,7 @@ class ServerArgs:
             reserved_mem += self.chunked_prefill_size * 1.5
             # For cuda graphs
             reserved_mem += self.cuda_graph_max_bs * 1.5
-            # Some adjustment for parallel size
+            # Some adjustment for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
             if self.speculative_algorithm is not None:
