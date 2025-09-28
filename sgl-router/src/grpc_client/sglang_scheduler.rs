@@ -2,6 +2,8 @@ use std::time::Duration;
 use tonic::{transport::Channel, Request};
 use tracing::debug;
 
+use crate::protocols::spec::{ChatCompletionRequest, ResponseFormat};
+
 // Include the generated protobuf code
 pub mod proto {
     tonic::include_proto!("sglang.grpc.scheduler");
@@ -11,13 +13,14 @@ pub mod proto {
 // package sglang.grpc.scheduler; generates a nested module structure
 
 /// gRPC client for SGLang scheduler
+#[derive(Clone)]
 pub struct SglangSchedulerClient {
     client: proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
 }
 
 impl SglangSchedulerClient {
     /// Create a new client and connect to the scheduler
-    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
         // Convert grpc:// to http:// for tonic
@@ -38,10 +41,11 @@ impl SglangSchedulerClient {
     }
 
     /// Submit a generation request (returns streaming response)
-    pub async fn generate_stream(
+    pub async fn generate(
         &mut self,
         req: proto::GenerateRequest,
-    ) -> Result<tonic::Streaming<proto::GenerateResponse>, Box<dyn std::error::Error>> {
+    ) -> Result<tonic::Streaming<proto::GenerateResponse>, Box<dyn std::error::Error + Send + Sync>>
+    {
         let request = Request::new(req);
         let response = self.client.generate(request).await?;
         Ok(response.into_inner())
@@ -50,7 +54,7 @@ impl SglangSchedulerClient {
     /// Perform health check
     pub async fn health_check(
         &mut self,
-    ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error>> {
+    ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending health check request");
         let request = Request::new(proto::HealthCheckRequest {
             tokenized: Some(proto::TokenizedInput {
@@ -69,11 +73,150 @@ impl SglangSchedulerClient {
         &mut self,
         request_id: String,
         reason: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let request = Request::new(proto::AbortRequest { request_id, reason });
 
         self.client.abort(request).await?;
         Ok(())
+    }
+
+    /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
+    pub fn build_generate_request(
+        &self,
+        request_id: String,
+        body: &ChatCompletionRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        multimodal_inputs: Option<proto::MultimodalInputs>,
+        tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
+    ) -> Result<proto::GenerateRequest, String> {
+        // Build sampling params
+        let sampling_params = self.build_grpc_sampling_params(body, tool_call_constraint)?;
+
+        let grpc_request = proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: processed_text,
+                input_ids: token_ids,
+            }),
+            mm_inputs: multimodal_inputs,
+            sampling_params: Some(sampling_params),
+            return_logprob: body.logprobs,
+            logprob_start_len: -1,
+            top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
+            return_hidden_states: body.return_hidden_states,
+            stream: body.stream,
+            ..Default::default()
+        };
+
+        Ok(grpc_request)
+    }
+
+    /// Build gRPC SamplingParams from OpenAI request
+    fn build_grpc_sampling_params(
+        &self,
+        request: &ChatCompletionRequest,
+        tool_call_constraint: Option<(String, String)>,
+    ) -> Result<proto::SamplingParams, String> {
+        let stop_sequences = self.extract_stop_strings(request);
+
+        // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
+        // If neither is specified, use None to let the backend decide the default
+        #[allow(deprecated)]
+        let max_new_tokens = request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .map(|v| v as i32);
+
+        // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
+        let skip_special_tokens = if request.tools.is_some() {
+            match &request.tool_choice {
+                Some(crate::protocols::spec::ToolChoice::Value(
+                    crate::protocols::spec::ToolChoiceValue::None,
+                )) => request.skip_special_tokens,
+                Some(_) => false, // tool_choice is not "none"
+                None => false, // TODO: this assumes tool_choice defaults to "auto" when tools present
+            }
+        } else {
+            request.skip_special_tokens
+        };
+
+        #[allow(deprecated)]
+        Ok(proto::SamplingParams {
+            temperature: request.temperature.unwrap_or(1.0),
+            top_p: request.top_p.unwrap_or(1.0),
+            top_k: request.top_k.unwrap_or(-1),
+            min_p: request.min_p.unwrap_or(0.0),
+            frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
+            presence_penalty: request.presence_penalty.unwrap_or(0.0),
+            repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
+            max_new_tokens,
+            stop: stop_sequences,
+            stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
+            skip_special_tokens,
+            ignore_eos: request.ignore_eos,
+            no_stop_trim: request.no_stop_trim,
+            n: request.n.unwrap_or(1) as i32,
+            constraint: self.build_constraint(request, tool_call_constraint)?,
+            ..Default::default()
+        })
+    }
+
+    /// Extract stop strings from request
+    fn extract_stop_strings(&self, request: &ChatCompletionRequest) -> Vec<String> {
+        match &request.stop {
+            Some(crate::protocols::spec::StringOrArray::String(s)) => vec![s.clone()],
+            Some(crate::protocols::spec::StringOrArray::Array(arr)) => arr.clone(),
+            None => vec![],
+        }
+    }
+
+    /// Build constraint for structured generation
+    fn build_constraint(
+        &self,
+        request: &ChatCompletionRequest,
+        tool_call_constraint: Option<(String, String)>,
+    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
+        let mut constraints = Vec::new();
+
+        if let Some(ResponseFormat::JsonSchema { json_schema }) = &request.response_format {
+            let schema_str = serde_json::to_string(&json_schema.schema)
+                .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+        }
+
+        if let Some(ebnf) = &request.ebnf {
+            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
+                ebnf.clone(),
+            ));
+        }
+
+        if let Some(regex) = &request.regex {
+            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
+        }
+
+        // Handle tool call constraint
+        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
+            if !constraints.is_empty() {
+                return Err("Constrained decoding is not compatible with tool calls.".to_string());
+            }
+            let tool_constraint = match constraint_type.as_str() {
+                "structural_tag" => {
+                    proto::sampling_params::Constraint::StructuralTag(constraint_value)
+                }
+                "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
+                "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
+                "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
+                _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
+            };
+            constraints.push(tool_constraint);
+        }
+
+        match constraints.len() {
+            0 => Ok(None),
+            1 => Ok(constraints.pop()),
+            _ => Err("Multiple constraints are not allowed.".to_string()),
+        }
     }
 }
 
@@ -83,7 +226,6 @@ mod tests {
 
     #[test]
     fn test_proto_types_compilation() {
-        // Test that protobuf types can be constructed
         let health_req = proto::HealthCheckRequest {
             tokenized: Some(proto::TokenizedInput {
                 original_text: "test".to_string(),
@@ -180,8 +322,6 @@ mod tests {
     }
 
     // TODO: SessionParams not in current proto - skip test
-    // #[test]
-    // fn test_session_params() { ... }
 
     #[test]
     fn test_embed_request() {
@@ -209,7 +349,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_connect_invalid_endpoint() {
-        // Test connecting to an invalid endpoint should return error
         let result = SglangSchedulerClient::connect("invalid://endpoint").await;
         assert!(result.is_err());
     }
@@ -225,30 +364,21 @@ mod tests {
         assert_eq!(tokenized.input_ids, vec![1, 15043, 1917, 2]);
     }
 
-    // Test response type construction
     #[test]
     fn test_generate_stream_chunk() {
         let chunk = proto::GenerateStreamChunk {
-            token_id: 1234,
-            text: " world".to_string(),
+            token_ids: vec![1234, 5678],
             prompt_tokens: 5,
             completion_tokens: 2,
             cached_tokens: 3,
-            generation_time: 0.025,
-            queue_time: 10,
             ..Default::default()
         };
 
-        assert_eq!(chunk.token_id, 1234);
-        assert_eq!(chunk.text, " world");
+        assert_eq!(chunk.token_ids, vec![1234, 5678]);
         assert_eq!(chunk.prompt_tokens, 5);
         assert_eq!(chunk.completion_tokens, 2);
         assert_eq!(chunk.cached_tokens, 3);
-        assert_eq!(chunk.generation_time, 0.025);
-        assert_eq!(chunk.queue_time, 10);
     }
 
     // TODO: ModelInfo not in current proto - skip test
-    // #[test]
-    // fn test_model_info() { ... }
 }

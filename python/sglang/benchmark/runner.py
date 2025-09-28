@@ -184,7 +184,9 @@ class BenchmarkRunner:
 
         accept_length = None
         if "sglang" in self.args.backend:
-            server_info = requests.get(self.base_url + "/get_server_info")
+            server_info = requests.get(
+                self.base_url + "/get_server_info", headers=get_auth_headers()
+            )
             if server_info.status_code == 200:
                 server_info_json = server_info.json()
                 if "decode" in server_info_json:
