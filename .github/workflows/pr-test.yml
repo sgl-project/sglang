@@ -160,7 +160,7 @@ jobs:
           python3 test_mla_deepseek_v3.py
 
   sgl-kernel-benchmark-test:
-    needs: [check-changes]
+    needs: [check-changes, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled()
     runs-on: 1-gpu-runner
     env:
