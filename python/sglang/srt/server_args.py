@@ -1768,7 +1768,7 @@ class ServerArgs:
         parser.add_argument(
             "--lora-target-modules",
             type=str,
-            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
+            # choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
             nargs="*",
             default=None,
             help="The union set of all target modules where LoRA should be applied. If not specified, "
@@ -2810,7 +2810,13 @@ class ServerArgs:
                         len(self.lora_target_modules) == 1
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
-
+                else:
+                    # Validate custom target modules (support prefixed names)
+                    for module in list(self.lora_target_modules):
+                        base_module = module.split('.')[-1]
+                        if base_module not in SUPPORTED_LORA_TARGET_MODULES:
+                            raise ValueError(f"Unsupported LoRA target module: {module}. "
+                                           f"Base module '{base_module}' must be one of {SUPPORTED_LORA_TARGET_MODULES}")
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
                 self.max_lora_rank and self.lora_target_modules

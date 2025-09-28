@@ -420,7 +420,15 @@ class Llama4ForConditionalGeneration(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
+        # Add reverse mapping for LoRA compatibility
+        "feed_forward.gate_proj": ["gate_proj"],
+        "feed_forward.up_proj": ["up_proj"],
+        "feed_forward.down_proj": ["down_proj"],
     }
+    
+    # Override LoRA parallelism configuration for Llama4
+    # gate_proj and up_proj should use Column Parallel (not Row Parallel)
+    lora_column_parallel_modules = ["feed_forward.gate_proj", "feed_forward.up_proj"]
 
     def __init__(
         self,
@@ -431,6 +439,9 @@ class Llama4ForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        
+        # Monkey patch LoRA row parallelism configuration for Llama4
+        # self._patch_lora_parallelism()
 
         # Check if this is a text-only model (modelopt fp8 llama4 has no vision components)
         self.has_vision_weights = self._has_vision_weights(config)
@@ -961,30 +972,97 @@ class Llama4ForConditionalGeneration(nn.Module):
     def set_embed(self, embed):
         return self.language_model.set_embed(embed)
 
+    def _patch_lora_parallelism(self):
+        """
+        Monkey patch LoRA parallelism configuration to fix gate_proj/up_proj 
+        being treated as Row Parallel instead of Column Parallel.
+        """
+        try:
+            from sglang.srt.lora.utils import ROW_PARALLELISM_LINEAR_LORA_NAMES
+            # Remove gate_proj and up_proj from row parallelism list if they exist
+            # (they shouldn't be there, but just in case)
+            modules_to_remove = ["gate_proj", "up_proj", "feed_forward.gate_proj", "feed_forward.up_proj"]
+            for module in modules_to_remove:
+                if module in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+                    ROW_PARALLELISM_LINEAR_LORA_NAMES.remove(module)
+            logger.info(f"LoRA parallelism patched for Llama4. ROW_PARALLELISM_LINEAR_LORA_NAMES: {ROW_PARALLELISM_LINEAR_LORA_NAMES}")
+            
+            # Debug: Print all submodules to understand the actual model structure
+            logger.info("=== DEBUG: Llama4 model structure ===")
+            for name, module in self.named_modules():
+                if "feed_forward" in name:
+                    logger.info(f"Module: {name} -> {type(module).__name__}")
+                elif "layers.0." in name and ("gate" in name or "up" in name or "down" in name):
+                    logger.info(f"Layer0 Module: {name} -> {type(module).__name__}")
+            logger.info("=== END DEBUG ===")
+        except Exception as e:
+            logger.warning(f"Failed to patch LoRA parallelism: {e}")
+
+    def get_lora_target_module_mapping(self, module_name: str, layer_idx: int):
+        """
+        Map LoRA target module names to actual base layer modules.
+        This is needed because LoRA adapters may use split module names
+        (e.g., gate_proj, up_proj) while the model uses fused modules (e.g., gate_up_proj).
+        """
+        base_module_name = module_name.split('.')[-1] if '.' in module_name else module_name
+        
+        # Map split feed_forward modules to the actual fused gate_up_proj layer
+        if base_module_name in ["gate_proj", "up_proj"]:
+            # Both gate_proj and up_proj map to the same gate_up_proj layer
+            decoder_layer = self.language_model.get_layers()[layer_idx]
+            return decoder_layer.feed_forward.gate_up_proj
+        elif base_module_name == "down_proj":
+            decoder_layer = self.language_model.get_layers()[layer_idx]
+            return decoder_layer.feed_forward.down_proj
+        elif base_module_name in ["q_proj", "k_proj", "v_proj"]:
+            decoder_layer = self.language_model.get_layers()[layer_idx]
+            return decoder_layer.self_attn.qkv_proj
+        elif base_module_name == "o_proj":
+            decoder_layer = self.language_model.get_layers()[layer_idx]
+            return decoder_layer.self_attn.o_proj
+        else:
+            # For other modules, return None to use default lookup
+            return None
+
+    def is_lora_column_parallel_module(self, module_name: str) -> bool:
+        """
+        Check if a LoRA module should use Column Parallel instead of Row Parallel.
+        This is needed for Llama4 because gate_proj and up_proj are actually
+        part of a MergedColumnParallelLinear layer, not RowParallelLinear.
+        """
+        return module_name in self.lora_column_parallel_modules
+
     def get_hidden_dim(self, module_name, layer_idx):
         # return input_dim, output_dim
+        # Handle both full module names (e.g., "feed_forward.gate_proj") and base names (e.g., "gate_proj")
+        base_module_name = module_name.split('.')[-1] if '.' in module_name else module_name
+        
         if module_name == "qkv_proj":
             return (
-                self.config.hidden_size,
-                self.config.head_dim
+                self.config.text_config.hidden_size,
+                self.config.text_config.head_dim
                 * (
-                    self.config.num_attention_heads
-                    + self.config.num_key_value_heads * 2
+                    self.config.text_config.num_attention_heads
+                    + self.config.text_config.num_key_value_heads * 2
                 ),
             )
         elif module_name == "o_proj":
             return (
-                self.config.head_dim * self.config.num_attention_heads,
-                self.config.hidden_size,
+                self.config.text_config.head_dim * self.config.text_config.num_attention_heads,
+                self.config.text_config.hidden_size,
             )
         elif module_name == "gate_up_proj":
-            return self.config.hidden_size, self.config.intermediate_size * 2
-        elif module_name == "down_proj":
+            return self.config.text_config.hidden_size, self.config.text_config.intermediate_size_mlp * 2
+        elif base_module_name == "gate_proj":
+            return self.config.text_config.hidden_size, self.config.text_config.intermediate_size_mlp
+        elif base_module_name == "up_proj":
+            return self.config.text_config.hidden_size, self.config.text_config.intermediate_size_mlp
+        elif module_name == "down_proj" or base_module_name == "down_proj":
             decoder_layer = self.language_model.get_layers()[layer_idx]
             intermediate_size = decoder_layer.get_intermediate_size()
-            return intermediate_size, self.config.hidden_size
+            return intermediate_size, self.config.text_config.hidden_size
         else:
-            raise NotImplementedError()
+            raise NotImplementedError(f"Module {module_name} (base: {base_module_name}) not supported for LoRA")
 
 
 EntryClass = Llama4ForConditionalGeneration
