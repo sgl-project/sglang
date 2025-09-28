@@ -160,7 +160,7 @@ def benchmark_quantization(batch_size, seq_len, hidden_dim, provider):
     elif provider == "sglang":
         fn = lambda: sglang_per_token_quant_fp8(x.clone())
 
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
