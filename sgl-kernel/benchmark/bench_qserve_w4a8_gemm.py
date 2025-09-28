@@ -1,6 +1,7 @@
 import argparse
 import copy
 import itertools
+import os
 
 import torch
 import triton
@@ -8,6 +9,12 @@ from sgl_kernel import (
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
+)
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
 
 
@@ -65,10 +72,17 @@ WEIGHT_SHAPES = {
 }
 
 
+# CI environment uses simplified parameters
+if IS_CI:
+    batch_sizes = [1, 16]  # Simplified for CI
+else:
+    batch_sizes = [1, 16, 32, 64, 128, 256, 512, 1024, 2048]
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
-        x_vals=[1, 16, 32, 64, 128, 256, 512, 1024, 2048],
+        x_vals=batch_sizes,
         x_log=False,
         line_arg="provider",
         line_vals=["FP16", "W8A8", "Qserve_W4A8_Per_Channel", "Qserve_W4A8_Per_Group"],
@@ -184,7 +198,17 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # Simplify for CI environment
+    if IS_CI:
+        args.models = [args.models[0]]  # Use only first model
+        args.tp_sizes = [args.tp_sizes[0]]  # Use only first TP size
+
     KN_model_names = prepare_shapes(args)
+
+    # Limit iterations in CI
+    if IS_CI:
+        KN_model_names = KN_model_names[:2]  # Only test first 2 shapes in CI
+
     for K, N, model_name in KN_model_names:
         print(f"{model_name} N={N} K={K}: ")
         benchmark.run(

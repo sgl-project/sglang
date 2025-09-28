@@ -1,13 +1,25 @@
 import argparse
 import copy
 import itertools
+import os
 
 import torch
 import triton
 from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 
-bs_range = [1, 8, 32, 64, 128, 256]
-qlen_range = [1, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
+
+# CI environment uses simplified parameters
+if IS_CI:
+    bs_range = [1]  # Single batch size for CI
+    qlen_range = [64]  # Single sequence length for CI
+else:
+    bs_range = [1, 8, 32, 64, 128, 256]
+    qlen_range = [1, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
 configs = list(itertools.product(bs_range, qlen_range))
 

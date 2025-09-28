@@ -1,4 +1,11 @@
 import argparse
+import os
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 import random
 from dataclasses import dataclass
 from typing import List, Tuple

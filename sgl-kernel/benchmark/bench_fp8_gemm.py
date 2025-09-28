@@ -1,14 +1,30 @@
 import argparse
 import copy
 import itertools
+import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
 from sgl_kernel import sgl_per_tensor_quant_fp8
-from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
-from vllm._custom_ops import scaled_fp8_quant as vllm_scaled_fp8_quant
+
+# Optional vLLM import
+try:
+    from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
+    from vllm._custom_ops import scaled_fp8_quant as vllm_scaled_fp8_quant
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    vllm_scaled_mm = None
+    vllm_scaled_fp8_quant = None
+    VLLM_AVAILABLE = False
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 # Weight Shapes are in the format
 # ([K, N], TP_SPLIT_DIM)
@@ -86,25 +102,48 @@ def sglang_scaled_fp8_quant(
     return output, scale
 
 
+# CI environment uses simplified parameters
+if IS_CI:
+    batch_sizes = [1]  # Single batch size for CI
+else:
+    batch_sizes = [1, 16, 64, 128, 256, 512, 1024, 2048]
+
+# Filter line_vals based on vLLM availability
+if VLLM_AVAILABLE:
+    line_vals = [
+        "vllm-fp8-fp16",
+        "vllm-fp8-bf16",
+        "sglang-fp8-fp16",
+        "sglang-fp8-bf16",
+    ]
+    line_names = [
+        "vllm-fp8-fp16",
+        "vllm-fp8-bf16",
+        "sglang-fp8-fp16",
+        "sglang-fp8-bf16",
+    ]
+    styles = [("green", "-"), ("green", "--"), ("blue", "-"), ("blue", "--")]
+else:
+    line_vals = [
+        "sglang-fp8-fp16",
+        "sglang-fp8-bf16",
+    ]
+    line_names = [
+        "sglang-fp8-fp16",
+        "sglang-fp8-bf16",
+    ]
+    styles = [("blue", "-"), ("blue", "--")]
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
-        x_vals=[1, 16, 64, 128, 256, 512, 1024, 2048],
+        x_vals=batch_sizes,
         x_log=False,
         line_arg="provider",
-        line_vals=[
-            "vllm-fp8-fp16",
-            "vllm-fp8-bf16",
-            "sglang-fp8-fp16",
-            "sglang-fp8-bf16",
-        ],
-        line_names=[
-            "vllm-fp8-fp16",
-            "vllm-fp8-bf16",
-            "sglang-fp8-fp16",
-            "sglang-fp8-bf16",
-        ],
-        styles=[("green", "-"), ("green", "--"), ("blue", "-"), ("blue", "--")],
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=styles,
         ylabel="GB/s",
         plot_name="fp8 scaled matmul",
         args={},
@@ -122,6 +161,9 @@ def benchmark(batch_size, provider, N, K):
     dtype = torch.float16 if "fp16" in provider else torch.bfloat16
 
     if "vllm-fp8" in provider:
+        if not VLLM_AVAILABLE:
+            # Return zero if vLLM is not available
+            return (0, 0, 0)
         a_fp8, scale_a_fp8 = vllm_scaled_fp8_quant(a, scale_a)
         b_fp8, scale_b_fp8 = vllm_scaled_fp8_quant(b, scale_b)
         b_fp8 = b_fp8.t()
@@ -173,6 +215,11 @@ if __name__ == "__main__":
         help="List of tensor parallel sizes",
     )
     args = parser.parse_args()
+
+    # Simplify for CI environment
+    if IS_CI:
+        args.models = [args.models[0]]  # Use only first model
+        args.tp_sizes = [args.tp_sizes[0]]  # Use only first TP size
 
     KN_model_names = prepare_shapes(args)
     for K, N, model_name in KN_model_names:

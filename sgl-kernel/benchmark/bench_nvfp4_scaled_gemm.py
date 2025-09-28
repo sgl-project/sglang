@@ -1,10 +1,17 @@
 import argparse
 import copy
 import itertools
+import os
 
 import torch
 import triton
 from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
