@@ -149,5 +149,46 @@ class TestFlashMLAMTP(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 1.8)
 
 
+class TestFlashMLAMTPMultiToken(TestFlashMLAMTP):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "lmsys/sglang-ci-dsv3-test"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = ["--trust-remote-code"]
+        if torch.cuda.is_available() and torch.version.cuda:
+            other_args.extend(
+                [
+                    "--cuda-graph-max-bs",
+                    "4",
+                    "--disable-radix",
+                    "--enable-torch-compile",
+                    "--torch-compile-max-bs",
+                    "1",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-draft-model-path",
+                    "lmsys/sglang-ci-dsv3-test-NextN",
+                    "--speculative-num-steps",
+                    "2",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "3",
+                    "--attention-backend",
+                    "flashmla",
+                ]
+            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+
 if __name__ == "__main__":
     unittest.main()
