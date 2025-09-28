@@ -263,22 +263,29 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             # per the Transformers docs & maintainers, tool call arguments in
-            # assistant-role messages with tool_calls need to be dicts not JSON str -
+            # messages with tool_calls need to be dicts not JSON str -
             # this is how tool-use chat templates will expect them moving forwards
             # so, for messages that have tool_calls, parse the string (which we get
             # from openAI format) to dict
+            # NOTE: tool_calls can appear in assistant, tool, function, or system messages
             if (
-                processed_msg["role"] == "assistant"
-                and "tool_calls" in processed_msg
+                "tool_calls" in processed_msg
                 and isinstance(processed_msg["tool_calls"], list)
             ):
                 for item in processed_msg["tool_calls"]:
-                    if "arguments" in item["function"] and isinstance(
+                    if "function" in item and "arguments" in item["function"] and isinstance(
                         item["function"]["arguments"], str
                     ):
-                        item["function"]["arguments"] = json.loads(
-                            item["function"]["arguments"]
-                        )
+                        try:
+                            item["function"]["arguments"] = json.loads(
+                                item["function"]["arguments"]
+                            )
+                        except json.JSONDecodeError as e:
+                            logger.warning(
+                                f"Failed to parse tool call arguments as JSON: {item['function']['arguments']}. "
+                                f"Error: {e}. Keeping as string."
+                            )
+                            # Keep the original string if JSON parsing fails
 
             openai_compatible_messages.append(processed_msg)
 

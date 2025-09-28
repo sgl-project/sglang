@@ -595,6 +595,107 @@ class ServingChatTestCase(unittest.TestCase):
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
 
+    def test_jinja_template_with_stringified_tool_arguments(self):
+        """Test that tool calls with stringified arguments are properly parsed in all message types."""
+        # Mock the template manager to use jinja template
+        self.template_manager.chat_template_name = "jinja_template"
+        self.template_manager.jinja_template_content_format = "openai"
+        
+        # Mock the tokenizer to have a jinja template
+        def mock_apply_chat_template(messages, **kwargs):
+            # This would normally fail with AttributeError if arguments is a string
+            # and the template tries to iterate over arguments.items()
+            for msg in messages:
+                if "tool_calls" in msg:
+                    for tool_call in msg["tool_calls"]:
+                        args = tool_call["function"]["arguments"]
+                        if isinstance(args, str):
+                            # This would cause the error: 'str' object has no attribute 'items'
+                            raise AttributeError("'str' object has no attribute 'items'")
+                        # If args is a dict, this should work fine
+                        _ = args.items()  # This is what Jinja2 templates do
+            return [1, 2, 3, 4, 5]  # Return mock token IDs
+        
+        self.tm.tokenizer.apply_chat_template = mock_apply_chat_template
+        
+        # Create request with tool call messages containing stringified arguments
+        # Test different message roles that can contain tool_calls
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user", 
+                    "content": "What's the weather like?"
+                },
+                {
+                    "role": "assistant",
+                    "content": "I'll check the weather for you.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"location": "San Francisco", "unit": "celsius"}'  # This is stringified JSON
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "content": "Weather is sunny",
+                    "tool_call_id": "call_1",
+                    "tool_calls": [  # Tool role message with tool_calls
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {
+                                "name": "get_forecast",
+                                "arguments": '{"days": 7, "detailed": true}'  # This should be handled by the fix
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "function",
+                    "content": "Function result",
+                    "tool_calls": [  # Function role message with tool_calls
+                        {
+                            "id": "call_3",
+                            "type": "function",
+                            "function": {
+                                "name": "another_function",
+                                "arguments": '{"param": "value"}'  # This should also be handled
+                            }
+                        }
+                    ]
+                }
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather information",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                                "unit": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            ]
+        )
+        
+        # This should not raise an AttributeError after the fix
+        result = self.chat._apply_jinja_template(req, [{"type": "function", "function": {"name": "get_weather"}}], False)
+        
+        # Verify the result is returned successfully
+        self.assertIsNotNone(result)
+        self.assertEqual(result.prompt_ids, [1, 2, 3, 4, 5])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
