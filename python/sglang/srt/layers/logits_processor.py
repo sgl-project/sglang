@@ -50,8 +50,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import dump_to_file, is_npu, use_intel_amx_backend,get_int_env_var,get_bool_env_var
-
+from sglang.srt.utils import (
+    dump_to_file,
+    get_bool_env_var,
+    get_int_env_var,
+    is_npu,
+    use_intel_amx_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +263,9 @@ class LogitsProcessor(nn.Module):
         )
 
         # enable chunked logprobs processing
-        self.enable_logprobs_chunk = get_bool_env_var("SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK")
+        self.enable_logprobs_chunk = get_bool_env_var(
+            "SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"
+        )
         # chunk size for logprobs processing
         self.logprobs_chunk_size = get_int_env_var(
             "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE", 2048
@@ -625,7 +632,9 @@ class LogitsProcessor(nn.Module):
             # Get the logprob of top-k tokens
             if logits_metadata.extend_return_top_logprob:
                 top_k_nums = logits_metadata.top_logprobs_nums[chunk_slice]
-                pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice]
+                pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
+                    chunk_slice
+                ]
                 split_len_topk = self.get_top_logprobs_chunk(
                     chunk_input_logprobs,
                     logits_metadata,
@@ -639,7 +648,9 @@ class LogitsProcessor(nn.Module):
             # Get the logprob of given token id
             if logits_metadata.extend_token_ids_logprob:
                 token_ids_logprobs = logits_metadata.token_ids_logprobs[chunk_slice]
-                pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice]
+                pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
+                    chunk_slice
+                ]
                 split_len_token_ids = self.get_token_ids_logprobs_chunk(
                     chunk_input_logprobs,
                     logits_metadata,
