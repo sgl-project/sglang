@@ -6,7 +6,6 @@ use sglang_router_rs::tool_parser::{DeepSeekParser, ParseState, StreamResult, To
 async fn test_deepseek_complete_parsing() {
     let parser = DeepSeekParser::new();
 
-    // Test single tool call
     let input = r#"Let me help you with that.
 <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather
 ```json
@@ -14,12 +13,11 @@ async fn test_deepseek_complete_parsing() {
 ```<｜tool▁call▁end｜><｜tool▁calls▁end｜>
 The weather in Tokyo is..."#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "get_weather");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "get_weather");
 
-    // Verify arguments
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["location"], "Tokyo");
     assert_eq!(args["units"], "celsius");
 }
@@ -39,10 +37,10 @@ async fn test_deepseek_multiple_tools() {
 ```<｜tool▁call▁end｜>
 <｜tool▁calls▁end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "search");
-    assert_eq!(result[1].function.name, "translate");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].function.name, "search");
+    assert_eq!(tools[1].function.name, "translate");
 }
 
 #[tokio::test]
@@ -98,11 +96,11 @@ async fn test_deepseek_nested_json() {
 }
 ```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "process");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "process");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert!(args["data"]["nested"]["deep"].is_array());
 }
 
@@ -136,10 +134,10 @@ async fn test_deepseek_malformed_json_handling() {
 ```<｜tool▁call▁end｜>
 <｜tool▁calls▁end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
     // Only the valid tool call should be parsed
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "valid");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "valid");
 }
 
 #[tokio::test]
@@ -153,9 +151,9 @@ async fn test_normal_text_extraction() {
 {"location": "Tokyo"}
 ```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "get_weather");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "get_weather");
 
     // TODO: Verify normal text extraction when parser returns it
     // In Python: normal_text = "Let me help you with that."
@@ -176,8 +174,8 @@ async fn test_multiple_tool_calls() {
 ```<｜tool▁call▁end｜>
 <｜tool▁calls▁end｜><｜end▁of▁sentence｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "get_weather");
-    assert_eq!(result[1].function.name, "get_weather");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].function.name, "get_weather");
+    assert_eq!(tools[1].function.name, "get_weather");
 }
