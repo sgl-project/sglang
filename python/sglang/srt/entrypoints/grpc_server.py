@@ -181,20 +181,34 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
 
-            # Submit to request manager
-            output_queue = await self.request_manager.generate_request(
+            # Submit to request manager (automatically handles n>1)
+            response_generator = self.request_manager.generate_request(
                 obj=tokenized_req,
                 request_id=request.request_id,
                 grpc_context=context,
             )
 
-            # Stream outputs
-            while True:
-                try:
-                    # Get output with timeout
-                    output = await asyncio.wait_for(output_queue.get(), timeout=4)
-
-                    # Check for errors
+            async for output in response_generator:
+                # Handle batch responses (for n>1 non-streaming)
+                if isinstance(output, list):
+                    for batch_output in output:
+                        if "error" in batch_output:
+                            yield sglang_scheduler_pb2.GenerateResponse(
+                                request_id=request.request_id,
+                                error=sglang_scheduler_pb2.GenerateError(
+                                    message=batch_output["error"],
+                                    http_status_code=(
+                                        "500" if "abort" not in batch_output else "499"
+                                    ),
+                                ),
+                            )
+                        else:
+                            # All non-error batch outputs are final responses
+                            yield self._create_completion_response(
+                                request.request_id, batch_output
+                            )
+                else:
+                    # Handle single response (for streaming or n=1 non-streaming)
                     if "error" in output:
                         yield sglang_scheduler_pb2.GenerateResponse(
                             request_id=request.request_id,
@@ -205,26 +219,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 ),
                             ),
                         )
-                        break
-
-                    # Check if finished
-                    if output.get("finished", False):
-                        # Send completion
+                    elif output.get("finished", False):
                         yield self._create_completion_response(
                             request.request_id, output
                         )
-                        break
                     else:
-                        # Send chunk
                         yield self._create_chunk_response(request.request_id, output)
-
-                except asyncio.TimeoutError:
-                    # Check if context is still active
-                    if context.cancelled():
-                        # Abort the request
-                        await self.request_manager.abort_request(request.request_id)
-                        break
-                    continue
 
         except Exception as e:
             logger.error(f"Generate failed: {e}\n{get_exception_traceback()}")
@@ -266,7 +266,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     prompt_tokens=result.get("prompt_tokens", 0),
                     cached_tokens=0,
                     embedding_dim=len(result["embedding"]),
-                    generation_time=time.time() - self.start_time,
                 ),
             )
 
@@ -322,14 +321,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             logger.info(f"Sending health check request to request manager...")
 
             # Submit and wait for response
-            output_queue = await self.request_manager.generate_request(
+            output_generator = self.request_manager.generate_request(
                 health_request, request_id=rid
             )
 
             try:
-                # Wait for response with configurable timeout
+                # Get first response with timeout
                 response = await asyncio.wait_for(
-                    output_queue.get(), timeout=HEALTH_CHECK_TIMEOUT
+                    output_generator.__anext__(), timeout=HEALTH_CHECK_TIMEOUT
                 )
 
                 # Clean up
@@ -404,8 +403,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             return_logprob=grpc_req.return_logprob,
             logprob_start_len=grpc_req.logprob_start_len or -1,
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
-            stream=True,  # Always stream for gRPC
-            lora_path=grpc_req.lora_id if grpc_req.lora_id else None,
+            stream=grpc_req.stream or False,
+            lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),
@@ -438,6 +437,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         regex = None
         json_schema = None
         ebnf_grammar = None
+        structural_tag = None
 
         if grpc_params.HasField("regex"):
             regex = grpc_params.regex
@@ -445,6 +445,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             json_schema = grpc_params.json_schema
         elif grpc_params.HasField("ebnf_grammar"):
             ebnf_grammar = grpc_params.ebnf_grammar
+        elif grpc_params.HasField("structural_tag"):
+            structural_tag = grpc_params.structural_tag
 
         return SGLSamplingParams(
             temperature=grpc_params.temperature or 1.0,
@@ -456,15 +458,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             repetition_penalty=grpc_params.repetition_penalty or 1.0,
             max_new_tokens=grpc_params.max_new_tokens or 128,
             min_new_tokens=grpc_params.min_new_tokens or 0,
-            stop=list(grpc_params.stop) if grpc_params.stop else None,
+            stop=list(grpc_params.stop) if grpc_params.stop else [],
             stop_token_ids=(
-                list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
+                list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else []
             ),
             skip_special_tokens=grpc_params.skip_special_tokens,
             spaces_between_special_tokens=grpc_params.spaces_between_special_tokens,
             regex=regex,
             json_schema=json_schema,
             ebnf=ebnf_grammar,
+            structural_tag=structural_tag,
             n=grpc_params.n or 1,
             ignore_eos=grpc_params.ignore_eos,
         )
@@ -473,16 +476,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self, request_id: str, output: Dict
     ) -> sglang_scheduler_pb2.GenerateResponse:
         """Create a streaming chunk response."""
+        meta_info = output.get("meta_info", {})
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
             chunk=sglang_scheduler_pb2.GenerateStreamChunk(
-                token_id=output["token_ids"][-1] if output.get("token_ids") else 0,
-                text=output.get("text", ""),
-                prompt_tokens=0,
-                completion_tokens=len(output.get("token_ids", [])),
-                cached_tokens=0,
-                generation_time=time.time() - self.start_time,
-                queue_time=0.0,
+                token_ids=output.get("token_ids", []),
+                prompt_tokens=meta_info.get("prompt_tokens", 0),
+                completion_tokens=meta_info.get("completion_tokens", 0),
+                cached_tokens=meta_info.get("cached_tokens", 0),
             ),
         )
 
@@ -491,20 +492,44 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> sglang_scheduler_pb2.GenerateResponse:
         """Create a completion response."""
 
-        # Determine finish reason
-        finish_reason = sglang_scheduler_pb2.GenerateComplete.STOP
+        # Extract meta info and finish reason details
         meta_info = output.get("meta_info", {})
-        if meta_info.get("finish_reason") == "length":
-            finish_reason = sglang_scheduler_pb2.GenerateComplete.LENGTH
-        elif meta_info.get("finish_reason") == "eos_token":
-            finish_reason = sglang_scheduler_pb2.GenerateComplete.EOS_TOKEN
+        finish_reason_data = meta_info.get("finish_reason")
+
+        # Determine finish reason, default is stop
+        finish_reason = "stop"
+        if finish_reason_data:
+            if isinstance(finish_reason_data, dict):
+                finish_reason_type = finish_reason_data.get("type")
+            else:
+                # Handle legacy string format
+                finish_reason_type = finish_reason_data
+
+            if finish_reason_type == "length":
+                finish_reason = "length"
+            elif finish_reason_type == "abort":
+                finish_reason = "abort"
+
+        # Extract matched_stop information
+        matched_stop_kwargs = {}
+        if isinstance(finish_reason_data, dict) and "matched" in finish_reason_data:
+            matched = finish_reason_data["matched"]
+            if isinstance(matched, int):
+                matched_stop_kwargs["matched_token_id"] = matched
+            elif isinstance(matched, str):
+                matched_stop_kwargs["matched_stop_str"] = matched
 
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
             complete=sglang_scheduler_pb2.GenerateComplete(
                 output_ids=output.get("token_ids", []),
-                output_text=output.get("text", ""),
                 finish_reason=finish_reason,
+                prompt_tokens=meta_info.get("prompt_tokens", 0),
+                completion_tokens=meta_info.get(
+                    "completion_tokens", len(output.get("token_ids", []))
+                ),
+                cached_tokens=meta_info.get("cached_tokens", 0),
+                **matched_stop_kwargs,
             ),
         )
 

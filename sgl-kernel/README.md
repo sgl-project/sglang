@@ -251,6 +251,14 @@ To use this with your library functions, simply wrap them with make_pytorch_shim
 ```
 
 2. Add benchmarks using [triton benchmark](https://triton-lang.org/main/python-api/generated/triton.testing.Benchmark.html) in [benchmark/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/benchmark)
+
+   **We recommend using `triton.testing.do_bench_cudagraph` for kernel benchmarking**:
+
+   Compared to `triton.testing.do_bench`, `do_bench_cudagraph` provides:
+   - Reduced CPU overhead impact for more accurate kernel performance measurements
+   - Incorporation of PDL (Programmatic Dependent Launch) effects into individual kernel results
+   - More realistic performance data on PDL-supported architectures (SM >= 90)
+
 3. Run test suite
 
 ### FAQ

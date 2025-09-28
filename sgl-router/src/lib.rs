@@ -6,7 +6,7 @@ use std::collections::HashMap;
 pub mod core;
 pub mod data_connector;
 #[cfg(feature = "grpc-client")]
-pub mod grpc;
+pub mod grpc_client;
 pub mod mcp;
 pub mod metrics;
 pub mod middleware;
@@ -67,58 +67,47 @@ struct Router {
     decode_policy: Option<PolicyType>,
     max_concurrent_requests: usize,
     cors_allowed_origins: Vec<String>,
-    // Retry configuration
     retry_max_retries: u32,
     retry_initial_backoff_ms: u64,
     retry_max_backoff_ms: u64,
     retry_backoff_multiplier: f32,
     retry_jitter_factor: f32,
     disable_retries: bool,
-    // Circuit breaker configuration
     cb_failure_threshold: u32,
     cb_success_threshold: u32,
     cb_timeout_duration_secs: u64,
     cb_window_duration_secs: u64,
     disable_circuit_breaker: bool,
-    // Health check configuration
     health_failure_threshold: u32,
     health_success_threshold: u32,
     health_check_timeout_secs: u64,
     health_check_interval_secs: u64,
     health_check_endpoint: String,
-    // IGW (Inference Gateway) configuration
     enable_igw: bool,
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<usize>,
-    // Connection mode (determined from worker URLs)
     connection_mode: config::ConnectionMode,
-    // Model path for tokenizer
     model_path: Option<String>,
-    // Explicit tokenizer path
     tokenizer_path: Option<String>,
 }
 
 impl Router {
     /// Determine connection mode from worker URLs
     fn determine_connection_mode(worker_urls: &[String]) -> config::ConnectionMode {
-        // Only consider it gRPC if explicitly specified with grpc:// or grpcs:// scheme
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
                 return config::ConnectionMode::Grpc;
             }
         }
-        // Default to HTTP for all other cases (including http://, https://, or no scheme)
         config::ConnectionMode::Http
     }
 
-    /// Convert PyO3 Router to RouterConfig
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
-        // Convert policy helper function
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
             match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
@@ -131,14 +120,12 @@ impl Router {
                     max_tree_size: self.max_tree_size,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5, // Default value
+                    load_check_interval_secs: 5,
                 },
             }
         };
 
-        // Determine routing mode
         let mode = if self.enable_igw {
-            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
             RoutingMode::Regular {
                 worker_urls: vec![],
             }
@@ -155,10 +142,8 @@ impl Router {
             }
         };
 
-        // Convert main policy
         let policy = convert_policy(&self.policy);
 
-        // Service discovery configuration
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig {
                 enabled: true,
@@ -174,7 +159,6 @@ impl Router {
             None
         };
 
-        // Metrics configuration
         let metrics = match (self.prometheus_port, self.prometheus_host.as_ref()) {
             (Some(port), Some(host)) => Some(MetricsConfig {
                 port,
@@ -231,6 +215,7 @@ impl Router {
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
             history_backend: config::HistoryBackend::Memory,
+            oracle: None,
         })
     }
 }
@@ -250,7 +235,7 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
-        max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
+        max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         api_key = None,
         log_dir = None,
@@ -264,40 +249,35 @@ impl Router {
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
-        request_timeout_secs = 1800,  // Add configurable request timeout
-        request_id_headers = None,  // Custom request ID headers
-        pd_disaggregation = false,  // New flag for PD mode
+        request_timeout_secs = 1800,
+        request_id_headers = None,
+        pd_disaggregation = false,
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
         decode_policy = None,
         max_concurrent_requests = 256,
         cors_allowed_origins = vec![],
-        // Retry defaults
         retry_max_retries = 5,
         retry_initial_backoff_ms = 50,
         retry_max_backoff_ms = 30_000,
         retry_backoff_multiplier = 1.5,
         retry_jitter_factor = 0.2,
         disable_retries = false,
-        // Circuit breaker defaults
         cb_failure_threshold = 10,
         cb_success_threshold = 3,
         cb_timeout_duration_secs = 60,
         cb_window_duration_secs = 120,
         disable_circuit_breaker = false,
-        // Health check defaults
         health_failure_threshold = 3,
         health_success_threshold = 2,
         health_check_timeout_secs = 5,
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
-        // IGW defaults
         enable_igw = false,
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
-        // Tokenizer defaults
         model_path = None,
         tokenizer_path = None,
     ))]
@@ -360,17 +340,14 @@ impl Router {
         model_path: Option<String>,
         tokenizer_path: Option<String>,
     ) -> PyResult<Self> {
-        // Determine connection mode from worker URLs
         let mut all_urls = worker_urls.clone();
 
-        // Add prefill URLs if in PD mode
         if let Some(ref prefill_urls) = prefill_urls {
             for (url, _) in prefill_urls {
                 all_urls.push(url.clone());
             }
         }
 
-        // Add decode URLs if in PD mode
         if let Some(ref decode_urls) = decode_urls {
             all_urls.extend(decode_urls.clone());
         }
@@ -439,12 +416,10 @@ impl Router {
     }
 
     fn start(&self) -> PyResult<()> {
-        // Convert to RouterConfig and validate
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {}", e))
         })?;
 
-        // Validate the configuration
         router_config.validate().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "Configuration validation failed: {}",
@@ -452,7 +427,6 @@ impl Router {
             ))
         })?;
 
-        // Create service discovery config if enabled
         let service_discovery_config = if self.service_discovery {
             Some(service_discovery::ServiceDiscoveryConfig {
                 enabled: true,
@@ -469,7 +443,6 @@ impl Router {
             None
         };
 
-        // Create Prometheus config if enabled
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port.unwrap_or(29000),
             host: self
@@ -478,11 +451,9 @@ impl Router {
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
         });
 
-        // Use tokio runtime instead of actix-web System for better compatibility
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-        // Block on the async startup function
         runtime.block_on(async move {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),

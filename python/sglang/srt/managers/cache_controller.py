@@ -275,41 +275,15 @@ class HiCacheController:
                 and self.storage_config.tp_rank != 0
             )
 
-            if storage_backend == "file":
-                from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+            # Use storage backend factory for dynamic backend creation
+            from sglang.srt.mem_cache.storage import StorageBackendFactory
 
-                self.storage_backend = HiCacheFile(self.storage_config)
-            elif storage_backend == "nixl":
-                from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
-
-                self.storage_backend = HiCacheNixl()
-            elif storage_backend == "mooncake":
-                from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                    MooncakeStore,
+            try:
+                self.storage_backend = StorageBackendFactory.create_backend(
+                    storage_backend, self.storage_config, self.mem_pool_host
                 )
-
-                self.storage_backend = MooncakeStore(self.storage_config)
-            elif storage_backend == "hf3fs":
-                from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
-                    HiCacheHF3FS,
-                )
-
-                if self.mem_pool_host.layout == "page_first":
-                    bytes_per_page = (
-                        mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
-                    )
-                elif self.mem_pool_host.layout == "layer_first":
-                    bytes_per_page = (
-                        mem_pool_host.get_size_per_token() * mem_pool_host.page_size
-                    )
-                dtype = mem_pool_host.dtype
-                self.storage_backend = HiCacheHF3FS.from_env_config(
-                    bytes_per_page, dtype, self.storage_config
-                )
-            else:
-                raise NotImplementedError(
-                    f"Unsupported storage backend: {storage_backend}"
-                )
+            except ValueError as e:
+                raise ValueError(f"Failed to create storage backend: {e}") from e
 
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
@@ -462,7 +436,6 @@ class HiCacheController:
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
-        self.mem_pool_host.protect_write(host_indices)
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -486,7 +459,6 @@ class HiCacheController:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
-            self.mem_pool_host.complete_io(op.host_indices)
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -510,7 +482,6 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
-        self.mem_pool_host.protect_load(host_indices)
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -555,7 +526,6 @@ class HiCacheController:
                     self.io_backend,
                 )
                 producer_event.complete(i)
-            self.mem_pool_host.complete_io(op.host_indices)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
@@ -573,29 +543,16 @@ class HiCacheController:
         )
         return producer_id
 
-    def evict_device(
-        self, device_indices: torch.Tensor, host_indices: torch.Tensor
-    ) -> int:
-        if self.mem_pool_host.is_synced(host_indices):
-            self.mem_pool_device_allocator.free(device_indices)
-            self.mem_pool_host.update_backup(host_indices)
-            return len(device_indices)
-        else:
-            raise ValueError(
-                f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
-            )
+    def evict_device(self, device_indices: torch.Tensor) -> int:
+        self.mem_pool_device_allocator.free(device_indices)
+        return len(device_indices)
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:
             raise ValueError("Other eviction policies are not supported yet.")
 
-        if self.mem_pool_host.is_backup(host_indices):
-            self.mem_pool_host.free(host_indices)
-            return len(host_indices)
-        else:
-            raise ValueError(
-                f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
-            )
+        self.mem_pool_host.free(host_indices)
+        return len(host_indices)
 
     def prefetch(
         self,

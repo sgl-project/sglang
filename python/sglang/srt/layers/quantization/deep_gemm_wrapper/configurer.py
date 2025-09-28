@@ -1,7 +1,5 @@
 import logging
 
-import torch
-
 from sglang.srt.utils import get_bool_env_var, get_device_sm, is_blackwell
 
 logger = logging.getLogger(__name__)
