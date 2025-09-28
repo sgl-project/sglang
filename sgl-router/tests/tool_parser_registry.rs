@@ -24,9 +24,9 @@ async fn test_openai_models_use_json() {
     for model in models {
         let parser = registry.get_parser(model).unwrap();
         let test_input = r#"{"name": "test", "arguments": {}}"#;
-        let result = parser.parse_complete(test_input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
+        let (_normal_text, tools) = parser.parse_complete(test_input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "test");
     }
 }
 
@@ -38,8 +38,8 @@ async fn test_anthropic_models_use_json() {
     for model in models {
         let parser = registry.get_parser(model).unwrap();
         let test_input = r#"{"name": "test", "arguments": {}}"#;
-        let result = parser.parse_complete(test_input).await.unwrap();
-        assert_eq!(result.len(), 1);
+        let (_normal_text, tools) = parser.parse_complete(test_input).await.unwrap();
+        assert_eq!(tools.len(), 1);
     }
 }
 
@@ -51,9 +51,9 @@ async fn test_mistral_models() {
     for model in models {
         let parser = registry.get_parser(model).unwrap();
         let test_input = r#"[TOOL_CALLS] [{"name": "test", "arguments": {}}]"#;
-        let result = parser.parse_complete(test_input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
+        let (_normal_text, tools) = parser.parse_complete(test_input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "test");
     }
 }
 
@@ -67,9 +67,9 @@ async fn test_qwen_models() {
         let test_input = r#"<tool_call>
 {"name": "test", "arguments": {}}
 </tool_call>"#;
-        let result = parser.parse_complete(test_input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
+        let (_normal_text, tools) = parser.parse_complete(test_input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "test");
     }
 }
 
@@ -80,22 +80,22 @@ async fn test_llama_model_variants() {
     // Llama 4 uses pythonic
     let parser = registry.get_parser("llama-4-70b").unwrap();
     let test_input = r#"[get_weather(city="NYC")]"#;
-    let result = parser.parse_complete(test_input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "get_weather");
+    let (_normal_text, tools) = parser.parse_complete(test_input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "get_weather");
 
     // Llama 3.2 uses python_tag
     let parser = registry.get_parser("llama-3.2-8b").unwrap();
     let test_input = r#"<|python_tag|>{"name": "test", "arguments": {}}"#;
-    let result = parser.parse_complete(test_input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "test");
+    let (_normal_text, tools) = parser.parse_complete(test_input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "test");
 
     // Other Llama models use JSON
     let parser = registry.get_parser("llama-2-70b").unwrap();
     let test_input = r#"{"name": "test", "arguments": {}}"#;
-    let result = parser.parse_complete(test_input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = parser.parse_complete(test_input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 }
 
 #[tokio::test]
@@ -105,9 +105,9 @@ async fn test_deepseek_models() {
     // DeepSeek uses pythonic format (simplified, v3 would need custom parser)
     let parser = registry.get_parser("deepseek-coder").unwrap();
     let test_input = r#"[function(arg="value")]"#;
-    let result = parser.parse_complete(test_input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "function");
+    let (_normal_text, tools) = parser.parse_complete(test_input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "function");
 }
 
 #[tokio::test]
@@ -117,16 +117,15 @@ async fn test_unknown_model_fallback() {
     // Unknown models should fall back to JSON parser
     let parser = registry.get_parser("unknown-model-xyz").unwrap();
     let test_input = r#"{"name": "fallback", "arguments": {}}"#;
-    let result = parser.parse_complete(test_input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "fallback");
+    let (_normal_text, tools) = parser.parse_complete(test_input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "fallback");
 }
 
 #[tokio::test]
 async fn test_pattern_specificity() {
     let registry = ParserRegistry::new();
 
-    // Test that more specific patterns take precedence
     // llama-4* should match before llama-*
     let parser = registry.get_parser("llama-4-70b").unwrap();
     assert!(parser.detect_format(r#"[test_function(x=1)]"#)); // Pythonic format
@@ -139,7 +138,6 @@ async fn test_pattern_specificity() {
 async fn test_real_world_model_outputs() {
     let registry = ParserRegistry::new();
 
-    // Test with realistic outputs from different models
     let test_cases = vec![
         (
             "gpt-4",
@@ -183,10 +181,10 @@ The weather information has been requested."#,
 
     for (model, output, expected_name) in test_cases {
         let parser = registry.get_parser(model).unwrap();
-        let result = parser.parse_complete(output).await.unwrap();
-        assert!(!result.is_empty(), "No tools parsed for model {}", model);
+        let (_normal_text, tools) = parser.parse_complete(output).await.unwrap();
+        assert!(!tools.is_empty(), "No tools parsed for model {}", model);
         assert_eq!(
-            result[0].function.name, expected_name,
+            tools[0].function.name, expected_name,
             "Wrong function name for model {}",
             model
         );
