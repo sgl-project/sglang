@@ -619,11 +619,14 @@ class ServerArgs:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
             # For cuda graphs
             reserved_mem += self.cuda_graph_max_bs * 1.5
-            # Some adjustment for large parallel size
+            # Some adjustments for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
             if self.kv_cache_dtype in ["fp8_e4m3", "fp8_e5m2"]:
                 reserved_mem += 4 * 1024
+
+            if gpu_mem > 60 * 1024:
+                reserved_mem = min(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
                 if self.speculative_algorithm == "STANDALONE":
