@@ -39,6 +39,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.utils import print_warning_once
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -261,7 +262,7 @@ def download_weights_from_hf(
         str: The path to the downloaded model weights.
     """
     # Check if it's a local directory and has weight files
-    if os.path.isdir(model_name_or_path):
+    if is_in_ci() and os.path.isdir(model_name_or_path):
         # Verify that the local directory contains weight files matching the allowed patterns
         local_weight_files = []
         for pattern in allow_patterns:
