@@ -65,13 +65,12 @@ impl PythonicParser {
     fn parse_tool_call_block(&self, block: &str) -> ToolParserResult<Vec<ToolCall>> {
         let expr = parse_python_expression(block)?;
         match expr {
-            Expr::List(list_expr) => {
-                let mut calls = Vec::with_capacity(list_expr.elts.len());
-                for (idx, call_expr) in list_expr.elts.into_iter().enumerate() {
-                    calls.push(build_tool_call(call_expr, idx)?);
-                }
-                Ok(calls)
-            }
+            Expr::List(list_expr) => list_expr
+                .elts
+                .into_iter()
+                .enumerate()
+                .map(|(idx, call_expr)| build_tool_call(call_expr, idx))
+                .collect(),
             _ => Err(ToolParserError::ParsingFailed(
                 "Expected a list of function calls in pythonic tool call".to_string(),
             )),
@@ -209,34 +208,10 @@ fn build_tool_call(expr: Expr, index: usize) -> ToolParserResult<ToolCall> {
 fn expression_to_json(expr: &Expr) -> ToolParserResult<Value> {
     match expr {
         Expr::Constant(expr_constant) => constant_to_json(&expr_constant.value),
-        Expr::List(list_expr) => {
-            let mut items = Vec::with_capacity(list_expr.elts.len());
-            for element in &list_expr.elts {
-                items.push(expression_to_json(element)?);
-            }
-            Ok(Value::Array(items))
-        }
-        Expr::Tuple(tuple_expr) => {
-            let mut items = Vec::with_capacity(tuple_expr.elts.len());
-            for element in &tuple_expr.elts {
-                items.push(expression_to_json(element)?);
-            }
-            Ok(Value::Array(items))
-        }
+        Expr::List(list_expr) => collect_sequence(&list_expr.elts).map(Value::Array),
+        Expr::Tuple(tuple_expr) => collect_sequence(&tuple_expr.elts).map(Value::Array),
         Expr::Dict(dict_expr) => {
-            let mut map = Map::with_capacity(dict_expr.keys.len());
-            for (key_expr, value_expr) in dict_expr.keys.iter().zip(dict_expr.values.iter()) {
-                let key_expr = key_expr.as_ref().ok_or_else(|| {
-                    ToolParserError::ParsingFailed(
-                        "pythonic tool calls do not support **kwargs".to_string(),
-                    )
-                })?;
-                let key_value = expression_to_json(key_expr)?;
-                let key = value_to_key_string(key_value)?;
-                let value_json = expression_to_json(value_expr)?;
-                map.insert(key, value_json);
-            }
-            Ok(Value::Object(map))
+            collect_dict(&dict_expr.keys, &dict_expr.values).map(Value::Object)
         }
         Expr::UnaryOp(unary_expr) => match unary_expr.op {
             UnaryOp::USub => match unary_expr.operand.as_ref() {
@@ -263,29 +238,15 @@ fn constant_to_json(constant: &Constant) -> ToolParserResult<Value> {
     match constant {
         Constant::None => Ok(Value::Null),
         Constant::Bool(b) => Ok(Value::Bool(*b)),
-        Constant::Int(value) => {
-            if let Some(i) = value.to_i64() {
-                Ok(Value::Number(Number::from(i)))
-            } else if let Some(u) = value.to_u64() {
-                Ok(Value::Number(Number::from(u)))
-            } else {
-                Ok(Value::String(value.to_string()))
-            }
-        }
+        Constant::Int(value) => Ok(integer_constant_to_value(value, false)),
         Constant::Float(f) => Number::from_f64(*f).map(Value::Number).ok_or_else(|| {
             ToolParserError::ParsingFailed(
                 "Invalid float literal in pythonic tool call".to_string(),
             )
         }),
         Constant::Str(s) => Ok(Value::String(s.clone())),
-        Constant::Bytes(bytes) => Ok(Value::String(String::from_utf8_lossy(bytes).into())),
-        Constant::Tuple(values) => {
-            let mut items = Vec::with_capacity(values.len());
-            for value in values {
-                items.push(constant_to_json(value)?);
-            }
-            Ok(Value::Array(items))
-        }
+        Constant::Bytes(bytes) => Ok(Value::String(String::from_utf8_lossy(bytes).into_owned())),
+        Constant::Tuple(values) => constant_tuple_to_array(values).map(Value::Array),
         Constant::Ellipsis | Constant::Complex { .. } => Err(ToolParserError::ParsingFailed(
             "Unsupported literal in pythonic tool call".to_string(),
         )),
@@ -294,20 +255,7 @@ fn constant_to_json(constant: &Constant) -> ToolParserResult<Value> {
 
 fn negate_constant(constant: &Constant) -> ToolParserResult<Value> {
     match constant {
-        Constant::Int(value) => {
-            if let Some(i) = value.to_i64() {
-                Ok(Value::Number(Number::from(-i)))
-            } else if let Some(u) = value.to_u64() {
-                let neg = -(u as i128);
-                if neg >= i64::MIN as i128 && neg <= i64::MAX as i128 {
-                    Ok(Value::Number(Number::from(neg as i64)))
-                } else {
-                    Ok(Value::String(format!("-{}", value)))
-                }
-            } else {
-                Ok(Value::String(format!("-{}", value)))
-            }
-        }
+        Constant::Int(value) => Ok(integer_constant_to_value(value, true)),
         Constant::Float(f) => Number::from_f64(-f).map(Value::Number).ok_or_else(|| {
             ToolParserError::ParsingFailed(
                 "Invalid float literal in pythonic tool call".to_string(),
@@ -329,6 +277,56 @@ fn value_to_key_string(value: Value) -> ToolParserResult<String> {
             "Unsupported key type in pythonic tool call: {:?}",
             other
         ))),
+    }
+}
+
+fn collect_sequence(elements: &[Expr]) -> ToolParserResult<Vec<Value>> {
+    elements.iter().map(expression_to_json).collect()
+}
+
+fn collect_dict(keys: &[Option<Expr>], values: &[Expr]) -> ToolParserResult<Map<String, Value>> {
+    let mut map = Map::with_capacity(keys.len());
+    for (key_expr, value_expr) in keys.iter().zip(values.iter()) {
+        let key_expr = key_expr.as_ref().ok_or_else(|| {
+            ToolParserError::ParsingFailed(
+                "pythonic tool calls do not support **kwargs".to_string(),
+            )
+        })?;
+        let key_value = expression_to_json(key_expr)?;
+        let key = value_to_key_string(key_value)?;
+        let value_json = expression_to_json(value_expr)?;
+        map.insert(key, value_json);
+    }
+    Ok(map)
+}
+
+fn constant_tuple_to_array(values: &[Constant]) -> ToolParserResult<Vec<Value>> {
+    values.iter().map(constant_to_json).collect()
+}
+
+fn integer_constant_to_value<T>(value: &T, negate: bool) -> Value
+where
+    T: ToPrimitive + std::fmt::Display,
+{
+    if let Some(mut i) = value.to_i64() {
+        if negate {
+            i = -i;
+        }
+        return Value::Number(Number::from(i));
+    }
+
+    if negate {
+        if let Some(u) = value.to_u64() {
+            if u <= i64::MAX as u64 {
+                return Value::Number(Number::from(-(u as i64)));
+            }
+            return Value::String(format!("-{}", value));
+        }
+        Value::String(format!("-{}", value))
+    } else if let Some(u) = value.to_u64() {
+        Value::Number(Number::from(u))
+    } else {
+        Value::String(value.to_string())
     }
 }
 
