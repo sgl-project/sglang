@@ -20,7 +20,7 @@ import pickle
 import signal
 import sys
 import threading
-from enum import Enum
+from enum import Enum, auto
 from functools import partialmethod
 from multiprocessing import shared_memory
 from typing import Any, Dict, List
@@ -55,9 +55,9 @@ logger = logging.getLogger(__name__)
 
 
 class RouterType(Enum):
-    TOKENIZER_ROUTER = "tokenizer router"
-    DETOKENIZER_MANAGER = "detokenizer manager"
-    DETOKENIZER_ROUTER = "detokenizer router"
+    TOKENIZER_ROUTER = auto()
+    DETOKENIZER_MANAGER = auto()
+    DETOKENIZER_ROUTER = auto()
 
 
 class SocketMapping:
