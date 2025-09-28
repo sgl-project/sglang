@@ -30,7 +30,7 @@ from sglang.test.simple_eval_common import ChatCompletionSampler
 
 # Initialize evaluator with HuggingFace dataset
 eval_obj = LongBenchV2Eval(
-    data_source="zai-org/LongBench-v2",
+    data_source="THUDM/LongBench-v2",
     num_examples=10,  # Limit for testing
     num_threads=4
 )
@@ -77,7 +77,7 @@ python -m sglang.test.run_eval \
 ```python
 # Evaluate only specific task categories
 eval_obj = LongBenchV2Eval(
-    data_source="zai-org/LongBench-v2",
+    data_source="THUDM/LongBench-v2",
     categories=[
         "single_document_qa",
         "code_repo_understanding"
@@ -90,7 +90,7 @@ eval_obj = LongBenchV2Eval(
 ```python
 # Focus on medium-length contexts
 eval_obj = LongBenchV2Eval(
-    data_source="zai-org/LongBench-v2",
+    data_source="THUDM/LongBench-v2",
     min_context_length=32000,  # tokens
     max_context_length=128000  # tokens
 )

@@ -64,7 +64,7 @@ def run_eval(args):
         from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
 
         # Default to HuggingFace dataset, can be overridden with --dataset-path
-        data_source = getattr(args, "dataset_path", "zai-org/LongBench-v2")
+        data_source = getattr(args, "dataset_path", "THUDM/LongBench-v2")
         categories = getattr(args, "categories", None)
         if categories:
             categories = categories.split(",")

@@ -107,7 +107,7 @@ class LongBenchV2Eval(Eval):
 
     def __init__(
         self,
-        data_source: str = "zai-org/LongBench-v2",
+        data_source: str = "THUDM/LongBench-v2",
         num_examples: Optional[int] = None,
         num_threads: int = 1,
         n_repeats: int = 1,
