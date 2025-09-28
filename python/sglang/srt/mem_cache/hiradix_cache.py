@@ -1,8 +1,8 @@
 import heapq
+import json
 import logging
 import threading
 import time
-from queue import Queue
 from typing import List, Optional
 
 import torch
@@ -150,71 +150,38 @@ class HiRadixCache(RadixCache):
             tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token)
         """
         # Parse extra config JSON if provided
-        extra_config = None
+        extra_config = {}
         if storage_backend_extra_config:
             try:
-                import json
-
                 extra_config = json.loads(storage_backend_extra_config)
             except Exception as e:
                 logger.error(f"Invalid backend extra config JSON: {e}")
-                # Cannot continue if extra config is invalid
-                raise e
+                raise
 
-        # Extract parameters from extra_config if they exist, otherwise use defaults
-        prefetch_threshold = 256  # tokens
-        prefetch_timeout_base = (
-            1  # seconds. A conservative estimate for scheduling overhead
+        prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
+        prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)
+        prefetch_timeout_per_ki_token = extra_config.pop(
+            "prefetch_timeout_per_ki_token", 0.25
         )
-        prefetch_timeout_per_ki_token = (
-            0.25  # seconds. A conservative estimate for data transfer overhead
-        )
-        if extra_config is not None:
-            prefetch_threshold = extra_config.pop(
-                "prefetch_threshold", prefetch_threshold
-            )
-            prefetch_timeout_base = extra_config.pop(
-                "prefetch_timeout_base", prefetch_timeout_base
-            )
-            prefetch_timeout_per_ki_token = extra_config.pop(
-                "prefetch_timeout_per_ki_token", prefetch_timeout_per_ki_token
-            )
 
-        # Validate prefetch_threshold is an integer
         if not isinstance(prefetch_threshold, int):
-            logger.warning(
-                f"prefetch_threshold must be an integer, got {type(prefetch_threshold).__name__}. Converting to int."
-            )
             raise ValueError(
-                f"prefetch_threshold must be an integer, got {type(prefetch_threshold).__name__}"
+                f"prefetch_threshold must be int, got {type(prefetch_threshold).__name__}"
             )
-        prefetch_threshold = int(prefetch_threshold)
-
-        # Validate prefetch_timeout_base is a float
         if not isinstance(prefetch_timeout_base, (int, float)):
-            logger.warning(
-                f"prefetch_timeout_base must be a number, got {type(prefetch_timeout_base).__name__}. Converting to float."
-            )
             raise ValueError(
-                f"prefetch_timeout_base must be a number, got {type(prefetch_timeout_base).__name__}"
+                f"prefetch_timeout_base must be number, got {type(prefetch_timeout_base).__name__}"
             )
-        prefetch_timeout_base = float(prefetch_timeout_base)
-
-        # Validate prefetch_timeout_per_ki_token is a float
         if not isinstance(prefetch_timeout_per_ki_token, (int, float)):
-            logger.warning(
-                f"prefetch_timeout_per_ki_token must be a number, got {type(prefetch_timeout_per_ki_token).__name__}. Converting to float."
-            )
             raise ValueError(
-                f"prefetch_timeout_per_ki_token must be a number, got {type(prefetch_timeout_per_ki_token).__name__}"
+                f"prefetch_timeout_per_ki_token must be number, got {type(prefetch_timeout_per_ki_token).__name__}"
             )
-        prefetch_timeout_per_ki_token = float(prefetch_timeout_per_ki_token)
 
         return (
             extra_config,
             prefetch_threshold,
-            prefetch_timeout_base,
-            prefetch_timeout_per_ki_token,
+            float(prefetch_timeout_base),
+            float(prefetch_timeout_per_ki_token),
         )
 
     def reset(self):
