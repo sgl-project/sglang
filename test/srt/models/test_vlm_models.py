@@ -81,7 +81,7 @@ class TestVLMModels(CustomTestCase):
         model = "openai_compatible"
         tp = 1
         tasks = "mmmu_val"
-        batch_size = 2
+        batch_size = 32
         log_suffix = "openai_compatible"
         os.makedirs(output_path, exist_ok=True)
 
