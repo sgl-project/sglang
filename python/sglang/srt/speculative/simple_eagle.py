@@ -159,6 +159,10 @@ class SimpleEagleWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+        
+    def clear_cache_pool(self):
+        self.model_runner.req_to_token_pool.clear()
+        self.model_runner.token_to_kv_pool_allocator.clear()
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
