@@ -51,7 +51,6 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-
 # Define constants
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -1166,14 +1165,11 @@ class ServerArgs:
 
             # Check TP size
             if self.tp_size > 1:
-                raise ValueError(
-                    "Currently only TP size 1 is supported for deterministic inference."
+                os.environ["NCCL_ALGO"] = "allreduce:tree"
+                self.disable_custom_all_reduce = True
+                logger.warning(
+                    "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                 )
-
-            # Warnings on MoE models
-            logger.warning(
-                "Currently deterministic inference is only tested on dense models. Please be cautious when using it on MoE models."
-            )
 
     def _handle_other_validations(self):
         pass
@@ -2214,9 +2210,12 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix"],
+            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic"],
             default=ServerArgs.hicache_storage_backend,
-            help="The storage backend for hierarchical KV cache.",
+            help="The storage backend for hierarchical KV cache. "
+            "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
+            "For dynamic backend, use --hicache-storage-backend-extra-config to specify: "
+            "backend_name (custom name), module_path (Python module path), class_name (backend class name).",
         )
         parser.add_argument(
             "--hicache-storage-prefetch-policy",
