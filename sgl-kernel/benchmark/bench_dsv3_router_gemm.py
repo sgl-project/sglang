@@ -13,11 +13,17 @@ import triton
 import triton.testing
 from sgl_kernel import dsv3_router_gemm
 
+# CI environment uses simplified parameters
+if IS_CI:
+    num_tokens_vals = [1, 2]  # Only test 2 values in CI
+else:
+    num_tokens_vals = [i + 1 for i in range(16)]  # Test 1-16 in full mode
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["num_tokens"],
-        x_vals=[i + 1 for i in range(16)],
+        x_vals=num_tokens_vals,
         x_log=False,
         line_arg="impl",
         line_vals=["torch-256", "sgl-kernel-256", "torch-384", "sgl-kernel-384"],
