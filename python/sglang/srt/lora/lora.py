@@ -155,17 +155,10 @@ class LoRAAdapter(nn.Module):
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
-        logger.info(f"=== DEBUG: normalize_gate_up_proj called for adapter {self.uid} ===")
-        logger.info(f"Weight names: {[name for name in weight_names if 'gate' in name or 'up' in name]}")
-        
         for weight_name in weight_names:
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
-                logger.info(f"Processing gate_proj: {weight_name}")
-                logger.info(f"  -> up_name: {up_name}")
-                logger.info(f"  -> gate_up_name: {gate_up_name}")
-                logger.info(f"  -> up_name in weights: {up_name in weights}")
                 
                 if up_name not in weights:
                     weights[up_name] = torch.zeros_like(weights[weight_name])
@@ -175,16 +168,9 @@ class LoRAAdapter(nn.Module):
                         f"or consider implementing custom initialization logic for other backends."
                     )
                 
-                # Log shapes before concatenation
-                gate_shape = weights[weight_name].shape
-                up_shape = weights[up_name].shape
-                logger.info(f"  -> gate_proj shape: {gate_shape}")
-                logger.info(f"  -> up_proj shape: {up_shape}")
-                
                 weights[gate_up_name] = torch.cat(
                     (weights[weight_name], weights[up_name]), 0
                 )
-                logger.info(f"  -> gate_up_proj shape: {weights[gate_up_name].shape}")
                 
                 weights.pop(weight_name)
                 if up_name in weights:
@@ -192,13 +178,6 @@ class LoRAAdapter(nn.Module):
             elif "gate_up_proj" in weight_name:
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
                 gate_up_name = weight_name
-                logger.info(f"Processing existing gate_up_proj: {weight_name}")
                 if "lora_A" in weight_name:
-                    old_shape = weights[gate_up_name].shape
                     weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
-                    logger.info(f"  -> repeated lora_A from {old_shape} to {weights[gate_up_name].shape}")
                 # else: no-op as LoRA B weight is already stacked.
-        
-        logger.info(f"=== DEBUG: normalize_gate_up_proj completed ===")
-        final_weights = [name for name in weights.keys() if 'gate' in name or 'up' in name]
-        logger.info(f"Final weight names: {final_weights}")
