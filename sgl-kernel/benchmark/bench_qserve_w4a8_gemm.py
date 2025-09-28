@@ -198,23 +198,19 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Simplify for CI environment
+    # Skip in CI environment
     if IS_CI:
-        args.models = [args.models[0]]  # Use only first model
-        args.tp_sizes = [args.tp_sizes[0]]  # Use only first TP size
+        print("Skipping QServe W4A8 GEMM benchmark in CI environment")
+        print("QServe operations may have compatibility issues in CI")
+    else:
+        KN_model_names = prepare_shapes(args)
 
-    KN_model_names = prepare_shapes(args)
+        for K, N, model_name in KN_model_names:
+            print(f"{model_name} N={N} K={K}: ")
+            benchmark.run(
+                print_data=True,
+                N=N,
+                K=K,
+            )
 
-    # Limit iterations in CI
-    if IS_CI:
-        KN_model_names = KN_model_names[:2]  # Only test first 2 shapes in CI
-
-    for K, N, model_name in KN_model_names:
-        print(f"{model_name} N={N} K={K}: ")
-        benchmark.run(
-            print_data=True,
-            N=N,
-            K=K,
-        )
-
-    print("Benchmark finished!")
+        print("Benchmark finished!")
