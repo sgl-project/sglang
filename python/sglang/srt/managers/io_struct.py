@@ -84,6 +84,8 @@ class GenerateReqInput:
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
     rid: Optional[Union[List[str], str]] = None
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[Union[List[str], str]] = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -132,7 +134,7 @@ class GenerateReqInput:
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
 
-    # Label for the request
+    # (Deprecated, please use custom_labels) Label for the request
     label: Optional[str] = None
 
     # Priority for the request
@@ -140,6 +142,9 @@ class GenerateReqInput:
 
     # Image gen grpc migration
     return_bytes: bool = False
+
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -567,6 +572,7 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: List[int]
     # Whether to stream output
     stream: bool
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -602,8 +608,14 @@ class TokenizedGenerateReqInput:
     # Priority for the request
     priority: Optional[int] = None
 
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[str] = None
+
     # Image gen grpc migration
     return_bytes: bool = False
+
+    # tracing context
+    trace_context: Optional[Dict] = None
 
 
 @dataclass
@@ -650,9 +662,14 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
+
+    # tracing context
+    trace_context: Optional[Dict] = None
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -754,6 +771,8 @@ class TokenizedEmbeddingReqInput:
     data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
+    # Priority for the request
+    priority: Optional[int] = None
 
 
 @dataclass
@@ -1021,6 +1040,44 @@ class UpdateWeightsFromTensorReqOutput:
 
 
 @dataclass
+class InitWeightsSendGroupForRemoteInstanceReqInput:
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The rank in the communication group
+    group_rank: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_send_group"
+    # The backend
+    backend: str = "nccl"
+
+
+@dataclass
+class InitWeightsSendGroupForRemoteInstanceReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class SendWeightsToRemoteInstanceReqInput:
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The group name
+    group_name: str = "weight_send_group"
+
+
+@dataclass
+class SendWeightsToRemoteInstanceReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsUpdateGroupReqInput:
     # The master address
     master_address: str
@@ -1038,6 +1095,17 @@ class InitWeightsUpdateGroupReqInput:
 
 @dataclass
 class InitWeightsUpdateGroupReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    group_name: str = "weight_update_group"
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqOutput:
     success: bool
     message: str
 
@@ -1330,3 +1398,21 @@ class BlockReqType(Enum):
 @dataclass
 class BlockReqInput:
     type: BlockReqType
+
+
+@dataclass
+class GetLoadReqInput:
+    pass
+
+
+@dataclass
+class GetLoadReqOutput:
+    dp_rank: int
+    num_reqs: int
+    num_waiting_reqs: int
+    num_tokens: int
+
+
+@dataclass
+class WatchLoadUpdateReq:
+    loads: List[GetLoadReqOutput]

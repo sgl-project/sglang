@@ -105,10 +105,13 @@ def remove_suffix(text: str, suffix: str) -> str:
 
 
 def get_auth_headers() -> Dict[str, str]:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        return {"Authorization": f"Bearer {api_key}"}
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    if openai_api_key:
+        return {"Authorization": f"Bearer {openai_api_key}"}
     else:
+        api_key = os.environ.get("API_KEY")
+        if api_key:
+            return {"Authorization": f"{api_key}"}
         return {}
 
 
@@ -205,6 +208,10 @@ async def async_request_openai_completions(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
+
+        if request_func_input.image_data:
+            payload.update({"image_data": request_func_input.image_data})
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
@@ -1107,7 +1114,8 @@ def sample_sharegpt_requests(
                 add_generation_prompt=True,
                 tokenize=False,
             )
-            prompt = prompt.replace(tokenizer.bos_token, "")
+            if tokenizer.bos_token:
+                prompt = prompt.replace(tokenizer.bos_token, "")
 
         prompt_token_ids = tokenizer.encode(prompt)
         completion = dataset[i][1]
@@ -1755,7 +1763,9 @@ async def benchmark(
         pbar.close()
 
     if "sglang" in backend:
-        server_info = requests.get(base_url + "/get_server_info")
+        server_info = requests.get(
+            base_url + "/get_server_info", headers=get_auth_headers()
+        )
         if server_info.status_code == 200:
             server_info_json = server_info.json()
             if "decode" in server_info_json:

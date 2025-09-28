@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod mock_mcp_server;
+pub mod mock_openai_server;
 pub mod mock_worker;
 pub mod test_app;
 
@@ -70,7 +71,6 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
 
         let content = response.bytes().expect("Failed to read tokenizer content");
 
-        // Verify we got actual JSON content
         if content.len() < 100 {
             panic!("Downloaded content too small: {} bytes", content.len());
         }
