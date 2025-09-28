@@ -299,14 +299,37 @@ def download_weights_from_hf(
                     "Failed to find local snapshot in default HF cache: %s", e
                 )
 
-        # If local snapshot exists, return it directly and skip download.
+        # If local snapshot exists, validate it contains at least one weight file
+        # matching allow_patterns before skipping download.
         if found_local_snapshot_dir is not None:
-            logger.info(
-                "Found local HF snapshot for %s at %s; skipping download.",
-                model_name_or_path,
-                found_local_snapshot_dir,
-            )
-            return found_local_snapshot_dir
+            local_weight_files: List[str] = []
+            try:
+                for pattern in allow_patterns:
+                    local_weight_files.extend(
+                        glob.glob(os.path.join(found_local_snapshot_dir, pattern))
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to scan local snapshot %s with patterns %s: %s",
+                    found_local_snapshot_dir,
+                    allow_patterns,
+                    e,
+                )
+                local_weight_files = []
+
+            if len(local_weight_files) > 0:
+                logger.info(
+                    "Found local HF snapshot for %s at %s; skipping download.",
+                    model_name_or_path,
+                    found_local_snapshot_dir,
+                )
+                return found_local_snapshot_dir
+            else:
+                logger.info(
+                    "Local HF snapshot at %s has no files matching %s; will attempt download.",
+                    found_local_snapshot_dir,
+                    allow_patterns,
+                )
 
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         # Before we download we look at that is available:
