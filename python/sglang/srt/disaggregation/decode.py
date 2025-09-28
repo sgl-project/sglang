@@ -568,10 +568,9 @@ class DecodePreallocQueue:
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
         if hasattr(self.req_to_token_pool, "rid_to_mamba_index_mapping"):
-            self.req_to_token_pool.alloc(1, [req])
+            req_pool_indices = self.req_to_token_pool.alloc(1, [req])
         else:
-            self.req_to_token_pool.alloc(1)
-        req_pool_indices = self.req_to_token_pool.alloc(1, [req])
+            req_pool_indices = self.req_to_token_pool.alloc(1)
 
         assert (
             req_pool_indices is not None
