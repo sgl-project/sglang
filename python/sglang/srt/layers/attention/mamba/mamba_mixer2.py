@@ -23,6 +23,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import set_weight_attrs
 
+# TODO Use the .causal_conv1d CUDA version of causal_conv1d
 from .causal_conv1d_triton import causal_conv1d_fn, causal_conv1d_update
 from .layernorm_gated import rms_norm_gated
 from .mamba import extra_groups_for_head_shards, mamba_v2_sharded_weight_loader
