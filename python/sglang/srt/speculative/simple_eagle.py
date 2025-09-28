@@ -159,7 +159,7 @@ class SimpleEagleWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
-        
+
     def clear_cache_pool(self):
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
@@ -364,6 +364,7 @@ class SimpleEagleWorker(TpModelWorker):
                 forward_batch.seq_lens + num_draft_tokens,
                 num_draft_tokens,
                 req_to_token.shape[-1],
+                self.page_size,
                 next_power_of_2(num_seqs),
             )
             forward_batch.spec_info.kv_indptr = kv_indptr
