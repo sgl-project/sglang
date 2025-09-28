@@ -42,22 +42,32 @@ impl Default for LlamaParser {
 
 #[async_trait]
 impl ToolParser for LlamaParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // First try with the configured python_tag parser
-        let result = self.json_parser.parse_complete(text).await?;
+        let (_json_normal_text, tools) = self.json_parser.parse_complete(text).await?;
 
-        if !result.is_empty() {
-            return Ok(result);
+        if !tools.is_empty() {
+            // Extract normal text before the python tag
+            // JsonParser doesn't preserve normal text for single start tokens, so we do it manually
+            let normal_text = if let Some(tag_pos) = text.find("<|python_tag|>") {
+                text[..tag_pos].to_string()
+            } else {
+                String::new()
+            };
+            return Ok((normal_text, tools));
         }
 
         // If no results and text starts with '{', try plain JSON
         if text.trim_start().starts_with('{') {
             // Create a temporary plain JSON parser
             let plain_parser = JsonParser::new();
-            return plain_parser.parse_complete(text).await;
+            let (_json_normal_text, tools) = plain_parser.parse_complete(text).await?;
+            // For plain JSON, don't extract normal text (consistent with JsonParser behavior)
+            return Ok((String::new(), tools));
         }
 
-        Ok(vec![])
+        // No tool calls found, return original text as normal text
+        Ok((text.to_string(), vec![]))
     }
 
     async fn parse_incremental(
@@ -99,10 +109,11 @@ mod tests {
         let parser = LlamaParser::new();
         let input = r#"<|python_tag|>{"name": "search", "arguments": {"query": "weather"}}"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "search");
-        assert!(result[0].function.arguments.contains("weather"));
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "search");
+        assert!(tool_calls[0].function.arguments.contains("weather"));
+        assert_eq!(normal_text, ""); // Pure python_tag with JSON should have no normal text
     }
 
     #[tokio::test]
@@ -110,9 +121,10 @@ mod tests {
         let parser = LlamaParser::new();
         let input = r#"{"name": "calculate", "arguments": {"x": 5, "y": 10}}"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "calculate");
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "calculate");
+        assert_eq!(normal_text, ""); // Pure JSON should have no normal text
     }
 
     #[tokio::test]
@@ -120,9 +132,10 @@ mod tests {
         let parser = LlamaParser::new();
         let input = r#"Let me help you with that. <|python_tag|>{"name": "get_time", "arguments": {"timezone": "UTC"}}"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_time");
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "get_time");
+        assert_eq!(normal_text, "Let me help you with that. ");
     }
 
     #[test]
@@ -141,15 +154,15 @@ mod tests {
         // Note: Llama 3.2 doesn't handle multiple calls well
         let input = r#"<|python_tag|>{"name": "func1", "arguments": {"x": 1}};"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
+        let (_normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
 
         // We expect this to either parse the first JSON object or fail gracefully
         // Since the semicolon makes it invalid JSON, it will likely return empty
         // This is acceptable as Llama 3.2 doesn't reliably support parallel calls
 
         // If it parses anything, it should be func1
-        if !result.is_empty() {
-            assert_eq!(result[0].function.name, "func1");
+        if !tool_calls.is_empty() {
+            assert_eq!(tool_calls[0].function.name, "func1");
         }
     }
 }
