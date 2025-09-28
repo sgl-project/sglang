@@ -24,7 +24,6 @@ from sglang.srt.utils import (
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
-    invoke_fused_moe_down_tma_kernel,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
@@ -83,6 +82,7 @@ def inplace_fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -111,6 +111,7 @@ def inplace_fused_experts(
         routed_scaling_factor,
         gemm1_alpha,
         gemm1_limit,
+        filter_expert,
     )
 
 
@@ -139,6 +140,7 @@ def inplace_fused_experts_fake(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ) -> None:
     pass
 
@@ -177,6 +179,7 @@ def outplace_fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -205,6 +208,7 @@ def outplace_fused_experts(
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        filter_expert=filter_expert,
     )
 
 
@@ -234,6 +238,7 @@ def outplace_fused_experts_fake(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -268,6 +273,10 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
+    filter_expert = (
+        moe_runner_config.num_experts is None
+        or moe_runner_config.num_experts != moe_runner_config.num_local_experts
+    )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         torch.ops.sglang.inplace_fused_experts(
@@ -295,6 +304,7 @@ def fused_experts(
             moe_runner_config.routed_scaling_factor,
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
+            filter_expert,
         )
         return hidden_states
     else:
@@ -324,6 +334,7 @@ def fused_experts(
             routed_scaling_factor=moe_runner_config.routed_scaling_factor,
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            filter_expert=filter_expert,
         )
 
 
@@ -373,6 +384,7 @@ def fused_experts_impl(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -422,8 +434,9 @@ def fused_experts_impl(
         and down_config.pop("USE_TMA", False)
     )
     topk = topk_ids.shape[1]
-    # 256 is the max BLOCK_SIZE_M
-    max_padded_tokens = min(M * topk, E) * (max_block_m - 1) if down_moe_use_tma else 0
+    max_padded_tokens = (
+        min(M * topk, E + 1) * (max_block_m - 1) if down_moe_use_tma else 0
+    )
     total_tokens = M * topk + max_padded_tokens
     cache = torch.empty(
         total_tokens * max(N, w2.shape[1]),
@@ -473,7 +486,7 @@ def fused_experts_impl(
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
 
         padded_tokens = (
-            min(tokens_in_chunk * topk, E) * (config["BLOCK_SIZE_M"] - 1)
+            min(tokens_in_chunk * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
             if down_moe_use_tma
             else 0
         )
@@ -518,6 +531,7 @@ def fused_experts_impl(
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
             c_sorted=down_moe_use_tma,
+            filter_expert=filter_expert,
         )
         if activation == "silu":
             if gemm1_alpha is not None:
@@ -544,12 +558,8 @@ def fused_experts_impl(
                 )
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
-        fused_moe_down_kernel = (
-            invoke_fused_moe_down_tma_kernel
-            if down_moe_use_tma
-            else invoke_fused_moe_kernel
-        )
-        fused_moe_down_kernel(
+
+        invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
             b2,
@@ -576,6 +586,9 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            a_use_tma=down_moe_use_tma,
+            b_use_tma=down_moe_use_tma,
+            filter_expert=filter_expert,
         )
 
         if routed_scaling_factor is None:
