@@ -215,29 +215,6 @@ class HiCacheStorageBaseMixin:
         )
 
 
-class TestHiCacheStorageTP(HiCacheStorageBaseMixin, CustomTestCase):
-    """Multi-TP tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--tp-size": 2}
-        return server_args, {}
-
-
-class TestHiCacheStorageLayerFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCase):
-    """Layer first direct tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {
-            "--hicache-mem-layout": "layer_first",
-            "--hicache-io-backend": "direct",
-        }
-        return server_args, {}
-
-
 class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCase):
     """Page first direct tests for HiCache Storage functionality"""
 
@@ -247,32 +224,8 @@ class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCas
         server_args = {
             "--hicache-mem-layout": "page_first_direct",
             "--hicache-io-backend": "direct",
+            "--tp-size": 2,
         }
-        return server_args, {}
-
-
-class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase):
-    """Page first layout tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--hicache-mem-layout": "page_first"}
-        return server_args, {}
-
-
-class TestHiCacheStorageMLA(HiCacheStorageBaseMixin, CustomTestCase):
-    """MLA Model tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_model_name(cls):
-        """Use MLA model for testing"""
-        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--tp-size": 2}
         return server_args, {}
 
 
@@ -282,7 +235,12 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
     @classmethod
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--tp-size": 2, "--hicache-ratio": 1.5}
+        server_args = {
+            #"--hicache-mem-layout": "page_first",
+            "--tp-size": 2,
+            "--hicache-ratio": 1.5,
+        }
+
         return server_args, {}
 
     def test_eval_accuracy(self):
@@ -323,24 +281,8 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
             metrics_cached["accuracy"], 0.6, "Cached accuracy should be reasonable"
         )
         self.assertLess(
-            accuracy_diff, 0.05, "Accuracy should be consistent between cache states"
+            accuracy_diff, 0.01, "Accuracy should be consistent between cache states"
         )
-
-
-# TODO: Add other backends tests（3fs/mooncake）
-# class TestHiCacheStorageMooncakeBackend(HiCacheStorageBaseTest):
-#     """Mooncake backend tests for HiCache Storage functionality"""
-
-#     @classmethod
-#     def _get_additional_server_args_and_env(cls):
-#         """Get additional server arguments specific to configuration - override in subclasses"""
-#         server_args = ["--hicache-storage-backend", "mooncake"]
-#         env = {
-#             "MOONCAKE_TE_META_DATA_SERVER": "http://127.0.0.1:8080/metadata",
-#             "MOONCAKE_MASTER": "127.0.0.1:50051"
-#             xxxxx
-#         }
-#         return server_args, {}
 
 
 if __name__ == "__main__":

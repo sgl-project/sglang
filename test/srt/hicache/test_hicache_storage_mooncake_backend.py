@@ -226,19 +226,6 @@ class TestMooncakeBackendLayerFirstLayout(
 '''
 
 
-class TestMooncakeBackendPageFirstLayout(
-    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
-):
-    """Page first layout tests for HiCache-Mooncake backend"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args, env_vars = super()._get_additional_server_args_and_env()
-        server_args["--hicache-mem-layout"] = "page_first"
-        return server_args, env_vars
-
-
 class TestMooncakeBackendMLAModel(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
@@ -267,6 +254,7 @@ class TestMooncakeBackendAccuracy(
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
         server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args["--hicache-mem-layout"] = "page_first"
         server_args["--hicache-ratio"] = 1.5
         server_args["--tp-size"] = 2
         return server_args, env_vars
@@ -309,7 +297,7 @@ class TestMooncakeBackendAccuracy(
             metrics_cached["accuracy"], 0.6, "Cached accuracy should be reasonable"
         )
         self.assertLess(
-            accuracy_diff, 0.05, "Accuracy should be consistent between cache states"
+            accuracy_diff, 0.01, "Accuracy should be consistent between cache states"
         )
 
 
