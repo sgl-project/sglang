@@ -404,7 +404,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             logprob_start_len=grpc_req.logprob_start_len or -1,
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
             stream=grpc_req.stream or False,
-            lora_path=grpc_req.lora_id if grpc_req.lora_id else None,
+            lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),
@@ -458,9 +458,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             repetition_penalty=grpc_params.repetition_penalty or 1.0,
             max_new_tokens=grpc_params.max_new_tokens or 128,
             min_new_tokens=grpc_params.min_new_tokens or 0,
-            stop=list(grpc_params.stop) if grpc_params.stop else None,
+            stop=list(grpc_params.stop) if grpc_params.stop else [],
             stop_token_ids=(
-                list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
+                list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else []
             ),
             skip_special_tokens=grpc_params.skip_special_tokens,
             spaces_between_special_tokens=grpc_params.spaces_between_special_tokens,
