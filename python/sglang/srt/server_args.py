@@ -623,7 +623,7 @@ class ServerArgs:
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
             if gpu_mem > 60 * 1024:
-                reserved_mem = min(reserved_mem, 10 * 1024)
+                reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
                 if self.speculative_algorithm == "STANDALONE":
