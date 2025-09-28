@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import os
-import queue
 import tempfile
 from collections import defaultdict
 from typing import (
@@ -261,48 +260,53 @@ def download_weights_from_hf(
     Returns:
         str: The path to the downloaded model weights.
     """
-    found_local_snapshot_dir = None
-    # Check custom cache_dir (if provided)
-    if cache_dir and not os.path.isdir(model_name_or_path):
-        try:
-            repo_folder = os.path.join(
-                cache_dir,
-                huggingface_hub.constants.REPO_ID_SEPARATOR.join(
-                    ["models", *model_name_or_path.split("/")]
-                ),
-            )
-            rev_to_use = revision
-            if not rev_to_use:
-                ref_main = os.path.join(repo_folder, "refs", "main")
-                if os.path.isfile(ref_main):
-                    with open(ref_main) as f:
-                        rev_to_use = f.read().strip()
-            if rev_to_use:
-                rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
-                if os.path.isdir(rev_dir):
+    if is_in_ci():
+        found_local_snapshot_dir = None
+        # Check custom cache_dir (if provided)
+        if cache_dir and not os.path.isdir(model_name_or_path):
+            try:
+                repo_folder = os.path.join(
+                    cache_dir,
+                    huggingface_hub.constants.REPO_ID_SEPARATOR.join(
+                        ["models", *model_name_or_path.split("/")]
+                    ),
+                )
+                rev_to_use = revision
+                if not rev_to_use:
+                    ref_main = os.path.join(repo_folder, "refs", "main")
+                    if os.path.isfile(ref_main):
+                        with open(ref_main) as f:
+                            rev_to_use = f.read().strip()
+                if rev_to_use:
+                    rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
+                    if os.path.isdir(rev_dir):
+                        found_local_snapshot_dir = rev_dir
+            except Exception as e:
+                logger.warning(
+                    "Failed to find local snapshot in custom cache_dir %s: %s",
+                    cache_dir,
+                    e,
+                )
+
+        # Check default HF cache as well
+        if not os.path.isdir(model_name_or_path):
+            try:
+                rev_dir = find_local_repo_dir(model_name_or_path, revision)
+                if rev_dir and os.path.isdir(rev_dir):
                     found_local_snapshot_dir = rev_dir
-        except Exception as e:
-            logger.warning(
-                "Failed to find local snapshot in custom cache_dir %s: %s", cache_dir, e
+            except Exception as e:
+                logger.warning(
+                    "Failed to find local snapshot in default HF cache: %s", e
+                )
+
+        # If local snapshot exists, return it directly and skip download.
+        if found_local_snapshot_dir is not None:
+            logger.info(
+                "Found local HF snapshot for %s at %s; skipping download.",
+                model_name_or_path,
+                found_local_snapshot_dir,
             )
-
-    # Check default HF cache as well
-    if not os.path.isdir(model_name_or_path):
-        try:
-            rev_dir = find_local_repo_dir(model_name_or_path, revision)
-            if rev_dir and os.path.isdir(rev_dir):
-                found_local_snapshot_dir = rev_dir
-        except Exception as e:
-            logger.warning("Failed to find local snapshot in default HF cache: %s", e)
-
-    # If local snapshot exists, return it directly and skip download.
-    if found_local_snapshot_dir is not None:
-        logger.info(
-            "Found local HF snapshot for %s at %s; skipping download.",
-            model_name_or_path,
-            found_local_snapshot_dir,
-        )
-        return found_local_snapshot_dir
+            return found_local_snapshot_dir
 
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         # Before we download we look at that is available:
