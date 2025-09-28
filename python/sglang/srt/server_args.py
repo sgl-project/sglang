@@ -619,6 +619,9 @@ class ServerArgs:
             # Some adjustment for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
+            if self.kv_cache_dtype in ["fp8_e4m3", "fp8_e5m2"]:
+                reserved_mem += 2 * 1024
+
             if self.speculative_algorithm is not None:
                 if self.speculative_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
