@@ -1,11 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import random
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from gguf import GGMLQuantizationType, GGUFReader, ReaderTensor, dequantize
 from huggingface_hub import snapshot_download
+from sgl_kernel import (
+    ggml_dequantize,
+    ggml_moe_a8,
+    ggml_moe_a8_vec,
+    ggml_moe_get_block_size,
+    ggml_mul_mat_a8,
+    ggml_mul_mat_vec_a8,
+)
 
 GGUF_SAMPLE = snapshot_download("Isotr0py/test-gguf-sample")
 GGUF_SAMPLE_MOE = snapshot_download("SzymonOzog/test-gguf-moe-sample")
@@ -56,6 +66,7 @@ QUANT_TYPES = [
     GGMLQuantizationType.Q5_0,
     GGMLQuantizationType.Q8_0,
 ]
+print(GGMLQuantizationType.IQ3_S)
 
 
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
@@ -73,7 +84,7 @@ def test_dequantize(
         ref_output = torch.tensor(
             dequantize(tensor.data, quant_type), device="cuda"
         ).to(dtype)
-        output = ops.ggml_dequantize(
+        output = ggml_dequantize(
             torch.tensor(tensor.data, device="cuda"), quant_type, *list(shape), dtype
         )
 
@@ -95,9 +106,7 @@ def test_mmvq(hidden_size: int, dtype: torch.dtype, quant_type: GGMLQuantization
         ref_output = x @ weight.T
 
         qweight = torch.tensor(tensor.data, device="cuda")
-        output = ops.ggml_mul_mat_vec_a8(qweight, x, quant_type, qweight.shape[0]).to(
-            dtype
-        )
+        output = ggml_mul_mat_vec_a8(qweight, x, quant_type, qweight.shape[0]).to(dtype)
 
         torch.testing.assert_close(output, ref_output, atol=1, rtol=1e-1)
 
@@ -137,7 +146,7 @@ def test_mmq(
         ref_output = x @ weight.T
 
         qweight = torch.tensor(tensor.data, device="cuda")
-        output = ops.ggml_mul_mat_a8(qweight, x, quant_type, qweight.shape[0])
+        output = ggml_mul_mat_a8(qweight, x, quant_type, qweight.shape[0])
         atols = {torch.half: 1, torch.bfloat16: 1.5, torch.float: 1.2}
         # test matrix has inputs centered around 0 and lower precision from
         # bfloat16 tends to accumulate and can greatly inflate rtol
@@ -146,3 +155,7 @@ def test_mmq(
         torch.testing.assert_close(
             output, ref_output, atol=atols[dtype], rtol=rtols[dtype]
         )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

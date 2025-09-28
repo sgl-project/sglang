@@ -116,6 +116,14 @@ from sgl_kernel.moe import (
     prepare_moe_input,
     topk_softmax,
 )
+from sgl_kernel.quantization import (
+    ggml_dequantize,
+    ggml_moe_a8,
+    ggml_moe_a8_vec,
+    ggml_moe_get_block_size,
+    ggml_mul_mat_a8,
+    ggml_mul_mat_vec_a8,
+)
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_mask_logits,
