@@ -95,14 +95,6 @@ class CommonKVManager(BaseKVManager):
     def _bind_server_socket(self):
         self.server_socket.bind(format_tcp_address(self.local_ip, self.rank_port))
 
-    @cache
-    def _connect(self, endpoint: str, is_ipv6: bool = False):
-        socket = zmq.Context().socket(zmq.PUSH)
-        if is_ipv6:
-            socket.setsockopt(zmq.IPV6, 1)
-        socket.connect(endpoint)
-        return socket
-
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
@@ -155,6 +147,33 @@ class CommonKVManager(BaseKVManager):
             socket.setsockopt(zmq.IPV6, 1)
         socket.connect(endpoint)
         return socket
+
+    def get_mha_kv_ptrs_with_pp(
+        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+    ) -> Tuple[List[int], List[int], List[int], List[int], int]:
+        # pp is not supported on the decode side yet
+        start_layer = self.kv_args.prefill_start_layer
+        num_kv_layers = len(src_kv_ptrs) // 2
+        end_layer = start_layer + num_kv_layers
+        dst_num_total_layers = len(dst_kv_ptrs) // 2
+        src_k_ptrs = src_kv_ptrs[:num_kv_layers]
+        src_v_ptrs = src_kv_ptrs[num_kv_layers:]
+        dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        dst_v_ptrs = dst_kv_ptrs[
+            dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+        ]
+        layers_current_pp_stage = len(src_k_ptrs)
+        return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
+
+    def get_mla_kv_ptrs_with_pp(
+        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+    ) -> Tuple[List[int], List[int], int]:
+        # pp is not supported on the decode side yet
+        start_layer = self.kv_args.prefill_start_layer
+        end_layer = start_layer + len(src_kv_ptrs)
+        sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        layers_current_pp_stage = len(src_kv_ptrs)
+        return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
 
 class CommonKVSender(BaseKVSender):

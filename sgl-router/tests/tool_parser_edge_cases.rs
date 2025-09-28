@@ -16,9 +16,9 @@ async fn test_empty_input() {
         let parser = registry
             .get_parser(&format!("test-{}", parser_name))
             .unwrap();
-        let result = parser.parse_complete("").await.unwrap();
+        let (_normal_text, tools) = parser.parse_complete("").await.unwrap();
         assert_eq!(
-            result.len(),
+            tools.len(),
             0,
             "Parser {} should return empty for empty input",
             parser_name
@@ -32,7 +32,12 @@ async fn test_plain_text_no_tools() {
 
     let json_parser = JsonParser::new();
     assert_eq!(
-        json_parser.parse_complete(plain_text).await.unwrap().len(),
+        json_parser
+            .parse_complete(plain_text)
+            .await
+            .unwrap()
+            .1
+            .len(),
         0
     );
 
@@ -42,13 +47,19 @@ async fn test_plain_text_no_tools() {
             .parse_complete(plain_text)
             .await
             .unwrap()
+            .1
             .len(),
         0
     );
 
     let qwen_parser = QwenParser::new();
     assert_eq!(
-        qwen_parser.parse_complete(plain_text).await.unwrap().len(),
+        qwen_parser
+            .parse_complete(plain_text)
+            .await
+            .unwrap()
+            .1
+            .len(),
         0
     );
 
@@ -58,6 +69,7 @@ async fn test_plain_text_no_tools() {
             .parse_complete(plain_text)
             .await
             .unwrap()
+            .1
             .len(),
         0
     );
@@ -74,9 +86,9 @@ async fn test_incomplete_json() {
     ];
 
     for input in incomplete_cases {
-        let result = json_parser.parse_complete(input).await.unwrap();
+        let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
         assert_eq!(
-            result.len(),
+            tools.len(),
             0,
             "Should not parse incomplete JSON: {}",
             input
@@ -106,9 +118,9 @@ async fn test_malformed_mistral() {
 
     for input in malformed_cases {
         // Parser might return error or empty vec for malformed input
-        if let Ok(result) = parser.parse_complete(input).await {
+        if let Ok((_normal_text, tools)) = parser.parse_complete(input).await {
             assert_eq!(
-                result.len(),
+                tools.len(),
                 0,
                 "Should not parse malformed Mistral: {}",
                 input
@@ -124,13 +136,13 @@ async fn test_missing_required_fields() {
 
     // Missing name field
     let input = r#"{"arguments": {"x": 1}}"#;
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 0, "Should not parse without name field");
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 0, "Should not parse without name field");
 
     // Name is not a string
     let input = r#"{"name": 123, "arguments": {}}"#;
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 0, "Should not parse with non-string name");
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 0, "Should not parse with non-string name");
 }
 
 #[tokio::test]
@@ -143,11 +155,11 @@ async fn test_very_long_strings() {
         long_string
     );
 
-    let result = json_parser.parse_complete(&input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "test");
+    let (_normal_text, tools) = json_parser.parse_complete(&input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "test");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["data"].as_str().unwrap().len(), 10000);
 }
 
@@ -158,36 +170,32 @@ async fn test_unicode_edge_cases() {
     // Various Unicode characters including emojis, CJK, RTL text
     let input = r#"{"name": "translate", "arguments": {"text": "Hello 世界 🌍 مرحبا עולם"}}"#;
 
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["text"], "Hello 世界 🌍 مرحبا עולם");
 }
 
 #[tokio::test]
 async fn test_nested_brackets_in_strings() {
-    // Test that parsers correctly handle brackets within string literals
-
     let mistral_parser = MistralParser::new();
     let input = r#"[TOOL_CALLS] [{"name": "echo", "arguments": {"text": "Array: [1, 2, 3]"}}]"#;
-    let result = mistral_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let (_normal_text, tools) = mistral_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["text"], "Array: [1, 2, 3]");
 
     let pythonic_parser = PythonicParser::new();
     let input = r#"[echo(text="List: [a, b, c]")]"#;
-    let result = pythonic_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let (_normal_text, tools) = pythonic_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["text"], "List: [a, b, c]");
 }
 
 #[tokio::test]
 async fn test_multiple_formats_in_text() {
-    // Test that parsers don't get confused by other formats in the text
-
     let json_parser = JsonParser::new();
     let input = r#"
     Here's some text with [TOOL_CALLS] that shouldn't trigger.
@@ -195,9 +203,9 @@ async fn test_multiple_formats_in_text() {
     And some more text with <tool_call> tags.
     "#;
 
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "actual_tool");
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "actual_tool");
 }
 
 #[tokio::test]
@@ -206,10 +214,10 @@ async fn test_escaped_characters() {
 
     let input = r#"{"name": "write", "arguments": {"content": "Line 1\nLine 2\r\nLine 3\tTabbed\\Backslash\"Quote"}}"#;
 
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     let content = args["content"].as_str().unwrap();
     assert!(content.contains('\n'));
     assert!(content.contains('\t'));
@@ -233,10 +241,10 @@ async fn test_numeric_edge_cases() {
         }
     }"#;
 
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["int"], 42);
     assert_eq!(args["float"], 123.456);
     assert_eq!(args["scientific"], 0.000123);
@@ -258,10 +266,10 @@ async fn test_null_and_boolean_values() {
         }
     }"#;
 
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["enabled"], true);
     assert_eq!(args["disabled"], false);
     assert_eq!(args["optional"], serde_json::Value::Null);
@@ -272,7 +280,6 @@ async fn test_partial_token_at_buffer_boundary() {
     let parser = QwenParser::new();
     let mut state = ParseState::new();
 
-    // Test case that would fail with the bug:
     // Send exactly "<tool" which is a 5-character prefix of "<tool_call>\n"
     let result = parser.parse_incremental("<tool", &mut state).await.unwrap();
     assert!(matches!(result, StreamResult::Incomplete));
@@ -303,7 +310,6 @@ async fn test_partial_token_at_buffer_boundary() {
 async fn test_exact_prefix_lengths() {
     let parser = QwenParser::new();
 
-    // Test various exact prefix lengths that would be missed by exclusive range
     let test_cases = vec![
         ("<", 1),            // 1-char prefix
         ("<t", 2),           // 2-char prefix
