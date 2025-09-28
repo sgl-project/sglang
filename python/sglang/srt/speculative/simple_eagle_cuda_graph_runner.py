@@ -82,6 +82,7 @@ class SimpleEAGLECudaGraphRunner:
         self.enable_profile_cuda_graph = (
             self.model_runner.server_args.enable_profile_cuda_graph
         )
+        self.page_size = eagle_worker.page_size
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(self.model_runner)
         self.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -445,6 +446,7 @@ class SimpleEAGLECudaGraphRunner:
             seq_lens,
             draft_token_num,
             req_to_token.shape[-1],
+            self.page_size,
             next_power_of_2(bs),
         )
         forward_batch.spec_info.kv_indptr = kv_indptr
