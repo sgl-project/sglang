@@ -136,7 +136,10 @@ python3 -m sglang.launch_server \
 
 ### Integration with PD Disaggregation
 
-HiCache works seamlessly with PD Disaggregation:
+HiCache works seamlessly with PD Disaggregation，You can choose between two configurations to deploy HICache and PD:
+
+1. Enable HICache only between P nodes, which allows KVCache sharing among the P nodes.
+2. Enable HICache on P nodes and asynchronous offloading of KVCache on D nodes. This configuration allows P nodes to share the KVCache from D nodes in multi-turn dialogue scenarios.
 
 ```bash
 # Prefill node with HiCache enabled for cross-prefill sharing (ideal for SystemPrompt scenarios)
