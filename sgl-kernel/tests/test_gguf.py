@@ -66,7 +66,6 @@ QUANT_TYPES = [
     GGMLQuantizationType.Q5_0,
     GGMLQuantizationType.Q8_0,
 ]
-print(GGMLQuantizationType.IQ3_S)
 
 
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
