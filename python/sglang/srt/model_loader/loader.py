@@ -511,7 +511,7 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
-                if is_npu:
+                if _is_npu:
                     torch.npu.empty_cache()
 
 
