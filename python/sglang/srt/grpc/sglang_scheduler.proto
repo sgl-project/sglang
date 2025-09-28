@@ -36,9 +36,9 @@ message SamplingParams {
   float presence_penalty = 6;
   float repetition_penalty = 7;
 
-  int32 max_new_tokens = 8;
+  optional int32 max_new_tokens = 8;
   repeated string stop = 9;
-  repeated int32 stop_token_ids = 10;
+  repeated uint32 stop_token_ids = 10;
   bool skip_special_tokens = 11;
   bool spaces_between_special_tokens = 12;
 
@@ -47,24 +47,24 @@ message SamplingParams {
     string regex = 13;
     string json_schema = 14;
     string ebnf_grammar = 15;
+    string structural_tag = 16;
   }
 
   // LoRA adapter
-  string lora_path = 16;
+  string lora_path = 17;
 
   // Speculative decoding
-  int32 n = 17;  // Number of samples
+  int32 n = 18;  // Number of samples
 
   // Token healing
-  bool token_healing = 18;
+  bool token_healing = 19;
 
   // Additional parameters
-  int32 min_new_tokens = 19;
-  bool ignore_eos = 20;
-  bool no_stop_trim = 21;
-  int32 stream_interval = 22;
-  map<string, float> logit_bias = 23;
-  string structural_tag = 24;
+  int32 min_new_tokens = 20;
+  bool ignore_eos = 21;
+  bool no_stop_trim = 22;
+  int32 stream_interval = 23;
+  map<string, float> logit_bias = 24;
 
   // Custom parameters for extensibility
   google.protobuf.Struct custom_params = 25;
@@ -98,7 +98,7 @@ message GenerateRequest {
   bool return_logprob = 5;
   int32 logprob_start_len = 6;
   int32 top_logprobs_num = 7;
-  repeated int32 token_ids_logprob = 8;
+  repeated uint32 token_ids_logprob = 8;
   bool return_hidden_states = 9;
 
   // For disaggregated serving
@@ -122,11 +122,14 @@ message GenerateRequest {
 
   // For load balancing
   int32 dp_balance_id = 17;
+
+  // Whether client wants streaming response
+  bool stream = 18;
 }
 
 message TokenizedInput {
   string original_text = 1;  // For reference
-  repeated int32 input_ids = 2;
+  repeated uint32 input_ids = 2;
 }
 
 message MultimodalInputs {
@@ -163,51 +166,44 @@ message GenerateResponse {
 }
 
 message GenerateStreamChunk {
-  // Generated token
-  int32 token_id = 1;
-  string text = 2;
+  // Generated tokens (incremental chunk)
+  repeated uint32 token_ids = 1;
 
   // Cumulative counts
-  int32 prompt_tokens = 3;
-  int32 completion_tokens = 4;
-  int32 cached_tokens = 5;
+  int32 prompt_tokens = 2;
+  int32 completion_tokens = 3;
+  int32 cached_tokens = 4;
 
   // Logprobs (if requested)
-  LogProbs logprobs = 6;
+  LogProbs logprobs = 5;
 
   // Hidden states (if requested)
-  repeated float hidden_states = 7;
-
-  // Metadata
-  float generation_time = 8;  // Time to generate this token
-  int32 queue_time = 9;       // Time spent in queue
+  repeated float hidden_states = 6;
 }
 
 message GenerateComplete {
   // Final output
-  repeated int32 output_ids = 1;
-  string output_text = 2;
+  repeated uint32 output_ids = 1;
 
-  // Finish reason
-  enum FinishReason {
-    // The model generated a stop sequence.
-    STOP = 0;
-    // The model reached the maximum generation length.
-    LENGTH = 1;
-    // The model generated an end-of-sequence (EOS) token.
-    EOS_TOKEN = 2;
-    // The model generated a user-provided stop string.
-    STOP_STR = 3;
-    // The request was aborted by the user or system.
-    ABORT = 4;
-  }
-  FinishReason finish_reason = 3;
+  // Finish reason as OpenAI-compatible string ("stop", "length", "abort")
+  string finish_reason = 2;
+
+  // Token usage counts
+  int32 prompt_tokens = 3;
+  int32 completion_tokens = 4;
+  int32 cached_tokens = 5;
 
   // All logprobs if requested
-  repeated LogProbs all_logprobs = 11;
+  repeated LogProbs all_logprobs = 6;
 
   // All hidden states if requested
-  repeated HiddenStates all_hidden_states = 12;
+  repeated HiddenStates all_hidden_states = 7;
+
+  // Matched stop information (for stop sequences)
+  oneof matched_stop {
+    uint32 matched_token_id = 8;
+    string matched_stop_str = 9;
+  }
 }
 
 message GenerateError {
@@ -285,10 +281,9 @@ message EmbedComplete {
 
   // Additional metadata
   int32 embedding_dim = 4;
-  float generation_time = 5;
 
   // For batch embeddings
-  repeated Embedding batch_embeddings = 6;
+  repeated Embedding batch_embeddings = 5;
 }
 
 message Embedding {

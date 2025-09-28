@@ -5,13 +5,15 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::config::{RouterConfig, RoutingMode};
+use sglang_router_rs::core::WorkerManager;
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
 
 /// Test context that manages mock workers
 struct TestContext {
     workers: Vec<MockWorker>,
-    router: Arc<dyn RouterTrait>,
+    _router: Arc<dyn RouterTrait>,
+    worker_urls: Vec<String>,
 }
 
 impl TestContext {
@@ -40,9 +42,19 @@ impl TestContext {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
 
-        config.mode = RoutingMode::Regular { worker_urls };
+        config.mode = RoutingMode::Regular {
+            worker_urls: worker_urls.clone(),
+        };
 
-        let app_context = common::create_test_context(config);
+        let app_context = common::create_test_context(config.clone());
+
+        // Initialize workers in the registry before creating router
+        if !worker_urls.is_empty() {
+            WorkerManager::initialize_workers(&config, &app_context.worker_registry, None)
+                .await
+                .expect("Failed to initialize workers");
+        }
+
         let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
 
@@ -50,7 +62,11 @@ impl TestContext {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
 
-        Self { workers, router }
+        Self {
+            workers,
+            _router: router,
+            worker_urls: worker_urls.clone(),
+        }
     }
 
     async fn shutdown(mut self) {
@@ -72,13 +88,11 @@ impl TestContext {
     ) -> Result<Vec<String>, String> {
         let client = Client::new();
 
-        // Get any worker URL for testing
-        let worker_urls = self.router.get_worker_urls();
-        if worker_urls.is_empty() {
-            return Err("No available workers".to_string());
-        }
-
-        let worker_url = &worker_urls[0];
+        // Use the first worker URL from the context
+        let worker_url = self
+            .worker_urls
+            .first()
+            .ok_or_else(|| "No workers available".to_string())?;
 
         let response = client
             .post(format!("{}{}", worker_url, endpoint))
@@ -183,7 +197,6 @@ mod streaming_tests {
         let events = result.unwrap();
         assert!(events.len() >= 2); // At least one chunk + [DONE]
 
-        // Verify events are valid JSON (except [DONE])
         for event in &events {
             if event != "[DONE]" {
                 let parsed: Result<serde_json::Value, _> = serde_json::from_str(event);
@@ -315,7 +328,6 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_sse_format_parsing() {
-        // Test SSE format parsing
         let parse_sse_chunk = |chunk: &[u8]| -> Vec<String> {
             let text = String::from_utf8_lossy(chunk);
             text.lines()
@@ -333,7 +345,6 @@ mod streaming_tests {
         assert_eq!(events[1], "{\"text\":\" world\"}");
         assert_eq!(events[2], "[DONE]");
 
-        // Test with mixed content
         let mixed = b"event: message\ndata: {\"test\":true}\n\n: comment\ndata: [DONE]\n\n";
         let events = parse_sse_chunk(mixed);
 
