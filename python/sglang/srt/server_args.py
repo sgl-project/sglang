@@ -613,7 +613,10 @@ class ServerArgs:
         if self.mem_fraction_static is None:
             reserved_mem = 0
             # For activation during large prefill
-            reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
+            if self.chunked_prefill_size > 0:
+                reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
+            else:
+                reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
             # For cuda graphs
             reserved_mem += self.cuda_graph_max_bs * 1.5
             # Some adjustment for large parallel size
