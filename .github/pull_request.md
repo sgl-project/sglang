@@ -135,21 +135,21 @@ I introduced a **unified activation registry + runtime apply helper** for MoE GL
   return StandardCombineInput(hidden_states=output)
 
 ## Accuracy Tests
-(sglang) root@nb-1365100433987193600-amrnhavl9gjk:/z_data/syxin/hanrui/sglang_fork/test# python3 -m sglang.test.few_shot_gsm8k --num-questions 200
-100%|███████████████████████████████████████████████████████████████████████████████████| 200/200 [00:22<00:00,  8.96it/s]
-Accuracy: 0.565
-Invalid: 0.130
-Latency: 22.411 s
-Output throughput: 3841.140 token/s (original)
+(sglang) root@nb-1365100433987193600-amrnhavl9gjk:/z_data/syxin/Hanrui/modifi
+ed/sglang_fork/test# python3 -m sglang.test.few_shot_gsm8k --num-questions 200
+100%|██████████████████████████████████████| 200/200 [00:23<00:00,  8.49it/s]
+Accuracy: 0.520
+Invalid: 0.180
+Latency: 23.781 s
+Output throughput: 3729.099 token/s (original)
 
-(sglang) root@nb-1365100433987193600-amrnhavl9gjk:/z_data/syxin/hanrui/sglang_fork/test# python3 -m sglang.test.few_shot_gsm8k --num-questions 200
-Downloading from https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl to /tmp/test.jsonl
-/tmp/test.jsonl: 732kB [00:00, 8.45MB/s]                                                                                                                            
-100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 200/200 [00:21<00:00,  9.12it/s]
-Accuracy: 0.535
-Invalid: 0.160
-Latency: 22.434 s
-Output throughput: 3992.351 token/s (modified)
+(sglang) root@nb-1365100433987193600-amrnhavl9gjk:/z_data/syxin/Hanrui/modifi
+ed/sglang_fork/test# python3 -m sglang.test.few_shot_gsm8k --num-questions 200
+100%|██████████████████████████████████████| 200/200 [00:19<00:00, 10.36it/s]
+Accuracy: 0.510
+Invalid: 0.215
+Latency: 19.348 s
+Output throughput: 4398.578 token/s(modified)
 
 ## Benchmarking and Profiling
 
