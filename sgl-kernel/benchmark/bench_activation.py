@@ -90,10 +90,15 @@ def calculate_diff(
     return ok
 
 
-kernels = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
-if GELU_QUICK_AVAILABLE:
-    kernels.append("gelu_quick")
-dtypes = [torch.float16, torch.bfloat16]
+# CI environment uses simplified parameters for kernels and dtypes too
+if IS_CI:
+    kernels = ["silu_and_mul"]  # Only test one kernel in CI
+    dtypes = [torch.float16]  # Only test one dtype in CI
+else:
+    kernels = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
+    if GELU_QUICK_AVAILABLE:
+        kernels.append("gelu_quick")
+    dtypes = [torch.float16, torch.bfloat16]
 
 
 def make_configs(bsizes: List[int], slens: List[int], dims_: List[int]) -> List[Tuple]:
