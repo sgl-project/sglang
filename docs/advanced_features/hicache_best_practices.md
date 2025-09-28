@@ -64,12 +64,19 @@ HiCache supports multiple storage backends through a clean, generic interface:
 ### Memory Layout Optimization
 
 ```bash
-# Page-first: Optimized for I/O efficiency with zero-copy (recommended)
+# Page-first: Optimized for I/O efficiency with zero-copy (recommended with kernel backend)
 --hicache-mem-layout page_first
+
+# Page-first-direct: Optimized for direct I/O operations (used with direct backend)
+--hicache-mem-layout page_first_direct
 
 # Layer-first
 --hicache-mem-layout layer_first
 ```
+
+**Layout Compatibility:**
+- `page_first`: Only compatible with `kernel` I/O backend, automatically switches to `layer_first` with `direct` backend
+- `page_first_direct`: Specifically designed for `direct` I/O backend with optimized memory organization
 
 ### Prefetch Policies
 
@@ -104,7 +111,6 @@ python3 -m sglang.launch_server \
   --enable-hierarchical-cache \
   --hicache-ratio 2 \
   --hicache-size 0 \
-  --hicache-io-backend kernel \
   --hicache-mem-layout page_first \
   --hicache-write-policy write_through \
   --hicache-storage-backend hf3fs \
@@ -190,7 +196,7 @@ To integrate a new storage backend:
 
 1. **Implement three core methods:**
    - `get(key)`: Retrieve value by key
-   - `exists(key)`: Check key existence  
+   - `exists(key)`: Check key existence
    - `set(key, value)`: Store key-value pair
 
 2. **Register your backend:** Add your storage backend to the HiCache [BackendFactory](../../python/sglang/srt/mem_cache/storage/backend_factory.py#L188)
