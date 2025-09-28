@@ -154,6 +154,9 @@ def benchmark(batch_size, provider, N, K):
     M = batch_size
     a = torch.ones((M, K), device="cuda") * 5.0
     b = torch.ones((N, K), device="cuda") * 5.0
+    # vLLM expects scalar scales, while sglang can handle per-token scales
+    scale_a_scalar = torch.randn(1, device="cuda", dtype=torch.float32)
+    scale_b_scalar = torch.randn(1, device="cuda", dtype=torch.float32)
     scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
     scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
     quantiles = [0.5, 0.2, 0.8]
@@ -164,8 +167,8 @@ def benchmark(batch_size, provider, N, K):
         if not VLLM_AVAILABLE:
             # Return zero if vLLM is not available
             return (0, 0, 0)
-        a_fp8, scale_a_fp8 = vllm_scaled_fp8_quant(a, scale_a)
-        b_fp8, scale_b_fp8 = vllm_scaled_fp8_quant(b, scale_b)
+        a_fp8, scale_a_fp8 = vllm_scaled_fp8_quant(a, scale_a_scalar)
+        b_fp8, scale_b_fp8 = vllm_scaled_fp8_quant(b, scale_b_scalar)
         b_fp8 = b_fp8.t()
         ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: vllm_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype),

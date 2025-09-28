@@ -170,10 +170,13 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Simplify for CI environment
+    # Skip in CI environment due to architecture compatibility issues
     if IS_CI:
-        args.models = [args.models[0]]  # Use only first model
-        args.tp_sizes = [args.tp_sizes[0]]  # Use only first TP size
+        print(
+            "Skipping INT8 GEMM benchmark in CI environment due to architecture compatibility issues"
+        )
+        print("INT8 operations may not be supported on all GPU architectures")
+        return
 
     KN_model_names = prepare_shapes(args)
     for K, N, model_name in KN_model_names:
