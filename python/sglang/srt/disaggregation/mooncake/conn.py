@@ -87,7 +87,7 @@ class TransferInfo:
             if msg[6] == b"":
                 dst_extra_pool_indices = []
             else:
-                dst_extra_pool_indices = list(np.frombuffer(msg[6], dtype=np.int64))
+                dst_extra_pool_indices = list(np.frombuffer(msg[6], dtype=np.int32))
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -248,7 +248,12 @@ class MooncakeKVManager(CommonKVManager):
             self.engine.batch_register(
                 self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
             )
-
+        
+        # Batch register extra KV data buffers
+        if self.kv_args.extra_pool_data_ptrs and self.kv_args.extra_pool_data_lens:
+            self.engine.batch_register(
+                self.kv_args.extra_pool_data_ptrs, self.kv_args.extra_pool_data_lens
+            )
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
             return 0
@@ -633,11 +638,10 @@ class MooncakeKVManager(CommonKVManager):
         for i, dst_extra_pool_ptr in enumerate(dst_extra_pool_data_ptrs):
             length = prefill_extra_pool_item_lens[i]
             src_addr = (
-                prefill_extra_pool_data_ptrs[i] + length * prefill_extra_pool_indice[0]
+                prefill_extra_pool_data_ptrs[i] + length * int(prefill_extra_pool_indice[0])
             )
-            logger.info(f"{dst_extra_pool_data_ptrs[i]=}, {length=}, {req.dst_extra_pool_indices[0]=}")
             dst_addr = (
-                dst_extra_pool_data_ptrs[i] + length * req.dst_extra_pool_indices[0]
+                dst_extra_pool_data_ptrs[i] + length * int(req.dst_extra_pool_indices[0])
             )
             transfer_blocks.append((src_addr, dst_addr, length))
 
@@ -1222,7 +1226,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             (
                                 np.array(
                                     extra_pool_indices,
-                                    dtype=np.int64,
+                                    dtype=np.int32,
                                 ).tobytes()
                                 if not is_dummy
                                 else b""
