@@ -11,6 +11,8 @@ class TestFile:
     estimated_time: float = 60
 
 
+TODO = 500
+
 suites = {
     "per-commit": [
         TestFile("function_call/test_json_schema_constraint.py", 30),
@@ -123,6 +125,9 @@ suites = {
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_vision_openai_server_a.py", 724),
         TestFile("test_vision_openai_server_b.py", 446),
+        TestFile("layers/attention/mamba/test_causal_conv1d.py", TODO),  # TODO: Measure
+        TestFile("layers/attention/mamba/test_mamba_ssm.py", TODO),  # TODO: Measure
+        TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", TODO),  # TODO: Measure
     ],
     "per-commit-2-gpu": [
         TestFile("lora/test_lora_tp.py", 116),
@@ -134,6 +139,7 @@ suites = {
         TestFile("test_release_memory_occupation.py", 257),
         TestFile("hicache/test_hicache_storage_file_backend.py", 400),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 400),
+        TestFile("layers/attention/mamba/test_mamba_mixer2.py", TODO),  # TODO: Measure
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 600),
