@@ -69,7 +69,7 @@ class Qwen3NextRMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states, gate=None):
+    def forward(self, hidden_states, gate):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -503,10 +503,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
-        if _is_npu:
-            core_attn_out = self.norm(core_attn_out)
-        else:
-            core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = self.norm(core_attn_out,z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
