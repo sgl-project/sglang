@@ -57,7 +57,12 @@ def get_moe_configs(
     # First look up if an optimized configuration is available in the configs
     # directory
     json_file_name = get_config_file_name(
-        E, N, dtype, [block_n, block_k], per_channel_quant, down_moe,
+        E,
+        N,
+        dtype,
+        [block_n, block_k],
+        per_channel_quant,
+        down_moe=down_moe,
     )
 
     # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,

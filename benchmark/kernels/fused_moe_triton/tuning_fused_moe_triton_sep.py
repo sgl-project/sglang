@@ -18,7 +18,6 @@ from transformers import AutoConfig
 from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_config_dtype_str,
-    invoke_fused_moe_down_tma_kernel,
     invoke_fused_moe_kernel,
     moe_align_block_size,
 )
@@ -144,7 +143,7 @@ def benchmark_config(
         topk_output.topk_ids.copy_(topk_ids[:tokens, :_topk])
         topk_output.router_logits.copy_(new_topk_output.router_logits)
 
-    down_moe_use_tma = False
+    moe_use_tma = False
 
     def run():
         moe_runner_config = MoeRunnerConfig(
@@ -160,7 +159,7 @@ def benchmark_config(
 
         topk = topk_ids.shape[1]
         padded_tokens = (
-            min(M * topk, E) * (config["BLOCK_SIZE_M"] - 1) if down_moe_use_tma else 0
+            min(M * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1) if moe_use_tma else 0
         )
         total_tokens = M * topk + padded_tokens
         cache = torch.empty(
@@ -214,7 +213,9 @@ def benchmark_config(
                     use_int4_w4a16=False,
                     per_channel_quant=False,
                     block_shape=block_shape,
-                    c_sorted=down_moe_use_tma,
+                    b_use_tma=moe_use_tma,
+                    c_sorted=moe_use_tma,
+                    filter_expert=False,
                 )
             end_event.record()
             end_event.synchronize()
@@ -226,13 +227,8 @@ def benchmark_config(
             start_event.record()
 
             silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            fused_moe_down_kernel = (
-                invoke_fused_moe_down_tma_kernel
-                if down_moe_use_tma
-                else invoke_fused_moe_kernel
-            )
             for _ in range(10 if not ncu_enable else 1):
-                fused_moe_down_kernel(
+                invoke_fused_moe_kernel(
                     intermediate_cache2,
                     w2,
                     None,
@@ -255,6 +251,9 @@ def benchmark_config(
                     use_int4_w4a16=False,
                     per_channel_quant=False,
                     block_shape=block_shape,
+                    a_use_tma=moe_use_tma,
+                    b_use_tma=moe_use_tma,
+                    filter_expert=False,
                 )
             end_event.record()
             end_event.synchronize()
@@ -263,28 +262,36 @@ def benchmark_config(
 
     # JIT compilation & warmup
     if not ncu_enable:
+        moe_use_tma = False
         run()
-    torch.cuda.synchronize()
+        moe_use_tma = True
+        run()
     latencies: List[float] = []
     latencies1: List[float] = []
     latencies_tma: List[float] = []
+    latencies1_tma: List[float] = []
+
     for i in range(num_iters):
         prepare(i)
         torch.cuda.synchronize()
-        down_moe_use_tma = False
+        moe_use_tma = False
         t0, t1 = run()
-        torch.cuda.synchronize()
-        down_moe_use_tma = True
-        t0_x, t_tma = run()
         torch.cuda.synchronize()
         latencies.append(t0)
         latencies1.append(t1)
-        latencies_tma.append(t_tma)
-    avg = sum(latencies) / (num_iters * 10) * 1000  # us
-    avg1 = sum(latencies1) / (num_iters * 10) * 1000  # us
-    avg_tma = sum(latencies_tma) / (num_iters * 10) * 1000  # us
 
-    return avg, avg1, avg_tma
+        moe_use_tma = True
+        t0, t1 = run()
+        torch.cuda.synchronize()
+        latencies_tma.append(t0)
+        latencies1_tma.append(t1)
+
+    avg = sum(latencies) / (num_iters * 10) * 1000  # us
+    avg_tma = sum(latencies_tma) / (num_iters * 10) * 1000  # us
+    avg1 = sum(latencies1) / (num_iters * 10) * 1000  # us
+    avg1_tma = sum(latencies1_tma) / (num_iters * 10) * 1000  # us
+
+    return avg, avg_tma, avg1, avg1_tma
 
 
 def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
@@ -342,7 +349,7 @@ class BestConfigTrace:
         self.name = name
         self.config = None
         self.time_cost = float("inf")
-        self.time_cost_all = None  # kernel0, kernel1 without tma, kernel1 with tma
+        self.time_cost_all = None  # kernel0 without tma,, kernel0 with tma, kernel1 without tma, kernel1 with tma
 
     def update(self, config, time_cost, time_cost_all):
         if time_cost < self.time_cost:
@@ -356,7 +363,7 @@ class BestConfigTrace:
 
     @property
     def total_time(self):
-        return self.time_cost_all[0] + min(self.time_cost_all[1], self.time_cost_all[2])
+        return self.time_cost_all[0] + min(self.time_cost_all[2], self.time_cost_all[3])
 
     def config_dict(self, down_moe=False):
         if not down_moe:
@@ -364,7 +371,7 @@ class BestConfigTrace:
         else:
             return {
                 **self.config,
-                "USE_TMA": self.time_cost_all[1] > self.time_cost_all[2],
+                "USE_TMA": self.time_cost_all[2] > self.time_cost_all[3],
             }
 
 
@@ -440,41 +447,40 @@ class BenchmarkWorker:
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             for config in tqdm(search_space):
                 try:
-                    kernel_time0, kernel_time_no_tma, kernel_time_tma = (
-                        benchmark_config(
-                            config,
-                            num_tokens,
-                            num_experts,
-                            shard_intermediate_size,
-                            hidden_size,
-                            topk,
-                            dtype,
-                            use_fp8_w8a8,
-                            use_int8_w8a8,
-                            use_int8_w8a16,
-                            topk_ids_dir,
-                            block_shape,
-                            num_iters=10,
-                        )
+                    kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma = benchmark_config(
+                        config,
+                        num_tokens,
+                        num_experts,
+                        shard_intermediate_size,
+                        hidden_size,
+                        topk,
+                        dtype,
+                        use_fp8_w8a8,
+                        use_int8_w8a8,
+                        use_int8_w8a16,
+                        topk_ids_dir,
+                        block_shape,
+                        num_iters=10,
                     )
                 except triton.runtime.autotuner.OutOfResources:
                     # Some configurations may be invalid and fail to compile.
                     continue
-                kernel_time1 = min(kernel_time_tma, kernel_time_no_tma)
+                kt0 = kt0_no_tma
+                kt1 = min(kt1_no_tma, kt1_tma)
                 trace0.update(
                     config,
-                    kernel_time0,
-                    (kernel_time0, kernel_time_no_tma, kernel_time_tma),
+                    kt0,
+                    (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
                 )
                 trace1.update(
                     config,
-                    kernel_time1,
-                    (kernel_time0, kernel_time_no_tma, kernel_time_tma),
+                    kt1,
+                    (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
                 )
                 trace2.update(
                     config,
-                    kernel_time0 + kernel_time1,
-                    (kernel_time0, kernel_time_no_tma, kernel_time_tma),
+                    kt0 + kt1,
+                    (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
                 )
 
         now = datetime.now()
@@ -545,7 +551,7 @@ def save_configs(
         shard_intermediate_size // 2,
         dtype_str,
         block_shape,
-        down_moe,
+        down_moe=down_moe,
     )
 
     print(f"Writing best config to {filename}...")
@@ -682,7 +688,7 @@ def main(args: argparse.Namespace):
                 "num_stages": args.configs[5],
             }
 
-            _, (t0, t1, t2) = worker.benchmark(
+            _, (t0, t0_tma, t1, t1_tma) = worker.benchmark(
                 args.batch_size,
                 E,
                 shard_intermediate_size,
@@ -696,7 +702,7 @@ def main(args: argparse.Namespace):
                 cfg,
                 topk_ids_dir,
             )
-            print(f"{t0=}, {t1=}, {t2=}")
+            print(f"{t0=}, {t0_tma=}, {t1=}, {t1_tma=}")
         return
 
     assert args.tune
