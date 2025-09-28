@@ -261,6 +261,7 @@ def download_weights_from_hf(
     Returns:
         str: The path to the downloaded model weights.
     """
+    found_local_snapshot_dir = None
     # Check custom cache_dir (if provided)
     if cache_dir and not os.path.isdir(model_name_or_path):
         try:
@@ -280,8 +281,10 @@ def download_weights_from_hf(
                 rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
                 if os.path.isdir(rev_dir):
                     found_local_snapshot_dir = rev_dir
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                "Failed to find local snapshot in custom cache_dir %s: %s", cache_dir, e
+            )
 
     # Check default HF cache as well
     if not os.path.isdir(model_name_or_path):
@@ -289,8 +292,8 @@ def download_weights_from_hf(
             rev_dir = find_local_repo_dir(model_name_or_path, revision)
             if rev_dir and os.path.isdir(rev_dir):
                 found_local_snapshot_dir = rev_dir
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to find local snapshot in default HF cache: %s", e)
 
     # If local snapshot exists, return it directly and skip download.
     if found_local_snapshot_dir is not None:
