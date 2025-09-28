@@ -96,7 +96,7 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
     x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
 
     fn, kernel_names = {
-        "triton": (triton_per_token_group_quant_8bit, "_per_token_group_quant_fp8"),
+        "triton": (triton_per_token_group_quant_8bit, "_per_token_group_quant_8bit"),
         "sglang": (
             sglang_per_token_group_quant_8bit,
             "per_token_group_quant_8bit_kernel",
