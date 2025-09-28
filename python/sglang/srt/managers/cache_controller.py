@@ -575,9 +575,9 @@ class HiCacheController:
         return operation.completed_tokens, operation.hash_value
 
     def append_host_mem_release(self, host_indices: torch.Tensor):
-        chunks = host_indices.split(self.mem_pool_host.page_size)
-        for chunk in chunks:
-            if len(chunk) > 0:
+        if len(host_indices) > 0:
+            chunks = host_indices.split(self.mem_pool_host.page_size)
+            for chunk in chunks:
                 self.host_mem_release_queue.put(chunk)
 
     def _page_get_zero_copy(self, operation, hash_values, host_indices):
