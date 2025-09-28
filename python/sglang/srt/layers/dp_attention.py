@@ -59,10 +59,7 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        if _DETERMINISTIC_INFERENCE:
-            return DpPaddingMode.SUM_LEN
-
-        if is_extend_in_batch:
+        if _DETERMINISTIC_INFERENCE or is_extend_in_batch:
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
@@ -77,10 +74,7 @@ class DpPaddingMode(IntEnum):
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _DETERMINISTIC_INFERENCE:
-            return DpPaddingMode.SUM_LEN
-
-        if _USE_ROCM700A_WA:
+        if _DETERMINISTIC_INFERENCE or _USE_ROCM700A_WA:
             return cls.SUM_LEN
         else:
             return cls.MAX_LEN
