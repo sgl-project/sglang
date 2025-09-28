@@ -206,6 +206,7 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
@@ -1187,7 +1188,7 @@ class MRotaryEmbedding(RotaryEmbedding):
 
                         time_tensor_long = time_tensor.long()
                         t_index = time_tensor_long.flatten()
-                    elif model_type == "qwen2_vl":
+                    elif model_type in ("qwen2_vl", "qwen3_vl", "qwen3_vl_moe"):
                         t_index = (
                             torch.arange(llm_grid_t)
                             .view(-1, 1)
