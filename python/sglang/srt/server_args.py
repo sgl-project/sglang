@@ -540,7 +540,7 @@ class ServerArgs:
           In order to compute mem_fraction_static, we need to estimate the size of activations and cuda graph buffers.
           The activation memory is proportional to the chunked_prefill_size.
           The cuda graph memory is proportional to the cuda_graph_max_bs.
-          We use reserved_mem = chunked_prefill_size * 1.5 + cuda_graph_max_bs * 1.5 to estimate the size of activations and cuda graph buffers in GB.
+          We use reserved_mem = chunked_prefill_size * 1.5 + cuda_graph_max_bs * 2 to estimate the size of activations and cuda graph buffers in GB.
           and set mem_fraction_static = (GPU memory capacity - reserved_mem) / GPU memory capacity.
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
@@ -611,16 +611,17 @@ class ServerArgs:
                 self.cuda_graph_max_bs = 160
 
         if self.mem_fraction_static is None:
-            reserved_mem = 0
+            # Constant meta data (e.g., from attention backend)
+            reserved_mem = 1
             # For activation during large prefill
             if self.chunked_prefill_size > 0:
                 reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
             else:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
             # For cuda graphs
-            reserved_mem += self.cuda_graph_max_bs * 1.5
+            reserved_mem += self.cuda_graph_max_bs * 2
             # Some adjustments for large parallel size
-            reserved_mem += self.tp_size * self.pp_size / 8 * 1024
+            reserved_mem += self.tp_size * self.pp_size / 4 * 1024
 
             if gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
