@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
+from sglang.srt.utils import bind_to_closest_numa_node
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class HiRadixCache(RadixCache):
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
+        hicache_numa_detect: bool = False,
     ):
 
         if hicache_io_backend == "direct":
@@ -52,6 +54,9 @@ class HiRadixCache(RadixCache):
                 logger.warning(
                     "Page first layout is not supported with direct IO backend, switching to layer first layout"
                 )
+
+        if hicache_numa_detect:
+            bind_to_closest_numa_node()
 
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
