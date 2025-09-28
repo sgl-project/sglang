@@ -54,12 +54,6 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-class RouterType(Enum):
-    TOKENIZER_ROUTER = auto()
-    DETOKENIZER_MANAGER = auto()
-    DETOKENIZER_ROUTER = auto()
-
-
 class SocketMapping:
     def __init__(self):
         self._zmq_context = zmq.Context()
@@ -74,20 +68,12 @@ class SocketMapping:
         self,
         recv_obj: MultiTokenizerRegisterReq,
         worker_id: str,
-        router_type: RouterType,
+        ipc_name: str,
     ):
-        type_str = router_type.value
-        ipc_name = (
-            worker_id
-            if router_type == RouterType.DETOKENIZER_ROUTER
-            else recv_obj.ipc_name
-        )
         if worker_id in self._mapping:
-            logger.warning(
-                f"Worker {worker_id} already registered in {type_str}, skipping..."
-            )
+            logger.warning(f"Worker {worker_id} already registered, skipping...")
             return
-        logger.info(f"Worker {worker_id} not registered in {type_str}, registering...")
+        logger.info(f"Worker {worker_id} not registered, registering...")
         socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
         self._mapping[worker_id] = socket
         self._mapping[worker_id].send_pyobj(recv_obj)
@@ -397,7 +383,7 @@ class MultiHttpWorkerDetokenizerMixin:
             for i, worker_id in enumerate(worker_ids):
                 if isinstance(recv_obj, MultiTokenizerRegisterReq):
                     self.socket_mapping.register_ipc_mapping(
-                        recv_obj, worker_id, router_type=RouterType.DETOKENIZER_MANAGER
+                        recv_obj, worker_id, ipc_name=recv_obj.ipc_name
                     )
                 else:
                     if detokenizer_worker_num > 1:
@@ -470,7 +456,9 @@ class MultiTokenizerRouter:
         for i, worker_id in enumerate(worker_ids):
             if isinstance(recv_obj, MultiTokenizerRegisterReq):
                 self.socket_mapping.register_ipc_mapping(
-                    recv_obj, worker_id, router_type=RouterType.TOKENIZER_ROUTER
+                    recv_obj,
+                    worker_id=worker_id,
+                    ipc_name=recv_obj.ipc_name,
                 )
             else:
                 new_recv_obj = _handle_output_by_index(recv_obj, i)
@@ -549,8 +537,8 @@ class MultiDetokenizerRouter:
                     else:
                         self.socket_mapping.register_ipc_mapping(
                             recv_obj,
-                            ipc_name,
-                            router_type=RouterType.DETOKENIZER_ROUTER,
+                            worker_id=ipc_name,
+                            ipc_name=ipc_name,
                         )
                     self.worker_id_to_ipc_mapping[worker_id] = ipc_name
                     self.ipc_name_index = (
