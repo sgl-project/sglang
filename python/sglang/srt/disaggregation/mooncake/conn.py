@@ -248,12 +248,13 @@ class MooncakeKVManager(CommonKVManager):
             self.engine.batch_register(
                 self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
             )
-        
+
         # Batch register extra KV data buffers
         if self.kv_args.extra_pool_data_ptrs and self.kv_args.extra_pool_data_lens:
             self.engine.batch_register(
                 self.kv_args.extra_pool_data_ptrs, self.kv_args.extra_pool_data_lens
             )
+
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
             return 0
@@ -637,11 +638,11 @@ class MooncakeKVManager(CommonKVManager):
 
         for i, dst_extra_pool_ptr in enumerate(dst_extra_pool_data_ptrs):
             length = prefill_extra_pool_item_lens[i]
-            src_addr = (
-                prefill_extra_pool_data_ptrs[i] + length * int(prefill_extra_pool_indice[0])
+            src_addr = prefill_extra_pool_data_ptrs[i] + length * int(
+                prefill_extra_pool_indice[0]
             )
-            dst_addr = (
-                dst_extra_pool_data_ptrs[i] + length * int(req.dst_extra_pool_indices[0])
+            dst_addr = dst_extra_pool_data_ptrs[i] + length * int(
+                req.dst_extra_pool_indices[0]
             )
             transfer_blocks.append((src_addr, dst_addr, length))
 

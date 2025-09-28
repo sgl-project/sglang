@@ -48,7 +48,12 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool, HybridReqToTokenPool, MambaPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    KVCache,
+    MambaPool,
+    ReqToTokenPool,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
@@ -122,6 +127,7 @@ class DecodeReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
 
+
 class HybridDecodeReqToTokenPool(HybridReqToTokenPool):
 
     def __init__(
@@ -144,7 +150,7 @@ class HybridDecodeReqToTokenPool(HybridReqToTokenPool):
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=enable_memory_saver,
-            pre_alloc_size=pre_alloc_size
+            pre_alloc_size=pre_alloc_size,
         )
         self.mamba_pool = MambaPool(
             size + pre_alloc_size,
@@ -169,6 +175,7 @@ class HybridDecodeReqToTokenPool(HybridReqToTokenPool):
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
         self.mamba_pool.clear()
+
 
 @dataclass
 class DecodeRequest:
