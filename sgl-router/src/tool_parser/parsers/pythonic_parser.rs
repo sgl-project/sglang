@@ -9,9 +9,11 @@
 /// rather than JSON for arguments.
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
+use regex::Regex;
 use rustpython_parser::ast::{Constant, Expr, Mod, UnaryOp};
 use rustpython_parser::{parse, Mode};
 use serde_json::{Map, Number, Value};
+use std::sync::OnceLock;
 
 use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
@@ -19,6 +21,20 @@ use crate::tool_parser::{
     traits::ToolParser,
     types::{FunctionCall, StreamResult, ToolCall},
 };
+
+static PYTHONIC_BLOCK_REGEX: OnceLock<Regex> = OnceLock::new();
+
+/// Lazily compiled regex that locates pythonic tool call blocks.
+fn pythonic_block_regex() -> &'static Regex {
+    PYTHONIC_BLOCK_REGEX.get_or_init(|| {
+        // Matches one or more function calls inside a list. The `(?s)` flag allows
+        // newlines inside argument lists while keeping the pattern anchored to
+        // identifiers followed by parentheses, preventing plain lists like
+        // `[1, 2, 3]` from matching.
+        Regex::new(r"(?s)\[\s*[A-Za-z_]\w*\s*\(.*?\)\s*(?:,\s*[A-Za-z_]\w*\s*\(.*?\)\s*)*\]")
+            .expect("pythonic tool call regex must compile")
+    })
+}
 
 /// Parser for Pythonic tool call format
 #[derive(Default)]
@@ -33,68 +49,11 @@ impl PythonicParser {
     /// Extract the first pythonic tool call block and return it along with the
     /// surrounding "normal" content.
     fn extract_tool_calls(&self, text: &str) -> Option<(String, String)> {
-        let chars: Vec<char> = text.chars().collect();
-
-        for start_idx in 0..chars.len() {
-            if chars[start_idx] != '[' {
-                continue;
-            }
-
-            let mut check_idx = start_idx + 1;
-            while check_idx < chars.len() && chars[check_idx].is_whitespace() {
-                check_idx += 1;
-            }
-
-            if check_idx >= chars.len()
-                || (!chars[check_idx].is_alphabetic() && chars[check_idx] != '_')
-            {
-                continue;
-            }
-
-            let mut bracket_depth = 0;
-            let mut in_string = false;
-            let mut string_char = ' ';
-            let mut escape_next = false;
-
-            for i in start_idx..chars.len() {
-                let ch = chars[i];
-
-                if escape_next {
-                    escape_next = false;
-                    continue;
-                }
-
-                if ch == '\\' && in_string {
-                    escape_next = true;
-                    continue;
-                }
-
-                if !in_string && (ch == '"' || ch == '\'') {
-                    in_string = true;
-                    string_char = ch;
-                } else if in_string && ch == string_char {
-                    in_string = false;
-                } else if !in_string {
-                    match ch {
-                        '[' => bracket_depth += 1,
-                        ']' => {
-                            bracket_depth -= 1;
-                            if bracket_depth == 0 {
-                                let extracted: String = chars[start_idx..=i].iter().collect();
-                                if extracted.contains('(') && extracted.contains(')') {
-                                    let before = &text[..start_idx];
-                                    let after = &text[(i + 1)..];
-                                    let normal_text = format!("{}{}", before, after);
-                                    return Some((extracted, normal_text));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        None
+        pythonic_block_regex().find(text).map(|mat| {
+            let block = mat.as_str().to_string();
+            let normal = format!("{}{}", &text[..mat.start()], &text[mat.end()..]);
+            (block, normal)
+        })
     }
 
     /// Strip special tokens that Llama models might output
@@ -155,32 +114,36 @@ impl ToolParser for PythonicParser {
 
     fn detect_format(&self, text: &str) -> bool {
         let cleaned = Self::strip_special_tokens(text);
+        if pythonic_block_regex().is_match(&cleaned) {
+            return true;
+        }
+
         let trimmed = cleaned.trim();
-
-        let Some(start_idx) = trimmed.find('[') else {
+        let Some(open_idx) = trimmed.find('[') else {
             return false;
         };
 
-        let remaining = &trimmed[start_idx + 1..];
-        let Some(paren_idx) = remaining.find('(') else {
+        let after_bracket = trimmed[open_idx + 1..].trim_start();
+        let mut chars = after_bracket.char_indices();
+        let Some((_, first_char)) = chars.next() else {
             return false;
         };
 
-        let candidate = remaining[..paren_idx].trim();
-        if candidate.is_empty() {
+        if !(first_char.is_ascii_alphabetic() || first_char == '_') {
             return false;
         }
 
-        let mut chars = candidate.chars();
-        match chars.next() {
-            Some(first) if first.is_alphabetic() || first == '_' => {
-                // ensure all subsequent chars are valid identifier parts or whitespace
-                candidate
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c.is_whitespace())
+        let mut ident_len = first_char.len_utf8();
+        for (idx, ch) in chars {
+            if ch.is_alphanumeric() || ch == '_' {
+                ident_len = idx + ch.len_utf8();
+            } else {
+                break;
             }
-            _ => false,
         }
+
+        let remaining = after_bracket[ident_len..].trim_start();
+        remaining.starts_with('(')
     }
 }
 
