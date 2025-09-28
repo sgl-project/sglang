@@ -1302,7 +1302,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.head_size,
         )
 
-        return q.reshape(query_shape), k.reshape(key_shape)
+        return q.view(query_shape), k.view(key_shape)
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _forward_native(
