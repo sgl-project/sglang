@@ -1296,33 +1296,26 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Triton-accelerated forward pass for Qwen2VL M-RoPE."""
+        assert positions.ndim == 2
+        assert self.mrope_section
+
         num_tokens = positions.shape[-1]
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
-
-        # Reshape for Triton kernel: (bsz, n_heads, seq_len, head_dim)
         query_shape = query.shape
         key_shape = key.shape
 
-        # Assume batch_size = 1 for simplicity, seq_len = num_tokens
-        batch_size = 1
-        seq_len = num_tokens
-        n_q_heads = query_shape[1] // self.head_size
-        n_kv_heads = key_shape[1] // self.head_size
-
-        query_reshaped = query.view(batch_size, n_q_heads, seq_len, self.head_size)
-        key_reshaped = key.view(batch_size, n_kv_heads, seq_len, self.head_size)
-
-        # Reshape cos/sin for Triton: (3, bsz, seq_len, head_dim)
-        cos_reshaped = cos.view(3, batch_size, seq_len, self.head_size)
-        sin_reshaped = sin.view(3, batch_size, seq_len, self.head_size)
-
         # Apply Triton M-RoPE directly on flattened tensors
-        query_rot, key_rot = triton_mrope(
-            query, key, cos, sin, self.mrope_section, self.head_size
+        q, k = triton_mrope(
+            query,
+            key,
+            cos,
+            sin,
+            self.mrope_section,
+            self.head_size,
         )
 
-        return query_rot, key_rot
+        return q.reshape(query_shape), k.reshape(key_shape)
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _forward_native(
