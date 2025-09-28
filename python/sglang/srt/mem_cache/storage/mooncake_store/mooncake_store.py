@@ -288,7 +288,7 @@ class MooncakeStore(HiCacheStorage):
         # Only set non-existing keys to storage
         if len(set_keys) > 0:
             put_results = self._put_batch_zero_copy_impl(
-                key_strs, buffer_ptrs, buffer_sizes
+                set_keys, set_buffer_ptrs, set_buffer_sizes
             )
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
