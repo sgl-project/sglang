@@ -3035,6 +3035,10 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "down_proj",
     "qkv_proj",
     "gate_up_proj",
+    # # Support prefixed module names for models like Llama4
+    # "feed_forward.gate_proj",
+    # "feed_forward.up_proj", 
+    # "feed_forward.down_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
