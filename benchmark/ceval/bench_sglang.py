@@ -8,7 +8,7 @@ import time
 import numpy as np
 from datasets import load_dataset
 
-from sglang.api import set_default_backend
+from sglang.lang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -58,7 +58,7 @@ def main(args):
             dataset = load_dataset(data_path, name=subject)
             dev_lines_temp = dataset["dev"]
             val_lines_temp = dataset["val"]
-            few_shot_examples = get_few_shot_examples(dev_lines_temp, subject)
+            few_shot_examples = get_few_shot_examples(dev_lines_temp)
             examples += f"{few_shot_examples}"
             for val_line in val_lines_temp:
                 arguments.append(
@@ -132,7 +132,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, default="ceval-exam")
+    parser.add_argument("--data-path", type=str, default="ceval/ceval-exam")
     parser.add_argument("--num-questions", type=int, default=None)
     args = add_common_sglang_args_and_parse(parser)
     main(args)

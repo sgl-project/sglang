@@ -16,6 +16,7 @@ python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TO
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../killall_sglang.sh"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
 # Install apt packages
 apt install -y git libnuma-dev
@@ -91,4 +92,8 @@ fi
 # Show current packages
 $PIP_CMD list
 
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+
+if [ -n "${HF_TOKEN:-}" ]; then
+    $PIP_CMD install -U "huggingface_hub[cli]" $PIP_INSTALL_SUFFIX
+    hf auth login --token $HF_TOKEN
+fi
