@@ -260,6 +260,26 @@ def download_weights_from_hf(
     Returns:
         str: The path to the downloaded model weights.
     """
+    # Check if it's a local directory and has weight files
+    if os.path.isdir(model_name_or_path):
+        # Verify that the local directory contains weight files matching the allowed patterns
+        local_weight_files = []
+        for pattern in allow_patterns:
+            local_weight_files.extend(
+                glob.glob(os.path.join(model_name_or_path, pattern))
+            )
+
+        if local_weight_files:
+            logger.info("Using local model weights at %s", model_name_or_path)
+            return model_name_or_path
+        else:
+            logger.warning(
+                "Local directory %s exists but contains no weight files matching patterns %s. "
+                "Falling back to download from HF Hub.",
+                model_name_or_path,
+                allow_patterns,
+            )
+
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         # Before we download we look at that is available:
         fs = HfFileSystem()
