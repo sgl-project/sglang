@@ -176,11 +176,10 @@ if __name__ == "__main__":
             "Skipping INT8 GEMM benchmark in CI environment due to architecture compatibility issues"
         )
         print("INT8 operations may not be supported on all GPU architectures")
-        return
+    else:
+        KN_model_names = prepare_shapes(args)
+        for K, N, model_name in KN_model_names:
+            print(f"{model_name} N={N} K={K}: ")
+            benchmark.run(print_data=True, N=N, K=K)
 
-    KN_model_names = prepare_shapes(args)
-    for K, N, model_name in KN_model_names:
-        print(f"{model_name} N={N} K={K}: ")
-        benchmark.run(print_data=True, N=N, K=K)
-
-    print("Benchmark finished!")
+        print("Benchmark finished!")
