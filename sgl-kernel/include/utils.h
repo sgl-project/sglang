@@ -20,6 +20,10 @@ limitations under the License.
 #include <torch/all.h>
 
 #ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+#endif
+
+#ifdef USE_ROCM
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \
@@ -454,3 +458,12 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
   if (x <= 1) return 1;
   return 1u << (32 - __builtin_clz(x - 1));
 }
+
+/*
+ * LDG Support
+ */
+#ifndef USE_ROCM
+#define SGLANG_LDG(arg) __ldg(arg)
+#else
+#define SGLANG_LDG(arg) *(arg)
+#endif

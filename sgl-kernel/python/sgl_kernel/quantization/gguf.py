@@ -5,19 +5,19 @@ def ggml_dequantize(
     weight: torch.Tensor, quant_type: int, M: int, N: int, dtype: torch.dtype
 ):
     assert M > 0 and N > 0, "GGUF weight Input shape must be of positive dimensions"
-    return torch.ops.sgl_kernel.ggml_dequantize(weight, quant_type, M, N, dtype)
+    return torch.ops.sgl_kernel.ggml_dequantize.default(weight, quant_type, M, N, dtype)
 
 
 def ggml_mul_mat_vec_a8(
     weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
 ) -> torch.Tensor:
-    return torch.ops.sgl_kernel.ggml_mul_mat_vec_a8(weight, x, quant_type, row)
+    return torch.ops.sgl_kernel.ggml_mul_mat_vec_a8.default(weight, x, quant_type, row)
 
 
 def ggml_mul_mat_a8(
     weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
 ) -> torch.Tensor:
-    return torch.ops.sgl_kernel.ggml_mul_mat_a8(weight, x, quant_type, row)
+    return torch.ops.sgl_kernel.ggml_mul_mat_a8.default(weight, x, quant_type, row)
 
 
 def ggml_moe_a8(
@@ -31,7 +31,7 @@ def ggml_moe_a8(
     topk: int,
     tokens: int,
 ) -> torch.Tensor:
-    return torch.ops.sgl_kernel.ggml_moe_a8(
+    return torch.ops.sgl_kernel.ggml_moe_a8.default(
         input,
         weight,
         sorted_token_ids,
@@ -53,10 +53,10 @@ def ggml_moe_a8_vec(
     row: int,
     tokens: int,
 ) -> torch.Tensor:
-    return torch.ops.sgl_kernel.ggml_moe_a8_vec(
+    return torch.ops.sgl_kernel.ggml_moe_a8_vec.default(
         input, weight, topk_ids, top_k, type, row, tokens
     )
 
 
 def ggml_moe_get_block_size(type: int) -> int:
-    return torch.ops.sgl_kernel.ggml_moe_get_block_size(type)
+    return torch.ops.sgl_kernel.ggml_moe_get_block_size.default(type)

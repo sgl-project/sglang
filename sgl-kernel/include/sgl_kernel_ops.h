@@ -321,6 +321,8 @@ void topk_softmax(
 
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
 
+void moe_sum(torch::Tensor& input, torch::Tensor& output);
+
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
     at::Tensor& bias,

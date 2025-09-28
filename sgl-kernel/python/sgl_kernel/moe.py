@@ -48,6 +48,16 @@ def moe_sum_reduce(
     )
 
 
+def moe_sum(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+):
+    torch.ops.sgl_kernel.moe_sum.default(
+        input_tensor,
+        output_tensor,
+    )
+
+
 def moe_fused_gate(
     input_tensor,
     bias,

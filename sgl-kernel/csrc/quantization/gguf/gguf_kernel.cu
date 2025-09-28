@@ -5,14 +5,18 @@
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
-#include "dequantize.cuh"
+// dont use clang-format here, it breaks the include order
+// clang-format off
+#include "utils.h"
+
 #include "ggml-common.h"
-#include "mmq.cuh"
+#include "vecdotq.cuh"
+#include "dequantize.cuh"
 #include "mmvq.cuh"
+#include "mmq.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
-#include "utils.h"
-#include "vecdotq.cuh"
+// clang-format off
 
 // Q8 gemv
 template <typename scalar_t>
