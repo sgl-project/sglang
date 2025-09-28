@@ -1330,13 +1330,82 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with optional Triton kernel acceleration.
+
+        Args:
+            positions:
+                [num_tokens,] (text only) or
+                [3, num_tokens] (T/H/W positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 1 or positions.ndim == 2
+
+        # Use Triton kernel for multimodal M-RoPE if available and applicable
+        if (
+            _triton_available
+            and positions.ndim == 2
+            and self.mrope_section
+            and _is_cuda
+            and self.is_neox_style
+            and self.rotary_dim == self.head_size
+        ):
+            return self._forward_triton(positions, query, key)
+        else:
+            return self._forward_native(positions, query, key)
+
+    def _forward_triton(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Triton-accelerated forward pass for Qwen2VL M-RoPE."""
+        num_tokens = positions.shape[-1]
+        cos_sin = self.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        # Reshape for Triton kernel: (bsz, n_heads, seq_len, head_dim)
+        query_shape = query.shape
+        key_shape = key.shape
+
+        # Assume batch_size = 1 for simplicity, seq_len = num_tokens
+        batch_size = 1
+        seq_len = num_tokens
+        n_q_heads = query_shape[1] // self.head_size
+        n_kv_heads = key_shape[1] // self.head_size
+
+        query_reshaped = query.view(batch_size, n_q_heads, seq_len, self.head_size)
+        key_reshaped = key.view(batch_size, n_kv_heads, seq_len, self.head_size)
+
+        # Reshape cos/sin for Triton: (3, bsz, seq_len, head_dim)
+        cos_reshaped = cos.view(3, batch_size, seq_len, self.head_size)
+        sin_reshaped = sin.view(3, batch_size, seq_len, self.head_size)
+
+        # Apply Triton M-RoPE
+        query_rot, key_rot = LigerQwen2VLMRopeFunction.apply(
+            query_reshaped, key_reshaped, cos_reshaped, sin_reshaped, self.mrope_section
+        )
+
+        # Reshape back to original format
+        query = query_rot.view(query_shape)
+        key = key_rot.view(key_shape)
+
+        return query, key
+
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    def _forward_native(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward().
 
