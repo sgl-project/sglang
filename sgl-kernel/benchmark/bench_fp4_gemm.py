@@ -10,6 +10,8 @@ import triton
 from flashinfer import mm_fp4
 from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 
+from sglang.srt.utils import get_device_capability
+
 # CI environment detection
 IS_CI = (
     os.getenv("CI", "false").lower() == "true"
@@ -211,21 +213,29 @@ if __name__ == "__main__":
             writer = csv.writer(f)
             writer.writerow(["provider", "m", "n", "k", "time_ms"])
 
-    NKs = get_weight_shapes(args)
+    # Check architecture compatibility - FP4 operations require sm100a/sm103a
+    major, minor = get_device_capability()
+    if major is None or major < 10:  # Requires compute capability 10.0+ (sm100a/sm103a)
+        print("Skipping FP4 GEMM benchmark")
+        if major is not None:
+            print(f"FP4 operations require sm100a/sm103a, but found sm{major}{minor}")
+        else:
+            print("Could not determine device capability")
+    else:
+        NKs = get_weight_shapes(args)
 
-    # Limit iterations in CI
-    if IS_CI:
-        NKs = NKs[:2]  # Only test first 2 shapes in CI
+        # Limit iterations in CI
+        if IS_CI:
+            NKs = NKs[:2]  # Only test first 2 shapes in CI
 
-    for N, K in NKs:
-        print(f"DeepSeek-R1-0528-FP4 N={N} K={K}: ")
-        benchmark.run(
-            print_data=True,
-            N=N,
-            K=K,
-            dtype=args.dtype,
-            correctness=args.correctness,
-            csv_file=args.csv,
-        )
-
-    print("Benchmark finished!")
+        for N, K in NKs:
+            print(f"DeepSeek-R1-0528-FP4 N={N} K={K}: ")
+            benchmark.run(
+                print_data=True,
+                N=N,
+                K=K,
+                dtype=args.dtype,
+                correctness=args.correctness,
+                csv_file=args.csv,
+            )
+        print("Benchmark finished!")

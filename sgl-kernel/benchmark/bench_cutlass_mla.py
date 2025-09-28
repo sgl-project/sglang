@@ -7,6 +7,8 @@ import torch
 import triton
 from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 
+from sglang.srt.utils import get_device_capability
+
 # CI environment detection
 IS_CI = (
     os.getenv("CI", "false").lower() == "true"
@@ -143,13 +145,34 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    for block_size in args.block_sizes:
-        for kv_split in args.num_kv_splits:
-            print(f"block_size={block_size}, num_kv_splits={kv_split}: ")
-            benchmark.run(
-                print_data=True,
-                block_size=block_size,
-                num_kv_splits=kv_split,
-            )
-
-    print("Benchmark finished!")
+    # Skip in CI environment or unsupported architectures
+    if IS_CI:
+        major, minor = get_device_capability()
+        if major is None or major < 10:  # Requires compute capability 10.0+
+            print("Skipping Cutlass MLA benchmark in CI environment")
+            if major is not None:
+                print(
+                    f"Cutlass MLA requires compute capability 10.0+, but found {major}.{minor}"
+                )
+            else:
+                print("Could not determine device capability")
+        else:
+            for block_size in args.block_sizes:
+                for kv_split in args.num_kv_splits:
+                    print(f"block_size={block_size}, num_kv_splits={kv_split}: ")
+                    benchmark.run(
+                        print_data=True,
+                        block_size=block_size,
+                        num_kv_splits=kv_split,
+                    )
+            print("Benchmark finished!")
+    else:
+        for block_size in args.block_sizes:
+            for kv_split in args.num_kv_splits:
+                print(f"block_size={block_size}, num_kv_splits={kv_split}: ")
+                benchmark.run(
+                    print_data=True,
+                    block_size=block_size,
+                    num_kv_splits=kv_split,
+                )
+        print("Benchmark finished!")
