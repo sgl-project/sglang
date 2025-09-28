@@ -256,7 +256,19 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        # Apply extra_backend_tag prefix if available. TODO: move it to backend
+        prefixed_keys = keys
+        if (
+            extra_info
+            and extra_info.extra_info
+            and extra_info.extra_info.get("extra_backend_tag")
+        ):
+            prefix = extra_info.extra_info["extra_backend_tag"]
+            prefixed_keys = [f"{prefix}_{key}" for key in keys]
+
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+            prefixed_keys, host_indices
+        )
         get_results = self._get_batch_zero_copy_impl(
             key_strs, buffer_ptrs, buffer_sizes
         )
@@ -268,17 +280,29 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        # Apply extra_backend_tag prefix if available. TODO: move it to backend
+        prefixed_keys = keys
+        if (
+            extra_info
+            and extra_info.extra_info
+            and extra_info.extra_info.get("extra_backend_tag")
+        ):
+            prefix = extra_info.extra_info["extra_backend_tag"]
+            prefixed_keys = [f"{prefix}_{key}" for key in keys]
+
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+            prefixed_keys, host_indices
+        )
         exist_result = self._batch_exist(key_strs)
 
         set_keys = []
         set_buffer_ptrs = []
         set_buffer_sizes = []
         set_indices = []
-        set_results = [-1] * len(keys)
-        for i in range(len(keys)):
+        set_results = [-1] * len(prefixed_keys)
+        for i in range(len(prefixed_keys)):
             if exist_result[i] != 1:
-                set_keys.append(keys[i])
+                set_keys.append(prefixed_keys[i])
                 set_buffer_ptrs.append(buffer_ptrs[i])
                 set_buffer_sizes.append(buffer_sizes[i])
                 set_indices.append(i)
@@ -288,7 +312,7 @@ class MooncakeStore(HiCacheStorage):
         # Only set non-existing keys to storage
         if len(set_keys) > 0:
             put_results = self._put_batch_zero_copy_impl(
-                key_strs, buffer_ptrs, buffer_sizes
+                set_keys, set_buffer_ptrs, set_buffer_sizes
             )
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]

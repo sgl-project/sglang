@@ -22,7 +22,10 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Set, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -274,6 +277,21 @@ class HiCacheController:
                 # todo: load balancing
                 and self.storage_config.tp_rank != 0
             )
+
+            # Handle extra_backend_tag configuration
+            if (
+                self.storage_config.extra_config
+                and self.storage_config.extra_config.get("extra_backend_tag")
+            ):
+                self.storage_extra_info = HiCacheStorageExtraInfo(
+                    extra_info={
+                        "extra_backend_tag": self.storage_config.extra_config[
+                            "extra_backend_tag"
+                        ]
+                    }
+                )
+            else:
+                self.storage_extra_info = None
 
             # Use storage backend factory for dynamic backend creation
             from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -580,7 +598,9 @@ class HiCacheController:
             self.host_mem_release_queue.put(chunk)
 
     def _page_get_zero_copy(self, operation, hash_values, host_indices):
-        results = self.storage_backend.batch_get_v1(hash_values, host_indices)
+        results = self.storage_backend.batch_get_v1(
+            hash_values, host_indices, self.storage_extra_info
+        )
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
@@ -759,7 +779,11 @@ class HiCacheController:
         return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices) -> bool:
-        return all(self.storage_backend.batch_set_v1(hash_values, host_indices))
+        return all(
+            self.storage_backend.batch_set_v1(
+                hash_values, host_indices, self.storage_extra_info
+            )
+        )
 
     # Backup batch by batch
     def _page_backup(self, operation):
