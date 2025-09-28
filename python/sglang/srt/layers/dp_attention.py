@@ -39,6 +39,7 @@ _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_DETERMINISTIC_INFERENCE = get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE")
 
 
 class DpPaddingMode(IntEnum):
@@ -58,6 +59,9 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
+        if _DETERMINISTIC_INFERENCE:
+            return DpPaddingMode.SUM_LEN
+
         if is_extend_in_batch:
             return DpPaddingMode.SUM_LEN
 
@@ -73,6 +77,9 @@ class DpPaddingMode(IntEnum):
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
+        if _DETERMINISTIC_INFERENCE:
+            return DpPaddingMode.SUM_LEN
+
         if _USE_ROCM700A_WA:
             return cls.SUM_LEN
         else:
