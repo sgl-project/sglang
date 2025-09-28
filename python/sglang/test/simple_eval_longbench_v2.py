@@ -6,11 +6,12 @@ Yushi Bai, Shangqing Tu, Jiajie Zhang, Hao Peng, Xiaozhi Wang, Xin Lv, Shulin Ca
 https://arxiv.org/abs/2412.15204
 """
 
+import csv
+import json
+import os
 import random
 import re
-from typing import List, Optional, Union
-
-import pandas
+from typing import Any, Dict, List, Optional
 
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
@@ -32,6 +33,9 @@ TASK_CATEGORIES = {
     "long_structured_data",
 }
 
+DEFAULT_DATASET = "THUDM/LongBench-v2"
+DEFAULT_DATASET_SPLIT = "train"
+
 
 def format_longbench_v2_question(row: dict) -> str:
     """Format a LongBench-v2 question using the official template."""
@@ -46,10 +50,10 @@ def format_longbench_v2_question(row: dict) -> str:
         choice_C = choices[2] if len(choices) > 2 else ""
         choice_D = choices[3] if len(choices) > 3 else ""
     else:
-        choice_A = row.get("A", "")
-        choice_B = row.get("B", "")
-        choice_C = row.get("C", "")
-        choice_D = row.get("D", "")
+        choice_A = row.get("A", row.get("choice_A", ""))
+        choice_B = row.get("B", row.get("choice_B", ""))
+        choice_C = row.get("C", row.get("choice_C", ""))
+        choice_D = row.get("D", row.get("choice_D", ""))
 
     # Official LongBench-v2 template
     prompt = f"""{context.strip()}
@@ -71,19 +75,24 @@ def extract_longbench_v2_answer(response: str) -> Optional[str]:
     response = response.replace("*", "")
 
     # First try: "The correct answer is (A)"
-    match = re.search(r"The correct answer is \(([A-D])\)", response)
+    match = re.search(r"The correct answer is \(([A-D])\)", response, re.IGNORECASE)
     if match:
-        return match.group(1)
+        return match.group(1).upper()
 
     # Second try: "The correct answer is A"
-    match = re.search(r"The correct answer is ([A-D])", response)
+    match = re.search(r"The correct answer is ([A-D])", response, re.IGNORECASE)
     if match:
-        return match.group(1)
+        return match.group(1).upper()
 
     # Fallback: Standard SGLang multichoice pattern
     match = re.search(ANSWER_PATTERN_MULTICHOICE, response)
     if match:
-        return match.group(1)
+        return match.group(1).upper()
+
+    # Generic fallback when model says "answer is A"
+    match = re.search(r"answer\s+is\s*\(?([A-D])\)?", response, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
 
     return None
 
@@ -139,6 +148,11 @@ class LongBenchV2Eval(Eval):
         # Repeat examples for multiple runs
         examples = examples * n_repeats
 
+        if not examples:
+            raise ValueError(
+                "No examples available for LongBench-v2 evaluation after filtering"
+            )
+
         self.examples = examples
         self.n_repeats = n_repeats
         self.num_threads = num_threads
@@ -151,52 +165,95 @@ class LongBenchV2Eval(Eval):
                 f"Context length filter: {min_context_length}-{max_context_length} tokens"
             )
 
-    def _load_dataset(self, data_source: str) -> List[dict]:
-        """Load dataset from various sources."""
-        examples = []
+    def _load_dataset(self, data_source: str) -> List[Dict[str, Any]]:
+        """Load dataset from HuggingFace hub or local files."""
 
-        if (
-            data_source.startswith("http")
-            or "/" in data_source
-            and not data_source.endswith((".csv", ".json"))
-        ):
-            # HuggingFace dataset
-            try:
-                from datasets import load_dataset
+        if not data_source:
+            data_source = DEFAULT_DATASET
 
-                dataset = load_dataset(data_source, split="test")
-                examples = [dict(row) for row in dataset]
-            except ImportError:
-                raise ImportError(
-                    "Please install datasets library: pip install datasets"
-                )
-        elif data_source.endswith(".csv"):
-            # CSV file
-            df = pandas.read_csv(data_source)
-            examples = [row.to_dict() for _, row in df.iterrows()]
-        elif data_source.endswith(".json"):
-            # JSON file
-            import json
-
-            with open(data_source, "r") as f:
-                examples = json.load(f)
+        if os.path.exists(data_source):
+            raw_examples = self._load_local_file(data_source)
         else:
-            # Assume it's a file path, try CSV first
+            raw_examples = self._load_hf_dataset(data_source)
+
+        return [self._normalize_example(example) for example in raw_examples]
+
+    def _load_local_file(self, path: str) -> List[Dict[str, Any]]:
+        """Load examples from a local CSV/JSON/JSONL file."""
+
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix in {".json", ".jsonl"}:
+            with open(path, "r", encoding="utf-8") as fh:
+                if suffix == ".jsonl":
+                    data = [json.loads(line) for line in fh if line.strip()]
+                else:
+                    data = json.load(fh)
+        elif suffix == ".csv":
+            with open(path, "r", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                data = list(reader)
+        else:
+            # Try JSON, then CSV as fallback
             try:
-                df = pandas.read_csv(data_source)
-                examples = [row.to_dict() for _, row in df.iterrows()]
-            except:
-                # Try JSON
-                import json
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except json.JSONDecodeError:
+                with open(path, "r", encoding="utf-8") as fh:
+                    reader = csv.DictReader(fh)
+                    data = list(reader)
 
-                with open(data_source, "r") as f:
-                    examples = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("data", [])
 
-        return examples
+        if not isinstance(data, list):
+            raise ValueError("Expected list of examples from local file")
+
+        return data
+
+    def _load_hf_dataset(self, identifier: str) -> List[Dict[str, Any]]:
+        """Load the dataset from HuggingFace Hub."""
+
+        parts = identifier.split(":", maxsplit=1)
+        dataset_name = parts[0]
+        split = parts[1] if len(parts) == 2 else DEFAULT_DATASET_SPLIT
+
+        try:
+            from datasets import load_dataset  # type: ignore
+        except ImportError as exc:
+            raise ImportError(
+                "Please install the 'datasets' package to load LongBench-v2 from HuggingFace: pip install datasets"
+            ) from exc
+
+        dataset = load_dataset(dataset_name, split=split)
+        return [dict(row) for row in dataset]
+
+    def _normalize_example(self, example: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure each example exposes the expected keys."""
+
+        normalized = dict(example)
+
+        for letter in ["A", "B", "C", "D"]:
+            choice_key = f"choice_{letter}"
+            if letter not in normalized and choice_key in normalized:
+                normalized[letter] = normalized[choice_key]
+
+        if "category" not in normalized and "domain" in normalized:
+            normalized["category"] = normalized["domain"]
+
+        answer = normalized.get("answer")
+        if isinstance(answer, str):
+            normalized["answer"] = answer.strip().upper()
+        elif isinstance(answer, int) and 0 <= answer < 4:
+            normalized["answer"] = ["A", "B", "C", "D"][answer]
+
+        return normalized
 
     def _filter_by_context_length(
-        self, examples: List[dict], min_length: Optional[int], max_length: Optional[int]
-    ) -> List[dict]:
+        self,
+        examples: List[Dict[str, Any]],
+        min_length: Optional[int],
+        max_length: Optional[int],
+    ) -> List[Dict[str, Any]]:
         """Filter examples by context length."""
         filtered = []
         for example in examples:
@@ -234,7 +291,9 @@ class LongBenchV2Eval(Eval):
 
             # Get correct answer
             correct_answer = row.get("answer", "")
-            if isinstance(correct_answer, int):
+            if isinstance(correct_answer, str):
+                correct_answer = correct_answer.strip().upper()
+            elif isinstance(correct_answer, int) and 0 <= correct_answer < 4:
                 correct_answer = ["A", "B", "C", "D"][correct_answer]
 
             # Calculate score
@@ -256,7 +315,7 @@ class LongBenchV2Eval(Eval):
             metrics = {"chars": len(response_text)}
 
             # Add category-specific metrics
-            category = row.get("category", "unknown")
+            category = row.get("category", row.get("domain", "unknown"))
             if category in TASK_CATEGORIES:
                 metrics[category] = score
 

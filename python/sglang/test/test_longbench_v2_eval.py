@@ -2,10 +2,9 @@
 Test cases for LongBench-v2 evaluation utility.
 """
 
+import json
 import os
 import tempfile
-
-import pandas as pd
 
 from sglang.test.simple_eval_longbench_v2 import (
     LongBenchV2Eval,
@@ -71,32 +70,92 @@ def test_extract_longbench_v2_answer():
 def test_longbench_v2_eval_initialization():
     """Test LongBench-v2 evaluation class initialization."""
 
-    # Create a temporary CSV file with sample data
-    sample_data = {
-        "_id": ["test_001", "test_002"],
-        "category": ["single_document_qa", "multi_document_qa"],
-        "question": ["What is X?", "What is Y?"],
-        "A": ["Option A1", "Option A2"],
-        "B": ["Option B1", "Option B2"],
-        "C": ["Option C1", "Option C2"],
-        "D": ["Option D1", "Option D2"],
-        "answer": ["A", "B"],
-        "context": ["Context 1", "Context 2"],
-    }
+    # Create a temporary JSON file with sample data
+    sample_data = [
+        {
+            "_id": "test_001",
+            "domain": "single_document_qa",
+            "question": "What is X?",
+            "choice_A": "Option A1",
+            "choice_B": "Option B1",
+            "choice_C": "Option C1",
+            "choice_D": "Option D1",
+            "answer": "A",
+            "context": "Context 1",
+        },
+        {
+            "_id": "test_002",
+            "domain": "multi_document_qa",
+            "question": "What is Y?",
+            "A": "Option A2",
+            "B": "Option B2",
+            "C": "Option C2",
+            "D": "Option D2",
+            "answer": "B",
+            "context": "Context 2",
+        },
+    ]
 
-    df = pd.DataFrame(sample_data)
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
-        df.to_csv(f.name, index=False)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(sample_data, f)
         temp_file = f.name
 
     try:
         # Test initialization with new data_source parameter
         eval_instance = LongBenchV2Eval(data_source=temp_file, num_examples=1)
         assert len(eval_instance.examples) == 1
-        assert eval_instance.examples[0]["category"] == "single_document_qa"
+        first_example = eval_instance.examples[0]
+        assert first_example.get("category") in {
+            "single_document_qa",
+            "multi_document_qa",
+        }
+        assert first_example.get("A") in {"Option A1", "Option A2"}
         print("✓ Evaluation class initialization works correctly")
 
+    finally:
+        os.unlink(temp_file)
+
+
+def test_category_filtering():
+    """Ensure category filtering keeps only requested domains."""
+
+    sample_data = [
+        {
+            "_id": "test_001",
+            "domain": "single_document_qa",
+            "question": "What is X?",
+            "choice_A": "Option A1",
+            "choice_B": "Option B1",
+            "choice_C": "Option C1",
+            "choice_D": "Option D1",
+            "answer": "A",
+            "context": "Context 1",
+        },
+        {
+            "_id": "test_002",
+            "domain": "multi_document_qa",
+            "question": "What is Y?",
+            "choice_A": "Option A2",
+            "choice_B": "Option B2",
+            "choice_C": "Option C2",
+            "choice_D": "Option D2",
+            "answer": "B",
+            "context": "Context 2",
+        },
+    ]
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(sample_data, f)
+        temp_file = f.name
+
+    try:
+        eval_instance = LongBenchV2Eval(
+            data_source=temp_file,
+            categories=["multi_document_qa"],
+        )
+        assert len(eval_instance.examples) == 1
+        assert eval_instance.examples[0]["category"] == "multi_document_qa"
+        print("✓ Category filtering works correctly")
     finally:
         os.unlink(temp_file)
 
@@ -108,6 +167,7 @@ def main():
     test_format_longbench_v2_question()
     test_extract_longbench_v2_answer()
     test_longbench_v2_eval_initialization()
+    test_category_filtering()
 
     print("\n" + "=" * 50)
     print("✅ ALL TESTS PASSED!")
