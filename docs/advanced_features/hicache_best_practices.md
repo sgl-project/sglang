@@ -136,10 +136,10 @@ python3 -m sglang.launch_server \
 
 ### Integration with PD Disaggregation
 
-HiCache works seamlessly with PD Disaggregation，You can choose between two configurations to deploy HICache and PD:
+HiCache works seamlessly with PD Disaggregation. You can choose between two configurations:
 
-1. Enable HICache only between P nodes, which allows KVCache sharing among the P nodes.
-2. Enable HICache on P nodes and asynchronous offloading of KVCache on D nodes. This configuration allows P nodes to share the KVCache from D nodes in multi-turn dialogue scenarios.
+1. **Prefill-only HiCache**: Enable HiCache only on Prefill nodes, allowing KV cache sharing among Prefill instances
+2. **Full HiCache with async offloading**: Enable HiCache on Prefill nodes and async KV cache offloading on Decode nodes, allowing Prefill nodes to reuse KV caches from Decode nodes in multi-turn dialogue scenarios
 
 ```bash
 # Prefill node with HiCache enabled for cross-prefill sharing (ideal for SystemPrompt scenarios)
@@ -163,7 +163,7 @@ python3 -m sglang.launch_server \
   --disaggregation-mode prefill \
   --disaggregation-transfer-backend mooncake
 
-# Enabling asynchronous offloading in Decode Node allows its KVCache to be contributed by Prefill
+# Decode node with async offloading enabled for KV cache reuse by Prefill (ideal for multi-turn conversations)
 python3 -m sglang.launch_server \
   --model-path /xxx/DeepSeek-R1/ \
   --tp 8 \
@@ -196,6 +196,26 @@ To integrate a new storage backend:
 2. **Register your backend:** Add your storage backend to the HiCache [BackendFactory](../../python/sglang/srt/mem_cache/storage/backend_factory.py#L188)
 
 The HiCache controller handles all scheduling and synchronization automatically.
+
+### Dynamic Backend Loading
+
+Alternatively, you can use dynamic loading to avoid hard-coding your backend in the repository:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path your-model \
+  --enable-hierarchical-cache \
+  --hicache-storage-backend dynamic \
+  --hicache-storage-backend-extra-config '{"backend_name":"custom_backend_name", "module_path": "your_module_path", "class_name": "YourHiCacheClassName"}'
+```
+
+**Configuration Parameters:**
+- `--hicache-storage-backend`: Set to `dynamic`
+- `--hicache-storage-backend-extra-config`: JSON configuration with:
+  - `backend_name`: Custom backend identifier
+  - `module_path`: Python module path to your implementation
+  - `class_name`: Your HiCache implementation class name
+
 
 ## Community and Support
 
