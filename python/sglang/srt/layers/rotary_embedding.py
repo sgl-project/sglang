@@ -206,6 +206,7 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
