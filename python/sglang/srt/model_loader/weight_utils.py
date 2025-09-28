@@ -261,37 +261,6 @@ def download_weights_from_hf(
     Returns:
         str: The path to the downloaded model weights.
     """
-    # Check if it's a local directory and has weight files
-    # if is_in_ci() and os.path.isdir(model_name_or_path):
-    print(f"download_weights_from_hf")
-    if os.path.isdir(model_name_or_path):
-        print(f"12312312")
-        # Verify that the local directory contains weight files matching the allowed patterns
-        local_weight_files = []
-        for pattern in allow_patterns:
-            local_weight_files.extend(
-                glob.glob(os.path.join(model_name_or_path, pattern))
-            )
-
-        print(f"local_weight_files")
-
-        if local_weight_files:
-            print("Using local model weights at %s", model_name_or_path)
-            logger.info("Using local model weights at %s", model_name_or_path)
-            return model_name_or_path
-        else:
-            logger.warning(
-                "Local directory %s exists but contains no weight files matching patterns %s. "
-                "Falling back to download from HF Hub.",
-                model_name_or_path,
-                allow_patterns,
-            )
-
-    # Determine local_only by checking whether the snapshot exists in HF cache
-    # (either custom cache_dir or default HF cache). This makes local_only reflect
-    # actual local availability rather than only the HF_HUB_OFFLINE flag.
-    local_only = False
-
     # Check custom cache_dir (if provided)
     if cache_dir and not os.path.isdir(model_name_or_path):
         try:
@@ -310,20 +279,29 @@ def download_weights_from_hf(
             if rev_to_use:
                 rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
                 if os.path.isdir(rev_dir):
-                    local_only = True
+                    found_local_snapshot_dir = rev_dir
         except Exception:
             pass
 
     # Check default HF cache as well
-    if not local_only and not os.path.isdir(model_name_or_path):
+    if not os.path.isdir(model_name_or_path):
         try:
             rev_dir = find_local_repo_dir(model_name_or_path, revision)
             if rev_dir and os.path.isdir(rev_dir):
-                local_only = True
+                found_local_snapshot_dir = rev_dir
         except Exception:
             pass
 
-    if not local_only:
+    # If local snapshot exists, return it directly and skip download.
+    if found_local_snapshot_dir is not None:
+        logger.info(
+            "Found local HF snapshot for %s at %s; skipping download.",
+            model_name_or_path,
+            found_local_snapshot_dir,
+        )
+        return found_local_snapshot_dir
+
+    if not huggingface_hub.constants.HF_HUB_OFFLINE:
         # Before we download we look at that is available:
         fs = HfFileSystem()
         file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
@@ -346,7 +324,7 @@ def download_weights_from_hf(
             cache_dir=cache_dir,
             tqdm_class=DisabledTqdm,
             revision=revision,
-            local_files_only=local_only,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
     return hf_folder
 
