@@ -38,7 +38,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.utils import print_warning_once
+from sglang.srt.utils import find_local_repo_dir, print_warning_once
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -262,7 +262,10 @@ def download_weights_from_hf(
         str: The path to the downloaded model weights.
     """
     # Check if it's a local directory and has weight files
-    if is_in_ci() and os.path.isdir(model_name_or_path):
+    # if is_in_ci() and os.path.isdir(model_name_or_path):
+    print(f"download_weights_from_hf")
+    if os.path.isdir(model_name_or_path):
+        print(f"12312312")
         # Verify that the local directory contains weight files matching the allowed patterns
         local_weight_files = []
         for pattern in allow_patterns:
@@ -270,7 +273,10 @@ def download_weights_from_hf(
                 glob.glob(os.path.join(model_name_or_path, pattern))
             )
 
+        print(f"local_weight_files")
+
         if local_weight_files:
+            print("Using local model weights at %s", model_name_or_path)
             logger.info("Using local model weights at %s", model_name_or_path)
             return model_name_or_path
         else:
@@ -281,7 +287,43 @@ def download_weights_from_hf(
                 allow_patterns,
             )
 
-    if not huggingface_hub.constants.HF_HUB_OFFLINE:
+    # Determine local_only by checking whether the snapshot exists in HF cache
+    # (either custom cache_dir or default HF cache). This makes local_only reflect
+    # actual local availability rather than only the HF_HUB_OFFLINE flag.
+    local_only = False
+
+    # Check custom cache_dir (if provided)
+    if cache_dir and not os.path.isdir(model_name_or_path):
+        try:
+            repo_folder = os.path.join(
+                cache_dir,
+                huggingface_hub.constants.REPO_ID_SEPARATOR.join(
+                    ["models", *model_name_or_path.split("/")]
+                ),
+            )
+            rev_to_use = revision
+            if not rev_to_use:
+                ref_main = os.path.join(repo_folder, "refs", "main")
+                if os.path.isfile(ref_main):
+                    with open(ref_main) as f:
+                        rev_to_use = f.read().strip()
+            if rev_to_use:
+                rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
+                if os.path.isdir(rev_dir):
+                    local_only = True
+        except Exception:
+            pass
+
+    # Check default HF cache as well
+    if not local_only and not os.path.isdir(model_name_or_path):
+        try:
+            rev_dir = find_local_repo_dir(model_name_or_path, revision)
+            if rev_dir and os.path.isdir(rev_dir):
+                local_only = True
+        except Exception:
+            pass
+
+    if not local_only:
         # Before we download we look at that is available:
         fs = HfFileSystem()
         file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
@@ -304,7 +346,7 @@ def download_weights_from_hf(
             cache_dir=cache_dir,
             tqdm_class=DisabledTqdm,
             revision=revision,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            local_files_only=local_only,
         )
     return hf_folder
 
