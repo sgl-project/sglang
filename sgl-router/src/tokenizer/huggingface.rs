@@ -26,7 +26,10 @@ impl HuggingFaceTokenizer {
     /// Create a tokenizer from a HuggingFace tokenizer JSON file
     pub fn from_file(file_path: &str) -> Result<Self> {
         // Try to auto-discover chat template if not explicitly provided
-        let chat_template_path = Self::discover_chat_template(file_path);
+        let path = std::path::Path::new(file_path);
+        let chat_template_path = path
+            .parent()
+            .and_then(crate::tokenizer::factory::discover_chat_template_in_dir);
         Self::from_file_with_chat_template(file_path, chat_template_path.as_deref())
     }
 
@@ -134,43 +137,6 @@ impl HuggingFaceTokenizer {
                 return template;
             }
         }
-        None
-    }
-
-    /// Discover chat template file in the same directory as the tokenizer
-    /// Priority order:
-    /// 1. chat_template.json (contains Jinja template in JSON format)
-    /// 2. chat_template.jinja (standard Jinja file)
-    /// 3. Any other .jinja file (fallback for non-standard naming)
-    fn discover_chat_template(tokenizer_path: &str) -> Option<String> {
-        use std::fs;
-
-        let path = std::path::Path::new(tokenizer_path);
-        let dir = path.parent()?;
-
-        // Priority 1: Look for chat_template.json (some models like Qwen3-VL use this)
-        let json_template_path = dir.join("chat_template.json");
-        if json_template_path.exists() {
-            return json_template_path.to_str().map(|s| s.to_string());
-        }
-
-        // Priority 2: Look for chat_template.jinja (standard name)
-        let jinja_path = dir.join("chat_template.jinja");
-        if jinja_path.exists() {
-            return jinja_path.to_str().map(|s| s.to_string());
-        }
-
-        // Priority 3: Look for any .jinja file (for models with non-standard naming)
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".jinja") && name != "chat_template.jinja" {
-                        return entry.path().to_str().map(|s| s.to_string());
-                    }
-                }
-            }
-        }
-
         None
     }
 

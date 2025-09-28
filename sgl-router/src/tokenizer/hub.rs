@@ -255,22 +255,37 @@ fn resolve_model_cache_dir(path: &Path, model_name: &str) -> PathBuf {
             return path.to_path_buf();
         }
 
-        // Try to find the correct level by going up
         let mut current = path.to_path_buf();
+
+        // First check if current path already contains tokenizer files
+        if current.join("tokenizer.json").exists() || current.join("tokenizer_config.json").exists()
+        {
+            return current;
+        }
+
+        // If not, traverse up to find the model root, then look in snapshots
         while let Some(parent) = current.parent() {
             if parent.to_string_lossy().contains(&expected_pattern) {
-                // Check if this directory contains tokenizer files
-                if current.join("tokenizer.json").exists()
-                    || current.join("tokenizer_config.json").exists()
-                {
-                    return current;
+                let snapshots_dir = parent.join("snapshots");
+                if snapshots_dir.exists() && snapshots_dir.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
+                        for entry in entries.flatten() {
+                            let snapshot_path = entry.path();
+                            if snapshot_path.is_dir()
+                                && (snapshot_path.join("tokenizer.json").exists()
+                                    || snapshot_path.join("tokenizer_config.json").exists())
+                            {
+                                return snapshot_path;
+                            }
+                        }
+                    }
                 }
+                return parent.to_path_buf();
             }
             current = parent.to_path_buf();
         }
     }
 
-    // Default: return the original path
     path.to_path_buf()
 }
 

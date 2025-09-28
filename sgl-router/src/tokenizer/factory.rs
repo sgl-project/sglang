@@ -135,7 +135,7 @@ fn is_likely_sentencepiece(buffer: &[u8]) -> bool {
 }
 
 /// Helper function to discover chat template files in a directory
-fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
+pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
     use std::fs;
 
     // Priority 1: Look for chat_template.json (contains Jinja in JSON format)
@@ -193,8 +193,14 @@ pub async fn create_tokenizer_async(
             if tokenizer_path.exists() {
                 // Try to find a chat template file in the cache directory
                 let chat_template_path = discover_chat_template_in_dir(&cache_dir);
+                let tokenizer_path_str = tokenizer_path.to_str().ok_or_else(|| {
+                    Error::msg(format!(
+                        "Tokenizer path is not valid UTF-8: {:?}",
+                        tokenizer_path
+                    ))
+                })?;
                 create_tokenizer_with_chat_template(
-                    tokenizer_path.to_str().unwrap(),
+                    tokenizer_path_str,
                     chat_template_path.as_deref(),
                 )
             } else {
@@ -204,8 +210,11 @@ pub async fn create_tokenizer_async(
                     let file_path = cache_dir.join(file_name);
                     if file_path.exists() {
                         let chat_template_path = discover_chat_template_in_dir(&cache_dir);
+                        let file_path_str = file_path.to_str().ok_or_else(|| {
+                            Error::msg(format!("File path is not valid UTF-8: {:?}", file_path))
+                        })?;
                         return create_tokenizer_with_chat_template(
-                            file_path.to_str().unwrap(),
+                            file_path_str,
                             chat_template_path.as_deref(),
                         );
                     }
