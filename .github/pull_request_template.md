@@ -2,7 +2,7 @@
 
 ## Motivation
 
-<!-- Describe the purpose and goals of this pull request. -->
+Enable config-driven, parameterized GLU activations for MoE across Triton/CUTLASS/native paths (bf16/fp8/fp4), while preserving existing fast paths and backward compatibility. Provide a single, unified activation entry that supports `silu`, `gelu`, `swish/swiglu`, `geglu`, `reglu` with optional `alpha`, `limit` (clamp), and `up_shift`. Defaults match the current behavior (e.g., standard SiLU/GEGLU fast paths) and no official configs need changes.
 
 ## Modifications
 
