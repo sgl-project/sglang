@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 import grpc
 import zmq
@@ -156,7 +156,7 @@ class GrpcRequestManager:
         obj: TokenizedGenerateReqInput,
         request_id: Optional[str] = None,
         grpc_context: Optional[grpc.aio.ServicerContext] = None,
-    ):
+    ) -> AsyncGenerator[Union[Dict, List[Dict]], None]:
         """
         Submit a generation request to the scheduler with n>1 parallel sampling support.
 

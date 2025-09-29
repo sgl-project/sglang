@@ -294,6 +294,6 @@ class SchedulerProfilerMixin:
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
                 )
-                return self.start_profile(True)
+                return self.start_profile()
         else:
             return self.stop_profile()

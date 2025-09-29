@@ -644,27 +644,96 @@ async fn responses_handler(
         }))
         .into_response()
     } else {
-        Json(json!({
-            "id": format!("resp-{}", Uuid::new_v4()),
-            "object": "response",
-            "created_at": timestamp,
-            "model": "mock-model",
-            "output": [{
-                "type": "message",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": "This is a mock responses output."
-                }]
-            }],
-            "status": "completed",
-            "usage": {
-                "input_tokens": 10,
-                "output_tokens": 5,
-                "total_tokens": 15
-            }
-        }))
-        .into_response()
+        // If tools are provided and this is the first call (no previous_response_id),
+        // emit a single function_tool_call to trigger the router's MCP flow.
+        let has_tools = payload
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|tool| {
+                    tool.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "function")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        let has_function_output = payload
+            .get("input")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "function_call_output")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if has_tools && !has_function_output {
+            let rid = format!("resp-{}", Uuid::new_v4());
+            Json(json!({
+                "id": rid,
+                "object": "response",
+                "created_at": timestamp,
+                "model": "mock-model",
+                "output": [{
+                    "type": "function_tool_call",
+                    "id": "call_1",
+                    "name": "brave_web_search",
+                    "arguments": "{\"query\":\"SGLang router MCP integration\"}",
+                    "status": "in_progress"
+                }],
+                "status": "in_progress",
+                "usage": null
+            }))
+            .into_response()
+        } else if has_tools && has_function_output {
+            Json(json!({
+                "id": format!("resp-{}", Uuid::new_v4()),
+                "object": "response",
+                "created_at": timestamp,
+                "model": "mock-model",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Tool result consumed; here is the final answer."
+                    }]
+                }],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 7,
+                    "total_tokens": 19
+                }
+            }))
+            .into_response()
+        } else {
+            Json(json!({
+                "id": format!("resp-{}", Uuid::new_v4()),
+                "object": "response",
+                "created_at": timestamp,
+                "model": "mock-model",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "This is a mock responses output."
+                    }]
+                }],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15
+                }
+            }))
+            .into_response()
+        }
     }
 }
 

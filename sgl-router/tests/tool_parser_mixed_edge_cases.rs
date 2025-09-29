@@ -17,9 +17,9 @@ async fn test_mixed_formats_in_text() {
     But here's the actual JSON: {"name": "test", "arguments": {}}
     "#;
 
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "test");
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "test");
 
     // Mistral parser should ignore JSON and other formats
     let mistral_parser = MistralParser::new();
@@ -28,9 +28,9 @@ async fn test_mixed_formats_in_text() {
     [TOOL_CALLS] [{"name": "real", "arguments": {}}]
     "#;
 
-    let result = mistral_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "real");
+    let (_normal_text, tools) = mistral_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "real");
 }
 
 #[tokio::test]
@@ -38,9 +38,9 @@ async fn test_format_markers_in_string_content() {
     let pythonic_parser = PythonicParser::new();
     let input = r#"[echo(text="Use [TOOL_CALLS] and <tool_call> in text")]"#;
 
-    let result = pythonic_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let (_normal_text, tools) = pythonic_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["text"], "Use [TOOL_CALLS] and <tool_call> in text");
 
     let qwen_parser = QwenParser::new();
@@ -48,9 +48,9 @@ async fn test_format_markers_in_string_content() {
 {"name": "log", "arguments": {"msg": "Found [function()] pattern"}}
 </tool_call>"#;
 
-    let result = qwen_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let (_normal_text, tools) = qwen_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["msg"], "Found [function()] pattern");
 }
 
@@ -75,11 +75,11 @@ async fn test_deeply_nested_json_structures() {
         }
     }"#;
 
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "deep_process");
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "deep_process");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert!(args["level1"]["level2"]["level3"]["level4"]["level5"]["data"].is_array());
 }
 
@@ -93,14 +93,14 @@ async fn test_multiple_sequential_calls_different_formats() {
     // Llama parser currently only returns the first tool found
     let input = r#"First call: <|python_tag|>{"name": "call1", "arguments": {}}"#;
 
-    let result = llama_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "call1");
+    let (_normal_text, tools) = llama_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "call1");
 
     let input2 = r#"{"name": "call2", "arguments": {"x": 1}}"#;
-    let result2 = llama_parser.parse_complete(input2).await.unwrap();
-    assert_eq!(result2.len(), 1);
-    assert_eq!(result2[0].function.name, "call2");
+    let (_normal_text2, tools2) = llama_parser.parse_complete(input2).await.unwrap();
+    assert_eq!(tools2.len(), 1);
+    assert_eq!(tools2[0].function.name, "call2");
 }
 
 #[tokio::test]
@@ -119,8 +119,8 @@ async fn test_empty_and_whitespace_variations() {
     ];
 
     for input in cases {
-        let result = json_parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1, "Should parse regardless of whitespace");
+        let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1, "Should parse regardless of whitespace");
     }
 }
 
@@ -141,11 +141,11 @@ async fn test_special_json_values() {
         }
     }"#;
 
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "test_special");
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "test_special");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert!(args["special_strings"].is_array());
     assert!(args["escaped"].is_string());
 }
@@ -181,22 +181,22 @@ async fn test_boundary_cases_for_extraction() {
 
     // JSON at the very beginning
     let input = r#"{"name": "start", "arguments": {}} and then text"#;
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "start");
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "start");
 
     // JSON at the very end
     let input = r#"Some text first {"name": "end", "arguments": {}}"#;
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "end");
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "end");
 
     // Multiple JSON objects in text (should find first valid one)
     let input =
         r#"Text {"name": "first", "arguments": {}} more {"name": "second", "arguments": {}}"#;
-    let result = json_parser.parse_complete(input).await.unwrap();
-    assert!(!result.is_empty());
-    assert_eq!(result[0].function.name, "first");
+    let (_normal_text, tools) = json_parser.parse_complete(input).await.unwrap();
+    assert!(!tools.is_empty());
+    assert_eq!(tools[0].function.name, "first");
 }
 
 #[tokio::test]
@@ -205,15 +205,15 @@ async fn test_pythonic_edge_cases() {
 
     // Function name with underscores and numbers
     let input = r#"[func_name_2(param_1="value")]"#;
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "func_name_2");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "func_name_2");
 
     // Empty string argument
     let input = r#"[process(text="")]"#;
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["text"], "");
 }
 
@@ -238,11 +238,11 @@ async fn test_mistral_with_pretty_json() {
         }
     ]"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "formatted");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "formatted");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["nested"]["key"], "value");
     assert_eq!(args["array"], json!([1, 2, 3]));
 }
@@ -256,11 +256,11 @@ async fn test_qwen_with_cdata_like_content() {
 {"name": "process", "arguments": {"xml": "<![CDATA[some data]]>"}}
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "process");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "process");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["xml"], "<![CDATA[some data]]>");
 }
 
@@ -271,9 +271,9 @@ async fn test_extremely_long_function_names() {
     let long_name = "very_long_function_name_that_might_appear_in_generated_code_somewhere";
     let input = format!(r#"[{}(param="value")]"#, long_name);
 
-    let result = parser.parse_complete(&input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, long_name);
+    let (_normal_text, tools) = parser.parse_complete(&input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, long_name);
 }
 
 #[tokio::test]
@@ -283,10 +283,10 @@ async fn test_json_with_duplicate_keys() {
     // JSON with duplicate keys (last one should win per JSON spec)
     let input = r#"{"name": "test", "arguments": {"key": "first", "key": "second"}}"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     // JSON parsers typically keep the last value for duplicate keys
     assert_eq!(args["key"], "second");
 }
