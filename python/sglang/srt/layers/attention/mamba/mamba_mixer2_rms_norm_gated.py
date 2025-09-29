@@ -10,10 +10,9 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.utils import set_weight_attrs
-
-from .layernorm_gated import rms_norm_gated
 
 
 # Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
@@ -118,4 +117,5 @@ class Mixer2RMSNormGated(CustomOp):
             z=gate,
             eps=self.variance_epsilon,
             norm_before_gate=False,
+            is_rms_norm=True,
         )

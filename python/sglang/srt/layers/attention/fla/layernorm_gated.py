@@ -181,6 +181,44 @@ def _layer_norm_fwd(
     return out, mean, rstd
 
 
+def rms_norm_gated(
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    is_rms_norm=False,
+):
+    """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+
+    x_shape_og = x.shape
+    # reshape input data into 2D tensor
+    x = x.reshape(-1, x.shape[-1])
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if z is not None:
+        assert z.shape == x_shape_og
+        z = z.reshape(-1, z.shape[-1])
+        if z.stride(-1) != 1:
+            z = z.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+    y, mean, rstd = _layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        z=z,
+        group_size=group_size,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=is_rms_norm,
+    )
+    return y.reshape(x_shape_og)
+
+
 class LayerNormFn(torch.autograd.Function):
 
     @staticmethod
@@ -195,55 +233,16 @@ class LayerNormFn(torch.autograd.Function):
         norm_before_gate=True,
         is_rms_norm=False,
     ):
-        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
-
-        x_shape_og = x.shape
-        # reshape input data into 2D tensor
-        x = x.reshape(-1, x.shape[-1])
-        if x.stride(-1) != 1:
-            x = x.contiguous()
-        if z is not None:
-            assert z.shape == x_shape_og
-            z = z.reshape(-1, z.shape[-1])
-            if z.stride(-1) != 1:
-                z = z.contiguous()
-        weight = weight.contiguous()
-        if bias is not None:
-            bias = bias.contiguous()
-        y, mean, rstd = _layer_norm_fwd(
+        return rms_norm_gated(
             x,
             weight,
             bias,
+            z,
             eps,
-            z=z,
-            group_size=group_size,
+            group_size,
             norm_before_gate=norm_before_gate,
             is_rms_norm=is_rms_norm,
         )
-        return y.reshape(x_shape_og)
-
-
-def layernorm_fn(
-    x,
-    weight,
-    bias,
-    z=None,
-    eps=1e-6,
-    group_size=None,
-    norm_before_gate=True,
-    is_rms_norm=False,
-):
-    return LayerNormFn.apply(
-        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm
-    )
-
-
-def rmsnorm_fn(
-    x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True
-):
-    return LayerNormFn.apply(
-        x, weight, bias, z, eps, group_size, norm_before_gate, True
-    )
 
 
 class LayerNorm(torch.nn.Module):
@@ -275,8 +274,7 @@ class LayerNorm(torch.nn.Module):
         torch.nn.init.zeros_(self.bias)
 
     def forward(self, x, z=None):
-        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
-        return layernorm_fn(
+        return LayerNormFn.apply(
             x,
             self.weight,
             self.bias,
@@ -284,6 +282,7 @@ class LayerNorm(torch.nn.Module):
             group_size=self.group_size,
             eps=self.eps,
             norm_before_gate=self.norm_before_gate,
+            is_rms_norm=False,
         )
 
 
@@ -314,8 +313,7 @@ class RMSNorm(torch.nn.Module):
         torch.nn.init.ones_(self.weight)
 
     def forward(self, x, z=None):
-        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
-        return rmsnorm_fn(
+        return LayerNormFn.apply(
             x,
             self.weight,
             self.bias,
@@ -323,4 +321,5 @@ class RMSNorm(torch.nn.Module):
             eps=self.eps,
             group_size=self.group_size,
             norm_before_gate=self.norm_before_gate,
+            is_rms_norm=True,
         )
