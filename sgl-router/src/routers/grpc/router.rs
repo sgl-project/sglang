@@ -730,6 +730,73 @@ impl GrpcRouter {
         Json(response).into_response()
     }
 
+    /// Convert proto LogProbs to OpenAI ChatLogProbs format
+    /// Note: Always decodes with skip_special_tokens=false to show actual tokens generated
+    fn convert_proto_to_openai_logprobs(
+        &self,
+        proto_logprobs: &proto::LogProbs,
+    ) -> Result<crate::protocols::spec::ChatLogProbs, String> {
+        let mut content_items = Vec::new();
+
+        // Decode token IDs to text (always with skip_special_tokens=false for logprobs)
+        let token_texts: Vec<String> = proto_logprobs
+            .token_ids
+            .iter()
+            .map(|&token_id| {
+                self.tokenizer
+                    .decode(&[token_id as u32], false)
+                    .unwrap_or_else(|_| format!("<token_{}>", token_id))
+            })
+            .collect();
+
+        // Build ChatLogProbsContent for each token
+        for (i, &logprob) in proto_logprobs.token_logprobs.iter().enumerate() {
+            let token_text = token_texts.get(i).cloned().unwrap_or_default();
+            let bytes = Some(token_text.as_bytes().to_vec());
+
+            // Build top_logprobs for this position
+            let mut top_logprobs = Vec::new();
+            if let Some(top_logprobs_entry) = proto_logprobs.top_logprobs.get(i) {
+                // Decode top token IDs (always with skip_special_tokens=false)
+                let top_token_texts: Vec<String> = top_logprobs_entry
+                    .token_ids
+                    .iter()
+                    .map(|&tid| {
+                        self.tokenizer
+                            .decode(&[tid as u32], false)
+                            .unwrap_or_else(|_| format!("<token_{}>", tid))
+                    })
+                    .collect();
+
+                for (j, (&top_logprob, &_top_token_id)) in top_logprobs_entry
+                    .values
+                    .iter()
+                    .zip(top_logprobs_entry.token_ids.iter())
+                    .enumerate()
+                {
+                    if let Some(top_token_text) = top_token_texts.get(j) {
+                        top_logprobs.push(crate::protocols::spec::TopLogProb {
+                            token: top_token_text.clone(),
+                            logprob: top_logprob,
+                            bytes: Some(top_token_text.as_bytes().to_vec()),
+                        });
+                    }
+                }
+            }
+
+            content_items.push(crate::protocols::spec::ChatLogProbsContent {
+                token: token_text,
+                logprob,
+                bytes,
+                top_logprobs,
+            });
+        }
+
+        Ok(crate::protocols::spec::ChatLogProbs::Detailed {
+            content: (!content_items.is_empty()).then_some(content_items),
+        })
+    }
+
     /// Process a single GenerateComplete response into a ChatChoice
     async fn process_single_choice(
         &self,
@@ -855,7 +922,22 @@ impl GrpcRouter {
             None => None,
         };
 
-        // Step 4: Build ChatCompletionMessage (proper response message type)
+        // Step 4: Convert output logprobs if present
+        // Note: complete.input_logprobs exists in proto but is not used for chat completions
+        //       (input logprobs are only used in /v1/completions endpoint with echo=true)
+        let logprobs = if let Some(proto_logprobs) = &complete.output_logprobs {
+            match self.convert_proto_to_openai_logprobs(proto_logprobs) {
+                Ok(logprobs) => Some(logprobs),
+                Err(e) => {
+                    error!("Failed to convert logprobs: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Step 5: Build ChatCompletionMessage (proper response message type)
         let chat_message = ChatCompletionMessage {
             role: "assistant".to_string(),
             content: if processed_text.is_empty() {
@@ -867,11 +949,11 @@ impl GrpcRouter {
             reasoning_content: reasoning_text,
         };
 
-        // Step 5: Build ChatChoice
+        // Step 6: Build ChatChoice
         let choice = ChatChoice {
             index: index as u32,
             message: chat_message,
-            logprobs: None,
+            logprobs,
             finish_reason: Some(final_finish_reason_str.to_string()),
             matched_stop,
             hidden_states: None,
