@@ -1518,31 +1518,45 @@ def check_evaluation_test_results(
         summary = " | model | status | score | score_threshold | \n"
         summary += "| ----- | ------ | ----- | --------------- | \n"
 
-    for model, accuracy, latency in results:
-        accuracy_threshold = model_accuracy_thresholds.get(model)
-        if accuracy_threshold is None:
-            print(f"Warning: No threshold defined for model {model}")
-            continue
+    results_dict = {res[0]: (res[1], res[2]) for res in results}
 
+    for model, accuracy_threshold in sorted(model_accuracy_thresholds.items()):
         latency_threshold = (
-            model_latency_thresholds.get(model, None)
-            if model_latency_thresholds
+            model_latency_thresholds.get(model)
+            if model_latency_thresholds is not None
             else 1e9
         )
 
-        is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
-        status_emoji = "✅" if is_success else "❌"
+        if model in results_dict:
+            accuracy, latency = results_dict[model]
+            is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
+            status_emoji = "✅" if is_success else "❌"
 
-        if not is_success:
-            failed_models.append(
-                f"\nScore Check Failed: {model}\n"
-                f"Model {model} score ({accuracy:.4f}) is below threshold ({accuracy_threshold:.4f})"
-            )
+            if not is_success:
+                if accuracy < accuracy_threshold:
+                    failed_models.append(
+                        f"\nScore Check Failed: {model}\n"
+                        f"Model {model} score ({accuracy:.4f}) is below threshold ({accuracy_threshold:.4f})"
+                    )
+                if latency > latency_threshold:
+                    failed_models.append(
+                        f"\nLatency Check Failed: {model}\n"
+                        f"Model {model} latency ({latency:.4f}) is above threshold ({latency_threshold:.4f})"
+                    )
 
-        if model_latency_thresholds is not None:
-            line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold}\n"
+            if model_latency_thresholds is not None:
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold}\n"
+            else:
+                line = (
+                    f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold}\n"
+                )
         else:
-            line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold}\n"
+            status_emoji = "❌"
+            failed_models.append(f"Model failed to launch or be evaluated: {model}")
+            if model_latency_thresholds is not None:
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold}\n"
+            else:
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold}\n"
 
         summary += line
 
@@ -1551,13 +1565,8 @@ def check_evaluation_test_results(
     if is_in_ci():
         write_github_step_summary(f"## {test_name}\n{summary}")
 
-    some_model_failed_to_get_result = len(results) != (
-        model_count or len(model_accuracy_thresholds)
-    )
-    if some_model_failed_to_get_result:
-        print("Some model has failed to launch and be evaluated")
-
-    if failed_models or some_model_failed_to_get_result:
+    if failed_models:
+        print("Some models failed the evaluation.")
         raise AssertionError("\n".join(failed_models))
 
 
