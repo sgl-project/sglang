@@ -7,7 +7,7 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_LOOKAHEAD_SPECULATIVE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -23,7 +23,7 @@ DEFAULT_SERVER_ARGS = [
     "--cuda-graph-max-bs",
     "8",
     "--speculative-algorithm",
-    "LOOKAHEAD",
+    "NGRAM",
     "--speculative-num-draft-tokens",
     "16",
     "--mem-fraction-static",
@@ -33,7 +33,7 @@ DEFAULT_SERVER_ARGS = [
 
 class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
 
-    model = DEFAULT_LOOKAHEAD_SPECULATIVE_TARGET_MODEL_FOR_TEST
+    model = DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
     accuracy_threshold = 0.79  # derived tests need to override this
     spec_decode_threshold = 1.8  # derived spec decoding tests need to override this
