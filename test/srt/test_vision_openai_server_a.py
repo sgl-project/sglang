@@ -149,7 +149,6 @@ class TestVLMContextLengthIssue(CustomTestCase):
         )
 
 
-# Note(Xinyuan): mllama is not stable for now, skip for CI
 class TestMllamaServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
@@ -161,27 +160,6 @@ class TestMllamaServer(ImageOpenAITestMixin):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
-
-
-class TestMinicpmv4Server(ImageOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-V-4"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.35",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
         )
         cls.base_url += "/v1"
 
@@ -204,6 +182,27 @@ class TestInternVL2_5Server(ImageOpenAITestMixin):
         )
         cls.base_url += "/v1"
 
+
+
+class TestMinicpmv4Server(ImageOpenAITestMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "openbmb/MiniCPM-V-4"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.35",
+                "--cuda-graph-max-bs",
+                "4",
+            ],
+        )
+        cls.base_url += "/v1"
 
 class TestMinicpmo2_6Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     @classmethod
@@ -306,14 +305,16 @@ class TestKimiVLServer(ImageOpenAITestMixin):
             other_args=[
                 "--trust-remote-code",
                 "--context-length",
-                "4096",
-                "--dtype",
-                "bfloat16",
-                "--cuda-graph-max-bs",
-                "4",
+                "8192",
+                "--dtype=bfloat16",
+                "--mem-fraction-static=0.7"
             ],
         )
         cls.base_url += "/v1"
+
+    def test_video_images_chat_completion(self):
+        # model context length exceeded
+        pass
 
 
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
@@ -345,5 +346,6 @@ if __name__ == "__main__":
         ImageOpenAITestMixin,
         VideoOpenAITestMixin,
         AudioOpenAITestMixin,
+        TestOpenAIOmniServerBase
     )
     unittest.main()
