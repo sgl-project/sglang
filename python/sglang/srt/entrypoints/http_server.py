@@ -814,16 +814,11 @@ async def update_weights_from_ckpt_engine(
         "success": success,
         "message": message,
     }
-    if success:
-        return ORJSONResponse(
-            content,
-            status_code=HTTPStatus.OK,
-        )
-    else:
-        return ORJSONResponse(
-            content,
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
+    status_code = HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(
+        content,
+        status_code=status_code,
+    )
 
 
 @app.post("/update_weight_version")
