@@ -433,6 +433,39 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
         self.clear()
 
+    def _check_consistency(self, caller: str):
+            """
+            一个内部断言，在每次内存操作后检查内存池的核心一致性。
+            主要检查“重复释放”（Double Free）问题。
+            """
+
+            torch.cuda.synchronize()  # 确保所有CUDA操作完成
+
+            # 核心检查：检查 self.free_pages 中是否有重复的页号
+            num_free_pages = len(self.free_pages)
+            # torch.unique() 是一个相对耗时的操作，所以只在debug模式下运行
+            unique_free_pages = len(torch.unique(self.free_pages))
+
+            if num_free_pages != unique_free_pages:
+                msg = (f"\n\n============================================================\n"
+                    f"FATAL: MEMORY POOL CORRUPTION DETECTED!\n"
+                    f"============================================================\n"
+                    f"Error occurred after the `{caller}` operation.\n"
+                    f"CAUSE: Duplicate page numbers found in the free list. This is a classic 'Double Free' error.\n"
+                    f"       It means the same memory page was returned to the pool twice, corrupting the allocator's state.\n"
+                    f"DETAILS:\n"
+                    f"  - Total entries in free_pages list: {num_free_pages}\n"
+                    f"  - Unique page numbers in free_pages list: {unique_free_pages}\n")
+                
+                # 找出具体的重复页号，这对于调试至关重要
+                vals, counts = torch.unique(self.free_pages, return_counts=True)
+                duplicates = vals[counts > 1]
+                msg += f"  - The following page numbers were freed more than once: {duplicates.tolist()}\n"
+                msg += f"============================================================\n"
+                
+                # 抛出 RuntimeError，这将立即停止程序并打印完整的 Traceback
+                raise RuntimeError(msg)
+            
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:
@@ -448,6 +481,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
+        self._check_consistency("alloc")
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -507,6 +541,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         self.free_pages = self.free_pages[num_new_pages:]
+        self._check_consistency("alloc_extend")
         return out_indices
 
     def alloc_decode(
@@ -546,6 +581,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         self.free_pages = self.free_pages[num_new_pages:]
+        self._check_consistency("alloc_decode") 
         return out_indices
 
     def free(self, free_index: torch.Tensor):
@@ -558,6 +594,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
+            self._check_consistency("free")
         else:
             self.free_group.append(free_index)
 

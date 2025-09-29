@@ -2246,14 +2246,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=[
-                "EAGLE",
-                "EAGLE3",
-                "NEXTN",
-                "SIMPLE_EAGLE",
-                "STANDALONE",
-                "NGRAM",
-            ],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM","STANDALONE","NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(

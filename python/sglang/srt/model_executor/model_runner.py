@@ -468,7 +468,7 @@ class ModelRunner:
             # self.init_device_graphs()
             if self.spec_algorithm.is_simple_eagle():
                 self.cuda_graph_runner = None
-                self.cuda_graph_mem_usage = 0
+                self.graph_mem_usage = 0
                 logger.info("We init target model cuda graphs in simple eagle....")
             else:
                 self.init_device_graphs()
