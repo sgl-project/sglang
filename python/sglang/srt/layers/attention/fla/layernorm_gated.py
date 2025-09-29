@@ -237,9 +237,9 @@ class LayerNormFn(torch.autograd.Function):
             x,
             weight,
             bias,
-            z,
             eps,
-            group_size,
+            z=z,
+            group_size=group_size,
             norm_before_gate=norm_before_gate,
             is_rms_norm=is_rms_norm,
         )

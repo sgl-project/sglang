@@ -1,8 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_state_passing.py
+# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_state_passing.py and
+# https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/vllm/model_executor/layers/mamba/ops/ssd_state_passing.py
 
 # ruff: noqa: E501
 
@@ -177,7 +175,7 @@ def _state_passing_fwd_kernel(
         out_ptrs += stride_out_chunk
 
 
-def state_passing_fwd(
+def _state_passing_fwd(
     states,
     dA_cumsum,
     initial_states=None,

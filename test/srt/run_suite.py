@@ -139,7 +139,7 @@ suites = {
         TestFile("test_release_memory_occupation.py", 257),
         TestFile("hicache/test_hicache_storage_file_backend.py", 400),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 400),
-        TestFile("layers/attention/mamba/test_mamba_mixer2.py", TODO),  # TODO: Measure
+        TestFile("layers/attention/mamba/test_mamba2_mixer.py", TODO),  # TODO: Measure
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 600),

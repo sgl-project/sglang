@@ -25,7 +25,7 @@ from sglang.srt.configs import NemotronHConfig
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
-from sglang.srt.layers.attention.mamba.mamba_mixer2 import MambaMixer2
+from sglang.srt.layers.attention.mamba.mamba2_mixer import Mamba2Mixer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -141,7 +141,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.mixer = MambaMixer2(
+        self.mixer = Mamba2Mixer(
             hidden_size=config.hidden_size,
             ssm_state_size=config.ssm_state_size,
             conv_kernel_size=config.conv_kernel,

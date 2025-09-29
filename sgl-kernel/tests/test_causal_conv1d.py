@@ -5,7 +5,7 @@ import torch
 from sgl_kernel import causal_conv1d_fwd
 from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
+PAD_SLOT_ID = -1
 
 
 def causal_conv1d_fn(

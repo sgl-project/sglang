@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/tests/kernels/mamba/test_mamba_mixer2.py
 
 from unittest.mock import patch
 
@@ -13,7 +12,7 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.layers.attention.mamba.mamba_mixer2_rms_norm_gated import (
+from sglang.srt.layers.attention.mamba.mamba2_mixer_rms_norm_gated import (
     Mixer2RMSNormGated,
 )
 
@@ -105,7 +104,7 @@ def mixer2_gated_norm_tensor_parallel(
     hidden_states = torch.randn(batch_size, seq_len, hidden_size)
     gate_states = torch.randn(batch_size, seq_len, hidden_size)
 
-    import sglang.srt.layers.attention.mamba.mamba_mixer2_rms_norm_gated as m2
+    import sglang.srt.layers.attention.mamba.mamba2_mixer_rms_norm_gated as m2
     import sglang.srt.model_loader.weight_utils as wu
 
     # Convenience: Avoid calling initialize_dp_attention

@@ -1,8 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_chunk_state.py
+# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_chunk_state.py and
+# https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/vllm/model_executor/layers/mamba/ops/ssd_chunk_state.py
+
 
 # ruff: noqa: E501
 
@@ -12,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .mamba_ssm import softplus
+from .mamba_ssm import _softplus
 
 
 @triton.autotune(
@@ -97,7 +96,7 @@ def _chunk_cumsum_fwd_kernel(
         ).to(tl.float32)
         dt += dt_bias[:, None]
     if DT_SOFTPLUS:
-        dt = tl.where(dt <= 20.0, softplus(dt), dt)
+        dt = tl.where(dt <= 20.0, _softplus(dt), dt)
     # As of Triton 2.2.0, tl.clamp is not available yet
     # dt = tl.clamp(dt, dt_min, dt_max)
     dt = tl.minimum(tl.maximum(dt, dt_min), dt_max)
@@ -675,7 +674,7 @@ def _chunk_state_fwd(
     return states
 
 
-def chunk_state_varlen(
+def _chunk_state_varlen(
     B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None
 ):
     total_seqlen, nheads, headdim = x.shape

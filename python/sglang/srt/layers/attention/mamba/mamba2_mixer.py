@@ -1,5 +1,17 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright 2025 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+# Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/vllm/model_executor/layers/mamba/mamba_mixer2.py
 
 from typing import Optional, Union
 
@@ -25,7 +37,7 @@ from sglang.srt.utils import set_weight_attrs
 from .causal_conv1d_triton import causal_conv1d_fn, causal_conv1d_update
 from .mamba import extra_groups_for_head_shards, mamba_v2_sharded_weight_loader
 from .mamba2_metadata import Mamba2Metadata
-from .mamba_mixer2_rms_norm_gated import Mixer2RMSNormGated
+from .mamba2_mixer_rms_norm_gated import Mixer2RMSNormGated
 from .mamba_ssm import selective_state_update
 from .ssd_combined import mamba_chunk_scan_combined
 
@@ -33,7 +45,7 @@ from .ssd_combined import mamba_chunk_scan_combined
 
 
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
-class MambaMixer2(CustomOp):
+class Mamba2Mixer(CustomOp):
     """
     Compute ∆, A, B, C, and D the state space parameters and compute
     the `contextualized_states`. A, D are input independent

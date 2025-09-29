@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
+
 
 import pytest
 import torch
@@ -12,8 +12,6 @@ from sglang.srt.layers.attention.mamba.ssd_combined import mamba_chunk_scan_comb
 # Added by the IBM Team, 2024
 
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/modules/ssd_minimal.py
-
-# SGLANG: Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
 # TODO: These take a long time to run - we should cut down on some of the parameterized matrix.
 

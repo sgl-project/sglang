@@ -1,8 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_combined.py
+# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_combined.py and
+# https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/vllm/model_executor/layers/mamba/ops/ssd_combined.py
 
 # ruff: noqa: E501
 
@@ -13,8 +11,8 @@ from packaging import version
 
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
-from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd, chunk_state_varlen
-from .ssd_state_passing import state_passing_fwd
+from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd, _chunk_state_varlen
+from .ssd_state_passing import _state_passing_fwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
@@ -112,7 +110,7 @@ def _mamba_chunk_scan_combined_fwd(
     # - this will ensure that states will be updated with the rightmost flushed seq_idx
     #   of the previous chunk. This implies that the first chunk of states is either 0
     #   or equal to init_states of the first example.
-    states, final_states = state_passing_fwd(
+    states, final_states = _state_passing_fwd(
         rearrange(states, "... p n -> ... (p n)"),
         dA_cumsum,
         initial_states=(
@@ -164,7 +162,7 @@ def _mamba_chunk_scan_combined_fwd(
         assert (
             batch == 1
         ), "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
-        varlen_states = chunk_state_varlen(
+        varlen_states = _chunk_state_varlen(
             B.squeeze(0),
             x.squeeze(0),
             dt.squeeze(0),

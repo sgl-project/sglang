@@ -1,8 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
+# Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py and
+# https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
 
 import torch
 import triton
@@ -16,14 +14,14 @@ TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
 if TRITON3:
 
     @triton.jit
-    def softplus(dt):
+    def _softplus(dt):
         dt = tl.where(dt <= 20.0, tl.math.log(tl.math.exp(dt) + 1), dt)
         return dt
 
 else:
 
     @triton.jit
-    def softplus(dt):
+    def _softplus(dt):
         dt = tl.where(dt <= 20.0, tl.math.log1p(tl.exp(dt)), dt)
         return dt
 
@@ -158,7 +156,7 @@ def _selective_scan_update_kernel(
         if HAS_DT_BIAS:
             dt += tl.load(dt_bias_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         if DT_SOFTPLUS:
-            dt = softplus(dt)
+            dt = _softplus(dt)
         A = tl.load(
             A_ptrs, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate), other=0.0
         ).to(tl.float32)
@@ -168,7 +166,7 @@ def _selective_scan_update_kernel(
         if HAS_DT_BIAS:
             dt += tl.load(dt_bias_ptr).to(tl.float32)
         if DT_SOFTPLUS:
-            dt = softplus(dt)
+            dt = _softplus(dt)
         A = tl.load(A_ptr).to(tl.float32)
         dA = tl.exp(A * dt)  # scalar, not a matrix
 
