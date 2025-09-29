@@ -518,15 +518,31 @@ class GrpcRequestManager:
             }
 
             # Accumulate input logprobs (only once, usually in first chunk)
-            if batch_out.input_token_logprobs_val and i < len(batch_out.input_token_logprobs_val):
+            if batch_out.input_token_logprobs_val and i < len(
+                batch_out.input_token_logprobs_val
+            ):
                 if not state.input_token_logprobs_val:
-                    state.input_token_logprobs_val.extend(batch_out.input_token_logprobs_val[i])
-                    if batch_out.input_token_logprobs_idx and i < len(batch_out.input_token_logprobs_idx):
-                        state.input_token_logprobs_idx.extend(batch_out.input_token_logprobs_idx[i])
-                    if batch_out.input_top_logprobs_val and i < len(batch_out.input_top_logprobs_val):
-                        state.input_top_logprobs_val.extend(batch_out.input_top_logprobs_val[i])
-                    if batch_out.input_top_logprobs_idx and i < len(batch_out.input_top_logprobs_idx):
-                        state.input_top_logprobs_idx.extend(batch_out.input_top_logprobs_idx[i])
+                    state.input_token_logprobs_val.extend(
+                        batch_out.input_token_logprobs_val[i]
+                    )
+                    if batch_out.input_token_logprobs_idx and i < len(
+                        batch_out.input_token_logprobs_idx
+                    ):
+                        state.input_token_logprobs_idx.extend(
+                            batch_out.input_token_logprobs_idx[i]
+                        )
+                    if batch_out.input_top_logprobs_val and i < len(
+                        batch_out.input_top_logprobs_val
+                    ):
+                        state.input_top_logprobs_val.extend(
+                            batch_out.input_top_logprobs_val[i]
+                        )
+                    if batch_out.input_top_logprobs_idx and i < len(
+                        batch_out.input_top_logprobs_idx
+                    ):
+                        state.input_top_logprobs_idx.extend(
+                            batch_out.input_top_logprobs_idx[i]
+                        )
 
             # Send input logprobs based on mode
             if state.input_token_logprobs_val:
@@ -553,13 +569,27 @@ class GrpcRequestManager:
                 batch_out.output_token_logprobs_val
             ):
                 # Accumulate in state first
-                state.output_token_logprobs_val.extend(batch_out.output_token_logprobs_val[i])
-                if batch_out.output_token_logprobs_idx and i < len(batch_out.output_token_logprobs_idx):
-                    state.output_token_logprobs_idx.extend(batch_out.output_token_logprobs_idx[i])
-                if batch_out.output_top_logprobs_val and i < len(batch_out.output_top_logprobs_val):
-                    state.output_top_logprobs_val.extend(batch_out.output_top_logprobs_val[i])
-                if batch_out.output_top_logprobs_idx and i < len(batch_out.output_top_logprobs_idx):
-                    state.output_top_logprobs_idx.extend(batch_out.output_top_logprobs_idx[i])
+                state.output_token_logprobs_val.extend(
+                    batch_out.output_token_logprobs_val[i]
+                )
+                if batch_out.output_token_logprobs_idx and i < len(
+                    batch_out.output_token_logprobs_idx
+                ):
+                    state.output_token_logprobs_idx.extend(
+                        batch_out.output_token_logprobs_idx[i]
+                    )
+                if batch_out.output_top_logprobs_val and i < len(
+                    batch_out.output_top_logprobs_val
+                ):
+                    state.output_top_logprobs_val.extend(
+                        batch_out.output_top_logprobs_val[i]
+                    )
+                if batch_out.output_top_logprobs_idx and i < len(
+                    batch_out.output_top_logprobs_idx
+                ):
+                    state.output_top_logprobs_idx.extend(
+                        batch_out.output_top_logprobs_idx[i]
+                    )
 
                 if state.obj.stream:
                     # For streaming: send incremental logprobs (only new tokens in this chunk)

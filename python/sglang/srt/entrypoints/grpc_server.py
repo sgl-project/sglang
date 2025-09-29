@@ -512,12 +512,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Convert output logprobs if present
         output_logprobs_proto = None
         if "output_logprobs" in output:
-            output_logprobs_proto = self._convert_logprobs_to_proto(output["output_logprobs"])
+            output_logprobs_proto = self._convert_logprobs_to_proto(
+                output["output_logprobs"]
+            )
 
         # Convert input logprobs if present (only in first chunk)
         input_logprobs_proto = None
         if "input_logprobs" in output:
-            input_logprobs_proto = self._convert_logprobs_to_proto(output["input_logprobs"])
+            input_logprobs_proto = self._convert_logprobs_to_proto(
+                output["input_logprobs"]
+            )
 
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
@@ -566,12 +570,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Convert output logprobs if present
         output_logprobs_proto = None
         if "output_logprobs" in output:
-            output_logprobs_proto = self._convert_logprobs_to_proto(output["output_logprobs"])
+            output_logprobs_proto = self._convert_logprobs_to_proto(
+                output["output_logprobs"]
+            )
 
         # Convert input logprobs if present
         input_logprobs_proto = None
         if "input_logprobs" in output:
-            input_logprobs_proto = self._convert_logprobs_to_proto(output["input_logprobs"])
+            input_logprobs_proto = self._convert_logprobs_to_proto(
+                output["input_logprobs"]
+            )
 
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
