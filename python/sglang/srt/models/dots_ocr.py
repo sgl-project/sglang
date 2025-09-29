@@ -80,9 +80,10 @@ class DotsOCRForCausalLM(nn.Module):
 
         # Ensure consistent dtype for FlashInfer compatibility
         # Force bfloat16 to match model's expected dtype
-        if image_embeds.dtype != torch.bfloat16 and hasattr(self.model, "embed_tokens"):
+        if hasattr(self.model, "embed_tokens"):
             target_dtype = self.model.embed_tokens.weight.dtype
-            image_embeds = image_embeds.to(target_dtype)
+            if image_embeds.dtype != target_dtype:
+                image_embeds = image_embeds.to(target_dtype)
 
         return image_embeds
 
