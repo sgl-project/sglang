@@ -489,7 +489,7 @@ class MambaMixer2(torch.nn.Module):
             # 2. Convolution sequence transformation
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
-            num_prefill_tokens = forward_batch.seq_lens_sum 
+            num_prefill_tokens = forward_batch.extend_num_tokens or 0
             has_initial_states = forward_batch.extend_prefix_lens > 0
             cache_indices = attn_metadata.mamba_cache_indices
 
