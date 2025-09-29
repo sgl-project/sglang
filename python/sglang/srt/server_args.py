@@ -107,7 +107,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Other platforms
     "intel_amx",
     "ascend",
-    "intel_xpu"
+    "intel_xpu",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv"]
