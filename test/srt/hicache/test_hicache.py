@@ -26,9 +26,9 @@ class TestHiCache(CustomTestCase):
             other_args=[
                 "--enable-hierarchical-cache",
                 "--mem-fraction-static",
-                0.7,
+                0.7 if not _is_hip else 0.2,
                 "--hicache-size",
-                100 if not _is_hip else 200,
+                100 if not _is_hip else 40,
             ],
         )
 

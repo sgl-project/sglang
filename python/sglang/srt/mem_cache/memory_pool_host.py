@@ -72,7 +72,7 @@ class HostKVCache(abc.ABC):
 
         assert (
             self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        ), f"The host memory {self.size / 1024**3} GB should be larger than the device memory {device_pool.size/ 1024**3} GB with the current protocol"
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()

@@ -38,6 +38,7 @@ from sglang.srt.utils import (
 )
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
+from sglang.srt.utils import is_hip
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -120,7 +121,7 @@ def is_in_ci():
 
 def is_in_amd_ci():
     """Return whether it is in an AMD CI runner."""
-    return get_bool_env_var("SGLANG_AMD_CI")
+    return get_bool_env_var("SGLANG_AMD_CI") or is_hip()
 
 
 def _use_cached_default_models(model_repo: str):
