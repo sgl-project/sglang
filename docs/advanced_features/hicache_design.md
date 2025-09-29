@@ -21,17 +21,26 @@ HiRadixTree extends this idea: each node corresponds to the KV Cache of a span o
 
 ### Overall Workflow
 
-The workflow of HiCache mainly involves two key operations: **prefetch** and **write-back**. When the system receives a new request, it first searches the local L1 and L2 caches for matching KV Caches. For parts not found locally, it attempts to prefetch from L3. After prefetching, all required KV Caches are loaded into the GPU for computation. Once the prefill computation is complete, the system considers storing the newly generated data into L2 or L3.
+The workflow of HiCache mainly involves three key operations: **local match**, **prefetch** and **write-back**. When the system receives a new request, it first searches the local L1 and L2 caches for matching KV Caches. For parts not found locally, it attempts to prefetch from L3. After prefetching, all required KV Caches are loaded into the GPU for computation. Once the prefill computation is complete, the system considers storing the newly generated data into L2 or L3.
 
 ![HiCache Workflow](https://lmsys.org/images/blog/hicache/hicache_overview.png)
 
-### Data Prefetch
+### Local Match
+
+Local matching is the first step in HiCache's workflow, where incoming request tokens are matched against the HiRadixTree to locate cached KV data in local memory tiers (L1 GPU memory and L2 host memory).
+
+The matching algorithm traverses the HiRadixTree from the root node, following child nodes that match the token sequence prefix. At each node, the incoming token sequence is compared with the node’s stored token sequence. When `page_size > 1`, matching is performed at the page granularity to optimize memory access patterns. If a match terminates within a node’s stored sequence, the node is automatically split to create an exact boundary, improving the efficiency of future matches.
+
+The algorithm returns a continuous prefix of the request, with the first part residing in L1 and the latter part in L2.
+
+Since the process only requires traversing the local HiRadixTree and does not involve any actual data copying, local matching is extremely fast.
+
+### Prefetch from L3
 
 Data prefetching is one of HiCache’s core optimization techniques, designed to proactively load KV Caches from L3 storage into local L2 memory, thereby reducing access latency during subsequent operations.
 
 **Prefetch Trigger Conditions**:
-When a new prefill request is detected, the system first searches local L1 and L2 for matching KV Caches of a continuous prefix. For the parts not found locally, the system queries L3 to retrieve metadata for the next continuous matching KV Caches. If the length of hit cache in L3 exceeds a threshold (default: 256 tokens, configurable), a prefetch operation is triggered.
-
+After local matching, for the parts not found in L1 or L2, the system queries L3 to retrieve metadata for the next continuous matching KV Caches. If the length of hit cache in L3 exceeds a threshold (default: 256 tokens, configurable), a prefetch operation is triggered.
 
 **Prefetch Strategies**: HiCache provides three different prefetch termination strategies to address different scenario needs:
 - **best_effort**: Terminates immediately when GPU can execute prefill computation, with no waiting time, suitable for scenarios extremely sensitive to latency.
@@ -90,9 +99,9 @@ However, because GPU KV computation is naturally performed layer by layer, the G
 
 SGLang supports a PD (Prefill-Decode) disaggregation deployment mode through the Mooncake TransferEngine (for details, see [this doc](https://docs.sglang.ai/advanced_features/pd_disaggregation.html)). In the PD-disaggregation deployment mode, HiCache can be enabled on both the prefill nodes and decode nodes to optimize prefill performance. If enabled on decode nodes, the decode output will also be written back to L3.
 
-## L3 Storage Backend
+### Unified Interfaces and Rich L3 Storage Backends
 
-HiCache supports a variety of L3 storage backends, allowing users to choose the most suitable backend for their specific use cases:
+HiCache encapsulates all read, write, and query operations on L3 backends within the `class HiCacheStorage(ABC)`, exposing a set of simple and consistent interfaces. This design supports a wide range of L3 storage backends and allows users to select the one that best fits their specific use cases.
 
 - **Mooncake**: Mooncake is a high-performance caching system for LLM inference that leverages RDMA and multi-NIC resources to enable zero-copy, ultra-fast data transfers. Try Mooncake [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/mooncake_store).
 
@@ -110,7 +119,7 @@ Specifically, **LMCache**, an efficient KV Cache layer for enterprise-scale LLM 
 
 - **`--enable-hierarchical-cache`**: Enable hierarchical cache functionality. This is required to use HiCache.
 
-- **`--hicache-ratio HICACHE_RATIO`**: The ratio of the size of host KV cache memory pool to the size of device pool. For example, setting this to 2 means the host memory pool will be twice the size of the device memory pool.
+- **`--hicache-ratio HICACHE_RATIO`**: The ratio of the size of host KV cache memory pool to the size of device pool. For example, a value of 2 means the host memory pool is twice as large as the device memory pool. The minimum allowed value is 2.
 
 - **`--hicache-size HICACHE_SIZE`**: The size of host KV cache memory pool in gigabytes. This parameter overrides `hicache-ratio` if set. For example, `--hicache-size 30` allocates 30GB for the host memory pool **for each rank**. If there are 8 ranks, then the total memory size is 240GB.
 
