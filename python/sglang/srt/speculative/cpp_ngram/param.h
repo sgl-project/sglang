@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace lookahead {
+namespace ngram {
 
 struct Param {
   bool enable;
@@ -122,4 +122,4 @@ struct Param {
   }
 };
 
-}  // namespace lookahead
+}  // namespace ngram
