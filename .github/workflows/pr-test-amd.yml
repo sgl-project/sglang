@@ -97,7 +97,6 @@ jobs:
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -124,7 +123,6 @@ jobs:
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -151,7 +149,6 @@ jobs:
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -177,7 +174,6 @@ jobs:
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -219,7 +215,6 @@ jobs:
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -255,7 +250,6 @@ jobs:
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -301,7 +295,6 @@ jobs:
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -329,7 +322,6 @@ jobs:
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -357,7 +349,6 @@ jobs:
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
