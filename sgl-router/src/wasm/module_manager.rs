@@ -1,17 +1,24 @@
 //! WASM Module Manager
 
-use crate::wasm::module::{WasmModule, WasmModuleDescriptor, WasmModuleMeta};
-use crate::wasm::{config::WasmRuntimeConfig, runtime::WasmRuntime};
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, RwLock,
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::Read,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
 };
+
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wasmtime::Val;
+
+use crate::wasm::{
+    config::WasmRuntimeConfig,
+    module::{WasmModule, WasmModuleDescriptor, WasmModuleMeta},
+    runtime::WasmRuntime,
+};
 
 pub struct WasmModuleManager {
     modules: Arc<RwLock<HashMap<Uuid, WasmModule>>>,

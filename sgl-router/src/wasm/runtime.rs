@@ -1,10 +1,12 @@
-use crate::wasm::config::WasmRuntimeConfig;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+
 use tokio::sync::oneshot;
 use wasmtime::{Config, Engine, Instance, Module, Store, Val};
+
+use crate::wasm::config::WasmRuntimeConfig;
 
 pub struct WasmRuntime {
     config: WasmRuntimeConfig,
@@ -317,9 +319,10 @@ impl Drop for WasmThreadPool {
 
 #[cfg(test)]
 mod tests {
+    use futures::future;
+
     use super::*;
     use crate::wasm::config::WasmRuntimeConfig;
-    use futures::future;
 
     // Helper function to create a simple WASM module that adds two numbers
     fn create_simple_add_wasm() -> Vec<u8> {
