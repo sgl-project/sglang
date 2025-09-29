@@ -1733,9 +1733,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
+            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
+                has_been_filtered = False
+            else:
+                has_been_filtered = True
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
-                has_been_filtered=self.forward_mode.is_target_verify(),
+                has_been_filtered=has_been_filtered,
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
