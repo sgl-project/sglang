@@ -160,18 +160,13 @@ impl JsonParser {
 
     /// Check if text contains JSON tool call markers (complete markers)
     fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains('{') || text.contains('[')
+        (text.contains('{') || text.contains('[')) && text.contains("name")
     }
 
     /// Check if buffer could be building toward a tool call pattern
     fn has_partial_start_token(&self, buffer: &str) -> bool {
         // Check if buffer ends with a partial match of tool call patterns
-        let patterns = [
-            r#"{"name""#,
-            r#"{"function""#,
-            r#"[{"name""#,
-            r#"[{"function""#,
-        ];
+        let patterns = [r#"{"name""#, r#"[{"name""#];
 
         for pattern in &patterns {
             // Check if buffer ends with any partial of this pattern
