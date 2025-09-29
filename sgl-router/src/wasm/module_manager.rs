@@ -47,7 +47,7 @@ impl WasmModuleManager {
             .map_err(|e| format!("Failed to acquire read lock: {}", e))?;
         if modules
             .values()
-            .any(|module| module.module_meta.sha256_hash == *sha256_hash)
+            .any(|module: &WasmModule| module.module_meta.sha256_hash == *sha256_hash)
         {
             return Err(format!(
                 "Module with SHA256 hash {:?} already exists",
