@@ -27,12 +27,15 @@ use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
 use crate::server::AppContext;
 use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
-use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoderBuilder};
+use crate::tokenizer::stop::{
+    SequenceDecoderOutput, StopSequenceDecoder, StopSequenceDecoderBuilder,
+};
 use crate::tokenizer::traits::Tokenizer;
 use crate::tokenizer::HuggingFaceTokenizer;
 use crate::tool_parser::ParserRegistry;
-use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
+use proto::generate_response::Response::{Chunk, Complete, Error};
+use serde_json::{json, Value};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -124,28 +127,9 @@ impl GrpcRouter {
         debug!("Selected worker: {}", worker.url());
 
         // Step 2: Get gRPC client from worker
-        let client = match worker.get_grpc_client().await {
-            Ok(Some(client_arc)) => {
-                // Clone the client from inside the Arc<Mutex<>>
-                let client = client_arc.lock().await.clone();
-                client
-            }
-            Ok(None) => {
-                error!("Selected worker is not a gRPC worker");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Selected worker is not configured for gRPC",
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                error!("Failed to get gRPC client from worker: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to get gRPC client: {}", e),
-                )
-                    .into_response();
-            }
+        let client = match Self::get_grpc_client_from_worker(&worker).await {
+            Ok(client) => client,
+            Err(response) => return response,
         };
 
         // Step 3: Process messages and apply chat template
@@ -209,6 +193,112 @@ impl GrpcRouter {
         }
     }
 
+    /// Main route_generate implementation
+    async fn route_generate_impl(
+        &self,
+        _headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!("Processing generate request for model: {:?}", model_id);
+
+        // Step 1: Resolve input (text, prompt, or input_ids)
+        let (original_text, token_ids) = match self.resolve_generate_input(body) {
+            Ok(res) => res,
+            Err(msg) => {
+                error!("Invalid generate request: {}", msg);
+                return (StatusCode::BAD_REQUEST, msg).into_response();
+            }
+        };
+
+        debug!("Resolved input with {} tokens", token_ids.len());
+
+        // Step 4: Select worker (fail fast if no workers available)
+        let worker = match self.select_worker_for_request(model_id, original_text.as_deref()) {
+            Some(w) => w,
+            None => {
+                warn!("No available workers for model: {:?}", model_id);
+                return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+            }
+        };
+
+        debug!("Selected worker: {}", worker.url());
+
+        // Step 2: Get gRPC client from worker
+        let client = match Self::get_grpc_client_from_worker(&worker).await {
+            Ok(client) => client,
+            Err(response) => return response,
+        };
+
+        // Step 3: Build the gRPC request
+        let request_id = body
+            .rid
+            .clone()
+            .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
+
+        let request = match client.build_plain_generate_request(
+            request_id.clone(),
+            body,
+            original_text.clone(),
+            token_ids,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                error!("Failed to build generate request: {}", e);
+                return (StatusCode::BAD_REQUEST, e).into_response();
+            }
+        };
+
+        // Step 4: Get weight version for response metadata
+        let weight_version = worker
+            .metadata()
+            .labels
+            .get("weight_version")
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+
+        // Step 5: Handle streaming vs non-streaming
+        if body.stream {
+            // TODO: Implement streaming support for generate endpoint
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "Streaming generate over gRPC is not supported yet",
+            )
+                .into_response();
+        }
+
+        self.handle_non_streaming_generate(client, request, body, request_id, weight_version)
+            .await
+    }
+
+    /// Get gRPC client from worker, returning appropriate error response on failure
+    async fn get_grpc_client_from_worker(
+        worker: &Arc<dyn Worker>,
+    ) -> Result<SglangSchedulerClient, Response> {
+        let client_arc = worker
+            .get_grpc_client()
+            .await
+            .map_err(|e| {
+                error!("Failed to get gRPC client from worker: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to get gRPC client: {}", e),
+                )
+                    .into_response()
+            })?
+            .ok_or_else(|| {
+                error!("Selected worker is not a gRPC worker");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Selected worker is not configured for gRPC",
+                )
+                    .into_response()
+            })?;
+
+        let client = client_arc.lock().await.clone();
+        Ok(client)
+    }
+
     /// Select a worker for the request
     fn select_worker_for_request(
         &self,
@@ -265,7 +355,7 @@ impl GrpcRouter {
             Self::process_tool_call_arguments(&mut transformed_messages)?;
 
             // Convert tools to JSON values for template processing
-            let tools_json: Option<Vec<serde_json::Value>> = request
+            let tools_json: Option<Vec<Value>> = request
                 .tools
                 .as_ref()
                 .map(|tools| {
@@ -284,7 +374,7 @@ impl GrpcRouter {
             if let Some(reasoning_effort) = &request.reasoning_effort {
                 combined_template_kwargs.insert(
                     "reasoning_effort".to_string(),
-                    serde_json::Value::String(reasoning_effort.clone()),
+                    Value::String(reasoning_effort.clone()),
                 );
             }
 
@@ -413,9 +503,9 @@ impl GrpcRouter {
                         part.as_object()
                             .and_then(|obj| obj.get("type")?.as_str())
                             .and_then(|type_str| match type_str {
-                                "image_url" => Some(serde_json::json!({"type": "image"})),
-                                "video_url" => Some(serde_json::json!({"type": "video"})),
-                                "audio_url" => Some(serde_json::json!({"type": "audio"})),
+                                "image_url" => Some(json!({"type": "image"})),
+                                "video_url" => Some(json!({"type": "video"})),
+                                "audio_url" => Some(json!({"type": "audio"})),
                                 _ => None,
                             })
                             .unwrap_or_else(|| part.clone())
@@ -483,11 +573,55 @@ impl GrpcRouter {
         None
     }
 
-    /// Create a StopSequenceDecoder from the chat completion request
-    fn create_stop_decoder(
+    /// Resolve the generate input into optional original text and token IDs
+    fn resolve_generate_input(
         &self,
-        original_request: &ChatCompletionRequest,
-    ) -> crate::tokenizer::stop::StopSequenceDecoder {
+        request: &GenerateRequest,
+    ) -> Result<(Option<String>, Vec<u32>), String> {
+        if let Some(text) = &request.text {
+            return self
+                .tokenize_single_text(text)
+                .map(|(original, ids)| (Some(original), ids));
+        }
+
+        // Handle input_ids - validate and convert
+        if let Some(input_ids) = &request.input_ids {
+            return match input_ids {
+                crate::protocols::spec::InputIds::Single(ids) => ids
+                    .iter()
+                    .map(|&id| u32::try_from(id))
+                    .collect::<Result<Vec<u32>, _>>()
+                    .map(|converted| (None, converted))
+                    .map_err(|_| "input_ids must be non-negative".to_string()),
+                crate::protocols::spec::InputIds::Batch(_) => {
+                    Err("Batch input_ids are not supported over gRPC generate yet".to_string())
+                }
+            };
+        }
+
+        Err("Either `text` or `input_ids` must be provided".to_string())
+    }
+
+    fn tokenize_single_text(&self, text: &str) -> Result<(String, Vec<u32>), String> {
+        let encoding = self
+            .tokenizer
+            .encode(text)
+            .map_err(|e| format!("Tokenization failed: {}", e))?;
+        Ok((text.to_string(), encoding.token_ids().to_vec()))
+    }
+
+    fn internal_error_static(msg: &'static str) -> Response {
+        error!("{}", msg);
+        (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+    }
+
+    fn internal_error_message(message: String) -> Response {
+        error!("{}", message);
+        (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+    }
+
+    /// Create a StopSequenceDecoder from the chat completion request
+    fn create_stop_decoder(&self, original_request: &ChatCompletionRequest) -> StopSequenceDecoder {
         // Extract stop sequences from request
         let stop_sequences: Vec<String> = match &original_request.stop {
             Some(StringOrArray::String(s)) => vec![s.clone()],
@@ -524,7 +658,7 @@ impl GrpcRouter {
 
     /// Process a chunk of tokens through the stop decoder
     fn process_chunk_tokens(
-        stop_decoder: &mut crate::tokenizer::stop::StopSequenceDecoder,
+        stop_decoder: &mut StopSequenceDecoder,
         token_ids: &[u32],
     ) -> (String, bool) {
         let mut chunk_text = String::new();
@@ -589,7 +723,7 @@ impl GrpcRouter {
             };
 
             match gen_response.response {
-                Some(proto::generate_response::Response::Chunk(chunk)) => {
+                Some(Chunk(chunk)) => {
                     // Process tokens and check if we should stop
                     let (chunk_text, should_stop) =
                         Self::process_chunk_tokens(&mut stop_decoder, &chunk.token_ids);
@@ -599,7 +733,7 @@ impl GrpcRouter {
                     }
                     continue;
                 }
-                Some(proto::generate_response::Response::Complete(_complete)) => {
+                Some(Complete(_complete)) => {
                     // Flush any remaining text
                     if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
                         if !text.is_empty() {
@@ -609,7 +743,7 @@ impl GrpcRouter {
                     }
                     break;
                 }
-                Some(proto::generate_response::Response::Error(error)) => {
+                Some(Error(error)) => {
                     error!("Generation error: {}", error.message);
                     break;
                 }
@@ -631,24 +765,12 @@ impl GrpcRouter {
     ) -> Response {
         let mut stop_decoder = self.create_stop_decoder(original_request);
 
-        // Small helpers to log + return a uniform 500
-        let fail_str = |msg: &'static str| -> Response {
-            error!("{}", msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
-        };
-        let fail_fmt = |prefix: &str, e: &dyn std::fmt::Display| -> Response {
-            error!("{}{}", prefix, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{}{}", prefix, e),
-            )
-                .into_response()
-        };
-
         // Start generation
         let mut stream = match client.generate(request).await {
             Ok(s) => s,
-            Err(e) => return fail_fmt("Failed to start generation: ", &e),
+            Err(e) => {
+                return Self::internal_error_message(format!("Failed to start generation: {}", e))
+            }
         };
 
         // Collect all responses (for n>1 support)
@@ -656,28 +778,33 @@ impl GrpcRouter {
         while let Some(response) = stream.next().await {
             match response {
                 Ok(gen_response) => match gen_response.response {
-                    Some(proto::generate_response::Response::Complete(complete)) => {
+                    Some(Complete(complete)) => {
                         all_responses.push(complete);
                     }
-                    Some(proto::generate_response::Response::Error(err)) => {
-                        error!("Generation failed for one choice: {}", err.message);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Generation failed: {}", err.message),
+                    Some(Error(err)) => {
+                        return Self::internal_error_message(format!(
+                            "Generation failed: {}",
+                            err.message
+                        ));
+                    }
+                    Some(Chunk(_)) => {
+                        return Self::internal_error_static(
+                            "Unexpected chunk response for non-streaming request",
                         )
-                            .into_response();
                     }
-                    Some(proto::generate_response::Response::Chunk(_)) => {
-                        return fail_str("Unexpected chunk response for non-streaming request")
-                    }
-                    None => return fail_str("Empty response from server"),
+                    None => return Self::internal_error_static("Empty response from server"),
                 },
-                Err(e) => return fail_fmt("Failed to get GenerateResponse: ", &e),
+                Err(e) => {
+                    return Self::internal_error_message(format!(
+                        "Failed to get GenerateResponse: {}",
+                        e
+                    ))
+                }
             }
         }
 
         if all_responses.is_empty() {
-            return fail_str("No responses from server");
+            return Self::internal_error_static("No responses from server");
         }
 
         // Process each response into a ChatChoice
@@ -689,12 +816,10 @@ impl GrpcRouter {
             {
                 Ok(choice) => choices.push(choice),
                 Err(e) => {
-                    error!("Failed to process choice {}: {}", index, e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to process choice {}: {}", index, e),
-                    )
-                        .into_response();
+                    return Self::internal_error_message(format!(
+                        "Failed to process choice {}: {}",
+                        index, e
+                    ));
                 }
             }
         }
@@ -728,6 +853,110 @@ impl GrpcRouter {
 
         // Serialize and return JSON response
         Json(response).into_response()
+    }
+
+    /// Submit request and handle non-streaming response for the `/generate` endpoint
+    async fn handle_non_streaming_generate(
+        &self,
+        mut client: SglangSchedulerClient,
+        request: proto::GenerateRequest,
+        original_request: &GenerateRequest,
+        request_id: String,
+        weight_version: String,
+    ) -> Response {
+        let start_time = Instant::now();
+
+        let mut stream = match client.generate(request).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                return Self::internal_error_message(format!("Failed to start generation: {}", e))
+            }
+        };
+
+        let mut final_completion: Option<proto::GenerateComplete> = None;
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(gen_response) => match gen_response.response {
+                    Some(Complete(complete)) => {
+                        final_completion = Some(complete);
+                        break;
+                    }
+                    Some(Error(err)) => {
+                        return Self::internal_error_message(format!(
+                            "Generation failed: {}",
+                            err.message
+                        ));
+                    }
+                    Some(Chunk(_)) | None => continue,
+                },
+                Err(e) => {
+                    return Self::internal_error_message(format!(
+                        "Failed to receive generate response: {}",
+                        e
+                    ))
+                }
+            }
+        }
+
+        let mut complete = match final_completion {
+            Some(c) => c,
+            None => {
+                return Self::internal_error_static("No completion received from scheduler");
+            }
+        };
+
+        let skip_special_tokens = original_request
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.skip_special_tokens)
+            .unwrap_or(true);
+
+        let decoded_text = match self
+            .tokenizer
+            .decode(&complete.output_ids, skip_special_tokens)
+        {
+            Ok(text) => text,
+            Err(e) => {
+                return Self::internal_error_message(format!(
+                    "Failed to decode output tokens: {}",
+                    e
+                ))
+            }
+        };
+
+        let output_ids = complete.output_ids.clone();
+
+        // Build base meta_info using json! macro
+        let mut meta_info = json!({
+            "finish_reason": complete.finish_reason.clone(),
+            "prompt_tokens": complete.prompt_tokens,
+            "completion_tokens": complete.completion_tokens,
+            "cached_tokens": complete.cached_tokens,
+            "id": request_id,
+            "weight_version": weight_version,
+            "e2e_latency": start_time.elapsed().as_secs_f64(),
+        });
+
+        let meta_obj = meta_info.as_object_mut().unwrap();
+
+        // Add matched_stop if present
+        if let Some(matched) = complete.matched_stop.take() {
+            use proto::generate_complete::MatchedStop;
+            let matched_value = match matched {
+                MatchedStop::MatchedTokenId(id) => json!(id),
+                MatchedStop::MatchedStopStr(s) => json!(s),
+            };
+            meta_obj.insert("matched_stop".to_string(), matched_value);
+        }
+
+        let response_body = json!({
+            "text": decoded_text,
+            "output_ids": output_ids,
+            "meta_info": meta_info,
+        });
+
+        Json(response_body).into_response()
     }
 
     /// Convert proto LogProbs to OpenAI ChatLogProbs format
@@ -803,7 +1032,7 @@ impl GrpcRouter {
         complete: &proto::GenerateComplete,
         index: usize,
         original_request: &ChatCompletionRequest,
-        stop_decoder: &mut crate::tokenizer::stop::StopSequenceDecoder,
+        stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
         // Decode tokens
@@ -1002,11 +1231,11 @@ impl RouterTrait for GrpcRouter {
 
     async fn route_generate(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &GenerateRequest,
-        _model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        self.route_generate_impl(headers, body, model_id).await
     }
 
     async fn route_chat(
