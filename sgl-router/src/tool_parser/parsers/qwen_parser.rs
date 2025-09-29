@@ -39,14 +39,6 @@ impl QwenParser {
         }
     }
 
-    /// Extract all tool call blocks from text
-    fn extract_tool_calls<'a>(&self, text: &'a str) -> Vec<&'a str> {
-        self.extractor
-            .captures_iter(text)
-            .filter_map(|cap| cap.get(1).map(|m| m.as_str()))
-            .collect()
-    }
-
     /// Parse a single JSON object into a ToolCall
     fn parse_single_object(&self, obj: &Value, index: usize) -> ToolParserResult<Option<ToolCall>> {
         let name = obj.get("name").and_then(|v| v.as_str());
@@ -268,26 +260,6 @@ impl ToolParser for QwenParser {
     }
 
     fn detect_format(&self, text: &str) -> bool {
-        // Check if text contains Qwen-specific markers. If not, it's not this format.
-        if !self.has_tool_markers(text) {
-            return false;
-        }
-
-        // Try to extract tool calls to see if we have a complete, valid one.
-        let tool_blocks = self.extract_tool_calls(text);
-        for json_str in &tool_blocks {
-            if let Ok(value) = serde_json::from_str::<Value>(json_str.trim()) {
-                if let Some(obj) = value.as_object() {
-                    if obj.contains_key("name") && obj.contains_key("arguments") {
-                        // Found a valid, complete tool call.
-                        return true;
-                    }
-                }
-            }
-        }
-
-        // If we have the marker but no valid complete tool call,
-        // it could be a partial stream. We should detect this as the format.
-        true
+        self.has_tool_markers(text)
     }
 }
