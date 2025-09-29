@@ -546,7 +546,7 @@ impl GrpcRouter {
                 };
 
                 // Parse JSON string to object (like Python json.loads)
-                match serde_json::from_str::<serde_json::Value>(args_str) {
+                match serde_json::from_str::<Value>(args_str) {
                     Ok(parsed) => *args = parsed,
                     Err(e) => {
                         return Err(format!(
@@ -620,10 +620,16 @@ impl GrpcRouter {
         (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
     }
 
-    /// Create a StopSequenceDecoder from the chat completion request
-    fn create_stop_decoder(&self, original_request: &ChatCompletionRequest) -> StopSequenceDecoder {
-        // Extract stop sequences from request
-        let stop_sequences: Vec<String> = match &original_request.stop {
+    /// Create a StopSequenceDecoder from stop parameters
+    fn create_stop_decoder(
+        &self,
+        stop: Option<&StringOrArray>,
+        stop_token_ids: Option<&Vec<u32>>,
+        skip_special_tokens: bool,
+        no_stop_trim: bool,
+    ) -> StopSequenceDecoder {
+        // Extract stop sequences
+        let stop_sequences: Vec<String> = match stop {
             Some(StringOrArray::String(s)) => vec![s.clone()],
             Some(StringOrArray::Array(arr)) => arr.clone(),
             None => vec![],
@@ -631,11 +637,11 @@ impl GrpcRouter {
 
         // Build stop sequence decoder
         let mut builder = StopSequenceDecoderBuilder::new(self.tokenizer.clone())
-            .skip_special_tokens(original_request.skip_special_tokens);
+            .skip_special_tokens(skip_special_tokens);
 
         // Add stop sequences (visible if no_stop_trim is true, hidden otherwise)
         for seq in stop_sequences {
-            builder = if original_request.no_stop_trim {
+            builder = if no_stop_trim {
                 builder.visible_stop_sequence(seq)
             } else {
                 builder.stop_sequence(seq)
@@ -643,9 +649,9 @@ impl GrpcRouter {
         }
 
         // Add stop token IDs (visible if no_stop_trim is true, hidden otherwise)
-        if let Some(stop_token_ids) = &original_request.stop_token_ids {
-            for &token_id in stop_token_ids {
-                builder = if original_request.no_stop_trim {
+        if let Some(token_ids) = stop_token_ids {
+            for &token_id in token_ids {
+                builder = if no_stop_trim {
                     builder.visible_stop_token(token_id)
                 } else {
                     builder.stop_token(token_id)
@@ -696,7 +702,12 @@ impl GrpcRouter {
         request: proto::GenerateRequest,
         original_request: &ChatCompletionRequest,
     ) -> Response {
-        let mut stop_decoder = self.create_stop_decoder(original_request);
+        let mut stop_decoder = self.create_stop_decoder(
+            original_request.stop.as_ref(),
+            original_request.stop_token_ids.as_ref(),
+            original_request.skip_special_tokens,
+            original_request.no_stop_trim,
+        );
 
         // Process streaming tokens
         let mut grpc_stream = match client.generate(request).await {
@@ -763,7 +774,12 @@ impl GrpcRouter {
         request: proto::GenerateRequest,
         original_request: &ChatCompletionRequest,
     ) -> Response {
-        let mut stop_decoder = self.create_stop_decoder(original_request);
+        let mut stop_decoder = self.create_stop_decoder(
+            original_request.stop.as_ref(),
+            original_request.stop_token_ids.as_ref(),
+            original_request.skip_special_tokens,
+            original_request.no_stop_trim,
+        );
 
         // Start generation
         let mut stream = match client.generate(request).await {
@@ -906,24 +922,41 @@ impl GrpcRouter {
             }
         };
 
-        let skip_special_tokens = original_request
-            .sampling_params
-            .as_ref()
-            .and_then(|p| p.skip_special_tokens)
-            .unwrap_or(true);
+        // Create stop decoder from sampling params
+        let params = original_request.sampling_params.as_ref();
+        let mut stop_decoder = self.create_stop_decoder(
+            params.and_then(|p| p.stop.as_ref()),
+            params.and_then(|p| p.stop_token_ids.as_ref()),
+            params.and_then(|p| p.skip_special_tokens).unwrap_or(true),
+            params.and_then(|p| p.no_stop_trim).unwrap_or(false),
+        );
 
-        let decoded_text = match self
-            .tokenizer
-            .decode(&complete.output_ids, skip_special_tokens)
-        {
-            Ok(text) => text,
+        // Process tokens through stop decoder
+        let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
+            Ok(outputs) => outputs,
             Err(e) => {
-                return Self::internal_error_message(format!(
-                    "Failed to decode output tokens: {}",
-                    e
-                ))
+                return Self::internal_error_message(format!("Failed to process tokens: {}", e))
             }
         };
+
+        // Accumulate text with early breaks
+        let mut decoded_text = String::new();
+        for output in outputs {
+            match output {
+                SequenceDecoderOutput::Text(t) => decoded_text.push_str(&t),
+                SequenceDecoderOutput::StoppedWithText(t) => {
+                    decoded_text.push_str(&t);
+                    break;
+                }
+                SequenceDecoderOutput::Stopped => break,
+                SequenceDecoderOutput::Held => {}
+            }
+        }
+
+        // Flush remaining text
+        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+            decoded_text.push_str(&t);
+        }
 
         let output_ids = complete.output_ids.clone();
 
