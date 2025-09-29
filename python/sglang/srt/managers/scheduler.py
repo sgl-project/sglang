@@ -388,10 +388,10 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
-        elif self.spec_algorithm.is_lookahead():
-            from sglang.srt.speculative.lookahead_worker import LOOKAHEADWorker
+        elif self.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
-            self.draft_worker = LOOKAHEADWorker(
+            self.draft_worker = NGRAMWorker(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 moe_ep_rank=moe_ep_rank,
@@ -826,7 +826,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 draft_token_to_kv_pool=(
                     None
-                    if self.draft_worker is None or self.spec_algorithm.is_lookahead()
+                    if self.draft_worker is None or self.spec_algorithm.is_ngram()
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
@@ -863,7 +863,7 @@ class Scheduler(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 draft_token_to_kv_pool=(
                     None
-                    if self.draft_worker is None or self.spec_algorithm.is_lookahead()
+                    if self.draft_worker is None or self.spec_algorithm.is_ngram()
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,

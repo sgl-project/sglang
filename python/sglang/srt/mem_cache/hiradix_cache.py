@@ -48,9 +48,9 @@ class HiRadixCache(RadixCache):
 
         if hicache_io_backend == "direct":
             if hicache_mem_layout == "page_first":
-                hicache_mem_layout = "layer_first"
+                hicache_mem_layout = "page_first_direct"
                 logger.warning(
-                    "Page first layout is not supported with direct IO backend, switching to layer first layout"
+                    "Page first layout is not supported with direct IO backend, switching to page first direct layout"
                 )
 
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()

@@ -42,7 +42,7 @@ elif is_hip():
 
 
 @dataclass
-class LookaheadVerifyInput:
+class NgramVerifyInput:
     def __init__(
         self,
         draft_token: torch.Tensor,
@@ -408,5 +408,5 @@ class LookaheadVerifyInput:
     def filter_batch(self, new_indices: torch.Tensor):
         pass
 
-    def merge_batch(self, spec_info: LookaheadVerifyInput):
+    def merge_batch(self, spec_info: NgramVerifyInput):
         pass

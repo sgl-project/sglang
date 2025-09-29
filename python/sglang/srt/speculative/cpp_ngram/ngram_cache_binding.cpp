@@ -1,19 +1,19 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "lookahead.h"
+#include "ngram.h"
 
-PYBIND11_MODULE(lookahead_cache_cpp, m) {
-  using namespace lookahead;
+PYBIND11_MODULE(ngram_cache_cpp, m) {
+  using namespace ngram;
   namespace py = pybind11;
   m.doc() = "";
 
-  py::class_<Lookahead>(m, "Lookahead")
+  py::class_<Ngram>(m, "Ngram")
       .def(py::init<size_t, const Param&>(), py::arg("capacity"), py::arg("param"))
-      .def("asyncInsert", &Lookahead::asyncInsert, "")
-      .def("batchMatch", &Lookahead::batchMatch, "")
-      .def("reset", &Lookahead::reset, "")
-      .def("synchronize", &Lookahead::synchronize, "");
+      .def("asyncInsert", &Ngram::asyncInsert, "")
+      .def("batchMatch", &Ngram::batchMatch, "")
+      .def("reset", &Ngram::reset, "")
+      .def("synchronize", &Ngram::synchronize, "");
 
   py::class_<Param>(m, "Param")
       .def(py::init<>())
@@ -35,9 +35,9 @@ PYBIND11_MODULE(lookahead_cache_cpp, m) {
       .def("resetBatchReturnTokenNum", &Param::resetBatchReturnTokenNum, "")
       .def("detail", &Param::detail, "");
 
-  py::class_<Lookahead::Result>(m, "Result")
+  py::class_<Ngram::Result>(m, "Result")
       .def(py::init<>())
-      .def_readwrite("token", &Lookahead::Result::token)
-      .def_readwrite("mask", &Lookahead::Result::mask)
-      .def("truncate", &Lookahead::Result::truncate);
+      .def_readwrite("token", &Ngram::Result::token)
+      .def_readwrite("mask", &Ngram::Result::mask)
+      .def("truncate", &Ngram::Result::truncate);
 }
