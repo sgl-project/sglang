@@ -175,7 +175,7 @@ def get_config(
         config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    except KeyError as e:
+    except ValueError as e:
         if not "deepseek_v32" in str(e):
             raise e
         config = _load_deepseek_v32_model(
