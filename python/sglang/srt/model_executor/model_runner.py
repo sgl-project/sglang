@@ -36,7 +36,7 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
-    get_nsa_head_dim,
+    get_nsa_index_head_dim,
     is_deepseek_nsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
@@ -1578,7 +1578,7 @@ class ModelRunner:
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                index_head_dim=get_nsa_head_dim(self.model_config.hf_config),
+                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
             )
         elif self.use_mla_backend:
             assert not is_nsa_model

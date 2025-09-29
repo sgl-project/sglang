@@ -52,20 +52,23 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
     return (
         config.architectures is not None
         and config.architectures[0] in ["DeepseekV3ForCausalLM"]
-        and getattr(config, "attn_module_list_cfg", None) is not None
+        and getattr(config, "index_topk", None) is not None
     )
 
 
-def get_nsa_head_dim(config: PretrainedConfig) -> int:
+def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
-    return config.attn_module_list_cfg[0]["attn_index"]["head_dim"]
+    return config.index_head_dim
 
 
-def get_nsa_index_topk(config):
-    values = [x["topk_tokens"] for x in config.attn_module_list_cfg]
-    ans = values[0]
-    assert all(ans == x for x in values)
-    return ans
+def get_nsa_index_topk(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_topk
+
+
+def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_n_heads
 
 
 class ModelConfig:
@@ -262,7 +265,7 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self.index_head_dim = (
-                get_nsa_head_dim(self.hf_config)
+                get_nsa_index_head_dim(self.hf_config)
                 if is_deepseek_nsa(self.hf_config)
                 else None
             )

@@ -28,7 +28,12 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.model_config import is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    get_nsa_index_head_dim,
+    get_nsa_index_n_heads,
+    get_nsa_index_topk,
+    is_deepseek_nsa,
+)
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -1061,19 +1066,12 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         self.use_nsa = is_deepseek_nsa(config)
         if self.use_nsa:
-            attn_module_list_cfg = config.attn_module_list_cfg[layer_id]
-            attn_index = attn_module_list_cfg["attn_index"]
-            assert attn_index["use_rope"]
-            index_n_heads: int = attn_index["n_head"]
-            index_head_dim: int = attn_index["head_dim"]
-            index_topk: int = attn_module_list_cfg["topk_tokens"]
-            rope_dim = attn_index["rope_dim"]
             self.indexer = Indexer(
                 hidden_size=hidden_size,
-                index_n_heads=index_n_heads,
-                index_head_dim=index_head_dim,
-                rope_head_dim=rope_dim,
-                index_topk=index_topk,
+                index_n_heads=get_nsa_index_n_heads(config),
+                index_head_dim=get_nsa_index_head_dim(config),
+                rope_head_dim=qk_rope_head_dim,
+                index_topk=get_nsa_index_topk(config),
                 q_lora_rank=q_lora_rank,
                 max_position_embeddings=max_position_embeddings,
                 rope_theta=rope_theta,
