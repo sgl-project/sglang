@@ -130,21 +130,42 @@ impl Default for Glm4MoeParser {
 
 #[async_trait]
 impl ToolParser for Glm4MoeParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains GLM-4 MoE format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
-        // Extract all tool call blocks
+        // Collect matches with positions and parse tools in one pass
+        let matches: Vec<_> = self.tool_call_extractor.find_iter(text).collect();
         let mut tools = Vec::new();
-        for mat in self.tool_call_extractor.find_iter(text) {
+
+        for mat in matches.iter() {
             if let Some(tool) = self.parse_tool_call(mat.as_str())? {
                 tools.push(tool);
             }
         }
 
-        Ok(tools)
+        // Extract normal text using first and last match positions
+        let normal_text = if tools.is_empty() {
+            text.to_string()
+        } else {
+            let first_start = matches[0].start();
+            let last_end = matches.last().unwrap().end();
+            let before = if first_start > 0 {
+                &text[..first_start]
+            } else {
+                ""
+            };
+            let after = if last_end < text.len() {
+                &text[last_end..]
+            } else {
+                ""
+            };
+            format!("{}{}", before, after)
+        };
+
+        Ok((normal_text, tools))
     }
 
     async fn parse_incremental(
@@ -156,8 +177,18 @@ impl ToolParser for Glm4MoeParser {
 
         // Check for tool markers
         if !self.has_tool_markers(&state.buffer) {
-            // No markers found, return as incomplete
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("<tool_call>") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Look for start of tool call
@@ -232,11 +263,12 @@ mod tests {
 <arg_value>2024-06-27</arg_value>
 </tool_call>More text"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Beijing"));
-        assert!(result[0].function.arguments.contains("2024-06-27"));
+        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert!(tools[0].function.arguments.contains("Beijing"));
+        assert!(tools[0].function.arguments.contains("2024-06-27"));
+        assert_eq!(normal_text, "Some text\nMore text"); // Text before and after tool call
     }
 
     #[tokio::test]
@@ -251,12 +283,13 @@ mod tests {
 <arg_value>Shanghai</arg_value>
 </tool_call>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert_eq!(result[1].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Beijing"));
-        assert!(result[1].function.arguments.contains("Shanghai"));
+        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert_eq!(tools[1].function.name, "get_weather");
+        assert!(tools[0].function.arguments.contains("Beijing"));
+        assert!(tools[1].function.arguments.contains("Shanghai"));
+        assert_eq!(normal_text, ""); // Pure tool calls, no normal text
     }
 
     #[tokio::test]
@@ -271,12 +304,13 @@ mod tests {
 <arg_value>test</arg_value>
 </tool_call>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "process_data");
+        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(normal_text, ""); // Pure tool call, no normal text
+        assert_eq!(tools[0].function.name, "process_data");
 
         // Parse arguments to check types
-        let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
         assert_eq!(args["count"], 42);
         assert_eq!(args["active"], true);
         assert_eq!(args["name"], "test");

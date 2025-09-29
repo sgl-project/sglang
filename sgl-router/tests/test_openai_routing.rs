@@ -84,8 +84,6 @@ fn create_minimal_completion_request() -> CompletionRequest {
     }
 }
 
-// ============= Basic Unit Tests =============
-
 /// Test basic OpenAI router creation and configuration
 #[tokio::test]
 async fn test_openai_router_creation() {
@@ -575,7 +573,6 @@ async fn test_unsupported_endpoints() {
     .await
     .unwrap();
 
-    // Test generate endpoint (SGLang-specific, should not be supported)
     let generate_request = GenerateRequest {
         prompt: None,
         text: Some("Hello world".to_string()),
@@ -593,15 +590,12 @@ async fn test_unsupported_endpoints() {
     let response = router.route_generate(None, &generate_request, None).await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
-    // Test completion endpoint (should also not be supported)
     let completion_request = create_minimal_completion_request();
     let response = router
         .route_completion(None, &completion_request, None)
         .await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 }
-
-// ============= Mock Server E2E Tests =============
 
 /// Test chat completion with mock OpenAI server
 #[tokio::test]
@@ -635,7 +629,6 @@ async fn test_openai_router_chat_completion_with_mock() {
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
     let chat_response: serde_json::Value = serde_json::from_str(&body_str).unwrap();
 
-    // Verify it's a valid chat completion response
     assert_eq!(chat_response["object"], "chat.completion");
     assert_eq!(chat_response["model"], "gpt-3.5-turbo");
     assert!(!chat_response["choices"].as_array().unwrap().is_empty());
@@ -704,7 +697,6 @@ async fn test_openai_e2e_with_server() {
         .unwrap();
     let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    // Verify the response structure
     assert_eq!(response_json["object"], "chat.completion");
     assert_eq!(response_json["model"], "gpt-3.5-turbo");
     assert!(!response_json["choices"].as_array().unwrap().is_empty());
