@@ -227,10 +227,34 @@ impl JsonParser {
         }
 
         // Check for any start token
-        self.token_config
+        let has_start_token = self
+            .token_config
             .start_tokens
             .iter()
-            .any(|token| text.contains(token))
+            .any(|token| text.contains(token));
+
+        // Also check if we have what looks like JSON even without start token
+        // This handles cases where we've already processed the start token
+        // and are working on subsequent tools
+        has_start_token || (text.trim_start().starts_with('{') && text.contains(r#""name""#))
+    }
+
+    /// Check if text might contain a partial start token (for streaming)
+    fn has_partial_start_token(&self, text: &str) -> bool {
+        if self.token_config.start_tokens.is_empty() {
+            return false;
+        }
+
+        // Check if the end of the buffer could be the start of any start token
+        for start_token in &self.token_config.start_tokens {
+            for i in 1..start_token.len() {
+                let token_prefix = &start_token[..i];
+                if text.ends_with(token_prefix) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -382,8 +406,42 @@ impl ToolParser for JsonParser {
 
         // Check if we have potential tool calls
         if !self.has_tool_markers(&state.buffer) {
-            // No tool markers, return as incomplete
-            return Ok(StreamResult::Incomplete);
+            if self.has_partial_start_token(&state.buffer) {
+                // We might be in the middle of receiving a start token, wait for more data
+                return Ok(StreamResult::Incomplete);
+            }
+
+            // No tool markers and no partial tokens - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if !self.token_config.start_tokens.is_empty() {
+            let start_token = &self.token_config.start_tokens[0];
+            if !start_token.is_empty() {
+                if let Some(marker_pos) = state.buffer.find(start_token) {
+                    if marker_pos > 0 {
+                        // We have text before the tool marker - extract it as normal text
+                        let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                        return Ok(StreamResult::NormalText(normal_text));
+                    }
+                }
+            }
+        } else {
+            // For JSON without start tokens, look for the start of JSON structure
+            // Find whichever comes first: '{' or '['
+            let brace_pos = state.buffer.find('{');
+            let bracket_pos = state.buffer.find('[');
+            let json_pos = brace_pos.iter().chain(bracket_pos.iter()).min().copied();
+
+            if let Some(pos) = json_pos {
+                if pos > 0 {
+                    // We have text before JSON structure - extract it as normal text
+                    let normal_text: String = state.buffer.drain(..pos).collect();
+                    return Ok(StreamResult::NormalText(normal_text));
+                }
+            }
         }
 
         // Extract JSON content first to check for separators
@@ -407,9 +465,8 @@ impl ToolParser for JsonParser {
                             // We need to figure out how much to remove from the original buffer
                             // Find where the separator is in the original buffer and remove up to and including it
                             if let Some(sep_in_original) = state.buffer.find(separator.as_str()) {
-                                let remaining =
-                                    state.buffer[sep_in_original + separator.len()..].to_string();
-                                state.buffer = remaining;
+                                // Remove processed content up to and including separator
+                                state.buffer.drain(..=sep_in_original + separator.len() - 1);
                             }
 
                             // Return the first tool as complete
@@ -518,7 +575,7 @@ impl ToolParser for JsonParser {
             }
             Err(_) => {
                 // Failed to parse even as partial JSON
-                // Keep buffering
+                // Continue waiting for more data
             }
         }
 
