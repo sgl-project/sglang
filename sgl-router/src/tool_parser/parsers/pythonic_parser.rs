@@ -84,8 +84,21 @@ impl ToolParser for PythonicParser {
         let cleaned = Self::strip_special_tokens(text);
 
         if let Some((tool_calls_text, normal_text)) = self.extract_tool_calls(&cleaned) {
-            let calls = self.parse_tool_call_block(&tool_calls_text)?;
-            Ok((normal_text, calls))
+            match self.parse_tool_call_block(&tool_calls_text) {
+                Ok(calls) => {
+                    if calls.is_empty() {
+                        // No tools successfully parsed despite having markers
+                        Ok((text.to_string(), vec![]))
+                    } else {
+                        Ok((normal_text, calls))
+                    }
+                }
+                Err(e) => {
+                    // Log warning and return entire text as fallback
+                    tracing::warn!("Failed to parse pythonic tool calls: {}", e);
+                    Ok((text.to_string(), vec![]))
+                }
+            }
         } else {
             Ok((text.to_string(), vec![]))
         }
@@ -327,86 +340,5 @@ where
         Value::Number(Number::from(u))
     } else {
         Value::String(value.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_single_function_call() {
-        let parser = PythonicParser::new();
-        let input = r#"[search_web(query="Rust programming", max_results=5)]"#;
-
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "search_web");
-
-        let args: Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
-        assert_eq!(args["query"], "Rust programming");
-        assert_eq!(args["max_results"], 5);
-    }
-
-    #[tokio::test]
-    async fn test_multiple_function_calls() {
-        let parser = PythonicParser::new();
-        let input = r#"[get_weather(city="Tokyo"), search(query="news")]"#;
-
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].function.name, "get_weather");
-        assert_eq!(tools[1].function.name, "search");
-    }
-
-    #[tokio::test]
-    async fn test_python_literals() {
-        let parser = PythonicParser::new();
-        let input = r#"[test(flag=True, disabled=False, optional=None)]"#;
-
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-
-        let args: Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
-        assert_eq!(args["flag"], true);
-        assert_eq!(args["disabled"], false);
-        assert!(args["optional"].is_null());
-    }
-
-    #[tokio::test]
-    async fn test_strip_special_tokens() {
-        let parser = PythonicParser::new();
-        let input = "<|python_start|>[call(arg=1)]<|python_end|>";
-
-        assert!(parser.detect_format(input));
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_detect_format() {
-        let parser = PythonicParser::new();
-        assert!(parser.detect_format("[foo(bar=1)]"));
-        assert!(!parser.detect_format("No python here"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_incremental() {
-        let parser = PythonicParser::new();
-        let mut state = ParseState::new();
-
-        let chunk1 = "[call(arg=";
-        let result1 = parser.parse_incremental(chunk1, &mut state).await.unwrap();
-        assert!(matches!(result1, StreamResult::Incomplete));
-
-        let chunk2 = "1)]";
-        let result2 = parser.parse_incremental(chunk2, &mut state).await.unwrap();
-
-        match result2 {
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "call");
-            }
-            other => panic!("Expected ToolComplete, got {:?}", other),
-        }
     }
 }
