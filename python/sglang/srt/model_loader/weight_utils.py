@@ -246,77 +246,79 @@ def find_local_hf_snapshot_dir(
 
     Only applied in ci
     """
-    if is_in_ci():
-        found_local_snapshot_dir = None
-        if not os.path.isdir(model_name_or_path):
-            # Check custom cache_dir (if provided)
-            if cache_dir:
-                try:
-                    repo_folder = os.path.join(
-                        cache_dir,
-                        huggingface_hub.constants.REPO_ID_SEPARATOR.join(
-                            ["models", *model_name_or_path.split("/")]
-                        ),
-                    )
-                    rev_to_use = revision
-                    if not rev_to_use:
-                        ref_main = os.path.join(repo_folder, "refs", "main")
-                        if os.path.isfile(ref_main):
-                            with open(ref_main) as f:
-                                rev_to_use = f.read().strip()
-                    if rev_to_use:
-                        rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
-                        if os.path.isdir(rev_dir):
-                            found_local_snapshot_dir = rev_dir
-                except Exception as e:
-                    logger.warning(
-                        "Failed to find local snapshot in custom cache_dir %s: %s",
-                        cache_dir,
-                        e,
-                    )
+    if not is_in_ci() or os.path.isdir(model_name_or_path):
+        return None
 
-            # Check default HF cache as well
-            if not found_local_snapshot_dir:
-                try:
-                    rev_dir = find_local_repo_dir(model_name_or_path, revision)
-                    if rev_dir and os.path.isdir(rev_dir):
-                        found_local_snapshot_dir = rev_dir
-                except Exception as e:
-                    logger.warning(
-                        "Failed to find local snapshot in default HF cache: %s", e
-                    )
+    found_local_snapshot_dir = None
 
-        # If local snapshot exists, validate it contains at least one weight file
-        # matching allow_patterns before skipping download.
-        if found_local_snapshot_dir is not None:
-            local_weight_files: List[str] = []
-            try:
-                for pattern in allow_patterns:
-                    local_weight_files.extend(
-                        glob.glob(os.path.join(found_local_snapshot_dir, pattern))
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Failed to scan local snapshot %s with patterns %s: %s",
-                    found_local_snapshot_dir,
-                    allow_patterns,
-                    e,
-                )
-                local_weight_files = []
+    # Check custom cache_dir (if provided)
+    if cache_dir:
+        try:
+            repo_folder = os.path.join(
+                cache_dir,
+                huggingface_hub.constants.REPO_ID_SEPARATOR.join(
+                    ["models", *model_name_or_path.split("/")]
+                ),
+            )
+            rev_to_use = revision
+            if not rev_to_use:
+                ref_main = os.path.join(repo_folder, "refs", "main")
+                if os.path.isfile(ref_main):
+                    with open(ref_main) as f:
+                        rev_to_use = f.read().strip()
+            if rev_to_use:
+                rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
+                if os.path.isdir(rev_dir):
+                    found_local_snapshot_dir = rev_dir
+        except Exception as e:
+            logger.warning(
+                "Failed to find local snapshot in custom cache_dir %s: %s",
+                cache_dir,
+                e,
+            )
 
-            if len(local_weight_files) > 0:
-                logger.info(
-                    "Found local HF snapshot for %s at %s; skipping download.",
-                    model_name_or_path,
-                    found_local_snapshot_dir,
-                )
-                return found_local_snapshot_dir
-            else:
-                logger.info(
-                    "Local HF snapshot at %s has no files matching %s; will attempt download.",
-                    found_local_snapshot_dir,
-                    allow_patterns,
-                )
+    # Check default HF cache as well
+    if not found_local_snapshot_dir:
+        try:
+            rev_dir = find_local_repo_dir(model_name_or_path, revision)
+            if rev_dir and os.path.isdir(rev_dir):
+                found_local_snapshot_dir = rev_dir
+        except Exception as e:
+            logger.warning("Failed to find local snapshot in default HF cache: %s", e)
+
+    # If local snapshot exists, validate it contains at least one weight file
+    # matching allow_patterns before skipping download.
+    if found_local_snapshot_dir is None:
+        return None
+
+    local_weight_files: List[str] = []
+    try:
+        for pattern in allow_patterns:
+            local_weight_files.extend(
+                glob.glob(os.path.join(found_local_snapshot_dir, pattern))
+            )
+    except Exception as e:
+        logger.warning(
+            "Failed to scan local snapshot %s with patterns %s: %s",
+            found_local_snapshot_dir,
+            allow_patterns,
+            e,
+        )
+        local_weight_files = []
+
+    if len(local_weight_files) > 0:
+        logger.info(
+            "Found local HF snapshot for %s at %s; skipping download.",
+            model_name_or_path,
+            found_local_snapshot_dir,
+        )
+        return found_local_snapshot_dir
+    else:
+        logger.info(
+            "Local HF snapshot at %s has no files matching %s; will attempt download.",
+            found_local_snapshot_dir,
+            allow_patterns,
+        )
     return None
 
 
