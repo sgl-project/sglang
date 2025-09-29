@@ -2965,8 +2965,9 @@ class ServerArgs:
             )
             self.disable_hybrid_swa_memory = True
         elif is_deepseek_nsa(hf_config):
-            self.attention_backend = "nsa"
-            logger.warning("Set nsa attention backend for DeepSeek NSA.")
+            if self.attention_backend is None and self.prefill_attention_backend is None and self.decode_attention_backend is None:
+                self.attention_backend = "nsa"
+                logger.warning("Set nsa attention backend for DeepSeek NSA.")
 
             self.enable_dp_attention = True
             self.dp_size = self.tp_size
