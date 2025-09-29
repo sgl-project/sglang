@@ -56,7 +56,7 @@ class DotsVLProcessor(Qwen2_5_VLProcessor):
         )
         self.image_token_id = (
             tokenizer.image_token_id
-            if getattr(tokenizer, "image_token_id", None)
+            if getattr(tokenizer, "image_token_id", None) is not None
             else tokenizer.convert_tokens_to_ids(self.image_token)
         )
 
