@@ -631,7 +631,7 @@ class ServerArgs:
                 # likely due to some inefficiencies in torch allocator or our implementation.
                 # So we need to reserve more memory.
                 if self.cuda_graph_max_bs > 300:
-                    reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1
+                    reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
             if gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
