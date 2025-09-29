@@ -227,10 +227,16 @@ impl JsonParser {
         }
 
         // Check for any start token
-        self.token_config
+        let has_start_token = self
+            .token_config
             .start_tokens
             .iter()
-            .any(|token| text.contains(token))
+            .any(|token| text.contains(token));
+
+        // Also check if we have what looks like JSON even without start token
+        // This handles cases where we've already processed the start token
+        // and are working on subsequent tools
+        has_start_token || (text.trim_start().starts_with('{') && text.contains(r#""name""#))
     }
 
     /// Check if text might contain a partial start token (for streaming)
@@ -459,9 +465,8 @@ impl ToolParser for JsonParser {
                             // We need to figure out how much to remove from the original buffer
                             // Find where the separator is in the original buffer and remove up to and including it
                             if let Some(sep_in_original) = state.buffer.find(separator.as_str()) {
-                                let remaining =
-                                    state.buffer[sep_in_original + separator.len()..].to_string();
-                                state.buffer = remaining;
+                                // Remove processed content up to and including separator
+                                state.buffer.drain(..=sep_in_original + separator.len() - 1);
                             }
 
                             // Return the first tool as complete
