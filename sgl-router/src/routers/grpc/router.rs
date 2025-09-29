@@ -929,10 +929,10 @@ impl GrpcRouter {
             None => None,
         };
 
-        // Step 4: Convert logprobs if present
-        // Note: all_logprobs is a Vec, but for a single choice we expect at most one entry
-        let logprobs = if !complete.all_logprobs.is_empty() {
-            let proto_logprobs = &complete.all_logprobs[0];
+        // Step 4: Convert output logprobs if present
+        // Note: complete.input_logprobs exists in proto but is not used for chat completions
+        //       (input logprobs are only used in /v1/completions endpoint with echo=true)
+        let logprobs = if let Some(proto_logprobs) = &complete.output_logprobs {
             match self.convert_proto_to_openai_logprobs(proto_logprobs) {
                 Ok(logprobs) => Some(logprobs),
                 Err(e) => {
