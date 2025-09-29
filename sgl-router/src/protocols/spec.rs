@@ -49,12 +49,6 @@ use std::collections::HashMap;
 //    - StringOrArray & LoRAPath types
 //    - Helper functions
 
-// ==================================================================
-// =            OPENAI SPEC - Chat Completions API                  =
-// ==================================================================
-
-// ============= Message Types =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ChatMessage {
@@ -119,8 +113,6 @@ pub struct ImageUrl {
     pub detail: Option<String>, // "auto", "low", or "high"
 }
 
-// ============= Response Format Types =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ResponseFormat {
@@ -139,8 +131,6 @@ pub struct JsonSchemaFormat {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
 }
-
-// ============= Streaming Delta Types =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessageDelta {
@@ -176,8 +166,6 @@ pub struct FunctionCallDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
 }
-
-// ============= Request =============
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ChatCompletionRequest {
@@ -299,7 +287,6 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verbosity: Option<i32>,
 
-    // ============= SGLang Extensions =============
     /// Top-k sampling parameter (-1 to disable)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
@@ -326,7 +313,7 @@ pub struct ChatCompletionRequest {
 
     /// Specific token IDs to use as stop conditions
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
     #[serde(default)]
@@ -423,8 +410,6 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 }
 
-// ============= Regular Response =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
@@ -438,10 +423,25 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: Option<String>,
 }
 
+/// Response message structure for ChatCompletionResponse (different from request ChatMessage)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatCompletionMessage {
+    pub role: String, // Always "assistant" for responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Reasoning content for O1-style models (SGLang extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    // Note: function_call is deprecated and not included
+    // Note: refusal, annotations, audio are not added yet
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatChoice {
     pub index: u32,
-    pub message: ChatMessage,
+    pub message: ChatCompletionMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>, // "stop", "length", "tool_calls", "content_filter", "function_call"
@@ -452,8 +452,6 @@ pub struct ChatChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_states: Option<Vec<f32>>,
 }
-
-// ============= Streaming Response =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionStreamResponse {
@@ -477,9 +475,6 @@ pub struct ChatStreamChoice {
     pub finish_reason: Option<String>,
 }
 
-// ==================================================================
-// =            OPENAI SPEC - Completions API                       =
-// ==================================================================
 // Completions API request types (v1/completions) - DEPRECATED but still supported
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -554,7 +549,6 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
 
-    // ============= SGLang Extensions =============
     /// Top-k sampling parameter (-1 to disable)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
@@ -585,7 +579,7 @@ pub struct CompletionRequest {
 
     /// Specific token IDs to use as stop conditions
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
     #[serde(default)]
@@ -599,7 +593,6 @@ pub struct CompletionRequest {
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
 
-    // ============= SGLang Extensions =============
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lora_path: Option<LoRAPath>,
@@ -638,8 +631,6 @@ impl GenerationRequest for CompletionRequest {
     }
 }
 
-// ============= Regular Response =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
@@ -668,8 +659,6 @@ pub struct CompletionChoice {
     pub hidden_states: Option<Vec<f32>>,
 }
 
-// ============= Streaming Response =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompletionStreamResponse {
     pub id: String,
@@ -690,16 +679,37 @@ pub struct CompletionStreamChoice {
     pub finish_reason: Option<String>,
 }
 
-// ==================================================================
-// =            OPENAI SPEC - Responses API                         =
-// ==================================================================
-
-// ============= Tool Definitions =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseTool {
     #[serde(rename = "type")]
     pub r#type: ResponseToolType,
+    // MCP-specific fields (used when type == "mcp")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_approval: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+impl Default for ResponseTool {
+    fn default() -> Self {
+        Self {
+            r#type: ResponseToolType::WebSearchPreview,
+            server_url: None,
+            authorization: None,
+            server_label: None,
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -707,9 +717,8 @@ pub struct ResponseTool {
 pub enum ResponseToolType {
     WebSearchPreview,
     CodeInterpreter,
+    Mcp,
 }
-
-// ============= Reasoning Configuration =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseReasoningParam {
@@ -728,8 +737,6 @@ pub enum ReasoningEffort {
     Medium,
     High,
 }
-
-// ============= Input/Output Items =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -790,8 +797,6 @@ pub enum ResponseReasoningContent {
     ReasoningText { text: String },
 }
 
-// ============= Output Items for Response =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -823,8 +828,6 @@ pub enum ResponseOutputItem {
     },
 }
 
-// ============= Service Tier =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceTier {
@@ -841,8 +844,6 @@ impl Default for ServiceTier {
     }
 }
 
-// ============= Truncation =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Truncation {
@@ -856,8 +857,6 @@ impl Default for Truncation {
     }
 }
 
-// ============= Response Status =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {
@@ -868,8 +867,6 @@ pub enum ResponseStatus {
     Cancelled,
 }
 
-// ============= Reasoning Info =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReasoningInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -877,8 +874,6 @@ pub struct ReasoningInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 }
-
-// ============= Text Format =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseTextFormat {
@@ -890,8 +885,6 @@ pub struct TextFormatType {
     #[serde(rename = "type")]
     pub format_type: String,
 }
-
-// ============= Include Fields =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -910,8 +903,6 @@ pub enum IncludeField {
     ReasoningEncryptedContent,
 }
 
-// ============= Usage Info =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UsageInfo {
     pub prompt_tokens: u32,
@@ -927,8 +918,6 @@ pub struct UsageInfo {
 pub struct PromptTokenUsageInfo {
     pub cached_tokens: u32,
 }
-
-// ============= Response Usage Format =============
 
 /// OpenAI Responses API usage format (different from standard UsageInfo)
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1038,7 +1027,6 @@ fn generate_request_id() -> String {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesRequest {
-    // ============= Core OpenAI API fields =============
     /// Run the request in the background
     #[serde(default)]
     pub background: bool,
@@ -1122,7 +1110,6 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
-    // ============= SGLang Extensions =============
     /// Request ID
     #[serde(default = "generate_request_id")]
     pub request_id: String,
@@ -1606,8 +1593,6 @@ impl ResponsesResponse {
     }
 }
 
-// ============= Helper Functions =============
-
 impl ResponseOutputItem {
     /// Create a new message output item
     pub fn new_message(
@@ -1708,19 +1693,11 @@ impl UsageInfo {
     }
 }
 
-// ==================================================================
-// =            OPENAI SPEC - Common                                =
-// ==================================================================
-
-// ============= Shared Request Components =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StreamOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
 }
-
-// ============= Tool Choice Types =============
 
 /// Tool choice value for simple string options
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1793,8 +1770,6 @@ pub struct FunctionCallResponse {
     pub arguments: Option<String>, // JSON string
 }
 
-// ============= Usage Tracking =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
@@ -1808,8 +1783,6 @@ pub struct Usage {
 pub struct CompletionTokensDetails {
     pub reasoning_tokens: Option<u32>,
 }
-
-// ============= Logprobs Types =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LogProbs {
@@ -1859,10 +1832,6 @@ pub struct ErrorDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 }
-
-// ==================================================================
-// =            SGLANG SPEC - GENERATE API                          =
-// ==================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -1938,7 +1907,7 @@ pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_stop_trim: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1975,7 +1944,6 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub return_logprob: bool,
 
-    // ============= SGLang Extensions =============
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lora_path: Option<LoRAPath>,
@@ -2035,10 +2003,6 @@ impl GenerationRequest for GenerateRequest {
         String::new()
     }
 }
-
-// ==================================================================
-// =            SGLANG SPEC - RERANK API                            =
-// ==================================================================
 
 // Constants for rerank API
 pub const DEFAULT_MODEL_NAME: &str = "default";
@@ -2237,10 +2201,6 @@ impl RerankResponse {
     }
 }
 
-// ==================================================================
-// =            OPENAI SPEC - Embeddings API                        =
-// ==================================================================
-
 /// Embeddings request compatible with OpenAI API
 /// We intentionally keep fields flexible to pass through to workers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2291,10 +2251,6 @@ impl GenerationRequest for EmbeddingRequest {
         }
     }
 }
-
-// ==================================================================
-// =            COMMON                                              =
-// ==================================================================
 
 /// Helper function for serde default value
 pub fn default_true() -> bool {
@@ -2358,10 +2314,6 @@ pub enum LoRAPath {
 mod tests {
     use super::*;
     use serde_json::{from_str, json, to_string};
-
-    // ==================================================================
-    // =            RERANK REQUEST TESTS                                =
-    // ==================================================================
 
     #[test]
     fn test_rerank_request_serialization() {
@@ -2534,10 +2486,6 @@ mod tests {
         assert_eq!(request.effective_top_k(), 3);
     }
 
-    // ==================================================================
-    // =            RERANK RESPONSE TESTS                               =
-    // ==================================================================
-
     #[test]
     fn test_rerank_response_creation() {
         let results = vec![
@@ -2709,10 +2657,6 @@ mod tests {
         assert_eq!(response.results[0].document, None);
     }
 
-    // ==================================================================
-    // =            RERANK RESULT TESTS                                 =
-    // ==================================================================
-
     #[test]
     fn test_rerank_result_serialization() {
         let result = RerankResult {
@@ -2755,10 +2699,6 @@ mod tests {
         assert_eq!(deserialized.meta_info, result.meta_info);
     }
 
-    // ==================================================================
-    // =            V1 COMPATIBILITY TESTS                              =
-    // ==================================================================
-
     #[test]
     fn test_v1_rerank_req_input_serialization() {
         let v1_input = V1RerankReqInput {
@@ -2791,10 +2731,6 @@ mod tests {
         assert_eq!(request.user, None);
     }
 
-    // ==================================================================
-    // =            GENERATION REQUEST TRAIT TESTS                      =
-    // ==================================================================
-
     #[test]
     fn test_rerank_request_generation_request_trait() {
         let request = RerankRequest {
@@ -2811,10 +2747,6 @@ mod tests {
         assert!(!request.is_stream());
         assert_eq!(request.extract_text_for_routing(), "test query");
     }
-
-    // ==================================================================
-    // =            EDGE CASES AND STRESS TESTS                         =
-    // ==================================================================
 
     #[test]
     fn test_rerank_request_very_long_query() {
@@ -2918,10 +2850,6 @@ mod tests {
         assert_eq!(usage.total_tokens, 150);
     }
 
-    // ==================================================================
-    // =            INTEGRATION TESTS                                   =
-    // ==================================================================
-
     #[test]
     fn test_full_rerank_workflow() {
         // Create request
@@ -2980,7 +2908,6 @@ mod tests {
         // Apply top_k
         response.apply_top_k(request.effective_top_k());
 
-        // Verify results
         assert_eq!(response.results.len(), 2);
         assert_eq!(response.results[0].score, 0.95);
         assert_eq!(response.results[0].index, 0);
@@ -2994,10 +2921,6 @@ mod tests {
         assert_eq!(deserialized.results.len(), 2);
         assert_eq!(deserialized.model, response.model);
     }
-
-    // ==================================================================
-    // =            EMBEDDINGS REQUEST TESTS                             =
-    // ==================================================================
 
     #[test]
     fn test_embedding_request_serialization_string_input() {
