@@ -612,7 +612,7 @@ class ServerArgs:
 
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
-            reserved_mem = 1
+            reserved_mem = 1024
             # For activation during large prefill
             if self.chunked_prefill_size > 0:
                 reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
@@ -625,7 +625,7 @@ class ServerArgs:
 
             if self.enable_dp_attention:
                 # DP attention needs more padding for some operations
-                reserved_mem += self.cuda_graph_max_bs * self.dp_size * 2
+                reserved_mem += self.cuda_graph_max_bs * self.dp_size * 3
 
             if gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
