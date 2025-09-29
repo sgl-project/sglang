@@ -127,9 +127,27 @@ class SGLangPerfAnalyzer:
         rcParams["axes.grid"] = True
         rcParams["grid.alpha"] = 0.3
 
-    def get_recent_runs(self, limit: int = 100) -> List[Dict]:
-        """Get recent CI run data"""
-        print(f"Getting recent {limit} PR Test runs...")
+    def get_recent_runs(
+        self, limit: int = 100, start_date: str = None, end_date: str = None
+    ) -> List[Dict]:
+        """Get recent CI run data with multiple collection strategies"""
+
+        # If date range is specified, get all data in that range
+        if start_date or end_date:
+            return self._get_date_range_runs(start_date, end_date)
+
+        print(f"Getting PR Test runs (limit: {limit})...")
+
+        # Use sampling strategy if limit >= 500, otherwise use sequential
+        if limit >= 500:
+            print(f"Using uniform sampling for {limit} runs to cover ~30 days...")
+            return self._get_sampled_runs(limit)
+        else:
+            return self._get_sequential_runs(limit)
+
+    def _get_sequential_runs(self, limit: int) -> List[Dict]:
+        """Original sequential method for smaller limits"""
+        print(f"Using sequential sampling for {limit} runs...")
 
         pr_test_runs = []
         page = 1
@@ -173,6 +191,251 @@ class SGLangPerfAnalyzer:
                 break
 
         return pr_test_runs
+
+    def _get_sampled_runs(self, limit: int) -> List[Dict]:
+        """Uniform sampling method for 30-day coverage"""
+        from datetime import datetime, timedelta
+
+        # Uniform sampling across 30 days
+        sampled_runs = self._sample_time_period(limit, days_back=30, uniform=True)
+
+        print(
+            f"Sampled {len(sampled_runs)} runs from 30-day period (requested: {limit})"
+        )
+        return sampled_runs
+
+    def _sample_time_period(
+        self,
+        target_samples: int,
+        days_back: int,
+        skip_recent_days: int = 0,
+        uniform: bool = False,
+    ) -> List[Dict]:
+        """Sample runs from a specific time period"""
+        from datetime import datetime, timedelta
+
+        # Calculate time range
+        end_time = datetime.utcnow() - timedelta(days=skip_recent_days)
+        start_time = end_time - timedelta(days=days_back - skip_recent_days)
+
+        sampling_type = "uniform" if uniform else "systematic"
+        print(
+            f"  {sampling_type.title()} sampling {target_samples} runs from {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}"
+        )
+
+        collected_runs = []
+        page = 1
+        per_page = 100
+        total_in_period = 0
+
+        while (
+            len(collected_runs) < target_samples * 3
+        ):  # Collect more than needed for sampling
+            url = f"{self.base_url}/repos/{self.repo}/actions/runs"
+            params = {"per_page": per_page, "page": page}
+
+            try:
+                response = self.session.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+
+                if not data.get("workflow_runs"):
+                    break
+
+                # Filter runs in time period and PR Test runs
+                period_runs = []
+                for run in data["workflow_runs"]:
+                    if run.get("name") != "PR Test":
+                        continue
+
+                    created_at = run.get("created_at", "")
+                    if created_at:
+                        try:
+                            run_time = datetime.fromisoformat(
+                                created_at.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            if start_time <= run_time <= end_time:
+                                period_runs.append(run)
+                                total_in_period += 1
+                        except:
+                            continue
+
+                collected_runs.extend(period_runs)
+
+                # Check if we've gone past our time window
+                if data["workflow_runs"]:
+                    last_run_time_str = data["workflow_runs"][-1].get("created_at", "")
+                    if last_run_time_str:
+                        try:
+                            last_run_time = datetime.fromisoformat(
+                                last_run_time_str.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            if last_run_time < start_time:
+                                print(f"  Reached time boundary at page {page}")
+                                break
+                        except:
+                            pass
+
+                if len(data["workflow_runs"]) < per_page:
+                    break
+
+                page += 1
+                time.sleep(0.1)
+
+            except requests.exceptions.RequestException as e:
+                print(f"  Error getting data for time period: {e}")
+                break
+
+        print(
+            f"  Found {total_in_period} runs in time period, collected {len(collected_runs)} for sampling"
+        )
+
+        # Sample from collected runs
+        if len(collected_runs) <= target_samples:
+            return collected_runs
+
+        if uniform:
+            # Uniform sampling: sort by time and select evenly distributed samples
+            collected_runs.sort(key=lambda x: x.get("created_at", ""))
+            step = len(collected_runs) / target_samples
+            sampled_runs = []
+
+            for i in range(target_samples):
+                index = int(i * step)
+                if index < len(collected_runs):
+                    sampled_runs.append(collected_runs[index])
+        else:
+            # Systematic sampling for even distribution
+            step = len(collected_runs) / target_samples
+            sampled_runs = []
+
+            for i in range(target_samples):
+                index = int(i * step)
+                if index < len(collected_runs):
+                    sampled_runs.append(collected_runs[index])
+
+        print(
+            f"  Sampled {len(sampled_runs)} runs from {len(collected_runs)} available"
+        )
+        return sampled_runs
+
+    def _get_date_range_runs(
+        self, start_date: str = None, end_date: str = None
+    ) -> List[Dict]:
+        """Get all CI runs within specified date range"""
+        from datetime import datetime, timedelta
+
+        # Parse dates
+        if start_date:
+            try:
+                start_time = datetime.strptime(start_date, "%Y-%m-%d")
+            except ValueError:
+                raise ValueError(
+                    f"Invalid start_date format. Use YYYY-MM-DD, got: {start_date}"
+                )
+        else:
+            # Default to 30 days ago if no start date
+            start_time = datetime.utcnow() - timedelta(days=30)
+
+        if end_date:
+            try:
+                end_time = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(
+                    days=1
+                )  # Include the end date
+            except ValueError:
+                raise ValueError(
+                    f"Invalid end_date format. Use YYYY-MM-DD, got: {end_date}"
+                )
+        else:
+            # Default to now if no end date
+            end_time = datetime.utcnow()
+
+        # Validate date range
+        if start_time >= end_time:
+            raise ValueError(
+                f"start_date ({start_date}) must be before end_date ({end_date})"
+            )
+
+        print(
+            f"Getting ALL CI runs from {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}"
+        )
+
+        collected_runs = []
+        page = 1
+        per_page = 100
+        total_in_period = 0
+
+        while True:
+            url = f"{self.base_url}/repos/{self.repo}/actions/runs"
+            params = {"per_page": per_page, "page": page}
+
+            try:
+                response = self.session.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+
+                if not data.get("workflow_runs"):
+                    break
+
+                # Filter runs in date range and PR Test runs
+                period_runs = []
+                for run in data["workflow_runs"]:
+                    if run.get("name") != "PR Test":
+                        continue
+
+                    created_at = run.get("created_at", "")
+                    if created_at:
+                        try:
+                            run_time = datetime.fromisoformat(
+                                created_at.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            if start_time <= run_time <= end_time:
+                                period_runs.append(run)
+                                total_in_period += 1
+                        except:
+                            continue
+
+                collected_runs.extend(period_runs)
+
+                # Check if we've gone past our time window
+                if data["workflow_runs"]:
+                    last_run_time_str = data["workflow_runs"][-1].get("created_at", "")
+                    if last_run_time_str:
+                        try:
+                            last_run_time = datetime.fromisoformat(
+                                last_run_time_str.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            if last_run_time < start_time:
+                                print(f"  Reached time boundary at page {page}")
+                                break
+                        except:
+                            pass
+
+                if len(data["workflow_runs"]) < per_page:
+                    break
+
+                page += 1
+
+                # Progress indicator for large date ranges
+                if page % 10 == 0:
+                    print(
+                        f"  Processed {page} pages, found {total_in_period} runs in date range..."
+                    )
+
+                time.sleep(0.1)
+
+            except requests.exceptions.RequestException as e:
+                print(f"  Error getting data for date range: {e}")
+                break
+
+        print(
+            f"Found {total_in_period} runs in date range {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}"
+        )
+
+        # Sort by creation time (newest first)
+        collected_runs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+        return collected_runs
 
     def get_job_logs(self, run_id: int, job_name: str) -> Optional[str]:
         """Get logs for specific job with early exit optimization"""
@@ -941,6 +1204,16 @@ def main():
         action="store_true",
         help="Upload results to sglang-bot/sglang-ci-data repository",
     )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        help="Start date for date range query (YYYY-MM-DD format). When specified with --end-date, gets ALL runs in range.",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        help="End date for date range query (YYYY-MM-DD format). When specified with --start-date, gets ALL runs in range.",
+    )
 
     args = parser.parse_args()
 
@@ -949,7 +1222,7 @@ def main():
 
     try:
         # Get CI run data
-        runs = analyzer.get_recent_runs(args.limit)
+        runs = analyzer.get_recent_runs(args.limit, args.start_date, args.end_date)
 
         if not runs:
             print("No CI run data found")
