@@ -11,8 +11,9 @@ async fn test_mistral_single_tool() {
     let input = r#"Let me search for that.
 [TOOL_CALLS] [{"name": "search_web", "arguments": {"query": "latest news", "max_results": 5}}]"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me search for that.\n");
     assert_eq!(tools[0].function.name, "search_web");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
@@ -29,8 +30,9 @@ async fn test_mistral_multiple_tools() {
     {"name": "search_news", "arguments": {"query": "AI developments", "limit": 10}}
 ]"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "I'll help you with both tasks.\n");
 
     assert_eq!(tools[0].function.name, "get_weather");
     let args0: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
@@ -47,8 +49,9 @@ async fn test_mistral_nested_json() {
     let input = r#"Processing complex data.
 [TOOL_CALLS] [{"name": "process_data", "arguments": {"config": {"nested": {"value": [1, 2, 3]}}, "enabled": true}}]"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Processing complex data.\n");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["config"]["nested"]["value"], json!([1, 2, 3]));
@@ -146,8 +149,9 @@ async fn test_mistral_real_world_output() {
 
 Let me execute these searches for you."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "I'll search for information about Rust programming and check the weather in San Francisco.\n\n");
     assert_eq!(tools[0].function.name, "web_search");
     assert_eq!(tools[1].function.name, "get_weather");
 }

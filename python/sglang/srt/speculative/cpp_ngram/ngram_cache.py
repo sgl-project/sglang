@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 
-# from sglang.op.lookahead import Lookahead, Param
-
 import logging
 import os
 from typing import List, Tuple
@@ -12,17 +10,17 @@ from torch.utils.cpp_extension import load
 logger = logging.getLogger(__name__)
 
 _abs_path = os.path.dirname(os.path.abspath(__file__))
-lookahead_cache_cpp = load(
-    name="lookahead_cache_cpp",
+ngram_cache_cpp = load(
+    name="ngram_cache_cpp",
     sources=[
-        f"{_abs_path}/lookahead_cache_binding.cpp",
-        f"{_abs_path}/lookahead.cpp",
+        f"{_abs_path}/ngram_cache_binding.cpp",
+        f"{_abs_path}/ngram.cpp",
     ],
     extra_cflags=["-O3", "-std=c++20"],
 )
 
 
-class LookaheadCache:
+class NgramCache:
     def __init__(
         self,
         branch_length=18,
@@ -34,7 +32,7 @@ class LookaheadCache:
         match_type="BFS",
         capacity=1000000,
     ):
-        param = lookahead_cache_cpp.Param()
+        param = ngram_cache_cpp.Param()
         param.branch_length = branch_length
         param.min_match_window_size = min_match_window_size
         param.max_match_window_size = max_match_window_size
@@ -42,7 +40,7 @@ class LookaheadCache:
         param.max_bfs_breadth = max_bfs_breadth
         param.draft_token_num = draft_token_num
         param.match_type = match_type
-        self.cache = lookahead_cache_cpp.Lookahead(capacity, param)
+        self.cache = ngram_cache_cpp.Ngram(capacity, param)
 
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
@@ -131,7 +129,7 @@ if __name__ == "__main__":
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         [1, 2, 3, 44, 55, 66, 77, 88, 99, 100],
     ]
-    cache = LookaheadCache(branch_length=12, draft_token_num=8)
+    cache = NgramCache(branch_length=12, draft_token_num=8)
     cache.batch_put(token_ids)
 
     cache.synchronize()

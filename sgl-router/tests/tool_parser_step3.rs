@@ -15,8 +15,9 @@ async fn test_step3_complete_parsing() {
 <｜tool_calls_end｜>
 Here are the results..."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me help you.\n");
     assert_eq!(tools[0].function.name, "search");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
@@ -174,8 +175,9 @@ async fn test_steptml_format() {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>Text after."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Text before.\n");
     assert_eq!(tools[0].function.name, "search");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();

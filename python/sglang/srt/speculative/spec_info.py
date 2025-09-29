@@ -29,8 +29,8 @@ class SpeculativeAlgorithm(IntEnum):
     def is_standalone(self):
         return self == SpeculativeAlgorithm.STANDALONE
 
-    def is_lookahead(self):
-        return self == SpeculativeAlgorithm.LOOKAHEAD
+    def is_ngram(self):
+        return self == SpeculativeAlgorithm.NGRAM
 
     @staticmethod
     def from_string(name: str):
@@ -39,7 +39,7 @@ class SpeculativeAlgorithm(IntEnum):
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
             "SIMPLE_EAGLE": SpeculativeAlgorithm.SIMPLE_EAGLE,
             "STANDALONE": SpeculativeAlgorithm.STANDALONE,
-            "LOOKAHEAD": SpeculativeAlgorithm.LOOKAHEAD,
+            "NGRAM": SpeculativeAlgorithm.NGRAM,
             None: SpeculativeAlgorithm.NONE,
         }
         if name is not None:
