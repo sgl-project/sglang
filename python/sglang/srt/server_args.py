@@ -107,6 +107,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Other platforms
     "intel_amx",
     "ascend",
+    "intel_xpu"
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv"]
@@ -730,7 +731,8 @@ class ServerArgs:
                 "fa3",
                 "aiter",
                 "triton",
-            }, "fa3, aiter, or triton is required for Llama4 model"
+                "intel_xpu",
+            }, "fa3, aiter, triton or intel_xpu is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
