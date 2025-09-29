@@ -5,8 +5,8 @@ from typing import Dict, List, Union
 
 from PIL import Image
 
-from sglang.srt.models.dots_vlm import DotsVLMForCausalLM
 from sglang.srt.models.dots_ocr import DotsOCRForCausalLM
+from sglang.srt.models.dots_vlm import DotsVLMForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,

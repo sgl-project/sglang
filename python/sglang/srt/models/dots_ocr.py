@@ -3,9 +3,12 @@
 
 import logging
 from typing import Iterable, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
+
+from sglang.srt.configs import DotsOCRConfig
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -14,16 +17,15 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.models.dots_vlm_vit import DotsVisionTransformer
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.dots_vlm_vit import DotsVisionTransformer
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import add_prefix
 
-from sglang.srt.configs import DotsOCRConfig
-
 logger = logging.getLogger(__name__)
+
 
 class DotsOCRForCausalLM(nn.Module):
     def __init__(
@@ -34,15 +36,15 @@ class DotsOCRForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        
+
         # Initialize vision transformer
         self.visual = DotsVisionTransformer(
             config.vision_config,
         )
-        
+
         # Initialize language model
         self.model = Qwen2ForCausalLM(config, quant_config)
-        
+
         # Initialize LM head
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
@@ -53,8 +55,7 @@ class DotsOCRForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-        
-        
+
         self.logits_processor = LogitsProcessor(config)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -79,9 +80,7 @@ class DotsOCRForCausalLM(nn.Module):
 
         # Ensure consistent dtype for FlashInfer compatibility
         # Force bfloat16 to match model's expected dtype
-        if image_embeds.dtype != torch.bfloat16 and hasattr(
-            self.model, "embed_tokens"
-        ):
+        if image_embeds.dtype != torch.bfloat16 and hasattr(self.model, "embed_tokens"):
             target_dtype = self.model.embed_tokens.weight.dtype
             image_embeds = image_embeds.to(target_dtype)
 
@@ -132,7 +131,7 @@ class DotsOCRForCausalLM(nn.Module):
             language_model=self.model,
         )
         return hidden_states
-        
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
         weights = list(weights)
@@ -144,7 +143,7 @@ class DotsOCRForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if name.startswith("vision_tower."):
                 vision_name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-                
+
                 vision_weights.append((vision_name, loaded_weight))
             else:
                 # All other weights go to language model
