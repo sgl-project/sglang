@@ -141,7 +141,6 @@ class TestInternVL2_5Server(ImageOpenAITestMixin):
         cls.base_url += "/v1"
 
 
-
 class TestMinicpmv4Server(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
@@ -161,6 +160,7 @@ class TestMinicpmv4Server(ImageOpenAITestMixin):
             ],
         )
         cls.base_url += "/v1"
+
 
 class TestMinicpmo2_6Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     @classmethod
@@ -265,7 +265,7 @@ class TestKimiVLServer(ImageOpenAITestMixin):
                 "--context-length",
                 "8192",
                 "--dtype=bfloat16",
-                "--mem-fraction-static=0.7"
+                "--mem-fraction-static=0.7",
             ],
         )
         cls.base_url += "/v1"
@@ -304,6 +304,6 @@ if __name__ == "__main__":
         ImageOpenAITestMixin,
         VideoOpenAITestMixin,
         AudioOpenAITestMixin,
-        TestOpenAIOmniServerBase
+        TestOpenAIOmniServerBase,
     )
     unittest.main()
