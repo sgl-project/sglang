@@ -627,6 +627,14 @@ class ServerArgs:
                 # DP attention needs more padding for some operations
                 reserved_mem += self.cuda_graph_max_bs * self.dp_size * 3
 
+                # DP attention uses much more memory for large cuda graph max bs,
+                # likely due to some inefficiencies in torch allocator and our implementation.
+                # So we need to reserve more memory.
+                if self.cuda_graph_max_bs > 250:
+                    reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1
+                if self.cuda_graph_max_bs > 500:
+                    reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1
+
             if gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
