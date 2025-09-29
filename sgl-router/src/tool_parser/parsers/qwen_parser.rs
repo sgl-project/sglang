@@ -134,43 +134,35 @@ impl ToolParser for QwenParser {
             return Ok((text.to_string(), vec![]));
         }
 
-        // Collect matches with positions and parse tools in one pass
-        let matches: Vec<_> = self.extractor.captures_iter(text).collect();
-        let mut tools = Vec::new();
+        // Find where the first tool call begins
+        let idx = text.find("<tool_call>").unwrap(); // Safe because has_tool_markers checked
+        let normal_text = text[..idx].to_string();
 
-        for (index, captures) in matches.iter().enumerate() {
+        // Extract tool calls
+        let mut tools = Vec::new();
+        for (index, captures) in self.extractor.captures_iter(text).enumerate() {
             if let Some(json_str) = captures.get(1) {
                 match serde_json::from_str::<Value>(json_str.as_str().trim()) {
-                    Ok(value) => {
-                        if let Some(tool) = self.parse_single_object(&value, index)? {
-                            tools.push(tool);
+                    Ok(value) => match self.parse_single_object(&value, index) {
+                        Ok(Some(tool)) => tools.push(tool),
+                        Ok(None) => continue,
+                        Err(e) => {
+                            tracing::warn!("Failed to parse tool call: {}", e);
+                            continue;
                         }
-                    }
-                    Err(_) => {
-                        // JSON parsing failed, might be incomplete
+                    },
+                    Err(e) => {
+                        tracing::warn!("Failed to parse JSON in tool call: {}", e);
+                        continue;
                     }
                 }
             }
         }
 
-        // Extract normal text using first and last match positions
-        let normal_text = if tools.is_empty() {
-            text.to_string()
-        } else {
-            let first_start = matches[0].get(0).unwrap().start();
-            let last_end = matches.last().unwrap().get(0).unwrap().end();
-            let before = if first_start > 0 {
-                &text[..first_start]
-            } else {
-                ""
-            };
-            let after = if last_end < text.len() {
-                &text[last_end..]
-            } else {
-                ""
-            };
-            format!("{}{}", before, after)
-        };
+        // If no tools were successfully parsed despite having markers, return entire text as fallback
+        if tools.is_empty() {
+            return Ok((text.to_string(), vec![]));
+        }
 
         Ok((normal_text, tools))
     }
@@ -341,16 +333,12 @@ mod tests {
         let input = r#"Let me help you with that.
 <tool_call>
 {"name": "get_info", "arguments": {"topic": "Rust"}}
-</tool_call>
-Here are the results."#;
+</tool_call>"#;
 
         let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].function.name, "get_info");
-        assert_eq!(
-            normal_text,
-            "Let me help you with that.\n\nHere are the results."
-        );
+        assert_eq!(normal_text, "Let me help you with that.\n");
     }
 
     #[tokio::test]

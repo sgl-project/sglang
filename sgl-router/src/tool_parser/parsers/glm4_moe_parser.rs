@@ -136,34 +136,27 @@ impl ToolParser for Glm4MoeParser {
             return Ok((text.to_string(), vec![]));
         }
 
-        // Collect matches with positions and parse tools in one pass
-        let matches: Vec<_> = self.tool_call_extractor.find_iter(text).collect();
-        let mut tools = Vec::new();
+        // Find where tool calls begin
+        let idx = text.find("<tool_call>").unwrap();
+        let normal_text = text[..idx].to_string();
 
-        for mat in matches.iter() {
-            if let Some(tool) = self.parse_tool_call(mat.as_str())? {
-                tools.push(tool);
+        // Extract tool calls
+        let mut tools = Vec::new();
+        for mat in self.tool_call_extractor.find_iter(text) {
+            match self.parse_tool_call(mat.as_str()) {
+                Ok(Some(tool)) => tools.push(tool),
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!("Failed to parse tool call: {}", e);
+                    continue;
+                }
             }
         }
 
-        // Extract normal text using first and last match positions
-        let normal_text = if tools.is_empty() {
-            text.to_string()
-        } else {
-            let first_start = matches[0].start();
-            let last_end = matches.last().unwrap().end();
-            let before = if first_start > 0 {
-                &text[..first_start]
-            } else {
-                ""
-            };
-            let after = if last_end < text.len() {
-                &text[last_end..]
-            } else {
-                ""
-            };
-            format!("{}{}", before, after)
-        };
+        // If no tools were successfully parsed despite having markers, return entire text as fallback
+        if tools.is_empty() {
+            return Ok((text.to_string(), vec![]));
+        }
 
         Ok((normal_text, tools))
     }
@@ -268,7 +261,7 @@ mod tests {
         assert_eq!(tools[0].function.name, "get_weather");
         assert!(tools[0].function.arguments.contains("Beijing"));
         assert!(tools[0].function.arguments.contains("2024-06-27"));
-        assert_eq!(normal_text, "Some text\nMore text"); // Text before and after tool call
+        assert_eq!(normal_text, "Some text\n");
     }
 
     #[tokio::test]
@@ -289,7 +282,7 @@ mod tests {
         assert_eq!(tools[1].function.name, "get_weather");
         assert!(tools[0].function.arguments.contains("Beijing"));
         assert!(tools[1].function.arguments.contains("Shanghai"));
-        assert_eq!(normal_text, ""); // Pure tool calls, no normal text
+        assert_eq!(normal_text, "");
     }
 
     #[tokio::test]

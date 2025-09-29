@@ -158,46 +158,33 @@ impl Default for Step3Parser {
 #[async_trait]
 impl ToolParser for Step3Parser {
     async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
-        // Check if text contains Step3 format
         if !self.has_tool_markers(text) {
             return Ok((text.to_string(), vec![]));
         }
 
-        // Find the tool calls section
-        if let Some(start_pos) = text.find("<｜tool_calls_begin｜>") {
-            let search_from = start_pos + "<｜tool_calls_begin｜>".len();
+        // Find where tool calls begin
+        let idx = text.find("<｜tool_calls_begin｜>").unwrap();
+        let normal_text = text[..idx].to_string();
 
-            // Find the end of tool calls section
-            if let Some(end_pos) = text[search_from..].find("<｜tool_calls_end｜>") {
-                let tool_section = &text[search_from..search_from + end_pos];
-                let end_abs = search_from + end_pos + "<｜tool_calls_end｜>".len();
-
-                // Extract all tool call blocks
-                let mut tools = Vec::new();
-                for mat in self.tool_call_extractor.find_iter(tool_section) {
-                    if let Some(tool) = self.parse_tool_call(mat.as_str())? {
-                        tools.push(tool);
-                    }
+        // Extract tool calls
+        let mut tools = Vec::new();
+        for mat in self.tool_call_extractor.find_iter(text) {
+            match self.parse_tool_call(mat.as_str()) {
+                Ok(Some(tool)) => tools.push(tool),
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!("Failed to parse tool call: {}", e);
+                    continue;
                 }
-
-                // Extract normal text before start and after end
-                let before = if start_pos > 0 {
-                    &text[..start_pos]
-                } else {
-                    ""
-                };
-                let after = if end_abs < text.len() {
-                    &text[end_abs..]
-                } else {
-                    ""
-                };
-                let normal_text = format!("{}{}", before, after);
-
-                return Ok((normal_text, tools));
             }
         }
 
-        Ok((text.to_string(), vec![]))
+        // If no tools were successfully parsed despite having markers, return entire text as fallback
+        if tools.is_empty() {
+            return Ok((text.to_string(), vec![]));
+        }
+
+        Ok((normal_text, tools))
     }
 
     async fn parse_incremental(
@@ -311,13 +298,14 @@ mod tests {
 <steptml:parameter name="location">Tokyo</steptml:parameter>
 <steptml:parameter name="units">celsius</steptml:parameter>
 </steptml:invoke><｜tool_call_end｜>
-<｜tool_calls_end｜>More text"#;
+<｜tool_calls_end｜>"#;
 
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].function.name, "get_weather");
         assert!(tools[0].function.arguments.contains("Tokyo"));
         assert!(tools[0].function.arguments.contains("celsius"));
+        assert_eq!(normal_text, "Some text\n")
     }
 
     #[tokio::test]

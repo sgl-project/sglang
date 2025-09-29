@@ -84,8 +84,21 @@ impl ToolParser for PythonicParser {
         let cleaned = Self::strip_special_tokens(text);
 
         if let Some((tool_calls_text, normal_text)) = self.extract_tool_calls(&cleaned) {
-            let calls = self.parse_tool_call_block(&tool_calls_text)?;
-            Ok((normal_text, calls))
+            match self.parse_tool_call_block(&tool_calls_text) {
+                Ok(calls) => {
+                    if calls.is_empty() {
+                        // No tools successfully parsed despite having markers
+                        Ok((text.to_string(), vec![]))
+                    } else {
+                        Ok((normal_text, calls))
+                    }
+                }
+                Err(e) => {
+                    // Log warning and return entire text as fallback
+                    tracing::warn!("Failed to parse pythonic tool calls: {}", e);
+                    Ok((text.to_string(), vec![]))
+                }
+            }
         } else {
             Ok((text.to_string(), vec![]))
         }
