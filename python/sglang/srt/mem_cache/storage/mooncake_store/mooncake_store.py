@@ -190,9 +190,10 @@ class MooncakeStore(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
-        assert (
-            self.mem_pool_host.layout == "page_first"
-        ), "mooncake store storage backend only support page first layout"
+        assert self.mem_pool_host.layout in [
+            "page_first",
+            "page_first_direct",
+        ], "mooncake store storage backend only support page first or page first direct layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
             buffer_ptr = buffer.data_ptr()

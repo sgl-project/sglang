@@ -152,9 +152,22 @@ impl ToolParser for KimiK2Parser {
             self.has_tool_markers(&state.buffer) || state.buffer.contains("<|tool_call_begin|>");
 
         if !has_tool_call {
-            // No markers found, clear buffer and return
-            state.buffer.clear();
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        let marker1_pos = state.buffer.find("<|tool_calls_section_begin|>");
+        let marker2_pos = state.buffer.find("<|tool_call_begin|>");
+        let marker_pos = marker1_pos.iter().chain(marker2_pos.iter()).min().copied();
+
+        if let Some(pos) = marker_pos {
+            if pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Try to match streaming pattern
