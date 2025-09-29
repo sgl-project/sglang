@@ -231,15 +231,19 @@ impl ToolParser for LlamaParser {
         }
 
         // Extract JSON content based on whether we have python_tag
-        let json_content = if self.has_python_tag(&state.buffer) {
+        let (json_content, content_start_pos) = if self.has_python_tag(&state.buffer) {
             // Extract content after python_tag
             if let Some(tag_pos) = state.buffer.find("<|python_tag|>") {
-                &state.buffer[tag_pos + "<|python_tag|>".len()..]
+                let start = tag_pos + "<|python_tag|>".len();
+                (&state.buffer[start..], start)
             } else {
-                &state.buffer
+                (&state.buffer[..], 0)
             }
         } else {
-            state.buffer.trim()
+            // Find where the actual content starts after trimming
+            let trimmed = state.buffer.trim_start();
+            let trim_offset = state.buffer.len() - trimmed.len();
+            (trimmed.trim_end(), trim_offset)
         };
 
         // Check if we have a semicolon separator (multiple tools)
@@ -250,13 +254,8 @@ impl ToolParser for LlamaParser {
             if let Ok(value) = serde_json::from_str::<Value>(first_json.trim()) {
                 if let Some(tool) = self.parse_single_object(&value)? {
                     // Remove the parsed JSON and semicolon from the buffer
-                    let start_pos = if self.has_python_tag(&state.buffer) {
-                        state.buffer.find("<|python_tag|>").unwrap() + "<|python_tag|>".len()
-                    } else {
-                        0
-                    };
-                    let end_pos = start_pos + semicolon_pos + 1; // +1 to include the semicolon
-                    state.buffer.drain(start_pos..end_pos);
+                    let end_pos = content_start_pos + semicolon_pos + 1; // +1 to include the semicolon
+                    state.buffer.drain(content_start_pos..end_pos);
 
                     return Ok(StreamResult::ToolComplete(tool));
                 }
