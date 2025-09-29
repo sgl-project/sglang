@@ -2661,16 +2661,26 @@ class Scheduler(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
     ):
         """Init the seed and client instance communication group."""
-        success, message = self.tp_worker.init_weights_send_group_for_remote_instance(
-            recv_req
-        )
+        if recv_req.is_draft_model:
+            success, message = (
+                self.draft_worker.init_weights_send_group_for_remote_instance(recv_req)
+            )
+        else:
+            success, message = (
+                self.tp_worker.init_weights_send_group_for_remote_instance(recv_req)
+            )
         return InitWeightsSendGroupForRemoteInstanceReqOutput(success, message)
 
     def send_weights_to_remote_instance(
         self, recv_req: SendWeightsToRemoteInstanceReqInput
     ):
         """Send the seed instance weights to the destination instance."""
-        success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
+        if recv_req.is_draft_model:
+            success, message = self.draft_worker.send_weights_to_remote_instance(
+                recv_req
+            )
+        else:
+            success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
         return SendWeightsToRemoteInstanceReqOutput(success, message)
 
     def slow_down(self, recv_req: SlowDownReqInput):
