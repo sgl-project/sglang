@@ -354,7 +354,7 @@ class ServingChatTestCase(unittest.TestCase):
                 {"type": "function", "function": {"name": "get_weather"}},
             ]
 
-            tool_calls, remaining_text, _ = self.chat._process_tool_calls(
+            tool_calls, remaining_text, finish_reason = self.chat._process_tool_calls(
                 text="<|tool_calls_section_begin|>...",
                 tools=tools,
                 finish_reason=finish_reason,
