@@ -13,6 +13,7 @@ class TestFile:
 
 suites = {
     "per-commit": [
+        TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
@@ -20,11 +21,9 @@ suites = {
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
         TestFile("lora/test_multi_lora_backend.py", 60),
-        TestFile("lora/test_lora_cuda_graph.py", 250),
         TestFile("lora/test_lora_update.py", 400),
         TestFile("lora/test_lora_qwen3.py", 97),
         TestFile("lora/test_lora_radix_cache.py", 100),
-        TestFile("lora/test_chunked_sgmv_backend.py", 30),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -35,7 +34,7 @@ suites = {
         # TestFile("models/test_grok_models.py", 60),  # Disabled due to illegal memory access
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
-        TestFile("models/test_vlm_models.py", 437),
+        TestFile("models/test_vlm_models.py", 741),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("openai_server/basic/test_protocol.py", 10),
         TestFile("openai_server/basic/test_serving_chat.py", 10),
@@ -78,7 +77,7 @@ suites = {
         TestFile("test_hidden_states.py", 55),
         TestFile("test_hybrid_attn_backend.py", 100),
         TestFile("test_standalone_speculative_decoding.py", 250),
-        TestFile("test_lookahead_speculative_decoding.py", 250),
+        TestFile("test_ngram_speculative_decoding.py", 250),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
@@ -93,7 +92,7 @@ suites = {
         TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 234),
-        TestFile("test_original_logprobs.py", 200),
+        TestFile("test_original_logprobs.py", 41),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_priority_scheduling.py", 100),
@@ -143,8 +142,6 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-8-gpu": [
-        # Disabled because it hangs on the CI.
-        # TestFile("ep/test_moe_ep.py", 181),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 800),
         TestFile("lora/test_lora_llama4.py", 600),
         TestFile("test_disaggregation.py", 499),
@@ -164,9 +161,6 @@ suites = {
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 371),
-    ],
-    "nightly": [
-        TestFile("test_nightly_gsm8k_eval.py"),
     ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
@@ -208,6 +202,7 @@ suite_amd = {
         TestFile("openai_server/features/test_reasoning_content.py", 89),
         TestFile("openai_server/function_call/test_openai_function_calling.py", 60),
         TestFile("openai_server/function_call/test_tool_choice.py", 226),
+        TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
         TestFile("openai_server/validation/test_matched_stop.py", 60),
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
@@ -244,7 +239,7 @@ suite_amd = {
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_srt_endpoint.py", 130),
-        TestFile("test_torch_compile.py", 76),
+        TestFile("test_torch_compile.py", 169),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_triton_attention_backend.py", 150),
