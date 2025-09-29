@@ -480,6 +480,9 @@ class MambaRadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        page_aligned_len = len(kv_indices)
+        page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
@@ -497,8 +500,8 @@ class MambaRadixCache(BasePrefixCache):
             )
             assert mamba_value_forked is not None, "Can not alloc mamba cache"
         new_prefix_len, mamba_exist = self.insert(
-            RadixKey(token_ids, req.extra_key),
-            kv_indices,
+            RadixKey(page_aligned_token_ids, req.extra_key),
+            page_aligned_kv_indices,
             mamba_value_forked,
         )
         self.token_to_kv_pool_allocator.free(
@@ -540,6 +543,29 @@ class MambaRadixCache(BasePrefixCache):
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
 
+    def _evict_leaf_node(self, x: TreeNode) -> Tuple[int, int, TreeNode, TreeNode]:
+        assert (
+            x.full_lock_ref == 0
+        ), f"leaf node with full lock must also have mamba lock, {x.id=} {x.full_lock_ref=}"
+        # 1. a leaf node, free full tokens and mamba
+        self.token_to_kv_pool_allocator.free(x.value)
+        full_num_evicted = len(x.value)
+        self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+        mamba_num_evicted = len(x.mamba_value)
+
+        # 2. get the next node, update the lru lists
+        x_next = self.mamba_lru_list.get_prev_no_lock(x)
+        self.full_lru_list.remove_node(x)
+        self.mamba_lru_list.remove_node(x)
+
+        # 3. delete the leaf node
+        self._delete_leaf(x)
+
+        # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
+        x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
+        full_num_evicted += leaf_full_num_evicted
+        return full_num_evicted, mamba_num_evicted, x, x_next
+
     def evict_mamba(self, mamba_num: int) -> None:
         if self.disable or mamba_num <= 0:
             return
@@ -564,24 +590,8 @@ class MambaRadixCache(BasePrefixCache):
                 # 3. tombstone the node
                 self._tombstone_internal_node(x)
             else:
-                assert (
-                    x.full_lock_ref == 0
-                ), f"leaf node with full lock must also have mamba lock, {x.id=} {x.full_lock_ref=}"
-                # 1. a leaf node, free full and mamba tokens
-                self.token_to_kv_pool_allocator.free(x.value)
-                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-                mamba_num_evicted += len(x.mamba_value)
-
-                # 2. get the next node, update the lru lists
-                x_next = self.mamba_lru_list.get_prev_no_lock(x)
-                self.full_lru_list.remove_node(x)
-                self.mamba_lru_list.remove_node(x)
-
-                # 3. delete the leaf node
-                self._delete_leaf(x)
-
-                # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
-                self._iteratively_delete_tombstone_leaf(x)
+                _, mamba_evicted_delta, _, x_next = self._evict_leaf_node(x)
+                mamba_num_evicted += mamba_evicted_delta
 
             x = x_next
 
@@ -597,27 +607,10 @@ class MambaRadixCache(BasePrefixCache):
             assert (
                 x != self.root_node
             ), f"root node should not exist in full lru list, {x.id=}"
-            assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
+            full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x)
+            full_num_evicted += full_num_evicted_delta
 
-            # 1. free node kv indices, evict full and mamba tokens
-            self.token_to_kv_pool_allocator.free(x.value)
-            full_num_evicted += len(x.value)
-            self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-            mamba_num_evicted += len(x.mamba_value)
-
-            # 2. get the next leaf, update the lru lists
-            x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
-            self.full_lru_list.remove_node(x)
-            self.mamba_lru_list.remove_node(x)
-
-            # 3. delete the leaf node
-            self._delete_leaf(x)
-
-            # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
-            x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
-            full_num_evicted += leaf_full_num_evicted
-
-            # 5. if parent has no more children, it is a leaf. It is possible that this node is lru, so
+            # if parent has no more children, it is a leaf. It is possible that this node is lru, so
             # we need to get the first leaf node in the lru list
             if len(x.parent.children) == 0:
                 x_next = self.full_lru_list.get_leaf_lru_no_lock()
