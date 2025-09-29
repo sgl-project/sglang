@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use wasmtime::{Config, Engine, Instance, Module, Store, Val};
 
 pub struct WasmRuntime {
@@ -17,8 +17,8 @@ pub struct WasmRuntime {
 }
 
 pub struct WasmThreadPool {
-    sender: mpsc::UnboundedSender<WasmTask>,
-    receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<WasmTask>>>,
+    sender: async_channel::Sender<WasmTask>,
+    receiver: async_channel::Receiver<WasmTask>,
     workers: Vec<std::thread::JoinHandle<()>>,
     // Metrics
     total_tasks: AtomicU64,
@@ -93,6 +93,7 @@ impl WasmRuntime {
         self.thread_pool
             .sender
             .send(task)
+            .await
             .map_err(|_| "Failed to send task to thread pool".to_string())?;
 
         let result = response_rx
@@ -139,8 +140,7 @@ impl WasmRuntime {
 
 impl WasmThreadPool {
     pub fn new(config: WasmRuntimeConfig) -> Result<Self, String> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        let (sender, receiver) = async_channel::unbounded();
 
         let mut workers = Vec::new();
         // set thread pool size based on cpu count
@@ -200,7 +200,7 @@ impl WasmThreadPool {
 
     async fn worker_loop(
         worker_id: usize,
-        receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<WasmTask>>>,
+        receiver: async_channel::Receiver<WasmTask>,
         config: WasmRuntimeConfig,
     ) {
         println!(
@@ -230,14 +230,9 @@ impl WasmThreadPool {
         // no module caching needed for pure execution
 
         loop {
-            let task = {
-                let mut receiver_guard = receiver.lock().await;
-                receiver_guard.recv().await
-            };
-
-            let task = match task {
-                Some(task) => task,
-                None => {
+            let task = match receiver.recv().await {
+                Ok(task) => task,
+                Err(_) => {
                     println!(
                         "WASM Worker {} received shutdown signal, exiting...",
                         worker_id
@@ -309,21 +304,9 @@ impl WasmThreadPool {
 
 impl Drop for WasmThreadPool {
     fn drop(&mut self) {
-        // drain and discard any pending tasks before closing
-        if let Ok(mut receiver_guard) = self.receiver.try_lock() {
-            loop {
-                match receiver_guard.try_recv() {
-                    Ok(_task) => {
-                        self.total_tasks.fetch_add(1, Ordering::Relaxed);
-                        self.failed_tasks.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
-        // close sender, let workers exit naturally once channel is empty and closed
-        drop(self.sender.clone());
+        // close sender and receiver
+        self.sender.close();
+        self.receiver.close();
 
         // wait for all workers to complete
         for worker in self.workers.drain(..) {
@@ -336,6 +319,7 @@ impl Drop for WasmThreadPool {
 mod tests {
     use super::*;
     use crate::wasm::config::WasmRuntimeConfig;
+    use futures::future;
 
     // Helper function to create a simple WASM module that adds two numbers
     fn create_simple_add_wasm() -> Vec<u8> {
@@ -495,5 +479,96 @@ mod tests {
             func.call(&mut store, &args, &mut results).unwrap();
             assert_eq!(results[0].unwrap_i32(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn test_thread_pool_execute_async_success() {
+        let wasm_bytes = create_simple_add_wasm();
+
+        let mut cfg = WasmRuntimeConfig::default();
+        cfg.thread_pool_size = 2;
+        let runtime = WasmRuntime::new(cfg).expect("create runtime");
+
+        let result = runtime
+            .execute_wasm_module_async(
+                wasm_bytes,
+                "add".to_string(),
+                vec![Val::I32(7), Val::I32(4)],
+            )
+            .await;
+        assert!(result.is_ok());
+        let vals = result.unwrap();
+        assert_eq!(vals.len(), 1);
+        assert_eq!(vals[0].unwrap_i32(), 11); // 7 + 4 = 11
+    }
+
+    #[tokio::test]
+    async fn test_thread_pool_execute_async_invalid_wasm() {
+        let invalid = create_invalid_wasm();
+
+        let mut cfg = WasmRuntimeConfig::default();
+        cfg.thread_pool_size = 1;
+        let runtime = WasmRuntime::new(cfg).expect("create runtime");
+
+        let result = runtime
+            .execute_wasm_module_async(invalid, "add".to_string(), vec![Val::I32(1), Val::I32(2)])
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(!msg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_thread_pool_execute_async_nonexistent_function() {
+        let wasm_bytes = create_simple_add_wasm();
+
+        let mut cfg = WasmRuntimeConfig::default();
+        cfg.thread_pool_size = 1;
+        let runtime = WasmRuntime::new(cfg).expect("create runtime");
+
+        let result = runtime
+            .execute_wasm_module_async(
+                wasm_bytes,
+                "no_such_fn".to_string(),
+                vec![Val::I32(1), Val::I32(2)],
+            )
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("not found") || !msg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_thread_pool_parallel_tasks_and_metrics() {
+        let wasm_bytes = create_simple_add_wasm();
+
+        let mut cfg = WasmRuntimeConfig::default();
+        cfg.thread_pool_size = 2;
+        let runtime = WasmRuntime::new(cfg).expect("create runtime");
+
+        // prepare 10 tasks
+        let futures_vec: Vec<_> = (0..10)
+            .map(|i| {
+                runtime.execute_wasm_module_async(
+                    wasm_bytes.clone(),
+                    "add".to_string(),
+                    vec![Val::I32(i), Val::I32(i * 2)],
+                )
+            })
+            .collect();
+
+        let results = future::join_all(futures_vec).await;
+        for (i, res) in results.into_iter().enumerate() {
+            assert!(res.is_ok());
+            let vals = res.unwrap();
+            assert_eq!(vals.len(), 1);
+            let expected = (i as i32) + (2 * i as i32);
+            assert_eq!(vals[0].unwrap_i32(), expected);
+        }
+
+        let (total, success, failed, _time) = runtime.get_metrics();
+        assert_eq!(total, 10);
+        assert_eq!(success, 10);
+        assert_eq!(failed, 0);
     }
 }
