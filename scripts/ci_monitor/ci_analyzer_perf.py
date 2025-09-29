@@ -228,7 +228,7 @@ class SGLangPerfAnalyzer:
         per_page = 100
         total_in_period = 0
 
-        while True:  # Continue until we reach the time boundary
+        while True:
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
             params = {"per_page": per_page, "page": page}
 
@@ -240,7 +240,6 @@ class SGLangPerfAnalyzer:
                 if not data.get("workflow_runs"):
                     break
 
-                # Filter runs in time period and PR Test runs
                 period_runs = []
                 for run in data["workflow_runs"]:
                     if run.get("name") != "PR Test":
