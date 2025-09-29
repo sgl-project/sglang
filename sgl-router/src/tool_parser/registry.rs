@@ -180,10 +180,9 @@ impl ParserRegistry {
         self.map_model("deepseek-*", "pythonic");
 
         // GLM models
-        // GLM-4 MoE uses XML-style format
-        self.map_model("glm-4-moe*", "glm4_moe");
-        self.map_model("THUDM/glm-4-moe*", "glm4_moe");
+        // GLM-4.5 and GLM-4.6 uses XML-style format
         self.map_model("glm-4.5*", "glm4_moe");
+        self.map_model("glm-4.6*", "glm4_moe");
         // Other GLM models may use JSON
         self.map_model("glm-*", "json");
 

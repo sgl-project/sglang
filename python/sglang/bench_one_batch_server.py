@@ -66,9 +66,8 @@ class BenchmarkResult(BaseModel):
     def help_str() -> str:
         return f"""
 Note: To view the traces through perfetto-ui, please:
-1. use Google Chrome
-2. enable popup
-
+    1. open with Google Chrome
+    2. allow popup
 """
 
     def to_markdown_row(
