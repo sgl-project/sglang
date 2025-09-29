@@ -2,6 +2,7 @@ import argparse
 import glob
 from dataclasses import dataclass
 
+from sglang.srt.utils import is_hip
 from sglang.test.test_utils import run_unittest_files
 
 
@@ -365,7 +366,7 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--timeout-per-file",
         type=int,
-        default=1200,
+        default=1200 if not is_hip() else 2000,
         help="The time limit for running one file in seconds.",
     )
     arg_parser.add_argument(
