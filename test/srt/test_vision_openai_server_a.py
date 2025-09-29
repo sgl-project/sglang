@@ -150,38 +150,17 @@ class TestVLMContextLengthIssue(CustomTestCase):
 
 
 # Note(Xinyuan): mllama is not stable for now, skip for CI
-# class TestMllamaServer(TestOpenAIVisionServer):
-#     @classmethod
-#     def setUpClass(cls):
-#         cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-#         cls.base_url = DEFAULT_URL_FOR_TEST
-#         cls.api_key = "sk-123456"
-#         cls.process = popen_launch_server(
-#             cls.model,
-#             cls.base_url,
-#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-#             api_key=cls.api_key,
-#         )
-#         cls.base_url += "/v1"
-
-
-class TestMinicpmvServer(ImageOpenAITestMixin):
+class TestMllamaServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-V-2_6"
+        cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.35",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
+            api_key=cls.api_key,
         )
         cls.base_url += "/v1"
 
@@ -292,22 +271,12 @@ class TestVILAServer(ImageOpenAITestMixin):
         cls.base_url += "/v1"
 
 
-class TestPhi4MMServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
+class TestGemma3itServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
-        # Manually download LoRA adapter_config.json as it's not downloaded by the model loader by default.
-        from huggingface_hub import constants, snapshot_download
-
-        snapshot_download(
-            "microsoft/Phi-4-multimodal-instruct",
-            allow_patterns=["**/adapter_config.json"],
-        )
-
-        cls.model = "microsoft/Phi-4-multimodal-instruct"
+        cls.model = "google/gemma-3-4b-it"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-
-        revision = "33e62acdd07cd7d6635badd529aa0a3467bb9c6a"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -316,41 +285,58 @@ class TestPhi4MMServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.70",
-                "--disable-radix-cache",
-                "--max-loras-per-batch",
-                "2",
-                "--revision",
-                revision,
-                "--lora-paths",
-                f"vision={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/vision-lora",
-                f"speech={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/speech-lora",
+                "--enable-multimodal",
                 "--cuda-graph-max-bs",
                 "4",
             ],
         )
         cls.base_url += "/v1"
 
-    def get_vision_request_kwargs(self):
-        return {
-            "extra_body": {
-                "lora_path": "vision",
-                "top_k": 1,
-                "top_p": 1.0,
-            }
-        }
 
-    def get_audio_request_kwargs(self):
-        return {
-            "extra_body": {
-                "lora_path": "speech",
-                "top_k": 1,
-                "top_p": 1.0,
-            }
-        }
+class TestKimiVLServer(ImageOpenAITestMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--context-length",
+                "4096",
+                "--dtype",
+                "bfloat16",
+                "--cuda-graph-max-bs",
+                "4",
+            ],
+        )
+        cls.base_url += "/v1"
 
-    # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
-    def test_audio_ambient_completion(self):
-        pass
+
+class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "zai-org/GLM-4.1V-9B-Thinking"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.68",
+                "--cuda-graph-max-bs",
+                "4",
+                "--reasoning-parser",
+                "glm45",
+            ],
+        )
+        cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
