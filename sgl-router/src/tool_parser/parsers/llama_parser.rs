@@ -127,8 +127,9 @@ impl LlamaParser {
                         all_tools.push(tool);
                     }
                 }
-                Err(_) => {
+                Err(e) => {
                     // Skip invalid JSON parts in semicolon-separated list
+                    tracing::warn!("Failed to parse tool call: {}", e);
                 }
             }
         }

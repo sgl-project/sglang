@@ -196,9 +196,16 @@ impl ToolParser for JsonParser {
     async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Always use extract_json_from_text to handle both pure JSON and mixed content
         if let Some((extracted_json, normal_text)) = self.extract_json_from_text(text) {
-            if let Ok(value) = serde_json::from_str::<Value>(&extracted_json) {
-                let tools = self.parse_json_value(&value)?;
-                return Ok((normal_text, tools));
+            match serde_json::from_str::<Value>(&extracted_json) {
+                Ok(value) => match self.parse_json_value(&value) {
+                    Ok(tools) => return Ok((normal_text, tools)),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse JSON tool calls: {}", e);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to parse extracted JSON: {}", e);
+                }
             }
         }
 
