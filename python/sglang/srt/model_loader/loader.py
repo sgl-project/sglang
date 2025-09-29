@@ -54,6 +54,8 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -546,7 +548,7 @@ class DefaultModelLoader(BaseModelLoader):
 
                 print(
                     "Model does not fit to the GPU mem. "
-                    f"We apply the following memmory limit for calibration: \n{max_memory}\n"
+                    f"We apply the following memory limit for calibration: \n{max_memory}\n"
                     "If you hit GPU OOM issue, please adjust `gpu_mem_percentage` or "
                     "reduce the calibration `batch_size` manually."
                 )
