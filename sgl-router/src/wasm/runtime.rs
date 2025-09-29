@@ -18,6 +18,7 @@ pub struct WasmRuntime {
 
 pub struct WasmThreadPool {
     sender: mpsc::UnboundedSender<WasmTask>,
+    receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<WasmTask>>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     // Metrics
     total_tasks: AtomicU64,
@@ -180,6 +181,7 @@ impl WasmThreadPool {
 
         Ok(Self {
             sender,
+            receiver,
             workers,
             total_tasks: AtomicU64::new(0),
             completed_tasks: AtomicU64::new(0),
@@ -307,7 +309,20 @@ impl WasmThreadPool {
 
 impl Drop for WasmThreadPool {
     fn drop(&mut self) {
-        // close sender, let workers exit naturally
+        // drain and discard any pending tasks before closing
+        if let Ok(mut receiver_guard) = self.receiver.try_lock() {
+            loop {
+                match receiver_guard.try_recv() {
+                    Ok(_task) => {
+                        self.total_tasks.fetch_add(1, Ordering::Relaxed);
+                        self.failed_tasks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // close sender, let workers exit naturally once channel is empty and closed
         drop(self.sender.clone());
 
         // wait for all workers to complete
