@@ -472,11 +472,48 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ignore_eos=grpc_params.ignore_eos,
         )
 
+    def _convert_logprobs_to_proto(
+        self, logprobs_data: Dict
+    ) -> Optional[sglang_scheduler_pb2.LogProbs]:
+        """Convert logprobs dict to proto LogProbs format (transport RAW data only)."""
+        if not logprobs_data:
+            return None
+
+        token_logprobs_val = logprobs_data.get("token_logprobs_val", [])
+        token_logprobs_idx = logprobs_data.get("token_logprobs_idx", [])
+        top_logprobs_val = logprobs_data.get("top_logprobs_val", [])
+        top_logprobs_idx = logprobs_data.get("top_logprobs_idx", [])
+
+        # Build TopLogProbs entries
+        top_logprobs_proto = []
+        if top_logprobs_val and top_logprobs_idx:
+            for val_list, idx_list in zip(top_logprobs_val, top_logprobs_idx):
+                top_logprobs_proto.append(
+                    sglang_scheduler_pb2.TopLogProbs(
+                        values=val_list if val_list else [],
+                        token_ids=idx_list if idx_list else [],
+                        token_texts=[],  # Empty - Rust will decode
+                    )
+                )
+
+        return sglang_scheduler_pb2.LogProbs(
+            token_logprobs=token_logprobs_val,
+            token_ids=token_logprobs_idx,
+            top_logprobs=top_logprobs_proto,
+            token_texts=[],  # Empty - Rust will decode
+        )
+
     def _create_chunk_response(
         self, request_id: str, output: Dict
     ) -> sglang_scheduler_pb2.GenerateResponse:
         """Create a streaming chunk response."""
         meta_info = output.get("meta_info", {})
+
+        # Convert logprobs if present
+        logprobs_proto = None
+        if "logprobs" in output:
+            logprobs_proto = self._convert_logprobs_to_proto(output["logprobs"])
+
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
             chunk=sglang_scheduler_pb2.GenerateStreamChunk(
@@ -484,6 +521,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 prompt_tokens=meta_info.get("prompt_tokens", 0),
                 completion_tokens=meta_info.get("completion_tokens", 0),
                 cached_tokens=meta_info.get("cached_tokens", 0),
+                logprobs=logprobs_proto,
             ),
         )
 
@@ -519,6 +557,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             elif isinstance(matched, str):
                 matched_stop_kwargs["matched_stop_str"] = matched
 
+        # Convert logprobs if present
+        logprobs_proto = None
+        if "logprobs" in output:
+            logprobs_proto = self._convert_logprobs_to_proto(output["logprobs"])
+
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
             complete=sglang_scheduler_pb2.GenerateComplete(
@@ -529,6 +572,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     "completion_tokens", len(output.get("token_ids", []))
                 ),
                 cached_tokens=meta_info.get("cached_tokens", 0),
+                all_logprobs=logprobs_proto,
                 **matched_stop_kwargs,
             ),
         )

@@ -516,19 +516,51 @@ class GrpcRequestManager:
                 },
             }
 
-            # Add logprobs if available
+            # Add logprobs if available (RAW - no detokenization!)
             if batch_out.output_token_logprobs_val and i < len(
                 batch_out.output_token_logprobs_val
             ):
-                output_data["logprobs"] = {
-                    "tokens": batch_out.output_token_logprobs_val[i],
-                    "top_logprobs": (
-                        batch_out.output_top_logprobs_val[i]
-                        if batch_out.output_top_logprobs_val
-                        and i < len(batch_out.output_top_logprobs_val)
-                        else None
-                    ),
-                }
+                # Accumulate in state first
+                state.output_token_logprobs_val.extend(batch_out.output_token_logprobs_val[i])
+                if batch_out.output_token_logprobs_idx and i < len(batch_out.output_token_logprobs_idx):
+                    state.output_token_logprobs_idx.extend(batch_out.output_token_logprobs_idx[i])
+                if batch_out.output_top_logprobs_val and i < len(batch_out.output_top_logprobs_val):
+                    state.output_top_logprobs_val.extend(batch_out.output_top_logprobs_val[i])
+                if batch_out.output_top_logprobs_idx and i < len(batch_out.output_top_logprobs_idx):
+                    state.output_top_logprobs_idx.extend(batch_out.output_top_logprobs_idx[i])
+
+                if state.obj.stream:
+                    # For streaming: send incremental logprobs (only new tokens in this chunk)
+                    # NOTE: this is different than TokenizerManager, which always accumulates
+                    output_data["logprobs"] = {
+                        "token_logprobs_val": batch_out.output_token_logprobs_val[i],
+                        "token_logprobs_idx": (
+                            batch_out.output_token_logprobs_idx[i]
+                            if batch_out.output_token_logprobs_idx
+                            and i < len(batch_out.output_token_logprobs_idx)
+                            else []
+                        ),
+                        "top_logprobs_val": (
+                            batch_out.output_top_logprobs_val[i]
+                            if batch_out.output_top_logprobs_val
+                            and i < len(batch_out.output_top_logprobs_val)
+                            else []
+                        ),
+                        "top_logprobs_idx": (
+                            batch_out.output_top_logprobs_idx[i]
+                            if batch_out.output_top_logprobs_idx
+                            and i < len(batch_out.output_top_logprobs_idx)
+                            else []
+                        ),
+                    }
+                elif output_data["finished"]:
+                    # Non-streaming: send cumulative logprobs only in final chunk
+                    output_data["logprobs"] = {
+                        "token_logprobs_val": state.output_token_logprobs_val,
+                        "token_logprobs_idx": state.output_token_logprobs_idx,
+                        "top_logprobs_val": state.output_top_logprobs_val,
+                        "top_logprobs_idx": state.output_top_logprobs_idx,
+                    }
 
             # Update state for accumulation
             if output_data["token_ids"]:
