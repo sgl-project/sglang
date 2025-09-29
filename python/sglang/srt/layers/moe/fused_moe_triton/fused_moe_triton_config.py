@@ -180,6 +180,7 @@ def try_get_optimal_moe_config(
     M: int,
     is_marlin: bool = False,
     block_shape: Optional[List[int]] = None,
+    return_down_config: bool = False,
 ):
     from sglang.srt.layers.moe.fused_moe_triton import get_config
 
@@ -204,16 +205,22 @@ def try_get_optimal_moe_config(
             config = get_default_config(
                 M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
             )
-
-        down_configs = get_moe_configs(E, N, dtype, block_n, block_k, down_moe=True)
-        if down_configs:
-            down_config = down_configs[
-                min(down_configs.keys(), key=lambda x: abs(x - M))
-            ]
-            down_config = dict(**down_config)
-            max_block_m = max([cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()])
-    assert down_config is None or config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
-    return config, (down_config, max_block_m)
+        if return_down_config:
+            down_configs = get_moe_configs(E, N, dtype, block_n, block_k, down_moe=True)
+            if down_configs:
+                down_config = down_configs[
+                    min(down_configs.keys(), key=lambda x: abs(x - M))
+                ]
+                down_config = dict(**down_config)
+                max_block_m = max(
+                    [cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()]
+                )
+    if return_down_config:
+        assert (
+            down_config is None or config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
+        )
+        return config, (down_config, max_block_m)
+    return config
 
 
 def get_config_dtype_str(
