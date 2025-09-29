@@ -287,14 +287,6 @@ class ServerArgs:
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     requests_all_greedy: Optional[bool] = True
-    # For lookahead only
-    speculative_lookahead_min_match_window_size: int = 1
-    speculative_lookahead_max_match_window_size: int = 12
-    speculative_lookahead_min_bfs_breadth: int = 1
-    speculative_lookahead_max_bfs_breadth: int = 10
-    speculative_lookahead_match_type: Literal["BFS", "PROB"] = "BFS"
-    speculative_lookahead_branch_length: int = 18
-    speculative_lookahead_capacity: int = 10 * 1000 * 1000
 
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
