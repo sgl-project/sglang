@@ -769,20 +769,22 @@ impl GrpcRouter {
 
         // Check if reasoning parsing is enabled and separate_reasoning is requested
         if original_request.separate_reasoning {
-            if let Ok(mut parser) = self
+            let pooled_parser = self
                 .reasoning_parser_factory
-                .create(&original_request.model)
-            {
-                match parser.detect_and_parse_reasoning(&processed_text) {
-                    Ok(result) => {
-                        if !result.reasoning_text.is_empty() {
-                            reasoning_text = Some(result.reasoning_text);
-                        }
-                        processed_text = result.normal_text;
+                .get_pooled(&original_request.model);
+
+            let mut parser = pooled_parser
+                .lock()
+                .map_err(|e| format!("Failed to acquire reasoning parser lock: {}", e))?;
+            match parser.detect_and_parse_reasoning(&processed_text) {
+                Ok(result) => {
+                    if !result.reasoning_text.is_empty() {
+                        reasoning_text = Some(result.reasoning_text);
                     }
-                    Err(e) => {
-                        return Err(format!("Reasoning parsing error: {}", e));
-                    }
+                    processed_text = result.normal_text;
+                }
+                Err(e) => {
+                    return Err(format!("Reasoning parsing error: {}", e));
                 }
             }
         }
