@@ -242,10 +242,6 @@ class LogitsProcessor(nn.Module):
         ):
             self.final_logit_softcapping = None
 
-        self.debug_tensor_dump_output_folder = global_server_args_dict.get(
-            "debug_tensor_dump_output_folder", None
-        )
-
     def forward(
         self,
         input_ids,
@@ -341,14 +337,6 @@ class LogitsProcessor(nn.Module):
         sampled_logits = (
             logits[sample_indices] if sample_indices is not None else logits
         )
-
-        if self.debug_tensor_dump_output_folder:
-            assert (
-                not self.do_tensor_parallel_all_gather
-                or get_local_attention_dp_size() == 1
-            ), "dp attention + sharded lm_head doesn't support full logits"
-            full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
-            dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)
 
         hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
