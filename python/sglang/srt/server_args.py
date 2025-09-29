@@ -286,14 +286,14 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
-    # For lookahead only
-    speculative_lookahead_min_match_window_size: int = 1
-    speculative_lookahead_max_match_window_size: int = 12
-    speculative_lookahead_min_bfs_breadth: int = 1
-    speculative_lookahead_max_bfs_breadth: int = 10
-    speculative_lookahead_match_type: Literal["BFS", "PROB"] = "BFS"
-    speculative_lookahead_branch_length: int = 18
-    speculative_lookahead_capacity: int = 10 * 1000 * 1000
+    # For ngram only
+    speculative_ngram_min_match_window_size: int = 1
+    speculative_ngram_max_match_window_size: int = 12
+    speculative_ngram_min_bfs_breadth: int = 1
+    speculative_ngram_max_bfs_breadth: int = 10
+    speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
+    speculative_ngram_branch_length: int = 18
+    speculative_ngram_capacity: int = 10 * 1000 * 1000
 
     # Expert parallelism
     ep_size: int = 1
@@ -567,7 +567,7 @@ class ServerArgs:
                         # Standalone speculative decoding needs more memory than other speculative
                         # decoding algorithms since the draft model is typically larger.
                         reserved_mem += 6 * 1024
-                    elif self.speculative_algorithm != "LOOKAHEAD":
+                    elif self.speculative_algorithm != "NGRAM":
                         reserved_mem += 2 * 1024
                 if self.enable_dp_attention:
                     reserved_mem += 4 * 1024
@@ -1025,23 +1025,23 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
-        if self.speculative_algorithm == "LOOKAHEAD":
+        if self.speculative_algorithm == "NGRAM":
             if not self.device.startswith("cuda"):
                 raise ValueError(
-                    "Lookahead speculative decoding only supports CUDA device."
+                    "Ngram speculative decoding only supports CUDA device."
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
             self.enable_mixed_chunk = False
-            self.speculative_eagle_topk = self.speculative_lookahead_max_bfs_breadth
+            self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
                 self.speculative_num_draft_tokens = (
-                    self.speculative_lookahead_max_match_window_size
+                    self.speculative_ngram_max_match_window_size
                 )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
-                "using lookahead speculative decoding."
+                "using ngram speculative decoding."
             )
 
             if (
@@ -1053,9 +1053,9 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
             if self.enable_dp_attention:
-                # TODO: support dp attention for lookahead speculative decoding
+                # TODO: support dp attention for ngram speculative decoding
                 raise ValueError(
-                    "Currently lookahead speculative decoding does not support dp attention."
+                    "Currently ngram speculative decoding does not support dp attention."
                 )
 
     def _handle_load_format(self):
@@ -1922,7 +1922,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "LOOKAHEAD"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -1982,49 +1982,49 @@ class ServerArgs:
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             default=ServerArgs.speculative_attention_mode,
         )
-        # Lookahead speculative decoding
+        # Ngram speculative decoding
         parser.add_argument(
-            "--speculative-lookahead-min-match-window-size",
+            "--speculative-ngram-min-match-window-size",
             type=int,
-            default=ServerArgs.speculative_lookahead_min_match_window_size,
-            help="The minimum window size for pattern matching in lookahead speculative decoding.",
+            default=ServerArgs.speculative_ngram_min_match_window_size,
+            help="The minimum window size for pattern matching in ngram speculative decoding.",
         )
         parser.add_argument(
-            "--speculative-lookahead-max-match-window-size",
+            "--speculative-ngram-max-match-window-size",
             type=int,
-            default=ServerArgs.speculative_lookahead_max_match_window_size,
-            help="The maximum window size for pattern matching in lookahead speculative decoding.",
+            default=ServerArgs.speculative_ngram_max_match_window_size,
+            help="The maximum window size for pattern matching in ngram speculative decoding.",
         )
         parser.add_argument(
-            "--speculative-lookahead-min-bfs-breadth",
+            "--speculative-ngram-min-bfs-breadth",
             type=int,
-            default=ServerArgs.speculative_lookahead_min_bfs_breadth,
-            help="The minimum breadth for BFS (Breadth-First Search) in lookahead speculative decoding.",
+            default=ServerArgs.speculative_ngram_min_bfs_breadth,
+            help="The minimum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
         )
         parser.add_argument(
-            "--speculative-lookahead-max-bfs-breadth",
+            "--speculative-ngram-max-bfs-breadth",
             type=int,
-            default=ServerArgs.speculative_lookahead_max_bfs_breadth,
-            help="The maximum breadth for BFS (Breadth-First Search) in lookahead speculative decoding.",
+            default=ServerArgs.speculative_ngram_max_bfs_breadth,
+            help="The maximum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
         )
         parser.add_argument(
-            "--speculative-lookahead-match-type",
+            "--speculative-ngram-match-type",
             type=str,
             choices=["BFS", "PROB"],
-            default=ServerArgs.speculative_lookahead_match_type,
+            default=ServerArgs.speculative_ngram_match_type,
             help="The match type for cache tree.",
         )
         parser.add_argument(
-            "--speculative-lookahead-branch-length",
+            "--speculative-ngram-branch-length",
             type=int,
-            default=ServerArgs.speculative_lookahead_branch_length,
-            help="The branch length for lookahead speculative decoding.",
+            default=ServerArgs.speculative_ngram_branch_length,
+            help="The branch length for ngram speculative decoding.",
         )
         parser.add_argument(
-            "--speculative-lookahead-capacity",
+            "--speculative-ngram-capacity",
             type=int,
-            default=ServerArgs.speculative_lookahead_capacity,
-            help="The cache capacity for lookahead speculative decoding.",
+            default=ServerArgs.speculative_ngram_capacity,
+            help="The cache capacity for ngram speculative decoding.",
         )
 
         # Expert parallelism
