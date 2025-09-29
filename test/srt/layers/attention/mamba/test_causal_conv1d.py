@@ -9,10 +9,10 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    PAD_SLOT_ID,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from sglang.srt.layers.attention.mamba.constants import PAD_SLOT_ID
 
 
 def causal_conv1d_ref(

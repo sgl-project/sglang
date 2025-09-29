@@ -1,1 +1,0 @@
-PAD_SLOT_ID = -1

@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .constants import PAD_SLOT_ID
+PAD_SLOT_ID = -1
 
 
 @triton.jit()

@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 from packaging import version
 
-from .constants import PAD_SLOT_ID
+from .causal_conv1d_triton import PAD_SLOT_ID
 
 TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
 
