@@ -24,8 +24,11 @@ from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.dp_attention import get_attention_tp_size, get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention.mamba.mamba_utils import MambaStateShapeCalculator
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_size,
+    get_tensor_model_parallel_world_size,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -91,7 +94,7 @@ class FalconH1Config(PretrainedConfig):
         mamba_n_heads (`int`, *optional*, defaults to 128):
             The number of mamba heads used in the v2 implementation.
         mamba_d_head (`int`, *optional*, defaults to `"auto"`):
-            Head embeddding dimension size
+            Head embedding dimension size
         mamba_n_groups (`int`, *optional*, defaults to 1):
             The number of the mamba groups used in the v2 implementation.
         mamba_d_state (`int`, *optional*, defaults to 256):
@@ -211,7 +214,9 @@ class FalconH1Config(PretrainedConfig):
         self.rope_scaling = None
         self.rope_scaling = rope_scaling
         self.projectors_bias = projectors_bias
-        mamba_intermediate = mamba_expand * hidden_size if mamba_d_ssm is None else mamba_d_ssm
+        mamba_intermediate = (
+            mamba_expand * hidden_size if mamba_d_ssm is None else mamba_d_ssm
+        )
 
         if mamba_intermediate % mamba_n_heads != 0:
             raise ValueError("mamba_n_heads must divide mamba_expand * hidden_size")
@@ -221,7 +226,9 @@ class FalconH1Config(PretrainedConfig):
             mamba_d_head = mamba_intermediate // mamba_n_heads
 
         if mamba_d_head * mamba_n_heads != mamba_intermediate:
-            raise ValueError("The dimensions for the Mamba head state do not match the model intermediate_size")
+            raise ValueError(
+                "The dimensions for the Mamba head state do not match the model intermediate_size"
+            )
 
         self.mamba_d_ssm = mamba_d_ssm
         self.mamba_n_heads = mamba_n_heads
@@ -319,11 +326,12 @@ class FalconH1Config(PretrainedConfig):
             # - but if n_groups cannot divide tp_size, we need to
             #   extend some extra groups
             extra_groups = MambaStateShapeCalculator.extra_groups_for_head_shards(
-                self.mamba_n_groups, world_size)
+                self.mamba_n_groups, world_size
+            )
             n_groups += extra_groups
 
         conv_dim = self.mamba_d_ssm + 2 * n_groups * self.mamba_d_state
-        
+
         conv_state_shape = (
             divide(conv_dim, world_size),
             self.mamba_d_conv - 1,
@@ -342,7 +350,7 @@ class FalconH1Config(PretrainedConfig):
         }
         ssm_dtype = dtype_map[os.environ["SGLANG_MAMBA_SSM_DTYPE"]]
         mamba_layers = self.linear_layer_ids
-        
+
         return (
             conv_state_shape,
             temporal_state_shape,

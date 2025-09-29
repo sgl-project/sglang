@@ -1,16 +1,13 @@
 import enum
 import logging
-from typing import Any, Iterable, Optional, Set, Tuple, List
+from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
 
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.configs.falcon_h1 import FalconH1Config
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -34,14 +31,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-)
-from sglang.srt.utils import (
-    add_prefix,
-    is_cuda,
-    make_layers,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -95,7 +86,7 @@ class FalconH1MLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        gate_up[:, :self.intermediate_size // self.tp_size] *= self.gate_multiplier
+        gate_up[:, : self.intermediate_size // self.tp_size] *= self.gate_multiplier
 
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
@@ -142,7 +133,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rope_scaling = getattr(config, "rope_scaling", None)
-        self.partial_rotary_factor  = getattr(config, "partial_rotary_factor", 1)
+        self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
         self.layer_id = layer_id
 
         self.rotary_emb = get_rope(
@@ -186,8 +177,11 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        self.d_ssm = (int(config.mamba_expand * config.hidden_size)
-                    if config.mamba_d_ssm is None else config.mamba_d_ssm)
+        self.d_ssm = (
+            int(config.mamba_expand * config.hidden_size)
+            if config.mamba_d_ssm is None
+            else config.mamba_d_ssm
+        )
 
         self.mamba = MambaMixer2(
             hidden_size=config.hidden_size,
@@ -229,9 +223,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.pre_ff_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -258,15 +250,15 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
 
     def _init_mup_vector(self):
         """
-        Non learnable per-block scaling vector composed of element-wise 
-        multipliersapplied to each separate contiguous block of the output 
+        Non learnable per-block scaling vector composed of element-wise
+        multipliersapplied to each separate contiguous block of the output
         of the linear projection (in_proj) before further processing
         (gating, convolution, SSM):
 
             - Z block:  [0 : d_ssm]                      → zxbcdt_multipliers[0]
             - X block:  [d_ssm : 2 * d_ssm]              → zxbcdt_multipliers[1]
             - B block:  [2 * d_ssm : 2 * d_ssm + G * S]  → zxbcdt_multipliers[2]
-            - C block:  [2 * d_ssm + G * S : 2 * d_ssm + 2 * G * S] 
+            - C block:  [2 * d_ssm + G * S : 2 * d_ssm + 2 * G * S]
                         → zxbcdt_multipliers[3]
             - dt block: [2 * d_ssm + 2 * G * S : end]    → zxbcdt_multipliers[4]
 
@@ -276,38 +268,36 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             - S:         SSM state size per group
             - All indices are divided by tp_size to support tensor parallelism
         """
-        vector_shape = (2 * self.d_ssm + 2 * self.groups_time_state_size +
-                        self.config.mamba_n_heads) // self.tp_size
+        vector_shape = (
+            2 * self.d_ssm + 2 * self.groups_time_state_size + self.config.mamba_n_heads
+        ) // self.tp_size
         mup_vector = torch.ones(1, vector_shape)
         # Z vector 0 -> d_ssm
-        mup_vector[:, :self.d_ssm //
-                   self.tp_size] *= self.zxbcdt_multipliers[0]
+        mup_vector[:, : self.d_ssm // self.tp_size] *= self.zxbcdt_multipliers[0]
         # X vector d_ssm -> 2 * d_ssm
-        mup_vector[:,
-                   (self.d_ssm //
-                    self.tp_size):(2 * self.d_ssm //
-                                   self.tp_size)] *= self.zxbcdt_multipliers[1]
+        mup_vector[
+            :, (self.d_ssm // self.tp_size) : (2 * self.d_ssm // self.tp_size)
+        ] *= self.zxbcdt_multipliers[1]
         # B vector 2 * d_ssm -> 2 * d_ssm + (n_group * d_state)
         mup_vector[
             :,
-            (2 * self.d_ssm) //
-            self.tp_size:(2 * self.d_ssm + self.groups_time_state_size) //
-            self.tp_size,
+            (2 * self.d_ssm)
+            // self.tp_size : (2 * self.d_ssm + self.groups_time_state_size)
+            // self.tp_size,
         ] *= self.zxbcdt_multipliers[2]
         # C vector 2 * d_ssm + (n_group * d_state)
         # -> 2 * d_ssm + 2 * (n_group * d_state)
         mup_vector[
             :,
-            (2 * self.d_ssm + self.groups_time_state_size) //
-            self.tp_size:(2 * self.d_ssm + 2 * self.groups_time_state_size) //
-            self.tp_size,
+            (2 * self.d_ssm + self.groups_time_state_size)
+            // self.tp_size : (2 * self.d_ssm + 2 * self.groups_time_state_size)
+            // self.tp_size,
         ] *= self.zxbcdt_multipliers[3]
         # dt vector 2 * d_ssm + 2 * (n_group * d_state)
         # -> 2 * d_ssm + 2 * (n_group * d_state) + n_heads
         mup_vector[
             :,
-            (2 * self.d_ssm + 2 * self.groups_time_state_size) //
-            self.tp_size:,
+            (2 * self.d_ssm + 2 * self.groups_time_state_size) // self.tp_size :,
         ] *= self.zxbcdt_multipliers[4]
 
         self.register_buffer("mup_vector", mup_vector, persistent=False)
@@ -355,7 +345,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 hidden_states * self.ssm_in_multiplier,
                 mamba_hidden_states,
                 forward_batch=forward_batch,
-                mup_vector=self.mup_vector
+                mup_vector=self.mup_vector,
             )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 
@@ -368,7 +358,9 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.feed_forward(hidden_states, forward_batch, use_reduce_scatter)
+        hidden_states = self.feed_forward(
+            hidden_states, forward_batch, use_reduce_scatter
+        )
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -435,7 +427,6 @@ class FalconH1Model(nn.Module):
             hidden_states = inputs_embeds * self.embedding_multiplier
         else:
             hidden_states = self.embed_tokens(input_ids) * self.embedding_multiplier
-    
 
         residual = None
         for i in range(len(self.layers)):
@@ -494,8 +485,9 @@ class FalconH1ForCausalLM(nn.Module):
             )
         self.lm_head = self.lm_head.float()
         self.lm_head_multiplier = config.lm_head_multiplier
-        self.logits_processor = LogitsProcessor(config, logit_scale=self.lm_head_multiplier)
-        
+        self.logits_processor = LogitsProcessor(
+            config, logit_scale=self.lm_head_multiplier
+        )
 
     @torch.no_grad()
     def forward(
@@ -544,10 +536,10 @@ class FalconH1ForCausalLM(nn.Module):
 
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
-            
+
             if "A_log" in name:
                 name = name.replace("A_log", "A")
-            
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -573,13 +565,12 @@ class FalconH1ForCausalLM(nn.Module):
                 #     continue
 
                 param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
-                
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+
                 weight_loader(param, loaded_weight)
-                
+
             loaded_params.add(name)
         return loaded_params
+
 
 EntryClass = FalconH1ForCausalLM

@@ -40,11 +40,11 @@ from sglang.srt.configs import (
     DeepseekVL2Config,
     DotsVLMConfig,
     ExaoneConfig,
+    FalconH1Config,
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
     Qwen3NextConfig,
-    FalconH1Config,
     Step3VLConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig

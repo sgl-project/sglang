@@ -52,6 +52,7 @@ class ForwardMetadata:
     query_start_loc: Optional[torch.Tensor]
     mamba_cache_indices: torch.Tensor
 
+
 class MambaAttnBackend(AttentionBackend):
     """Attention backend using Mamba kernel."""
 

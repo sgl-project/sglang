@@ -113,7 +113,6 @@ class TestFalconH1NoGatedRMS(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.80)
 
 
-
 class TestFalconH1NoGatedTP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -146,4 +145,3 @@ class TestFalconH1NoGatedTP4(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.80)
-
