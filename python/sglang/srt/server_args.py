@@ -822,6 +822,7 @@ class ServerArgs:
 
             model_arch = self.get_hf_config().architectures[0]
             if model_arch in [
+                "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "BailingMoeForCausalLM",
@@ -3168,6 +3169,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         # The default value for llama
         return (5, 4, 8)
     elif arch in [
+        "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",

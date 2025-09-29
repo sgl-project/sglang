@@ -3401,4 +3401,8 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
-EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM]
+class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
+    pass
+
+
+EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

@@ -51,7 +51,8 @@ class ModelImpl(str, Enum):
 def is_deepseek_nsa(config: PretrainedConfig) -> bool:
     return (
         config.architectures is not None
-        and config.architectures[0] in ["DeepseekV3ForCausalLM"]
+        and config.architectures[0]
+        in ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"]
         and getattr(config, "index_topk", None) is not None
     )
 
@@ -252,6 +253,7 @@ class ModelConfig:
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
