@@ -123,6 +123,10 @@ Specifically, **LMCache**, an efficient KV Cache layer for enterprise-scale LLM 
 
 - **`--hicache-size HICACHE_SIZE`**: The size of host KV cache memory pool in gigabytes. This parameter overrides `hicache-ratio` if set. For example, `--hicache-size 30` allocates 30GB for the host memory pool **for each rank**. If there are 8 ranks, then the total memory size is 240GB.
 
+**Note**: `--hicache-ratio` and `--hicache-size` are two critical parameters. In general, a larger HiCache size leads to a higher cache hit rate, which improves prefill performance. However, the relationship between cache size and hit rate is not linear. Once most reusable KV data—especially hot tokens—are already cached, further increasing the size yields only marginal performance gains. Users can set these parameters based on their workload characteristics and performance requirements.
+
+- **`--page-size PAGE_SIZE`**: The number of tokens per page. This parameter determines the granularity of KV cache storage and retrieval. Larger page sizes reduce metadata overhead and improve I/O efficiency for storage backends, but may lower the cache hit rate when only part of a page matches the stored KV cache. For workloads with long common prefixes, larger pages can improve performance, while workloads with more diverse prefixes may benefit from smaller pages.
+
 - **`--hicache-write-policy {write_back,write_through,write_through_selective}`**: Controls how data is written from faster to slower memory tiers:
   - `write_through`: Immediately writes data to all tiers (strongest caching benefits)
   - `write_through_selective`: Uses hit-count tracking to back up only frequently accessed data
@@ -144,6 +148,6 @@ Specifically, **LMCache**, an efficient KV Cache layer for enterprise-scale LLM 
 - **`--hicache-storage-prefetch-policy {best_effort,wait_complete,timeout}`**: Control when prefetching from storage should stop:
   - `best_effort`: Prefetch as much as possible without blocking
   - `wait_complete`: Wait for prefetch to complete before proceeding
-  - `timeout`: Use timeout-based prefetching
+  - `timeout`: Terminates after specified time or when complete (Recommended for production environments, as setting an appropriate timeout helps the system meet required SLOs)
 
 - **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: JSON string containing extra configuration for the storage backend, e.g., `--hicache-storage-backend-extra-config '{"prefetch_threshold":512, "prefetch_timeout_base": 0.5, "prefetch_timeout_per_ki_token": 0.25}' `
