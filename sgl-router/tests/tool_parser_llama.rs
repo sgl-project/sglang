@@ -36,8 +36,9 @@ async fn test_llama_with_text_before() {
     let parser = LlamaParser::new();
     let input = r#"Let me help you with that. <|python_tag|>{"name": "get_time", "arguments": {"timezone": "UTC"}}"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me help you with that. ");
     assert_eq!(tools[0].function.name, "get_time");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
@@ -99,8 +100,9 @@ async fn test_llama_invalid_json_after_tag() {
     let parser = LlamaParser::new();
 
     let input = r#"<|python_tag|>{"name": invalid}"#;
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 0);
+    assert_eq!(normal_text, "<|python_tag|>{\"name\": invalid}");
 }
 
 #[tokio::test]
