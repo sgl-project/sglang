@@ -1,6 +1,7 @@
 use sglang_router_rs::protocols::spec;
 use sglang_router_rs::tokenizer::chat_template::{
-    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateProcessor,
+    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
+    ChatTemplateProcessor,
 };
 
 #[test]
@@ -169,11 +170,7 @@ assistant:
 {%- endif %}
 "#;
 
-    let processor = ChatTemplateProcessor::new(
-        template.to_string(),
-        Some("<s>".to_string()),
-        Some("</s>".to_string()),
-    );
+    let processor = ChatTemplateProcessor::new(template.to_string());
 
     let messages = vec![
         spec::ChatMessage::System {
@@ -194,8 +191,12 @@ assistant:
         .map(|msg| serde_json::to_value(msg).unwrap())
         .collect();
 
+    let params = ChatTemplateParams {
+        add_generation_prompt: true,
+        ..Default::default()
+    };
     let result = processor
-        .apply_chat_template(&message_values, true)
+        .apply_chat_template(&message_values, params)
         .unwrap();
     assert!(result.contains("system: You are helpful"));
     assert!(result.contains("user: Hello"));
@@ -204,19 +205,15 @@ assistant:
 
 #[test]
 fn test_chat_template_with_tokens_unit_test() {
-    // Template that uses special tokens
+    // Template that uses template kwargs for tokens (more realistic)
     let template = r#"
-{{ bos_token }}
+{%- if start_token -%}{{ start_token }}{%- endif -%}
 {%- for message in messages -%}
-{{ message.role }}: {{ message.content }}{{ eos_token }}
+{{ message.role }}: {{ message.content }}{%- if end_token -%}{{ end_token }}{%- endif -%}
 {% endfor -%}
 "#;
 
-    let processor = ChatTemplateProcessor::new(
-        template.to_string(),
-        Some("<s>".to_string()),
-        Some("</s>".to_string()),
-    );
+    let processor = ChatTemplateProcessor::new(template.to_string());
 
     let messages = [spec::ChatMessage::User {
         role: "user".to_string(),
@@ -230,8 +227,24 @@ fn test_chat_template_with_tokens_unit_test() {
         .map(|msg| serde_json::to_value(msg).unwrap())
         .collect();
 
+    // Use template_kwargs to pass tokens
+    let mut template_kwargs = std::collections::HashMap::new();
+    template_kwargs.insert(
+        "start_token".to_string(),
+        serde_json::Value::String("<s>".to_string()),
+    );
+    template_kwargs.insert(
+        "end_token".to_string(),
+        serde_json::Value::String("</s>".to_string()),
+    );
+
+    let params = ChatTemplateParams {
+        template_kwargs: Some(&template_kwargs),
+        ..Default::default()
+    };
+
     let result = processor
-        .apply_chat_template(&message_values, false)
+        .apply_chat_template(&message_values, params)
         .unwrap();
     assert!(result.contains("<s>"));
     assert!(result.contains("</s>"));
