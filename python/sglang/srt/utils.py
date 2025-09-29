@@ -174,6 +174,8 @@ def is_blackwell():
 
 @lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
     )
@@ -181,6 +183,8 @@ def is_sm100_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
     )
@@ -466,7 +470,7 @@ def is_pin_memory_available() -> bool:
 
 class LayerFn(Protocol):
 
-    def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
+    def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
 def make_layers(
@@ -477,7 +481,7 @@ def make_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Dict[str, Any] = {},
-) -> Tuple[int, int, torch.nn.ModuleList]:
+) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices

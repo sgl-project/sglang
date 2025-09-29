@@ -318,6 +318,7 @@ class PrefillAdder:
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
+        max_prefill_bs: Optional[int],
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
     ):
@@ -356,6 +357,10 @@ class PrefillAdder:
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
+        )
+
+        self.max_prefill_bs = (
+            max_prefill_bs if max_prefill_bs is not None else 2147483647
         )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
@@ -549,6 +554,9 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        if len(self.can_run_list) >= self.max_prefill_bs:
+            return AddReqResult.OTHER
+
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 

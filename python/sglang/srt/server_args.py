@@ -94,6 +94,7 @@ ATTENTION_BACKEND_CHOICES = [
     "triton",
     "torch_native",
     "flex_attention",
+    "nsa",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -119,6 +120,11 @@ DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
+
+NSA_CHOICES = ["flashmla", "fa3", "tilelang"]
+
+NSA_DEFAULT_PREFILL = "flashmla"
+NSA_DEFAULT_DECODE = "fa3"
 
 
 # Allow external code to add more choices
@@ -398,6 +404,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
+    max_prefill_bs: Optional[int] = None
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -442,6 +449,10 @@ class ServerArgs:
 
     # For deterministic inference
     enable_deterministic_inference: bool = False
+
+    # NSA attention backend
+    nsa_prefill: str = NSA_DEFAULT_PREFILL
+    nsa_decode: str = NSA_DEFAULT_DECODE
 
     # Deprecated arguments
     enable_ep_moe: bool = False
@@ -2450,6 +2461,12 @@ class ServerArgs:
             nargs="+",
             help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess.",
         )
+        parser.add_argument(
+            "--max-prefill-bs",
+            type=int,
+            default=ServerArgs.max_prefill_bs,
+            help="The maximum batch size for prefill requests.",
+        )
 
         # Debug tensor dumps
         parser.add_argument(
@@ -2586,6 +2603,21 @@ class ServerArgs:
             "--enable-deterministic-inference",
             action="store_true",
             help="Enable deterministic inference mode with batch invariant ops.",
+        )
+
+        # For NSA models
+        parser.add_argument(
+            "--nsa-prefill",
+            default=NSA_DEFAULT_PREFILL,
+            type=str,
+            choices=NSA_CHOICES,
+        )
+
+        parser.add_argument(
+            "--nsa-decode",
+            default=NSA_DEFAULT_DECODE,
+            type=str,
+            choices=NSA_CHOICES,
         )
 
         # Deprecated arguments
@@ -2856,6 +2888,8 @@ class ServerArgs:
             ), f"{arg_name} customer rule bucket values should be non-negative"
 
     def model_specific_adjustments(self):
+        from sglang.srt.configs.model_config import is_deepseek_nsa
+
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
@@ -2929,6 +2963,19 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif is_deepseek_nsa(hf_config):
+            self.attention_backend = "nsa"
+            logger.warning("Set nsa attention backend for DeepSeek NSA.")
+
+            self.enable_dp_attention = True
+            self.dp_size = self.tp_size
+            logger.warning("DP attention is enabled for DeepSeek NSA.")
+
+            self.page_size = 64
+            logger.warning("Setting page size to 64 for DeepSeek NSA.")
+
+            self.max_prefill_bs = 1
+            logger.warning("Setting maximum prefill batch size to 1 for DeepSeek NSA.")
 
     def adjust_mem_fraction_for_vlm(self, model_config):
         vision_config = getattr(model_config.hf_config, "vision_config", None)

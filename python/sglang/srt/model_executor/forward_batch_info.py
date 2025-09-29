@@ -45,13 +45,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
 )
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import (
-    flatten_nested_list,
-    get_compiler_backend,
-    is_npu,
-    support_triton,
-)
+from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -300,6 +294,7 @@ class ForwardBatch:
     # For padding
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
+    num_token_non_padded_cpu: int = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -361,6 +356,7 @@ class ForwardBatch:
             ret.num_token_non_padded = torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
+        ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync
         if batch.global_num_tokens is not None:

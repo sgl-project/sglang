@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -115,3 +116,11 @@ class AttentionBackend(ABC):
     def support_triton(self):
         """Check if the current backend supports triton."""
         return True
+
+    def get_indexer_metadata(
+        self,
+        layer_id: int,
+        forward_batch: ForwardBatch,
+    ) -> Optional[BaseIndexerMetadata]:
+        """Get the indexer metadata. None means don't support indexer."""
+        return None

@@ -79,37 +79,48 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         num_new_pages = (
-            (
-                (seq_lens + self.page_size - 1) // self.page_size
-                - (prefix_lens + self.page_size - 1) // self.page_size
-            )
-            .sum()
-            .item()
-        )
-        if self.need_sort and num_new_pages > len(self.free_pages):
+            (seq_lens + self.page_size - 1) // self.page_size
+            - (prefix_lens + self.page_size - 1) // self.page_size
+        ).sum()
+        num_new_pages_item = num_new_pages.item()
+        if self.need_sort and num_new_pages_item > len(self.free_pages):
             self.merge_and_sort_free()
 
-        if num_new_pages > len(self.free_pages):
+        if num_new_pages_item > len(self.free_pages):
             return None
 
         out_indices = torch.empty(
-            (extend_num_tokens,), dtype=torch.int32, device=self.device
+            (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
 
-        alloc_extend_kernel_ascend(
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            self.page_size,
-            self.device,
-        )
+        if num_new_pages_item < 200:
+            import sgl_kernel_npu
+
+            torch.ops.npu.alloc_extend(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                self.page_size,
+                out_indices,
+                num_new_pages,
+            )
+
+        else:
+            alloc_extend_kernel_ascend(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                self.device,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        self.free_pages = self.free_pages[num_new_pages:]
+        self.free_pages = self.free_pages[num_new_pages_item:]
         return out_indices
 
     def alloc_decode(

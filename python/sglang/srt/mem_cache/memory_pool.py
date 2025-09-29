@@ -15,6 +15,7 @@ limitations under the License.
 
 from __future__ import annotations
 
+from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
@@ -1030,6 +1031,8 @@ class MLATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        use_nsa: bool = False,
+        override_kv_cache_dim: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -1044,6 +1047,8 @@ class MLATokenToKVPool(KVCache):
 
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.use_nsa = use_nsa
+        self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
 
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
@@ -1067,7 +1072,7 @@ class MLATokenToKVPool(KVCache):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.kv_buffer = [
                     torch.zeros(
-                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                        (size + page_size, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=device,
                     )
@@ -1186,6 +1191,103 @@ class MLATokenToKVPool(KVCache):
         torch.cuda.synchronize()
 
 
+class NSATokenToKVPool(MLATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        kv_lora_rank: int,
+        dtype: torch.dtype,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        index_head_dim: int,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+            use_nsa=True,
+        )
+        # self.index_k_dtype = torch.float8_e4m3fn
+        # self.index_k_scale_dtype = torch.float32
+        self.index_head_dim = index_head_dim
+        # num head == 1 and head dim == 128 for index_k in NSA
+        assert index_head_dim == 128
+
+        self.quant_block_size = 128
+
+        assert self.page_size == 64
+        self.index_k_with_scale_buffer = [
+            torch.zeros(
+                # Layout:
+                #     ref: test_attention.py :: kv_cache_cast_to_fp8
+                #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
+                #     data: for page i,
+                #         * buf[i, :page_size * head_dim] for fp8 data
+                #         * buf[i, page_size * head_dim:].view(float32) for scale
+                (
+                    (size + page_size + 1) // self.page_size,
+                    self.page_size
+                    * (index_head_dim + index_head_dim // self.quant_block_size * 4),
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            for _ in range(layer_num)
+        ]
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+
+    def get_index_k_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetK.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
+        )
+
+    def get_index_k_scale_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetS.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
+        )
+
+    # TODO rename later (currently use diff name to avoid confusion)
+    def set_index_k_and_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        index_buf_accessor.SetKAndS.execute(
+            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
+        )
+
+
 class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
     def __init__(
         self,
@@ -1194,6 +1296,7 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
         dtype: torch.dtype,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
+        index_head_dim: Optional[int],
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
@@ -1213,6 +1316,7 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
 
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.index_head_dim = index_head_dim
 
         self.custom_mem_pool = None
 
@@ -1240,6 +1344,18 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
+            if self.index_head_dim is not None:
+                self.index_k_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.index_head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
 
         self._finalize_allocation_log(size)
 
@@ -1251,6 +1367,10 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
             kv_size_bytes += get_tensor_size_bytes(k_cache)
         for v_cache in self.v_buffer:
             kv_size_bytes += get_tensor_size_bytes(v_cache)
+        if self.index_head_dim is not None:
+            assert hasattr(self, "index_k_buffer")
+            for index_k_cache in self.index_k_buffer:
+                kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):
@@ -1277,6 +1397,14 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
 
+    def get_index_k_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if self.store_dtype != self.dtype:
+            return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.index_k_buffer[layer_id - self.start_layer]
+
     # for disagg
     def get_contiguous_buf_infos(self):
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
@@ -1289,6 +1417,16 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
         kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)] + [
             self.v_buffer[i][0].nbytes for i in range(self.layer_num)
         ]
+        if self.index_head_dim is not None:
+            kv_data_ptrs += [
+                self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)
+            ]
+            kv_data_lens += [
+                self.index_k_buffer[i].nbytes for i in range(self.layer_num)
+            ]
+            kv_item_lens += [
+                self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
+            ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
@@ -1323,6 +1461,26 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
             ),
             loc.view(-1, 1),
             cache_v.view(-1, 1, self.qk_rope_head_dim),
+        )
+
+    def set_index_k_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ):
+        if index_k.dtype != self.dtype:
+            index_k = index_k.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            index_k = index_k.view(self.store_dtype)
+
+        torch_npu.npu_scatter_nd_update_(
+            self.index_k_buffer[layer_id - self.start_layer].view(
+                -1, 1, self.index_head_dim
+            ),
+            loc.view(-1, 1),
+            index_k.view(-1, 1, self.index_head_dim),
         )
 
 

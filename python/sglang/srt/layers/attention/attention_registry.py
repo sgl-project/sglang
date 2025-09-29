@@ -62,6 +62,13 @@ def create_ascend_backend(runner):
     return AscendAttnBackend(runner)
 
 
+@register_attention_backend("nsa")
+def create_nsa_backend(runner):
+    from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+
+    return NativeSparseAttnBackend(runner)
+
+
 @register_attention_backend("triton")
 def create_triton_backend(runner):
     assert not runner.model_config.is_encoder_decoder, (
