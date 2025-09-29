@@ -4,7 +4,7 @@
 
 In large language model inference, the prefill phase is often time-consuming: input sequences need to be first converted into Key-Value cache (KV Cache) for subsequent decoding. When multiple requests share the same prefix, the KV Cache for that prefix is identical. By caching and reusing these shared KV Caches, redundant computation can be avoided. To address this, SGLang introduced RadixAttention, which leverages idle GPU memory to cache and reuse prefix KV Caches, and **HiCache**, which extends this idea to host memory and distributed storage.
 
-Inspired by the classic three-level cache design of modern CPUs, HiCache organizes GPU memory as L1, host memory as L2, and distributed storage as L3. This hierarchy enables HiCache to fully exploit the "idle" storage space of GPUs and CPUs, while integrating distributed cache systems such as Mooncake, 3FS, NIXL, LM Cache, and AIBrix KVCache for global KV Cache storage and scheduling. As a result, HiCache significantly expands KV Cache capacity while maintaining strong read performance—especially in workloads such as multi-QA and long-context inference, where KV Cache reuse is frequent. For detailed benchmark results, see [this blog](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
+Inspired by the classic three-level cache design of modern CPUs, HiCache organizes GPU memory as L1, host memory as L2, and distributed storage as L3. This hierarchy enables HiCache to fully exploit the "idle" storage space of GPUs and CPUs, while integrating distributed cache systems such as Mooncake, 3FS, NIXL, and AIBrix KVCache for global KV Cache storage and scheduling. As a result, HiCache significantly expands KV Cache capacity while maintaining strong read performance—especially in workloads such as multi-QA and long-context inference, where KV Cache reuse is frequent. For detailed benchmark results, see [this blog](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
 
 
 ## System Design
@@ -13,7 +13,7 @@ Inspired by the classic three-level cache design of modern CPUs, HiCache organiz
 
 In many modern CPU architectures, the small but fast L1 and L2 caches are private to each core, enabling rapid access to the hottest data, while the larger L3 cache is shared across all cores to significantly reduce redundancy within the cache. Similarly, in HiCache, the L1 and L2 KV Caches are private to each inference instance, whereas the L3 KV Cache is shared among all inference instances within the cluster.
 
-### HiRadixTree: Meta Data Organization in HiCache
+### HiRadixTree: Metadata Organization in HiCache
 
 For KV Cache data organization, HiCache builds upon the RadixTree structure introduced in RadixAttention and proposes HiRadixTree. In RadixAttention, each node of the RadixTree corresponds to the KV Cache of a consecutive span of tokens in GPU memory. A path from the root to a leaf node represents the prefix of a request, and shared prefixes across multiple requests can reuse the same nodes, thereby avoiding redundant storage.
 
@@ -98,13 +98,13 @@ HiCache supports a variety of L3 storage backends, allowing users to choose the 
 
 - **DeepSeek 3FS (HF3FS)**: HF3FS is a kubernetes-native distributed storage solution with operator-based deployment. Try HF3FS [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/hf3fs).
 
-- **NIXL**: NIXL provides a unified API for accessing various storage plugins, including but not limited to Deepseek's 3FS, GPU Direct Storage (GDS) and Amazon S3-compatible object storage. Try NIXL [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/nixl).
-
-- **LMCache**: LMCache is an efficient KV Cache layer for enterprise-scale LLM inference. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache).
+- **NIXL**: NIXL provides a unified API for accessing various storage plugins, including but not limited to DeepSeek's 3FS, GPU Direct Storage (GDS) and Amazon S3-compatible object storage. Try NIXL [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/nixl).
 
 - **AIBrix KVCache**: AIBrix KVCache is a production-ready KVCache Offloading Framework, which enables efficient memory tiering and low-overhead cross-engine reuse. Try AIBrix KVCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/aibrix_kvcache).
 
-- **HiCacheFile**: A simple file-based storage backend for demonstration purpose.
+- **HiCacheFile**: A simple file-based storage backend for demonstration purposes.
+
+Specifically, **LMCache**, an efficient KV Cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache).
 
 ## Related Parameters
 
@@ -112,7 +112,7 @@ HiCache supports a variety of L3 storage backends, allowing users to choose the 
 
 - **`--hicache-ratio HICACHE_RATIO`**: The ratio of the size of host KV cache memory pool to the size of device pool. For example, setting this to 2 means the host memory pool will be twice the size of the device memory pool.
 
-- **`--hicache-size HICACHE_SIZE`**: The size of host KV cache memory pool in gigabytes. This parameter overrides `hicache-ratio` if set. For example, `--hicache-size 30` allocates 30GB for the host memory pool **for each rank**. IF there are 8 ranks, then the total memory size is 240GB.
+- **`--hicache-size HICACHE_SIZE`**: The size of host KV cache memory pool in gigabytes. This parameter overrides `hicache-ratio` if set. For example, `--hicache-size 30` allocates 30GB for the host memory pool **for each rank**. If there are 8 ranks, then the total memory size is 240GB.
 
 - **`--hicache-write-policy {write_back,write_through,write_through_selective}`**: Controls how data is written from faster to slower memory tiers:
   - `write_through`: Immediately writes data to all tiers (strongest caching benefits)
@@ -128,7 +128,7 @@ HiCache supports a variety of L3 storage backends, allowing users to choose the 
   - `page_first`: Optimized for I/O efficiency
   - `page_first_direct`: Groups all tokens of a given layer within a page, allowing transfers from L2 to GPU to be aggregated at the page-layer level
 
-- **`--hicache-storage-backend {file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).
+- **`--hicache-storage-backend {file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: `backend_name` (custom name), `module_path` (Python module path), `class_name` (backend class name).
 
 - **`--enable-lmcache`**: Using LMCache as an alternative hierarchical cache solution
 
