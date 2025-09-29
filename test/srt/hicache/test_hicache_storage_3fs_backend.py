@@ -79,44 +79,9 @@ class TestHf3fsBackendAccuracy(HiCacheStorage3FSBackendBaseMixin, CustomTestCase
 
     def test_eval_accuracy(self):
         """Test eval accuracy with cache persistence across cache flushes"""
-        print("\n=== Testing Eval Accuracy with Cache Persistence ===")
+        from test_hicache_storage_file_backend import run_eval_accuracy_test
 
-        # First evaluation - populate cache
-        print("Phase 1: Running initial GSM8K evaluation to populate cache...")
-        args_initial = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=50,
-            max_new_tokens=512,
-            parallel=10,
-            host=f"http://{self.base_host}",
-            port=int(self.base_port),
-        )
-        metrics_initial = run_eval_few_shot_gsm8k(args_initial)
-
-        # Flush cache to force remote storage access
-        print("Phase 2: Flushing device cache...")
-        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
-        time.sleep(2)
-
-        # Second evaluation - should use remote cache
-        print("Phase 3: Running second GSM8K evaluation using remote cache...")
-        metrics_cached = run_eval_few_shot_gsm8k(args_initial)
-
-        # Verify accuracy consistency
-        accuracy_diff = abs(metrics_initial["accuracy"] - metrics_cached["accuracy"])
-        print(f"Accuracy difference: {accuracy_diff:.4f}")
-
-        # Assertions
-        self.assertGreater(
-            metrics_initial["accuracy"], 0.6, "Initial accuracy should be reasonable"
-        )
-        self.assertGreater(
-            metrics_cached["accuracy"], 0.6, "Cached accuracy should be reasonable"
-        )
-        self.assertLess(
-            accuracy_diff, 0.01, "Accuracy should be consistent between cache states"
-        )
+        run_eval_accuracy_test(self, accuracy_threshold=0.02)
 
 
 if __name__ == "__main__":

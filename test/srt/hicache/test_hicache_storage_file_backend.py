@@ -236,7 +236,7 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
         server_args = {
-            #"--hicache-mem-layout": "page_first",
+            # "--hicache-mem-layout": "page_first",
             "--tp-size": 2,
             "--hicache-ratio": 1.5,
         }
@@ -245,44 +245,55 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
 
     def test_eval_accuracy(self):
         """Test eval accuracy with cache persistence across cache flushes"""
-        print("\n=== Testing Eval Accuracy with Cache Persistence ===")
+        run_eval_accuracy_test(self)
 
-        # First evaluation - populate cache
-        print("Phase 1: Running initial GSM8K evaluation to populate cache...")
-        args_initial = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=50,
-            max_new_tokens=512,
-            parallel=10,
-            host=f"http://{self.base_host}",
-            port=int(self.base_port),
-        )
-        metrics_initial = run_eval_few_shot_gsm8k(args_initial)
 
-        # Flush cache to force remote storage access
-        print("Phase 2: Flushing device cache...")
-        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
-        time.sleep(2)
+def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.01):
+    """Generic eval accuracy test with configurable accuracy threshold
 
-        # Second evaluation - should use remote cache
-        print("Phase 3: Running second GSM8K evaluation using remote cache...")
-        metrics_cached = run_eval_few_shot_gsm8k(args_initial)
+    Args:
+        test_instance: The test class instance that provides base_host, base_port, flush_cache, and assert methods
+    """
+    print("\n=== Testing Eval Accuracy with Cache Persistence ===")
 
-        # Verify accuracy consistency
-        accuracy_diff = abs(metrics_initial["accuracy"] - metrics_cached["accuracy"])
-        print(f"Accuracy difference: {accuracy_diff:.4f}")
+    # First evaluation - populate cache
+    print("Phase 1: Running initial GSM8K evaluation to populate cache...")
+    args_initial = SimpleNamespace(
+        num_shots=5,
+        data_path=None,
+        num_questions=50,
+        max_new_tokens=512,
+        parallel=10,
+        host=f"http://{test_instance.base_host}",
+        port=int(test_instance.base_port),
+    )
+    metrics_initial = run_eval_few_shot_gsm8k(args_initial)
 
-        # Assertions
-        self.assertGreater(
-            metrics_initial["accuracy"], 0.6, "Initial accuracy should be reasonable"
-        )
-        self.assertGreater(
-            metrics_cached["accuracy"], 0.6, "Cached accuracy should be reasonable"
-        )
-        self.assertLess(
-            accuracy_diff, 0.01, "Accuracy should be consistent between cache states"
-        )
+    # Flush cache to force remote storage access
+    print("Phase 2: Flushing device cache...")
+    test_instance.assertTrue(test_instance.flush_cache(), "Cache flush should succeed")
+    time.sleep(2)
+
+    # Second evaluation - should use remote cache
+    print("Phase 3: Running second GSM8K evaluation using remote cache...")
+    metrics_cached = run_eval_few_shot_gsm8k(args_initial)
+
+    # Verify accuracy consistency
+    accuracy_diff = abs(metrics_initial["accuracy"] - metrics_cached["accuracy"])
+    print(f"Accuracy difference: {accuracy_diff:.4f}")
+
+    # Assertions
+    test_instance.assertGreater(
+        metrics_initial["accuracy"], 0.6, "Initial accuracy should be reasonable"
+    )
+    test_instance.assertGreater(
+        metrics_cached["accuracy"], 0.6, "Cached accuracy should be reasonable"
+    )
+    test_instance.assertLess(
+        accuracy_diff,
+        accuracy_threshold,
+        "Accuracy should be consistent between cache states",
+    )
 
 
 if __name__ == "__main__":
