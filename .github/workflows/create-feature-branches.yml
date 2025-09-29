@@ -1,0 +1,352 @@
+name: Create Feature Branches from Tags
+
+on:
+  push:
+    tags:
+      - "v*" # Triggers on version tags like v1.0.0, v2.1.3, etc.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create branch from"
+        required: true
+        type: string
+
+jobs:
+  check-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      is_prerelease: ${{ steps.check.outputs.is_prerelease }}
+      tag: ${{ steps.check.outputs.tag }}
+      branch_name: ${{ steps.check.outputs.branch_name }}
+    steps:
+      - name: Check if tag should be processed
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+
+          # Check if this is a pre-release tag
+          if [[ "$TAG" =~ [\.-]?(rc|alpha|beta|pre|dev)[0-9]*$ ]]; then
+            # Extract base version (e.g., v0.10.0 from v0.10.0rc1)
+            BASE_VERSION=$(echo "$TAG" | sed -E 's/[\.-]?(rc|alpha|beta|pre|dev)[0-9]*$//')
+
+            # Check if corresponding full release exists
+            if git ls-remote --tags origin | grep -q "refs/tags/$BASE_VERSION$"; then
+              echo "::notice::Skipping pre-release tag $TAG because full release $BASE_VERSION exists"
+              echo "is_prerelease=true" >> $GITHUB_OUTPUT
+              echo "tag=$TAG" >> $GITHUB_OUTPUT
+              echo "branch_name=" >> $GITHUB_OUTPUT
+            else
+              echo "::notice::Processing pre-release tag $TAG (no full release $BASE_VERSION found)"
+              echo "is_prerelease=false" >> $GITHUB_OUTPUT
+              echo "tag=$TAG" >> $GITHUB_OUTPUT
+              echo "branch_name=features-based-on-$TAG" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "::notice::Processing stable release tag: $TAG"
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
+            echo "branch_name=features-based-on-$TAG" >> $GITHUB_OUTPUT
+          fi
+
+  create-feature-branch:
+    needs: check-tag
+    if: needs.check-tag.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ORG_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Set tag variables
+        id: get_tag
+        run: |
+          echo "tag=${{ needs.check-tag.outputs.tag }}" >> $GITHUB_OUTPUT
+          echo "branch_name=${{ needs.check-tag.outputs.branch_name }}" >> $GITHUB_OUTPUT
+
+      - name: Find previous tag with existing branch
+        id: previous_tag
+        run: |
+          CURRENT_TAG="${{ steps.get_tag.outputs.tag }}"
+
+          # Get all tags sorted by version (newest first)
+          ALL_TAGS=$(git tag --sort=-version:refname)
+
+          # Find the position of current tag and get all tags after it (older versions)
+          FOUND_CURRENT=false
+          PREVIOUS_TAG_WITH_BRANCH=""
+          PREVIOUS_BRANCH_NAME=""
+
+          echo "Searching for previous tag with existing feature branch..."
+          echo "Current tag: $CURRENT_TAG"
+
+          for tag in $ALL_TAGS; do
+            if [[ "$FOUND_CURRENT" == "true" ]]; then
+              # Check if this is a pre-release tag
+              if [[ "$tag" =~ [\.-]?(rc|alpha|beta|pre|dev)[0-9]*$ ]]; then
+                # Extract base version (e.g., v0.10.0 from v0.10.0rc1)
+                BASE_VERSION=$(echo "$tag" | sed -E 's/[\.-]?(rc|alpha|beta|pre|dev)[0-9]*$//')
+
+                # Check if corresponding full release exists
+                if git ls-remote --tags origin | grep -q "refs/tags/$BASE_VERSION$"; then
+                  echo "Skipping pre-release tag $tag because full release $BASE_VERSION exists"
+                  continue
+                else
+                  echo "Considering pre-release tag $tag (no full release $BASE_VERSION found)"
+                fi
+              fi
+
+              # This is a previous tag, check if it has a feature branch
+              CANDIDATE_BRANCH="features-based-on-$tag"
+              echo "Checking if branch exists for tag $tag: $CANDIDATE_BRANCH"
+
+              if git ls-remote --heads origin "$CANDIDATE_BRANCH" | grep -q "$CANDIDATE_BRANCH"; then
+                echo "Found previous tag with branch: $tag -> $CANDIDATE_BRANCH"
+                PREVIOUS_TAG_WITH_BRANCH="$tag"
+                PREVIOUS_BRANCH_NAME="$CANDIDATE_BRANCH"
+                break
+              else
+                echo "No branch found for tag $tag"
+              fi
+            elif [[ "$tag" == "$CURRENT_TAG" ]]; then
+              FOUND_CURRENT=true
+              echo "Found current tag position in list"
+            fi
+          done
+
+          if [[ -z "$PREVIOUS_TAG_WITH_BRANCH" ]]; then
+            echo "No previous tag with existing feature branch found"
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "tag=" >> $GITHUB_OUTPUT
+            echo "branch_name=" >> $GITHUB_OUTPUT
+          else
+            echo "Found previous tag with branch: $PREVIOUS_TAG_WITH_BRANCH"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "tag=$PREVIOUS_TAG_WITH_BRANCH" >> $GITHUB_OUTPUT
+            echo "branch_name=$PREVIOUS_BRANCH_NAME" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check if current branch already exists
+        id: check_branch
+        run: |
+          BRANCH_NAME="${{ steps.get_tag.outputs.branch_name }}"
+          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Branch $BRANCH_NAME already exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Branch $BRANCH_NAME does not exist"
+          fi
+
+      - name: Get commits to cherry-pick
+        id: get_commits
+        if: steps.previous_tag.outputs.exists == 'true'
+        run: |
+          PREVIOUS_TAG="${{ steps.previous_tag.outputs.tag }}"
+          PREVIOUS_BRANCH_NAME="${{ steps.previous_tag.outputs.branch_name }}"
+
+          # Fetch the previous branch
+          git fetch origin "$PREVIOUS_BRANCH_NAME:$PREVIOUS_BRANCH_NAME"
+
+          # Get commits between the previous tag and HEAD of previous branch
+          COMMITS=$(git rev-list --reverse "$PREVIOUS_TAG..origin/$PREVIOUS_BRANCH_NAME")
+
+          if [[ -z "$COMMITS" ]]; then
+            echo "No commits to cherry-pick"
+            echo "has_commits=false" >> $GITHUB_OUTPUT
+            echo "commits=" >> $GITHUB_OUTPUT
+          else
+            echo "Commits to cherry-pick:"
+            echo "$COMMITS"
+            echo "has_commits=true" >> $GITHUB_OUTPUT
+            # Convert newlines to spaces for GitHub Actions
+            COMMITS_ONELINE=$(echo "$COMMITS" | tr '\n' ' ')
+            echo "commits=$COMMITS_ONELINE" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create feature branch
+        if: steps.check_branch.outputs.exists == 'false'
+        run: |
+          TAG="${{ steps.get_tag.outputs.tag }}"
+          BRANCH_NAME="${{ steps.get_tag.outputs.branch_name }}"
+
+          # Create branch from the tag
+          git checkout -b "$BRANCH_NAME" "$TAG"
+          git push origin "$BRANCH_NAME"
+
+          echo "Created branch: $BRANCH_NAME from tag: $TAG"
+
+      - name: Cherry-pick commits
+        id: cherry_pick
+        if: steps.check_branch.outputs.exists == 'false' && steps.get_commits.outputs.has_commits == 'true'
+        run: |
+          BRANCH_NAME="${{ steps.get_tag.outputs.branch_name }}"
+          COMMITS="${{ steps.get_commits.outputs.commits }}"
+
+          git checkout "$BRANCH_NAME"
+
+          # Try cherry-picking commits
+          CONFLICT_OCCURRED=false
+          for commit in $COMMITS; do
+            echo "Cherry-picking commit: $commit"
+            if ! git cherry-pick "$commit"; then
+              echo "Conflict occurred while cherry-picking $commit"
+              CONFLICT_OCCURRED=true
+              # Abort the cherry-pick to clean state
+              git cherry-pick --abort
+              break
+            fi
+          done
+
+          if [[ "$CONFLICT_OCCURRED" == "true" ]]; then
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            echo "Conflicts detected during cherry-pick"
+          else
+            echo "conflict=false" >> $GITHUB_OUTPUT
+            echo "All commits cherry-picked successfully"
+          fi
+
+      - name: Create PR for successful cherry-pick
+        if: steps.check_branch.outputs.exists == 'false' && steps.get_commits.outputs.has_commits == 'true' && steps.cherry_pick.outputs.conflict == 'false'
+        run: |
+          BRANCH_NAME="${{ steps.get_tag.outputs.branch_name }}"
+          PREVIOUS_BRANCH_NAME="${{ steps.previous_tag.outputs.branch_name }}"
+          PREVIOUS_TAG="${{ steps.previous_tag.outputs.tag }}"
+          CURRENT_TAG="${{ steps.get_tag.outputs.tag }}"
+          COMMITS="${{ steps.get_commits.outputs.commits }}"
+
+          # Create a new branch for the PR
+          PR_BRANCH="pr-$BRANCH_NAME"
+          git checkout -b "$PR_BRANCH" "$BRANCH_NAME"
+          git push origin "$PR_BRANCH"
+
+          # Create PR using GitHub CLI or API
+          COMMIT_LIST_MD=$(echo $COMMITS | tr ' ' '\n' | while read commit; do echo "- $commit"; done)
+
+          # Create PR body content
+          PR_BODY="## Cherry-pick: $PREVIOUS_BRANCH_NAME → $BRANCH_NAME
+
+          This PR contains cherry-picked commits from \`$PREVIOUS_BRANCH_NAME\` to \`$BRANCH_NAME\`.
+
+          **Source:** \`$PREVIOUS_BRANCH_NAME\` (commits after tag \`$PREVIOUS_TAG\`)
+          **Target:** \`$BRANCH_NAME\` (based on tag \`$CURRENT_TAG\`)
+
+          **Commits to cherry-pick:**
+          $COMMIT_LIST_MD
+          "
+
+          gh pr create \
+            --title "Cherry-pick: $PREVIOUS_BRANCH_NAME → $BRANCH_NAME" \
+            --body "$PR_BODY" \
+            --base "$BRANCH_NAME" \
+            --head "$PR_BRANCH" \
+            --reviewer "CatherineSue,shenoyvvarun,slin1237,YouNeedCryDear,upfixer,key4ng"
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Create PR for conflicts
+        if: steps.cherry_pick.outputs.conflict == 'true'
+        run: |
+          BRANCH_NAME="${{ steps.get_tag.outputs.branch_name }}"
+          PREVIOUS_BRANCH_NAME="${{ steps.previous_tag.outputs.branch_name }}"
+          PREVIOUS_TAG="${{ steps.previous_tag.outputs.tag }}"
+          CURRENT_TAG="${{ steps.get_tag.outputs.tag }}"
+          COMMITS="${{ steps.get_commits.outputs.commits }}"
+
+          # Create a conflict resolution branch
+          CONFLICT_BRANCH="cherry-pick-conflicts-$BRANCH_NAME"
+          git checkout -b "$CONFLICT_BRANCH" "$BRANCH_NAME"
+
+          # Create an empty commit to establish the branch and enable PR creation
+          COMMIT_LIST=$(echo $COMMITS | tr ' ' '\n' | while read commit; do git log --oneline -1 $commit 2>/dev/null || echo $commit; done)
+
+          # Now attempt the merge - conflicts will be left in proper Git state
+          if ! git merge origin/"$PREVIOUS_BRANCH_NAME" --no-ff -m "Cherry-pick commits from $PREVIOUS_BRANCH_NAME"; then
+            echo "Merge conflicts detected. Committing conflict markers so they can be pushed."
+
+            # Capture conflicted files before staging
+            CONFLICTED_FILES=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+
+            # Add all files including conflict markers
+            git add .
+
+            # Commit the conflict markers with clear documentation
+            git commit -m "🚧 CONFLICTS: Cherry-pick from $PREVIOUS_BRANCH_NAME to $BRANCH_NAME
+
+            ⚠️  This commit contains unresolved merge conflicts in files:
+            $CONFLICTED_FILES
+
+            Commits being cherry-picked:
+            $COMMIT_LIST
+
+            📝 Edit files to remove conflict markers"
+
+            # Push the conflict markers
+            git push origin "$CONFLICT_BRANCH"
+          else
+            echo "Merge completed successfully without conflicts."
+            git push origin "$CONFLICT_BRANCH"  # Push the successful merge
+          fi
+
+          # Create PR using GitHub CLI or API
+          COMMIT_LIST_MD=$(echo $COMMITS | tr ' ' '\n' | while read commit; do echo "- $commit"; done)
+
+          # Create PR body content
+          PR_BODY="## 🚧 Cherry-pick Conflicts Need Resolution
+
+          This PR contains merge conflicts from cherry-picking commits from \`$PREVIOUS_BRANCH_NAME\` to \`$BRANCH_NAME\`.
+
+          **Source:** \`$PREVIOUS_BRANCH_NAME\` (commits after tag \`$PREVIOUS_TAG\`)
+          **Target:** \`$BRANCH_NAME\` (based on tag \`$CURRENT_TAG\`)
+
+          **Commits to cherry-pick:**
+          $COMMIT_LIST_MD
+
+          ## 🛠️ How to resolve conflicts:
+
+          1. **Checkout this branch:**
+            \`\`\`bash
+            git fetch origin && git checkout $CONFLICT_BRANCH
+            \`\`\`
+
+          2. **Resolve conflicts using IDE tools or manually:**
+            - **VS Code**: Automatically detects \`<<<<<<<\`, \`=======\`, \`>>>>>>>\` markers and shows merge conflict UI
+            - **Other IDEs**: Most modern IDEs detect conflict markers automatically
+            - **Manual**: Edit files to remove conflict markers and choose the correct code
+
+          3. **Commit the resolution:**
+            \`\`\`bash
+            git add resolved-files
+            git commit -m \"✅ Resolved: Cherry-pick from $PREVIOUS_BRANCH_NAME to $BRANCH_NAME\"
+            git push origin $CONFLICT_BRANCH
+            \`\`\`
+
+          🎯 **No force push needed!**"
+
+          gh pr create \
+            --title "Cherry-pick conflicts: $PREVIOUS_BRANCH_NAME → $BRANCH_NAME" \
+            --body "$PR_BODY" \
+            --base "$BRANCH_NAME" \
+            --head "$CONFLICT_BRANCH" \
+            --reviewer "CatherineSue,shenoyvvarun,slin1237,YouNeedCryDear,upfixer,key4ng"
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Skip if branch exists
+        if: steps.check_branch.outputs.exists == 'true'
+        run: |
+          echo "Branch ${{ steps.get_tag.outputs.branch_name }} already exists. Skipping creation."
