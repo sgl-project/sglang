@@ -35,6 +35,7 @@ else:
     Image = Any
 
 
+# Parameters for a session
 @dataclass
 class SessionParams:
     id: Optional[str] = None
@@ -132,17 +133,22 @@ class GenerateReqInput:
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
 
-    # Label for the request
-    label: Optional[str] = None
-
     # Priority for the request
     priority: Optional[int] = None
 
-    # Image gen grpc migration
-    return_bytes: bool = False
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[Union[List[str], str]] = None
 
-    # For customer metric labels
-    customer_labels: Optional[Dict[str, str]] = None
+    # Whether to disallow logging for this request (e.g. due to ZDR)
+    no_logs: bool = False
+
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
+
+    # (Deprecated, please use custom_labels) Label for the request
+    label: Optional[str] = None
+    # (Internal) Whether to return bytes for image generation
+    return_bytes: bool = False
 
     def contains_mm_input(self) -> bool:
         return (
@@ -542,8 +548,11 @@ class GenerateReqInput:
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
             conversation_id=self.conversation_id,
-            label=self.label,
             priority=self.priority,
+            extra_key=self.extra_key,
+            no_logs=self.no_logs,
+            custom_labels=self.custom_labels,
+            label=self.label,
             return_bytes=self.return_bytes,
         )
 
@@ -600,17 +609,22 @@ class TokenizedGenerateReqInput:
     # For dp balance
     dp_balance_id: int = -1
 
-    # Label for the request
-    label: Optional[str] = None
-
     # Priority for the request
     priority: Optional[int] = None
 
-    # Image gen grpc migration
-    return_bytes: bool = False
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[str] = None
+
+    # Whether to disallow logging for this request (e.g. due to ZDR)
+    no_logs: bool = False
 
     # tracing context
     trace_context: Optional[Dict] = None
+
+    # (Deprecated, please use custom_labels) Label for the request
+    label: Optional[str] = None
+    # (Internal) Whether to return bytes for image generation
+    return_bytes: bool = False
 
 
 @dataclass
@@ -1090,6 +1104,17 @@ class InitWeightsUpdateGroupReqInput:
 
 @dataclass
 class InitWeightsUpdateGroupReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    group_name: str = "weight_update_group"
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqOutput:
     success: bool
     message: str
 
