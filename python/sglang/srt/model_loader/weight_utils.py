@@ -236,29 +236,15 @@ def get_quant_config(
     return quant_cls.from_config(config)
 
 
-def download_weights_from_hf(
+def find_local_hf_snapshot_dir(
     model_name_or_path: str,
     cache_dir: Optional[str],
     allow_patterns: List[str],
     revision: Optional[str] = None,
-    ignore_patterns: Optional[Union[str, List[str]]] = None,
-) -> str:
-    """Download model weights from Hugging Face Hub.
+) -> Optional[str]:
+    """If the weights are already local, skip downloading and returns the path
 
-    Args:
-        model_name_or_path (str): The model name or path.
-        cache_dir (Optional[str]): The cache directory to store the model
-            weights. If None, will use HF defaults.
-        allow_patterns (List[str]): The allowed patterns for the
-            weight files. Files matched by any of the patterns will be
-            downloaded.
-        revision (Optional[str]): The revision of the model.
-        ignore_patterns (Optional[Union[str, List[str]]]): The patterns to
-            filter out the weight files. Files matched by any of the patterns
-            will be ignored.
-
-    Returns:
-        str: The path to the downloaded model weights.
+    Only applied in ci
     """
     if is_in_ci():
         found_local_snapshot_dir = None
@@ -330,6 +316,39 @@ def download_weights_from_hf(
                     found_local_snapshot_dir,
                     allow_patterns,
                 )
+    return None
+
+
+def download_weights_from_hf(
+    model_name_or_path: str,
+    cache_dir: Optional[str],
+    allow_patterns: List[str],
+    revision: Optional[str] = None,
+    ignore_patterns: Optional[Union[str, List[str]]] = None,
+) -> str:
+    """Download model weights from Hugging Face Hub.
+
+    Args:
+        model_name_or_path (str): The model name or path.
+        cache_dir (Optional[str]): The cache directory to store the model
+            weights. If None, will use HF defaults.
+        allow_patterns (List[str]): The allowed patterns for the
+            weight files. Files matched by any of the patterns will be
+            downloaded.
+        revision (Optional[str]): The revision of the model.
+        ignore_patterns (Optional[Union[str, List[str]]]): The patterns to
+            filter out the weight files. Files matched by any of the patterns
+            will be ignored.
+
+    Returns:
+        str: The path to the downloaded model weights.
+    """
+
+    path = find_local_hf_snapshot_dir(
+        model_name_or_path, cache_dir, allow_patterns, revision
+    )
+    if path is not None:
+        return path
 
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         # Before we download we look at that is available:
