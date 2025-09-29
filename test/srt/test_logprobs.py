@@ -19,12 +19,12 @@ from sglang.test.test_utils import (
 DENSE_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 if torch.version.hip is not None:
     print("Running on AMD ROCm GPU")
-    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/yushengsu/logprobs/resolve/main/sglang_baseline_2000_amd_determinisitc.pkl"
+    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/yushengsu/logprobs/resolve/main/sglang_baseline_2000_amd_determinisitc_flashinfer.pkl"
     DENSE_TOLERANCE_MAX_DIFF = 1e-8
     DENSE_TOLERANCE_MEAN_DIFF = 1e-8
 elif torch.version.cuda is not None:
     print("Running on NVIDIA CUDA GPU")
-    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000_deterministic.pkl"
+    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000_deterministic_flashinfer.pkl"
     DENSE_TOLERANCE_MAX_DIFF = 1e-8
     DENSE_TOLERANCE_MEAN_DIFF = 1e-8
 else:
@@ -48,7 +48,7 @@ class TestLogprobsDense(unittest.TestCase):
         cls.engine = sgl.Engine(
             model_path=DENSE_MODEL_NAME,
             random_seed=42,
-            attention_backend="fa3",
+            attention_backend="flashinfer",
             enable_deterministic_inference=True,
             skip_tokenizer_init=True,
             mem_fraction_static=0.80,
@@ -104,7 +104,7 @@ class TestLogprobsDense(unittest.TestCase):
                 common_tokens = baseline_token_map.keys() & sglang_token_map.keys()
                 self.assertGreaterEqual(
                     len(common_tokens),
-                    TOP_K / 2,
+                    TOP_K,
                     f"there are only {len(common_tokens)} common topk tokens that matches",
                 )
                 for token_id in common_tokens:
