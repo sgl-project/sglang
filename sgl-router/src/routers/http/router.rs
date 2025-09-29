@@ -774,6 +774,32 @@ impl RouterTrait for Router {
     fn router_type(&self) -> &'static str {
         "regular"
     }
+
+    fn readiness(&self) -> Response {
+        // Regular router is ready if it has at least one healthy worker
+        let workers = self.worker_registry.get_all();
+        let healthy_count = workers.iter().filter(|w| w.is_healthy()).count();
+        let total_workers = workers.len();
+
+        if healthy_count > 0 {
+            Json(serde_json::json!({
+                "status": "ready",
+                "healthy_workers": healthy_count,
+                "total_workers": total_workers
+            }))
+            .into_response()
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "not_ready",
+                    "reason": "no healthy workers available",
+                    "total_workers": total_workers
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]

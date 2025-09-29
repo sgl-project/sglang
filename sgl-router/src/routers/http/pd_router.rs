@@ -1243,6 +1243,59 @@ impl RouterTrait for PDRouter {
     fn router_type(&self) -> &'static str {
         "pd"
     }
+
+    fn readiness(&self) -> Response {
+        // PD router is ready if it has at least one healthy prefill AND one healthy decode worker
+        let prefill_workers = self.worker_registry.get_prefill_workers();
+        let decode_workers = self.worker_registry.get_decode_workers();
+
+        let healthy_prefill_count = prefill_workers.iter().filter(|w| w.is_healthy()).count();
+
+        let healthy_decode_count = decode_workers.iter().filter(|w| w.is_healthy()).count();
+
+        let total_prefill = prefill_workers.len();
+        let total_decode = decode_workers.len();
+
+        if healthy_prefill_count > 0 && healthy_decode_count > 0 {
+            Json(json!({
+                "status": "ready",
+                "prefill": {
+                    "healthy": healthy_prefill_count,
+                    "total": total_prefill
+                },
+                "decode": {
+                    "healthy": healthy_decode_count,
+                    "total": total_decode
+                }
+            }))
+            .into_response()
+        } else {
+            let mut reasons = Vec::new();
+            if healthy_prefill_count == 0 {
+                reasons.push("no healthy prefill workers");
+            }
+            if healthy_decode_count == 0 {
+                reasons.push("no healthy decode workers");
+            }
+
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "not_ready",
+                    "reason": reasons.join(", "),
+                    "prefill": {
+                        "healthy": healthy_prefill_count,
+                        "total": total_prefill
+                    },
+                    "decode": {
+                        "healthy": healthy_decode_count,
+                        "total": total_decode
+                    }
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]
