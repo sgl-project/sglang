@@ -131,18 +131,23 @@ def test_dp_aware_worker_expansion_and_api_key(
     r = requests.post(
         f"{router_url}/add_worker",
         params={"url": worker_url, "api_key": api_key},
+        headers={"Authorization": f"Bearer {api_key}"},
         timeout=180,
     )
     r.raise_for_status()
 
-    r = requests.get(f"{router_url}/list_workers", timeout=30)
+    r = requests.get(
+        f"{router_url}/list_workers",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
     r.raise_for_status()
     urls = r.json().get("urls", [])
     assert len(urls) == 2
     assert set(urls) == {f"{worker_url}@0", f"{worker_url}@1"}
 
-    # Verify API key enforcement path-through
-    # 1) Without Authorization -> 401 from backend
+    # Verify API key enforcement
+    # 1) Without Authorization -> Should get 401 Unauthorized
     r = requests.post(
         f"{router_url}/v1/completions",
         json={"model": e2e_model, "prompt": "hi", "max_tokens": 1},
