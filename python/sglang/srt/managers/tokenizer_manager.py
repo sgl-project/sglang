@@ -1353,12 +1353,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Drain requests
         while True:
             remain_num_req = len(self.rid_to_state)
+            remaining_rids = list(self.rid_to_state.keys())
 
             if self.server_status == ServerStatus.UnHealthy:
                 # if health check failed, we should exit immediately
                 logger.error(
-                    "Signal SIGTERM received while health check failed. Exiting... remaining number of requests: %d",
-                    remain_num_req,
+                    "Signal SIGTERM received while health check failed. Force exiting."
                 )
                 self.dump_requests_before_crash()
                 break
@@ -1366,13 +1366,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
                 # if force shutdown flag set, exit immediately
                 logger.error(
-                    "Signal SIGTERM received while force shutdown flag set. Force exiting... remaining number of requests: %d",
-                    remain_num_req,
+                    "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
                 break
 
             logger.info(
-                f"Gracefully exiting... remaining number of requests {remain_num_req}"
+                f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
             )
             if remain_num_req > 0:
                 await asyncio.sleep(5)
