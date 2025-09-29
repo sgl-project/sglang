@@ -154,7 +154,7 @@ That's all!"#;
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1); // Should extract the valid tool
     assert_eq!(tools[0].function.name, "valid_tool");
-    // Normal text should only contain text BEFORE the first tool call
+    // Normal text should contain text before the first tool call
     assert_eq!(normal_text, "Let me help you with that.\n");
 }
 
@@ -213,8 +213,8 @@ async fn test_unicode_and_special_chars_in_failed_parsing() {
 </tool_call>"#;
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 0);
-    // Should handle Unicode properly in the fallback text
-    assert!(!normal_text.is_empty() || normal_text == input);
+    // Should handle Unicode properly in the fallback text - malformed content should be preserved
+    assert_eq!(normal_text, input);
 
     // Special characters that might confuse parsers
     let input = r#"Response: <tool_call>{"name": "test\n\t", "arguments": {"]}"}</tool_call>"#;
