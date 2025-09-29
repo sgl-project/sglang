@@ -82,6 +82,7 @@ class GrpcReqState:
 
     # Streaming state
     stream_finished: bool = False
+    input_logprobs_sent: bool = False  # Track if input logprobs were sent in streaming
 
     # Token accumulation (for non-streaming)
     output_ids: List[int] = dataclasses.field(default_factory=list)
@@ -516,19 +517,105 @@ class GrpcRequestManager:
                 },
             }
 
-            # Add logprobs if available
+            # Accumulate input logprobs (only once, usually in first chunk)
+            if batch_out.input_token_logprobs_val and i < len(
+                batch_out.input_token_logprobs_val
+            ):
+                if not state.input_token_logprobs_val:
+                    state.input_token_logprobs_val.extend(
+                        batch_out.input_token_logprobs_val[i]
+                    )
+                    if batch_out.input_token_logprobs_idx and i < len(
+                        batch_out.input_token_logprobs_idx
+                    ):
+                        state.input_token_logprobs_idx.extend(
+                            batch_out.input_token_logprobs_idx[i]
+                        )
+                    if batch_out.input_top_logprobs_val and i < len(
+                        batch_out.input_top_logprobs_val
+                    ):
+                        state.input_top_logprobs_val.extend(
+                            batch_out.input_top_logprobs_val[i]
+                        )
+                    if batch_out.input_top_logprobs_idx and i < len(
+                        batch_out.input_top_logprobs_idx
+                    ):
+                        state.input_top_logprobs_idx.extend(
+                            batch_out.input_top_logprobs_idx[i]
+                        )
+
+            # Send input logprobs based on mode
+            if state.input_token_logprobs_val:
+                if state.obj.stream and not state.input_logprobs_sent:
+                    # Streaming: send input logprobs once in first chunk that has them
+                    output_data["input_logprobs"] = {
+                        "token_logprobs_val": state.input_token_logprobs_val,
+                        "token_logprobs_idx": state.input_token_logprobs_idx,
+                        "top_logprobs_val": state.input_top_logprobs_val,
+                        "top_logprobs_idx": state.input_top_logprobs_idx,
+                    }
+                    state.input_logprobs_sent = True
+                elif not state.obj.stream and output_data["finished"]:
+                    # Non-streaming: send input logprobs in final chunk
+                    output_data["input_logprobs"] = {
+                        "token_logprobs_val": state.input_token_logprobs_val,
+                        "token_logprobs_idx": state.input_token_logprobs_idx,
+                        "top_logprobs_val": state.input_top_logprobs_val,
+                        "top_logprobs_idx": state.input_top_logprobs_idx,
+                    }
+
+            # Add output logprobs if available (RAW - no detokenization!)
             if batch_out.output_token_logprobs_val and i < len(
                 batch_out.output_token_logprobs_val
             ):
-                output_data["logprobs"] = {
-                    "tokens": batch_out.output_token_logprobs_val[i],
-                    "top_logprobs": (
+                # Accumulate in state first
+                state.output_token_logprobs_val.extend(
+                    batch_out.output_token_logprobs_val[i]
+                )
+                if batch_out.output_token_logprobs_idx and i < len(
+                    batch_out.output_token_logprobs_idx
+                ):
+                    state.output_token_logprobs_idx.extend(
+                        batch_out.output_token_logprobs_idx[i]
+                    )
+                if batch_out.output_top_logprobs_val and i < len(
+                    batch_out.output_top_logprobs_val
+                ):
+                    state.output_top_logprobs_val.extend(
                         batch_out.output_top_logprobs_val[i]
-                        if batch_out.output_top_logprobs_val
-                        and i < len(batch_out.output_top_logprobs_val)
-                        else None
-                    ),
-                }
+                    )
+                if batch_out.output_top_logprobs_idx and i < len(
+                    batch_out.output_top_logprobs_idx
+                ):
+                    state.output_top_logprobs_idx.extend(
+                        batch_out.output_top_logprobs_idx[i]
+                    )
+
+                if state.obj.stream:
+                    # For streaming: send incremental logprobs (only new tokens in this chunk)
+                    # NOTE: this is different than TokenizerManager, which always accumulates
+                    def get_part(attr_name):
+                        source_list = getattr(batch_out, attr_name, None)
+                        return (
+                            source_list[i]
+                            if source_list and i < len(source_list)
+                            else []
+                        )
+
+                    output_data["output_logprobs"] = {
+                        "token_logprobs_val": batch_out.output_token_logprobs_val[i],
+                        "token_logprobs_idx": get_part("output_token_logprobs_idx"),
+                        "top_logprobs_val": get_part("output_top_logprobs_val"),
+                        "top_logprobs_idx": get_part("output_top_logprobs_idx"),
+                    }
+                elif output_data["finished"]:
+                    # Non-streaming: send cumulative output logprobs in final chunk
+                    output_data["output_logprobs"] = {
+                        "token_logprobs_val": state.output_token_logprobs_val,
+                        "token_logprobs_idx": state.output_token_logprobs_idx,
+                        "top_logprobs_val": state.output_top_logprobs_val,
+                        "top_logprobs_idx": state.output_top_logprobs_idx,
+                    }
 
             # Update state for accumulation
             if output_data["token_ids"]:
