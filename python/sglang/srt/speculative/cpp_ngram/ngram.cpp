@@ -1,16 +1,16 @@
-#include "lookahead.h"
+#include "ngram.h"
 
 #include <limits>
 #include <vector>
 
-namespace lookahead {
+namespace ngram {
 
 struct Node {
   std::unordered_map<int32_t, int32_t> next;
 };
 
-Lookahead::Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root) {
-  Lookahead::Result info;
+Ngram::Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root) {
+  Ngram::Result info;
   std::vector<int32_t> prevs;
   info.token.reserve(draft_token_num);
   prevs.reserve(draft_token_num);
@@ -50,7 +50,7 @@ Lookahead::Result fillResult(int last_token, int draft_token_num, std::vector<No
   return info;
 }
 
-Lookahead::Lookahead(size_t capacity, const Param& param) {
+Ngram::Ngram(size_t capacity, const Param& param) {
   param_ = param;
   nodes_.resize(capacity);
   for (auto& node : nodes_) {
@@ -116,17 +116,16 @@ Lookahead::Lookahead(size_t capacity, const Param& param) {
   }
 
   quit_flag_ = false;
-  insert_worker_ = std::thread(&Lookahead::insert, this);
+  insert_worker_ = std::thread(&Ngram::insert, this);
 }
 
-Lookahead::~Lookahead() {
+Ngram::~Ngram() {
   quit_flag_ = true;
   insert_queue_.close();
   insert_worker_.join();
 }
 
-std::vector<std::pair<TrieNode*, int32_t>>
-Lookahead::match(const std::vector<int32_t>& tokens, size_t batch_size) const {
+std::vector<std::pair<TrieNode*, int32_t>> Ngram::match(const std::vector<int32_t>& tokens, size_t batch_size) const {
   auto draft_token_num = param_.get_draft_token_num(batch_size);
   auto min_match_window_size = param_.get_min_match_window_size(batch_size);
   auto max_match_window_size = param_.max_match_window_size;
@@ -154,7 +153,7 @@ Lookahead::match(const std::vector<int32_t>& tokens, size_t batch_size) const {
   return result;
 }
 
-void Lookahead::squeeze(size_t count) {
+void Ngram::squeeze(size_t count) {
   if (!(node_pool_.size() >= free_node_count_ + count)) {
     throw std::runtime_error(
         "Insufficient node size to release required nodes. "
@@ -177,13 +176,13 @@ void Lookahead::squeeze(size_t count) {
   }
 }
 
-void Lookahead::synchronize() const {
+void Ngram::synchronize() const {
   while (!insert_queue_.empty()) {
     std::this_thread::sleep_for(std::chrono::microseconds(10));
   }
 }
 
-void Lookahead::insert() {
+void Ngram::insert() {
   while (!quit_flag_) {
     std::vector<int32_t> data;
     if (!insert_queue_.dequeue(data)) {
@@ -239,13 +238,13 @@ void Lookahead::insert() {
   }
 }
 
-void Lookahead::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
   for (auto&& token : tokens) {
     insert_queue_.enqueue(std::move(token));
   }
 }
 
-Lookahead::Result Lookahead::matchBFS(const std::vector<int32_t>& tokens, size_t batch_size) const {
+Ngram::Result Ngram::matchBFS(const std::vector<int32_t>& tokens, size_t batch_size) const {
   std::vector<std::pair<TrieNode*, int32_t>> nodes = match(tokens, batch_size);
 
   double bfs_breadth_scale = double(param_.max_bfs_breadth - param_.min_bfs_breadth) /
@@ -284,7 +283,7 @@ Lookahead::Result Lookahead::matchBFS(const std::vector<int32_t>& tokens, size_t
   return fillResult(tokens.back(), draft_token_num + 1, tree, root);
 }
 
-Lookahead::Result Lookahead::matchProb(const std::vector<int32_t>& tokens, size_t batch_size) const {
+Ngram::Result Ngram::matchProb(const std::vector<int32_t>& tokens, size_t batch_size) const {
   std::vector<std::pair<TrieNode*, int32_t>> nodes = match(tokens, batch_size);
   auto draft_token_num = param_.get_draft_token_num(batch_size);
 
@@ -346,10 +345,10 @@ Lookahead::Result Lookahead::matchProb(const std::vector<int32_t>& tokens, size_
   return fillResult(tokens.back(), draft_token_num + 1, tree, root);
 }
 
-Lookahead::Result Lookahead::batchMatch(const std::vector<std::vector<int32_t>>& tokens) const {
+Ngram::Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens) const {
   std::unique_lock<std::mutex> lock(mutex_);
   Result merged_result;
-  auto match_func = param_.match_type == "BFS" ? &Lookahead::matchBFS : &Lookahead::matchProb;
+  auto match_func = param_.match_type == "BFS" ? &Ngram::matchBFS : &Ngram::matchProb;
   for (const auto& tks : tokens) {
     Result res = (this->*match_func)(tks, tokens.size());
     merged_result.token.insert(merged_result.token.end(), res.token.begin(), res.token.end());
@@ -358,7 +357,7 @@ Lookahead::Result Lookahead::batchMatch(const std::vector<std::vector<int32_t>>&
   return merged_result;
 }
 
-void Lookahead::Result::truncate(size_t n) {
+void Ngram::Result::truncate(size_t n) {
   if (n < token.size()) {
     int full_n = token.size();
     for (int i = 1; i < n; ++i) {
@@ -369,4 +368,4 @@ void Lookahead::Result::truncate(size_t n) {
   }
 }
 
-}  // namespace lookahead
+}  // namespace ngram
