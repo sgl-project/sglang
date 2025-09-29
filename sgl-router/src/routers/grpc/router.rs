@@ -1,8 +1,6 @@
 // gRPC Router Implementation
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
@@ -10,25 +8,33 @@ use axum::{
     extract::Request,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::RetryConfig;
-use crate::core::{
-    BasicWorkerBuilder, CircuitBreakerConfig, HealthConfig, WorkerRegistry, WorkerType,
-};
+use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
 use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::metrics::RouterMetrics;
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{ChatCompletionRequest, StringOrArray};
+use crate::policies::PolicyRegistry;
+use crate::protocols::spec::ChatMessage;
+use crate::protocols::spec::{
+    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
+    CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, ResponsesGetParams,
+    ResponsesRequest, StringOrArray, Tool, ToolChoice, Usage,
+};
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserRegistry;
-use uuid::Uuid;
-
+use crate::server::AppContext;
 use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
+use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoderBuilder};
+use crate::tokenizer::traits::Tokenizer;
+use crate::tokenizer::HuggingFaceTokenizer;
+use crate::tool_parser::ParserRegistry;
 use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_stream::StreamExt;
+use uuid::Uuid;
 
 // Data structures for processing
 #[derive(Debug)]
@@ -39,39 +45,21 @@ pub struct ProcessedMessages {
 }
 
 /// gRPC router implementation for SGLang
-#[allow(dead_code)] // Fields will be used once implementation is complete
+#[allow(dead_code)]
 pub struct GrpcRouter {
-    /// Centralized worker registry
     worker_registry: Arc<WorkerRegistry>,
-    /// Centralized policy registry
     policy_registry: Arc<PolicyRegistry>,
-    /// Load balancing policy
-    policy: Arc<dyn LoadBalancingPolicy>,
-    /// Tokenizer for handling text encoding/decoding
     tokenizer: Arc<dyn Tokenizer>,
-    /// Reasoning parser factory for structured reasoning outputs
     reasoning_parser_factory: ParserFactory,
-    /// Tool parser registry for function/tool calls
     tool_parser_registry: &'static ParserRegistry,
-    /// Configuration
-    timeout_secs: u64,
-    interval_secs: u64,
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
-    circuit_breaker_config: CircuitBreakerConfig,
 }
 
 impl GrpcRouter {
     /// Create a new gRPC router
-    pub async fn new(
-        worker_urls: Vec<String>,
-        policy: Arc<dyn LoadBalancingPolicy>,
-        ctx: &Arc<crate::server::AppContext>,
-    ) -> Result<Self, String> {
-        // Update metrics
-        RouterMetrics::set_active_workers(worker_urls.len());
-
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         // Extract necessary components from context
         let tokenizer = ctx
             .tokenizer
@@ -87,97 +75,30 @@ impl GrpcRouter {
             .tool_parser_registry
             .ok_or_else(|| "gRPC router requires tool parser registry".to_string())?;
 
-        // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
-        let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
-        let core_cb_config = CircuitBreakerConfig {
-            failure_threshold: circuit_breaker_config.failure_threshold,
-            success_threshold: circuit_breaker_config.success_threshold,
-            timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
-            window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
-        };
-
-        // Create gRPC clients for each worker
-        let mut grpc_clients = HashMap::new();
-        for url in &worker_urls {
-            match SglangSchedulerClient::connect(url).await {
-                Ok(client) => {
-                    grpc_clients.insert(url.clone(), client);
-                    info!("Connected to gRPC worker at {}", url);
-                }
-                Err(e) => {
-                    warn!("Failed to connect to gRPC worker at {}: {}", url, e);
-                    // Continue with other workers
-                }
-            }
-        }
-
-        if grpc_clients.is_empty() {
-            return Err("Failed to connect to any gRPC workers".to_string());
-        }
-
-        // Get registries from context
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Create Worker trait objects with gRPC connection mode and register them
-        for url in &worker_urls {
-            if let Some(client) = grpc_clients.remove(url) {
-                let worker = BasicWorkerBuilder::new(url.clone())
-                    .worker_type(WorkerType::Regular)
-                    .connection_mode(crate::core::ConnectionMode::Grpc { port: None })
-                    .circuit_breaker_config(core_cb_config.clone())
-                    .health_config(HealthConfig {
-                        timeout_secs: ctx.router_config.health_check.timeout_secs,
-                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
-                        endpoint: ctx.router_config.health_check.endpoint.clone(),
-                        failure_threshold: ctx.router_config.health_check.failure_threshold,
-                        success_threshold: ctx.router_config.health_check.success_threshold,
-                    })
-                    .grpc_client(client)
-                    .build();
-
-                // Register worker in the centralized registry
-                worker_registry.register(Arc::new(worker));
-            } else {
-                warn!("No gRPC client for worker {}, skipping", url);
-            }
-        }
-
-        // Get only gRPC workers from registry for policy initialization
         let workers = worker_registry.get_workers_filtered(
-            None, // any model
+            None,
             Some(WorkerType::Regular),
-            Some(crate::core::ConnectionMode::Grpc { port: None }),
-            false, // include unhealthy workers during initialization
+            Some(ConnectionMode::Grpc { port: None }),
+            false,
         );
 
-        // Initialize policy with workers if needed
-        if let Some(cache_aware) = policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.init_workers(&workers);
-        }
-
-        // No need for local health checkers - WorkerRegistry handles health checking
+        RouterMetrics::set_active_workers(workers.len());
+        info!("gRPC router found {} workers in registry", workers.len());
 
         Ok(GrpcRouter {
             worker_registry,
             policy_registry,
-            policy,
             tokenizer,
             reasoning_parser_factory,
             tool_parser_registry,
-            timeout_secs: ctx.router_config.worker_startup_timeout_secs,
-            interval_secs: ctx.router_config.worker_startup_check_interval_secs,
             dp_aware: ctx.router_config.dp_aware,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
-            circuit_breaker_config: core_cb_config,
         })
     }
-
-    // ============ Chat Implementation ============
 
     /// Main route_chat implementation
     async fn route_chat_impl(
@@ -202,11 +123,23 @@ impl GrpcRouter {
 
         debug!("Selected worker: {}", worker.url());
 
-        // Step 2: Get gRPC client for worker (fail fast if can't connect)
-        let client = match self.get_or_create_grpc_client(worker.url()).await {
-            Ok(c) => c,
+        // Step 2: Get gRPC client from worker
+        let client = match worker.get_grpc_client().await {
+            Ok(Some(client_arc)) => {
+                // Clone the client from inside the Arc<Mutex<>>
+                let client = client_arc.lock().await.clone();
+                client
+            }
+            Ok(None) => {
+                error!("Selected worker is not a gRPC worker");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Selected worker is not configured for gRPC",
+                )
+                    .into_response();
+            }
             Err(e) => {
-                error!("Failed to get gRPC client: {}", e);
+                error!("Failed to get gRPC client from worker: {}", e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to get gRPC client: {}", e),
@@ -249,11 +182,11 @@ impl GrpcRouter {
 
         // Step 6: Build the base gRPC request
         let request_id = format!("chatcmpl-{}", Uuid::new_v4());
-        let base_request = match client.build_generate_request(
+        let request = match client.build_generate_request(
             request_id,
             body,
             processed_messages.text.clone(),
-            token_ids.into_iter().map(|id| id as i32).collect(),
+            token_ids,
             processed_messages.multimodal_inputs,
             tool_call_constraint, // Pass the full tuple (type, value)
         ) {
@@ -268,31 +201,30 @@ impl GrpcRouter {
             }
         };
 
+        // Step 7: Handle streaming vs non-streaming
         if body.stream {
-            self.handle_streaming_chat(client, base_request, body).await
+            self.handle_streaming_chat(client, request, body).await
         } else {
-            self.handle_non_streaming_chat(client, base_request, body)
-                .await
+            self.handle_non_streaming_chat(client, request, body).await
         }
     }
 
-    // ============ Helper Methods ============
     /// Select a worker for the request
     fn select_worker_for_request(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
-    ) -> Option<Arc<dyn crate::core::Worker>> {
+    ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
             model_id,
             Some(WorkerType::Regular),
-            Some(crate::core::ConnectionMode::Grpc { port: None }),
+            Some(ConnectionMode::Grpc { port: None }),
             false, // get all workers, we'll filter by is_available() next
         );
 
         // Filter by availability (health + circuit breaker)
-        let available: Vec<Arc<dyn crate::core::Worker>> = workers
+        let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
             .cloned()
@@ -319,10 +251,10 @@ impl GrpcRouter {
         request: &ChatCompletionRequest,
     ) -> Result<ProcessedMessages, String> {
         // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
-        let formatted_text = if let Some(hf_tokenizer) =
-            self.tokenizer
-                .as_any()
-                .downcast_ref::<crate::tokenizer::HuggingFaceTokenizer>()
+        let formatted_text = if let Some(hf_tokenizer) = self
+            .tokenizer
+            .as_any()
+            .downcast_ref::<HuggingFaceTokenizer>()
         {
             // Get content format and transform messages accordingly
             let content_format = hf_tokenizer.chat_template_content_format();
@@ -425,9 +357,9 @@ impl GrpcRouter {
 
     /// Process messages based on content format for ANY message type
     fn process_content_format(
-        messages: &[crate::protocols::spec::ChatMessage],
-        content_format: crate::tokenizer::chat_template::ChatTemplateContentFormat,
-    ) -> Result<Vec<serde_json::Value>, String> {
+        messages: &[ChatMessage],
+        content_format: ChatTemplateContentFormat,
+    ) -> Result<Vec<Value>, String> {
         messages
             .iter()
             .map(|message| {
@@ -497,7 +429,7 @@ impl GrpcRouter {
 
     /// Process tool call arguments in messages
     /// Per Transformers docs, tool call arguments in assistant messages should be dicts
-    fn process_tool_call_arguments(messages: &mut [serde_json::Value]) -> Result<(), String> {
+    fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
         for msg in messages {
             // Early return if not assistant message
             let role = msg.get("role").and_then(|v| v.as_str());
@@ -541,8 +473,8 @@ impl GrpcRouter {
     /// Generate tool constraints for structured generation
     fn generate_tool_constraints(
         &self,
-        _tools: &[crate::protocols::spec::Tool],
-        _tool_choice: &Option<crate::protocols::spec::ToolChoice>,
+        _tools: &[Tool],
+        _tool_choice: &Option<ToolChoice>,
         model: &str,
     ) -> Option<(String, String)> {
         let _parser = self.tool_parser_registry.get_parser(model)?;
@@ -551,40 +483,399 @@ impl GrpcRouter {
         None
     }
 
-    /// Get or create a gRPC client for the worker
-    async fn get_or_create_grpc_client(
+    /// Create a StopSequenceDecoder from the chat completion request
+    fn create_stop_decoder(
         &self,
-        worker_url: &str,
-    ) -> Result<SglangSchedulerClient, String> {
-        // TODO: move to worker
-        debug!("Creating new gRPC client for worker: {}", worker_url);
-        SglangSchedulerClient::connect(worker_url)
-            .await
-            .map_err(|e| format!("Failed to connect to gRPC server: {}", e))
+        original_request: &ChatCompletionRequest,
+    ) -> crate::tokenizer::stop::StopSequenceDecoder {
+        // Extract stop sequences from request
+        let stop_sequences: Vec<String> = match &original_request.stop {
+            Some(StringOrArray::String(s)) => vec![s.clone()],
+            Some(StringOrArray::Array(arr)) => arr.clone(),
+            None => vec![],
+        };
+
+        // Build stop sequence decoder
+        let mut builder = StopSequenceDecoderBuilder::new(self.tokenizer.clone())
+            .skip_special_tokens(original_request.skip_special_tokens);
+
+        // Add stop sequences (visible if no_stop_trim is true, hidden otherwise)
+        for seq in stop_sequences {
+            builder = if original_request.no_stop_trim {
+                builder.visible_stop_sequence(seq)
+            } else {
+                builder.stop_sequence(seq)
+            };
+        }
+
+        // Add stop token IDs (visible if no_stop_trim is true, hidden otherwise)
+        if let Some(stop_token_ids) = &original_request.stop_token_ids {
+            for &token_id in stop_token_ids {
+                builder = if original_request.no_stop_trim {
+                    builder.visible_stop_token(token_id)
+                } else {
+                    builder.stop_token(token_id)
+                };
+            }
+        }
+
+        builder.build()
     }
 
-    /// Placeholder for streaming handler (to be implemented in Phase 2)
+    /// Process a chunk of tokens through the stop decoder
+    fn process_chunk_tokens(
+        stop_decoder: &mut crate::tokenizer::stop::StopSequenceDecoder,
+        token_ids: &[u32],
+    ) -> (String, bool) {
+        let mut chunk_text = String::new();
+
+        for &token_id in token_ids {
+            match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
+                debug!(
+                    "Error processing token {}: {}. Treating as Held.",
+                    token_id, e
+                );
+                SequenceDecoderOutput::Held
+            }) {
+                SequenceDecoderOutput::Text(text) => {
+                    chunk_text.push_str(&text);
+                }
+                SequenceDecoderOutput::StoppedWithText(text) => {
+                    chunk_text.push_str(&text);
+                    return (chunk_text, true); // Return text and signal to stop
+                }
+                SequenceDecoderOutput::Stopped => {
+                    return (chunk_text, true); // Return text and signal to stop
+                }
+                SequenceDecoderOutput::Held => {
+                    // Text held for potential stop sequence match
+                }
+            }
+        }
+        (chunk_text, false) // Return text and continue processing
+    }
+
+    /// Submit request and handle streaming response for chat completions route
     async fn handle_streaming_chat(
         &self,
-        _client: SglangSchedulerClient,
-        _request: proto::GenerateRequest,
-        _original_request: &ChatCompletionRequest,
+        mut client: SglangSchedulerClient,
+        request: proto::GenerateRequest,
+        original_request: &ChatCompletionRequest,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Streaming not yet implemented").into_response()
+        let mut stop_decoder = self.create_stop_decoder(original_request);
+
+        // Process streaming tokens
+        let mut grpc_stream = match client.generate(request).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("Failed to start generation: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Generation failed: {}", e),
+                )
+                    .into_response();
+            }
+        };
+
+        let mut decoded_text = String::new();
+
+        while let Some(response) = grpc_stream.next().await {
+            let gen_response = match response {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!("Stream error: {}", e);
+                    break;
+                }
+            };
+
+            match gen_response.response {
+                Some(proto::generate_response::Response::Chunk(chunk)) => {
+                    // Process tokens and check if we should stop
+                    let (chunk_text, should_stop) =
+                        Self::process_chunk_tokens(&mut stop_decoder, &chunk.token_ids);
+                    decoded_text.push_str(&chunk_text);
+                    if should_stop {
+                        break;
+                    }
+                    continue;
+                }
+                Some(proto::generate_response::Response::Complete(_complete)) => {
+                    // Flush any remaining text
+                    if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
+                        if !text.is_empty() {
+                            decoded_text.push_str(&text);
+                            debug!("Flushed text: {}", text);
+                        }
+                    }
+                    break;
+                }
+                Some(proto::generate_response::Response::Error(error)) => {
+                    error!("Generation error: {}", error.message);
+                    break;
+                }
+                None => continue,
+            }
+        }
+
+        // TODO: Replace with proper SSE streaming response
+        // For now, return the complete decoded text
+        (StatusCode::OK, format!("Decoded text: {}", decoded_text)).into_response()
     }
 
-    /// Placeholder for non-streaming handler (to be implemented in Phase 3)
+    /// Submit request and handle non-streaming response for chat completions route
     async fn handle_non_streaming_chat(
         &self,
-        _client: SglangSchedulerClient,
-        _request: proto::GenerateRequest,
-        _original_request: &ChatCompletionRequest,
+        mut client: SglangSchedulerClient,
+        request: proto::GenerateRequest,
+        original_request: &ChatCompletionRequest,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Non-streaming not yet implemented",
-        )
-            .into_response()
+        let mut stop_decoder = self.create_stop_decoder(original_request);
+
+        // Small helpers to log + return a uniform 500
+        let fail_str = |msg: &'static str| -> Response {
+            error!("{}", msg);
+            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+        };
+        let fail_fmt = |prefix: &str, e: &dyn std::fmt::Display| -> Response {
+            error!("{}{}", prefix, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{}{}", prefix, e),
+            )
+                .into_response()
+        };
+
+        // Start generation
+        let mut stream = match client.generate(request).await {
+            Ok(s) => s,
+            Err(e) => return fail_fmt("Failed to start generation: ", &e),
+        };
+
+        // Collect all responses (for n>1 support)
+        let mut all_responses = Vec::new();
+        while let Some(response) = stream.next().await {
+            match response {
+                Ok(gen_response) => match gen_response.response {
+                    Some(proto::generate_response::Response::Complete(complete)) => {
+                        all_responses.push(complete);
+                    }
+                    Some(proto::generate_response::Response::Error(err)) => {
+                        error!("Generation failed for one choice: {}", err.message);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Generation failed: {}", err.message),
+                        )
+                            .into_response();
+                    }
+                    Some(proto::generate_response::Response::Chunk(_)) => {
+                        return fail_str("Unexpected chunk response for non-streaming request")
+                    }
+                    None => return fail_str("Empty response from server"),
+                },
+                Err(e) => return fail_fmt("Failed to get GenerateResponse: ", &e),
+            }
+        }
+
+        if all_responses.is_empty() {
+            return fail_str("No responses from server");
+        }
+
+        // Process each response into a ChatChoice
+        let mut choices = Vec::new();
+        for (index, complete) in all_responses.iter().enumerate() {
+            match self
+                .process_single_choice(complete, index, original_request, &mut stop_decoder)
+                .await
+            {
+                Ok(choice) => choices.push(choice),
+                Err(e) => {
+                    error!("Failed to process choice {}: {}", index, e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to process choice {}: {}", index, e),
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        // Aggregate usage information from all responses
+        let total_prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
+        let total_completion_tokens: u32 = all_responses
+            .iter()
+            .map(|r| r.completion_tokens as u32)
+            .sum();
+        let usage = Usage {
+            prompt_tokens: total_prompt_tokens,
+            completion_tokens: total_completion_tokens,
+            total_tokens: total_prompt_tokens + total_completion_tokens,
+            completion_tokens_details: None,
+        };
+
+        // Build final ChatCompletionResponse
+        let response = ChatCompletionResponse {
+            id: format!("chatcmpl-{}", Uuid::new_v4()),
+            object: "chat.completion".to_string(),
+            created: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            model: original_request.model.clone(),
+            choices,
+            usage: Some(usage),
+            system_fingerprint: None,
+        };
+
+        // Serialize and return JSON response
+        Json(response).into_response()
+    }
+
+    /// Process a single GenerateComplete response into a ChatChoice
+    async fn process_single_choice(
+        &self,
+        complete: &proto::GenerateComplete,
+        index: usize,
+        original_request: &ChatCompletionRequest,
+        stop_decoder: &mut crate::tokenizer::stop::StopSequenceDecoder,
+    ) -> Result<ChatChoice, String> {
+        stop_decoder.reset();
+        // Decode tokens
+        let outputs = stop_decoder
+            .process_tokens(&complete.output_ids)
+            .map_err(|e| format!("Failed to process tokens: {}", e))?;
+
+        // Accumulate text with early breaks
+        let mut final_text = String::new();
+        for output in outputs {
+            match output {
+                SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
+                SequenceDecoderOutput::StoppedWithText(t) => {
+                    final_text.push_str(&t);
+                    break;
+                }
+                SequenceDecoderOutput::Stopped => break,
+                SequenceDecoderOutput::Held => {}
+            }
+        }
+
+        // Flush remaining text
+        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+            final_text.push_str(&t);
+        }
+
+        // Step 1: Handle reasoning content parsing
+        let mut reasoning_text: Option<String> = None;
+        let mut processed_text = final_text;
+
+        // Check if reasoning parsing is enabled and separate_reasoning is requested
+        if original_request.separate_reasoning {
+            if let Ok(mut parser) = self
+                .reasoning_parser_factory
+                .create(&original_request.model)
+            {
+                match parser.detect_and_parse_reasoning(&processed_text) {
+                    Ok(result) => {
+                        if !result.reasoning_text.is_empty() {
+                            reasoning_text = Some(result.reasoning_text);
+                        }
+                        processed_text = result.normal_text;
+                    }
+                    Err(e) => {
+                        return Err(format!("Reasoning parsing error: {}", e));
+                    }
+                }
+            }
+        }
+
+        // Step 2: Handle tool call parsing
+        let mut tool_calls: Option<Vec<crate::protocols::spec::ToolCall>> = None;
+
+        // Check if tool calls should be processed
+        let tool_choice_enabled = !matches!(
+            &original_request.tool_choice,
+            Some(ToolChoice::Value(
+                crate::protocols::spec::ToolChoiceValue::None
+            ))
+        );
+
+        if tool_choice_enabled && original_request.tools.is_some() {
+            if let Some(parser) = self
+                .tool_parser_registry
+                .get_parser(&original_request.model)
+            {
+                match parser.parse_complete(&processed_text).await {
+                    Ok((normal_text, parsed_tool_calls)) => {
+                        if !parsed_tool_calls.is_empty() {
+                            let spec_tool_calls = parsed_tool_calls
+                                .into_iter()
+                                .map(|tc| crate::protocols::spec::ToolCall {
+                                    id: tc.id,
+                                    tool_type: "function".to_string(),
+                                    function: crate::protocols::spec::FunctionCallResponse {
+                                        name: tc.function.name,
+                                        arguments: Some(
+                                            serde_json::to_string(&tc.function.arguments)
+                                                .unwrap_or_else(|_| "{}".to_string()),
+                                        ),
+                                    },
+                                })
+                                .collect();
+                            tool_calls = Some(spec_tool_calls);
+                            processed_text = normal_text;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Tool call parsing error: {}", e);
+                        // Continue without tool calls rather than failing
+                    }
+                }
+            }
+        }
+
+        // Step 3: Use finish reason directly from proto (already OpenAI-compatible string)
+        let finish_reason_str = &complete.finish_reason;
+
+        // Override finish reason if we have tool calls
+        let final_finish_reason_str = if tool_calls.is_some() {
+            "tool_calls"
+        } else {
+            finish_reason_str
+        };
+
+        // Extract matched_stop information from proto
+        let matched_stop = match &complete.matched_stop {
+            Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => Some(
+                serde_json::Value::Number(serde_json::Number::from(*token_id)),
+            ),
+            Some(proto::generate_complete::MatchedStop::MatchedStopStr(stop_str)) => {
+                Some(serde_json::Value::String(stop_str.clone()))
+            }
+            None => None,
+        };
+
+        // Step 4: Build ChatCompletionMessage (proper response message type)
+        let chat_message = ChatCompletionMessage {
+            role: "assistant".to_string(),
+            content: if processed_text.is_empty() {
+                None
+            } else {
+                Some(processed_text)
+            },
+            tool_calls,
+            reasoning_content: reasoning_text,
+        };
+
+        // Step 5: Build ChatChoice
+        let choice = ChatChoice {
+            index: index as u32,
+            message: chat_message,
+            logprobs: None,
+            finish_reason: Some(final_finish_reason_str.to_string()),
+            matched_stop,
+            hidden_states: None,
+        };
+
+        Ok(choice)
     }
 }
 
@@ -593,8 +884,6 @@ impl std::fmt::Debug for GrpcRouter {
         let stats = self.worker_registry.stats();
         f.debug_struct("GrpcRouter")
             .field("workers_count", &stats.total_workers)
-            .field("timeout_secs", &self.timeout_secs)
-            .field("interval_secs", &self.interval_secs)
             .field("dp_aware", &self.dp_aware)
             .finish()
     }
@@ -630,7 +919,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::GenerateRequest,
+        _body: &GenerateRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -639,7 +928,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &crate::protocols::spec::ChatCompletionRequest,
+        body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await
@@ -648,7 +937,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_completion(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::CompletionRequest,
+        _body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -657,7 +946,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_responses(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::ResponsesRequest,
+        _body: &ResponsesRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -667,7 +956,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _response_id: &str,
-        _params: &crate::protocols::spec::ResponsesGetParams,
+        _params: &ResponsesGetParams,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -679,7 +968,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::EmbeddingRequest,
+        _body: &EmbeddingRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -688,7 +977,7 @@ impl RouterTrait for GrpcRouter {
     async fn route_rerank(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::RerankRequest,
+        _body: &RerankRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
@@ -892,7 +1181,6 @@ mod tests {
 
     #[test]
     fn test_transform_messages_mixed_content_types() {
-        // Test with both text and multimodal content
         let messages = vec![
             ChatMessage::User {
                 role: "user".to_string(),
@@ -916,7 +1204,6 @@ mod tests {
             },
         ];
 
-        // Test String format
         let result_string =
             GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::String)
                 .unwrap();
@@ -925,7 +1212,6 @@ mod tests {
         assert_eq!(result_string[0]["content"].as_str().unwrap(), "Plain text");
         assert_eq!(result_string[1]["content"].as_str().unwrap(), "With image");
 
-        // Test OpenAI format
         let result_openai =
             GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::OpenAI)
                 .unwrap();

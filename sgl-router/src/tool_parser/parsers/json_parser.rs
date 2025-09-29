@@ -88,64 +88,65 @@ impl JsonParser {
         content.trim()
     }
 
-    /// Try to extract a JSON object or array from text that may contain other content
-    fn extract_json_from_text(&self, text: &str) -> Option<String> {
-        // Look for JSON object starting with {
-        if let Some(start) = text.find('{') {
-            let mut depth = 0;
-            let mut in_string = false;
-            let mut escape_next = false;
+    /// Try to extract a first valid JSON object or array from text that may contain other content
+    /// Returns (json_string, normal_text) where normal_text is text before and after the JSON
+    fn extract_json_from_text(&self, text: &str) -> Option<(String, String)> {
+        let mut in_string = false;
+        let mut escape = false;
+        let mut stack: Vec<char> = Vec::with_capacity(8);
+        let mut start: Option<usize> = None;
 
-            for (i, ch) in text[start..].char_indices() {
-                if escape_next {
-                    escape_next = false;
-                    continue;
+        for (i, ch) in text.char_indices() {
+            if escape {
+                escape = false;
+                continue;
+            }
+
+            match ch {
+                '\\' if in_string => escape = true,
+                '"' => in_string = !in_string,
+                _ if in_string => {}
+                '{' | '[' => {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                    stack.push(ch);
                 }
+                '}' | ']' => {
+                    let Some(open) = stack.pop() else {
+                        // Stray closer - reset and continue looking for next valid JSON
+                        start = None;
+                        continue;
+                    };
 
-                match ch {
-                    '\\' if in_string => escape_next = true,
-                    '"' if !in_string => in_string = true,
-                    '"' if in_string => in_string = false,
-                    '{' if !in_string => depth += 1,
-                    '}' if !in_string => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(text[start..start + i + 1].to_string());
+                    let valid = (open == '{' && ch == '}') || (open == '[' && ch == ']');
+                    if !valid {
+                        // Mismatch - reset and continue looking
+                        start = None;
+                        stack.clear();
+                        continue;
+                    }
+
+                    if stack.is_empty() {
+                        let s = start.unwrap();
+                        let e = i + ch.len_utf8();
+                        let potential_json = &text[s..e];
+
+                        // Validate that this is actually valid JSON before returning
+                        if serde_json::from_str::<Value>(potential_json).is_ok() {
+                            let json = potential_json.to_string();
+                            let normal = format!("{}{}", &text[..s], &text[e..]);
+                            return Some((json, normal));
+                        } else {
+                            // Not valid JSON, reset and continue looking
+                            start = None;
+                            continue;
                         }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
-
-        // Look for JSON array starting with [
-        if let Some(start) = text.find('[') {
-            let mut depth = 0;
-            let mut in_string = false;
-            let mut escape_next = false;
-
-            for (i, ch) in text[start..].char_indices() {
-                if escape_next {
-                    escape_next = false;
-                    continue;
-                }
-
-                match ch {
-                    '\\' if in_string => escape_next = true,
-                    '"' if !in_string => in_string = true,
-                    '"' if in_string => in_string = false,
-                    '[' if !in_string => depth += 1,
-                    ']' if !in_string => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(text[start..start + i + 1].to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
         None
     }
 
@@ -226,10 +227,34 @@ impl JsonParser {
         }
 
         // Check for any start token
-        self.token_config
+        let has_start_token = self
+            .token_config
             .start_tokens
             .iter()
-            .any(|token| text.contains(token))
+            .any(|token| text.contains(token));
+
+        // Also check if we have what looks like JSON even without start token
+        // This handles cases where we've already processed the start token
+        // and are working on subsequent tools
+        has_start_token || (text.trim_start().starts_with('{') && text.contains(r#""name""#))
+    }
+
+    /// Check if text might contain a partial start token (for streaming)
+    fn has_partial_start_token(&self, text: &str) -> bool {
+        if self.token_config.start_tokens.is_empty() {
+            return false;
+        }
+
+        // Check if the end of the buffer could be the start of any start token
+        for start_token in &self.token_config.start_tokens {
+            for i in 1..start_token.len() {
+                let token_prefix = &start_token[..i];
+                if text.ends_with(token_prefix) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -241,16 +266,20 @@ impl Default for JsonParser {
 
 #[async_trait]
 impl ToolParser for JsonParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if we have multiple start tokens (e.g., multiple <|python_tag|> markers)
         if !self.token_config.start_tokens.is_empty() {
             let start_token = &self.token_config.start_tokens[0];
             if !start_token.is_empty() && text.matches(start_token).count() > 1 {
                 // We have multiple occurrences of the start token
                 let mut all_tools = Vec::new();
+                let mut all_normal_text = String::new();
                 let mut remaining = text;
 
                 while let Some(start_pos) = remaining.find(start_token.as_str()) {
+                    // Add text before this start token to normal text
+                    all_normal_text.push_str(&remaining[..start_pos]);
+
                     // Extract content after this start token
                     let after_token = &remaining[start_pos + start_token.len()..];
 
@@ -264,12 +293,19 @@ impl ToolParser for JsonParser {
                     let json_content = &after_token[..end_pos];
 
                     // Try to extract and parse JSON from this segment
-                    if let Some(extracted) = self.extract_json_from_text(json_content) {
+                    if let Some((extracted, segment_normal_text)) =
+                        self.extract_json_from_text(json_content)
+                    {
                         if let Ok(value) = serde_json::from_str::<Value>(&extracted) {
                             if let Ok(tools) = self.parse_json_value(&value) {
                                 all_tools.extend(tools);
                             }
                         }
+                        // Add the normal text from this segment
+                        all_normal_text.push_str(&segment_normal_text);
+                    } else {
+                        // If no JSON found, add the entire content as normal text
+                        all_normal_text.push_str(json_content);
                     }
 
                     // Move to the next segment
@@ -279,9 +315,10 @@ impl ToolParser for JsonParser {
                     }
                 }
 
-                if !all_tools.is_empty() {
-                    return Ok(all_tools);
-                }
+                // Add any remaining text
+                all_normal_text.push_str(remaining);
+
+                return Ok((all_normal_text, all_tools));
             }
         }
 
@@ -290,21 +327,30 @@ impl ToolParser for JsonParser {
 
         // Try to parse as JSON first
         match serde_json::from_str::<Value>(json_content) {
-            Ok(value) => self.parse_json_value(&value),
+            Ok(value) => {
+                let tools = self.parse_json_value(&value)?;
+                Ok((String::new(), tools))
+            }
             Err(_) => {
                 // If parse failed, check if we have multiple JSON objects separated by the configured separator
-                // This handles cases like: {"name": "func1", ...};{"name": "func2", ...}
+                // Only do this if we can reasonably expect multiple complete JSON objects
+                // (i.e., text starts and ends with JSON-like structure)
                 if !self.token_config.separator.is_empty()
                     && json_content.contains(&self.token_config.separator)
+                    && json_content.trim().starts_with('{')
+                    && json_content.trim().ends_with('}')
                 {
                     let mut all_tools = Vec::new();
 
                     // Split by separator and try to parse each part
                     let parts: Vec<&str> =
                         json_content.split(&self.token_config.separator).collect();
+                    let mut normal_parts = Vec::new();
+
                     for part in parts {
                         let trimmed = part.trim();
                         if trimmed.is_empty() {
+                            normal_parts.push(trimmed.to_string());
                             continue;
                         }
 
@@ -313,32 +359,40 @@ impl ToolParser for JsonParser {
                             if let Ok(tools) = self.parse_json_value(&value) {
                                 all_tools.extend(tools);
                             }
-                        } else if let Some(extracted) = self.extract_json_from_text(trimmed) {
+                            normal_parts.push(trimmed.to_string());
+                        } else if let Some((extracted, part_normal_text)) =
+                            self.extract_json_from_text(trimmed)
+                        {
                             // Try extracting JSON from this part
                             if let Ok(value) = serde_json::from_str::<Value>(&extracted) {
                                 if let Ok(tools) = self.parse_json_value(&value) {
                                     all_tools.extend(tools);
                                 }
                             }
+                            normal_parts.push(part_normal_text);
+                        } else {
+                            normal_parts.push(trimmed.to_string());
                         }
                     }
 
-                    if !all_tools.is_empty() {
-                        return Ok(all_tools);
-                    }
+                    // Rejoin with the original separator to preserve it
+                    let all_normal_text = normal_parts.join(&self.token_config.separator);
+
+                    return Ok((all_normal_text, all_tools));
                 }
 
-                // If no wrapper tokens configured and parse failed,
-                // try to extract JSON from mixed text
+                // If no wrapper tokens configured and parse failed, try to extract JSON from mixed text
                 if self.token_config.start_tokens.is_empty() {
-                    if let Some(extracted) = self.extract_json_from_text(text) {
-                        if let Ok(value) = serde_json::from_str::<Value>(&extracted) {
-                            return self.parse_json_value(&value);
+                    if let Some((extracted_json, normal_text)) = self.extract_json_from_text(text) {
+                        if let Ok(value) = serde_json::from_str::<Value>(&extracted_json) {
+                            let tools = self.parse_json_value(&value)?;
+                            return Ok((normal_text, tools));
                         }
                     }
                 }
-                // Not valid JSON, return empty
-                Ok(vec![])
+
+                // No valid JSON found, return original text as normal text
+                Ok((text.to_string(), vec![]))
             }
         }
     }
@@ -352,8 +406,42 @@ impl ToolParser for JsonParser {
 
         // Check if we have potential tool calls
         if !self.has_tool_markers(&state.buffer) {
-            // No tool markers, return as incomplete
-            return Ok(StreamResult::Incomplete);
+            if self.has_partial_start_token(&state.buffer) {
+                // We might be in the middle of receiving a start token, wait for more data
+                return Ok(StreamResult::Incomplete);
+            }
+
+            // No tool markers and no partial tokens - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if !self.token_config.start_tokens.is_empty() {
+            let start_token = &self.token_config.start_tokens[0];
+            if !start_token.is_empty() {
+                if let Some(marker_pos) = state.buffer.find(start_token) {
+                    if marker_pos > 0 {
+                        // We have text before the tool marker - extract it as normal text
+                        let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                        return Ok(StreamResult::NormalText(normal_text));
+                    }
+                }
+            }
+        } else {
+            // For JSON without start tokens, look for the start of JSON structure
+            // Find whichever comes first: '{' or '['
+            let brace_pos = state.buffer.find('{');
+            let bracket_pos = state.buffer.find('[');
+            let json_pos = brace_pos.iter().chain(bracket_pos.iter()).min().copied();
+
+            if let Some(pos) = json_pos {
+                if pos > 0 {
+                    // We have text before JSON structure - extract it as normal text
+                    let normal_text: String = state.buffer.drain(..pos).collect();
+                    return Ok(StreamResult::NormalText(normal_text));
+                }
+            }
         }
 
         // Extract JSON content first to check for separators
@@ -377,9 +465,8 @@ impl ToolParser for JsonParser {
                             // We need to figure out how much to remove from the original buffer
                             // Find where the separator is in the original buffer and remove up to and including it
                             if let Some(sep_in_original) = state.buffer.find(separator.as_str()) {
-                                let remaining =
-                                    state.buffer[sep_in_original + separator.len()..].to_string();
-                                state.buffer = remaining;
+                                // Remove processed content up to and including separator
+                                state.buffer.drain(..=sep_in_original + separator.len() - 1);
                             }
 
                             // Return the first tool as complete
@@ -488,7 +575,7 @@ impl ToolParser for JsonParser {
             }
             Err(_) => {
                 // Failed to parse even as partial JSON
-                // Keep buffering
+                // Continue waiting for more data
             }
         }
 
@@ -538,9 +625,41 @@ mod tests {
         let parser = JsonParser::new();
         let input = r#"{"name": "get_weather", "arguments": {"location": "San Francisco"}}"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(normal_text, ""); // Pure JSON should have no normal text
+    }
+
+    #[tokio::test]
+    async fn test_extract_json_with_normal_text() {
+        let parser = JsonParser::new();
+
+        // Test extraction of JSON from mixed text
+        let input =
+            r#"Here is some text before {"name": "test", "arguments": {}} and some text after."#;
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "test");
+        assert_eq!(
+            normal_text,
+            "Here is some text before  and some text after."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_json_array_with_normal_text() {
+        let parser = JsonParser::new();
+
+        // Test extraction of JSON array from mixed text
+        let input = r#"Prefix text [{"name": "func1", "arguments": {}}, {"name": "func2", "arguments": {}}] suffix text"#;
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].function.name, "func1");
+        assert_eq!(tool_calls[1].function.name, "func2");
+        assert_eq!(normal_text, "Prefix text  suffix text");
     }
 
     #[tokio::test]
@@ -551,10 +670,11 @@ mod tests {
             {"name": "search", "arguments": {"query": "news"}}
         ]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert_eq!(result[1].function.name, "search");
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(tool_calls[1].function.name, "search");
+        assert_eq!(normal_text, ""); // Pure JSON should have no normal text
     }
 
     #[tokio::test]
@@ -562,10 +682,11 @@ mod tests {
         let parser = JsonParser::new();
         let input = r#"{"name": "calculate", "parameters": {"x": 10, "y": 20}}"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "calculate");
-        assert!(result[0].function.arguments.contains("10"));
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "calculate");
+        assert!(tool_calls[0].function.arguments.contains("10"));
+        assert_eq!(normal_text, ""); // Pure JSON should have no normal text
     }
 
     #[tokio::test]
@@ -577,9 +698,38 @@ mod tests {
         });
 
         let input = r#"<tool>{"name": "test", "arguments": {}}</tool>"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "test");
+        assert_eq!(normal_text, ""); // Wrapper tokens with no extra text
+    }
+
+    #[tokio::test]
+    async fn test_parse_with_start_token_invalid_json() {
+        let parser = JsonParser::with_config(TokenConfig {
+            start_tokens: vec!["<|python_tag|>".to_string()],
+            end_tokens: vec!["".to_string()],
+            separator: ";".to_string(),
+        });
+
+        let input = r#"Hello world <|python_tag|>this is not valid json at all"#;
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 0);
+        assert_eq!(normal_text, input); // Should return entire original text when JSON parsing fails
+    }
+
+    #[tokio::test]
+    async fn test_parse_with_normal_text() {
+        let parser = JsonParser::new();
+        let input = r#"Here is the weather data: {"name": "get_weather", "arguments": {"location": "SF"}} Let me know if you need more info."#;
+
+        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(
+            normal_text,
+            "Here is the weather data:  Let me know if you need more info."
+        ); // Normal text is now extracted when JSON is found in mixed content
     }
 
     #[test]

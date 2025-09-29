@@ -157,10 +157,10 @@ impl Default for Step3Parser {
 
 #[async_trait]
 impl ToolParser for Step3Parser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains Step3 format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
         // Find the tool calls section
@@ -170,6 +170,7 @@ impl ToolParser for Step3Parser {
             // Find the end of tool calls section
             if let Some(end_pos) = text[search_from..].find("<｜tool_calls_end｜>") {
                 let tool_section = &text[search_from..search_from + end_pos];
+                let end_abs = search_from + end_pos + "<｜tool_calls_end｜>".len();
 
                 // Extract all tool call blocks
                 let mut tools = Vec::new();
@@ -179,11 +180,24 @@ impl ToolParser for Step3Parser {
                     }
                 }
 
-                return Ok(tools);
+                // Extract normal text before start and after end
+                let before = if start_pos > 0 {
+                    &text[..start_pos]
+                } else {
+                    ""
+                };
+                let after = if end_abs < text.len() {
+                    &text[end_abs..]
+                } else {
+                    ""
+                };
+                let normal_text = format!("{}{}", before, after);
+
+                return Ok((normal_text, tools));
             }
         }
 
-        Ok(vec![])
+        Ok((text.to_string(), vec![]))
     }
 
     async fn parse_incremental(
@@ -195,8 +209,18 @@ impl ToolParser for Step3Parser {
 
         // Check for tool markers
         if !self.has_tool_markers(&state.buffer) {
-            // No markers found, return as incomplete
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("<｜tool_calls_begin｜>") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Look for start of tool calls
@@ -289,11 +313,11 @@ mod tests {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>More text"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Tokyo"));
-        assert!(result[0].function.arguments.contains("celsius"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert!(tools[0].function.arguments.contains("Tokyo"));
+        assert!(tools[0].function.arguments.contains("celsius"));
     }
 
     #[tokio::test]
@@ -308,10 +332,10 @@ mod tests {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "search");
-        assert_eq!(result[1].function.name, "calculate");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "search");
+        assert_eq!(tools[1].function.name, "calculate");
     }
 
     #[tokio::test]
@@ -326,12 +350,12 @@ mod tests {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "process_data");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "process_data");
 
         // Parse arguments to check types
-        let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
         assert_eq!(args["count"], 42);
         assert_eq!(args["active"], true);
         assert_eq!(args["rate"], 1.5);

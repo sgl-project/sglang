@@ -79,16 +79,18 @@ impl Default for KimiK2Parser {
 
 #[async_trait]
 impl ToolParser for KimiK2Parser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains Kimi K2 format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
+        // Collect matches with positions and parse tools in one pass
+        let matches: Vec<_> = self.tool_call_extractor.captures_iter(text).collect();
         let mut tools = Vec::new();
 
-        // Extract all tool calls
-        for captures in self.tool_call_extractor.captures_iter(text) {
+        // Extract all tool calls using collected matches
+        for captures in matches.iter() {
             if let (Some(id_match), Some(args_match)) = (
                 captures.name("tool_call_id"),
                 captures.name("function_arguments"),
@@ -116,7 +118,26 @@ impl ToolParser for KimiK2Parser {
             }
         }
 
-        Ok(tools)
+        // Extract normal text using first and last match positions
+        let normal_text = if tools.is_empty() || matches.is_empty() {
+            text.to_string()
+        } else {
+            let first_start = matches[0].get(0).unwrap().start();
+            let last_end = matches.last().unwrap().get(0).unwrap().end();
+            let before = if first_start > 0 {
+                &text[..first_start]
+            } else {
+                ""
+            };
+            let after = if last_end < text.len() {
+                &text[last_end..]
+            } else {
+                ""
+            };
+            format!("{}{}", before, after)
+        };
+
+        Ok((normal_text, tools))
     }
 
     async fn parse_incremental(
@@ -131,9 +152,22 @@ impl ToolParser for KimiK2Parser {
             self.has_tool_markers(&state.buffer) || state.buffer.contains("<|tool_call_begin|>");
 
         if !has_tool_call {
-            // No markers found, clear buffer and return
-            state.buffer.clear();
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        let marker1_pos = state.buffer.find("<|tool_calls_section_begin|>");
+        let marker2_pos = state.buffer.find("<|tool_call_begin|>");
+        let marker_pos = marker1_pos.iter().chain(marker2_pos.iter()).min().copied();
+
+        if let Some(pos) = marker_pos {
+            if pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Try to match streaming pattern
@@ -227,10 +261,10 @@ mod tests {
 <|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location": "Tokyo", "units": "celsius"}<|tool_call_end|>
 <|tool_calls_section_end|>More text"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Tokyo"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert!(tools[0].function.arguments.contains("Tokyo"));
     }
 
     #[tokio::test]
@@ -241,10 +275,10 @@ mod tests {
 <|tool_call_begin|>functions.calculate:1<|tool_call_argument_begin|>{"expression": "2+2"}<|tool_call_end|>
 <|tool_calls_section_end|>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "search");
-        assert_eq!(result[1].function.name, "calculate");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "search");
+        assert_eq!(tools[1].function.name, "calculate");
     }
 
     #[tokio::test]
@@ -254,9 +288,9 @@ mod tests {
 <|tool_call_begin|> functions.test:0 <|tool_call_argument_begin|> {"key": "value"} <|tool_call_end|>
 <|tool_calls_section_end|>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "test");
     }
 
     #[test]

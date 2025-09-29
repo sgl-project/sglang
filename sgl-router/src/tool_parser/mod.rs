@@ -4,7 +4,6 @@
 // Core modules
 pub mod errors;
 pub mod partial_json;
-pub mod python_literal_parser;
 pub mod registry;
 pub mod state;
 pub mod traits;

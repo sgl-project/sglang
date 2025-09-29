@@ -54,21 +54,17 @@ mod tests {
 
     #[test]
     fn test_create_from_config() {
-        // Test Random
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Random);
         assert_eq!(policy.name(), "random");
 
-        // Test RoundRobin
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RoundRobin);
         assert_eq!(policy.name(), "round_robin");
 
-        // Test PowerOfTwo
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
         });
         assert_eq!(policy.name(), "power_of_two");
 
-        // Test CacheAware
         let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAware {
             cache_threshold: 0.7,
             balance_abs_threshold: 10,
