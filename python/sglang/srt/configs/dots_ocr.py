@@ -1,8 +1,6 @@
-from typing import Any, Optional
-from transformers.configuration_utils import PretrainedConfig
+from typing import Optional
 from transformers.models.qwen2 import Qwen2Config
 from transformers import Qwen2_5_VLProcessor, AutoProcessor
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.image_processing_utils import BaseImageProcessor
 from sglang.srt.configs.dots_vlm import DotsVisionConfig
 

@@ -1,16 +1,13 @@
 # coding=utf-8
 # Adapted from Qwen2.5-VL SGLang implementation
-# for DOTSOCR model
 
 import logging
-from functools import lru_cache, partial
-from typing import Iterable, List, Optional, Tuple, Type
+from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
@@ -28,27 +25,7 @@ from sglang.srt.configs import DotsOCRConfig
 
 logger = logging.getLogger(__name__)
 
-
-cached_get_processor = lru_cache(get_processor)
-
 class DotsOCRForCausalLM(nn.Module):
-    # BitandBytes specific attributes
-    default_bitsandbytes_target_modules = [
-        ".gate_up_proj.",
-        ".down_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
     def __init__(
         self,
         config: DotsOCRConfig,
@@ -77,11 +54,8 @@ class DotsOCRForCausalLM(nn.Module):
                 prefix=add_prefix("lm_head", prefix),
             )
         
-        # For EAGLE3 support
-        self.capture_aux_hidden_states = False
         
         self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -143,13 +117,6 @@ class DotsOCRForCausalLM(nn.Module):
             loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
         return loaded_weight
 
-    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # DOTSOCR doesn't support video by default
-        raise NotImplementedError("DOTSOCR doesn't support video features")
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -202,18 +169,5 @@ class DotsOCRForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        self.capture_aux_hidden_states = True
-        self.model.capture_aux_hidden_states = True
-        
-        if layer_ids is None:
-            num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
-                2,
-                num_layers // 2,
-                num_layers - 3,
-            ]  # Specific layers for EAGLE3 support
-        else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 EntryClass = [DotsOCRForCausalLM]
