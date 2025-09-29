@@ -623,6 +623,10 @@ class ServerArgs:
             # Some adjustments for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 4 * 1024
 
+            if self.enable_dp_attention:
+                # DP attention needs more padding for some operations
+                reserved_mem += self.cuda_graph_max_bs * self.dp_size * 2
+
             if gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
@@ -633,9 +637,6 @@ class ServerArgs:
                 elif self.speculative_algorithm != "LOOKAHEAD":
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
-            if self.enable_dp_attention:
-                # DP attention needs more padding for some operations
-                reserved_mem += 4 * 1024
 
             self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
 

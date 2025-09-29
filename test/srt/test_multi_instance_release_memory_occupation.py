@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 
 TEST_SUITE = dict(
     model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    mem_fraction_static=0.85,
+    mem_fraction_static=0.83,
     dp_size=2,
     tp_size=2,
 )
