@@ -228,9 +228,7 @@ class SGLangPerfAnalyzer:
         per_page = 100
         total_in_period = 0
 
-        while (
-            len(collected_runs) < target_samples * 3
-        ):  # Collect more than needed for sampling
+        while True:  # Continue until we reach the time boundary
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
             params = {"per_page": per_page, "page": page}
 
@@ -296,6 +294,23 @@ class SGLangPerfAnalyzer:
             f"  Found {total_in_period} runs in time period, collected {len(collected_runs)} for sampling"
         )
 
+        # Debug: Show time range of collected data
+        if collected_runs:
+            collected_runs_sorted = sorted(
+                collected_runs, key=lambda x: x.get("created_at", "")
+            )
+            earliest = (
+                collected_runs_sorted[0].get("created_at", "")[:10]
+                if collected_runs_sorted
+                else "N/A"
+            )
+            latest = (
+                collected_runs_sorted[-1].get("created_at", "")[:10]
+                if collected_runs_sorted
+                else "N/A"
+            )
+            print(f"  Collected data spans from {earliest} to {latest}")
+
         # Sample from collected runs
         if len(collected_runs) <= target_samples:
             return collected_runs
@@ -323,6 +338,24 @@ class SGLangPerfAnalyzer:
         print(
             f"  Sampled {len(sampled_runs)} runs from {len(collected_runs)} available"
         )
+
+        # Debug: Show time range of sampled data
+        if sampled_runs:
+            sampled_runs_sorted = sorted(
+                sampled_runs, key=lambda x: x.get("created_at", "")
+            )
+            earliest = (
+                sampled_runs_sorted[0].get("created_at", "")[:10]
+                if sampled_runs_sorted
+                else "N/A"
+            )
+            latest = (
+                sampled_runs_sorted[-1].get("created_at", "")[:10]
+                if sampled_runs_sorted
+                else "N/A"
+            )
+            print(f"  Sampled data spans from {earliest} to {latest}")
+
         return sampled_runs
 
     def _get_date_range_runs(
@@ -1215,9 +1248,11 @@ class SGLangPerfAnalyzer:
                                     f"| {' | '.join(['---'] * len(header.split(',')))} |"
                                 )
 
-                                # Show last 5 records
+                                # Show most recent 5 records (CSV is already sorted newest first)
                                 data_lines = lines[1:]
-                                for line in data_lines[-5:]:
+                                for line in data_lines[
+                                    :5
+                                ]:  # Take first 5 lines (most recent)
                                     if line.strip():
                                         summary_lines.append(
                                             f"| {' | '.join(line.strip().split(','))} |"
