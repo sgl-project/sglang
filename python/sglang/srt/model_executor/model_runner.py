@@ -104,6 +104,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    trigger_init_weights_send_group_for_remote_instance_request,
+)
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.offloader import (
@@ -112,9 +115,6 @@ from sglang.srt.offloader import (
     set_offloader,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
-from sglang.srt.remote_instance_weight_loader_utils import (
-    trigger_init_weights_send_group_for_remote_instance_request,
-)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -147,6 +147,25 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+MLA_ATTENTION_BACKENDS = [
+    "aiter",
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "triton",
+    "flashmla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "ascend",
+]
+
+
+def add_mla_attention_backend(backend_name):
+    if backend_name not in MLA_ATTENTION_BACKENDS:
+        MLA_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
+
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -158,6 +177,13 @@ SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
+
+
+if _is_npu:
+    import torch_npu
+
+    torch.npu.config.allow_internal_format = True
+    torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
 class RankZeroFilter(logging.Filter):
@@ -387,6 +413,12 @@ class ModelRunner:
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
+        # Enable batch invariant mode
+        if server_args.enable_deterministic_inference:
+            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
+
+            enable_batch_invariant_mode()
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -513,17 +545,7 @@ class ModelRunner:
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
-                if server_args.attention_backend in [
-                    "aiter",
-                    "flashinfer",
-                    "fa3",
-                    "fa4",
-                    "triton",
-                    "flashmla",
-                    "cutlass_mla",
-                    "trtllm_mla",
-                    "ascend",
-                ]:
+                if server_args.attention_backend in MLA_ATTENTION_BACKENDS:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
                     )
@@ -721,6 +743,10 @@ class ModelRunner:
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
+            tp_rank=self.tp_rank,
+            remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
+            remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
+            remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
@@ -1180,6 +1206,7 @@ class ModelRunner:
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
+            server_args=self.server_args,
         )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
@@ -2033,7 +2060,6 @@ class ModelRunner:
             )
 
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
-
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -2041,6 +2067,12 @@ class ModelRunner:
             forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
+            # For prefill, we only use the position of the last token.
+            (
+                forward_batch.positions
+                if forward_batch.forward_mode.is_decode()
+                else forward_batch.seq_lens - 1
+            ),
         )
         return next_token_ids
 
