@@ -388,16 +388,15 @@ async fn test_llama_streaming_multiple_tools_chunked() {
             let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
             assert_eq!(args["city"], "Paris");
         }
-        _ => {
-            // Might need one more chunk to complete
-            let chunk3 = r#""get_time", "parameters": {"timezone": "UTC"}}"#;
-            let result3 = parser.parse_incremental(chunk3, &mut state).await.unwrap();
-            match result3 {
-                sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-                    assert_eq!(tool.function.name, "get_weather");
-                }
-                _ => panic!("Expected tool to be complete, got: {:?}", result3),
-            }
+        _ => panic!("Expected first tool complete, got: {:?}", result2),
+    }
+
+    let chunk3 = r#""get_time", "parameters": {"timezone": "UTC"}}"#;
+    let result3 = parser.parse_incremental(chunk3, &mut state).await.unwrap();
+    match result3 {
+        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
+            assert_eq!(tool.function.name, "get_time");
         }
+        _ => panic!("Expected tool to be complete, got: {:?}", result3),
     }
 }
