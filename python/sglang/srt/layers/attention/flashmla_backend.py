@@ -5,13 +5,20 @@ Support attention backend for FlashMLA.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, Union
 
 import torch
 import triton
 from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
+from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
+from sglang.srt.layers.attention.nsa.utils import (
+    NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
+    NSA_KV_CACHE_STORE_FP8,
+    compute_nsa_seqlens,
+)
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -74,9 +81,16 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+
+        self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
+        self.nsa_index_topk = (
+            get_nsa_index_topk(model_runner.model_config.hf_config)
+            if self.use_nsa
+            else None
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
@@ -100,10 +114,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 max_seqlen_pad,
             )
-            mla_metadata, num_splits = get_mla_metadata(
-                forward_batch.seq_lens.to(torch.int32),
-                self.num_q_heads,
-                1,
+            mla_metadata, num_splits = _get_mla_metadata_wrapped(
+                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                seq_len_q=1,
+                num_heads_q=self.num_q_heads,
+                num_heads_k=1,
+                nsa_index_topk=self.nsa_index_topk,
             )
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
@@ -130,10 +146,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 max_seqlen_pad,
             )
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_draft_tokens * self.num_q_heads,
-                1,
+            mla_metadata, num_splits = _get_mla_metadata_wrapped(
+                cache_seqlens=seq_lens.to(torch.int32),
+                seq_len_q=self.num_draft_tokens,
+                num_heads_q=self.num_q_heads,
+                num_heads_k=1,
+                nsa_index_topk=self.nsa_index_topk,
             )
 
             # Use FlashMLADecodeMetadata which has the attributes forward_extend expects
@@ -162,20 +180,28 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             cuda_graph_kv_indices = block_kv_indices
 
         if self.num_draft_tokens:
-            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
-                torch.ones(
-                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
-                ),
-                self.num_draft_tokens * self.num_q_heads,
-                1,
+            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = (
+                _get_mla_metadata_wrapped(
+                    cache_seqlens=torch.ones(
+                        max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
+                    ),
+                    seq_len_q=self.num_draft_tokens,
+                    num_heads_q=self.num_q_heads,
+                    num_heads_k=1,
+                    nsa_index_topk=self.nsa_index_topk,
+                )
             )
         else:
-            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
-                torch.ones(
-                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
-                ),
-                self.num_q_heads,
-                1,
+            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = (
+                _get_mla_metadata_wrapped(
+                    cache_seqlens=torch.ones(
+                        max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
+                    ),
+                    seq_len_q=1,
+                    num_heads_q=self.num_q_heads,
+                    num_heads_k=1,
+                    nsa_index_topk=self.nsa_index_topk,
+                )
             )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
@@ -201,10 +227,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_q_heads,
-                1,
+            mla_metadata, num_splits = _get_mla_metadata_wrapped(
+                cache_seqlens=seq_lens.to(torch.int32),
+                seq_len_q=1,
+                num_heads_q=self.num_q_heads,
+                num_heads_k=1,
+                nsa_index_topk=self.nsa_index_topk,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
@@ -226,10 +254,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_draft_tokens * self.num_q_heads,
-                1,
+            mla_metadata, num_splits = _get_mla_metadata_wrapped(
+                cache_seqlens=seq_lens.to(torch.int32),
+                seq_len_q=self.num_draft_tokens,
+                num_heads_q=self.num_q_heads,
+                num_heads_k=1,
+                nsa_index_topk=self.nsa_index_topk,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
@@ -275,10 +305,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_q_heads,
-                1,
+            mla_metadata, num_splits = _get_mla_metadata_wrapped(
+                cache_seqlens=seq_lens.to(torch.int32),
+                seq_len_q=1,
+                num_heads_q=self.num_q_heads,
+                num_heads_k=1,
+                nsa_index_topk=self.nsa_index_topk,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
@@ -300,10 +332,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_draft_tokens * self.num_q_heads,
-                1,
+            mla_metadata, num_splits = _get_mla_metadata_wrapped(
+                cache_seqlens=seq_lens.to(torch.int32),
+                seq_len_q=self.num_draft_tokens,
+                num_heads_q=self.num_q_heads,
+                num_heads_k=1,
+                nsa_index_topk=self.nsa_index_topk,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
@@ -335,6 +369,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         cache_loc = forward_batch.out_cache_loc
 
@@ -349,13 +384,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
         bs = forward_batch.batch_size
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim)
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-        if self.data_type == torch.float8_e4m3fn:
+        if (not self.use_nsa) and self.data_type == torch.float8_e4m3fn:
             reshape_q_fp8 = reshape_q.to(torch.float8_e4m3fn)
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q_fp8,
-                k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
+                k_cache=k_cache,
                 block_table=self.forward_metadata.block_kv_indices[:bs],
                 cache_seqlens=forward_batch.seq_lens.to(torch.int32),
                 head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
@@ -369,17 +405,49 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
+            block_table = self.forward_metadata.block_kv_indices[:bs]
+            cache_seqlens = forward_batch.seq_lens.to(torch.int32)
+
+            extra_kwargs: Dict
+            if self.use_nsa:
+                assert topk_indices is not None
+                extra_kwargs = dict(
+                    indices=_compute_indices_in_kvcache(
+                        block_table=block_table,
+                        topk_indices=topk_indices.to(torch.int32),
+                        page_size=self.page_size,
+                    ),
+                    # doc says it is not used, but if pass in None then error
+                    block_table=block_table,
+                    is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
+                )
+                cache_seqlens = compute_nsa_seqlens(
+                    cache_seqlens, nsa_index_topk=self.nsa_index_topk
+                )
+            else:
+                extra_kwargs = dict(
+                    block_table=block_table,
+                    causal=True,
+                )
+
+            if (
+                self.use_nsa
+                and NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8
+                and not NSA_KV_CACHE_STORE_FP8
+            ):
+                # inefficiently quantize the whole cache
+                k_cache = quantize_k_cache(k_cache)
+
             # todo: need check all causal True or False?
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q,
-                k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-                block_table=self.forward_metadata.block_kv_indices[:bs],
-                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                k_cache=k_cache,
+                cache_seqlens=cache_seqlens,
                 head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                 num_splits=self.forward_metadata.num_splits,
                 softmax_scale=layer.scaling,
-                causal=True,
+                **extra_kwargs,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -539,3 +607,52 @@ class FlashMLAMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, call_fn)
+
+
+def _get_mla_metadata_wrapped(
+    *,
+    cache_seqlens: torch.Tensor,
+    seq_len_q: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    nsa_index_topk: Optional[int],
+):
+    if nsa_index_topk is not None:
+        assert nsa_index_topk is not None
+        return get_mla_metadata(
+            cache_seqlens=cache_seqlens,
+            # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
+            #      but the name looks like need seq_len_q?
+            num_q_tokens_per_head_k=seq_len_q * num_heads_q // num_heads_k,
+            num_heads_k=num_heads_k,
+            num_heads_q=num_heads_q,
+            is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
+            topk=nsa_index_topk,
+        )
+    else:
+        assert nsa_index_topk is None
+        return get_mla_metadata(
+            cache_seqlens=cache_seqlens,
+            num_heads_per_head_k=seq_len_q * num_heads_q // num_heads_k,
+            num_heads_k=num_heads_k,
+        )
+
+
+# TODO speedup
+def _compute_indices_in_kvcache(block_table, topk_indices, page_size):
+    topk_indices_safe = topk_indices.masked_fill(topk_indices == -1, 0)
+
+    idx0 = torch.arange(block_table.size(0), device=topk_indices_safe.device).unsqueeze(
+        1
+    )
+    block_idx = block_table[idx0, topk_indices_safe // page_size]
+    offset = topk_indices_safe % page_size
+    indices_in_kvcache = block_idx * page_size + offset
+
+    # the kernel requires invalid entry to be -1
+    assert indices_in_kvcache.shape == topk_indices.shape
+    indices_in_kvcache[topk_indices == -1] = -1
+
+    # return: (batch_size, seqlen_q_ori, topk)
+    indices_in_kvcache = indices_in_kvcache[:, None, :]
+    return indices_in_kvcache
