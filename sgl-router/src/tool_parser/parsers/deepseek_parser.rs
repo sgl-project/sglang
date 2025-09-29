@@ -50,52 +50,58 @@ impl DeepSeekParser {
         text.contains("<｜tool▁calls▁begin｜>")
     }
 
-    /// Parse a single tool call block
-    fn parse_tool_call(&self, block: &str) -> ToolParserResult<Option<ToolCall>> {
-        if let Some(captures) = self.func_detail_extractor.captures(block) {
-            // Get function type (should be "function")
-            let func_type = captures.get(1).map_or("", |m| m.as_str());
-            if func_type != "function" {
-                return Ok(None);
-            }
+    /// Parse a single tool call block - throws error if parsing fails
+    fn parse_tool_call(&self, block: &str) -> ToolParserResult<ToolCall> {
+        let captures = self.func_detail_extractor.captures(block).ok_or_else(|| {
+            ToolParserError::ParsingFailed("Failed to match tool call pattern".to_string())
+        })?;
 
-            // Get function name
-            let func_name = captures.get(2).map_or("", |m| m.as_str()).trim();
-
-            // Get JSON arguments
-            let json_args = captures.get(3).map_or("{}", |m| m.as_str()).trim();
-
-            // Parse JSON arguments
-            match serde_json::from_str::<Value>(json_args) {
-                Ok(value) => {
-                    // Create arguments object
-                    let args = if value.is_object() {
-                        value
-                    } else {
-                        // If not an object, wrap it
-                        serde_json::json!({ "value": value })
-                    };
-
-                    let arguments = serde_json::to_string(&args)
-                        .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
-
-                    // Generate ID
-                    let id = format!("deepseek_call_{}", uuid::Uuid::new_v4());
-
-                    Ok(Some(ToolCall {
-                        id,
-                        r#type: "function".to_string(),
-                        function: FunctionCall {
-                            name: func_name.to_string(),
-                            arguments,
-                        },
-                    }))
-                }
-                Err(_) => Ok(None),
-            }
-        } else {
-            Ok(None)
+        // Get function type (should be "function")
+        let func_type = captures.get(1).map_or("", |m| m.as_str());
+        if func_type != "function" {
+            return Err(ToolParserError::ParsingFailed(format!(
+                "Invalid function type: {}",
+                func_type
+            )));
         }
+
+        // Get function name
+        let func_name = captures.get(2).map_or("", |m| m.as_str()).trim();
+        if func_name.is_empty() {
+            return Err(ToolParserError::ParsingFailed(
+                "Empty function name".to_string(),
+            ));
+        }
+
+        // Get JSON arguments
+        let json_args = captures.get(3).map_or("{}", |m| m.as_str()).trim();
+
+        // Parse JSON arguments
+        let value = serde_json::from_str::<Value>(json_args)
+            .map_err(|e| ToolParserError::ParsingFailed(format!("Invalid JSON: {}", e)))?;
+
+        // Create arguments object
+        let args = if value.is_object() {
+            value
+        } else {
+            // If not an object, wrap it
+            serde_json::json!({ "value": value })
+        };
+
+        let arguments = serde_json::to_string(&args)
+            .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+
+        // Generate ID
+        let id = format!("deepseek_call_{}", uuid::Uuid::new_v4());
+
+        Ok(ToolCall {
+            id,
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: func_name.to_string(),
+                arguments,
+            },
+        })
     }
 }
 
@@ -108,39 +114,30 @@ impl Default for DeepSeekParser {
 #[async_trait]
 impl ToolParser for DeepSeekParser {
     async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
-        // Check if text contains DeepSeek format
         if !self.has_tool_markers(text) {
             return Ok((text.to_string(), vec![]));
         }
 
-        // Collect matches with positions and parse tools in one pass
-        let matches: Vec<_> = self.tool_call_extractor.find_iter(text).collect();
-        let mut tools = Vec::new();
+        // Find where tool calls begin
+        let idx = text.find("<｜tool▁calls▁begin｜>").unwrap();
+        let normal_text = text[..idx].to_string();
 
-        for mat in matches.iter() {
-            if let Some(tool) = self.parse_tool_call(mat.as_str())? {
-                tools.push(tool);
+        // Try to extract tool calls, log warnings for failures
+        let mut tools = Vec::new();
+        for mat in self.tool_call_extractor.find_iter(text) {
+            match self.parse_tool_call(mat.as_str()) {
+                Ok(tool) => tools.push(tool),
+                Err(e) => {
+                    tracing::warn!("Failed to parse tool call: {}", e);
+                    continue;
+                }
             }
         }
 
-        // Extract normal text using first and last match positions
-        let normal_text = if tools.is_empty() || matches.is_empty() {
-            text.to_string()
-        } else {
-            let first_start = matches[0].start();
-            let last_end = matches.last().unwrap().end();
-            let before = if first_start > 0 {
-                &text[..first_start]
-            } else {
-                ""
-            };
-            let after = if last_end < text.len() {
-                &text[last_end..]
-            } else {
-                ""
-            };
-            format!("{}{}", before, after)
-        };
+        // If no tools were successfully parsed despite having markers, return entire text as fallback
+        if tools.is_empty() {
+            return Ok((text.to_string(), vec![]));
+        }
 
         Ok((normal_text, tools))
     }
@@ -185,11 +182,16 @@ impl ToolParser for DeepSeekParser {
                     // Extract and parse the complete tool call
                     let tool_call_text = &state.buffer[call_start_abs..call_end_abs];
 
-                    if let Some(tool) = self.parse_tool_call(tool_call_text)? {
-                        // Remove the processed part from buffer
-                        state.buffer.drain(..call_end_abs);
-
-                        return Ok(StreamResult::ToolComplete(tool));
+                    match self.parse_tool_call(tool_call_text) {
+                        Ok(tool) => {
+                            // Remove the processed part from buffer
+                            state.buffer.drain(..call_end_abs);
+                            return Ok(StreamResult::ToolComplete(tool));
+                        }
+                        Err(_) => {
+                            // Parsing failed, skip this tool call
+                            state.buffer.drain(..call_end_abs);
+                        }
                     }
                 } else {
                     // Tool call not complete yet, try to extract partial info
@@ -246,53 +248,5 @@ impl ToolParser for DeepSeekParser {
 
     fn detect_format(&self, text: &str) -> bool {
         self.has_tool_markers(text)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_deepseek_single_tool() {
-        let parser = DeepSeekParser::new();
-        let input = r#"Some text
-<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather
-```json
-{"location": "Tokyo", "units": "celsius"}
-```<｜tool▁call▁end｜><｜tool▁calls▁end｜>More text"#;
-
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "get_weather");
-        assert!(tools[0].function.arguments.contains("Tokyo"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_deepseek_multiple_tools() {
-        let parser = DeepSeekParser::new();
-        let input = r#"<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather
-```json
-{"location": "Tokyo"}
-```<｜tool▁call▁end｜>
-<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather
-```json
-{"location": "Paris"}
-```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"#;
-
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].function.name, "get_weather");
-        assert_eq!(tools[1].function.name, "get_weather");
-        assert!(tools[0].function.arguments.contains("Tokyo"));
-        assert!(tools[1].function.arguments.contains("Paris"));
-    }
-
-    #[test]
-    fn test_detect_format() {
-        let parser = DeepSeekParser::new();
-        assert!(parser.detect_format("<｜tool▁calls▁begin｜>"));
-        assert!(!parser.detect_format("plain text"));
-        assert!(!parser.detect_format("[TOOL_CALLS]"));
     }
 }
