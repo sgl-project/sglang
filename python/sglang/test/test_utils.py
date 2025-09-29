@@ -32,13 +32,13 @@ from sglang.global_config import global_config
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_hip,
     is_port_available,
     kill_process_tree,
     retry,
 )
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
-from sglang.srt.utils import is_hip
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
