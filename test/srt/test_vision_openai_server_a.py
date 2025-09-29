@@ -8,25 +8,9 @@ import unittest
 
 from test_vision_openai_server_common import *
 
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    popen_launch_server,
-)
 
-
-class TestLlava(ImageOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
+class TestLlavaServer(ImageOpenAITestMixin):
+    model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
 
 
 class TestQwen2VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
@@ -71,47 +55,25 @@ class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
         cls.base_url += "/v1"
 
 
-class TestQwen2_5_VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--mem-fraction-static",
-                "0.35",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    model = "Qwen/Qwen2.5-VL-7B-Instruct"
+    other_args = [
+        "--mem-fraction-static",
+        "0.35",
+        "--cuda-graph-max-bs",
+        "4",
+    ]
 
 
-class TestVLMContextLengthIssue(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "Qwen/Qwen2-VL-7B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--context-length",
-                "300",
-                "--mem-fraction-static=0.75",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+class TestQwen2VLContextLengthServer(CustomTestCase):
+    model = "Qwen/Qwen2-VL-7B-Instruct"
+    other_args = [
+        "--context-length",
+        "300",
+        "--mem-fraction-static=0.75",
+        "--cuda-graph-max-bs",
+        "4",
+    ]
 
     @classmethod
     def tearDownClass(cls):
@@ -150,167 +112,84 @@ class TestVLMContextLengthIssue(CustomTestCase):
 
 
 class TestMllamaServer(ImageOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
+    model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
 
 
-class TestInternVL2_5Server(ImageOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "OpenGVLab/InternVL2_5-2B"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+class TestInternVL25Server(ImageOpenAITestMixin):
+    model = "OpenGVLab/InternVL2_5-2B"
+    other_args = [
+        "--trust-remote-code",
+        "--cuda-graph-max-bs",
+        "4",
+    ]
 
 
-class TestMinicpmv4Server(ImageOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-V-4"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.35",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+class TestMiniCPMV4Server(ImageOpenAITestMixin):
+    model = "openbmb/MiniCPM-V-4"
+    other_args = [
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.35",
+        "--cuda-graph-max-bs",
+        "4",
+    ]
 
 
-class TestMinicpmo2_6Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-o-2_6"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.65",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
+    model = "openbmb/MiniCPM-o-2_6"
+    other_args = [
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.65",
+        "--cuda-graph-max-bs",
+        "4",
+    ]
 
 
-class TestMimoVLServer(ImageOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "XiaomiMiMo/MiMo-VL-7B-RL"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.6",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+class TestMiMoVLServer(ImageOpenAITestMixin):
+    model = "XiaomiMiMo/MiMo-VL-7B-RL"
+    other_args = [
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.6",
+        "--cuda-graph-max-bs",
+        "4",
+    ]
 
 
 class TestVILAServer(ImageOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.revision = "6bde1de5964b40e61c802b375fff419edc867506"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--trust-remote-code",
-                "--context-length=65536",
-                f"--revision={cls.revision}",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+    model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
+    revision = "6bde1de5964b40e61c802b375fff419edc867506"
+    other_args = [
+        "--trust-remote-code",
+        "--context-length=65536",
+        f"--revision={revision}",
+        "--cuda-graph-max-bs",
+        "4",
+    ]
 
 
 class TestGemma3itServer(ImageOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "google/gemma-3-4b-it"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.70",
-                "--enable-multimodal",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+    model = "google/gemma-3-4b-it"
+    other_args = [
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.70",
+        "--enable-multimodal",
+        "--cuda-graph-max-bs",
+        "4",
+    ]
 
 
 class TestKimiVLServer(ImageOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--context-length",
-                "8192",
-                "--dtype=bfloat16",
-                "--mem-fraction-static=0.7",
-            ],
-        )
-        cls.base_url += "/v1"
+    model = "moonshotai/Kimi-VL-A3B-Instruct"
+    other_args = [
+        "--trust-remote-code",
+        "--context-length",
+        "8192",
+        "--dtype=bfloat16",
+        "--mem-fraction-static=0.7",
+    ]
 
     def test_video_images_chat_completion(self):
         # model context length exceeded
@@ -318,26 +197,16 @@ class TestKimiVLServer(ImageOpenAITestMixin):
 
 
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "zai-org/GLM-4.1V-9B-Thinking"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.68",
-                "--cuda-graph-max-bs",
-                "4",
-                "--reasoning-parser",
-                "glm45",
-            ],
-        )
-        cls.base_url += "/v1"
+    model = "zai-org/GLM-4.1V-9B-Thinking"
+    other_args = [
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.68",
+        "--cuda-graph-max-bs",
+        "4",
+        "--reasoning-parser",
+        "glm45",
+    ]
 
 
 if __name__ == "__main__":
@@ -346,6 +215,5 @@ if __name__ == "__main__":
         ImageOpenAITestMixin,
         VideoOpenAITestMixin,
         AudioOpenAITestMixin,
-        TestOpenAIOmniServerBase,
     )
     unittest.main()
