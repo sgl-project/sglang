@@ -16,6 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 from sglang.srt.layers.attention.nsa import index_buf_accessor
+from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
@@ -38,6 +39,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.layers.attention.nsa.utils import NSA_KV_CACHE_STORE_FP8
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
 
@@ -1048,7 +1050,12 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
-        self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+        # TODO do not hardcode
+        self.kv_cache_dim = (
+            656
+            if use_nsa and NSA_KV_CACHE_STORE_FP8
+            else (kv_lora_rank + qk_rope_head_dim)
+        )
 
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
@@ -1135,7 +1142,10 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
+        if self.use_nsa and NSA_KV_CACHE_STORE_FP8:
+            # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
+            cache_k = quantize_k_cache(cache_k.unsqueeze(1)).squeeze(1)
+        elif cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
