@@ -163,19 +163,17 @@ impl ToolParser for LlamaParser {
             self.parse_semicolon_separated(&json_content)?
         } else {
             // Try single JSON object
-            match serde_json::from_str::<Value>(json_content.trim()) {
-                Ok(value) => {
-                    if let Some(tool) = self.parse_single_object(&value)? {
-                        vec![tool]
-                    } else {
-                        vec![]
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse tool call: {}", e);
-                    vec![]
-                }
-            }
+            let parsed = serde_json::from_str::<Value>(json_content.trim())
+                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))
+                .and_then(|v| {
+                    self.parse_single_object(&v)
+                        .map(|opt| opt.map_or_else(Vec::new, |tool| vec![tool]))
+                });
+
+            parsed.unwrap_or_else(|e| {
+                tracing::warn!("Failed to parse tool call: {:?}", e);
+                vec![]
+            })
         };
 
         // If we couldn't parse any tools, return the original text
