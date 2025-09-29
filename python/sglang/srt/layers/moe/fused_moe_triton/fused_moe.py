@@ -412,6 +412,7 @@ def fused_experts_impl(
         topk_ids.shape[1],
         config_dtype,
         block_shape=block_shape,
+        return_down_config=True,
     )
 
     config, (down_config, max_block_m) = get_config_func(M)
