@@ -118,8 +118,12 @@ async fn test_json_extraction_without_wrapper_tokens() {
     And here is some text after.
     "#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(
+        normal_text,
+        "\n    Here is some text before the JSON.\n    \n    And here is some text after.\n    "
+    );
     assert_eq!(tools[0].function.name, "search");
 }
 
@@ -143,8 +147,9 @@ async fn test_json_with_multiline_wrapper_content() {
 ```
 Done!"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "");
     assert_eq!(tools[0].function.name, "format_code");
 }
 

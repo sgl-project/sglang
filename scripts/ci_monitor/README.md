@@ -24,6 +24,7 @@ A comprehensive toolkit to analyze CI failures and performance trends for the SG
 - **CSV Export**: Export performance data in structured CSV format
 - **Trend Analysis**: Visualize performance trends with interactive charts
 - **Comprehensive Metrics**: Track output throughput, E2E latency, TTFT, accept length, and more
+- **Time-Based Sampling**: Intelligent sampling strategy to cover extended time periods (up to 30 days) with limited API calls
 
 ### Common Features
 - **Automated Monitoring**: GitHub Actions workflow for continuous CI and performance monitoring
@@ -77,14 +78,89 @@ python ci_analyzer_perf.py --token YOUR_GITHUB_TOKEN
 #### Advanced Usage
 
 ```bash
-# Analyze last 1000 PR Test runs
+# Analyze last 1000 PR Test runs (auto-enables uniform sampling for ~30 days coverage)
 python ci_analyzer_perf.py --token YOUR_GITHUB_TOKEN --limit 1000
 
 # Custom output directory
 python ci_analyzer_perf.py --token YOUR_GITHUB_TOKEN --limit 500 --output-dir my_performance_data
+
+# Use sampling with 500 runs (will use sequential mode since < 500 threshold)
+python ci_analyzer_perf.py --token YOUR_GITHUB_TOKEN --limit 500
+
+# Get ALL performance data within a specific date range (recommended for historical analysis)
+python ci_analyzer_perf.py --token YOUR_GITHUB_TOKEN --start-date 2024-12-01 --end-date 2024-12-31
+
+# Get complete data for the last week
+python ci_analyzer_perf.py --token YOUR_GITHUB_TOKEN --start-date $(date -d '7 days ago' +%Y-%m-%d) --end-date $(date +%Y-%m-%d)
+
+# Upload results to GitHub repository for sharing
+python ci_analyzer_perf.py --token YOUR_GITHUB_TOKEN --limit 1000 --upload-to-github
 ```
 
 **Important**: Make sure your GitHub token has `repo` and `workflow` permissions, otherwise you'll get 404 errors.
+
+## Data Collection Strategies
+
+The Performance Analyzer offers multiple strategies for collecting performance data to suit different analysis needs.
+
+### 1. Uniform Sampling Strategy
+
+**When to use**: Daily monitoring and trend analysis over extended periods.
+
+- **Automatically enabled** when `--limit >= 500`
+- **Disabled** for smaller limits (< 500) to maintain backward compatibility
+
+#### How it works:
+- Collects data uniformly across a 30-day period
+- Ensures even time distribution of samples
+- Provides consistent coverage for trend analysis
+
+#### Example with 1000 Runs:
+- **Time Range**: Last 30 days
+- **Distribution**: 1000 samples evenly distributed across the period
+- **Coverage**: ~33 samples per day on average
+
+### 2. Date Range Collection
+
+**When to use**: Historical analysis, specific period investigation, or complete data collection.
+
+Use `--start-date` and `--end-date` parameters to get **ALL** CI runs within a specific time range.
+
+#### Features:
+- **Complete Data**: Gets every CI run in the specified range (no sampling)
+- **No Limit**: Ignores the `--limit` parameter
+- **Flexible Range**: Specify any date range you need
+- **Historical Analysis**: Perfect for investigating specific time periods
+
+#### Date Format:
+- Use `YYYY-MM-DD` format (e.g., `2024-12-01`)
+- Both parameters are optional:
+  - Only `--start-date`: Gets all runs from that date to now
+  - Only `--end-date`: Gets all runs from 30 days ago to that date
+  - Both: Gets all runs in the specified range
+
+### 3. Sequential Collection (Traditional)
+
+**When to use**: Quick checks or when you only need recent data.
+
+- **Default behavior** for `--limit < 500`
+- Gets the most recent CI runs in chronological order
+- Fast and simple for immediate analysis
+
+### Comparison
+
+| Strategy | Use Case | Time Coverage | Data Completeness | API Efficiency |
+|----------|----------|---------------|-------------------|----------------|
+| **Uniform Sampling** | Daily monitoring, trends | ~30 days | Sampled | High |
+| **Date Range** | Historical analysis | Any range | Complete | Variable |
+| **Sequential** | Quick checks | 3-4 days | Complete (recent) | High |
+
+### Benefits
+
+- **Flexible Analysis**: Choose the right strategy for your needs
+- **Extended Coverage**: Up to 30 days with sampling, unlimited with date ranges
+- **Complete Data**: Get every run in a specific period when needed
+- **API Efficiency**: Optimized for different use patterns
 
 ## Parameters
 
@@ -101,8 +177,11 @@ python ci_analyzer_perf.py --token YOUR_GITHUB_TOKEN --limit 500 --output-dir my
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--token` | Required | GitHub Personal Access Token |
-| `--limit` | 100 | Number of PR Test runs to analyze |
+| `--limit` | 100 | Number of PR Test runs to analyze (ignored when using date range) |
 | `--output-dir` | performance_tables | Output directory for CSV tables and PNG charts |
+| `--start-date` | None | Start date for date range query (YYYY-MM-DD format) |
+| `--end-date` | None | End date for date range query (YYYY-MM-DD format) |
+| `--upload-to-github` | False | Upload results to sglang-bot/sglang-ci-data repository |
 
 ## Getting GitHub Token
 
