@@ -30,7 +30,12 @@ from transformers.utils import TensorType
 
 from sglang.srt.configs.openvla import OpenVLAConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.mm_utils import general_mm_embed_routine
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
@@ -294,50 +299,62 @@ class OpenVLAForActionPrediction(PreTrainedModel):
 
         embedding_layer = self.language_model.model.embed_tokens
         input_ids.clamp_(min=0, max=32064 - 1)  # Clamp image pad_value token ids
-        input_embeddings = embedding_layer(input_ids)
-
-        pt = 0
         bs = forward_batch.batch_size
-        extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
-        extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
+        assert bs == len(forward_batch.mm_inputs), (
+            "Batch size doesn't match the number of image inputs, "
+            "each request can have only one image."
+        )
+
+        extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().tolist()
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens.cpu().tolist()
         prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
 
-        assert bs == len(
-            forward_batch.mm_inputs
-        ), "Batch size doesn't match the number of image inputs, each request can have only one image."
+        pt = 0
         for i, image_input in enumerate(forward_batch.mm_inputs):
+            assert image_input is not None, "Missing mm_inputs entry"
             assert (
                 len(image_input.mm_items) == 1
             ), "OpenVLA only supports single image inputs"
+
             mm_item = image_input.mm_items[0]
-            processed_image = mm_item.feature
-            pixel_value = processed_image.to(torch.bfloat16).to(input_embeddings.device)
-            patch_features = self.vision_backbone(pixel_value)
-            projected_patch_embeddings = self.projector(patch_features)[0]
+
+            if not getattr(mm_item, "offsets", None):
+                mm_item.offsets = [(1, 256)]
 
             relative_id_image_start = 1 - prefix_lens_cpu[i]
             relative_id_image_end = relative_id_image_start + 256
-
-            # Supports chunked prefill
             id_start = max(pt + relative_id_image_start, extend_start_loc_cpu[i])
             id_end = min(
-                pt + relative_id_image_end, extend_start_loc_cpu[i] + extend_seq_lens[i]
+                pt + relative_id_image_end,
+                extend_start_loc_cpu[i] + extend_seq_lens_cpu[i],
             )
             if id_end < 0:
                 id_end = 0
-            length = id_end - id_start
-            id_image_start = 0 if prefix_lens_cpu[i] == 0 else prefix_lens_cpu[i] - 1
-            # print(f"{id_start=} {id_end=} {length=} {id_image_start=} {id_image_start + length=}")
-            input_embeddings[id_start:id_end] = projected_patch_embeddings[
-                id_image_start : id_image_start + length
-            ]
-            pt += forward_batch.extend_seq_lens_cpu[i]
 
-        return self.language_model(
-            input_ids=None,
-            positions=positions,
+            if id_end > id_start:
+                pad_val = mm_item.pad_value
+                input_ids[id_start:id_end] = pad_val
+
+            pt += extend_seq_lens_cpu[i]
+
+        def _image_embedder(items: List[MultimodalDataItem]) -> torch.Tensor:
+            outs = []
+            for it in items:
+                pixel_value = it.feature.to(torch.bfloat16).to(input_ids.device)
+                patch_features = self.vision_backbone(pixel_value)
+                projected = self.projector(patch_features)[0]
+                outs.append(projected)
+            return torch.cat(outs, dim=0) if len(outs) > 1 else outs[0]
+
+        return general_mm_embed_routine(
+            input_ids=input_ids,
             forward_batch=forward_batch,
-            input_embeds=input_embeddings,
+            language_model=self.language_model,
+            multimodal_model=None,
+            data_embedding_funcs={Modality.IMAGE: _image_embedder},
+            placeholder_tokens=None,
+            use_deepstack=False,
+            positions=positions,
         )
 
 
