@@ -167,29 +167,6 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
 
-    if capture_bs is None:
-        if server_args.speculative_algorithm is None:
-            if server_args.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
-            else:
-                capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
-        else:
-            # Since speculative decoding requires more cuda graph memory, we
-            # capture less.
-            capture_bs = (
-                list(range(1, 9))
-                + list(range(10, 33, 2))
-                + list(range(40, 65, 8))
-                + list(range(80, 161, 16))
-            )
-
-        gpu_mem = get_device_memory_capacity()
-        if gpu_mem is not None:
-            if gpu_mem > 90 * 1024:  # H200, H20
-                capture_bs += list(range(160, 257, 8))
-            if gpu_mem > 160 * 1000:  # B200, MI300
-                capture_bs += list(range(256, 513, 16))
-
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
@@ -205,12 +182,6 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
     capture_bs = [bs for bs in capture_bs if bs % mul_base == 0]
 
-    if server_args.cuda_graph_max_bs:
-        capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
-        if max(capture_bs) < server_args.cuda_graph_max_bs:
-            capture_bs += list(
-                range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
-            )
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"

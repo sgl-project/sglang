@@ -38,6 +38,10 @@ impl MistralParser {
     /// - Escape sequences
     /// - Bracket depth
     fn extract_json_array<'a>(&self, text: &'a str) -> Option<&'a str> {
+        self.extract_json_array_with_pos(text).map(|(_, json)| json)
+    }
+
+    fn extract_json_array_with_pos<'a>(&self, text: &'a str) -> Option<(usize, &'a str)> {
         const BOT_TOKEN: &str = "[TOOL_CALLS] [";
 
         // Find the start of the token
@@ -78,7 +82,7 @@ impl MistralParser {
                     bracket_count -= 1;
                     if bracket_count == 0 {
                         // Found the matching closing bracket
-                        return Some(&text[json_start..=i]);
+                        return Some((start_idx, &text[json_start..=i]));
                     }
                 }
             }
@@ -154,18 +158,31 @@ impl Default for MistralParser {
 
 #[async_trait]
 impl ToolParser for MistralParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains Mistral format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
-        // Extract JSON array from Mistral format
-        if let Some(json_array) = self.extract_json_array(text) {
-            self.parse_json_array(json_array)
+        // Extract JSON array from Mistral format with position
+        if let Some((start_idx, json_array)) = self.extract_json_array_with_pos(text) {
+            // Extract normal text before BOT_TOKEN
+            let normal_text_before = if start_idx > 0 {
+                text[..start_idx].to_string()
+            } else {
+                String::new()
+            };
+
+            match self.parse_json_array(json_array) {
+                Ok(tools) => Ok((normal_text_before, tools)),
+                Err(_) => {
+                    // If JSON parsing fails, return the original text as normal text
+                    Ok((text.to_string(), vec![]))
+                }
+            }
         } else {
             // Markers present but no complete array found
-            Ok(vec![])
+            Ok((text.to_string(), vec![]))
         }
     }
 
@@ -178,7 +195,18 @@ impl ToolParser for MistralParser {
 
         // Check if we have the start marker
         if !self.has_tool_markers(&state.buffer) {
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before [TOOL_CALLS] and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("[TOOL_CALLS]") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Try to extract complete JSON array
@@ -291,10 +319,10 @@ mod tests {
         let parser = MistralParser::new();
         let input = r#"[TOOL_CALLS] [{"name": "get_weather", "arguments": {"location": "Paris", "units": "celsius"}}]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Paris"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert!(tools[0].function.arguments.contains("Paris"));
     }
 
     #[tokio::test]
@@ -305,10 +333,10 @@ mod tests {
             {"name": "calculate", "arguments": {"expression": "2 + 2"}}
         ]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "search");
-        assert_eq!(result[1].function.name, "calculate");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "search");
+        assert_eq!(tools[1].function.name, "calculate");
     }
 
     #[tokio::test]
@@ -316,11 +344,11 @@ mod tests {
         let parser = MistralParser::new();
         let input = r#"[TOOL_CALLS] [{"name": "process", "arguments": {"data": [1, 2, [3, 4]], "config": {"nested": [5, 6]}}}]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "process");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "process");
         // JSON serialization removes spaces, so check for [3,4] without spaces
-        assert!(result[0].function.arguments.contains("[3,4]"));
+        assert!(tools[0].function.arguments.contains("[3,4]"));
     }
 
     #[tokio::test]
@@ -328,9 +356,9 @@ mod tests {
         let parser = MistralParser::new();
         let input = r#"[TOOL_CALLS] [{"name": "echo", "arguments": {"message": "He said \"Hello [World]\""}}]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "echo");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "echo");
     }
 
     #[test]

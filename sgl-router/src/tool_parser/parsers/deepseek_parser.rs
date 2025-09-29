@@ -50,14 +50,6 @@ impl DeepSeekParser {
         text.contains("<｜tool▁calls▁begin｜>")
     }
 
-    /// Extract all tool call blocks from text
-    fn extract_tool_calls<'a>(&self, text: &'a str) -> Vec<&'a str> {
-        self.tool_call_extractor
-            .find_iter(text)
-            .map(|m| m.as_str())
-            .collect()
-    }
-
     /// Parse a single tool call block
     fn parse_tool_call(&self, block: &str) -> ToolParserResult<Option<ToolCall>> {
         if let Some(captures) = self.func_detail_extractor.captures(block) {
@@ -115,23 +107,42 @@ impl Default for DeepSeekParser {
 
 #[async_trait]
 impl ToolParser for DeepSeekParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains DeepSeek format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
-        // Extract all tool call blocks
-        let tool_blocks = self.extract_tool_calls(text);
+        // Collect matches with positions and parse tools in one pass
+        let matches: Vec<_> = self.tool_call_extractor.find_iter(text).collect();
         let mut tools = Vec::new();
 
-        for block in tool_blocks {
-            if let Some(tool) = self.parse_tool_call(block)? {
+        for mat in matches.iter() {
+            if let Some(tool) = self.parse_tool_call(mat.as_str())? {
                 tools.push(tool);
             }
         }
 
-        Ok(tools)
+        // Extract normal text using first and last match positions
+        let normal_text = if tools.is_empty() || matches.is_empty() {
+            text.to_string()
+        } else {
+            let first_start = matches[0].start();
+            let last_end = matches.last().unwrap().end();
+            let before = if first_start > 0 {
+                &text[..first_start]
+            } else {
+                ""
+            };
+            let after = if last_end < text.len() {
+                &text[last_end..]
+            } else {
+                ""
+            };
+            format!("{}{}", before, after)
+        };
+
+        Ok((normal_text, tools))
     }
 
     async fn parse_incremental(
@@ -143,8 +154,18 @@ impl ToolParser for DeepSeekParser {
 
         // Check for tool markers
         if !self.has_tool_markers(&state.buffer) {
-            // No markers found, return as incomplete
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("<｜tool▁calls▁begin｜>") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Look for start of tool calls
@@ -209,7 +230,7 @@ impl ToolParser for DeepSeekParser {
                                             });
                                         }
                                         Err(_) => {
-                                            // Can't parse yet, keep buffering
+                                            // Can't parse yet, continue waiting for more data
                                         }
                                     }
                                 }
@@ -241,10 +262,10 @@ mod tests {
 {"location": "Tokyo", "units": "celsius"}
 ```<｜tool▁call▁end｜><｜tool▁calls▁end｜>More text"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Tokyo"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert!(tools[0].function.arguments.contains("Tokyo"));
     }
 
     #[tokio::test]
@@ -259,12 +280,12 @@ mod tests {
 {"location": "Paris"}
 ```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert_eq!(result[1].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Tokyo"));
-        assert!(result[1].function.arguments.contains("Paris"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert_eq!(tools[1].function.name, "get_weather");
+        assert!(tools[0].function.arguments.contains("Tokyo"));
+        assert!(tools[1].function.arguments.contains("Paris"));
     }
 
     #[test]
