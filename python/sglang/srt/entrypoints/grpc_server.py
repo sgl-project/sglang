@@ -490,9 +490,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             for val_list, idx_list in zip(top_logprobs_val, top_logprobs_idx):
                 top_logprobs_proto.append(
                     sglang_scheduler_pb2.TopLogProbs(
-                        values=val_list if val_list else [],
-                        token_ids=idx_list if idx_list else [],
-                        token_texts=[],  # Empty - Rust will decode
+                        values=val_list,
+                        token_ids=idx_list,
                     )
                 )
 
@@ -500,7 +499,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             token_logprobs=token_logprobs_val,
             token_ids=token_logprobs_idx,
             top_logprobs=top_logprobs_proto,
-            token_texts=[],  # Empty - Rust will decode
         )
 
     def _create_chunk_response(
@@ -510,18 +508,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         meta_info = output.get("meta_info", {})
 
         # Convert output logprobs if present
-        output_logprobs_proto = None
-        if "output_logprobs" in output:
-            output_logprobs_proto = self._convert_logprobs_to_proto(
-                output["output_logprobs"]
-            )
+        output_logprobs_proto = self._convert_logprobs_to_proto(
+            output.get("output_logprobs")
+        )
 
         # Convert input logprobs if present (only in first chunk)
-        input_logprobs_proto = None
-        if "input_logprobs" in output:
-            input_logprobs_proto = self._convert_logprobs_to_proto(
-                output["input_logprobs"]
-            )
+        input_logprobs_proto = self._convert_logprobs_to_proto(
+            output.get("input_logprobs")
+        )
 
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
@@ -568,18 +562,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 matched_stop_kwargs["matched_stop_str"] = matched
 
         # Convert output logprobs if present
-        output_logprobs_proto = None
-        if "output_logprobs" in output:
-            output_logprobs_proto = self._convert_logprobs_to_proto(
-                output["output_logprobs"]
-            )
+        output_logprobs_proto = self._convert_logprobs_to_proto(
+            output.get("output_logprobs")
+        )
 
         # Convert input logprobs if present
-        input_logprobs_proto = None
-        if "input_logprobs" in output:
-            input_logprobs_proto = self._convert_logprobs_to_proto(
-                output["input_logprobs"]
-            )
+        input_logprobs_proto = self._convert_logprobs_to_proto(
+            output.get("input_logprobs")
+        )
 
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,

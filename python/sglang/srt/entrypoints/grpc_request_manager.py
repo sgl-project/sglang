@@ -594,26 +594,19 @@ class GrpcRequestManager:
                 if state.obj.stream:
                     # For streaming: send incremental logprobs (only new tokens in this chunk)
                     # NOTE: this is different than TokenizerManager, which always accumulates
+                    def get_part(attr_name):
+                        source_list = getattr(batch_out, attr_name, None)
+                        return (
+                            source_list[i]
+                            if source_list and i < len(source_list)
+                            else []
+                        )
+
                     output_data["output_logprobs"] = {
                         "token_logprobs_val": batch_out.output_token_logprobs_val[i],
-                        "token_logprobs_idx": (
-                            batch_out.output_token_logprobs_idx[i]
-                            if batch_out.output_token_logprobs_idx
-                            and i < len(batch_out.output_token_logprobs_idx)
-                            else []
-                        ),
-                        "top_logprobs_val": (
-                            batch_out.output_top_logprobs_val[i]
-                            if batch_out.output_top_logprobs_val
-                            and i < len(batch_out.output_top_logprobs_val)
-                            else []
-                        ),
-                        "top_logprobs_idx": (
-                            batch_out.output_top_logprobs_idx[i]
-                            if batch_out.output_top_logprobs_idx
-                            and i < len(batch_out.output_top_logprobs_idx)
-                            else []
-                        ),
+                        "token_logprobs_idx": get_part("output_token_logprobs_idx"),
+                        "top_logprobs_val": get_part("output_top_logprobs_val"),
+                        "top_logprobs_idx": get_part("output_top_logprobs_idx"),
                     }
                 elif output_data["finished"]:
                     # Non-streaming: send cumulative output logprobs in final chunk

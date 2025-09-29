@@ -750,12 +750,7 @@ impl GrpcRouter {
             .collect();
 
         // Build ChatLogProbsContent for each token
-        for (i, (&_token_id, &logprob)) in proto_logprobs
-            .token_ids
-            .iter()
-            .zip(proto_logprobs.token_logprobs.iter())
-            .enumerate()
-        {
+        for (i, &logprob) in proto_logprobs.token_logprobs.iter().enumerate() {
             let token_text = token_texts.get(i).cloned().unwrap_or_default();
             let bytes = Some(token_text.as_bytes().to_vec());
 
@@ -798,11 +793,7 @@ impl GrpcRouter {
         }
 
         Ok(crate::protocols::spec::ChatLogProbs::Detailed {
-            content: if content_items.is_empty() {
-                None
-            } else {
-                Some(content_items)
-            },
+            content: (!content_items.is_empty()).then_some(content_items),
         })
     }
 
