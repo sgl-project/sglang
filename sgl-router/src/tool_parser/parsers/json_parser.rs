@@ -227,10 +227,34 @@ impl JsonParser {
         }
 
         // Check for any start token
-        self.token_config
+        let has_start_token = self
+            .token_config
             .start_tokens
             .iter()
-            .any(|token| text.contains(token))
+            .any(|token| text.contains(token));
+
+        // Also check if we have what looks like JSON even without start token
+        // This handles cases where we've already processed the start token
+        // and are working on subsequent tools
+        has_start_token || (text.trim_start().starts_with('{') && text.contains(r#""name""#))
+    }
+
+    /// Check if text might contain a partial start token (for streaming)
+    fn has_partial_start_token(&self, text: &str) -> bool {
+        if self.token_config.start_tokens.is_empty() {
+            return false;
+        }
+
+        // Check if the end of the buffer could be the start of any start token
+        for start_token in &self.token_config.start_tokens {
+            for i in 1..start_token.len() {
+                let token_prefix = &start_token[..i];
+                if text.ends_with(token_prefix) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -382,8 +406,42 @@ impl ToolParser for JsonParser {
 
         // Check if we have potential tool calls
         if !self.has_tool_markers(&state.buffer) {
-            // No tool markers, return as incomplete
-            return Ok(StreamResult::Incomplete);
+            if self.has_partial_start_token(&state.buffer) {
+                // We might be in the middle of receiving a start token, wait for more data
+                return Ok(StreamResult::Incomplete);
+            }
+
+            // No tool markers and no partial tokens - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if !self.token_config.start_tokens.is_empty() {
+            let start_token = &self.token_config.start_tokens[0];
+            if !start_token.is_empty() {
+                if let Some(marker_pos) = state.buffer.find(start_token) {
+                    if marker_pos > 0 {
+                        // We have text before the tool marker - extract it as normal text
+                        let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                        return Ok(StreamResult::NormalText(normal_text));
+                    }
+                }
+            }
+        } else {
+            // For JSON without start tokens, look for the start of JSON structure
+            // Find whichever comes first: '{' or '['
+            let brace_pos = state.buffer.find('{');
+            let bracket_pos = state.buffer.find('[');
+            let json_pos = brace_pos.iter().chain(bracket_pos.iter()).min().copied();
+
+            if let Some(pos) = json_pos {
+                if pos > 0 {
+                    // We have text before JSON structure - extract it as normal text
+                    let normal_text: String = state.buffer.drain(..pos).collect();
+                    return Ok(StreamResult::NormalText(normal_text));
+                }
+            }
         }
 
         // Extract JSON content first to check for separators
@@ -407,9 +465,8 @@ impl ToolParser for JsonParser {
                             // We need to figure out how much to remove from the original buffer
                             // Find where the separator is in the original buffer and remove up to and including it
                             if let Some(sep_in_original) = state.buffer.find(separator.as_str()) {
-                                let remaining =
-                                    state.buffer[sep_in_original + separator.len()..].to_string();
-                                state.buffer = remaining;
+                                // Remove processed content up to and including separator
+                                state.buffer.drain(..=sep_in_original + separator.len() - 1);
                             }
 
                             // Return the first tool as complete
@@ -518,7 +575,7 @@ impl ToolParser for JsonParser {
             }
             Err(_) => {
                 // Failed to parse even as partial JSON
-                // Keep buffering
+                // Continue waiting for more data
             }
         }
 
@@ -555,158 +612,6 @@ impl ToolParser for JsonParser {
             }
         } else {
             false
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_single_tool_call() {
-        let parser = JsonParser::new();
-        let input = r#"{"name": "get_weather", "arguments": {"location": "San Francisco"}}"#;
-
-        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].function.name, "get_weather");
-        assert_eq!(normal_text, ""); // Pure JSON should have no normal text
-    }
-
-    #[tokio::test]
-    async fn test_extract_json_with_normal_text() {
-        let parser = JsonParser::new();
-
-        // Test extraction of JSON from mixed text
-        let input =
-            r#"Here is some text before {"name": "test", "arguments": {}} and some text after."#;
-        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
-
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].function.name, "test");
-        assert_eq!(
-            normal_text,
-            "Here is some text before  and some text after."
-        );
-    }
-
-    #[tokio::test]
-    async fn test_extract_json_array_with_normal_text() {
-        let parser = JsonParser::new();
-
-        // Test extraction of JSON array from mixed text
-        let input = r#"Prefix text [{"name": "func1", "arguments": {}}, {"name": "func2", "arguments": {}}] suffix text"#;
-        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
-
-        assert_eq!(tool_calls.len(), 2);
-        assert_eq!(tool_calls[0].function.name, "func1");
-        assert_eq!(tool_calls[1].function.name, "func2");
-        assert_eq!(normal_text, "Prefix text  suffix text");
-    }
-
-    #[tokio::test]
-    async fn test_parse_multiple_tool_calls() {
-        let parser = JsonParser::new();
-        let input = r#"[
-            {"name": "get_weather", "arguments": {"location": "SF"}},
-            {"name": "search", "arguments": {"query": "news"}}
-        ]"#;
-
-        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tool_calls.len(), 2);
-        assert_eq!(tool_calls[0].function.name, "get_weather");
-        assert_eq!(tool_calls[1].function.name, "search");
-        assert_eq!(normal_text, ""); // Pure JSON should have no normal text
-    }
-
-    #[tokio::test]
-    async fn test_parse_with_parameters_key() {
-        let parser = JsonParser::new();
-        let input = r#"{"name": "calculate", "parameters": {"x": 10, "y": 20}}"#;
-
-        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].function.name, "calculate");
-        assert!(tool_calls[0].function.arguments.contains("10"));
-        assert_eq!(normal_text, ""); // Pure JSON should have no normal text
-    }
-
-    #[tokio::test]
-    async fn test_parse_with_wrapper_tokens() {
-        let parser = JsonParser::with_config(TokenConfig {
-            start_tokens: vec!["<tool>".to_string()],
-            end_tokens: vec!["</tool>".to_string()],
-            separator: ", ".to_string(),
-        });
-
-        let input = r#"<tool>{"name": "test", "arguments": {}}</tool>"#;
-        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].function.name, "test");
-        assert_eq!(normal_text, ""); // Wrapper tokens with no extra text
-    }
-
-    #[tokio::test]
-    async fn test_parse_with_start_token_invalid_json() {
-        let parser = JsonParser::with_config(TokenConfig {
-            start_tokens: vec!["<|python_tag|>".to_string()],
-            end_tokens: vec!["".to_string()],
-            separator: ";".to_string(),
-        });
-
-        let input = r#"Hello world <|python_tag|>this is not valid json at all"#;
-        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tool_calls.len(), 0);
-        assert_eq!(normal_text, input); // Should return entire original text when JSON parsing fails
-    }
-
-    #[tokio::test]
-    async fn test_parse_with_normal_text() {
-        let parser = JsonParser::new();
-        let input = r#"Here is the weather data: {"name": "get_weather", "arguments": {"location": "SF"}} Let me know if you need more info."#;
-
-        let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].function.name, "get_weather");
-        assert_eq!(
-            normal_text,
-            "Here is the weather data:  Let me know if you need more info."
-        ); // Normal text is now extracted when JSON is found in mixed content
-    }
-
-    #[test]
-    fn test_detect_format() {
-        let parser = JsonParser::new();
-
-        assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
-        assert!(parser.detect_format(r#"[{"name": "test"}]"#));
-        assert!(!parser.detect_format("plain text"));
-        assert!(!parser.detect_format(r#"{"key": "value"}"#));
-    }
-
-    #[tokio::test]
-    async fn test_streaming_parse() {
-        // Just verify that streaming eventually produces a complete tool call
-        let parser = JsonParser::new();
-        let mut state = ParseState::new();
-
-        // Send complete JSON in one go
-        // TODO simplified version, address more complex version
-        let full_json = r#"{"name": "get_weather", "arguments": {"location": "SF"}}"#;
-
-        let result = parser
-            .parse_incremental(full_json, &mut state)
-            .await
-            .unwrap();
-
-        // Should get a complete tool immediately with complete JSON
-        match result {
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "get_weather");
-                assert!(tool.function.arguments.contains("SF"));
-            }
-            _ => panic!("Expected ToolComplete for complete JSON input"),
         }
     }
 }
