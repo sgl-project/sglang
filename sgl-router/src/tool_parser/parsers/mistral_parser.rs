@@ -195,7 +195,18 @@ impl ToolParser for MistralParser {
 
         // Check if we have the start marker
         if !self.has_tool_markers(&state.buffer) {
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before [TOOL_CALLS] and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("[TOOL_CALLS]") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Try to extract complete JSON array
