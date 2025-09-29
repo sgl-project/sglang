@@ -109,7 +109,8 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
-        normalized_name = params_mapping.get(name, name)
+        base_name = name.split(".")[-1] # Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj"). 
+        normalized_name = params_mapping.get(base_name, name)
         result.add(normalized_name)
     return result
 
