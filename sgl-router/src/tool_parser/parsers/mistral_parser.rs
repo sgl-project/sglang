@@ -175,8 +175,9 @@ impl ToolParser for MistralParser {
 
             match self.parse_json_array(json_array) {
                 Ok(tools) => Ok((normal_text_before, tools)),
-                Err(_) => {
+                Err(e) => {
                     // If JSON parsing fails, return the original text as normal text
+                    tracing::warn!("Failed to parse tool call: {}", e);
                     Ok((text.to_string(), vec![]))
                 }
             }
