@@ -99,9 +99,9 @@ def get_normalized_target_modules(
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
     Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
-    
+
     Always normalizes to base names for consistency, ensuring compatibility between
-    prefixed adapter modules and server target modules.
+    prefixed adapter modules and SUPPORTED_LORA_TARGET_MODULES.
     """
     params_mapping = {
         "q_proj": "qkv_proj",
@@ -114,7 +114,7 @@ def get_normalized_target_modules(
     result = set()
     for name in target_modules:
         base_name = name.split(".")[-1]
-        
+
         if base_name in params_mapping:
             normalized_name = params_mapping[base_name]
             result.add(normalized_name)
