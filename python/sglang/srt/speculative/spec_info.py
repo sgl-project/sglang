@@ -6,6 +6,7 @@ class SpeculativeAlgorithm(IntEnum):
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
+    NGRAM = auto()
     LOOKAHEAD = auto()
     SIMPLE_EAGLE = auto()
 

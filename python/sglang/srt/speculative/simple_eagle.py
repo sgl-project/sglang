@@ -160,14 +160,10 @@ class SimpleEagleWorker(TpModelWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-    def clear_cache_pool(self):
-        self.model_runner.req_to_token_pool.clear()
-        self.model_runner.token_to_kv_pool_allocator.clear()
-
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
-        self.cuda_graph_mem_usage = 0
+        self.graph_mem_usage = 0
         # self.server_args.disable_cuda_graph = False
         if self.server_args.disable_cuda_graph:
             return
@@ -179,10 +175,10 @@ class SimpleEagleWorker(TpModelWorker):
         )
         self.cuda_graph_runner = SimpleEAGLECudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.cuda_graph_mem_usage = before_mem - after_mem
+        self.graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture simple cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+            f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
     @property
@@ -364,7 +360,6 @@ class SimpleEagleWorker(TpModelWorker):
                 forward_batch.seq_lens + num_draft_tokens,
                 num_draft_tokens,
                 req_to_token.shape[-1],
-                self.page_size,
                 next_power_of_2(num_seqs),
             )
             forward_batch.spec_info.kv_indptr = kv_indptr
