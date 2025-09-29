@@ -66,7 +66,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     other_args = ["--tp", "2"] if is_tp2 else []
 
                     if model == "meta-llama/Llama-3.1-70B-Instruct":
-                        other_args.append("--mem-fraction-static", "0.9")
+                        other_args.extend(["--mem-fraction-static", "0.9"])
 
                     process = popen_launch_server(
                         model=model,
