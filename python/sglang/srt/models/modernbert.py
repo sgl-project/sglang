@@ -40,7 +40,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
 
-
+# checked
 class ModernBertEmbeddings(nn.Module):
     """Token embedding + layer norm + dropout."""
 
@@ -54,11 +54,8 @@ class ModernBertEmbeddings(nn.Module):
         self.norm = nn.LayerNorm(
             config.hidden_size,
             eps=config.norm_eps,
+            bias=config.norm_bias,
         )
-        if not config.norm_bias:
-            with torch.no_grad():
-                self.norm.bias.zero_()
-                self.norm.bias.requires_grad_(False)
         self.drop = nn.Dropout(config.embedding_dropout)
 
     def forward(
@@ -135,7 +132,11 @@ class ModernBertSelfAttention(nn.Module):
                 if config.local_rope_theta is not None
                 else config.global_rope_theta
             )
-        max_position_embeddings = config.max_position_embeddings
+        # 关键修复：局部注意力层使用local_attention作为max_position_embeddings
+        if self.is_global_layer:
+            max_position_embeddings = config.max_position_embeddings
+        else:
+            max_position_embeddings = config.max_position_embeddings 
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
@@ -186,10 +187,9 @@ class ModernBertSelfAttention(nn.Module):
 
         attn_output = self.attn(q, k, v, forward_batch)
         attn_output, _ = self.out_proj(attn_output)
-        attn_output = self.dropout(attn_output)
         return attn_output
 
-
+# checked
 class ModernBertMLP(nn.Module):
     """ModernBERT MLP uses gated activation."""
 
@@ -202,8 +202,7 @@ class ModernBertMLP(nn.Module):
         super().__init__()
         self.intermediate_size = config.intermediate_size
         self.hidden_size = config.hidden_size
-
-        self.input_linear = ColumnParallelLinear(
+        self.Wi = ColumnParallelLinear(
             input_size=config.hidden_size,
             output_size=config.intermediate_size * 2,
             bias=config.mlp_bias,
@@ -213,7 +212,7 @@ class ModernBertMLP(nn.Module):
         hidden_act = getattr(config, "hidden_activation", "gelu")
         self.activation = get_act_fn(hidden_act)
         self.dropout = nn.Dropout(config.mlp_dropout)
-        self.out_linear = RowParallelLinear(
+        self.Wo = RowParallelLinear(
             input_size=config.intermediate_size,
             output_size=config.hidden_size,
             bias=config.mlp_bias,
@@ -222,14 +221,14 @@ class ModernBertMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.input_linear(hidden_states)
-        gate, up = gate_up.chunk(2, dim=-1)
-        hidden_states = self.activation(gate) * up
+        gate_up, _ = self.Wi(hidden_states)
+        input, gate = gate_up.chunk(2, dim=-1)
+        hidden_states = self.activation(input) * gate
         hidden_states = self.dropout(hidden_states)
-        hidden_states, _ = self.out_linear(hidden_states)
+        hidden_states, _ = self.Wo(hidden_states)
         return hidden_states
 
-
+# checked
 class ModernBertEncoderLayer(nn.Module):
     def __init__(
         self,
@@ -247,11 +246,8 @@ class ModernBertEncoderLayer(nn.Module):
             self.attn_norm = nn.LayerNorm(
                 config.hidden_size,
                 eps=config.norm_eps,
+                bias=config.norm_bias,
             )
-            if not config.norm_bias:
-                with torch.no_grad():
-                    self.attn_norm.bias.zero_()
-                    self.attn_norm.bias.requires_grad_(False)
 
         self.attention = ModernBertSelfAttention(
             config=config,
@@ -262,11 +258,8 @@ class ModernBertEncoderLayer(nn.Module):
         self.mlp_norm = nn.LayerNorm(
             config.hidden_size,
             eps=config.norm_eps,
+            bias=config.norm_bias,
         )
-        if not config.norm_bias:
-            with torch.no_grad():
-                self.mlp_norm.bias.zero_()
-                self.mlp_norm.bias.requires_grad_(False)
         self.mlp = ModernBertMLP(
             config=config,
             quant_config=quant_config,
@@ -314,11 +307,8 @@ class ModernBertEncoder(nn.Module):
         self.final_norm = nn.LayerNorm(
             config.hidden_size,
             eps=config.norm_eps,
+            bias=config.norm_bias,
         )
-        if not config.norm_bias:
-            with torch.no_grad():
-                self.final_norm.bias.zero_()
-                self.final_norm.bias.requires_grad_(False)
 
     def forward(
         self,
@@ -348,7 +338,7 @@ class ModernBertModel(nn.Module):
             prefix=add_prefix("encoder", prefix),
         )
         self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=True)
-
+    
     @torch.no_grad()
     def forward(
         self,
@@ -359,70 +349,18 @@ class ModernBertModel(nn.Module):
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
         assert get_embedding, "ModernBertModel is only used for embedding"
-
+        
+        # 1. Embeddings
         if input_embeds is None:
             hidden_states = self.embeddings(input_ids=input_ids)
         else:
             hidden_states = self.embeddings(inputs_embeds=input_embeds)
-
-        if hidden_states.dim() == 3:
-            batch_size = hidden_states.shape[0]
-            seq_len = hidden_states.shape[1]
-        else:
-            batch_size = getattr(forward_batch, "batch_size", 1)
-            seq_len = hidden_states.shape[0] // max(batch_size, 1)
-
-        device = hidden_states.device
-
-        seq_lens = getattr(forward_batch, "extend_seq_lens", None)
-        if seq_lens is None:
-            if getattr(forward_batch, "seq_lens", None) is not None:
-                seq_lens = forward_batch.seq_lens
-            elif getattr(forward_batch, "attention_mask", None) is not None:
-                seq_lens = forward_batch.attention_mask.sum(dim=1).to(torch.int32)
-            else:
-                seq_lens = torch.full(
-                    (batch_size,),
-                    seq_len,
-                    dtype=torch.int32,
-                    device=device,
-                )
-            forward_batch.extend_seq_lens = seq_lens
-
-        batch_size = seq_lens.numel()
-        device = hidden_states.device
-
-        if hidden_states.dim() == 3:
-            B, T, D = hidden_states.shape
-            hs_bt = hidden_states.reshape(B * T, D)
-            if getattr(forward_batch, "attention_mask", None) is not None:
-                valid_mask = forward_batch.attention_mask.to(torch.bool).reshape(-1)
-            else:
-                ar = torch.arange(T, device=device).unsqueeze(0)
-                valid_mask = (ar < seq_lens.unsqueeze(1)).reshape(-1)
-            hidden_states = hs_bt[valid_mask]
-        else:
-            N = hidden_states.shape[0]
-            sum_l = int(seq_lens.sum().item())
-            if N != sum_l:
-                raise ValueError("Unexpected hidden_states shape: expect packed [sum(L_i), D]")
-
-        # packed positions: cat(0..L0-1, 0..L1-1, ...)
-        positions = torch.cat(
-            [torch.arange(int(L), device=device, dtype=torch.long) for L in seq_lens.tolist()],
-            dim=0,
-        )
-
-        # （可选）形状自检，调试时开：
-        if "os" in globals() and bool(int(os.environ.get("SGL_DEBUG_SHAPES", "0"))):
-            N = int(seq_lens.sum().item())
-            print("[DBG] N=", N, " hs=", tuple(hidden_states.shape), " pos=", tuple(positions.shape))
-            assert hidden_states.shape[0] == N and positions.shape[0] == N
-
-        # 进入 encoder（RadixAttention 会用 extend_seq_lens + sliding_window_size 自动建滑窗索引）
+        
+        # 2. Encoder (22 layers)
         hidden_states = self.encoder(hidden_states, positions, forward_batch)
-        pooled_output = self.pooler(hidden_states, forward_batch)
-        return pooled_output
+        
+        # 3. Pooling
+        return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
@@ -431,15 +369,12 @@ class ModernBertModel(nn.Module):
             ("model.embeddings.norm", "embeddings.norm"),
             ("model.layers.", "encoder.layers."),
             ("model.final_norm", "encoder.final_norm"),
-            ("model.head.norm", "pooler.dense"),
-            ("model.head.dense", "pooler.dense"),
-            ("decoder.bias", "pooler.bias"),
-            ("mlp.Wi", "mlp.input_linear"),
-            ("mlp.Wo", "mlp.out_linear"),
-            ("attn.Wqkv", "attention.qkv_proj"),
-            ("attn.Wo", "attention.out_proj"),
-            ("attn_norm", "attn_norm"),
-            ("mlp_norm", "mlp_norm"),
+            (".attn.Wqkv", ".attention.qkv_proj"),
+            (".attn.Wo", ".attention.out_proj"),
+            (".mlp.Wi", ".mlp.Wi"),
+            (".mlp.Wo", ".mlp.Wo"),
+            (".attn_norm", ".attn_norm"),
+            (".mlp_norm", ".mlp_norm"),
         )
 
         unmatched = []

@@ -97,7 +97,7 @@ class SchedulerProfilerMixin:
     def start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
-        stage_str = f" for {stage.__str__()}" if stage else ""
+        stage_str = f" for {stage.name}" if stage else ""
         logger.info(
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
         )
@@ -181,7 +181,7 @@ class SchedulerProfilerMixin:
         if not Path(self.torch_profiler_output_dir).exists():
             Path(self.torch_profiler_output_dir).mkdir(parents=True, exist_ok=True)
 
-        stage_suffix = f"-{stage.__str__()}" if stage else ""
+        stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
@@ -247,7 +247,7 @@ class SchedulerProfilerMixin:
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
                         # force trace flush
-                        self.stop_profile(ForwardMode.EXTEND)
+                        self.stop_profile(stage=ForwardMode.EXTEND)
                     self.start_profile(batch.forward_mode)
                 self.profiler_decode_ct += 1
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
@@ -294,6 +294,6 @@ class SchedulerProfilerMixin:
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
                 )
-                return self.start_profile(True)
+                return self.start_profile()
         else:
             return self.stop_profile()
