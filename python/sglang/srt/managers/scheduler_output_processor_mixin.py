@@ -310,9 +310,7 @@ class SchedulerOutputProcessorMixin:
         self, req: Req, input_token_logprobs: List
     ) -> None:
         """Process input token logprobs values and indices."""
-        is_multi_item_scoring = (
-            req.is_prefill_only and self.server_args.multi_item_scoring_delimiter
-        )
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
 
         # Process logprob values - handle multi-item scoring vs regular requests
         if is_multi_item_scoring:
@@ -346,9 +344,7 @@ class SchedulerOutputProcessorMixin:
         if req.top_logprobs_num <= 0:
             return
 
-        is_multi_item_scoring = (
-            req.is_prefill_only and self.server_args.multi_item_scoring_delimiter
-        )
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
 
         # Initialize arrays - multi-item scoring starts empty, others start with None
         req.input_top_logprobs_val = [] if is_multi_item_scoring else [None]
@@ -363,8 +359,8 @@ class SchedulerOutputProcessorMixin:
             req.input_top_logprobs_val.extend(val)
             req.input_top_logprobs_idx.extend(idx)
 
-        # Remove last token (sampling token) for non-prefill-only requests
-        if not is_multi_item_scoring and not req.is_prefill_only:
+        # Remove last token (sampling token) for non multi-item scoring requests
+        if not is_multi_item_scoring:
             req.input_top_logprobs_val.pop()
             req.input_top_logprobs_idx.pop()
 
@@ -377,9 +373,7 @@ class SchedulerOutputProcessorMixin:
         if req.token_ids_logprob is None:
             return
 
-        is_multi_item_scoring = (
-            req.is_prefill_only and self.server_args.multi_item_scoring_delimiter
-        )
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
 
         # Initialize arrays - multi-item scoring starts empty, others start with None
         req.input_token_ids_logprobs_val = [] if is_multi_item_scoring else [None]
@@ -397,8 +391,8 @@ class SchedulerOutputProcessorMixin:
             )
             req.input_token_ids_logprobs_idx.extend(idx)
 
-        # Remove last token (sampling token) for non-prefill-only requests
-        if not is_multi_item_scoring and not req.is_prefill_only:
+        # Remove last token (sampling token) for non multi-item scoring requests
+        if not is_multi_item_scoring:
             req.input_token_ids_logprobs_val.pop()
             req.input_token_ids_logprobs_idx.pop()
 
@@ -412,9 +406,7 @@ class SchedulerOutputProcessorMixin:
         For multi-item scoring, only delimiter positions have logprobs.
         For regular requests, all positions from logprob_start_len onwards have logprobs.
         """
-        is_multi_item_scoring = (
-            req.is_prefill_only and self.server_args.multi_item_scoring_delimiter
-        )
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
 
         if is_multi_item_scoring:
             # Multi-item scoring: count delimiter tokens from logprob_start_len onwards
@@ -436,9 +428,7 @@ class SchedulerOutputProcessorMixin:
         For multi-item scoring, only delimiter positions have logprobs.
         For regular requests, all positions in the range have logprobs.
         """
-        is_multi_item_scoring = (
-            req.is_prefill_only and self.server_args.multi_item_scoring_delimiter
-        )
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
 
         if is_multi_item_scoring:
             # Multi-item scoring: count delimiter tokens in the relevant portion
@@ -453,6 +443,15 @@ class SchedulerOutputProcessorMixin:
         else:
             # Regular request: all tokens in the range
             return extend_input_len - extend_logprob_start_len
+
+    def _is_multi_item_scoring(self, req: Req) -> bool:
+        """Check if request uses multi-item scoring.
+
+        Multi-item scoring applies to prefill-only requests when a delimiter
+        token is configured. In this mode, only positions containing the
+        delimiter token receive logprobs.
+        """
+        return req.is_prefill_only and self.server_args.multi_item_scoring_delimiter
 
     def add_input_logprob_return_values(
         self: Scheduler,
