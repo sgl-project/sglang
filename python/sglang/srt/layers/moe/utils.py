@@ -131,8 +131,10 @@ def initialize_moe_config(server_args: ServerArgs):
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
-    SPECULATIVE_MOE_RUNNER_BACKEND = MoeRunnerBackend(
-        server_args.speculative_moe_runner_backend
+    SPECULATIVE_MOE_RUNNER_BACKEND = (
+        MoeRunnerBackend(server_args.speculative_moe_runner_backend)
+        if server_args.speculative_moe_runner_backend is not None
+        else MOE_RUNNER_BACKEND
     )
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""

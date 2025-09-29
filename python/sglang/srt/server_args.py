@@ -300,7 +300,7 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
-    speculative_moe_runner_backend: str = "auto"
+    speculative_moe_runner_backend: Optional[str] = None
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -925,7 +925,7 @@ class ServerArgs:
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
-        
+
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):
             logger.warning(
                 "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass_fp8 and/or --speculative-moe-runner-backend=cutlass_fp8 instead"
@@ -1109,6 +1109,11 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+
+        if self.speculative_moe_runner_backend is not None:
+            assert (
+                self.speculative_algorithm == "EAGLE"
+            ), "speculative_moe_runner_backend is only implemented for --speculative-algorithm=EAGLE"
 
     def _handle_load_format(self):
         if (
