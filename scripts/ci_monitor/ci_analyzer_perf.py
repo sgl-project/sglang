@@ -262,6 +262,12 @@ class SGLangPerfAnalyzer:
 
                 collected_runs.extend(period_runs)
 
+                # Progress indicator every 5 pages
+                if page % 5 == 0:
+                    print(
+                        f"    Page {page}: Found {total_in_period} runs in target period, collected {len(collected_runs)} total"
+                    )
+
                 # Check if we've gone past our time window
                 if data["workflow_runs"]:
                     last_run_time_str = data["workflow_runs"][-1].get("created_at", "")
@@ -397,6 +403,12 @@ class SGLangPerfAnalyzer:
 
                 collected_runs.extend(period_runs)
 
+                # Progress indicator every 5 pages
+                if page % 5 == 0:
+                    print(
+                        f"    Page {page}: Found {total_in_period} runs in date range, collected {len(collected_runs)} total"
+                    )
+
                 # Check if we've gone past our time window
                 if data["workflow_runs"]:
                     last_run_time_str = data["workflow_runs"][-1].get("created_at", "")
@@ -415,13 +427,6 @@ class SGLangPerfAnalyzer:
                     break
 
                 page += 1
-
-                # Progress indicator for large date ranges
-                if page % 10 == 0:
-                    print(
-                        f"  Processed {page} pages, found {total_in_period} runs in date range..."
-                    )
-
                 time.sleep(0.1)
 
             except requests.exceptions.RequestException as e:
@@ -617,8 +622,7 @@ class SGLangPerfAnalyzer:
                         f"    Found {test_name} performance data: {list(perf_data.keys())}"
                     )
 
-            time.sleep(0.2)  # Slightly longer delay between runs to be API-friendly
-
+            time.sleep(0.2)
         return all_test_data
 
     def generate_performance_tables(
@@ -953,69 +957,148 @@ class SGLangPerfAnalyzer:
     def upload_file_to_github(
         self, file_path: str, github_path: str, commit_message: str
     ) -> bool:
-        """Upload a file to GitHub repository"""
-        try:
-            # Read file content
-            with open(file_path, "rb") as f:
-                content = f.read()
+        """Upload a file to GitHub repository with retry logic"""
+        max_retries = 30
+        retry_count = 0
 
-            # Encode content to base64
-            content_encoded = base64.b64encode(content).decode("utf-8")
+        while retry_count < max_retries:
+            try:
+                # Read file content
+                with open(file_path, "rb") as f:
+                    content = f.read()
 
-            # Check if file exists to get SHA
-            check_url = f"{self.base_url}/repos/{self.data_repo}/contents/{github_path}"
-            check_response = self.session.get(check_url)
+                # Encode content to base64
+                content_encoded = base64.b64encode(content).decode("utf-8")
 
-            sha = None
-            if check_response.status_code == 200:
-                sha = check_response.json().get("sha")
+                # Check if file exists to get SHA
+                check_url = (
+                    f"{self.base_url}/repos/{self.data_repo}/contents/{github_path}"
+                )
+                check_response = self.session.get(check_url)
 
-            # Prepare upload data
-            upload_data = {
-                "message": commit_message,
-                "content": content_encoded,
-                "branch": self.data_branch,
-            }
+                sha = None
+                if check_response.status_code == 200:
+                    sha = check_response.json().get("sha")
 
-            if sha:
-                upload_data["sha"] = sha
+                # Prepare upload data
+                upload_data = {
+                    "message": commit_message,
+                    "content": content_encoded,
+                    "branch": self.data_branch,
+                }
 
-            # Upload file
-            response = self.session.put(check_url, json=upload_data)
-            response.raise_for_status()
+                if sha:
+                    upload_data["sha"] = sha
 
-            print(f"    ✅ Uploaded: {github_path}")
-            return True
+                # Upload file
+                response = self.session.put(check_url, json=upload_data)
 
-        except Exception as e:
-            print(f"    ❌ Failed to upload {github_path}: {e}")
-            return False
+                if response.status_code in [200, 201]:
+                    print(f"    ✅ Uploaded: {github_path}")
+                    return True
+                elif response.status_code == 403:
+                    retry_count += 1
+                    wait_time = min(2**retry_count, 30)
+                    print(
+                        f"    ⚠️ Upload forbidden (403) for {github_path}, retrying in {wait_time}s... (attempt {retry_count}/{max_retries})"
+                    )
+                    if retry_count >= max_retries:
+                        print(
+                            f"    ❌ Failed to upload {github_path} after {max_retries} attempts (403 Forbidden)"
+                        )
+                        return False
+                    time.sleep(wait_time)
+                else:
+                    response.raise_for_status()
+
+            except requests.exceptions.RequestException as e:
+                retry_count += 1
+                wait_time = min(2**retry_count, 30)
+                print(
+                    f"    ⚠️ Upload error for {github_path} (attempt {retry_count}/{max_retries}): {e}"
+                )
+                if retry_count >= max_retries:
+                    print(
+                        f"    ❌ Failed to upload {github_path} after {max_retries} attempts: {e}"
+                    )
+                    return False
+                print(f"    Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            except Exception as e:
+                print(f"    ❌ Failed to upload {github_path}: {e}")
+                return False
+
+        return False
 
     def upload_performance_data_to_github(self, output_dir: str):
         """Upload performance_tables to GitHub with original structure"""
         print("📤 Uploading performance data to GitHub...")
 
-        # Check if target repository exists
+        # Check if target repository exists with retry logic
         repo_url = f"{self.base_url}/repos/{self.data_repo}"
-        try:
-            repo_response = self.session.get(repo_url)
-            if repo_response.status_code == 404:
+        max_retries = 30
+        retry_count = 0
+
+        print(f"🔍 Checking repository access to {self.data_repo}...")
+
+        while retry_count < max_retries:
+            try:
+                repo_response = self.session.get(repo_url)
+
+                if repo_response.status_code == 200:
+                    print(f"✅ Repository {self.data_repo} is accessible")
+                    break
+                elif repo_response.status_code == 404:
+                    print(
+                        f"❌ Repository {self.data_repo} does not exist or is not accessible"
+                    )
+                    print("   Please ensure:")
+                    print("   1. The repository exists")
+                    print("   2. Your GitHub token has access to this repository")
+                    print("   3. Your token has 'contents:write' permission")
+                    return
+                elif repo_response.status_code == 403:
+                    retry_count += 1
+                    wait_time = min(2**retry_count, 60)  # Exponential backoff, max 60s
+                    print(
+                        f"⚠️ Repository access forbidden (403), retrying in {wait_time}s... (attempt {retry_count}/{max_retries})"
+                    )
+                    if retry_count >= max_retries:
+                        print(
+                            f"❌ Failed to access repository after {max_retries} attempts"
+                        )
+                        print("   This might be due to:")
+                        print("   1. GitHub API rate limiting")
+                        print("   2. Token permissions issue")
+                        print("   3. Repository access restrictions")
+                        return
+                    time.sleep(wait_time)
+                else:
+                    retry_count += 1
+                    wait_time = min(2**retry_count, 60)
+                    print(
+                        f"⚠️ Repository access failed with status {repo_response.status_code}, retrying in {wait_time}s... (attempt {retry_count}/{max_retries})"
+                    )
+                    if retry_count >= max_retries:
+                        print(
+                            f"❌ Failed to access repository {self.data_repo} after {max_retries} attempts"
+                        )
+                        return
+                    time.sleep(wait_time)
+
+            except Exception as e:
+                retry_count += 1
+                wait_time = min(2**retry_count, 60)
                 print(
-                    f"❌ Repository {self.data_repo} does not exist or is not accessible"
+                    f"⚠️ Error checking repository (attempt {retry_count}/{max_retries}): {e}"
                 )
-                print("   Please ensure:")
-                print("   1. The repository exists")
-                print("   2. Your GitHub token has access to this repository")
-                print("   3. Your token has 'contents:write' permission")
-                return
-            elif repo_response.status_code != 200:
-                print(
-                    f"❌ Failed to access repository {self.data_repo}: {repo_response.status_code}"
-                )
-                return
-        except Exception as e:
-            print(f"❌ Error checking repository: {e}")
-            return
+                if retry_count >= max_retries:
+                    print(
+                        f"❌ Failed to check repository after {max_retries} attempts: {e}"
+                    )
+                    return
+                print(f"   Retrying in {wait_time}s...")
+                time.sleep(wait_time)
 
         # Generate timestamp for this upload
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
