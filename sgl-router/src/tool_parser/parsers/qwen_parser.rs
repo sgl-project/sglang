@@ -191,8 +191,7 @@ impl ToolParser for QwenParser {
         // Check if we have the start marker
         if !self.has_tool_markers(&state.buffer) {
             // No tool markers detected - return all buffered content as normal text
-            let normal_text = state.buffer.clone();
-            state.buffer.clear();
+            let normal_text = std::mem::take(&mut state.buffer);
             return Ok(StreamResult::NormalText(normal_text));
         }
 
@@ -200,8 +199,7 @@ impl ToolParser for QwenParser {
         if let Some(marker_pos) = state.buffer.find("<tool_call>") {
             if marker_pos > 0 {
                 // We have text before the tool marker - extract it as normal text
-                let normal_text = state.buffer[..marker_pos].to_string();
-                state.buffer = state.buffer[marker_pos..].to_string();
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
                 return Ok(StreamResult::NormalText(normal_text));
             }
         }
@@ -228,8 +226,7 @@ impl ToolParser for QwenParser {
                         // JSON parsing failed, might be incomplete or malformed
                         // If we have what looks like a complete tool call block, treat as normal text
                         if state.buffer[start_pos..end_pos].contains("\n</tool_call>") {
-                            let malformed_text = state.buffer[..end_pos].to_string();
-                            state.buffer = state.buffer[end_pos..].to_string();
+                            let malformed_text: String = state.buffer.drain(..end_pos).collect();
                             return Ok(StreamResult::NormalText(malformed_text));
                         }
                     }

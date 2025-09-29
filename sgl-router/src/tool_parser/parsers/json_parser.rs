@@ -406,8 +406,7 @@ impl ToolParser for JsonParser {
             }
 
             // No tool markers and no partial tokens - return all buffered content as normal text
-            let normal_text = state.buffer.clone();
-            state.buffer.clear();
+            let normal_text = std::mem::take(&mut state.buffer);
             return Ok(StreamResult::NormalText(normal_text));
         }
 
@@ -418,8 +417,7 @@ impl ToolParser for JsonParser {
                 if let Some(marker_pos) = state.buffer.find(start_token) {
                     if marker_pos > 0 {
                         // We have text before the tool marker - extract it as normal text
-                        let normal_text = state.buffer[..marker_pos].to_string();
-                        state.buffer = state.buffer[marker_pos..].to_string();
+                        let normal_text: String = state.buffer.drain(..marker_pos).collect();
                         return Ok(StreamResult::NormalText(normal_text));
                     }
                 }
@@ -429,18 +427,12 @@ impl ToolParser for JsonParser {
             // Find whichever comes first: '{' or '['
             let brace_pos = state.buffer.find('{');
             let bracket_pos = state.buffer.find('[');
-            let json_pos = match (brace_pos, bracket_pos) {
-                (Some(b), Some(k)) => Some(b.min(k)),
-                (Some(b), None) => Some(b),
-                (None, Some(k)) => Some(k),
-                (None, None) => None,
-            };
+            let json_pos = brace_pos.iter().chain(bracket_pos.iter()).min().copied();
 
             if let Some(pos) = json_pos {
                 if pos > 0 {
                     // We have text before JSON structure - extract it as normal text
-                    let normal_text = state.buffer[..pos].to_string();
-                    state.buffer = state.buffer[pos..].to_string();
+                    let normal_text: String = state.buffer.drain(..pos).collect();
                     return Ok(StreamResult::NormalText(normal_text));
                 }
             }

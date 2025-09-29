@@ -155,8 +155,7 @@ impl ToolParser for DeepSeekParser {
         // Check for tool markers
         if !self.has_tool_markers(&state.buffer) {
             // No tool markers detected - return all buffered content as normal text
-            let normal_text = state.buffer.clone();
-            state.buffer.clear();
+            let normal_text = std::mem::take(&mut state.buffer);
             return Ok(StreamResult::NormalText(normal_text));
         }
 
@@ -164,8 +163,7 @@ impl ToolParser for DeepSeekParser {
         if let Some(marker_pos) = state.buffer.find("<｜tool▁calls▁begin｜>") {
             if marker_pos > 0 {
                 // We have text before the tool marker - extract it as normal text
-                let normal_text = state.buffer[..marker_pos].to_string();
-                state.buffer = state.buffer[marker_pos..].to_string();
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
                 return Ok(StreamResult::NormalText(normal_text));
             }
         }

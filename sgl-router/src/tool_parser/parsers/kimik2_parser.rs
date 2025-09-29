@@ -153,24 +153,19 @@ impl ToolParser for KimiK2Parser {
 
         if !has_tool_call {
             // No tool markers detected - return all buffered content as normal text
-            let normal_text = state.buffer.clone();
-            state.buffer.clear();
+            let normal_text = std::mem::take(&mut state.buffer);
             return Ok(StreamResult::NormalText(normal_text));
         }
 
         // Check for text before tool markers and extract it as normal text
-        if let Some(marker_pos) = state.buffer.find("<|tool_calls_section_begin|>") {
-            if marker_pos > 0 {
+        let marker1_pos = state.buffer.find("<|tool_calls_section_begin|>");
+        let marker2_pos = state.buffer.find("<|tool_call_begin|>");
+        let marker_pos = marker1_pos.iter().chain(marker2_pos.iter()).min().copied();
+
+        if let Some(pos) = marker_pos {
+            if pos > 0 {
                 // We have text before the tool marker - extract it as normal text
-                let normal_text = state.buffer[..marker_pos].to_string();
-                state.buffer = state.buffer[marker_pos..].to_string();
-                return Ok(StreamResult::NormalText(normal_text));
-            }
-        } else if let Some(marker_pos) = state.buffer.find("<|tool_call_begin|>") {
-            if marker_pos > 0 {
-                // We have text before the individual tool call marker - extract it as normal text
-                let normal_text = state.buffer[..marker_pos].to_string();
-                state.buffer = state.buffer[marker_pos..].to_string();
+                let normal_text: String = state.buffer.drain(..pos).collect();
                 return Ok(StreamResult::NormalText(normal_text));
             }
         }
