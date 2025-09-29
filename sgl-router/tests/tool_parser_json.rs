@@ -3,33 +3,35 @@
 //! Tests for the JSON parser which handles OpenAI, Claude, and generic JSON formats
 
 use serde_json::json;
-use sglang_router_rs::tool_parser::{JsonParser, ToolParser};
+use sglang_router_rs::tool_parser::{JsonParser, TokenConfig, ToolParser};
 
 #[tokio::test]
 async fn test_simple_json_tool_call() {
     let parser = JsonParser::new();
     let input = r#"{"name": "get_weather", "arguments": {"location": "San Francisco"}}"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "get_weather");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "");
+    assert_eq!(tools[0].function.name, "get_weather");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["location"], "San Francisco");
 }
 
 #[tokio::test]
 async fn test_json_array_of_tools() {
     let parser = JsonParser::new();
-    let input = r#"[
+    let input = r#"Hello, here are the results: [
         {"name": "get_weather", "arguments": {"location": "SF"}},
         {"name": "search", "arguments": {"query": "news"}}
     ]"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "get_weather");
-    assert_eq!(result[1].function.name, "search");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "Hello, here are the results: ");
+    assert_eq!(tools[0].function.name, "get_weather");
+    assert_eq!(tools[1].function.name, "search");
 }
 
 #[tokio::test]
@@ -37,11 +39,12 @@ async fn test_json_with_parameters_key() {
     let parser = JsonParser::new();
     let input = r#"{"name": "calculate", "parameters": {"x": 10, "y": 20}}"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "calculate");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "");
+    assert_eq!(tools[0].function.name, "calculate");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["x"], 10);
     assert_eq!(args["y"], 20);
 }
@@ -51,9 +54,13 @@ async fn test_json_extraction_from_text() {
     let parser = JsonParser::new();
     let input = r#"I'll help you with that. {"name": "search", "arguments": {"query": "rust"}} Let me search for that."#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "search");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(
+        normal_text,
+        "I'll help you with that.  Let me search for that."
+    );
+    assert_eq!(tools[0].function.name, "search");
 }
 
 #[tokio::test]
@@ -73,11 +80,12 @@ async fn test_json_with_nested_objects() {
         }
     }"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "update_config");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "");
+    assert_eq!(tools[0].function.name, "update_config");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["settings"]["theme"], "dark");
     assert_eq!(args["settings"]["notifications"]["email"], true);
 }
@@ -87,10 +95,11 @@ async fn test_json_with_special_characters() {
     let parser = JsonParser::new();
     let input = r#"{"name": "echo", "arguments": {"text": "Line 1\nLine 2\tTabbed", "path": "C:\\Users\\test"}}"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["text"], "Line 1\nLine 2\tTabbed");
     assert_eq!(args["path"], "C:\\Users\\test");
 }
@@ -100,10 +109,11 @@ async fn test_json_with_unicode() {
     let parser = JsonParser::new();
     let input = r#"{"name": "translate", "arguments": {"text": "Hello 世界 🌍", "emoji": "😊"}}"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["text"], "Hello 世界 🌍");
     assert_eq!(args["emoji"], "😊");
 }
@@ -113,11 +123,12 @@ async fn test_json_empty_arguments() {
     let parser = JsonParser::new();
     let input = r#"{"name": "ping", "arguments": {}}"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "ping");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "");
+    assert_eq!(tools[0].function.name, "ping");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args, json!({}));
 }
 
@@ -127,13 +138,17 @@ async fn test_json_invalid_format() {
 
     // Missing closing brace
     let input = r#"{"name": "test", "arguments": {"key": "value""#;
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 0);
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 0);
+    assert_eq!(
+        normal_text,
+        "{\"name\": \"test\", \"arguments\": {\"key\": \"value\""
+    );
 
     // Not JSON at all
     let input = "This is just plain text";
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 0);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 0);
 }
 
 #[tokio::test]
@@ -144,4 +159,33 @@ async fn test_json_format_detection() {
     assert!(parser.detect_format(r#"[{"name": "test"}]"#));
     assert!(!parser.detect_format("plain text"));
     assert!(!parser.detect_format(r#"{"key": "value"}"#)); // No name field
+}
+
+#[tokio::test]
+async fn test_parse_with_wrapper_tokens() {
+    let parser = JsonParser::with_config(TokenConfig {
+        start_tokens: vec!["<tool>".to_string()],
+        end_tokens: vec!["</tool>".to_string()],
+        separator: ", ".to_string(),
+    });
+
+    let input = r#"<tool>{"name": "test", "arguments": {}}</tool>"#;
+    let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].function.name, "test");
+    assert_eq!(normal_text, ""); // Wrapper tokens with no extra text
+}
+
+#[tokio::test]
+async fn test_parse_with_start_token_invalid_json() {
+    let parser = JsonParser::with_config(TokenConfig {
+        start_tokens: vec!["<|python_tag|>".to_string()],
+        end_tokens: vec!["".to_string()],
+        separator: ";".to_string(),
+    });
+
+    let input = r#"Hello world <|python_tag|>this is not valid json at all"#;
+    let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tool_calls.len(), 0);
+    assert_eq!(normal_text, input); // Should return entire original text when JSON parsing fails
 }

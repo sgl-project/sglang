@@ -22,6 +22,7 @@ from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.tng_r1t2_detector import TngR1T2Detector
+from sglang.srt.function_call.utils import get_json_schema_constraint
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,9 @@ class FunctionCallParser:
         ):
             ebnf = self.get_ebnf(tool_choice)
             return ("ebnf", ebnf) if ebnf is not None else None
+        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+            json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            return ("json_schema", json_schema)
 
     def get_ebnf(
         self, tool_choice: Union[ToolChoice, Literal["required"]]
