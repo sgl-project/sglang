@@ -111,19 +111,25 @@ async fn test_mistral_parser_invalid_format_returns_as_normal_text() {
 async fn test_deepseek_parser_invalid_format_returns_as_normal_text() {
     let parser = DeepSeekParser::new();
 
-    // Invalid JSON after emoji marker
-    let input = r#"🤔[{"name": "test", "arguments": malformed}]"#;
+    // Invalid JSON in tool call
+    let input = r#"Some text<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>test
+```json
+{"name": "test", "arguments": malformed}
+```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"#;
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 0);
     assert_eq!(normal_text, input); // Should preserve original text when parsing fails
 
-    // Emoji but no JSON array
-    let input = "🤔 Just thinking about this problem...";
+    // Missing function marker
+    let input = r#"<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>notfunction<｜tool▁sep｜>test
+```json
+{"x": 1}
+```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"#;
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 0);
-    assert_eq!(normal_text, input); // Should return original text
+    assert_eq!(normal_text, input); // Should return original text when parsing fails
 
-    // No emoji marker at all
+    // No tool markers at all
     let input = "Regular response without any special markers.";
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 0);
@@ -148,9 +154,8 @@ That's all!"#;
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1); // Should extract the valid tool
     assert_eq!(tools[0].function.name, "valid_tool");
-    // Normal text should contain the text around the valid tool call
-    assert!(normal_text.contains("Let me help you"));
-    assert!(normal_text.contains("That's all!"));
+    // Normal text should contain text before the first tool call
+    assert_eq!(normal_text, "Let me help you with that.\n");
 }
 
 #[tokio::test]
@@ -208,8 +213,8 @@ async fn test_unicode_and_special_chars_in_failed_parsing() {
 </tool_call>"#;
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 0);
-    // Should handle Unicode properly in the fallback text
-    assert!(!normal_text.is_empty() || normal_text == input);
+    // Should handle Unicode properly in the fallback text - malformed content should be preserved
+    assert_eq!(normal_text, input);
 
     // Special characters that might confuse parsers
     let input = r#"Response: <tool_call>{"name": "test\n\t", "arguments": {"]}"}</tool_call>"#;
