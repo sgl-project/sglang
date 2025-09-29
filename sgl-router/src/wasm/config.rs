@@ -153,7 +153,9 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("max_memory_pages cannot exceed 65536"));
+        assert!(result
+            .unwrap_err()
+            .contains("max_memory_pages cannot exceed 65536"));
     }
 
     #[test]
@@ -168,7 +170,9 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("max_execution_time_ms cannot be 0"));
+        assert!(result
+            .unwrap_err()
+            .contains("max_execution_time_ms cannot be 0"));
     }
 
     #[test]
@@ -183,7 +187,9 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("max_execution_time_ms cannot exceed 300000ms"));
+        assert!(result
+            .unwrap_err()
+            .contains("max_execution_time_ms cannot exceed 300000ms"));
     }
 
     #[test]
@@ -198,7 +204,9 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("max_stack_size must be at least 64KB"));
+        assert!(result
+            .unwrap_err()
+            .contains("max_stack_size must be at least 64KB"));
     }
 
     #[test]
@@ -213,7 +221,9 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("max_stack_size cannot exceed 16MB"));
+        assert!(result
+            .unwrap_err()
+            .contains("max_stack_size cannot exceed 16MB"));
     }
 
     #[test]
@@ -243,7 +253,9 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("thread_pool_size cannot exceed 128"));
+        assert!(result
+            .unwrap_err()
+            .contains("thread_pool_size cannot exceed 128"));
     }
 
     #[test]
@@ -258,7 +270,9 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("module_cache_size cannot be 0"));
+        assert!(result
+            .unwrap_err()
+            .contains("module_cache_size cannot be 0"));
     }
 
     #[test]
@@ -273,7 +287,9 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("module_cache_size cannot exceed 1000"));
+        assert!(result
+            .unwrap_err()
+            .contains("module_cache_size cannot exceed 1000"));
     }
 
     #[test]
