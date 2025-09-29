@@ -316,3 +316,169 @@ impl Drop for WasmThreadPool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wasm::config::WasmRuntimeConfig;
+
+    // Helper function to create a simple WASM module that adds two numbers
+    fn create_simple_add_wasm() -> Vec<u8> {
+        // This is a minimal WASM module that exports a function "add" that takes two i32 and returns their sum
+        vec![
+            0x00, 0x61, 0x73, 0x6d, // WASM magic number
+            0x01, 0x00, 0x00, 0x00, // version 1
+            // Type section
+            0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+            0x7f, // func type: (i32, i32) -> i32
+            // Function section
+            0x03, 0x02, 0x01, 0x00, // 1 function of type 0
+            // Export section
+            0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00, // export "add" function
+            // Code section
+            0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a,
+            0x0b, // add function body
+        ]
+    }
+
+    // Helper function to create an invalid WASM module
+    fn create_invalid_wasm() -> Vec<u8> {
+        vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x99] // Valid header but with invalid byte
+    }
+
+    #[test]
+    fn test_get_cpu_info() {
+        let (cpu_count, max_recommended) = WasmRuntime::get_cpu_info();
+        assert!(cpu_count > 0);
+        assert!(max_recommended > 0);
+        assert!(max_recommended >= cpu_count);
+    }
+
+    #[tokio::test]
+    async fn test_execute_wasm_module_async_success() {
+        let wasm_bytes = create_simple_add_wasm();
+        let args = vec![Val::I32(5), Val::I32(3)];
+
+        let mut config = Config::new();
+        config.async_stack_size(1024 * 1024);
+        let engine = Engine::new(&config).unwrap();
+
+        let module = Module::new(&engine, wasm_bytes).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let func = instance.get_func(&mut store, "add").unwrap();
+
+        let mut results = vec![Val::I32(0); func.ty(&store).results().len()];
+        func.call(&mut store, &args, &mut results).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].unwrap_i32(), 8); // 5 + 3 = 8
+    }
+
+    #[tokio::test]
+    async fn test_execute_wasm_module_async_invalid_module() {
+        let wasm_bytes = create_invalid_wasm();
+
+        let mut config = Config::new();
+        config.async_stack_size(1024 * 1024);
+        let engine = Engine::new(&config).unwrap();
+
+        let result = Module::new(&engine, wasm_bytes);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(!error_msg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_wasm_module_async_nonexistent_function() {
+        let wasm_bytes = create_simple_add_wasm();
+
+        let mut config = Config::new();
+        config.async_stack_size(1024 * 1024);
+        let engine = Engine::new(&config).unwrap();
+
+        let module = Module::new(&engine, wasm_bytes).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+        // Try to get nonexistent function
+        let func = instance.get_func(&mut store, "nonexistent");
+        assert!(func.is_none());
+    }
+
+    #[test]
+    fn test_execute_wasm_sync() {
+        let wasm_bytes = create_simple_add_wasm();
+        let args = vec![Val::I32(10), Val::I32(20)];
+
+        let mut config = Config::new();
+        config.async_stack_size(1024 * 1024);
+        let engine = Engine::new(&config).unwrap();
+
+        let module = Module::new(&engine, wasm_bytes).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let func = instance.get_func(&mut store, "add").unwrap();
+
+        let mut results = vec![Val::I32(0); func.ty(&store).results().len()];
+        func.call(&mut store, &args, &mut results).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].unwrap_i32(), 30); // 10 + 20 = 30
+    }
+
+    #[test]
+    fn test_config_default_values() {
+        let config = WasmRuntimeConfig::default();
+
+        assert_eq!(config.max_memory_pages, 1024);
+        assert_eq!(config.max_execution_time_ms, 1000);
+        assert_eq!(config.enable_wasi, true);
+        assert_eq!(config.max_stack_size, 1024 * 1024);
+        assert!(config.thread_pool_size > 0);
+        assert_eq!(config.module_cache_size, 10);
+    }
+
+    #[test]
+    fn test_config_clone() {
+        let config = WasmRuntimeConfig::default();
+        let cloned_config = config.clone();
+
+        assert_eq!(config.max_memory_pages, cloned_config.max_memory_pages);
+        assert_eq!(
+            config.max_execution_time_ms,
+            cloned_config.max_execution_time_ms
+        );
+        assert_eq!(config.enable_wasi, cloned_config.enable_wasi);
+        assert_eq!(config.max_stack_size, cloned_config.max_stack_size);
+        assert_eq!(config.thread_pool_size, cloned_config.thread_pool_size);
+        assert_eq!(config.module_cache_size, cloned_config.module_cache_size);
+    }
+
+    #[test]
+    fn test_different_function_args() {
+        let wasm_bytes = create_simple_add_wasm();
+
+        let mut config = Config::new();
+        config.async_stack_size(1024 * 1024);
+        let engine = Engine::new(&config).unwrap();
+
+        let module = Module::new(&engine, wasm_bytes).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let func = instance.get_func(&mut store, "add").unwrap();
+
+        let test_cases = vec![
+            (vec![Val::I32(0), Val::I32(0)], 0),
+            (vec![Val::I32(1), Val::I32(1)], 2),
+            (vec![Val::I32(-1), Val::I32(1)], 0),
+            (vec![Val::I32(100), Val::I32(200)], 300),
+        ];
+
+        for (args, expected) in test_cases {
+            let mut results = vec![Val::I32(0); func.ty(&store).results().len()];
+            func.call(&mut store, &args, &mut results).unwrap();
+            assert_eq!(results[0].unwrap_i32(), expected);
+        }
+    }
+}
