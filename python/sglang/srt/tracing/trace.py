@@ -25,6 +25,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from fastapi import FastAPI
+
 logger = logging.getLogger(__name__)
 opentelemetry_imported = False
 tracing_enabled = False
@@ -32,6 +34,7 @@ tracing_enabled = False
 try:
     from opentelemetry import context, propagate, trace
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import TracerProvider, id_generator
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -550,3 +553,10 @@ def trace_slice_add_attr(rid: str, attrs: Dict[str, Any]):
 
     slice_info = thread_context.cur_slice_stack[-1]
     slice_info.span.set_attributes(attrs)
+
+
+def instrument_fastapi(app: FastAPI):
+    if not opentelemetry_imported:
+        return
+
+    FastAPIInstrumentor.instrument_app(app)
