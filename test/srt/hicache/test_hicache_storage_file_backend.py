@@ -24,6 +24,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -215,6 +216,33 @@ class HiCacheStorageBaseMixin:
         )
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase):
+    """Page first layout tests for HiCache Storage functionality"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args = {"--hicache-mem-layout": "page_first"}
+        return server_args, {}
+
+
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+class TestHiCacheStorageMLA(HiCacheStorageBaseMixin, CustomTestCase):
+    """MLA Model tests for HiCache Storage functionality"""
+
+    @classmethod
+    def _get_model_name(cls):
+        """Use MLA model for testing"""
+        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args = {"--tp-size": 2}
+        return server_args, {}
+
+
 class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCase):
     """Page first direct tests for HiCache Storage functionality"""
 
@@ -236,7 +264,6 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
         server_args = {
-            # "--hicache-mem-layout": "page_first",
             "--tp-size": 2,
             "--hicache-ratio": 1.5,
         }

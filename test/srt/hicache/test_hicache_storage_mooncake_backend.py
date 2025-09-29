@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     find_available_port,
+    is_in_ci,
 )
 
 
@@ -224,6 +225,20 @@ class TestMooncakeBackendLayerFirstLayout(
         server_args["--hicache-io-backend"] = "direct"
         return server_args, env_vars
 '''
+
+
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+class TestMooncakeBackendPageFirstLayout(
+    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
+):
+    """Page first layout tests for HiCache-Mooncake backend"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args["--hicache-mem-layout"] = "page_first"
+        return server_args, env_vars
 
 
 class TestMooncakeBackendMLAModel(
