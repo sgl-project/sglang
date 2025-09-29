@@ -17,9 +17,17 @@ import torch
 from packaging import version
 from torch.multiprocessing import reductions
 
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
 
 def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
+
+    # Currently, NPU does not support UUID. This has been temporarily commented out, with support expected in the fourth quarter.
+    if _is_npu:
+        return
 
     if hasattr(reductions, "_reduce_tensor_original"):
         return

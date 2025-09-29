@@ -246,7 +246,7 @@ class CudaGraphRunner:
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
-            or model_runner.spec_algorithm.is_lookahead()
+            or model_runner.spec_algorithm.is_ngram()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -413,12 +413,12 @@ class CudaGraphRunner:
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
-        is_lookahead_supported = (
+        is_ngram_supported = (
             (
                 forward_batch.batch_size * self.num_tokens_per_bs
                 == forward_batch.input_ids.numel()
             )
-            if self.model_runner.spec_algorithm.is_lookahead()
+            if self.model_runner.spec_algorithm.is_ngram()
             else True
         )
 
@@ -427,7 +427,7 @@ class CudaGraphRunner:
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
-            and is_lookahead_supported
+            and is_ngram_supported
         )
 
     def capture(self) -> None:
@@ -838,10 +838,10 @@ class CudaGraphRunner:
                     seq_lens_cpu=None,
                 )
 
-        elif self.model_runner.spec_algorithm.is_lookahead():
-            from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+        elif self.model_runner.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.ngram_utils import NgramVerifyInput
 
-            spec_info = LookaheadVerifyInput(
+            spec_info = NgramVerifyInput(
                 draft_token=None,
                 tree_mask=self.custom_mask,
                 positions=None,

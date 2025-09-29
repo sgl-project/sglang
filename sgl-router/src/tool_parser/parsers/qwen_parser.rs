@@ -128,32 +128,51 @@ impl Default for QwenParser {
 
 #[async_trait]
 impl ToolParser for QwenParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains Qwen format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
-        // Extract all tool call blocks
-        let tool_blocks = self.extract_tool_calls(text);
+        // Collect matches with positions and parse tools in one pass
+        let matches: Vec<_> = self.extractor.captures_iter(text).collect();
         let mut tools = Vec::new();
 
-        for (index, json_str) in tool_blocks.iter().enumerate() {
-            // Parse each JSON block
-            match serde_json::from_str::<Value>(json_str.trim()) {
-                Ok(value) => {
-                    if let Some(tool) = self.parse_single_object(&value, index)? {
-                        tools.push(tool);
+        for (index, captures) in matches.iter().enumerate() {
+            if let Some(json_str) = captures.get(1) {
+                match serde_json::from_str::<Value>(json_str.as_str().trim()) {
+                    Ok(value) => {
+                        if let Some(tool) = self.parse_single_object(&value, index)? {
+                            tools.push(tool);
+                        }
                     }
-                }
-                Err(_) => {
-                    // Skip malformed JSON blocks
-                    continue;
+                    Err(_) => {
+                        // JSON parsing failed, might be incomplete
+                    }
                 }
             }
         }
 
-        Ok(tools)
+        // Extract normal text using first and last match positions
+        let normal_text = if tools.is_empty() {
+            text.to_string()
+        } else {
+            let first_start = matches[0].get(0).unwrap().start();
+            let last_end = matches.last().unwrap().get(0).unwrap().end();
+            let before = if first_start > 0 {
+                &text[..first_start]
+            } else {
+                ""
+            };
+            let after = if last_end < text.len() {
+                &text[last_end..]
+            } else {
+                ""
+            };
+            format!("{}{}", before, after)
+        };
+
+        Ok((normal_text, tools))
     }
 
     async fn parse_incremental(
@@ -171,7 +190,18 @@ impl ToolParser for QwenParser {
 
         // Check if we have the start marker
         if !self.has_tool_markers(&state.buffer) {
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("<tool_call>") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Find start and end positions
@@ -193,7 +223,12 @@ impl ToolParser for QwenParser {
                         }
                     }
                     Err(_) => {
-                        // JSON parsing failed, might be incomplete
+                        // JSON parsing failed, might be incomplete or malformed
+                        // If we have what looks like a complete tool call block, treat as normal text
+                        if state.buffer[start_pos..end_pos].contains("\n</tool_call>") {
+                            let malformed_text: String = state.buffer.drain(..end_pos).collect();
+                            return Ok(StreamResult::NormalText(malformed_text));
+                        }
                     }
                 }
             } else {
@@ -276,10 +311,11 @@ mod tests {
 {"name": "get_weather", "arguments": {"location": "Beijing", "units": "celsius"}}
 </tool_call>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Beijing"));
+        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert!(tools[0].function.arguments.contains("Beijing"));
+        assert_eq!(normal_text, ""); // Pure tool call, no normal text
     }
 
     #[tokio::test]
@@ -292,10 +328,11 @@ mod tests {
 {"name": "calculate", "arguments": {"expression": "2 + 2"}}
 </tool_call>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "search");
-        assert_eq!(result[1].function.name, "calculate");
+        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "search");
+        assert_eq!(tools[1].function.name, "calculate");
+        assert_eq!(normal_text, ""); // Pure tool calls, no normal text
     }
 
     #[tokio::test]
@@ -307,9 +344,13 @@ mod tests {
 </tool_call>
 Here are the results."#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_info");
+        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_info");
+        assert_eq!(
+            normal_text,
+            "Let me help you with that.\n\nHere are the results."
+        );
     }
 
     #[tokio::test]
@@ -329,10 +370,11 @@ Here are the results."#;
 }
 </tool_call>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "process_data");
-        assert!(result[0].function.arguments.contains("nested"));
+        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "process_data");
+        assert!(tools[0].function.arguments.contains("nested"));
+        assert_eq!(normal_text, ""); // Pure tool call, no normal text
     }
 
     #[test]
