@@ -251,6 +251,8 @@ def use_attn_input_tp_scattered(q_lora_rank, forward_batch: ForwardBatch):
     return (
         support_attn_input_tp_scattered(q_lora_rank)
         and forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and not forward_batch.forward_mode.is_draft_extend()
         and forward_batch.input_ids is not None
     )
 
