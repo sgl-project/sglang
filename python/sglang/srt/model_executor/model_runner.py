@@ -1482,7 +1482,7 @@ class ModelRunner:
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
-                f"Not enough memory. Please try to increase --mem-fraction-static."
+                f"Not enough memory. Please try to increase --mem-fraction-static. "
                 f"Current value: {self.server_args.mem_fraction_static=}"
             )
 
