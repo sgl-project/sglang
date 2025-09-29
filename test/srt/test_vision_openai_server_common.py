@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import openai
@@ -8,7 +9,12 @@ import requests
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
 
 # image
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
@@ -23,12 +29,20 @@ AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-fi
 
 
 class TestOpenAIOmniServerBase(CustomTestCase):
+    model: str
+    other_args: list = []
+
     @classmethod
     def setUpClass(cls):
-        cls.model = ""
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.process = None
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=cls.other_args or [],
+        )
         cls.base_url += "/v1"
 
     @classmethod
@@ -139,6 +153,52 @@ class AudioOpenAITestMixin(TestOpenAIOmniServerBase):
 
 
 class ImageOpenAITestMixin(TestOpenAIOmniServerBase):
+    def run_decode_with_image(self, image_id):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        content = []
+        if image_id == 0:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                }
+            )
+        elif image_id == 1:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": IMAGE_SGL_LOGO_URL},
+                }
+            )
+        else:
+            pass
+
+        content.append(
+            {
+                "type": "text",
+                "text": "Describe this image in a sentence.",
+            }
+        )
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {"role": "user", "content": content},
+            ],
+            temperature=0,
+            **(self.get_vision_request_kwargs()),
+        )
+
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+
+    def test_mixed_batch(self):
+        image_ids = [0, 1, 2] * 4
+        with ThreadPoolExecutor(4) as executor:
+            list(executor.map(self.run_decode_with_image, image_ids))
+
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
