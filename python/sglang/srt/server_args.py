@@ -610,6 +610,12 @@ class ServerArgs:
             if self.cuda_graph_max_bs is None:
                 self.cuda_graph_max_bs = 160
 
+        # Set cuda graph batch sizes
+        if self.cuda_graph_bs is None:
+            self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
+        else:
+            self.cuda_graph_max_bs = max(self.cuda_graph_bs)
+
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
             reserved_mem = 1024
@@ -653,10 +659,6 @@ class ServerArgs:
             model_config = ModelConfig.from_server_args(self)
             if model_config.is_multimodal:
                 self.adjust_mem_fraction_for_vlm(model_config)
-
-        # Set cuda graph batch sizes
-        if self.cuda_graph_bs is None:
-            self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
 
     def _generate_cuda_graph_batch_sizes(self):
         """
