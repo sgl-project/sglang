@@ -261,12 +261,12 @@ async fn test_almost_valid_tool_calls() {
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     // Some JSON parsers might accept trailing commas
     if tools.is_empty() {
-        assert_eq!(normal_text, r#"{"name": "test", "arguments": ,}"#);
+        assert_eq!(normal_text, r#"{"name": "test", "arguments": {},}"#);
     }
 
     // Wrong quote types
     let input = r#"{'name': 'test', 'arguments': {}}"#;
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 0); // Standard JSON requires double quotes
-    assert_eq!(normal_text, r#"{'name': 'test', 'arguments': }"#);
+    assert_eq!(normal_text, r#"{'name': 'test', 'arguments': {}}"#);
 }
