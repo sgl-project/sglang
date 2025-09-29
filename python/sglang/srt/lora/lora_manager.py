@@ -67,6 +67,9 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
+        
+        # Store eviction policy from server args
+        self.eviction_policy = getattr(server_args, 'lora_eviction_policy', 'fifo') if server_args else 'fifo'
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -402,6 +405,7 @@ class LoRAManager:
 
     def init_memory_pool(self):
         """(Re)initialize the LoRA memory pool based on the current configurations."""
+        eviction_policy = self.eviction_policy
         self.memory_pool = LoRAMemoryPool(
             base_hf_config=self.base_hf_config,
             max_loras_per_batch=self.max_loras_per_batch,
@@ -411,6 +415,7 @@ class LoRAManager:
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,
+            eviction_policy=eviction_policy,
         )
 
     def set_lora_module(self, module_name, module):

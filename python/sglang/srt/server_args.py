@@ -265,6 +265,7 @@ class ServerArgs:
     ] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
+    lora_eviction_policy: str = "fifo"  # Backward compatibility: default to FIFO
     lora_backend: str = "triton"
     max_lora_chunk_size: Optional[int] = 16
 
@@ -1794,6 +1795,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_loaded_loras,
             help="If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
+        )
+        parser.add_argument(
+            "--lora-eviction-policy",
+            type=str,
+            default="fifo",
+            choices=["fifo", "lru"],
+            help="LoRA adapter eviction policy when memory pool is full. 'fifo': First-In-First-Out (default for backward compatibility). 'lru': Least Recently Used (better cache efficiency).",
         )
         parser.add_argument(
             "--lora-backend",

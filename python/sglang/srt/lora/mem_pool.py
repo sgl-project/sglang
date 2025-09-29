@@ -17,6 +17,7 @@ from sglang.srt.lora.utils import (
     get_stacked_multiply,
     get_target_module_name,
 )
+from sglang.srt.lora.eviction_policy import get_eviction_policy
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class LoRAMemoryPool:
         max_lora_rank: int,
         target_modules: Set[str],
         base_model: torch.nn.Module,
+        eviction_policy: str = "fifo",
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -63,6 +65,9 @@ class LoRAMemoryPool:
         self.tp_rank: int = tp_rank
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
+
+        # Initialize eviction policy
+        self.eviction_policy = get_eviction_policy(eviction_policy)
 
         # Both A_buffer and B_buffer maps lora weight names to its buffer space.
         # A_buffer contains num_layer number of row-major tensors with shape
@@ -189,31 +194,45 @@ class LoRAMemoryPool:
         lora_refs: Dict[str, LoRARef],
     ):
         def get_available_buffer_slot():
+            # 1. Prioritize empty slots
             for buffer_id in range(self.max_loras_per_batch):
-                # Prioritize empty slots
                 if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
                     return buffer_id
 
+            # 2. Memory pool is full, need to evict using policy
+            # Collect eviction candidates (not in current batch)
+            candidates = set()
+            pinned_uids = set()
+            
             for buffer_id in range(self.max_loras_per_batch):
                 uid = self.buffer_id_to_uid[buffer_id]
+                if uid not in cur_uids and uid is not None:
+                    candidates.add(uid)
+                    lora_ref = lora_refs.get(uid)
+                    if lora_ref is not None and lora_ref.pinned:
+                        pinned_uids.add(uid)
 
-                # Evict unneeded lora
-                if uid not in cur_uids:
-                    # Skip pinned LoRAs
-                    # TODO (lifuhuang): we might consider supporting pinning base model (uid == None) in the future.
-                    if uid is not None:
-                        lora_ref = lora_refs.get(uid)
-                        if lora_ref is not None and lora_ref.pinned:
-                            continue
-
-                    self.uid_to_buffer_id.pop(uid)
-                    logger.debug(f"Evicting LoRA {uid} from buffer slot {buffer_id}.")
-                    self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
-                    return buffer_id
-
-            raise ValueError(
-                "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."
+            # Use eviction policy to select victim
+            victim_uid = self.eviction_policy.select_victim(
+                candidates, pinned_uids, lora_refs
             )
+            
+            if victim_uid is None:
+                raise ValueError(
+                    "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."
+                )
+
+            # Evict the selected victim
+            victim_buffer_id = self.uid_to_buffer_id[victim_uid]
+            self.uid_to_buffer_id.pop(victim_uid)
+            self.eviction_policy.remove(victim_uid)
+            self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
+            logger.debug(f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}.")
+            return victim_buffer_id
+
+        # Mark all adapters in current batch as used (for LRU tracking)
+        for uid in cur_uids:
+            self.eviction_policy.mark_used(uid)
 
         for uid in cur_uids:
             if uid not in self.uid_to_buffer_id:
