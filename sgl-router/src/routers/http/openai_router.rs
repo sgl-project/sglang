@@ -1152,9 +1152,10 @@ impl OpenAIRouter {
 
     /// Generate a unique ID for MCP output items (similar to OpenAI format)
     fn generate_mcp_id(prefix: &str) -> String {
-        use rand::Rng;
+        use rand::RngCore;
         let mut rng = rand::rng();
-        let bytes: Vec<u8> = (0..30).map(|_| rng.random()).collect();
+        let mut bytes = [0u8; 30];
+        rng.fill_bytes(&mut bytes);
         let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
         format!("{}_{}", prefix, hex_string)
     }
@@ -1235,29 +1236,16 @@ impl OpenAIRouter {
             args.error,
         );
 
-        // Insert mcp_list_tools at the beginning
-        let mut new_output = vec![list_tools_item];
+        // Find the index of the last message item to insert mcp_call before it
+        let call_insertion_index = output_array
+            .iter()
+            .rposition(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+            .unwrap_or(output_array.len());
 
-        // Add existing items, inserting mcp_call before the final message
-        let mut found_final_message = false;
-        for item in output_array.iter() {
-            let item_type = item.get("type").and_then(|v| v.as_str());
+        // Insert items in-place for efficiency
+        output_array.insert(call_insertion_index, call_item);
+        output_array.insert(0, list_tools_item);
 
-            // Insert mcp_call right before the final message
-            if item_type == Some("message") && !found_final_message {
-                new_output.push(call_item.clone());
-                found_final_message = true;
-            }
-
-            new_output.push(item.clone());
-        }
-
-        // If no message found, append mcp_call at the end
-        if !found_final_message {
-            new_output.push(call_item);
-        }
-
-        *output_array = new_output;
         Ok(())
     }
 
