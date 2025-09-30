@@ -48,8 +48,18 @@ if TYPE_CHECKING:
 class NSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
 
-    flashmla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    num_splits: Optional[torch.Tensor] = None
+    flashmla_metadata: torch.Tensor
+    num_splits: torch.Tensor
+
+    def slice(self, sli):
+        return NSAFlashMLAMetadata(
+            flashmla_metadata=self.flashmla_metadata,
+            num_splits=self.num_splits[sli],
+        )
+
+    def copy_(self, other: "NSAFlashMLAMetadata"):
+        self.flashmla_metadata.copy_(other.flashmla_metadata)
+        self.num_splits.copy_(other.num_splits)
 
 
 @dataclass(frozen=True)
@@ -259,7 +269,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table,
             flashmla_metadata=self._compute_flashmla_metadata(
-                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                cache_seqlens=cache_seqlens_int32,
                 seq_len_q=1,  # TODO handle MTP which is not 1
             ),
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
@@ -295,6 +305,10 @@ class NativeSparseAttnBackend(AttentionBackend):
                 self.max_context_len,
                 dtype=torch.int32,
                 device=self.device,
+            ),
+            "flashmla_metadata": self._compute_flashmla_metadata(
+                cache_seqlens=torch.ones(max_bs, dtype=torch.int32, device=self.device),
+                seq_len_q=1,  # TODO handle MTP which is not 1
             ),
         }
 
@@ -335,6 +349,16 @@ class NativeSparseAttnBackend(AttentionBackend):
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
+        flashmla_metadata = self.decode_cuda_graph_metadata["flashmla_metadata"].slice(
+            slice(0, bs + 1)
+        )
+        flashmla_metadata.copy_(
+            self._compute_flashmla_metadata(
+                cache_seqlens=cache_seqlens_int32,
+                seq_len_q=1,  # TODO handle MTP which is not 1
+            )
+        )
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -343,8 +367,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table_1,
-            # TODO: handle cuda graph
-            flashmla_metadata=None,
+            flashmla_metadata=flashmla_metadata,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -407,6 +430,13 @@ class NativeSparseAttnBackend(AttentionBackend):
             metadata.real_page_table[:, :new_len].copy_(real_table)
         else:
             assert metadata.real_page_table is metadata.page_table_1
+
+        metadata.flashmla_metadata.copy_(
+            self._compute_flashmla_metadata(
+                cache_seqlens=cache_seqlens,
+                seq_len_q=1,  # TODO handle MTP which is not 1
+            )
+        )
 
         self.forward_metadata = metadata
 
