@@ -86,7 +86,7 @@ def run_eval(args):
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
-    if args.repeat == 1:
+    if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
     else:
         from concurrent.futures import ThreadPoolExecutor
