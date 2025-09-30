@@ -249,7 +249,7 @@ impl GrpcRouter {
             }
         };
 
-        // Step 4: Get weight version for response metadata
+        // Step 5: Get weight version for response metadata
         let weight_version = worker
             .metadata()
             .labels
