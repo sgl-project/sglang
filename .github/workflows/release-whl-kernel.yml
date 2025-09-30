@@ -19,7 +19,7 @@ concurrency:
 jobs:
   build-cu129:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: lababu
+    runs-on: sgl-kernel-release-node
     strategy:
       matrix:
         python-version: ["3.10"]
@@ -206,7 +206,7 @@ jobs:
 
   build-cu129-aarch64:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: sgl-kernel-release-node-arm
+    runs-on: lababu
     strategy:
       matrix:
         python-version: ["3.10"]
