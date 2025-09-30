@@ -33,7 +33,8 @@ class TestOpenAIOmniServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if cls.process is not None:
+            kill_process_tree(cls.process.pid)
 
     def get_vision_request_kwargs(self):
         return self.get_request_kwargs()
