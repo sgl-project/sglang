@@ -618,6 +618,117 @@ impl GrpcRouter {
         serde_json::to_string(&array_schema).ok()
     }
 
+    /// Parse tool calls from JSON schema constrained response
+    fn parse_json_schema_response(
+        &self,
+        processed_text: &str,
+        tool_choice: &Option<ToolChoice>,
+    ) -> (Option<Vec<crate::protocols::spec::ToolCall>>, String) {
+        match tool_choice {
+            Some(ToolChoice::Function { function, .. }) => {
+                // Specific function: Parse parameters directly
+                match serde_json::from_str::<serde_json::Value>(processed_text) {
+                    Ok(params) => {
+                        let tool_call = crate::protocols::spec::ToolCall {
+                            id: format!("call_{}", uuid::Uuid::new_v4()),
+                            tool_type: "function".to_string(),
+                            function: crate::protocols::spec::FunctionCallResponse {
+                                name: function.name.clone(),
+                                arguments: Some(
+                                    serde_json::to_string(&params)
+                                        .unwrap_or_else(|_| "{}".to_string()),
+                                ),
+                            },
+                        };
+                        (Some(vec![tool_call]), String::new())
+                    }
+                    Err(e) => {
+                        error!("Failed to parse specific function parameters: {}", e);
+                        (None, processed_text.to_string())
+                    }
+                }
+            }
+            Some(ToolChoice::Value(crate::protocols::spec::ToolChoiceValue::Required))
+            | Some(ToolChoice::AllowedTools { .. }) => {
+                // Required mode: Parse array of tool calls
+                match serde_json::from_str::<Vec<serde_json::Value>>(processed_text) {
+                    Ok(parsed_array) => {
+                        let spec_tool_calls: Vec<crate::protocols::spec::ToolCall> = parsed_array
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(i, item)| {
+                                let obj = item.as_object()?;
+                                let name = obj.get("name")?.as_str()?.to_string();
+                                let parameters = obj.get("parameters")?;
+
+                                Some(crate::protocols::spec::ToolCall {
+                                    id: format!("call_{}_{}", i, uuid::Uuid::new_v4()),
+                                    tool_type: "function".to_string(),
+                                    function: crate::protocols::spec::FunctionCallResponse {
+                                        name,
+                                        arguments: Some(
+                                            serde_json::to_string(parameters)
+                                                .unwrap_or_else(|_| "{}".to_string()),
+                                        ),
+                                    },
+                                })
+                            })
+                            .collect();
+                        (Some(spec_tool_calls), String::new())
+                    }
+                    Err(e) => {
+                        error!("Failed to parse required tool call array: {}", e);
+                        (None, processed_text.to_string())
+                    }
+                }
+            }
+            _ => (None, processed_text.to_string()),
+        }
+    }
+
+    /// Parse tool calls using model-specific parser
+    async fn parse_with_model_parser(
+        &self,
+        processed_text: &str,
+        model: &str,
+    ) -> (Option<Vec<crate::protocols::spec::ToolCall>>, String) {
+        let Some(parser) = self.tool_parser_registry.get_parser(model) else {
+            return (None, processed_text.to_string());
+        };
+
+        if !parser.detect_format(processed_text) {
+            return (None, processed_text.to_string());
+        }
+
+        match parser.parse_complete(processed_text).await {
+            Ok((normal_text, parsed_tool_calls)) => {
+                if parsed_tool_calls.is_empty() {
+                    return (None, normal_text);
+                }
+
+                let spec_tool_calls = parsed_tool_calls
+                    .into_iter()
+                    .map(|tc| crate::protocols::spec::ToolCall {
+                        id: tc.id,
+                        tool_type: "function".to_string(),
+                        function: crate::protocols::spec::FunctionCallResponse {
+                            name: tc.function.name,
+                            arguments: Some(
+                                serde_json::to_string(&tc.function.arguments)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            ),
+                        },
+                    })
+                    .collect();
+                (Some(spec_tool_calls), normal_text)
+            }
+            Err(e) => {
+                error!("Tool call parsing error: {}", e);
+                (None, processed_text.to_string())
+            }
+        }
+    }
+
     /// Create a StopSequenceDecoder from the chat completion request
     fn create_stop_decoder(
         &self,
@@ -1012,112 +1123,12 @@ impl GrpcRouter {
             };
 
             if used_json_schema {
-                // JSON schema was used - parse response based on tool_choice type
-                match &original_request.tool_choice {
-                    Some(ToolChoice::Function { function, .. }) => {
-                        // Specific function: Parse parameters directly
-                        match serde_json::from_str::<serde_json::Value>(&processed_text) {
-                            Ok(params) => {
-                                let tool_call = crate::protocols::spec::ToolCall {
-                                    id: format!("call_{}", uuid::Uuid::new_v4()),
-                                    tool_type: "function".to_string(),
-                                    function: crate::protocols::spec::FunctionCallResponse {
-                                        name: function.name.clone(),
-                                        arguments: Some(
-                                            serde_json::to_string(&params)
-                                                .unwrap_or_else(|_| "{}".to_string()),
-                                        ),
-                                    },
-                                };
-                                tool_calls = Some(vec![tool_call]);
-                                processed_text = String::new(); // Tool call extracted
-                            }
-                            Err(e) => {
-                                error!("Failed to parse specific function parameters: {}", e);
-                            }
-                        }
-                    }
-                    Some(ToolChoice::Value(crate::protocols::spec::ToolChoiceValue::Required))
-                    | Some(ToolChoice::AllowedTools { .. }) => {
-                        // Required mode: Parse array of tool calls
-                        // JSON format: [{"name": "tool1", "parameters": {...}}, ...]
-                        // Note: AllowedTools only gets here if mode="required" (checked in used_json_schema)
-                        match serde_json::from_str::<Vec<serde_json::Value>>(&processed_text) {
-                            Ok(parsed_array) => {
-                                let spec_tool_calls: Vec<crate::protocols::spec::ToolCall> =
-                                    parsed_array
-                                        .into_iter()
-                                        .enumerate()
-                                        .filter_map(|(i, item)| {
-                                            let obj = item.as_object()?;
-                                            let name = obj.get("name")?.as_str()?.to_string();
-                                            let parameters = obj.get("parameters")?;
-
-                                            Some(crate::protocols::spec::ToolCall {
-                                                id: format!("call_{}_{}", i, uuid::Uuid::new_v4()),
-                                                tool_type: "function".to_string(),
-                                                function:
-                                                    crate::protocols::spec::FunctionCallResponse {
-                                                        name,
-                                                        arguments: Some(
-                                                            serde_json::to_string(parameters)
-                                                                .unwrap_or_else(|_| {
-                                                                    "{}".to_string()
-                                                                }),
-                                                        ),
-                                                    },
-                                            })
-                                        })
-                                        .collect();
-                                tool_calls = Some(spec_tool_calls);
-                                processed_text = String::new(); // Tool calls extracted
-                            }
-                            Err(e) => {
-                                error!("Failed to parse required tool call array: {}", e);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                (tool_calls, processed_text) =
+                    self.parse_json_schema_response(&processed_text, &original_request.tool_choice);
             } else {
-                // No JSON schema constraint - use model-specific parser
-                if let Some(parser) = self
-                    .tool_parser_registry
-                    .get_parser(&original_request.model)
-                {
-                    // Check if text contains tool calls before parsing
-                    if parser.detect_format(&processed_text) {
-                        match parser.parse_complete(&processed_text).await {
-                            Ok((normal_text, parsed_tool_calls)) => {
-                                if !parsed_tool_calls.is_empty() {
-                                    let spec_tool_calls = parsed_tool_calls
-                                        .into_iter()
-                                        .map(|tc| crate::protocols::spec::ToolCall {
-                                            id: tc.id,
-                                            tool_type: "function".to_string(),
-                                            function:
-                                                crate::protocols::spec::FunctionCallResponse {
-                                                    name: tc.function.name,
-                                                    arguments: Some(
-                                                        serde_json::to_string(
-                                                            &tc.function.arguments,
-                                                        )
-                                                        .unwrap_or_else(|_| "{}".to_string()),
-                                                    ),
-                                                },
-                                        })
-                                        .collect();
-                                    tool_calls = Some(spec_tool_calls);
-                                    processed_text = normal_text;
-                                }
-                            }
-                            Err(e) => {
-                                error!("Tool call parsing error: {}", e);
-                                // Continue without tool calls rather than failing
-                            }
-                        }
-                    }
-                }
+                (tool_calls, processed_text) = self
+                    .parse_with_model_parser(&processed_text, &original_request.model)
+                    .await;
             }
         }
 
