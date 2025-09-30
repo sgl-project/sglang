@@ -991,25 +991,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         )
                     )
                     rids.append(tmp_obj.rid)
-            elif self._batch_has_only_input_ids(batch_size, obj):
-                tokenized_objs = []
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                    tokenized_objs.append(tokenized_obj)
-
-                # Send as a single batched request
-                self._send_batch_request(obj, tokenized_objs, created_time)
-
-                # Set up generators for each request in the batch
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    generators.append(
-                        self._wait_one_response(
-                            tmp_obj, self.rid_to_state[tmp_obj.rid], request
-                        )
-                    )
-                    rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
                 with (
