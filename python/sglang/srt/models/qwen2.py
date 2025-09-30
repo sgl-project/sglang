@@ -438,14 +438,12 @@ class Qwen2ForCausalLM(nn.Module):
         # perform weight tying for PP
         if self.pp_group.world_size > 1 and config.tie_word_embeddings:
             if self.pp_group.is_first_rank:
-                self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
-                )
-            else:
+                self.pp_group.send(self.model.embed_tokens.weight, dst=-1)
+            elif self.pp_group.is_last_rank:
                 emb_token_weight = self.pp_group.recv(
-                    size=(config.vocab_size, config.hidden_size),
+                    size=self.lm_head.weight.size(),
                     dtype=next(self.model.parameters()).dtype,
-                    src=self.pp_group.first_rank,
+                    src=0,
                 )
                 self.lm_head.weight.copy_(emb_token_weight)
 
