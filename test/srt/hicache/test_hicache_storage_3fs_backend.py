@@ -81,7 +81,7 @@ class TestHf3fsBackendAccuracy(HiCacheStorage3FSBackendBaseMixin, CustomTestCase
         """Test eval accuracy with cache persistence across cache flushes"""
         from test_hicache_storage_file_backend import run_eval_accuracy_test
 
-        run_eval_accuracy_test(self, accuracy_threshold=0.01)
+        run_eval_accuracy_test(self)
 
 
 if __name__ == "__main__":

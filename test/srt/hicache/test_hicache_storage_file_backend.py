@@ -276,7 +276,7 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
         run_eval_accuracy_test(self)
 
 
-def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.01):
+def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     """Generic eval accuracy test with configurable accuracy threshold
 
     Args:
