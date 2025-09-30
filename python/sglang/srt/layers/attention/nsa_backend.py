@@ -18,6 +18,7 @@ from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcach
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.topk import (
@@ -495,9 +496,11 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         # Do absorbed multi-latent attention
         assert q_rope is not None
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-            q.dtype
-        )
+        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+        # when store in fp8 and compute in fp8, no need to convert dtype
+        if not (NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 and NSA_KV_CACHE_STORE_FP8):
+            kv_cache = kv_cache.to(q.dtype)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -782,7 +785,9 @@ class NativeSparseAttnBackend(AttentionBackend):
                 nsa_index_topk=self.nsa_index_topk,
             ),
             # doc says it is not used, but if pass in None then error
-            block_table=torch.empty((q_all.shape[0], 0), dtype=torch.int32, device=q_all.device),
+            block_table=torch.empty(
+                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+            ),
             is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
         )
 
