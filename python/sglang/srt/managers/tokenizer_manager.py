@@ -820,6 +820,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
 
+    def _batch_has_only_input_ids(
+        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> bool:
+        """Check if all requests in the batch provide input_ids only."""
+        for i in range(batch_size):
+            if obj[i].input_ids is None:
+                return False
+        return True
+
     def _send_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -959,6 +968,25 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 self._validate_batch_tokenization_constraints(batch_size, obj)
 
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+
+                # Send as a single batched request
+                self._send_batch_request(obj, tokenized_objs, created_time)
+
+                # Set up generators for each request in the batch
+                for i in range(batch_size):
+                    tmp_obj = obj[i]
+                    generators.append(
+                        self._wait_one_response(
+                            tmp_obj, self.rid_to_state[tmp_obj.rid], request
+                        )
+                    )
+                    rids.append(tmp_obj.rid)
+            elif self._batch_has_only_input_ids(batch_size, obj):
+                tokenized_objs = []
+                for i in range(batch_size):
+                    tmp_obj = obj[i]
+                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                    tokenized_objs.append(tokenized_obj)
 
                 # Send as a single batched request
                 self._send_batch_request(obj, tokenized_objs, created_time)
