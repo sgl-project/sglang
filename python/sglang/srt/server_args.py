@@ -638,19 +638,22 @@ class ServerArgs:
                 # So we need to reserve more memory.
                 if self.cuda_graph_max_bs > 300:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
+            
+            if gpu_mem is not None:
+                if gpu_mem > 60 * 1024:
+                    reserved_mem = max(reserved_mem, 10 * 1024)
 
-            if gpu_mem > 60 * 1024:
-                reserved_mem = max(reserved_mem, 10 * 1024)
+                if self.speculative_algorithm is not None:
+                    if self.speculative_algorithm == "STANDALONE":
+                        # standalonedraft model and cuda graphs
+                        reserved_mem += 6 * 1024
+                    elif self.speculative_algorithm != "NGRAM":
+                        # eagle draft models and cuda graphs
+                        reserved_mem += 2 * 1024
 
-            if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
-                    # standalonedraft model and cuda graphs
-                    reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
-                    # eagle draft models and cuda graphs
-                    reserved_mem += 2 * 1024
-
-            self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
+                self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
+            else:
+                self.mem_fraction_static = reserved_mem
 
             # Lazy init to avoid circular import
             # Multimodal models need more memory for the image processor
