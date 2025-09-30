@@ -224,7 +224,7 @@ impl GrpcRouter {
 
         debug!("Selected worker: {}", worker.url());
 
-        // Step 2: Get gRPC client from worker
+        // Step 3: Get gRPC client from worker
         let client = match Self::get_grpc_client_from_worker(&worker).await {
             Ok(client) => client,
             Err(response) => return response,
