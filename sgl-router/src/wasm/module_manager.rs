@@ -16,7 +16,7 @@ use wasmtime::Val;
 
 use crate::wasm::{
     config::WasmRuntimeConfig,
-    module::{WasmModule, WasmModuleDescriptor, WasmModuleMeta},
+    module::{WasmModule, WasmModuleAttachPoint, WasmModuleDescriptor, WasmModuleMeta, WasmModuleType},
     runtime::WasmRuntime,
 };
 
@@ -128,6 +128,7 @@ impl WasmModuleManager {
                 created_at: now,
                 last_accessed_at: now,
                 access_count: 0,
+                attach_points: descriptor.attach_points.clone(),
             },
         };
 
@@ -165,6 +166,15 @@ impl WasmModuleManager {
             .read()
             .map_err(|e| format!("Failed to acquire read lock: {}", e))?;
         Ok(modules.get(&module_uuid).cloned())
+    }
+
+    /// get modules by attach point
+    pub fn get_modules_by_attach_point(&self, attach_point: WasmModuleAttachPoint) -> Result<Vec<WasmModule>, String> {
+        let modules = self
+            .modules
+            .read()
+            .map_err(|e| format!("Failed to acquire read lock: {}", e))?;
+        Ok(modules.values().filter(|module| module.module_meta.attach_points.contains_key(&attach_point)).cloned().collect())
     }
 
     /// execute module function
