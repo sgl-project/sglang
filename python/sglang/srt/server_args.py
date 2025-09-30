@@ -650,8 +650,11 @@ class ServerArgs:
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
 
-            self.mem_fraction_static = (round((gpu_mem - reserved_mem) / gpu_mem, 3)
-                if gpu_mem is not None else 0.88)
+            self.mem_fraction_static = (
+                round((gpu_mem - reserved_mem) / gpu_mem, 3)
+                if gpu_mem is not None
+                else 0.88
+            )
 
             # Lazy init to avoid circular import
             # Multimodal models need more memory for the image processor
