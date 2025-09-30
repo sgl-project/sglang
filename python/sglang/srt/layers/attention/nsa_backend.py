@@ -558,10 +558,8 @@ class NativeSparseAttnBackend(AttentionBackend):
                 v_head_dim=layer.v_head_dim,
                 # TODO optimize args
                 layer=layer,
-                forward_batch=forward_batch,
                 metadata=metadata,
-                topk_indices=topk_indices,
-                block_table=metadata.real_page_table,
+                page_table_1=page_table_1,
             )
         elif NSA_PREFILL_IMPL == "fa3":
             return self._forward_fa3(
@@ -654,10 +652,8 @@ class NativeSparseAttnBackend(AttentionBackend):
                 v_head_dim=layer.v_head_dim,
                 # TODO optimize args
                 layer=layer,
-                forward_batch=forward_batch,
                 metadata=metadata,
-                topk_indices=topk_indices,
-                block_table=metadata.real_page_table,
+                page_table_1=page_table_1,
             )
         elif NSA_DECODE_IMPL == "tilelang":
             if q_rope is not None:
@@ -751,10 +747,8 @@ class NativeSparseAttnBackend(AttentionBackend):
         v_head_dim: int,
         sm_scale: float,
         layer,
-        forward_batch: ForwardBatch,
         metadata: NSAMetadata,
-        topk_indices,
-        block_table,
+        page_table_1,
     ) -> torch.Tensor:
         from flash_mla import flash_mla_with_kvcache
 
@@ -769,6 +763,15 @@ class NativeSparseAttnBackend(AttentionBackend):
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
+        # TODO fuse transform
+        page_table_1_transformed = torch.nn.functional.pad(
+            page_table_1,
+            (0, self.nsa_index_topk - page_table_1.shape[-1]),
+            "constant",
+            -1,
+        )
+        page_table_1_transformed = page_table_1_transformed.unsqueeze(1)
+
         o, _ = flash_mla_with_kvcache(
             q=q_all,
             k_cache=kv_cache,
@@ -777,13 +780,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
             num_splits=metadata.flashmla_metadata.num_splits,
             softmax_scale=sm_scale,
-            # TODO improve
-            indices=_compute_indices_in_kvcache(
-                block_table=block_table,
-                topk_indices=topk_indices.to(torch.int32),
-                page_size=self.real_page_size,
-                nsa_index_topk=self.nsa_index_topk,
-            ),
+            indices=page_table_1_transformed,
             # doc says it is not used, but if pass in None then error
             block_table=torch.empty(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
@@ -839,32 +836,3 @@ class NativeSparseAttnBackend(AttentionBackend):
             flashmla_metadata=flashmla_metadata,
             num_splits=num_splits,
         )
-
-
-# TODO speedup
-def _compute_indices_in_kvcache(block_table, topk_indices, page_size, nsa_index_topk):
-    topk_indices_safe = topk_indices.masked_fill(topk_indices == -1, 0)
-
-    idx0 = torch.arange(block_table.size(0), device=topk_indices_safe.device).unsqueeze(
-        1
-    )
-    block_idx = block_table[idx0, topk_indices_safe // page_size]
-    offset = topk_indices_safe % page_size
-    indices_in_kvcache = block_idx * page_size + offset
-
-    # the kernel requires invalid entry to be -1
-    assert indices_in_kvcache.shape == topk_indices.shape
-    indices_in_kvcache[topk_indices == -1] = -1
-
-    # return: (batch_size, seqlen_q_ori, topk)
-    indices_in_kvcache = indices_in_kvcache[:, None, :]
-
-    indices_in_kvcache = torch.nn.functional.pad(
-        indices_in_kvcache,
-        (0, nsa_index_topk - indices_in_kvcache.shape[-1]),
-        "constant",
-        -1,
-    )
-    assert indices_in_kvcache.shape[-1] == nsa_index_topk
-
-    return indices_in_kvcache
