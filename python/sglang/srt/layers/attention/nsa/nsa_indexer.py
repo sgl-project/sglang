@@ -444,11 +444,6 @@ class Indexer(CustomOp):
 
         query, key = self._get_q_k_bf16(q_lora, x, positions, enable_dual_stream)
 
-        q_fp8 = query.to(torch.float32)
-        k_fp8 = key.to(torch.float32)
-        q_scale = torch.ones((query.shape[0], 1), dtype=torch.float32, device="cuda")
-        k_scale = torch.ones((key.shape[0], 1), dtype=torch.float32, device="cuda")
-
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
