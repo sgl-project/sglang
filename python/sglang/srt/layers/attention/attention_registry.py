@@ -54,9 +54,17 @@ def create_aiter_backend(runner):
 
 @register_attention_backend("wave")
 def create_wave_backend(runner):
-    from sglang.srt.layers.attention.wave_backend import WaveAttnBackend
-
-    return WaveAttnBackend(runner)
+    try:
+        from sglang.srt.layers.attention.wave_backend import WaveAttnBackend
+        return WaveAttnBackend(runner)
+    except ImportError as e:
+        if "wave_lang" in str(e):
+            raise ImportError(
+                "wave_lang dependency is required for wave attention backend. "
+                "Please install wave_lang or use a different attention backend."
+            ) from e
+        else:
+            raise
 
 
 @register_attention_backend("ascend")
