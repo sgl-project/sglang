@@ -69,6 +69,13 @@ ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 ARG MOONCAKE_COMMIT="dcdf1c784b40aa6975a8ed89fe26321b028e40e8"
 
+ARG TILELANG_REPO="https://github.com/HaiShaw/tilelang.git"
+ARG TILELANG_BRANCH="dsv32-mi35x"
+ARG TILELANG_COMMIT="ae938cf885743f165a19656d1122ad42bb0e30b8"
+
+ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
+ARG FHT_BRANCH="rocm"
+ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 USER root
 
 # Install some basic utilities
@@ -256,8 +263,10 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   # 4) Install Cython for TVM Python build (pin to <3 for broad compat)
   python3 -m pip install --no-cache-dir "cython>=0.29.36,<3.0"; \
   # 5) Clone + build TileLang; pass LLVM_CONFIG to CMake
-  git clone https://github.com/HaiShaw/tilelang.git --recursive -b dsv32-mi35x tilelang; \
+  git clone --recursive --branch "${TILELANG_BRANCH}" "${TILELANG_REPO}" tilelang; \
   cd tilelang; \
+  git fetch --depth=1 origin "${TILELANG_COMMIT}" || true; \
+  git checkout -f "${TILELANG_COMMIT}"; \
   git submodule update --init --recursive; \
   export CMAKE_ARGS="-DLLVM_CONFIG=${LLVM_CONFIG} ${CMAKE_ARGS:-}"; \
   bash ./install_rocm.sh'
@@ -265,8 +274,9 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 # -----------------------
 # Hadamard-transform (HIP build)
 RUN /bin/bash -lc 'set -euo pipefail; \
-    git clone https://github.com/jeffdaily/fast-hadamard-transform.git -b rocm fast-hadamard-transform; \
+    git clone --branch "${FHT_BRANCH}" "${FHT_REPO}" fast-hadamard-transform; \
     cd fast-hadamard-transform; \
+    git checkout -f "${FHT_COMMIT}"; \
     python setup.py install'
 
 # -----------------------
