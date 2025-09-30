@@ -3,7 +3,6 @@ import datetime
 from google.protobuf import timestamp_pb2 as _timestamp_pb2
 from google.protobuf import struct_pb2 as _struct_pb2
 from google.protobuf.internal import containers as _containers
-from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from collections.abc import Iterable as _Iterable, Mapping as _Mapping
@@ -163,50 +162,46 @@ class GenerateResponse(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., chunk: _Optional[_Union[GenerateStreamChunk, _Mapping]] = ..., complete: _Optional[_Union[GenerateComplete, _Mapping]] = ..., error: _Optional[_Union[GenerateError, _Mapping]] = ...) -> None: ...
 
 class GenerateStreamChunk(_message.Message):
-    __slots__ = ("token_ids", "prompt_tokens", "completion_tokens", "cached_tokens", "logprobs", "hidden_states")
+    __slots__ = ("token_ids", "prompt_tokens", "completion_tokens", "cached_tokens", "output_logprobs", "hidden_states", "input_logprobs")
     TOKEN_IDS_FIELD_NUMBER: _ClassVar[int]
     PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
     COMPLETION_TOKENS_FIELD_NUMBER: _ClassVar[int]
     CACHED_TOKENS_FIELD_NUMBER: _ClassVar[int]
-    LOGPROBS_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     HIDDEN_STATES_FIELD_NUMBER: _ClassVar[int]
+    INPUT_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     token_ids: _containers.RepeatedScalarFieldContainer[int]
     prompt_tokens: int
     completion_tokens: int
     cached_tokens: int
-    logprobs: LogProbs
+    output_logprobs: LogProbs
     hidden_states: _containers.RepeatedScalarFieldContainer[float]
-    def __init__(self, token_ids: _Optional[_Iterable[int]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., logprobs: _Optional[_Union[LogProbs, _Mapping]] = ..., hidden_states: _Optional[_Iterable[float]] = ...) -> None: ...
+    input_logprobs: LogProbs
+    def __init__(self, token_ids: _Optional[_Iterable[int]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., output_logprobs: _Optional[_Union[LogProbs, _Mapping]] = ..., hidden_states: _Optional[_Iterable[float]] = ..., input_logprobs: _Optional[_Union[LogProbs, _Mapping]] = ...) -> None: ...
 
 class GenerateComplete(_message.Message):
-    __slots__ = ("output_ids", "finish_reason", "prompt_tokens", "completion_tokens", "cached_tokens", "all_logprobs", "all_hidden_states")
-    class FinishReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
-        __slots__ = ()
-        STOP: _ClassVar[GenerateComplete.FinishReason]
-        LENGTH: _ClassVar[GenerateComplete.FinishReason]
-        EOS_TOKEN: _ClassVar[GenerateComplete.FinishReason]
-        STOP_STR: _ClassVar[GenerateComplete.FinishReason]
-        ABORT: _ClassVar[GenerateComplete.FinishReason]
-    STOP: GenerateComplete.FinishReason
-    LENGTH: GenerateComplete.FinishReason
-    EOS_TOKEN: GenerateComplete.FinishReason
-    STOP_STR: GenerateComplete.FinishReason
-    ABORT: GenerateComplete.FinishReason
+    __slots__ = ("output_ids", "finish_reason", "prompt_tokens", "completion_tokens", "cached_tokens", "output_logprobs", "all_hidden_states", "matched_token_id", "matched_stop_str", "input_logprobs")
     OUTPUT_IDS_FIELD_NUMBER: _ClassVar[int]
     FINISH_REASON_FIELD_NUMBER: _ClassVar[int]
     PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
     COMPLETION_TOKENS_FIELD_NUMBER: _ClassVar[int]
     CACHED_TOKENS_FIELD_NUMBER: _ClassVar[int]
-    ALL_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     ALL_HIDDEN_STATES_FIELD_NUMBER: _ClassVar[int]
+    MATCHED_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
+    MATCHED_STOP_STR_FIELD_NUMBER: _ClassVar[int]
+    INPUT_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     output_ids: _containers.RepeatedScalarFieldContainer[int]
-    finish_reason: GenerateComplete.FinishReason
+    finish_reason: str
     prompt_tokens: int
     completion_tokens: int
     cached_tokens: int
-    all_logprobs: _containers.RepeatedCompositeFieldContainer[LogProbs]
+    output_logprobs: LogProbs
     all_hidden_states: _containers.RepeatedCompositeFieldContainer[HiddenStates]
-    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., finish_reason: _Optional[_Union[GenerateComplete.FinishReason, str]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., all_logprobs: _Optional[_Iterable[_Union[LogProbs, _Mapping]]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ...) -> None: ...
+    matched_token_id: int
+    matched_stop_str: str
+    input_logprobs: LogProbs
+    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., finish_reason: _Optional[str] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., output_logprobs: _Optional[_Union[LogProbs, _Mapping]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ..., matched_token_id: _Optional[int] = ..., matched_stop_str: _Optional[str] = ..., input_logprobs: _Optional[_Union[LogProbs, _Mapping]] = ...) -> None: ...
 
 class GenerateError(_message.Message):
     __slots__ = ("message", "http_status_code", "details")
@@ -219,26 +214,22 @@ class GenerateError(_message.Message):
     def __init__(self, message: _Optional[str] = ..., http_status_code: _Optional[str] = ..., details: _Optional[str] = ...) -> None: ...
 
 class LogProbs(_message.Message):
-    __slots__ = ("token_logprobs", "token_ids", "top_logprobs", "token_texts")
+    __slots__ = ("token_logprobs", "token_ids", "top_logprobs")
     TOKEN_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     TOKEN_IDS_FIELD_NUMBER: _ClassVar[int]
     TOP_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
-    TOKEN_TEXTS_FIELD_NUMBER: _ClassVar[int]
     token_logprobs: _containers.RepeatedScalarFieldContainer[float]
     token_ids: _containers.RepeatedScalarFieldContainer[int]
     top_logprobs: _containers.RepeatedCompositeFieldContainer[TopLogProbs]
-    token_texts: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, token_logprobs: _Optional[_Iterable[float]] = ..., token_ids: _Optional[_Iterable[int]] = ..., top_logprobs: _Optional[_Iterable[_Union[TopLogProbs, _Mapping]]] = ..., token_texts: _Optional[_Iterable[str]] = ...) -> None: ...
+    def __init__(self, token_logprobs: _Optional[_Iterable[float]] = ..., token_ids: _Optional[_Iterable[int]] = ..., top_logprobs: _Optional[_Iterable[_Union[TopLogProbs, _Mapping]]] = ...) -> None: ...
 
 class TopLogProbs(_message.Message):
-    __slots__ = ("values", "token_ids", "token_texts")
+    __slots__ = ("values", "token_ids")
     VALUES_FIELD_NUMBER: _ClassVar[int]
     TOKEN_IDS_FIELD_NUMBER: _ClassVar[int]
-    TOKEN_TEXTS_FIELD_NUMBER: _ClassVar[int]
     values: _containers.RepeatedScalarFieldContainer[float]
     token_ids: _containers.RepeatedScalarFieldContainer[int]
-    token_texts: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, values: _Optional[_Iterable[float]] = ..., token_ids: _Optional[_Iterable[int]] = ..., token_texts: _Optional[_Iterable[str]] = ...) -> None: ...
+    def __init__(self, values: _Optional[_Iterable[float]] = ..., token_ids: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class HiddenStates(_message.Message):
     __slots__ = ("values", "layer", "position")

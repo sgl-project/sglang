@@ -388,10 +388,10 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
-        elif self.spec_algorithm.is_lookahead():
-            from sglang.srt.speculative.lookahead_worker import LOOKAHEADWorker
+        elif self.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
-            self.draft_worker = LOOKAHEADWorker(
+            self.draft_worker = NGRAMWorker(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 moe_ep_rank=moe_ep_rank,
@@ -756,6 +756,7 @@ class Scheduler(
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,
+                    is_eagle=self.spec_algorithm.is_eagle(),
                 )
 
         if (
@@ -806,7 +807,7 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=self.model_config.hf_text_config.hidden_size,
-                dtype=self.model_config.dtype,
+                hidden_states_dtype=self.model_config.dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -826,7 +827,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 draft_token_to_kv_pool=(
                     None
-                    if self.draft_worker is None or self.spec_algorithm.is_lookahead()
+                    if self.draft_worker is None or self.spec_algorithm.is_ngram()
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
@@ -855,7 +856,7 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=self.model_config.hf_text_config.hidden_size,
-                dtype=self.model_config.dtype,
+                hidden_states_dtype=self.model_config.dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -863,7 +864,7 @@ class Scheduler(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 draft_token_to_kv_pool=(
                     None
-                    if self.draft_worker is None or self.spec_algorithm.is_lookahead()
+                    if self.draft_worker is None or self.spec_algorithm.is_ngram()
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,

@@ -598,8 +598,6 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
-    // ============= PrometheusConfig Tests =============
-
     #[test]
     fn test_prometheus_config_default() {
         let config = PrometheusConfig::default();
@@ -627,8 +625,6 @@ mod tests {
         assert_eq!(cloned.port, config.port);
         assert_eq!(cloned.host, config.host);
     }
-
-    // ============= IP Address Parsing Tests =============
 
     #[test]
     fn test_valid_ipv4_parsing() {
@@ -679,8 +675,6 @@ mod tests {
         }
     }
 
-    // ============= Socket Address Creation Tests =============
-
     #[test]
     fn test_socket_addr_creation() {
         let test_cases = vec![("127.0.0.1", 8080), ("0.0.0.0", 29000), ("::1", 9090)];
@@ -716,8 +710,6 @@ mod tests {
         }
     }
 
-    // ============= Duration Bucket Tests =============
-
     #[test]
     fn test_duration_bucket_coverage() {
         let test_cases: [(f64, &str); 7] = [
@@ -743,8 +735,6 @@ mod tests {
         }
     }
 
-    // ============= Matcher Configuration Tests =============
-
     #[test]
     fn test_duration_suffix_matcher() {
         let matcher = Matcher::Suffix(String::from("duration_seconds"));
@@ -762,8 +752,6 @@ mod tests {
             _ => panic!("Expected Suffix matcher"),
         }
     }
-
-    // ============= Builder Configuration Tests =============
 
     #[test]
     fn test_prometheus_builder_configuration() {
@@ -783,15 +771,11 @@ mod tests {
         }
     }
 
-    // ============= Upkeep Timeout Tests =============
-
     #[test]
     fn test_upkeep_timeout_duration() {
         let timeout = Duration::from_secs(5 * 60);
         assert_eq!(timeout.as_secs(), 300);
     }
-
-    // ============= Custom Bucket Tests =============
 
     #[test]
     fn test_custom_buckets_for_different_metrics() {
@@ -809,8 +793,6 @@ mod tests {
             assert!(generate_buckets[i] > generate_buckets[i - 1]);
         }
     }
-
-    // ============= RouterMetrics Tests =============
 
     #[test]
     fn test_metrics_static_methods() {
@@ -876,8 +858,6 @@ mod tests {
         TokenizerMetrics::set_vocab_size("huggingface", 50000);
     }
 
-    // ============= Port Availability Tests =============
-
     #[test]
     fn test_port_already_in_use() {
         let port = 29123;
@@ -891,8 +871,6 @@ mod tests {
             assert_eq!(config.port, port);
         }
     }
-
-    // ============= Integration Test Helpers =============
 
     #[test]
     fn test_metrics_endpoint_accessibility() {
@@ -936,8 +914,6 @@ mod tests {
             handle.join().unwrap();
         }
     }
-
-    // ============= Edge Cases Tests =============
 
     #[test]
     fn test_empty_string_metrics() {
