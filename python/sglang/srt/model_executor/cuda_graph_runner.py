@@ -167,29 +167,6 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
 
-    if capture_bs is None:
-        if server_args.speculative_algorithm is None:
-            if server_args.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
-            else:
-                capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
-        else:
-            # Since speculative decoding requires more cuda graph memory, we
-            # capture less.
-            capture_bs = (
-                list(range(1, 9))
-                + list(range(10, 33, 2))
-                + list(range(40, 65, 8))
-                + list(range(80, 161, 16))
-            )
-
-        gpu_mem = get_device_memory_capacity()
-        if gpu_mem is not None:
-            if gpu_mem > 90 * 1024:  # H200, H20
-                capture_bs += list(range(160, 257, 8))
-            if gpu_mem > 160 * 1000:  # B200, MI300
-                capture_bs += list(range(256, 513, 16))
-
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
@@ -205,12 +182,6 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
     capture_bs = [bs for bs in capture_bs if bs % mul_base == 0]
 
-    if server_args.cuda_graph_max_bs:
-        capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
-        if max(capture_bs) < server_args.cuda_graph_max_bs:
-            capture_bs += list(
-                range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
-            )
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -275,7 +246,7 @@ class CudaGraphRunner:
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
-            or model_runner.spec_algorithm.is_lookahead()
+            or model_runner.spec_algorithm.is_ngram()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -442,12 +413,12 @@ class CudaGraphRunner:
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
-        is_lookahead_supported = (
+        is_ngram_supported = (
             (
                 forward_batch.batch_size * self.num_tokens_per_bs
                 == forward_batch.input_ids.numel()
             )
-            if self.model_runner.spec_algorithm.is_lookahead()
+            if self.model_runner.spec_algorithm.is_ngram()
             else True
         )
 
@@ -456,7 +427,7 @@ class CudaGraphRunner:
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
-            and is_lookahead_supported
+            and is_ngram_supported
         )
 
     def capture(self) -> None:
@@ -466,6 +437,7 @@ class CudaGraphRunner:
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 record_shapes=True,
             )
+            torch.cuda.memory._record_memory_history()
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -514,6 +486,8 @@ class CudaGraphRunner:
                     save_gemlite_cache()
 
         if self.enable_profile_cuda_graph:
+            torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
+            torch.cuda.memory._record_memory_history(enabled=None)
             log_message = (
                 "Sorted by CUDA Time:\n"
                 + prof.key_averages(group_by_input_shape=True).table(
@@ -523,6 +497,7 @@ class CudaGraphRunner:
                 + prof.key_averages(group_by_input_shape=True).table(
                     sort_by="cpu_time_total", row_limit=10
                 )
+                + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
             )
             logger.info(log_message)
 
@@ -867,10 +842,10 @@ class CudaGraphRunner:
                     seq_lens_cpu=None,
                 )
 
-        elif self.model_runner.spec_algorithm.is_lookahead():
-            from sglang.srt.speculative.lookahead_info import LookaheadVerifyInput
+        elif self.model_runner.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.ngram_utils import NgramVerifyInput
 
-            spec_info = LookaheadVerifyInput(
+            spec_info = NgramVerifyInput(
                 draft_token=None,
                 tree_mask=self.custom_mask,
                 positions=None,

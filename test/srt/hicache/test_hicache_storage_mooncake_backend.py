@@ -236,6 +236,21 @@ class TestMooncakeBackendPageFirstLayout(
         """Get additional server arguments specific to configuration - override in subclasses"""
         server_args, env_vars = super()._get_additional_server_args_and_env()
         server_args["--hicache-mem-layout"] = "page_first"
+        server_args["--hicache-io-backend"] = "kernel"
+        return server_args, env_vars
+
+
+class TestMooncakeBackendPageFirstDirectLayout(
+    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
+):
+    """Page first layout tests for HiCache-Mooncake backend"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args["--hicache-mem-layout"] = "page_first_direct"
+        server_args["--hicache-io-backend"] = "direct"
         return server_args, env_vars
 
 
