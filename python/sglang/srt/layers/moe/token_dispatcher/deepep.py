@@ -13,7 +13,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
+from sglang.srt.layers.moe.utils import (
+    DeepEPMode,
+    get_deepep_config,
+    get_moe_runner_backend,
+    is_tbo_enabled,
+)
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -517,8 +522,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            # TODO(shuw): pending https://github.com/deepseek-ai/DeepEP/pull/341
-            use_fp8=not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"),
+            use_fp8=not get_moe_runner_backend().is_cutlass_w4afp8(),
         )
         return (
             hidden_states,
