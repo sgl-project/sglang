@@ -21,7 +21,7 @@ use crate::protocols::spec::ChatMessage;
 use crate::protocols::spec::{
     ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
     CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, ResponsesGetParams,
-    ResponsesRequest, StringOrArray, Tool, ToolChoice, Usage,
+    ResponsesRequest, StringOrArray, Tool, ToolChoice, ToolChoiceValue, Usage,
 };
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
@@ -31,7 +31,8 @@ use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoderBuilder};
 use crate::tokenizer::traits::Tokenizer;
 use crate::tokenizer::HuggingFaceTokenizer;
 use crate::tool_parser::ParserRegistry;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -508,8 +509,6 @@ impl GrpcRouter {
         tool_choice: &Option<ToolChoice>,
         _model: &str,
     ) -> Option<(String, String)> {
-        use crate::protocols::spec::ToolChoiceValue;
-
         let choice = tool_choice.as_ref()?;
 
         match choice {
@@ -554,9 +553,6 @@ impl GrpcRouter {
     /// Build JSON schema for required tool calls (array with minItems: 1)
     /// Includes $defs consolidation from all tools (matching Python's behavior)
     fn build_required_array_schema(&self, tools: &[Tool]) -> Option<String> {
-        use serde_json::{json, Map, Value};
-        use std::collections::HashMap;
-
         // Build anyOf schemas for each tool
         let mut any_of_schemas = Vec::new();
         for tool in tools {
