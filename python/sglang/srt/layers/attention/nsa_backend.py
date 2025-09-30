@@ -85,8 +85,6 @@ class NSAMetadata:
     # 2. sparse decode/prefill, indexer need real_page_table to compute the score
     real_page_table: torch.Tensor
 
-    flashmla_metadata: NSAFlashMLAMetadata
-
     # NSA metadata (nsa prefill are expanded)
     nsa_cache_seqlens_int32: torch.Tensor  # this seqlens is clipped to `topk`
     nsa_cu_seqlens_q: torch.Tensor  # must be arange(0, len(nsa_cu_seqlens_k))
@@ -94,6 +92,8 @@ class NSAMetadata:
     nsa_extend_seq_lens_list: List[int]
     nsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     nsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
+
+    flashmla_metadata: Optional[NSAFlashMLAMetadata] = None
 
 
 @dataclass(frozen=True)
@@ -268,9 +268,13 @@ class NativeSparseAttnBackend(AttentionBackend):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table,
-            flashmla_metadata=self._compute_flashmla_metadata(
-                cache_seqlens=cache_seqlens_int32,
-                seq_len_q=1,  # TODO handle MTP which is not 1
+            flashmla_metadata=(
+                self._compute_flashmla_metadata(
+                    cache_seqlens=cache_seqlens_int32,
+                    seq_len_q=1,  # TODO handle MTP which is not 1
+                )
+                if NSA_DECODE_IMPL == "flashmla_decode"
+                else None
             ),
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
@@ -306,9 +310,15 @@ class NativeSparseAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             ),
-            "flashmla_metadata": self._compute_flashmla_metadata(
-                cache_seqlens=torch.ones(max_bs, dtype=torch.int32, device=self.device),
-                seq_len_q=1,  # TODO handle MTP which is not 1
+            "flashmla_metadata": (
+                self._compute_flashmla_metadata(
+                    cache_seqlens=torch.ones(
+                        max_bs, dtype=torch.int32, device=self.device
+                    ),
+                    seq_len_q=1,  # TODO handle MTP which is not 1
+                )
+                if NSA_DECODE_IMPL == "flashmla_decode"
+                else None
             ),
         }
 
@@ -349,15 +359,18 @@ class NativeSparseAttnBackend(AttentionBackend):
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
-        flashmla_metadata = self.decode_cuda_graph_metadata["flashmla_metadata"].slice(
-            slice(0, bs + 1)
-        )
-        flashmla_metadata.copy_(
-            self._compute_flashmla_metadata(
-                cache_seqlens=cache_seqlens_int32,
-                seq_len_q=1,  # TODO handle MTP which is not 1
+        if NSA_DECODE_IMPL == "flashmla_decode":
+            flashmla_metadata = self.decode_cuda_graph_metadata[
+                "flashmla_metadata"
+            ].slice(slice(0, bs + 1))
+            flashmla_metadata.copy_(
+                self._compute_flashmla_metadata(
+                    cache_seqlens=cache_seqlens_int32,
+                    seq_len_q=1,  # TODO handle MTP which is not 1
+                )
             )
-        )
+        else:
+            flashmla_metadata = None
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -431,12 +444,13 @@ class NativeSparseAttnBackend(AttentionBackend):
         else:
             assert metadata.real_page_table is metadata.page_table_1
 
-        metadata.flashmla_metadata.copy_(
-            self._compute_flashmla_metadata(
-                cache_seqlens=cache_seqlens,
-                seq_len_q=1,  # TODO handle MTP which is not 1
+        if NSA_DECODE_IMPL == "flashmla_decode":
+            metadata.flashmla_metadata.copy_(
+                self._compute_flashmla_metadata(
+                    cache_seqlens=cache_seqlens,
+                    seq_len_q=1,  # TODO handle MTP which is not 1
+                )
             )
-        )
 
         self.forward_metadata = metadata
 
