@@ -355,7 +355,7 @@ class TokenizerCommunicatorMixin:
         ), "dp_size must be 1 for init parameter update group"
         result = (await self.init_weights_update_group_communicator(obj))[0]
         return result.success, result.message
-    
+
     async def destroy_weights_update_group(
         self,
         obj: DestroyWeightsUpdateGroupReqInput,
