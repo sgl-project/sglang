@@ -1229,6 +1229,8 @@ impl GrpcRouter {
         // Add output logprobs if requested and available
         if original_request.return_logprob {
             if let Some(output_logprobs) = &complete.output_logprobs {
+                debug!("Output logprobs received: token_logprobs={:?}, token_ids={:?}",
+                    output_logprobs.token_logprobs, output_logprobs.token_ids);
                 let output_logprobs_json =
                     self.convert_proto_logprobs_to_tuple_array(output_logprobs);
                 meta_obj.insert("output_token_logprobs".to_string(), output_logprobs_json);
@@ -1237,6 +1239,8 @@ impl GrpcRouter {
 
         // Add input logprobs if available
         if let Some(input_logprobs) = &complete.input_logprobs {
+            debug!("Input logprobs received: token_logprobs={:?}, token_ids={:?}",
+                input_logprobs.token_logprobs, input_logprobs.token_ids);
             let input_logprobs_json = self.convert_proto_logprobs_to_tuple_array(input_logprobs);
             meta_obj.insert("input_token_logprobs".to_string(), input_logprobs_json);
         }
