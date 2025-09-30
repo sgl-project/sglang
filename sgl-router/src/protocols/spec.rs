@@ -1961,6 +1961,14 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub return_logprob: bool,
 
+    /// Starting position for returning logprobs (0 = from beginning)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprob_start_len: Option<i32>,
+
+    /// Whether to include decoded text in logprobs
+    #[serde(default)]
+    pub return_text_in_logprobs: bool,
+
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lora_path: Option<LoRAPath>,

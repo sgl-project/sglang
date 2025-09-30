@@ -1226,6 +1226,21 @@ impl GrpcRouter {
             meta_obj.insert("matched_stop".to_string(), matched_value);
         }
 
+        // Add output logprobs if requested and available
+        if original_request.return_logprob {
+            if let Some(output_logprobs) = &complete.output_logprobs {
+                let output_logprobs_json =
+                    self.convert_proto_logprobs_to_tuple_array(output_logprobs);
+                meta_obj.insert("output_token_logprobs".to_string(), output_logprobs_json);
+            }
+        }
+
+        // Add input logprobs if available
+        if let Some(input_logprobs) = &complete.input_logprobs {
+            let input_logprobs_json = self.convert_proto_logprobs_to_tuple_array(input_logprobs);
+            meta_obj.insert("input_token_logprobs".to_string(), input_logprobs_json);
+        }
+
         let response_body = json!({
             "text": decoded_text,
             "output_ids": output_ids,
@@ -1233,6 +1248,30 @@ impl GrpcRouter {
         });
 
         Json(response_body).into_response()
+    }
+
+    /// Convert proto LogProbs to tuple array format for /generate endpoint
+    /// Format: [[logprob, token_id, token_text], ...]
+    fn convert_proto_logprobs_to_tuple_array(&self, proto_logprobs: &proto::LogProbs) -> Value {
+        let all_logprobs: Vec<Value> = proto_logprobs
+            .token_logprobs
+            .iter()
+            .enumerate()
+            .map(|(i, &logprob)| {
+                let token_id = proto_logprobs.token_ids.get(i).copied().unwrap_or(0);
+                let token_text = self.decode_token(token_id);
+                json!([logprob, token_id, token_text])
+            })
+            .collect();
+
+        Value::Array(all_logprobs)
+    }
+
+    /// Helper to decode a token ID to text
+    fn decode_token(&self, token_id: i32) -> String {
+        self.tokenizer
+            .decode(&[token_id as u32], false)
+            .unwrap_or_else(|_| format!("<token_{}>", token_id))
     }
 
     /// Convert proto LogProbs to OpenAI ChatLogProbs format
@@ -1362,21 +1401,19 @@ impl GrpcRouter {
         }
 
         // Step 2: Handle tool call parsing
-        let mut tool_calls: Option<Vec<crate::protocols::spec::ToolCall>> = None;
+        let mut tool_calls: Option<Vec<ToolCall>> = None;
 
         // Check if tool calls should be processed
         let tool_choice_enabled = !matches!(
             &original_request.tool_choice,
-            Some(ToolChoice::Value(
-                crate::protocols::spec::ToolChoiceValue::None
-            ))
+            Some(ToolChoice::Value(ToolChoiceValue::None))
         );
 
         if tool_choice_enabled && original_request.tools.is_some() {
             // Check if JSON schema constraint was used (specific function or required mode)
             let used_json_schema = match &original_request.tool_choice {
                 Some(ToolChoice::Function { .. }) => true,
-                Some(ToolChoice::Value(crate::protocols::spec::ToolChoiceValue::Required)) => true,
+                Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
                 Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
                 _ => false,
             };
@@ -1403,11 +1440,11 @@ impl GrpcRouter {
 
         // Extract matched_stop information from proto
         let matched_stop = match &complete.matched_stop {
-            Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => Some(
-                serde_json::Value::Number(serde_json::Number::from(*token_id)),
-            ),
+            Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => {
+                Some(Value::Number(serde_json::Number::from(*token_id)))
+            }
             Some(proto::generate_complete::MatchedStop::MatchedStopStr(stop_str)) => {
-                Some(serde_json::Value::String(stop_str.clone()))
+                Some(Value::String(stop_str.clone()))
             }
             None => None,
         };
