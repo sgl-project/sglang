@@ -27,6 +27,16 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import add_prefix, align, is_cuda
 
+try:
+    import deep_gemm_v32
+except ImportError as e:
+    print("Error when importing deep_gemm_v32, try deep_gemm")
+    try:
+        import deep_gemm as deep_gemm_v32
+    except ImportError as e:
+        print("Error when importing deep_gemm, skip")
+
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -309,7 +319,6 @@ class Indexer(CustomOp):
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
             layer_id=layer_id
         )
-        import deep_gemm_v32
 
         blocksize = page_size
         seqlens_32 = metadata.get_seqlens_int32()
@@ -398,8 +407,6 @@ class Indexer(CustomOp):
         ks = torch.cat(ks_list, dim=0)
         seq_lens_expanded = metadata.get_seqlens_expanded()
         ke = ks + seq_lens_expanded
-
-        import deep_gemm_v32
 
         logits = deep_gemm_v32.fp8_mqa_logits(
             q_fp8,
