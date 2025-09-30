@@ -192,17 +192,15 @@ class RuntimeEndpoint(BaseBackend):
 
         obj = res.json()
 
-        if isinstance(obj, list):
-            if not obj:
-                return [], []
-            comps, meta_infos = zip(
-                *((item["text"], item["meta_info"]) for item in obj)
-            )
-            return list(comps), list(meta_infos)
-        else:
-            comp = obj["text"]
-            meta_info = obj["meta_info"]
-            return comp, meta_info
+        # Ensure obj is always a list for consistent processing
+        if not isinstance(obj, list):
+            obj = [obj]
+
+        if not obj:
+            return [], []
+
+        comps, meta_infos = zip(*((item["text"], item["meta_info"]) for item in obj))
+        return list(comps), list(meta_infos)
 
     def generate_stream(
         self,
