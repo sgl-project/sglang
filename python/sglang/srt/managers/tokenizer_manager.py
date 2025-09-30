@@ -963,11 +963,21 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            if self.server_args.enable_tokenizer_batch_encode:
-                # Validate batch tokenization constraints
-                self._validate_batch_tokenization_constraints(batch_size, obj)
-
-                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+            if (
+                self.server_args.enable_tokenizer_batch_encode
+                or self._batch_has_only_input_ids(batch_size, obj)
+            ):
+                if self.server_args.enable_tokenizer_batch_encode:
+                    self._validate_batch_tokenization_constraints(batch_size, obj)
+                    tokenized_objs = await self._batch_tokenize_and_process(
+                        batch_size, obj
+                    )
+                else:
+                    tokenized_objs = []
+                    for i in range(batch_size):
+                        tmp_obj = obj[i]
+                        tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        tokenized_objs.append(tokenized_obj)
 
                 # Send as a single batched request
                 self._send_batch_request(obj, tokenized_objs, created_time)
