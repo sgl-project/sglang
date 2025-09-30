@@ -1903,7 +1903,15 @@ class ModelOptModelLoader(DefaultModelLoader):
 
         logger.info("ModelOptModelLoader: Loading base model...")
 
-        # Use shared method from parent class to load base model
+        # Check if model is already quantized
+        if model_config._is_already_quantized():
+            logger.info("Model is already quantized, loading directly...")
+            # Use default loading for pre-quantized models
+            return super().load_model(
+                model_config=model_config, device_config=device_config
+            )
+
+        # Use shared method from parent class to load base model for quantization
         model = self._load_modelopt_base_model(model_config)
 
         # Import ModelOpt modules (already done in _load_modelopt_base_model, but needed here for quantization)
@@ -1916,7 +1924,13 @@ class ModelOptModelLoader(DefaultModelLoader):
             )
             raise
 
-        quant_choice_str = model_config.modelopt_quant
+        # Handle both old modelopt_quant and new unified quantization flags
+        if model_config.modelopt_quant:
+            # Legacy modelopt_quant flag
+            quant_choice_str = model_config.modelopt_quant
+        else:
+            # Unified quantization flag - extract the type (fp8/fp4)
+            quant_choice_str = model_config._get_modelopt_quant_type()
 
         quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
         if not quant_cfg_name:
@@ -1974,6 +1988,22 @@ def get_model_loader(
         and model_config.modelopt_quant
     ):
         logger.info("Using ModelOptModelLoader due to 'modelopt_quant' config.")
+        return ModelOptModelLoader(load_config)
+
+    # Use ModelOptModelLoader for unified quantization flags
+    if (
+        model_config
+        and hasattr(model_config, "quantization")
+        and model_config.quantization in ["modelopt_fp8", "modelopt_fp4"]
+    ):
+        if model_config._is_already_quantized():
+            logger.info(
+                f"Using ModelOptModelLoader for pre-quantized model: {model_config.quantization}"
+            )
+        else:
+            logger.info(
+                f"Using ModelOptModelLoader for quantization: {model_config.quantization}"
+            )
         return ModelOptModelLoader(load_config)
 
     if isinstance(load_config.load_format, type):
