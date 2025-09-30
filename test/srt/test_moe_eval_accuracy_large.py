@@ -27,9 +27,10 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
         cls.model = DEFAULT_MOE_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
 
+        # Set up environment variables
+        env = os.environ.copy()
         if is_hip():
-            # Set up environment variables to disable memory imbalance check
-            env = os.environ.copy()
+            # Disable memory imbalance check for HIP
             env["SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"] = "true"
 
         cls.process = popen_launch_server(
