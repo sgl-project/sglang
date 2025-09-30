@@ -32,7 +32,6 @@ from sglang.srt.layers.attention.nsa.transform_index import (
 from sglang.srt.layers.attention.nsa.utils import (
     NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
     NSA_FUSE_TOPK,
-    NSA_KV_CACHE_STORE_FP8,
     compute_nsa_seqlens,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -164,6 +163,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
         assert self.use_nsa, "NSA backend only supports DeepSeek NSA"
+        self.nsa_kv_cache_store_fp8 = model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -499,7 +499,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         # when store in fp8 and compute in fp8, no need to convert dtype
-        if not (NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 and NSA_KV_CACHE_STORE_FP8):
+        if not (NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 and self.nsa_kv_cache_store_fp8):
             kv_cache = kv_cache.to(q.dtype)
 
         if q_rope is not None:
