@@ -313,6 +313,18 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            queue_time=([output.queue_time[i]] if len(output.queue_time) > i else None),
+            inference_start_time=(
+                [output.inference_start_time[i]]
+                if len(output.inference_start_time) > i
+                else None
+            ),
+            prefill_delay=(
+                [output.prefill_delay[i]] if len(output.prefill_delay) > i else None
+            ),
+            prefill_latency=(
+                [output.prefill_latency[i]] if len(output.prefill_latency) > i else None
+            ),
         )
     elif isinstance(output, BatchMultimodalOut):
         new_output = BatchMultimodalOut(

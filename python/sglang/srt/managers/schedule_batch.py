@@ -631,6 +631,8 @@ class Req:
         self.has_log_time_stats: bool = False
         self.queue_time_start = None
         self.queue_time_end = None
+        self.prefill_start_time = None
+        self.prefill_end_time = None
         self.last_tic = time.monotonic()
 
         # For disaggregation

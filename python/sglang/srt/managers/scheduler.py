@@ -2012,6 +2012,13 @@ class Scheduler(
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
+        # Capture prefill start time for EXTEND mode
+        if batch.forward_mode == ForwardMode.EXTEND:
+            current_time = time.perf_counter()
+            for req in batch.reqs:
+                if req.prefill_start_time is None:
+                    req.prefill_start_time = current_time
+
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none():
@@ -2075,6 +2082,13 @@ class Scheduler(
             ret = EmbeddingBatchResult(
                 embeddings=embeddings, bid=model_worker_batch.bid
             )
+
+        # Capture prefill end time for EXTEND mode
+        if batch.forward_mode == ForwardMode.EXTEND:
+            current_time = time.perf_counter()
+            for req in batch.reqs:
+                if req.prefill_start_time is not None and req.prefill_end_time is None:
+                    req.prefill_end_time = current_time
         return ret
 
     def process_batch_result(
