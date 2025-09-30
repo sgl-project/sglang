@@ -917,7 +917,7 @@ class ServerArgs:
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert (
                 self.quantization == "modelopt_fp4" or self.quantization == "fp8"
-            ), "modelopt_fp4 quantization is required for Flashinfer TRTLLM MoE"
+            ), "modelopt_fp4 or fp8 quantization is required for Flashinfer TRTLLM MoE"
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
