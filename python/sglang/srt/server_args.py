@@ -159,11 +159,7 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
-    dtype: str = "auto"
-    kv_cache_dtype: str = "auto"
-    quantization: Optional[str] = None
     modelopt_quant: Optional[Union[str, Dict]] = None
-    quantization_param_path: Optional[str] = None
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
