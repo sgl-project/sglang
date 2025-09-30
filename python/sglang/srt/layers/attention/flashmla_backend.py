@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
-from sglang.srt.layers.attention.nsa.topk import fast_topk_impl
-
 """
 Support attention backend for FlashMLA.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, Union, override
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, Union
 
 import torch
 import triton
@@ -19,7 +16,6 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttn
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.utils import (
     NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
-    NSA_FUSE_TOPK,
     NSA_KV_CACHE_STORE_FP8,
     compute_nsa_seqlens,
 )
@@ -45,11 +41,6 @@ class FlashMLADecodeMetadata:
     num_splits: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
 
-    # borrowed from nsa_backend.py, TODO cleanup
-    cache_seqlens_int32: torch.Tensor = None
-    real_page_table: torch.Tensor = None
-    nsa_seqlens_expanded: torch.Tensor = None  # expanded, unclipped `seqlens`
-
     def __init__(
         self,
         flashmla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -59,34 +50,6 @@ class FlashMLADecodeMetadata:
         self.flashmla_metadata = flashmla_metadata
         self.num_splits = num_splits
         self.block_kv_indices = block_kv_indices
-
-
-@dataclass(frozen=True)
-class FlashMLAIndexerMetadata(BaseIndexerMetadata):
-    attn_metadata: FlashMLADecodeMetadata
-
-    @override
-    def get_seqlens_int32(self) -> torch.Tensor:
-        return self.attn_metadata.cache_seqlens_int32
-
-    @override
-    def get_page_table_64(self) -> torch.Tensor:
-        return self.attn_metadata.real_page_table
-
-    @override
-    def get_seqlens_expanded(self) -> torch.Tensor:
-        return self.attn_metadata.nsa_seqlens_expanded
-
-    @override
-    def topk_transform(
-        self,
-        logits: torch.Tensor,
-        topk: int,
-    ) -> torch.Tensor:
-        if not NSA_FUSE_TOPK:
-            return fast_topk_impl(logits, self.get_seqlens_expanded(), topk)
-
-        raise NotImplementedError
 
 
 class FlashMLABackend(FlashInferMLAAttnBackend):
@@ -129,20 +92,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             else None
         )
 
-        # TODO copied from nsa_backend.py, unify it
-        self.real_page_size = model_runner.page_size
-
-    # TODO copied from nsa_backend.py, unify it
-    def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
-        page_size = self.real_page_size
-        if page_size == 1:
-            return page_table
-        max_seqlen_k = page_table.shape[1]
-        strided_indices = torch.arange(
-            0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
-        )
-        return page_table[:, strided_indices] // page_size
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
         bs = forward_batch.batch_size
@@ -177,19 +126,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 num_splits,
                 block_kv_indices,
             )
-            if self.use_nsa:
-                # TODO copied from nsa_backend, should unify
-                max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
-                cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
-                page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, :max_seqlen_k
-                ]
-                self.forward_metadata.cache_seqlens_int32 = cache_seqlens_int32
-                self.forward_metadata.real_page_table = self._transform_table_1_to_real(
-                    page_table
-                )
-                self.forward_metadata.nsa_seqlens_expanded = cache_seqlens_int32
-
         elif forward_batch.forward_mode.is_target_verify():
             seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
             seq_lens = forward_batch.seq_lens + self.num_draft_tokens
@@ -224,8 +160,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 num_splits,
                 block_kv_indices,
             )
-            if self.use_nsa:
-                raise NotImplementedError
         else:
             super().init_forward_metadata(forward_batch)
 
@@ -307,8 +241,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_num_splits[: bs + 1],
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
-            if self.use_nsa:
-                raise NotImplementedError
         elif forward_mode.is_target_verify():
             seq_lens = seq_lens + self.num_draft_tokens
             max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
@@ -336,8 +268,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_num_splits[: bs + 1],
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
-            if self.use_nsa:
-                raise NotImplementedError
         else:
             super().init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -582,11 +512,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     causal=True,
                 )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-    def get_indexer_metadata(
-        self, layer_id: int, forward_batch: ForwardBatch
-    ) -> FlashMLAIndexerMetadata:
-        return FlashMLAIndexerMetadata(attn_metadata=self.forward_metadata)
 
 
 # TODO: multi step kv indices optimization
