@@ -67,7 +67,7 @@ from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, support_triton
 
@@ -90,6 +90,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_radix_cache",
     "enable_dp_lm_head",
+    "enable_fp32_lm_head",
     "flashinfer_mxfp4_moe_precision",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
@@ -1735,7 +1736,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
-            self.spec_info.filter_batch(keep_indices_device)
+            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
+                has_been_filtered = False
+            else:
+                has_been_filtered = True
+            self.spec_info.filter_batch(
+                new_indices=keep_indices_device,
+                has_been_filtered=has_been_filtered,
+            )
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
