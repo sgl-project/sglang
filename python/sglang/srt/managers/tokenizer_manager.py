@@ -1515,12 +1515,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             return
 
         if len(recv_obj.input_token_logprobs_val) > 0:
-            state.input_token_logprobs_val.extend(
-                recv_obj.input_token_logprobs_val[recv_obj_index]
-            )
-            state.input_token_logprobs_idx.extend(
-                recv_obj.input_token_logprobs_idx[recv_obj_index]
-            )
+            if recv_obj.input_token_logprobs_val[recv_obj_index]:
+                state.input_token_logprobs_val.extend(
+                    recv_obj.input_token_logprobs_val[recv_obj_index]
+                )
+                state.input_token_logprobs_idx.extend(
+                    recv_obj.input_token_logprobs_idx[recv_obj_index]
+                )
         state.output_token_logprobs_val.extend(
             recv_obj.output_token_logprobs_val[recv_obj_index]
         )
@@ -1732,14 +1733,24 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         state.finished = True
         if recv_obj.finished_reason:
             out = {
+                "text": "",
+                "output_ids": [],
                 "meta_info": {
                     "id": recv_obj.rid,
                     "finish_reason": recv_obj.finished_reason,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "model_version": self.server_args.weight_version,
+                    "cached_tokens": 0,
+                    "e2e_latency": 0,
+                    "output_token_logprobs": [[]],
+                    "input_token_logprobs": [[]],
                 },
             }
         else:
             out = {
                 "text": "",
+                "output_ids": [],
                 "meta_info": {
                     "id": origin_rid,
                     "finish_reason": {
@@ -1748,6 +1759,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     },
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
+                    "model_version": self.server_args.weight_version,
+                    "cached_tokens": 0,
+                    "e2e_latency": 0,
+                    "output_token_logprobs": [[]],
+                    "input_token_logprobs": [[]],
                 },
             }
         state.out_list.append(out)
