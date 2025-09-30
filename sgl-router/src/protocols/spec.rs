@@ -1491,6 +1491,7 @@ impl ResponsesResponse {
                 ToolChoice::Value(ToolChoiceValue::Required) => "required".to_string(),
                 ToolChoice::Value(ToolChoiceValue::None) => "none".to_string(),
                 ToolChoice::Function { .. } => "function".to_string(),
+                ToolChoice::AllowedTools { mode, .. } => mode.clone(),
             },
             tools: request.tools.clone(),
             top_p: request.top_p,
@@ -1718,6 +1719,12 @@ pub enum ToolChoice {
         tool_type: String, // "function"
         function: FunctionChoice,
     },
+    AllowedTools {
+        #[serde(rename = "type")]
+        tool_type: String, // "allowed_tools"
+        mode: String, // "auto" | "required" TODO: need validation
+        tools: Vec<ToolReference>,
+    },
 }
 
 impl Default for ToolChoice {
@@ -1729,6 +1736,14 @@ impl Default for ToolChoice {
 /// Function choice specification for ToolChoice::Function
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionChoice {
+    pub name: String,
+}
+
+/// Tool reference for ToolChoice::AllowedTools
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolReference {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "function"
     pub name: String,
 }
 
