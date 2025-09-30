@@ -514,6 +514,14 @@ class ServerArgs:
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+
+        # If using model from www.modelscope.cn, first download the model.
+        from sglang.srt.utils import prepare_model_and_tokenizer
+
+        self.model_path, self.tokenizer_path = prepare_model_and_tokenizer(
+            self.model_path, self.tokenizer_path
+        )
+
         if self.served_model_name is None:
             self.served_model_name = self.model_path
         if self.device is None:
