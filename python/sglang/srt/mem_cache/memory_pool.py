@@ -1057,6 +1057,9 @@ class MLATokenToKVPool(KVCache):
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
+        if use_nsa and NSA_KV_CACHE_STORE_FP8:
+            assert self.dtype == torch.float8_e4m3fn, f"{self.dtype=}"
+
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
