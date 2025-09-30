@@ -193,6 +193,14 @@ class NativeSparseAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
 
+        # Speculative decoding
+        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = (
+            model_runner.server_args.speculative_num_draft_tokens
+        )
+        self.speculative_step_id = speculative_step_id
+
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
             next_pow_of_2 = 1 << (l - 1).bit_length()
@@ -260,12 +268,13 @@ class NativeSparseAttnBackend(AttentionBackend):
                 cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
+            seqlens_expanded = cache_seqlens_int32  # Maybe not right?
         elif forward_batch.forward_mode.is_target_verify():
             cache_seqlens_int32 = (
                 forward_batch.seq_lens + self.speculative_num_draft_tokens
             ).to(torch.int32)
-            max_seq_len_q = self.speculative_num_draft_tokens
-            max_seq_len_k = (
+            max_seqlen_q = self.speculative_num_draft_tokens
+            max_seqlen_k = (
                 forward_batch.seq_lens_cpu.max().item()
                 + self.speculative_num_draft_tokens
             )
@@ -278,8 +287,10 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
             page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : max_seq_len_k
+                forward_batch.req_pool_indices, :max_seqlen_k
             ]
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            seqlens_expanded = cache_seqlens_int32  # Maybe not right?
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -295,7 +306,10 @@ class NativeSparseAttnBackend(AttentionBackend):
             ]
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert forward_batch.extend_seq_lens is not None
-            if any(forward_batch.extend_prefix_lens_cpu) or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND:
+            if (
+                any(forward_batch.extend_prefix_lens_cpu)
+                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
+            ):
                 max_seqlen_q = max(extend_seq_lens_cpu)
                 cu_seqlens_q = compute_cu_seqlens(
                     forward_batch.extend_seq_lens.to(torch.int32)
