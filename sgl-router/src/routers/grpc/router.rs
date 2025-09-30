@@ -1239,7 +1239,7 @@ impl GrpcRouter {
     /// Note: Always decodes with skip_special_tokens=false to show actual tokens generated
     fn convert_proto_to_openai_logprobs(
         &self,
-        proto_logprobs: &proto::LogProbs,
+        proto_logprobs: &proto::OutputLogProbs,
     ) -> Result<crate::protocols::spec::ChatLogProbs, String> {
         let mut content_items = Vec::new();
 
