@@ -70,9 +70,9 @@ class LoRAManager:
 
         # Store eviction policy from server args
         self.eviction_policy = (
-            getattr(server_args, "lora_eviction_policy", "fifo")
+            getattr(server_args, "lora_eviction_policy", "lru")
             if server_args
-            else "fifo"
+            else "lru"
         )
 
         # LoRA backend for running sgemm kernels

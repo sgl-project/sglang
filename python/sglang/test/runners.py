@@ -519,7 +519,7 @@ class SRTRunner:
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
-        lora_eviction_policy: str = "fifo",
+        lora_eviction_policy: str = "lru",
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
