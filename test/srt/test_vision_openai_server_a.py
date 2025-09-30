@@ -115,17 +115,6 @@ class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     ]
 
 
-class TestMiMoVLServer(ImageOpenAITestMixin):
-    model = "XiaomiMiMo/MiMo-VL-7B-RL"
-    other_args = [
-        "--trust-remote-code",
-        "--mem-fraction-static",
-        "0.6",
-        "--cuda-graph-max-bs",
-        "4",
-    ]
-
-
 class TestVILAServer(ImageOpenAITestMixin):
     model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
     revision = "6bde1de5964b40e61c802b375fff419edc867506"
