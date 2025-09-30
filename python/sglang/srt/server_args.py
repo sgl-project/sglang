@@ -123,7 +123,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 NSA_CHOICES = ["flashmla", "fa3", "tilelang"]
 
-NSA_DEFAULT_PREFILL = "flashmla"
+NSA_DEFAULT_PREFILL = "flashmla_prefill"
 NSA_DEFAULT_DECODE = "fa3"
 
 
@@ -2965,7 +2965,11 @@ class ServerArgs:
             )
             self.disable_hybrid_swa_memory = True
         elif is_deepseek_nsa(hf_config):
-            if self.attention_backend is None and self.prefill_attention_backend is None and self.decode_attention_backend is None:
+            if (
+                self.attention_backend is None
+                and self.prefill_attention_backend is None
+                and self.decode_attention_backend is None
+            ):
                 self.attention_backend = "nsa"
                 logger.warning("Set nsa attention backend for DeepSeek NSA.")
 

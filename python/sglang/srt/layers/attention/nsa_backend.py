@@ -7,6 +7,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Tuple,
     TypeAlias,
     Union,
     override,
@@ -18,6 +19,7 @@ from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcach
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.topk import (
     fast_topk_impl,
     fast_topk_transform_fused_cuda,
@@ -26,7 +28,13 @@ from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
-from sglang.srt.layers.attention.nsa.utils import NSA_FUSE_TOPK, compute_nsa_seqlens
+from sglang.srt.layers.attention.nsa.utils import (
+    NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
+    NSA_FUSE_TOPK,
+    NSA_KV_CACHE_STORE_FP8,
+    compute_nsa_seqlens,
+)
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.two_batch_overlap import global_server_args_dict
@@ -34,6 +42,13 @@ from sglang.srt.two_batch_overlap import global_server_args_dict
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+@dataclass(frozen=True)
+class NSAFlashMLAMetadata:
+    """Metadata only needed by FlashMLA"""
+    flashmla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    num_splits: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +73,8 @@ class NSAMetadata:
     # 1. dense decode/prefill, we use paged flash attention, need real_page_table
     # 2. sparse decode/prefill, indexer need real_page_table to compute the score
     real_page_table: torch.Tensor
+
+    flashmla_metadata: NSAFlashMLAMetadata
 
     # NSA metadata (nsa prefill are expanded)
     nsa_cache_seqlens_int32: torch.Tensor  # this seqlens is clipped to `topk`
@@ -115,7 +132,9 @@ def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     )
 
 
-_NSA_IMPL_T: TypeAlias = Literal["flashmla", "fa3", "tilelang"]
+_NSA_IMPL_T: TypeAlias = Literal[
+    "flashmla_prefill", "flashmla_decode", "fa3", "tilelang"
+]
 
 NSA_PREFILL_IMPL: _NSA_IMPL_T
 NSA_DECODE_IMPL: _NSA_IMPL_T
@@ -135,6 +154,10 @@ class NativeSparseAttnBackend(AttentionBackend):
         assert self.use_nsa, "NSA backend only supports DeepSeek NSA"
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
+        self.num_q_heads = (
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        )
+        self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -234,6 +257,13 @@ class NativeSparseAttnBackend(AttentionBackend):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table,
+            flashmla_metadata=_compute_flashmla_metadata(
+                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                seq_len_q=1,  # TODO handle MTP which is not 1
+                num_heads_q=self.num_q_heads,
+                num_heads_k=1,
+                nsa_index_topk=self.nsa_index_topk,
+            ),
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -315,6 +345,8 @@ class NativeSparseAttnBackend(AttentionBackend):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table_1,
+            # TODO: handle cuda graph
+            flashmla_metadata=None,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -461,10 +493,10 @@ class NativeSparseAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif NSA_PREFILL_IMPL == "flashmla":
+        elif NSA_PREFILL_IMPL == "flashmla_prefill":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
-            return self._forward_flashmla(
+            return self._forward_flashmla_prefill(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -542,15 +574,30 @@ class NativeSparseAttnBackend(AttentionBackend):
                 page_size=1,
             )
 
-        if NSA_DECODE_IMPL == "flashmla":
+        if NSA_DECODE_IMPL == "flashmla_prefill":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
-            return self._forward_flashmla(
+            return self._forward_flashmla_prefill(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+            )
+        elif NSA_DECODE_IMPL == "flashmla_decode":
+            if q_rope is not None:
+                q_all = torch.cat([q_nope, q_rope], dim=-1)
+            return self._forward_flashmla_decode(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+                # TODO optimize args
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+                topk_indices=topk_indices,
+                block_table=metadata.real_page_table,
             )
         elif NSA_DECODE_IMPL == "tilelang":
             if q_rope is not None:
@@ -618,7 +665,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         return o  # type: ignore
 
-    def _forward_flashmla(
+    def _forward_flashmla_prefill(
         self,
         q_all: torch.Tensor,
         kv_cache: torch.Tensor,
@@ -635,6 +682,53 @@ class NativeSparseAttnBackend(AttentionBackend):
             sm_scale=sm_scale,
             d_v=v_head_dim,
         )
+        return o
+
+    def _forward_flashmla_decode(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        sm_scale: float,
+        layer,
+        forward_batch: ForwardBatch,
+        metadata: NSAMetadata,
+        topk_indices,
+        block_table,
+    ) -> torch.Tensor:
+        from flash_mla import flash_mla_with_kvcache
+
+        bs = forward_batch.batch_size
+        cache_seqlens = forward_batch.seq_lens.to(torch.int32)
+
+        q_all = q_all.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
+        assert self.real_page_size == 64, "only page size 64 is supported"
+
+        if NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 and not NSA_KV_CACHE_STORE_FP8:
+            # inefficiently quantize the whole cache
+            kv_cache = quantize_k_cache(kv_cache)
+
+        o, _ = flash_mla_with_kvcache(
+            q=q_all,
+            k_cache=kv_cache,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=v_head_dim,
+            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+            num_splits=metadata.flashmla_metadata.num_splits,
+            softmax_scale=sm_scale,
+            # TODO improve
+            indices=_compute_indices_in_kvcache(
+                block_table=block_table,
+                topk_indices=topk_indices.to(torch.int32),
+                page_size=self.real_page_size,
+            ),
+            # doc says it is not used, but if pass in None then error
+            block_table=block_table,
+            is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
+        )
+
+        # TODO shape correct?
         return o
 
     def _forward_tilelang(
@@ -663,3 +757,49 @@ class NativeSparseAttnBackend(AttentionBackend):
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
         return NSAIndexerMetadata(attn_metadata=self.forward_metadata)
+
+
+def _compute_flashmla_metadata(
+    cache_seqlens: torch.Tensor,
+    seq_len_q: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    nsa_index_topk: int,
+):
+    from flash_mla import get_mla_metadata
+
+    flashmla_metadata, num_splits = get_mla_metadata(
+        cache_seqlens=cache_seqlens,
+        # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
+        #      but the name looks like need seq_len_q?
+        num_q_tokens_per_head_k=seq_len_q * num_heads_q // num_heads_k,
+        num_heads_k=num_heads_k,
+        num_heads_q=num_heads_q,
+        is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
+        topk=nsa_index_topk,
+    )
+
+    return NSAFlashMLAMetadata(
+        flashmla_metadata=flashmla_metadata,
+        num_splits=num_splits,
+    )
+
+
+# TODO speedup
+def _compute_indices_in_kvcache(block_table, topk_indices, page_size):
+    topk_indices_safe = topk_indices.masked_fill(topk_indices == -1, 0)
+
+    idx0 = torch.arange(block_table.size(0), device=topk_indices_safe.device).unsqueeze(
+        1
+    )
+    block_idx = block_table[idx0, topk_indices_safe // page_size]
+    offset = topk_indices_safe % page_size
+    indices_in_kvcache = block_idx * page_size + offset
+
+    # the kernel requires invalid entry to be -1
+    assert indices_in_kvcache.shape == topk_indices.shape
+    indices_in_kvcache[topk_indices == -1] = -1
+
+    # return: (batch_size, seqlen_q_ori, topk)
+    indices_in_kvcache = indices_in_kvcache[:, None, :]
+    return indices_in_kvcache
