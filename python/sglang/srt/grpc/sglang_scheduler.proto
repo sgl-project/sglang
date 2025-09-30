@@ -174,11 +174,14 @@ message GenerateStreamChunk {
   int32 completion_tokens = 3;
   int32 cached_tokens = 4;
 
-  // Logprobs (if requested)
-  LogProbs logprobs = 5;
+  // Output logprobs (if requested) - incremental for streaming
+  LogProbs output_logprobs = 5;
 
   // Hidden states (if requested)
   repeated float hidden_states = 6;
+
+  // Input logprobs (if requested) - only in first chunk
+  LogProbs input_logprobs = 7;
 }
 
 message GenerateComplete {
@@ -193,8 +196,8 @@ message GenerateComplete {
   int32 completion_tokens = 4;
   int32 cached_tokens = 5;
 
-  // All logprobs if requested
-  repeated LogProbs all_logprobs = 6;
+  // Output logprobs if requested (cumulative)
+  LogProbs output_logprobs = 6;
 
   // All hidden states if requested
   repeated HiddenStates all_hidden_states = 7;
@@ -204,6 +207,9 @@ message GenerateComplete {
     uint32 matched_token_id = 8;
     string matched_stop_str = 9;
   }
+
+  // Input logprobs if requested (for prompt tokens)
+  LogProbs input_logprobs = 10;
 }
 
 message GenerateError {
@@ -218,15 +224,11 @@ message LogProbs {
 
   // Top logprobs at each position
   repeated TopLogProbs top_logprobs = 3;
-
-  // Decoded text for tokens
-  repeated string token_texts = 4;
 }
 
 message TopLogProbs {
   repeated float values = 1;
   repeated int32 token_ids = 2;
-  repeated string token_texts = 3;
 }
 
 message HiddenStates {
