@@ -508,6 +508,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "mxfp4",
+            "auto-round",
         ]
         optimized_quantization_methods = [
             "fp8",
