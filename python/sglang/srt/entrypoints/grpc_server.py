@@ -498,20 +498,30 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         top_logprobs_val = logprobs_data.get("top_logprobs_val", [])
         top_logprobs_idx = logprobs_data.get("top_logprobs_idx", [])
 
-        # Build TopLogProbs entries
+        # Filter out None values from token logprobs (can occur with cached tokens)
+        # Proto expects floats, not None
+        filtered_vals = []
+        filtered_idx = []
+        for val, idx in zip(token_logprobs_val, token_logprobs_idx):
+            if val is not None:
+                filtered_vals.append(val)
+                filtered_idx.append(idx)
+
+        # Build TopLogProbs entries, skipping None entries
         top_logprobs_proto = []
         if top_logprobs_val and top_logprobs_idx:
             for val_list, idx_list in zip(top_logprobs_val, top_logprobs_idx):
-                top_logprobs_proto.append(
-                    sglang_scheduler_pb2.TopLogProbs(
-                        values=val_list,
-                        token_ids=idx_list,
+                if val_list is not None and idx_list is not None:
+                    top_logprobs_proto.append(
+                        sglang_scheduler_pb2.TopLogProbs(
+                            values=val_list,
+                            token_ids=idx_list,
+                        )
                     )
-                )
 
         return sglang_scheduler_pb2.LogProbs(
-            token_logprobs=token_logprobs_val,
-            token_ids=token_logprobs_idx,
+            token_logprobs=filtered_vals,
+            token_ids=filtered_idx,
             top_logprobs=top_logprobs_proto,
         )
 
