@@ -238,3 +238,11 @@ compile_commands.json
 Cargo.lock
 
 lmms-eval
+
+# HIP
+sgl-kernel/**/*.hip
+sgl-kernel/**/*_hip.h
+sgl-kernel/**/*_hip.cuh
+# sglang/sgl-kernel/csrc/allreduce/custom_all_reduce* actually has
+# hip files in the tree.
+!custom_all_reduce*hip*
