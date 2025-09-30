@@ -244,6 +244,7 @@ class Indexer(CustomOp):
                     dim=-1,
                 )
             with torch.cuda.stream(self.alt_stream):
+                # TODO we should also put DeepGEMM half SM here?
                 key, _ = self.wk(x)
                 key = self.k_norm(key)
 
