@@ -121,7 +121,7 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
-NSA_CHOICES = ["flashmla", "fa3", "tilelang"]
+NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang"]
 
 NSA_DEFAULT_PREFILL = "flashmla_prefill"
 NSA_DEFAULT_DECODE = "fa3"
