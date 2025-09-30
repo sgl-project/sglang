@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -54,12 +55,29 @@ class BenchmarkResult:
     median_e2e_latency_ms: float
     success_rate: float
     timestamp: str
+    server_command: str = ""  # Full command to launch server
+    benchmark_command: str = ""  # Full command to run benchmark
     status: str = "success"  # "success", "server_failed", "benchmark_failed"
     error_message: str = ""
 
 
 class AutoTuner:
     """Auto-tuner for SGLang server configurations."""
+
+    @staticmethod
+    def _normalize_arg_key(key: str) -> str:
+        """Normalize argument key to underscore format for internal storage.
+
+        Accepts:
+        - "--backend-attention" -> "backend_attention"
+        - "backend-attention" -> "backend_attention"
+        - "backend_attention" -> "backend_attention"
+        """
+        # Strip leading dashes
+        key = key.lstrip('-')
+        # Replace hyphens with underscores
+        key = key.replace('-', '_')
+        return key
 
     def __init__(
         self,
@@ -83,8 +101,8 @@ class AutoTuner:
         verbose_benchmark: bool = True,
         save_server_logs: bool = False,
         server_log_dir: str = "server_logs",
-        tail_server_logs: bool = False,
         visualize: bool = False,
+        no_restart: bool = False,
     ):
         # Validate that exactly one of request_rates or max_concurrency_list is provided
         if (request_rates is None and max_concurrency_list is None) or \
@@ -92,8 +110,9 @@ class AutoTuner:
             raise ValueError("Must specify exactly one of --request-rates or --max-concurrency-list")
 
         self.model_path = model_path
-        self.static_server_args = static_server_args
-        self.search_server_args = search_server_args
+        # Normalize all keys in static_server_args and search_server_args to underscore format
+        self.static_server_args = {AutoTuner._normalize_arg_key(k): v for k, v in static_server_args.items()}
+        self.search_server_args = {AutoTuner._normalize_arg_key(k): v for k, v in search_server_args.items()}
         self.request_rates = request_rates
         self.max_concurrency_list = max_concurrency_list
         self.use_concurrency_mode = max_concurrency_list is not None
@@ -112,8 +131,8 @@ class AutoTuner:
         self.verbose_benchmark = verbose_benchmark
         self.save_server_logs = save_server_logs
         self.server_log_dir = Path(server_log_dir)
-        self.tail_server_logs = tail_server_logs
         self.visualize = visualize
+        self.restart_between_runs = not no_restart
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -163,11 +182,8 @@ class AutoTuner:
 
         # Add static parameters
         for key, value in self.static_server_args.items():
-            # Special handling for attention_backend - don't replace underscores
-            if key == "attention_backend":
-                key_formatted = f"--{key.replace('_', '-')}"
-            else:
-                key_formatted = f"--{key.replace('_', '-')}"
+            # Convert underscore format to hyphenated CLI format
+            key_formatted = f"--{key.replace('_', '-')}"
             if isinstance(value, bool):
                 if value:
                     cmd.append(key_formatted)
@@ -176,11 +192,8 @@ class AutoTuner:
 
         # Add search parameters for this configuration
         for key, value in config.items():
-            # Special handling for attention_backend - don't replace underscores
-            if key == "attention_backend":
-                key_formatted = f"--{key.replace('_', '-')}"
-            else:
-                key_formatted = f"--{key.replace('_', '-')}"
+            # Convert underscore format to hyphenated CLI format
+            key_formatted = f"--{key.replace('_', '-')}"
             if isinstance(value, bool):
                 if value:
                     cmd.append(key_formatted)
@@ -195,7 +208,17 @@ class AutoTuner:
         Returns:
             (success, error_message) tuple
         """
+        # First stop any managed server process
+        self._stop_server()
+
+        # Check if port is already in use and kill any leftover processes
+        port = self.static_server_args.get("port", 30000)
+        self._cleanup_port(port)
+
         cmd = self._build_server_command(config)
+
+        # Store the server command for later reference
+        self.current_server_command = " ".join(cmd)
 
         print(f"\nStarting server with command:")
         print(" ".join(cmd))
@@ -288,17 +311,6 @@ class AutoTuner:
                     if self.server_stderr_file:
                         self.server_stderr_file.flush()
 
-                    # Display tail of logs if requested
-                    if self.tail_server_logs and hasattr(self, 'current_stderr_path'):
-                        print("\n--- Last 50 lines of server stderr ---")
-                        try:
-                            with open(self.current_stderr_path, 'r') as f:
-                                lines = f.readlines()
-                                print(''.join(lines[-50:]))
-                        except:
-                            pass
-                        print("--- End of server stderr ---\n")
-
                     # Extract error from log file
                     if hasattr(self, 'current_stderr_path'):
                         try:
@@ -325,19 +337,71 @@ class AutoTuner:
         print(error_msg)
         return False, error_msg
 
+    def _cleanup_port(self, port: int):
+        """Kill any existing process listening on the specified port.
+
+        Only kills processes that are not part of the current process tree to avoid
+        accidentally terminating the autotuner itself or processes it manages.
+        """
+        try:
+            # Wait a bit to ensure any processes are fully terminated
+            time.sleep(1)
+
+            # Use lsof to find process using the port
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                current_pid = os.getpid()
+
+                for pid_str in pids:
+                    try:
+                        pid = int(pid_str)
+
+                        # Skip if it's the current process
+                        if pid == current_pid:
+                            continue
+
+                        # Check if this is a child of the current process
+                        try:
+                            with open(f"/proc/{pid}/stat", "r") as f:
+                                stat_info = f.read().split()
+                                ppid = int(stat_info[3])
+                                if ppid == current_pid:
+                                    print(f"Skipping PID {pid} (child of current process)")
+                                    continue
+                        except (FileNotFoundError, IndexError, ValueError):
+                            # /proc not available or process already gone, proceed with caution
+                            pass
+
+                        print(f"Found orphaned process {pid} on port {port}, terminating...")
+                        os.kill(pid, signal.SIGKILL)  # Use SIGKILL directly to avoid signal handler issues
+                        time.sleep(1)
+                    except (ValueError, ProcessLookupError, OSError):
+                        # Process already gone or invalid PID
+                        pass
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            # lsof not available or timed out, skip cleanup
+            pass
+
     def _stop_server(self):
         """Stop the currently running server."""
         if self.server_process:
             print("Stopping server...")
             self.server_process.terminate()
             try:
-                self.server_process.wait(timeout=10)
+                self.server_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                print("Server didn't terminate gracefully, killing...")
+                print("Server didn't terminate gracefully after 5s, force killing...")
                 self.server_process.kill()
                 self.server_process.wait()
+
             self.server_process = None
-            time.sleep(2)  # Give time for port to be released
 
         # Close log files if they exist
         if self.server_stdout_file:
@@ -388,7 +452,9 @@ class AutoTuner:
             cmd.extend(["--max-concurrency", str(max_concurrency)])
             print(f"\nRunning benchmark with max concurrency {max_concurrency}...")
 
-        print(" ".join(cmd))
+        # Store the benchmark command for later reference
+        benchmark_command = " ".join(cmd)
+        print(benchmark_command)
 
         try:
             # Use Popen for real-time streaming
@@ -397,99 +463,79 @@ class AutoTuner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=False,  # Read as bytes for better control
-                bufsize=0,  # Unbuffered
             )
 
-            # Collect output while optionally streaming
-            stdout_data = []
+            # Collect output - map stream to (data_list, output_stream)
+            streams = {
+                process.stdout: ([], sys.stdout),
+                process.stderr: ([], sys.stderr),
+            }
 
-            # Stream stdout in real-time if verbose
+            # Stream output in real-time if verbose
             if self.verbose_benchmark:
                 print("\n--- Benchmark Output ---", flush=True)
 
-            # Read stdout and stderr for real-time progress bars
-            # Set timeout for select
-            timeout = self.benchmark_timeout
+            # Set timeout for benchmark
             start_time = time.monotonic()
-            stderr_data = []
 
             # Make stderr and stdout non-blocking
-            fcntl.fcntl(process.stderr.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
-            fcntl.fcntl(process.stdout.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+            for stream in streams:
+                fcntl.fcntl(stream.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
 
+            process_finished = False
             while True:
                 # Check if process has finished
-                if process.poll() is not None:
-                    break
+                poll_result = process.poll()
+                if poll_result is not None and not process_finished:
+                    process_finished = True
 
                 # Check for timeout
-                if time.monotonic() - start_time > timeout:
+                if time.monotonic() - start_time > self.benchmark_timeout:
                     process.kill()
                     process.wait()
                     print(f"Benchmark timed out after {self.benchmark_timeout} seconds")
                     return None
 
                 # Use select to check if data is available on stdout or stderr
-                ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.01)
+                # Use shorter timeout if process finished to drain remaining data quickly
+                select_timeout = 0.1 if not process_finished else 0.5
+                ready, _, _ = select.select(list(streams.keys()), [], [], select_timeout)
 
-                for stream in ready:
-                    try:
-                        if stream == process.stdout:
-                            chunk = os.read(process.stdout.fileno(), 65536)
+                data_read = False
+                if ready:
+                    for stream in ready:
+                        try:
+                            chunk = os.read(stream.fileno(), 65536)
                             if chunk:
-                                stdout_data.append(chunk)
+                                data_list, output_stream = streams[stream]
+                                data_list.append(chunk)
+                                data_read = True
                                 if self.verbose_benchmark:
-                                    sys.stdout.write(chunk.decode('utf-8', errors='replace'))
-                                    sys.stdout.flush()
-                        elif stream == process.stderr:
-                            chunk = os.read(process.stderr.fileno(), 65536)
-                            if chunk:
-                                stderr_data.append(chunk)
-                                if self.verbose_benchmark:
-                                    # Print stderr output in real-time (this includes progress bars)
-                                    sys.stderr.write(chunk.decode('utf-8', errors='replace'))
-                                    sys.stderr.flush()
-                    except OSError:
-                        # No data available or pipe closed
-                        pass
+                                    output_stream.write(chunk.decode('utf-8', errors='replace'))
+                                    output_stream.flush()
+                        except OSError as e:
+                            # Pipe closed or no data available
+                            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                                # Unexpected error
+                                pass
+
+                # If process finished and we've drained data (no actual data read), break
+                if process_finished and not data_read:
+                    break
 
             # Get return code
-            return_code = process.wait()
+            return_code = poll_result if poll_result is not None else process.wait()
 
-            # Read any remaining stdout
-            try:
-                while True:
-                    remaining = os.read(process.stdout.fileno(), 65536)
-                    if not remaining:
-                        break
-                    stdout_data.append(remaining)
-                    if self.verbose_benchmark:
-                        sys.stdout.write(remaining.decode('utf-8', errors='replace'))
-                        sys.stdout.flush()
-            except OSError:
-                pass
+            # Close pipes to release resources
+            process.stdout.close()
+            process.stderr.close()
 
-            # Read any remaining stderr
-            try:
-                while True:
-                    remaining = os.read(process.stderr.fileno(), 65536)
-                    if not remaining:
-                        break
-                    stderr_data.append(remaining)
-                    if self.verbose_benchmark:
-                        sys.stderr.write(remaining.decode('utf-8', errors='replace'))
-                        sys.stderr.flush()
-            except OSError:
-                pass
-
-            # Join stderr data
-            stderr = b''.join(stderr_data).decode('utf-8', errors='replace')
+            # Decode collected output
+            stdout = b''.join(streams[process.stdout][0]).decode('utf-8', errors='replace')
+            stderr = b''.join(streams[process.stderr][0]).decode('utf-8', errors='replace')
 
             if self.verbose_benchmark:
                 print("\n--- End Benchmark Output ---\n")
-
-            # Join collected output for parsing
-            stdout = b''.join(stdout_data).decode('utf-8', errors='replace')
 
             if return_code != 0:
                 print(f"Benchmark failed with return code {return_code}")
@@ -499,7 +545,7 @@ class AutoTuner:
 
             # Parse the output
             return self._parse_benchmark_output(
-                stdout, config, request_rate, max_concurrency
+                stdout, config, request_rate, max_concurrency, benchmark_command
             )
 
         except Exception as e:
@@ -515,6 +561,22 @@ class AutoTuner:
         error_message: str
     ) -> BenchmarkResult:
         """Create a BenchmarkResult for failed configurations."""
+        # Build benchmark command for reference even if it failed
+        port = self.static_server_args.get("port", 30000)
+        benchmark_cmd = [
+            sys.executable, "-m", "sglang.bench_serving",
+            "--backend", "sglang",
+            "--port", str(port),
+            "--model", self.model_path,
+            "--dataset-name", self.dataset_name,
+            "--num-prompts", str(self.num_prompts),
+        ]
+        if request_rate is not None:
+            benchmark_cmd.extend(["--request-rate", str(request_rate)])
+        else:
+            benchmark_cmd.extend(["--max-concurrency", str(max_concurrency)])
+        benchmark_command = " ".join(benchmark_cmd)
+
         return BenchmarkResult(
             config=config,
             request_rate=request_rate,
@@ -533,6 +595,8 @@ class AutoTuner:
             median_e2e_latency_ms=0,
             success_rate=0,
             timestamp=datetime.now().isoformat(),
+            server_command=self.current_server_command,
+            benchmark_command=benchmark_command,
             status=status,
             error_message=error_message
         )
@@ -542,7 +606,8 @@ class AutoTuner:
         output: str,
         config: Dict[str, Any],
         request_rate: Optional[float],
-        max_concurrency: Optional[int]
+        max_concurrency: Optional[int],
+        benchmark_command: str
     ) -> Optional[BenchmarkResult]:
         """Parse benchmark output to extract metrics."""
         try:
@@ -603,7 +668,9 @@ class AutoTuner:
                 mean_e2e_latency_ms=metrics.get('mean_e2e_latency_ms', 0),
                 median_e2e_latency_ms=metrics.get('median_e2e_latency_ms', 0),
                 success_rate=metrics.get('success_rate', 1.0),
-                timestamp=datetime.now().isoformat()
+                timestamp=datetime.now().isoformat(),
+                server_command=getattr(self, 'current_server_command', ''),
+                benchmark_command=benchmark_command
             )
 
         except Exception as e:
@@ -650,6 +717,35 @@ class AutoTuner:
             json.dump(summary, f, indent=2)
         print(f"Summary saved to: {json_path}")
         print(f"Total runs: {len(self.results)} | Successful: {success_count} | Failed: {failed_count}")
+
+        # Save reproduction commands to a text file
+        commands_path = self.output_dir / f"reproduction_commands_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(commands_path, 'w') as f:
+            f.write("# SGLang Autotune - Reproduction Commands\n")
+            f.write("# This file contains the exact commands used for each benchmark run\n")
+            f.write("# You can copy and paste these commands to manually reproduce results\n")
+            f.write(f"# Generated: {datetime.now().isoformat()}\n")
+            f.write("="*80 + "\n\n")
+
+            for i, result in enumerate(self.results, 1):
+                f.write(f"# Run {i}/{len(self.results)}\n")
+                f.write(f"# Config: {result.config}\n")
+                if result.request_rate is not None:
+                    f.write(f"# Request Rate: {result.request_rate}\n")
+                else:
+                    f.write(f"# Max Concurrency: {result.max_concurrency}\n")
+                f.write(f"# Status: {result.status}\n")
+                if result.status == "success":
+                    f.write(f"# Total Throughput: {result.total_token_throughput:.2f} tok/s\n")
+                else:
+                    f.write(f"# Error: {result.error_message}\n")
+                f.write("\n# Step 1: Launch server\n")
+                f.write(result.server_command + "\n\n")
+                f.write("# Step 2: Run benchmark\n")
+                f.write(result.benchmark_command + "\n\n")
+                f.write("="*80 + "\n\n")
+
+        print(f"Reproduction commands saved to: {commands_path}")
 
         # Generate visualizations if requested
         if self.visualize:
@@ -851,8 +947,21 @@ class AutoTuner:
         print(f"  - Configurations to test: {len(configurations)}")
         print(f"  - {test_label}: {test_values}")
         print(f"  - Total runs: {total_runs}")
+        print(f"  - Restart between runs: {self.restart_between_runs}")
         print(f"  - Static server args: {self.static_server_args}")
         print(f"  - Search server args: {self.search_server_args}")
+
+        # Check for caching warning
+        disable_radix_cache = self.static_server_args.get('disable_radix_cache', False) or \
+                              self.static_server_args.get('disable-radix-cache', False)
+        if not self.restart_between_runs and not disable_radix_cache:
+            print("\n" + "!"*80)
+            print("WARNING: Server will NOT restart between runs and radix cache is enabled!")
+            print("This means requests from previous runs may be cached, affecting benchmark results.")
+            print("For accurate isolated measurements, consider:")
+            print("  1. Remove --no-restart flag (default behavior), OR")
+            print("  2. Add --disable-radix-cache to server args")
+            print("!"*80 + "\n")
 
         run_count = 0
 
@@ -861,58 +970,110 @@ class AutoTuner:
             print(f"Testing configuration: {config}")
             print(f"{'='*80}")
 
-            # Start server with this configuration
-            server_success, server_error = self._start_server(config)
-            if not server_success:
-                print(f"Failed to start server with config: {config}")
-                # Record failure for all request rates for this config
+            if self.restart_between_runs:
+                # Restart server for each run - more accurate but slower
                 for test_value in test_values:
                     run_count += 1
+
+                    # Start server for this specific run
+                    server_success, server_error = self._start_server(config)
+                    if not server_success:
+                        print(f"Failed to start server with config: {config}")
+                        if self.use_concurrency_mode:
+                            print(f"\n[Run {run_count}/{total_runs}] Max concurrency: {test_value} - SKIPPED (server failed)")
+                            failed_result = self._create_failed_result(
+                                config, None, test_value, "server_failed", server_error
+                            )
+                        else:
+                            print(f"\n[Run {run_count}/{total_runs}] Request rate: {test_value} - SKIPPED (server failed)")
+                            failed_result = self._create_failed_result(
+                                config, test_value, None, "server_failed", server_error
+                            )
+                        self.results.append(failed_result)
+                        continue
+
+                    # Run benchmark
                     if self.use_concurrency_mode:
-                        print(f"\n[Run {run_count}/{total_runs}] Max concurrency: {test_value} - SKIPPED (server failed)")
-                        failed_result = self._create_failed_result(
-                            config, None, test_value, "server_failed", server_error
-                        )
+                        print(f"\n[Run {run_count}/{total_runs}] Max concurrency: {test_value}")
+                        result = self._run_benchmark(config, request_rate=None, max_concurrency=test_value)
                     else:
-                        print(f"\n[Run {run_count}/{total_runs}] Request rate: {test_value} - SKIPPED (server failed)")
-                        failed_result = self._create_failed_result(
-                            config, test_value, None, "server_failed", server_error
-                        )
-                    self.results.append(failed_result)
-                continue
+                        print(f"\n[Run {run_count}/{total_runs}] Request rate: {test_value}")
+                        result = self._run_benchmark(config, request_rate=test_value, max_concurrency=None)
 
-            # Run benchmarks for each test value (request rate or max concurrency)
-            for test_value in test_values:
-                run_count += 1
+                    if result:
+                        self.results.append(result)
+                        print(f"✓ Benchmark completed successfully")
+                        print(f"  Total token throughput: {result.total_token_throughput:.2f} tok/s")
+                        print(f"  Median TTFT: {result.median_ttft_ms:.2f} ms")
+                        print(f"  Median E2E: {result.median_e2e_latency_ms:.2f} ms")
+                    else:
+                        print(f"✗ Benchmark failed")
+                        # Record benchmark failure
+                        if self.use_concurrency_mode:
+                            failed_result = self._create_failed_result(
+                                config, None, test_value, "benchmark_failed", "Benchmark execution failed"
+                            )
+                        else:
+                            failed_result = self._create_failed_result(
+                                config, test_value, None, "benchmark_failed", "Benchmark execution failed"
+                            )
+                        self.results.append(failed_result)
 
-                if self.use_concurrency_mode:
-                    print(f"\n[Run {run_count}/{total_runs}] Max concurrency: {test_value}")
-                    result = self._run_benchmark(config, request_rate=None, max_concurrency=test_value)
-                else:
-                    print(f"\n[Run {run_count}/{total_runs}] Request rate: {test_value}")
-                    result = self._run_benchmark(config, request_rate=test_value, max_concurrency=None)
+                    # Stop server after this run
+                    self._stop_server()
+            else:
+                # Start server once for all runs with this config - faster but may have caching
+                server_success, server_error = self._start_server(config)
+                if not server_success:
+                    print(f"Failed to start server with config: {config}")
+                    # Record failure for all request rates for this config
+                    for test_value in test_values:
+                        run_count += 1
+                        if self.use_concurrency_mode:
+                            print(f"\n[Run {run_count}/{total_runs}] Max concurrency: {test_value} - SKIPPED (server failed)")
+                            failed_result = self._create_failed_result(
+                                config, None, test_value, "server_failed", server_error
+                            )
+                        else:
+                            print(f"\n[Run {run_count}/{total_runs}] Request rate: {test_value} - SKIPPED (server failed)")
+                            failed_result = self._create_failed_result(
+                                config, test_value, None, "server_failed", server_error
+                            )
+                        self.results.append(failed_result)
+                    continue
 
-                if result:
-                    self.results.append(result)
-                    print(f"✓ Benchmark completed successfully")
-                    print(f"  Total token throughput: {result.total_token_throughput:.2f} tok/s")
-                    print(f"  Median TTFT: {result.median_ttft_ms:.2f} ms")
-                    print(f"  Median E2E: {result.median_e2e_latency_ms:.2f} ms")
-                else:
-                    print(f"✗ Benchmark failed")
-                    # Record benchmark failure
+                # Run benchmarks for each test value (request rate or max concurrency)
+                for test_value in test_values:
+                    run_count += 1
+
                     if self.use_concurrency_mode:
-                        failed_result = self._create_failed_result(
-                            config, None, test_value, "benchmark_failed", "Benchmark execution failed"
-                        )
+                        print(f"\n[Run {run_count}/{total_runs}] Max concurrency: {test_value}")
+                        result = self._run_benchmark(config, request_rate=None, max_concurrency=test_value)
                     else:
-                        failed_result = self._create_failed_result(
-                            config, test_value, None, "benchmark_failed", "Benchmark execution failed"
-                        )
-                    self.results.append(failed_result)
+                        print(f"\n[Run {run_count}/{total_runs}] Request rate: {test_value}")
+                        result = self._run_benchmark(config, request_rate=test_value, max_concurrency=None)
 
-            # Stop server before next configuration
-            self._stop_server()
+                    if result:
+                        self.results.append(result)
+                        print(f"✓ Benchmark completed successfully")
+                        print(f"  Total token throughput: {result.total_token_throughput:.2f} tok/s")
+                        print(f"  Median TTFT: {result.median_ttft_ms:.2f} ms")
+                        print(f"  Median E2E: {result.median_e2e_latency_ms:.2f} ms")
+                    else:
+                        print(f"✗ Benchmark failed")
+                        # Record benchmark failure
+                        if self.use_concurrency_mode:
+                            failed_result = self._create_failed_result(
+                                config, None, test_value, "benchmark_failed", "Benchmark execution failed"
+                            )
+                        else:
+                            failed_result = self._create_failed_result(
+                                config, test_value, None, "benchmark_failed", "Benchmark execution failed"
+                            )
+                        self.results.append(failed_result)
+
+                # Stop server before next configuration
+                self._stop_server()
 
         # Save and display results
         self._save_results()
@@ -1093,17 +1254,18 @@ Examples:
         help="Directory to save server logs (default: server_logs)"
     )
 
-    parser.add_argument(
-        "--tail-server-logs",
-        action="store_true",
-        help="Display last lines of server logs when server fails to start"
-    )
-
     # Visualization option
     parser.add_argument(
         "--visualize",
         action="store_true",
         help="Generate grouped bar charts for benchmark metrics"
+    )
+
+    # Server restart option
+    parser.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="Don't restart server between benchmark runs (default: restart between runs for accurate isolated results)"
     )
 
     # Config file option
@@ -1217,8 +1379,8 @@ Examples:
         verbose_benchmark=verbose_benchmark,
         save_server_logs=args.save_server_logs,
         server_log_dir=args.server_log_dir,
-        tail_server_logs=args.tail_server_logs,
-        visualize=args.visualize
+        visualize=args.visualize,
+        no_restart=args.no_restart
     )
 
     tuner.run()
