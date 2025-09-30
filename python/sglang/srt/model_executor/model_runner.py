@@ -627,7 +627,7 @@ class ModelRunner:
             raise
 
         if self.device == "cuda":
-            if self.server_args.enable_mooncake_dist_backend:
+            if self.server_args.elastic_ep_backend == "mooncake":
                 backend = "mooncake"
             else:
                 backend = "nccl"
@@ -829,7 +829,7 @@ class ModelRunner:
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
-        if self.server_args.enable_mooncake_dist_backend:
+        if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
             dist.barrier(group=get_tp_group().cpu_group)
         else:

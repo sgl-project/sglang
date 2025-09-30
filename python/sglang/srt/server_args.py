@@ -190,7 +190,7 @@ class ServerArgs:
 
     # Runtime options
     device: Optional[str] = None
-    enable_mooncake_dist_backend: bool = False
+    elastic_ep_backend: Literal[None, "mooncake"] = None
     tp_size: int = 1
     pp_size: int = 1
     max_micro_batch_size: Optional[int] = None
@@ -1412,9 +1412,11 @@ class ServerArgs:
             help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
-            "--enable-mooncake-dist-backend",
-            action="store_true",
-            help="Enable Mooncake Backend to support fault-tolerant communication.",
+            "--elastic-ep-backend",
+            type=str,
+            default=ServerArgs.elastic_ep_backend,
+            choices=["none", "mooncake"],
+            help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
         )
         parser.add_argument(
             "--tensor-parallel-size",

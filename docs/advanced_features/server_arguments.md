@@ -130,22 +130,23 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 ## Runtime options
 
-| Arguments | Description | Defaults |
-|-----------|-------------|----------|
-| `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | None |
-| `--tp-size` | The tensor parallelism size. | 1 |
-| `--pp-size` | The pipeline parallelism size. | 1 |
-| `--max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
-| `--stream-interval` | The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher. | 1 |
-| `--stream-output` | Whether to output as a sequence of disjoint segments. | False |
-| `--random-seed` | The random seed. | None |
+| Arguments                             | Description                                                                                                                                                                | Defaults |
+|---------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------|
+| `--device`                            | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.                                                                       | None |
+| `--elastic-ep-backend`                | Select the collective communication backend for elastic EP. Currently supports 'mooncake'.                                                                                                               | None |
+| `--tp-size`                           | The tensor parallelism size.                                                                                                                                               | 1 |
+| `--pp-size`                           | The pipeline parallelism size.                                                                                                                                             | 1 |
+| `--max-micro-batch-size`              | The maximum micro batch size in pipeline parallelism.                                                                                                                      | None |
+| `--stream-interval`                   | The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher.      | 1 |
+| `--stream-output`                     | Whether to output as a sequence of disjoint segments.                                                                                                                      | False |
+| `--random-seed`                       | The random seed.                                                                                                                                                           | None |
 | `--constrained-json-whitespace-pattern` | Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*. | None |
-| `--watchdog-timeout` | Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging. | 300 |
-| `--dist-timeout` | Set timeout for torch.distributed initialization. | None |
-| `--download-dir` | Model download directory for huggingface. | None |
-| `--base-gpu-id` | The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine. | 0 |
-| `--gpu-id-step` | The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,.... | 1 |
-| `--sleep-on-idle` | Reduce CPU usage when sglang is idle. | False |
+| `--watchdog-timeout`                  | Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.                                                      | 300 |
+| `--dist-timeout`                      | Set timeout for torch.distributed initialization.                                                                                                                          | None |
+| `--download-dir`                      | Model download directory for huggingface.                                                                                                                                  | None |
+| `--base-gpu-id`                       | The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.                                                                 | 0 |
+| `--gpu-id-step`                       | The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,....                                                                  | 1 |
+| `--sleep-on-idle`                     | Reduce CPU usage when sglang is idle.                                                                                                                                      | False |
 
 ## Logging
 
@@ -241,23 +242,23 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 ## Expert parallelism
 
-| Arguments | Description | Defaults |
-|-----------|-------------|----------|
-| `--ep-size` | The expert parallelism size. | 1 |
-| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | none |
-| `--moe-runner-backend` | Select the runner backend for MoE. | 'triton' |
-| `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
-| `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | 0 |
-| `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in EPLB. | None |
-| `--init-expert-location` | Initial location of EP experts. | trivial |
-| `--enable-eplb` | Enable EPLB algorithm. | False |
-| `--eplb-algorithm` | Chosen EPLB algorithm. | auto |
-| `--eplb-rebalance-num-iterations` | Number of iterations to automatically trigger a EPLB re-balance. | 1000 |
-| `--eplb-rebalance-layers-per-chunk` | Number of layers to rebalance per forward pass. | None |
-| `--expert-distribution-recorder-mode` | Mode of expert distribution recorder. | None |
-| `--expert-distribution-recorder-buffer-size` | Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer. | None |
-| `--enable-expert-distribution-metrics` | Enable logging metrics for expert balancedness. | False |
-| `--deepep-config` | Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path. | None |
+| Arguments | Description                                                                                                                                                                                     | Defaults |
+|-----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------|
+| `--ep-size` | The expert parallelism size.                                                                                                                                                                    | 1 |
+| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism, could be `deepep` or `mooncake`.                                                                                         | none |
+| `--moe-runner-backend` | Select the runner backend for MoE.                                                                                                                                                              | 'triton' |
+| `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.               | auto |
+| `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel.                                                                                                                                   | 0 |
+| `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in EPLB.                                                                                                                                    | None |
+| `--init-expert-location` | Initial location of EP experts.                                                                                                                                                                 | trivial |
+| `--enable-eplb` | Enable EPLB algorithm.                                                                                                                                                                          | False |
+| `--eplb-algorithm` | Chosen EPLB algorithm.                                                                                                                                                                          | auto |
+| `--eplb-rebalance-num-iterations` | Number of iterations to automatically trigger a EPLB re-balance.                                                                                                                                | 1000 |
+| `--eplb-rebalance-layers-per-chunk` | Number of layers to rebalance per forward pass.                                                                                                                                                 | None |
+| `--expert-distribution-recorder-mode` | Mode of expert distribution recorder.                                                                                                                                                           | None |
+| `--expert-distribution-recorder-buffer-size` | Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.                                                                                                      | None |
+| `--enable-expert-distribution-metrics` | Enable logging metrics for expert balancedness.                                                                                                                                                 | False |
+| `--deepep-config` | Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.                                                                                  | None |
 | `--moe-dense-tp-size` | TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports. | None |
 
 ## Hierarchical cache
