@@ -48,7 +48,7 @@ jobs:
 
   build-dev-arm:
     if: ${{ github.repository == 'sgl-project/sglang' }}
-    runs-on: labubu
+    runs-on: sgl-kernel-release-node-arm
     strategy:
       matrix:
         variant:
