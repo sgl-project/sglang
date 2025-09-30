@@ -1359,8 +1359,3 @@ def should_use_tensor_core(
         return gqa_group_size >= 4
     else:
         return False
-
-
-# Use as a fast path to override the indptr in flashinfer's plan function
-# This is used to remove some host-to-device copy overhead.
-# original fast_decode_plan is moved to flashinfer
