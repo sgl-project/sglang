@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class NSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
+
     flashmla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     num_splits: Optional[torch.Tensor] = None
 
@@ -722,6 +723,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 block_table=block_table,
                 topk_indices=topk_indices.to(torch.int32),
                 page_size=self.real_page_size,
+                nsa_index_topk=self.nsa_index_topk,
             ),
             # doc says it is not used, but if pass in None then error
             block_table=block_table,
@@ -786,7 +788,7 @@ def _compute_flashmla_metadata(
 
 
 # TODO speedup
-def _compute_indices_in_kvcache(block_table, topk_indices, page_size):
+def _compute_indices_in_kvcache(block_table, topk_indices, page_size, nsa_index_topk):
     topk_indices_safe = topk_indices.masked_fill(topk_indices == -1, 0)
 
     idx0 = torch.arange(block_table.size(0), device=topk_indices_safe.device).unsqueeze(
@@ -802,4 +804,13 @@ def _compute_indices_in_kvcache(block_table, topk_indices, page_size):
 
     # return: (batch_size, seqlen_q_ori, topk)
     indices_in_kvcache = indices_in_kvcache[:, None, :]
+
+    indices_in_kvcache = torch.nn.functional.pad(
+        indices_in_kvcache,
+        (0, nsa_index_topk - indices_in_kvcache.shape[-1]),
+        "constant",
+        -1,
+    )
+    assert indices_in_kvcache.shape[-1] == nsa_index_topk
+
     return indices_in_kvcache
