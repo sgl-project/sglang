@@ -175,13 +175,13 @@ message GenerateStreamChunk {
   int32 cached_tokens = 4;
 
   // Output logprobs (if requested) - incremental for streaming
-  LogProbs output_logprobs = 5;
+  OutputLogProbs output_logprobs = 5;
 
   // Hidden states (if requested)
   repeated float hidden_states = 6;
 
   // Input logprobs (if requested) - only in first chunk
-  LogProbs input_logprobs = 7;
+  InputLogProbs input_logprobs = 7;
 }
 
 message GenerateComplete {
@@ -197,7 +197,7 @@ message GenerateComplete {
   int32 cached_tokens = 5;
 
   // Output logprobs if requested (cumulative)
-  LogProbs output_logprobs = 6;
+  OutputLogProbs output_logprobs = 6;
 
   // All hidden states if requested
   repeated HiddenStates all_hidden_states = 7;
@@ -209,7 +209,7 @@ message GenerateComplete {
   }
 
   // Input logprobs if requested (for prompt tokens)
-  LogProbs input_logprobs = 10;
+  InputLogProbs input_logprobs = 10;
 }
 
 message GenerateError {
@@ -218,12 +218,27 @@ message GenerateError {
   string details = 3;
 }
 
-message LogProbs {
+// Output logprobs - all values are present (no None)
+message OutputLogProbs {
   repeated float token_logprobs = 1;
   repeated int32 token_ids = 2;
 
   // Top logprobs at each position
   repeated TopLogProbs top_logprobs = 3;
+}
+
+// Input logprobs - first token has no logprob (None)
+message InputLogProbs {
+  repeated InputTokenLogProb token_logprobs = 1;
+  repeated int32 token_ids = 2;
+
+  // Top logprobs at each position
+  repeated TopLogProbs top_logprobs = 3;
+}
+
+// Wrapper to represent optional logprob (first input token has no logprob)
+message InputTokenLogProb {
+  optional float value = 1;
 }
 
 message TopLogProbs {
