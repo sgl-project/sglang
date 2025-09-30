@@ -197,7 +197,6 @@ mod streaming_tests {
         let events = result.unwrap();
         assert!(events.len() >= 2); // At least one chunk + [DONE]
 
-        // Verify events are valid JSON (except [DONE])
         for event in &events {
             if event != "[DONE]" {
                 let parsed: Result<serde_json::Value, _> = serde_json::from_str(event);
@@ -329,7 +328,6 @@ mod streaming_tests {
 
     #[tokio::test]
     async fn test_sse_format_parsing() {
-        // Test SSE format parsing
         let parse_sse_chunk = |chunk: &[u8]| -> Vec<String> {
             let text = String::from_utf8_lossy(chunk);
             text.lines()
@@ -347,7 +345,6 @@ mod streaming_tests {
         assert_eq!(events[1], "{\"text\":\" world\"}");
         assert_eq!(events[2], "[DONE]");
 
-        // Test with mixed content
         let mixed = b"event: message\ndata: {\"test\":true}\n\n: comment\ndata: [DONE]\n\n";
         let events = parse_sse_chunk(mixed);
 
