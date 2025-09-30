@@ -258,12 +258,9 @@ class NativeSparseAttnBackend(AttentionBackend):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table,
-            flashmla_metadata=_compute_flashmla_metadata(
+            flashmla_metadata=self._compute_flashmla_metadata(
                 cache_seqlens=forward_batch.seq_lens.to(torch.int32),
                 seq_len_q=1,  # TODO handle MTP which is not 1
-                num_heads_q=self.num_q_heads,
-                num_heads_k=1,
-                nsa_index_topk=self.nsa_index_topk,
             ),
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
@@ -760,31 +757,24 @@ class NativeSparseAttnBackend(AttentionBackend):
     ) -> NSAIndexerMetadata:
         return NSAIndexerMetadata(attn_metadata=self.forward_metadata)
 
+    def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
+        from flash_mla import get_mla_metadata
 
-def _compute_flashmla_metadata(
-    cache_seqlens: torch.Tensor,
-    seq_len_q: int,
-    num_heads_q: int,
-    num_heads_k: int,
-    nsa_index_topk: int,
-):
-    from flash_mla import get_mla_metadata
+        flashmla_metadata, num_splits = get_mla_metadata(
+            cache_seqlens=cache_seqlens,
+            # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
+            #      but the name looks like need seq_len_q?
+            num_q_tokens_per_head_k=seq_len_q * self.num_q_heads // 1,
+            num_heads_k=1,
+            num_heads_q=self.num_q_heads,
+            is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
+            topk=self.nsa_index_topk,
+        )
 
-    flashmla_metadata, num_splits = get_mla_metadata(
-        cache_seqlens=cache_seqlens,
-        # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
-        #      but the name looks like need seq_len_q?
-        num_q_tokens_per_head_k=seq_len_q * num_heads_q // num_heads_k,
-        num_heads_k=num_heads_k,
-        num_heads_q=num_heads_q,
-        is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
-        topk=nsa_index_topk,
-    )
-
-    return NSAFlashMLAMetadata(
-        flashmla_metadata=flashmla_metadata,
-        num_splits=num_splits,
-    )
+        return NSAFlashMLAMetadata(
+            flashmla_metadata=flashmla_metadata,
+            num_splits=num_splits,
+        )
 
 
 # TODO speedup
