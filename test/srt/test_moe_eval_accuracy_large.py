@@ -3,6 +3,7 @@ Usage:
 python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mmlu
 """
 
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_hip,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
@@ -24,6 +26,12 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MOE_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
+
+        if is_hip():
+            # Set up environment variables to disable memory imbalance check
+            env = os.environ.copy()
+            env["SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"] = "true"
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -34,6 +42,7 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
                 "--tp",
                 "2",
             ],
+            env=env,
         )
 
     @classmethod
