@@ -20,8 +20,9 @@ use crate::policies::PolicyRegistry;
 use crate::protocols::spec::ChatMessage;
 use crate::protocols::spec::{
     ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
-    CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, ResponsesGetParams,
-    ResponsesRequest, StringOrArray, Tool, ToolChoice, ToolChoiceValue, Usage,
+    CompletionRequest, EmbeddingRequest, FunctionCallResponse, GenerateRequest, RerankRequest,
+    ResponsesGetParams, ResponsesRequest, StringOrArray, Tool, ToolCall, ToolChoice,
+    ToolChoiceValue, Usage,
 };
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
@@ -619,16 +620,16 @@ impl GrpcRouter {
         &self,
         processed_text: &str,
         tool_choice: &Option<ToolChoice>,
-    ) -> (Option<Vec<crate::protocols::spec::ToolCall>>, String) {
+    ) -> (Option<Vec<ToolCall>>, String) {
         match tool_choice {
             Some(ToolChoice::Function { function, .. }) => {
                 // Specific function: Parse parameters directly
-                match serde_json::from_str::<serde_json::Value>(processed_text) {
+                match serde_json::from_str::<Value>(processed_text) {
                     Ok(params) => {
-                        let tool_call = crate::protocols::spec::ToolCall {
+                        let tool_call = ToolCall {
                             id: format!("call_{}", uuid::Uuid::new_v4()),
                             tool_type: "function".to_string(),
-                            function: crate::protocols::spec::FunctionCallResponse {
+                            function: FunctionCallResponse {
                                 name: function.name.clone(),
                                 arguments: Some(
                                     serde_json::to_string(&params)
@@ -644,12 +645,12 @@ impl GrpcRouter {
                     }
                 }
             }
-            Some(ToolChoice::Value(crate::protocols::spec::ToolChoiceValue::Required))
+            Some(ToolChoice::Value(ToolChoiceValue::Required))
             | Some(ToolChoice::AllowedTools { .. }) => {
                 // Required mode: Parse array of tool calls
-                match serde_json::from_str::<Vec<serde_json::Value>>(processed_text) {
+                match serde_json::from_str::<Vec<Value>>(processed_text) {
                     Ok(parsed_array) => {
-                        let spec_tool_calls: Vec<crate::protocols::spec::ToolCall> = parsed_array
+                        let spec_tool_calls: Vec<ToolCall> = parsed_array
                             .into_iter()
                             .enumerate()
                             .filter_map(|(i, item)| {
@@ -657,10 +658,10 @@ impl GrpcRouter {
                                 let name = obj.get("name")?.as_str()?.to_string();
                                 let parameters = obj.get("parameters")?;
 
-                                Some(crate::protocols::spec::ToolCall {
+                                Some(ToolCall {
                                     id: format!("call_{}_{}", i, uuid::Uuid::new_v4()),
                                     tool_type: "function".to_string(),
-                                    function: crate::protocols::spec::FunctionCallResponse {
+                                    function: FunctionCallResponse {
                                         name,
                                         arguments: Some(
                                             serde_json::to_string(parameters)
@@ -687,7 +688,7 @@ impl GrpcRouter {
         &self,
         processed_text: &str,
         model: &str,
-    ) -> (Option<Vec<crate::protocols::spec::ToolCall>>, String) {
+    ) -> (Option<Vec<ToolCall>>, String) {
         let Some(parser) = self.tool_parser_registry.get_parser(model) else {
             return (None, processed_text.to_string());
         };
@@ -704,10 +705,10 @@ impl GrpcRouter {
 
                 let spec_tool_calls = parsed_tool_calls
                     .into_iter()
-                    .map(|tc| crate::protocols::spec::ToolCall {
+                    .map(|tc| ToolCall {
                         id: tc.id,
                         tool_type: "function".to_string(),
-                        function: crate::protocols::spec::FunctionCallResponse {
+                        function: FunctionCallResponse {
                             name: tc.function.name,
                             arguments: Some(
                                 serde_json::to_string(&tc.function.arguments)
