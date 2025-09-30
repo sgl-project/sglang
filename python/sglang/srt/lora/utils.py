@@ -114,12 +114,8 @@ def get_normalized_target_modules(
     result = set()
     for name in target_modules:
         base_name = name.split(".")[-1]
-
-        if base_name in params_mapping:
-            normalized_name = params_mapping[base_name]
-            result.add(normalized_name)
-        else:
-            result.add(base_name)
+        normalized_name = params_mapping.get(base_name, base_name)
+        result.add(normalized_name)
     return result
 
 
