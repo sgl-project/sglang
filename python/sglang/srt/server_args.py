@@ -2982,7 +2982,24 @@ class ServerArgs:
                 logger.warning("Setting page size to 64 for DeepSeek NSA.")
 
                 self.max_prefill_bs = 1
-                logger.warning("Setting maximum prefill batch size to 1 for DeepSeek NSA.")
+                logger.warning(
+                    "Setting maximum prefill batch size to 1 for DeepSeek NSA."
+                )
+
+                # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
+                import torch
+
+                major, _ = torch.cuda.get_device_capability()
+                if major >= 10:
+                    self.kv_cache_dtype = "fp8_e4m3"
+                    logger.warning("Setting KV cache dtype to fp8.")
+
+                if self.kv_cache_dtype == "fp8_e4m3":
+                    self.nsa_prefill = "flashmla_decode"
+                    self.nsa_decode = "flashmla_decode"
+                    logger.warning(
+                        "Setting NSA backend to flashmla_decode for FP8 KV Cache."
+                    )
 
     def adjust_mem_fraction_for_vlm(self, model_config):
         vision_config = getattr(model_config.hf_config, "vision_config", None)

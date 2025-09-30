@@ -764,7 +764,9 @@ class NativeSparseAttnBackend(AttentionBackend):
             kv_cache = quantize_k_cache(kv_cache)
 
         indices = page_table_1.unsqueeze(1)
-        assert indices.shape[-1] == self.nsa_index_topk  # requirement of FlashMLA decode kernel
+        assert (
+            indices.shape[-1] == self.nsa_index_topk
+        )  # requirement of FlashMLA decode kernel
 
         o, _ = flash_mla_with_kvcache(
             q=q_all,
