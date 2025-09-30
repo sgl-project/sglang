@@ -43,7 +43,7 @@ elif is_hip():
 
 
 @dataclass
-class NgramVerifyInput:
+class NgramVerifyInput(SpecInput):
     def __init__(
         self,
         draft_token: torch.Tensor,
