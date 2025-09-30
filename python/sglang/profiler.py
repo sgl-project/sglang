@@ -25,6 +25,7 @@ def _run_profile(
     output_dir: Optional[str] = None,
     profile_name: Optional[str] = None,
     profile_by_stage: bool = False,
+    profile_stage: str = "all",
 ) -> str:
     if output_dir is None:
         output_dir = PROFILER_DIR
@@ -61,6 +62,9 @@ def _run_profile(
         "activities": activities,
         "profile_by_stage": profile_by_stage,
     }
+    
+    # Add profile_stage (always included, defaults to "all")
+    json_data["profile_stage"] = profile_stage
 
     response = requests.post(url=url + "/start_profile", json=json_data)
     response.raise_for_status()
@@ -76,10 +80,11 @@ def run_profile(
     output_dir: Optional[str] = None,
     profile_name: Optional[str] = None,
     profile_by_stage: bool = False,
+    profile_stage: str = "all",
 ):
     # step based profile will self terminate on num_steps constraints
     link = _run_profile(
-        url, num_steps, activities, output_dir, profile_name, profile_by_stage
+        url, num_steps, activities, output_dir, profile_name, profile_by_stage, profile_stage
     )
     return link
 
@@ -115,7 +120,14 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         type=bool,
         default=False,
-        help="The number of forward steps to profile.",
+        help="Enable stage-based profiling (prefill vs decode stages).",
+    )
+    parser.add_argument(
+        "--profile-stage",
+        type=str,
+        choices=["prefill", "decode", "all"],
+        default="all",
+        help="Which stage to profile when --profile-by-stage is enabled. Defaults to 'all' (both prefill and decode).",
     )
     parser.add_argument(
         "--cpu",
@@ -163,4 +175,5 @@ if __name__ == "__main__":
         args.output_dir,
         args.profile_name,
         args.profile_by_stage,
+        args.profile_stage,
     )

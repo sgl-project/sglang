@@ -35,7 +35,6 @@ else:
     Image = Any
 
 
-# Parameters for a session
 @dataclass
 class SessionParams:
     id: Optional[str] = None
@@ -133,22 +132,17 @@ class GenerateReqInput:
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
 
+    # Label for the request
+    label: Optional[str] = None
+
     # Priority for the request
     priority: Optional[int] = None
 
-    # Extra key for classifying the request (e.g. cache_salt)
-    extra_key: Optional[Union[List[str], str]] = None
-
-    # Whether to disallow logging for this request (e.g. due to ZDR)
-    no_logs: bool = False
-
-    # For custom metric labels
-    custom_labels: Optional[Dict[str, str]] = None
-
-    # (Deprecated, please use custom_labels) Label for the request
-    label: Optional[str] = None
-    # (Internal) Whether to return bytes for image generation
+    # Image gen grpc migration
     return_bytes: bool = False
+
+    # For customer metric labels
+    customer_labels: Optional[Dict[str, str]] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -548,11 +542,8 @@ class GenerateReqInput:
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
             conversation_id=self.conversation_id,
-            priority=self.priority,
-            extra_key=self.extra_key,
-            no_logs=self.no_logs,
-            custom_labels=self.custom_labels,
             label=self.label,
+            priority=self.priority,
             return_bytes=self.return_bytes,
         )
 
@@ -579,7 +570,6 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: List[int]
     # Whether to stream output
     stream: bool
-
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -609,22 +599,17 @@ class TokenizedGenerateReqInput:
     # For dp balance
     dp_balance_id: int = -1
 
+    # Label for the request
+    label: Optional[str] = None
+
     # Priority for the request
     priority: Optional[int] = None
 
-    # Extra key for classifying the request (e.g. cache_salt)
-    extra_key: Optional[str] = None
-
-    # Whether to disallow logging for this request (e.g. due to ZDR)
-    no_logs: bool = False
+    # Image gen grpc migration
+    return_bytes: bool = False
 
     # tracing context
     trace_context: Optional[Dict] = None
-
-    # (Deprecated, please use custom_labels) Label for the request
-    label: Optional[str] = None
-    # (Internal) Whether to return bytes for image generation
-    return_bytes: bool = False
 
 
 @dataclass
@@ -671,8 +656,6 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
-    # Priority for the request
-    priority: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -780,8 +763,6 @@ class TokenizedEmbeddingReqInput:
     data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
-    # Priority for the request
-    priority: Optional[int] = None
 
 
 @dataclass
@@ -1109,17 +1090,6 @@ class InitWeightsUpdateGroupReqOutput:
 
 
 @dataclass
-class DestroyWeightsUpdateGroupReqInput:
-    group_name: str = "weight_update_group"
-
-
-@dataclass
-class DestroyWeightsUpdateGroupReqOutput:
-    success: bool
-    message: str
-
-
-@dataclass
 class UpdateWeightVersionReqInput:
     # The new weight version
     new_version: str
@@ -1222,6 +1192,7 @@ class ProfileReqInput:
     profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    profile_stage: str = "all"  # "prefill", "decode", or "all" (default)
 
 
 class ProfileReqType(Enum):
@@ -1240,6 +1211,7 @@ class ProfileReq:
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
+    profile_stage: str = "all"  # "prefill", "decode", or "all" (default)
 
 
 @dataclass

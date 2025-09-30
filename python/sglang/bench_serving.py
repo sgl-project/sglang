@@ -208,10 +208,6 @@ async def async_request_openai_completions(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
-
-        if request_func_input.image_data:
-            payload.update({"image_data": request_func_input.image_data})
-
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
@@ -592,11 +588,15 @@ async def async_request_gserver(
     raise NotImplementedError()
 
 
-async def async_request_profile(api_url: str) -> RequestFuncOutput:
+async def async_request_profile(
+    api_url: str, 
+    profile_params: Optional[Dict[str, Any]] = None
+) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            json_data = profile_params if profile_params else None
+            async with session.post(url=api_url, json=json_data) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -1114,8 +1114,7 @@ def sample_sharegpt_requests(
                 add_generation_prompt=True,
                 tokenize=False,
             )
-            if tokenizer.bos_token:
-                prompt = prompt.replace(tokenizer.bos_token, "")
+            prompt = prompt.replace(tokenizer.bos_token, "")
 
         prompt_token_ids = tokenizer.encode(prompt)
         completion = dataset[i][1]
@@ -1603,6 +1602,8 @@ async def benchmark(
     lora_names: List[str],
     extra_request_body: Dict[str, Any],
     profile: bool,
+    profile_by_stage: bool = False,
+    profile_stage: str = "all",
     pd_separated: bool = False,
     flush_cache: bool = False,
     warmup_requests: int = 1,
@@ -1701,11 +1702,19 @@ async def benchmark(
     # Start profiler
     if profile:
         print("Starting profiler...")
+        profile_params = {}
+        if profile_by_stage:
+            profile_params["profile_by_stage"] = True
+            # Pass stage directly (None means profile all stages)
+            profile_params["profile_stage"] = profile_stage
+                
         profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
+            api_url=base_url + "/start_profile",
+            profile_params=profile_params if profile_params else None
         )
         if profile_output.success:
-            print("Profiler started")
+            stage_info = f" ({profile_stage or 'all'} stage{'s' if not profile_stage else ''})" if profile_by_stage else ""
+            print(f"Profiler started{stage_info}")
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
@@ -1763,9 +1772,7 @@ async def benchmark(
         pbar.close()
 
     if "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/get_server_info", headers=get_auth_headers()
-        )
+        server_info = requests.get(base_url + "/get_server_info")
         if server_info.status_code == 200:
             server_info_json = server_info.json()
             if "decode" in server_info_json:
@@ -1983,6 +1990,12 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
+        
+    if not hasattr(args, "profile_by_stage"):
+        args.profile_by_stage = False
+        
+    if not hasattr(args, "profile_stage"):
+        args.profile_stage = "all"
 
     print(f"benchmark_args={args}")
 
@@ -2114,6 +2127,8 @@ def run_benchmark(args_: argparse.Namespace):
             lora_names=args.lora_name,
             extra_request_body=extra_request_body,
             profile=args.profile,
+            profile_by_stage=args.profile_by_stage,
+            profile_stage=args.profile_stage,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
             warmup_requests=args.warmup_requests,
@@ -2313,6 +2328,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--profile-by-stage",
+        action="store_true",
+        help="Enable stage-based profiling (prefill vs decode stages separately).",
+    )
+    parser.add_argument(
+        "--profile-stage",
+        type=str,
+        choices=["prefill", "decode", "all"],
+        default="all",
+        help="Which stage to profile when --profile-by-stage is enabled. Defaults to 'all' (both prefill and decode).",
     )
     parser.add_argument(
         "--lora-name",
