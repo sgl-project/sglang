@@ -213,7 +213,7 @@ impl GrpcRouter {
 
         debug!("Resolved input with {} tokens", token_ids.len());
 
-        // Step 4: Select worker (fail fast if no workers available)
+        // Step 2: Select worker (fail fast if no workers available)
         let worker = match self.select_worker_for_request(model_id, original_text.as_deref()) {
             Some(w) => w,
             None => {
