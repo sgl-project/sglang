@@ -546,6 +546,40 @@ class ModelConfig:
             # Default to FP8 for backward compatibility
             return {"quant_method": "modelopt_fp8"}
 
+    def _is_already_quantized(self) -> bool:
+        """Check if the model is already quantized based on config files."""
+        # Check for HuggingFace quantization config
+        if is_remote_url(self.model_path):
+            try:
+                from huggingface_hub import HfApi
+
+                hf_api = HfApi()
+                return hf_api.file_exists(self.model_path, "hf_quant_config.json")
+            except Exception:
+                return False
+        else:
+            return os.path.exists(os.path.join(self.model_path, "hf_quant_config.json"))
+
+    def _get_modelopt_quant_type(self) -> str:
+        """Extract ModelOpt quantization type from unified quantization flag."""
+        if self.quantization == "modelopt_fp8":
+            return "fp8"
+        elif self.quantization == "modelopt_fp4":
+            return "fp4"
+        elif self.quantization == "modelopt":
+            # Auto-detect from model config
+            quant_cfg = self._parse_quant_hf_config()
+            if quant_cfg:
+                quant_method = quant_cfg.get("quant_method", "").lower()
+                if "fp4" in quant_method:
+                    return "fp4"
+                elif "fp8" in quant_method:
+                    return "fp8"
+            # Default to fp8 if can't detect
+            return "fp8"
+        else:
+            return "fp8"  # Default fallback
+
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
         supported_quantization = [*QUANTIZATION_METHODS]

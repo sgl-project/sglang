@@ -82,6 +82,7 @@ QUANTIZATION_CHOICES = [
     "bitsandbytes",
     "gguf",
     "modelopt",
+    "modelopt_fp8",
     "modelopt_fp4",
     "petit_nvfp4",
     "w8a8_int8",
@@ -190,6 +191,7 @@ class ServerArgs:
     modelopt_checkpoint_restore_path: Optional[str] = None
     modelopt_checkpoint_save_path: Optional[str] = None
     modelopt_export_path: Optional[str] = None
+    quantize_and_serve: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -1671,6 +1673,14 @@ class ServerArgs:
             help="Path to export the quantized model in HuggingFace format after ModelOpt quantization. "
             "The exported model can then be used directly with SGLang for inference. "
             "If not provided, the model will not be exported.",
+        )
+        parser.add_argument(
+            "--quantize-and-serve",
+            action="store_true",
+            default=ServerArgs.quantize_and_serve,
+            help="Quantize the model with ModelOpt and immediately serve it without exporting. "
+            "This is useful for development and prototyping. For production, it's recommended "
+            "to use separate quantization and deployment steps.",
         )
         parser.add_argument(
             "--kv-cache-dtype",
