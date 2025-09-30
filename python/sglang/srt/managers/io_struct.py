@@ -103,10 +103,10 @@ class GenerateReqInput:
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
 
-    # The user ID for the request, as provided from IPOP.
+    # The user ID for the request, as provided by external caller.
     user_id: Optional[Union[List[str], str]] = None
-    # The request ID for the request, as provided from IPOP.
-    # `rid` is a SGLang internal request ID, whereas `request_id` is the request ID provided by IPOP.
+    # The request ID for the request, as provided by external caller.
+    # `rid` is a SGLang internal request ID, whereas `request_id` is the request ID provided by external caller.
     external_request_id: Optional[Union[List[str], str]] = None
 
     # The modalities of the image data [image, multi-images, video]
@@ -406,7 +406,7 @@ class GenerateReqInput:
             raise ValueError("The rid should be a string or a list of strings.")
 
     def _normalize_external_request_id(self, num):
-        """Normalize IPOP-provided request IDs for batch processing."""
+        """Normalize external request IDs for batch processing."""
         if self.external_request_id is None:
             self.external_request_id = [None] * num
         elif isinstance(self.external_request_id, str):
