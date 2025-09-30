@@ -230,7 +230,7 @@ impl GrpcRouter {
             Err(response) => return response,
         };
 
-        // Step 3: Build the gRPC request
+        // Step 4: Build the gRPC request
         let request_id = body
             .rid
             .clone()
