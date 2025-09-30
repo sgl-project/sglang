@@ -315,7 +315,7 @@ class Indexer(CustomOp):
         seqlens_32 = metadata.get_seqlens_int32()
         # NOTE(dark): 132 is SM count on H200/B200, not magic number
         schedule_metadata = deep_gemm_v32.get_paged_mqa_logits_metadata(
-            seqlens_32, blocksize, 132
+            seqlens_32, blocksize, self.sm_count
         )
 
         assert len(q_fp8.shape) == 3
