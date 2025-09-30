@@ -270,6 +270,12 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     python setup.py install'
 
 # -----------------------
+# Python tools
+RUN python3 -m pip install --no-cache-dir \
+    py-spy \
+    pre-commit
+
+# -----------------------
 # Performance environment variable.
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1
