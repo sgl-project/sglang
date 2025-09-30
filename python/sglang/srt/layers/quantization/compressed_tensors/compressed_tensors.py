@@ -18,6 +18,9 @@ from compressed_tensors.quantization import (
     QuantizationType,
 )
 from pydantic import BaseModel
+from transformers.utils.quantization_config import (
+    CompressedTensorsConfig as HfCompressedTensorsConfig,
+)
 
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
@@ -41,6 +44,9 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 try:
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_24 import (
+        CompressedTensors24,
+    )
     from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
         WNA16_SUPPORTED_BITS,
         CompressedTensorsWNA16,
@@ -504,11 +510,18 @@ class CompressedTensorsConfig(QuantizationConfig):
                 else self.config
             )
 
+            if model_compression_config is not None:
+                cfg = HfCompressedTensorsConfig.from_dict(model_compression_config)
+            else:
+                raise ValueError(
+                    "model_compression_config is expected for a 2:4 sparse model, but None is found."
+                )
+
             scheme = CompressedTensors24(
                 quantized=weight_quant is not None or input_quant is not None,
                 weight_quant=weight_quant,
                 input_quant=input_quant,
-                model_compression_config=model_compression_config,
+                model_compression_config=cfg,
             )
         elif weight_quant is None:
             logger.warning_once(
