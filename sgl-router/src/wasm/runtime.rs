@@ -6,7 +6,10 @@ use std::sync::{
 use tokio::sync::oneshot;
 use wasmtime::{Config, Engine, Instance, Module, Store, Val};
 
-use crate::wasm::config::WasmRuntimeConfig;
+use crate::wasm::{
+    config::WasmRuntimeConfig,
+    errors::{Result, WasmRuntimeError},
+};
 
 pub struct WasmRuntime {
     config: WasmRuntimeConfig,
@@ -33,12 +36,12 @@ pub enum WasmTask {
         wasm_bytes: Vec<u8>,
         function_name: String,
         args: Vec<Val>,
-        response: oneshot::Sender<Result<Vec<Val>, String>>,
+        response: oneshot::Sender<Result<Vec<Val>>>,
     },
 }
 
 impl WasmRuntime {
-    pub fn new(config: WasmRuntimeConfig) -> Result<Self, String> {
+    pub fn new(config: WasmRuntimeConfig) -> Result<Self> {
         let thread_pool = Arc::new(WasmThreadPool::new(config.clone())?);
 
         Ok(Self {
@@ -51,7 +54,7 @@ impl WasmRuntime {
         })
     }
 
-    pub fn with_default_config() -> Result<Self, String> {
+    pub fn with_default_config() -> Result<Self> {
         Self::new(WasmRuntimeConfig::default())
     }
 
@@ -81,7 +84,7 @@ impl WasmRuntime {
         wasm_bytes: Vec<u8>,
         function_name: String,
         args: Vec<Val>,
-    ) -> Result<Vec<Val>, String> {
+    ) -> Result<Vec<Val>> {
         let start_time = std::time::Instant::now();
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -96,11 +99,11 @@ impl WasmRuntime {
             .sender
             .send(task)
             .await
-            .map_err(|_| "Failed to send task to thread pool".to_string())?;
+            .map_err(|e| WasmRuntimeError::CallFailed(format!("Failed to send task to thread pool: {}", e)))?;
 
         let result = response_rx
             .await
-            .map_err(|_| "Failed to receive response from thread pool".to_string())?;
+            .map_err(|e| WasmRuntimeError::CallFailed(format!("Failed to receive response from thread pool: {}", e)))?;
 
         // Record metrics
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -123,7 +126,7 @@ impl WasmRuntime {
         wasm_bytes: Vec<u8>,
         function_name: String,
         args: Vec<Val>,
-    ) -> Result<Vec<Val>, String> {
+    ) -> Result<Vec<Val>> {
         // use tokio::runtime::Handle::current() to execute in async context
         let handle = tokio::runtime::Handle::current();
         handle.block_on(self.execute_wasm_module_async(wasm_bytes, function_name, args))
@@ -141,7 +144,7 @@ impl WasmRuntime {
 }
 
 impl WasmThreadPool {
-    pub fn new(config: WasmRuntimeConfig) -> Result<Self, String> {
+    pub fn new(config: WasmRuntimeConfig) -> Result<Self> {
         let (sender, receiver) = async_channel::unbounded();
 
         let mut workers = Vec::new();
@@ -273,20 +276,20 @@ impl WasmThreadPool {
         function_name: String,
         args: Vec<Val>,
         config: &WasmRuntimeConfig,
-    ) -> Result<Vec<Val>, String> {
+    ) -> Result<Vec<Val>> {
         // compile module from bytes
         let module = Module::new(engine, wasm_bytes)
-            .map_err(|e| format!("Failed to compile module: {}", e))?;
+            .map_err(|e| WasmRuntimeError::CompileFailed(e.to_string()))?;
 
         // create store and instance
         let mut store = Store::new(engine, ());
         let instance = Instance::new(&mut store, &module, &[])
-            .map_err(|e| format!("Failed to create instance: {}", e))?;
+            .map_err(|e| WasmRuntimeError::InstanceCreateFailed(e.to_string()))?;
 
         // get function
         let func = instance
             .get_func(&mut store, &function_name)
-            .ok_or_else(|| format!("Function {} not found", function_name))?;
+            .ok_or_else(|| WasmRuntimeError::FunctionNotFound(function_name.clone()))?;
 
         // set execution timeout
         let timeout_duration = std::time::Duration::from_millis(config.max_execution_time_ms);
@@ -297,8 +300,8 @@ impl WasmThreadPool {
             func.call(&mut store, &args, &mut results)
         })
         .await
-        .map_err(|_| "Execution timeout".to_string())?
-        .map_err(|e| format!("Execution failed: {}", e))?;
+        .map_err(|_| WasmRuntimeError::Timeout)?
+        .map_err(|e| WasmRuntimeError::CallFailed(e.to_string()))?;
 
         Ok(results)
     }
@@ -517,7 +520,7 @@ mod tests {
             .execute_wasm_module_async(invalid, "add".to_string(), vec![Val::I32(1), Val::I32(2)])
             .await;
         assert!(result.is_err());
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(!msg.is_empty());
     }
 
@@ -537,7 +540,7 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(msg.contains("not found") || !msg.is_empty());
     }
 

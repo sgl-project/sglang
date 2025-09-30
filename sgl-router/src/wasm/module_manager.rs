@@ -16,7 +16,8 @@ use wasmtime::Val;
 
 use crate::wasm::{
     config::WasmRuntimeConfig,
-    module::{WasmModule, WasmModuleAttachPoint, WasmModuleDescriptor, WasmModuleMeta, WasmModuleType},
+    module::{WasmModule, WasmModuleAttachPoint, WasmModuleDescriptor, WasmModuleMeta},
+    errors::{Result, WasmError, WasmManagerError, WasmModuleError},
     runtime::WasmRuntime,
 };
 
@@ -31,7 +32,7 @@ pub struct WasmModuleManager {
 }
 
 impl WasmModuleManager {
-    pub fn new(config: WasmRuntimeConfig) -> Result<Self, String> {
+    pub fn new(config: WasmRuntimeConfig) -> Result<Self> {
         let runtime = Arc::new(WasmRuntime::new(config)?);
         Ok(Self {
             modules: Arc::new(RwLock::new(HashMap::new())),
@@ -43,43 +44,40 @@ impl WasmModuleManager {
         })
     }
 
-    pub fn with_default_config() -> Result<Self, String> {
+    pub fn with_default_config() -> Result<Self> {
         Self::new(WasmRuntimeConfig::default())
     }
 
-    fn check_duplicate_sha256_hash(&self, sha256_hash: &[u8; 32]) -> Result<(), String> {
+    fn check_duplicate_sha256_hash(&self, sha256_hash: &[u8; 32]) -> Result<()> {
         let modules = self
             .modules
             .read()
-            .map_err(|e| format!("Failed to acquire read lock: {}", e))?;
+            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
         if modules
             .values()
             .any(|module: &WasmModule| module.module_meta.sha256_hash == *sha256_hash)
         {
-            return Err(format!(
-                "Module with SHA256 hash {:?} already exists",
-                sha256_hash
-            ));
+            return Err(WasmModuleError::DuplicateSha256(*sha256_hash).into());
         }
         Ok(())
     }
 
-    fn calculate_size_bytes(&self, file_path: &str) -> Result<u64, String> {
-        let file = File::open(file_path).map_err(|e| format!("Failed to open file: {}", e))?;
+    fn calculate_size_bytes(&self, file_path: &str) -> Result<u64> {
+        let file = File::open(file_path).map_err(|e| WasmError::from(e))?;
         let metadata = file
             .metadata()
-            .map_err(|e| format!("Failed to get metadata: {}", e))?;
+            .map_err(|e| WasmError::from(e))?;
         Ok(metadata.len())
     }
 
-    fn calculate_sha256_hash(&self, file_path: &str) -> Result<[u8; 32], String> {
-        let mut file = File::open(file_path).map_err(|e| format!("Failed to open file: {}", e))?;
+    fn calculate_sha256_hash(&self, file_path: &str) -> Result<[u8; 32]> {
+        let mut file = File::open(file_path).map_err(|e| WasmError::from(e))?;
         let mut hasher = Sha256::new();
         let mut buffer = [0; 1024];
         loop {
             let bytes_read = file
                 .read(&mut buffer)
-                .map_err(|e| format!("Failed to read file: {}", e))?;
+                .map_err(|e| WasmError::from(e))?;
             if bytes_read == 0 {
                 break;
             }
@@ -88,20 +86,20 @@ impl WasmModuleManager {
         Ok(hasher.finalize().into())
     }
 
-    fn validate_module_descriptor(&self, descriptor: WasmModuleDescriptor) -> Result<(), String> {
+    fn validate_module_descriptor(&self, descriptor: WasmModuleDescriptor) -> Result<()> {
         if descriptor.name.is_empty() {
-            return Err("Module name cannot be empty".to_string());
+            return Err(WasmModuleError::InvalidDescriptor("Module name cannot be empty".to_string()).into());
         }
         if descriptor.file_path.is_empty() {
-            return Err("Module file path cannot be empty".to_string());
+            return Err(WasmModuleError::InvalidDescriptor("Module file path cannot be empty".to_string()).into());
         }
         if self.calculate_size_bytes(&descriptor.file_path)? == 0 {
-            return Err("Module file size cannot be 0".to_string());
+            return Err(WasmModuleError::ValidationFailed("Module file size cannot be 0".to_string()).into());
         }
         Ok(())
     }
 
-    pub fn add_module(&self, descriptor: WasmModuleDescriptor) -> Result<Uuid, String> {
+    pub fn add_module(&self, descriptor: WasmModuleDescriptor) -> Result<Uuid> {
         // validate the module descriptor
         self.validate_module_descriptor(descriptor.clone())?;
 
@@ -135,45 +133,45 @@ impl WasmModuleManager {
         let mut modules = self
             .modules
             .write()
-            .map_err(|e| format!("Failed to acquire write lock: {}", e))?;
+            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
         modules.insert(module_uuid, module);
         Ok(module_uuid)
     }
 
-    pub fn remove_module(&self, module_uuid: Uuid) -> Result<(), String> {
+    pub fn remove_module(&self, module_uuid: Uuid) -> Result<()> {
         let mut modules = self
             .modules
             .write()
-            .map_err(|e| format!("Failed to acquire write lock: {}", e))?;
+            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
         if !modules.contains_key(&module_uuid) {
-            return Err(format!("Module with UUID {} does not exist", module_uuid));
+            return Err(WasmManagerError::ModuleNotFound(module_uuid).into());
         }
         modules.remove(&module_uuid);
         Ok(())
     }
 
-    pub fn get_all_modules(&self) -> Result<Vec<WasmModule>, String> {
+    pub fn get_all_modules(&self) -> Result<Vec<WasmModule>> {
         let modules = self
             .modules
             .read()
-            .map_err(|e| format!("Failed to acquire read lock: {}", e))?;
+            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
         Ok(modules.values().cloned().collect())
     }
 
-    pub fn get_module(&self, module_uuid: Uuid) -> Result<Option<WasmModule>, String> {
+    pub fn get_module(&self, module_uuid: Uuid) -> Result<Option<WasmModule>> {
         let modules = self
             .modules
             .read()
-            .map_err(|e| format!("Failed to acquire read lock: {}", e))?;
+            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
         Ok(modules.get(&module_uuid).cloned())
     }
 
     /// get modules by attach point
-    pub fn get_modules_by_attach_point(&self, attach_point: WasmModuleAttachPoint) -> Result<Vec<WasmModule>, String> {
+    pub fn get_modules_by_attach_point(&self, attach_point: WasmModuleAttachPoint) -> Result<Vec<WasmModule>> {
         let modules = self
             .modules
             .read()
-            .map_err(|e| format!("Failed to acquire read lock: {}", e))?;
+            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
         Ok(modules.values().filter(|module| module.module_meta.attach_points.contains_key(&attach_point)).cloned().collect())
     }
 
@@ -183,22 +181,22 @@ impl WasmModuleManager {
         module_uuid: Uuid,
         function_name: String,
         args: Vec<Val>,
-    ) -> Result<Vec<Val>, String> {
+    ) -> Result<Vec<Val>> {
         let start_time = std::time::Instant::now();
 
         let module = {
             let modules = self
                 .modules
                 .read()
-                .map_err(|e| format!("Failed to acquire read lock: {}", e))?;
+                .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
             modules
                 .get(&module_uuid)
                 .cloned()
-                .ok_or_else(|| format!("Module {} not found", module_uuid))?
+                .ok_or_else(|| WasmError::from(WasmManagerError::ModuleNotFound(module_uuid)))?
         };
 
         let wasm_bytes = std::fs::read(&module.module_meta.file_path)
-            .map_err(|e| format!("Failed to read module file: {}", e))?;
+            .map_err(|e| WasmError::from(e))?;
 
         let result = self
             .runtime
@@ -226,22 +224,22 @@ impl WasmModuleManager {
         module_uuid: Uuid,
         function_name: String,
         args: Vec<Val>,
-    ) -> Result<Vec<Val>, String> {
+    ) -> Result<Vec<Val>> {
         let start_time = std::time::Instant::now();
 
         let module = {
             let modules = self
                 .modules
                 .read()
-                .map_err(|e| format!("Failed to acquire read lock: {}", e))?;
+                .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
             modules
                 .get(&module_uuid)
                 .cloned()
-                .ok_or_else(|| format!("Module {} not found", module_uuid))?
+                .ok_or_else(|| WasmError::from(WasmManagerError::ModuleNotFound(module_uuid)))?
         };
 
         let wasm_bytes = std::fs::read(&module.module_meta.file_path)
-            .map_err(|e| format!("Failed to read module file: {}", e))?;
+            .map_err(|e| WasmError::from(e))?;
 
         let result = self
             .runtime
