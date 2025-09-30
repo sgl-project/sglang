@@ -61,6 +61,11 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 
+from sglang.srt.model_executor.compilation.custom_ops import (
+    _set_dp_buffer_len,
+    _set_dp_buffer_len_register_fake
+)
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -630,7 +635,7 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            _set_dp_buffer_len(global_dp_buffer_len, num_tokens)
 
             kwargs = {}
             if (
@@ -659,7 +664,7 @@ class CudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
         out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
+            graph, get_global_graph_memory_pool(), stream, run_once, bs
         )
 
         return graph, out
