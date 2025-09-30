@@ -763,14 +763,8 @@ class NativeSparseAttnBackend(AttentionBackend):
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
-        # TODO fuse transform
-        page_table_1_transformed = torch.nn.functional.pad(
-            page_table_1,
-            (0, self.nsa_index_topk - page_table_1.shape[-1]),
-            "constant",
-            -1,
-        )
-        page_table_1_transformed = page_table_1_transformed.unsqueeze(1)
+        indices = page_table_1.unsqueeze(1)
+        assert indices.shape[-1] == self.nsa_index_topk  # requirement of FlashMLA decode kernel
 
         o, _ = flash_mla_with_kvcache(
             q=q_all,
@@ -780,7 +774,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
             num_splits=metadata.flashmla_metadata.num_splits,
             softmax_scale=sm_scale,
-            indices=page_table_1_transformed,
+            indices=indices,
             # doc says it is not used, but if pass in None then error
             block_table=torch.empty(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
