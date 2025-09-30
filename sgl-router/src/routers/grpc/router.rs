@@ -257,7 +257,7 @@ impl GrpcRouter {
             .cloned()
             .unwrap_or_else(|| "default".to_string());
 
-        // Step 5: Handle streaming vs non-streaming
+        // Step 6: Handle streaming vs non-streaming
         if body.stream {
             // TODO: Implement streaming support for generate endpoint
             return (
