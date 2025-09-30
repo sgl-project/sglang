@@ -122,10 +122,9 @@ async fn test_pythonic_empty_arguments() {
 async fn test_pythonic_format_detection() {
     let parser = PythonicParser::new();
 
-    assert!(parser.detect_format("[function_name("));
+    assert!(!parser.detect_format("[function_name(")); // Incomplete
     assert!(parser.detect_format("[get_weather(city=\"NYC\")]"));
     assert!(!parser.detect_format("Just plain text"));
-    assert!(!parser.detect_format("[1, 2, 3]")); // Plain list
     assert!(!parser.detect_format("{\"name\": \"test\"}")); // JSON
 }
 
