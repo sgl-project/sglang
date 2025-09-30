@@ -268,6 +268,9 @@ impl GrpcRouter {
             .clone()
             .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
 
+        debug!("Building plain generate request with return_logprob={}, logprob_start_len={:?}",
+            body.return_logprob, body.logprob_start_len);
+
         let request = match client.build_plain_generate_request(
             request_id.clone(),
             body,
