@@ -1,8 +1,12 @@
+use std::convert::TryFrom;
 use std::time::Duration;
 use tonic::{transport::Channel, Request};
 use tracing::debug;
 
-use crate::protocols::spec::{ChatCompletionRequest, ResponseFormat};
+use crate::protocols::spec::{
+    ChatCompletionRequest, GenerateRequest, ResponseFormat,
+    SamplingParams as GenerateSamplingParams, StringOrArray,
+};
 
 // Include the generated protobuf code
 pub mod proto {
@@ -20,7 +24,7 @@ pub struct SglangSchedulerClient {
 
 impl SglangSchedulerClient {
     /// Create a new client and connect to the scheduler
-    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
         // Convert grpc:// to http:// for tonic
@@ -41,10 +45,11 @@ impl SglangSchedulerClient {
     }
 
     /// Submit a generation request (returns streaming response)
-    pub async fn generate_stream(
+    pub async fn generate(
         &mut self,
         req: proto::GenerateRequest,
-    ) -> Result<tonic::Streaming<proto::GenerateResponse>, Box<dyn std::error::Error>> {
+    ) -> Result<tonic::Streaming<proto::GenerateResponse>, Box<dyn std::error::Error + Send + Sync>>
+    {
         let request = Request::new(req);
         let response = self.client.generate(request).await?;
         Ok(response.into_inner())
@@ -53,7 +58,7 @@ impl SglangSchedulerClient {
     /// Perform health check
     pub async fn health_check(
         &mut self,
-    ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error>> {
+    ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending health check request");
         let request = Request::new(proto::HealthCheckRequest {
             tokenized: Some(proto::TokenizedInput {
@@ -72,7 +77,7 @@ impl SglangSchedulerClient {
         &mut self,
         request_id: String,
         reason: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let request = Request::new(proto::AbortRequest { request_id, reason });
 
         self.client.abort(request).await?;
@@ -85,7 +90,7 @@ impl SglangSchedulerClient {
         request_id: String,
         body: &ChatCompletionRequest,
         processed_text: String,
-        token_ids: Vec<i32>,
+        token_ids: Vec<u32>,
         multimodal_inputs: Option<proto::MultimodalInputs>,
         tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
     ) -> Result<proto::GenerateRequest, String> {
@@ -105,6 +110,37 @@ impl SglangSchedulerClient {
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
+            ..Default::default()
+        };
+
+        Ok(grpc_request)
+    }
+
+    /// Build a basic GenerateRequest from the SGLang spec GenerateRequest
+    pub fn build_plain_generate_request(
+        &self,
+        request_id: String,
+        body: &GenerateRequest,
+        original_text: Option<String>,
+        token_ids: Vec<u32>,
+    ) -> Result<proto::GenerateRequest, String> {
+        let sampling_params =
+            Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
+
+        let grpc_request = proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: original_text.unwrap_or_default(),
+                input_ids: token_ids,
+            }),
+            sampling_params: Some(sampling_params),
+            return_logprob: body.return_logprob,
+            logprob_start_len: -1,
+            top_logprobs_num: 0,
+            token_ids_logprob: vec![],
+            return_hidden_states: body.return_hidden_states,
+            stream: body.stream,
+            log_metrics: true,
             ..Default::default()
         };
 
@@ -153,6 +189,8 @@ impl SglangSchedulerClient {
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens,
+            ignore_eos: request.ignore_eos,
+            no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1) as i32,
             constraint: self.build_constraint(request, tool_call_constraint)?,
             ..Default::default()
@@ -162,8 +200,8 @@ impl SglangSchedulerClient {
     /// Extract stop strings from request
     fn extract_stop_strings(&self, request: &ChatCompletionRequest) -> Vec<String> {
         match &request.stop {
-            Some(crate::protocols::spec::StringOrArray::String(s)) => vec![s.clone()],
-            Some(crate::protocols::spec::StringOrArray::Array(arr)) => arr.clone(),
+            Some(StringOrArray::String(s)) => vec![s.clone()],
+            Some(StringOrArray::Array(arr)) => arr.clone(),
             None => vec![],
         }
     }
@@ -214,6 +252,100 @@ impl SglangSchedulerClient {
             1 => Ok(constraints.pop()),
             _ => Err("Multiple constraints are not allowed.".to_string()),
         }
+    }
+
+    fn build_single_constraint_from_plain(
+        params: &GenerateSamplingParams,
+    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
+        let mut constraints = Vec::new();
+        if let Some(json_schema) = &params.json_schema {
+            constraints.push(proto::sampling_params::Constraint::JsonSchema(
+                json_schema.clone(),
+            ));
+        }
+        if let Some(regex) = &params.regex {
+            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
+        }
+        if let Some(ebnf) = &params.ebnf {
+            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
+                ebnf.clone(),
+            ));
+        }
+
+        match constraints.len() {
+            0 => Ok(None),
+            1 => Ok(constraints.pop()),
+            _ => Err("Multiple structured constraints are not allowed".to_string()),
+        }
+    }
+
+    fn build_sampling_params_from_plain(
+        params: Option<&GenerateSamplingParams>,
+    ) -> Result<proto::SamplingParams, String> {
+        let mut sampling = proto::SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: -1,
+            repetition_penalty: 1.0,
+            n: 1,
+            ..Default::default()
+        };
+
+        let Some(p) = params else {
+            return Ok(sampling);
+        };
+
+        // Simple field mappings using a macro
+        macro_rules! map_field {
+            ($field:ident) => {
+                if let Some(val) = p.$field {
+                    sampling.$field = val;
+                }
+            };
+        }
+
+        map_field!(temperature);
+        map_field!(top_p);
+        map_field!(top_k);
+        map_field!(frequency_penalty);
+        map_field!(presence_penalty);
+        map_field!(repetition_penalty);
+        map_field!(min_p);
+        map_field!(ignore_eos);
+        map_field!(skip_special_tokens);
+        map_field!(no_stop_trim);
+
+        // Handle stop sequences
+        if let Some(stop) = &p.stop {
+            match stop {
+                StringOrArray::String(s) => sampling.stop.push(s.clone()),
+                StringOrArray::Array(arr) => sampling.stop.extend(arr.clone()),
+            }
+        }
+
+        // Handle stop token IDs
+        if let Some(stop_token_ids) = &p.stop_token_ids {
+            sampling.stop_token_ids = stop_token_ids.clone();
+        }
+
+        // Handle max_new_tokens with conversion
+        if let Some(max_new_tokens) = p.max_new_tokens {
+            sampling.max_new_tokens =
+                Some(i32::try_from(max_new_tokens).map_err(|_| {
+                    "max_new_tokens must fit into a 32-bit signed integer".to_string()
+                })?);
+        }
+
+        // Handle min_tokens with conversion
+        if let Some(min_tokens) = p.min_tokens {
+            sampling.min_new_tokens = i32::try_from(min_tokens)
+                .map_err(|_| "min_tokens must fit into a 32-bit signed integer".to_string())?;
+        }
+
+        // Handle constraints (exactly one allowed)
+        sampling.constraint = Self::build_single_constraint_from_plain(p)?;
+
+        Ok(sampling)
     }
 }
 
