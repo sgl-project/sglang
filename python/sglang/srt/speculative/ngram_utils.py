@@ -54,7 +54,7 @@ class NgramVerifyInput:
         retrive_next_sibling: torch.Tensor,
         draft_token_num: int,
     ):
-        super().__init__(SpecInputType.LOOKAHEAD_VERIFY)
+        super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
         self.custom_mask = tree_mask
         self.positions = positions

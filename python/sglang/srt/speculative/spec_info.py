@@ -46,7 +46,7 @@ class SpecInputType(IntEnum):
     # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
-    LOOKAHEAD_VERIFY = auto()
+    NGRAM_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -61,7 +61,7 @@ class SpecInput(ABC):
     def is_verify_input(self) -> bool:
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
-            SpecInputType.LOOKAHEAD_VERIFY,
+            SpecInputType.NGRAM_VERIFY,
         }
 
     @abstractmethod
