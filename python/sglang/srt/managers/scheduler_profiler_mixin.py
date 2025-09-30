@@ -265,7 +265,7 @@ class SchedulerProfilerMixin:
 
             torch.distributed.barrier(self.tp_cpu_group)
             if self.tp_rank == 0:
-                from sglang.srt.utils import rpd_to_chrome_trace
+                from sglang.srt.rpd_utils import rpd_to_chrome_trace
 
                 rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
             self.rpd_profiler = None
@@ -394,7 +394,7 @@ class SchedulerProfilerMixin:
             else:
                 logger.error(f"❌ PROFILE ERROR: Unsupported batch stage: {batch.forward_mode}")
                 raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
-        else:            
+        else:
             # Check profiler
             if (
                 self.profiler_target_forward_ct
