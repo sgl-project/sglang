@@ -95,7 +95,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
 
 # Download NVSHMEM source files
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    if [ "$BUILD_TYPE" = "blackwell_aarch" ] && [ "$(uname -m)" = "aarch64" ]; then \
+    if [ "$BUILD_TYPE" = "blackwell_aarch64" ] && [ "$(uname -m)" = "aarch64" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git \
       && cd DeepEP && git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     else \

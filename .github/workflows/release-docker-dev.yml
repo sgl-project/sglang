@@ -53,7 +53,7 @@ jobs:
       matrix:
         variant:
           - version: 12.9.1
-            type: blackwell_aarch
+            type: blackwell_aarch64
             tag: blackwell-cu129
     steps:
       - name: Delete huge unnecessary tools folder
