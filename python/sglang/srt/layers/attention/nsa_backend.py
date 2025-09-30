@@ -787,8 +787,6 @@ class NativeSparseAttnBackend(AttentionBackend):
             ),
             is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
         )
-
-        # TODO shape correct?
         return o
 
     def _forward_tilelang(
