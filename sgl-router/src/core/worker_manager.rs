@@ -310,12 +310,35 @@ impl WorkerManager {
                     }
                 }
             } else {
+                // Fetch server info to get model_id and other metadata
+                let mut labels = HashMap::new();
+
+                match Self::get_server_info(url, config.api_key.as_deref()).await {
+                    Ok(info) => {
+                        let model_id = info
+                            .model_id
+                            .or_else(|| {
+                                info.model_path.as_ref().and_then(|path| {
+                                    path.split('/').next_back().map(|s| s.to_string())
+                                })
+                            })
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        labels.insert("model_id".to_string(), model_id);
+                        info!("Worker {} has model_id: {}", url, labels["model_id"]);
+                    }
+                    Err(e) => {
+                        warn!("Failed to query server info from {}: {}", url, e);
+                        labels.insert("model_id".to_string(), "unknown".to_string());
+                    }
+                }
+
                 let worker = Self::create_basic_worker(
                     url.clone(),
                     WorkerType::Regular,
                     connection_mode.clone(),
                     config.api_key.clone(),
-                    None,
+                    Some(labels),
                     circuit_breaker_config.clone(),
                     health_config.clone(),
                 );
@@ -355,12 +378,42 @@ impl WorkerManager {
             let worker_type = WorkerType::Prefill {
                 bootstrap_port: **bootstrap_port,
             };
+
+            // Fetch server info to get model_id and other metadata
+            let mut labels = HashMap::new();
+
+            match Self::get_server_info(url, config.api_key.as_deref()).await {
+                Ok(info) => {
+                    let model_id = info
+                        .model_id
+                        .or_else(|| {
+                            info.model_path
+                                .as_ref()
+                                .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    labels.insert("model_id".to_string(), model_id);
+                    info!(
+                        "Prefill worker {} has model_id: {}",
+                        url, labels["model_id"]
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to query server info from prefill worker {}: {}",
+                        url, e
+                    );
+                    labels.insert("model_id".to_string(), "unknown".to_string());
+                }
+            }
+
             let worker = Self::create_basic_worker(
                 (*url).clone(),
                 worker_type,
                 connection_mode.clone(),
                 config.api_key.clone(),
-                None,
+                Some(labels),
                 circuit_breaker_config.clone(),
                 health_config.clone(),
             );
@@ -400,12 +453,38 @@ impl WorkerManager {
         }
 
         for url in urls {
+            // Fetch server info to get model_id and other metadata
+            let mut labels = HashMap::new();
+
+            match Self::get_server_info(url, config.api_key.as_deref()).await {
+                Ok(info) => {
+                    let model_id = info
+                        .model_id
+                        .or_else(|| {
+                            info.model_path
+                                .as_ref()
+                                .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    labels.insert("model_id".to_string(), model_id);
+                    info!("Decode worker {} has model_id: {}", url, labels["model_id"]);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to query server info from decode worker {}: {}",
+                        url, e
+                    );
+                    labels.insert("model_id".to_string(), "unknown".to_string());
+                }
+            }
+
             let worker = Self::create_basic_worker(
                 url.clone(),
                 WorkerType::Decode,
                 connection_mode.clone(),
                 config.api_key.clone(),
-                None,
+                Some(labels),
                 circuit_breaker_config.clone(),
                 health_config.clone(),
             );
@@ -440,12 +519,15 @@ impl WorkerManager {
         let mut registered_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
 
         for url in urls {
+            let mut labels = HashMap::new();
+            labels.insert("model_id".to_string(), "unknown".to_string());
+
             let worker = Self::create_basic_worker(
                 url.clone(),
                 WorkerType::Regular,
                 connection_mode.clone(),
                 config.api_key.clone(),
-                None,
+                Some(labels),
                 circuit_breaker_config.clone(),
                 health_config.clone(),
             );
@@ -489,12 +571,16 @@ impl WorkerManager {
                 port: *bootstrap_port,
             };
 
+            // For gRPC workers, we can't fetch server info via HTTP endpoints
+            let mut labels = HashMap::new();
+            labels.insert("model_id".to_string(), "unknown".to_string());
+
             let worker = Self::create_basic_worker(
                 url.clone(),
                 worker_type,
                 connection_mode,
                 config.api_key.clone(),
-                None,
+                Some(labels),
                 circuit_breaker_config.clone(),
                 health_config.clone(),
             );
@@ -514,12 +600,16 @@ impl WorkerManager {
         for url in decode_urls {
             let connection_mode = ConnectionMode::Grpc { port: None };
 
+            // For gRPC workers, we can't fetch server info via HTTP endpoints
+            let mut labels = HashMap::new();
+            labels.insert("model_id".to_string(), "unknown".to_string());
+
             let worker = Self::create_basic_worker(
                 url.clone(),
                 WorkerType::Decode,
                 connection_mode,
                 config.api_key.clone(),
-                None,
+                Some(labels),
                 circuit_breaker_config.clone(),
                 health_config.clone(),
             );
