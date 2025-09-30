@@ -270,7 +270,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             page_table_1=page_table,
             flashmla_metadata=(
                 self._compute_flashmla_metadata(
-                    cache_seqlens=cache_seqlens_int32,
+                    cache_seqlens=nsa_cache_seqlens_int32,
                     seq_len_q=1,  # TODO handle MTP which is not 1
                 )
                 if NSA_DECODE_IMPL == "flashmla_decode"
@@ -365,7 +365,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             ].slice(slice(0, bs + 1))
             flashmla_metadata.copy_(
                 self._compute_flashmla_metadata(
-                    cache_seqlens=cache_seqlens_int32,
+                    cache_seqlens=nsa_cache_seqlens_int32,
                     seq_len_q=1,  # TODO handle MTP which is not 1
                 )
             )
@@ -447,7 +447,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         if NSA_DECODE_IMPL == "flashmla_decode":
             metadata.flashmla_metadata.copy_(
                 self._compute_flashmla_metadata(
-                    cache_seqlens=cache_seqlens,
+                    cache_seqlens=nsa_cache_seqlens,
                     seq_len_q=1,  # TODO handle MTP which is not 1
                 )
             )
@@ -755,10 +755,10 @@ class NativeSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         from flash_mla import flash_mla_with_kvcache
 
-        bs = forward_batch.batch_size
-        cache_seqlens = forward_batch.seq_lens.to(torch.int32)
+        cache_seqlens = metadata.nsa_cache_seqlens_int32
 
-        q_all = q_all.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+        # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
+        q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
@@ -782,7 +782,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 nsa_index_topk=self.nsa_index_topk,
             ),
             # doc says it is not used, but if pass in None then error
-            block_table=block_table,
+            block_table=torch.empty((q_all.shape[0], 0), dtype=torch.int32, device=q_all.device),
             is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
         )
 
