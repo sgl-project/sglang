@@ -1145,10 +1145,8 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        if self.use_nsa and NSA_KV_CACHE_STORE_FP8:
-            # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
-            cache_k = quantize_k_cache(cache_k.unsqueeze(1)).squeeze(1)
-        elif cache_k.dtype != self.dtype:
+        assert not (self.use_nsa and NSA_KV_CACHE_STORE_FP8)
+        if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
@@ -1165,16 +1163,28 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        if cache_k_nope.dtype != self.dtype:
-            cache_k_nope = cache_k_nope.to(self.dtype)
-            cache_k_rope = cache_k_rope.to(self.dtype)
-        if self.store_dtype != self.dtype:
-            cache_k_nope = cache_k_nope.view(self.store_dtype)
-            cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-        set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id - self.start_layer], loc, cache_k_nope, cache_k_rope
-        )
+        if self.use_nsa and NSA_KV_CACHE_STORE_FP8:
+            # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
+            # TODO no need to cat
+            cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+            cache_k = quantize_k_cache(cache_k.unsqueeze(1)).squeeze(1)
+            cache_k = cache_k.view(self.store_dtype)
+            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+        else:
+            if cache_k_nope.dtype != self.dtype:
+                cache_k_nope = cache_k_nope.to(self.dtype)
+                cache_k_rope = cache_k_rope.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                cache_k_nope = cache_k_nope.view(self.store_dtype)
+                cache_k_rope = cache_k_rope.view(self.store_dtype)
+
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+            )
 
     def get_cpu_copy(self, indices):
         torch.cuda.synchronize()
