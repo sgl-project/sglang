@@ -2026,9 +2026,6 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-
             # skip generation sub model
             if "gen" in name:
                 continue
