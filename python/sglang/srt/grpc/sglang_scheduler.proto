@@ -4,7 +4,6 @@ package sglang.grpc.scheduler;
 
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/struct.proto";
-import "google/protobuf/wrappers.proto";
 
 // Service definition for SGLang scheduler communication
 // This protocol bridges the Rust router and Python scheduler
