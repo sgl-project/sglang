@@ -9,7 +9,6 @@ from einops import rearrange
 from torch import nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.utils import add_prefix, is_npu
 
 if not is_npu():
@@ -257,8 +256,6 @@ class Indexer(CustomOp):
             current_stream.wait_stream(self.alt_stream)
         else:
             query, _ = self.wq_b(q_lora)
-            if dumper._enable:
-                after_wq_b = query.clone()
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
 
             q_rope, _ = torch.split(
@@ -266,11 +263,7 @@ class Indexer(CustomOp):
             )
 
             key, _ = self.wk(x)
-            if dumper._enable:
-                after_wk = key.clone()
             key = self.k_norm(key)
-            if dumper._enable:
-                after_k_norm = key.clone()
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
@@ -279,10 +272,6 @@ class Indexer(CustomOp):
 
         query[..., : self.rope_head_dim] = q_rope
         key[..., : self.rope_head_dim] = k_rope
-
-        if dumper._enable:
-            q_before_hadamard = query.clone()
-            k_before_hadamard = key.clone()
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
