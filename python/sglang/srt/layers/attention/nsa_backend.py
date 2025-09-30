@@ -545,6 +545,21 @@ class NativeSparseAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+        elif NSA_PREFILL_IMPL == "flashmla_decode":
+            if q_rope is not None:
+                q_all = torch.cat([q_nope, q_rope], dim=-1)
+            return self._forward_flashmla_decode(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+                # TODO optimize args
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+                topk_indices=topk_indices,
+                block_table=metadata.real_page_table,
+            )
         elif NSA_PREFILL_IMPL == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
