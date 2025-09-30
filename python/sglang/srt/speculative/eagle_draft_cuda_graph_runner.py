@@ -58,6 +58,7 @@ class EAGLEDraftCudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.enable_pdmux = False
         server_args = model_runner.server_args
 
         # Batch sizes to capture
@@ -152,7 +153,9 @@ class EAGLEDraftCudaGraphRunner:
     def capture(self):
         CudaGraphRunner.capture(self)
 
-    def capture_one_batch_size(self, num_seqs: int, forward: Callable):
+    def capture_one_batch_size(
+        self, num_seqs: int, forward: Callable, stream_idx: int = 0
+    ):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = num_seqs * self.num_tokens_per_bs
