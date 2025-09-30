@@ -100,7 +100,6 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
-    "hybrid_linear_attn",
     # AMD specific
     "aiter",
     "wave",
@@ -802,7 +801,7 @@ class ServerArgs:
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
 
-        if is_npu() and self.attention_backend in ["ascend", "hybrid_linear_attn"]:
+        if is_npu() and self.attention_backend in ["ascend"]:
             logger.warning(
                 "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
             )
