@@ -321,14 +321,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             logger.info(f"Sending health check request to request manager...")
 
             # Submit and wait for response
-            output_queue = await self.request_manager.generate_request(
+            output_generator = self.request_manager.generate_request(
                 health_request, request_id=rid
             )
 
             try:
-                # Wait for response with configurable timeout
+                # Get first response with timeout
                 response = await asyncio.wait_for(
-                    output_queue.get(), timeout=HEALTH_CHECK_TIMEOUT
+                    output_generator.__anext__(), timeout=HEALTH_CHECK_TIMEOUT
                 )
 
                 # Clean up
@@ -404,7 +404,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             logprob_start_len=grpc_req.logprob_start_len or -1,
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
             stream=grpc_req.stream or False,
-            lora_path=grpc_req.lora_id if grpc_req.lora_id else None,
+            lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),
@@ -458,9 +458,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             repetition_penalty=grpc_params.repetition_penalty or 1.0,
             max_new_tokens=grpc_params.max_new_tokens or 128,
             min_new_tokens=grpc_params.min_new_tokens or 0,
-            stop=list(grpc_params.stop) if grpc_params.stop else None,
+            stop=list(grpc_params.stop) if grpc_params.stop else [],
             stop_token_ids=(
-                list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
+                list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else []
             ),
             skip_special_tokens=grpc_params.skip_special_tokens,
             spaces_between_special_tokens=grpc_params.spaces_between_special_tokens,
@@ -472,11 +472,51 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ignore_eos=grpc_params.ignore_eos,
         )
 
+    def _convert_logprobs_to_proto(
+        self, logprobs_data: Dict
+    ) -> Optional[sglang_scheduler_pb2.LogProbs]:
+        """Convert logprobs dict to proto LogProbs format (transport RAW data only)."""
+        if not logprobs_data:
+            return None
+
+        token_logprobs_val = logprobs_data.get("token_logprobs_val", [])
+        token_logprobs_idx = logprobs_data.get("token_logprobs_idx", [])
+        top_logprobs_val = logprobs_data.get("top_logprobs_val", [])
+        top_logprobs_idx = logprobs_data.get("top_logprobs_idx", [])
+
+        # Build TopLogProbs entries
+        top_logprobs_proto = []
+        if top_logprobs_val and top_logprobs_idx:
+            for val_list, idx_list in zip(top_logprobs_val, top_logprobs_idx):
+                top_logprobs_proto.append(
+                    sglang_scheduler_pb2.TopLogProbs(
+                        values=val_list,
+                        token_ids=idx_list,
+                    )
+                )
+
+        return sglang_scheduler_pb2.LogProbs(
+            token_logprobs=token_logprobs_val,
+            token_ids=token_logprobs_idx,
+            top_logprobs=top_logprobs_proto,
+        )
+
     def _create_chunk_response(
         self, request_id: str, output: Dict
     ) -> sglang_scheduler_pb2.GenerateResponse:
         """Create a streaming chunk response."""
         meta_info = output.get("meta_info", {})
+
+        # Convert output logprobs if present
+        output_logprobs_proto = self._convert_logprobs_to_proto(
+            output.get("output_logprobs")
+        )
+
+        # Convert input logprobs if present (only in first chunk)
+        input_logprobs_proto = self._convert_logprobs_to_proto(
+            output.get("input_logprobs")
+        )
+
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
             chunk=sglang_scheduler_pb2.GenerateStreamChunk(
@@ -484,6 +524,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 prompt_tokens=meta_info.get("prompt_tokens", 0),
                 completion_tokens=meta_info.get("completion_tokens", 0),
                 cached_tokens=meta_info.get("cached_tokens", 0),
+                output_logprobs=output_logprobs_proto,
+                input_logprobs=input_logprobs_proto,
             ),
         )
 
@@ -492,13 +534,42 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> sglang_scheduler_pb2.GenerateResponse:
         """Create a completion response."""
 
-        # Determine finish reason
-        finish_reason = sglang_scheduler_pb2.GenerateComplete.STOP
+        # Extract meta info and finish reason details
         meta_info = output.get("meta_info", {})
-        if meta_info.get("finish_reason") == "length":
-            finish_reason = sglang_scheduler_pb2.GenerateComplete.LENGTH
-        elif meta_info.get("finish_reason") == "eos_token":
-            finish_reason = sglang_scheduler_pb2.GenerateComplete.EOS_TOKEN
+        finish_reason_data = meta_info.get("finish_reason")
+
+        # Determine finish reason, default is stop
+        finish_reason = "stop"
+        if finish_reason_data:
+            if isinstance(finish_reason_data, dict):
+                finish_reason_type = finish_reason_data.get("type")
+            else:
+                # Handle legacy string format
+                finish_reason_type = finish_reason_data
+
+            if finish_reason_type == "length":
+                finish_reason = "length"
+            elif finish_reason_type == "abort":
+                finish_reason = "abort"
+
+        # Extract matched_stop information
+        matched_stop_kwargs = {}
+        if isinstance(finish_reason_data, dict) and "matched" in finish_reason_data:
+            matched = finish_reason_data["matched"]
+            if isinstance(matched, int):
+                matched_stop_kwargs["matched_token_id"] = matched
+            elif isinstance(matched, str):
+                matched_stop_kwargs["matched_stop_str"] = matched
+
+        # Convert output logprobs if present
+        output_logprobs_proto = self._convert_logprobs_to_proto(
+            output.get("output_logprobs")
+        )
+
+        # Convert input logprobs if present
+        input_logprobs_proto = self._convert_logprobs_to_proto(
+            output.get("input_logprobs")
+        )
 
         return sglang_scheduler_pb2.GenerateResponse(
             request_id=request_id,
@@ -510,6 +581,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     "completion_tokens", len(output.get("token_ids", []))
                 ),
                 cached_tokens=meta_info.get("cached_tokens", 0),
+                output_logprobs=output_logprobs_proto,
+                input_logprobs=input_logprobs_proto,
+                **matched_stop_kwargs,
             ),
         )
 
