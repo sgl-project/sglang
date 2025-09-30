@@ -1273,10 +1273,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             #   (= len(fill_ids) - len(prefix_indices), where fill_ids = origin_input_ids + output_ids
             #    and prefix_indices are the cached/shared prefix tokens)
             #
-            if req.logprob_start_len < 0:
-                # Logprobs not requested - skip all input logprob computation
-                req.extend_logprob_start_len = req.extend_input_len
-            elif req.logprob_start_len >= pre_len:
+            if req.logprob_start_len >= pre_len:
                 # Optimization for prefill-only requests: When we only need logprobs at
                 # positions beyond the input sequence (to score next-token likelihood), skip all
                 # input logprob computation during prefill since no generation will occur.
