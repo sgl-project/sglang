@@ -74,7 +74,6 @@ class ModelConfig:
         self.quantization = quantization
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
-
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
