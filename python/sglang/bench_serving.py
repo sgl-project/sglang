@@ -208,6 +208,10 @@ async def async_request_openai_completions(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
+
+        if request_func_input.image_data:
+            payload.update({"image_data": request_func_input.image_data})
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
@@ -1114,7 +1118,8 @@ def sample_sharegpt_requests(
                 add_generation_prompt=True,
                 tokenize=False,
             )
-            prompt = prompt.replace(tokenizer.bos_token, "")
+            if tokenizer.bos_token:
+                prompt = prompt.replace(tokenizer.bos_token, "")
 
         prompt_token_ids = tokenizer.encode(prompt)
         completion = dataset[i][1]
@@ -1772,7 +1777,9 @@ async def benchmark(
         pbar.close()
 
     if "sglang" in backend:
-        server_info = requests.get(base_url + "/get_server_info")
+        server_info = requests.get(
+            base_url + "/get_server_info", headers=get_auth_headers()
+        )
         if server_info.status_code == 200:
             server_info_json = server_info.json()
             if "decode" in server_info_json:
