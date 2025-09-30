@@ -54,9 +54,7 @@ from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
-from sglang.srt.layers.attention.nsa.utils import NSA_KV_CACHE_STORE_FP8
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -1173,14 +1171,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
         )
 
-        if self.use_nsa and NSA_KV_CACHE_STORE_FP8:
-            # MLA + prefill is not supported yet, thus we always use MHA_CHUNKED_KV
-            self.chunked_prefix_cache_threshold = 1
-        else:
-            # TODO: Design a finer way to determine the threshold
-            self.chunked_prefix_cache_threshold = get_int_env_var(
-                "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
-            )
+        # TODO: Design a finer way to determine the threshold
+        self.chunked_prefix_cache_threshold = get_int_env_var(
+            "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
+        )
 
         # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
         # which requires self.w_kc and self.w_vc to be packed.
@@ -2245,15 +2239,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
                 self.attn_mha.layer_id
             )
-            latent_cache = latent_cache_buf[
-                forward_batch.prefix_chunk_kv_indices[i]
-            ].contiguous()
-
-            if self.use_nsa and NSA_KV_CACHE_STORE_FP8:
-                # latent_cache: (num_tokens, num_heads 1, fp8_dim 656); we unsqueeze the page_size=1 dim here
-                latent_cache = dequantize_k_cache(latent_cache.unsqueeze(1)).squeeze(1)
-            else:
-                latent_cache = latent_cache.to(q.dtype)
+            latent_cache = (
+                latent_cache_buf[forward_batch.prefix_chunk_kv_indices[i]]
+                .contiguous()
+                .to(q.dtype)
+            )
 
             kv_a_normed, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
