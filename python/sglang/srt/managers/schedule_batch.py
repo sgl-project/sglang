@@ -41,7 +41,9 @@ import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union, Literal
+import functools
+
 
 import numpy as np
 import torch
@@ -79,6 +81,77 @@ if TYPE_CHECKING:
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+class SingletonMeta(type):
+    _instances = {}
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            cls._instances[cls] = super().__call__(*args, **kwargs)
+        return cls._instances[cls]
+
+
+@dataclasses.dataclass()
+class GlobaServerlArgs(metaclass=SingletonMeta):
+    use_mla_backend:bool
+    spec_algorithm:SpeculativeAlgorithm
+    decode_attention_backend_str:str
+    prefill_attention_backend_str:str
+    # From ServerArgs
+    attention_backend: Optional[str] = None
+    mm_attention_backend: Optional[str] = None
+    debug_tensor_dump_inject: bool = False
+    debug_tensor_dump_output_folder: Optional[str] = None
+    chunked_prefill_size: Optional[int] = None
+    device: Optional[str] = None
+    disable_chunked_prefix_cache: bool = False
+    disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
+    disable_radix_cache: bool = False
+    enable_dp_lm_head: bool = False
+    flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
+    enable_flashinfer_allreduce_fusion: bool = False
+    moe_dense_tp_size: Optional[int] = None
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    ep_num_redundant_experts: int = 0
+    enable_nan_detection: bool = False
+    flashinfer_mla_disable_ragged: bool = False
+    max_micro_batch_size: Optional[int] = None
+    disable_shared_experts_fusion: bool = False
+    sampling_backend: Optional[str] = None
+    speculative_accept_threshold_single: float = 1.0
+    speculative_accept_threshold_acc: float = 1.0
+    speculative_attention_mode: str = "prefill"
+    torchao_config: str = ""
+    triton_attention_reduce_in_fp32: bool = False
+    num_reserved_decode_tokens: int = 512
+    weight_loader_disable_mmap: bool = False
+    enable_multimodal: Optional[bool] = None
+    enable_symm_mem: bool = False
+    enable_custom_logit_processor: bool = False
+    disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
+    enable_deterministic_inference: bool = False
+
+
+    @classmethod
+    def from_server_args(cls, server_args: ServerArgs,model_config:ModelConfig):
+        from sglang.srt.configs.model_config import AttentionArch # avoid circular import
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        return cls(decode_attention_backend_str = (
+            server_args.decode_attention_backend
+            if server_args.decode_attention_backend
+            else server_args.attention_backend
+        ),
+            prefill_attention_backend_str=(
+                                              server_args.prefill_attention_backend
+                                              if server_args.prefill_attention_backend
+                                              else server_args.attention_backend
+                                          ),
+            use_mla_backend=model_config.attention_arch == AttentionArch.MLA,
+            spec_algorithm=SpeculativeAlgorithm.from_string(
+                server_args.speculative_algorithm
+            ),
+            **{k:getattr(server_args,k) for k in GLOBAL_SERVER_ARGS_KEYS})
+
+
 GLOBAL_SERVER_ARGS_KEYS = [
     "attention_backend",
     "mm_attention_backend",
@@ -115,10 +188,27 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deterministic_inference",
 ]
 
+class ProxyGlobal:
+
+    def __getitem__(self, item):
+        logger.info(f"getattr(GlobaServerlArgs(), {item})")
+        return getattr(GlobaServerlArgs(), item)
+
+    def __setitem__(self, key, value):
+        logger.info(f"setattr(GlobaServerlArgs(), key {key}, value {value})")
+
+        setattr(GlobaServerlArgs(), key, value)
+
+    def get(self, item,default=None):
+        logger.info(f"getattr(GlobaServerlArgs(), {item})")
+        return getattr(GlobaServerlArgs(), item, default)
+
 # Put some global args for easy access
-global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+global_server_args_dict = ProxyGlobal()
 
 logger = logging.getLogger(__name__)
+
+
 
 
 class BaseFinishReason:
