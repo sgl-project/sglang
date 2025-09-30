@@ -1505,6 +1505,21 @@ class ServerArgs:
             "This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt",
         )
         parser.add_argument(
+            "--modelopt-checkpoint-restore-path",
+            type=str,
+            default=ServerArgs.modelopt_checkpoint_restore_path,
+            help="Path to restore a previously saved ModelOpt quantized checkpoint. "
+            "If provided, the quantization process will be skipped and the model "
+            "will be loaded from this checkpoint.",
+        )
+        parser.add_argument(
+            "--modelopt-checkpoint-save-path",
+            type=str,
+            default=ServerArgs.modelopt_checkpoint_save_path,
+            help="Path to save the ModelOpt quantized checkpoint after quantization. "
+            "This allows reusing the quantized model in future runs.",
+        )
+        parser.add_argument(
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,

@@ -1896,8 +1896,8 @@ class ModelOptModelLoader(DefaultModelLoader):
             f"Quantizing model with ModelOpt using config attribute: mtq.{quant_cfg_name}"
         )
 
-        quantized_ckpt_restore_path = None
-        quantized_ckpt_save_path = None
+        quantized_ckpt_restore_path = model_config.modelopt_checkpoint_restore_path
+        quantized_ckpt_save_path = model_config.modelopt_checkpoint_save_path
         tokenizer = AutoTokenizer.from_pretrained(
             model_config.model_path, use_fast=True
         )
