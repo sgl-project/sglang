@@ -269,7 +269,11 @@ def test_deterministic(args):
             f"Long prompt: total samples: {len(output_long_prompt)}, Unique samples: {len(set(output_long_prompt))}"
         )
 
-        return [len(set(output_prompt_1)), len(set(output_prompt_2)), len(set(output_long_prompt))]
+        return [
+            len(set(output_prompt_1)),
+            len(set(output_prompt_2)),
+            len(set(output_long_prompt)),
+        ]
 
     elif args.test_mode == "prefix":
         # In prefix mode, we create prompts from the same long prompt, with different lengths of common prefix.

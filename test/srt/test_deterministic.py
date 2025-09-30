@@ -8,18 +8,17 @@ test into unit tests so that's easily reproducible in CI.
 """
 
 import unittest
-
 from types import SimpleNamespace
 
-
 from sglang.srt.utils import kill_process_tree
+from sglang.test.test_deterministic import BenchArgs, test_deterministic
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.test_deterministic import test_deterministic, BenchArgs
+
 
 class TestDeterministicFlashinfer(CustomTestCase):
     @classmethod
@@ -33,7 +32,7 @@ class TestDeterministicFlashinfer(CustomTestCase):
             device="auto",
             other_args=[
                 "--enable-deterministic",
-                "--disable-radix-cache", # this should be by default now but still set it for safety
+                "--disable-radix-cache",  # this should be by default now but still set it for safety
                 "--attention-backend",
                 "flashinfer",
             ],
@@ -42,7 +41,7 @@ class TestDeterministicFlashinfer(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-    
+
     def _extract_host_and_port(self, url):
         return url.split("://")[-1].split(":")[0], int(url.split(":")[-1])
 
@@ -75,6 +74,7 @@ class TestDeterministicFlashinfer(CustomTestCase):
         args.n_trials = 10
         results = test_deterministic(args)
         assert all(lambda x: x == 1, results)
+
 
 if __name__ == "__main__":
     unittest.main()
