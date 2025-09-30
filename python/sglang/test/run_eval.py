@@ -111,6 +111,8 @@ def run_eval(args):
         print(f"Scores: {scores_repeat}")
         print("=" * 20)
 
+        executor.shutdown()
+
     # Dump reports
     metrics = result.metrics | {"score": result.score}
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
