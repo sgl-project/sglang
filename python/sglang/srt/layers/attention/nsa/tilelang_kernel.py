@@ -767,6 +767,7 @@ def tilelang_sparse_fwd(
     tail_dim = dim - d_v
     topk = indices.shape[-1]
     assert topk == 2048
+    # NOTE(dark): v2 offers better performance than v1
     kernel = sparse_attention_fwd_kernel_v2(
         num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
     )
