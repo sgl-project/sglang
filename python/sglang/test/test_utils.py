@@ -947,8 +947,10 @@ def run_bench_one_batch(model, other_args):
         # Return prefill_latency, decode_throughput, decode_latency
         output_lines = output.split("\n")
         if len(output_lines) < 9:
-            raise RuntimeError(f"Benchmark output too short (expected at least 9 lines, got {len(output_lines)}). Output: {output}")
-        
+            raise RuntimeError(
+                f"Benchmark output too short (expected at least 9 lines, got {len(output_lines)}). Output: {output}"
+            )
+
         prefill_line = output_lines[-9]
         decode_line = output_lines[-3]
         pattern = (
@@ -958,14 +960,18 @@ def run_bench_one_batch(model, other_args):
         if match:
             prefill_latency = float(match.group("latency"))
         else:
-            raise RuntimeError(f"Could not parse prefill latency from line: {prefill_line}")
-            
+            raise RuntimeError(
+                f"Could not parse prefill latency from line: {prefill_line}"
+            )
+
         match = re.search(pattern, decode_line)
         if match:
             decode_latency = float(match.group("latency"))
             decode_throughput = float(match.group("throughput"))
         else:
-            raise RuntimeError(f"Could not parse decode latency/throughput from line: {decode_line}")
+            raise RuntimeError(
+                f"Could not parse decode latency/throughput from line: {decode_line}"
+            )
     finally:
         kill_process_tree(process.pid)
 
