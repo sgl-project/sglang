@@ -4,16 +4,17 @@ import json
 import os
 import time
 from typing import Any, Tuple
-from tqdm import tqdm
 
 import numpy as np
 import openai
 import pandas as pd
+from tqdm import tqdm
 from tqdm.asyncio import tqdm_asyncio
 
 from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 choices = ["A", "B", "C", "D"]
+
 
 def format_subject(subject):
     l = subject.split("_")
@@ -32,6 +33,7 @@ def format_example(df, idx, include_answer=True):
     if include_answer:
         prompt += " {}\n\n".format(df.iloc[idx, k + 1])
     return prompt
+
 
 def gen_few_shot_messages(train_df, subject, k=-1):
     if k == -1:
@@ -52,11 +54,9 @@ def gen_few_shot_messages(train_df, subject, k=-1):
 
     return messages
 
+
 async def process_sample(
-    client: Any, 
-    question: str, 
-    few_shot_examples: list, 
-    model: str
+    client: Any, question: str, few_shot_examples: list, model: str
 ) -> Tuple[str, int, int]:
     messages = few_shot_examples + [{"role": "user", "content": question}]
 
@@ -69,8 +69,9 @@ async def process_sample(
     return (
         response.choices[0].message.content,
         response.usage.prompt_tokens,
-        response.usage.completion_tokens
+        response.usage.completion_tokens,
     )
+
 
 async def process_sample_with_semaphore(
     semaphore: asyncio.Semaphore,
@@ -82,6 +83,7 @@ async def process_sample_with_semaphore(
     async with semaphore:
         return await process_sample(client, few_shot_examples, question, model)
 
+
 def gen_prompt(train_df, subject, k=-1):
     prompt = "The following are multiple choice questions (with answers) about{}.\n\n".format(
         format_subject(subject)
@@ -92,7 +94,8 @@ def gen_prompt(train_df, subject, k=-1):
         prompt += format_example(train_df, i)
     return prompt
 
-async def eval_mmlu(args) -> None: 
+
+async def eval_mmlu(args) -> None:
     subjects = sorted(
         [
             f.split("_test.csv")[0]
@@ -132,14 +135,12 @@ async def eval_mmlu(args) -> None:
     else:
         host = args.host.replace("http://", "").replace("https://", "")
         client = openai.AsyncOpenAI(
-            api_key="sk",
-            base_url=f"http://{host}:{args.port}/v1",
-            timeout=20 * 60 * 60
+            api_key="sk", base_url=f"http://{host}:{args.port}/v1", timeout=20 * 60 * 60
         )
         model = "default"
 
     start = time.perf_counter()
-    
+
     if args.parallel == 1:
         responses = []
         prompt_tokens = []
@@ -149,7 +150,7 @@ async def eval_mmlu(args) -> None:
             responses.append(response)
             prompt_tokens.append(pt)
             completion_tokens.append(ct)
-    else: 
+    else:
         semaphore = asyncio.Semaphore(args.parallel)
         tasks = [
             process_sample_with_semaphore(semaphore, client, fs, q, model)
@@ -165,7 +166,8 @@ async def eval_mmlu(args) -> None:
     latency = time.perf_counter() - start
 
     preds = [
-        response.strip()[0] if len(response.strip()) > 0 else "" for response in responses
+        response.strip()[0] if len(response.strip()) > 0 else ""
+        for response in responses
     ]
 
     cors = [pred == label for pred, label in zip(preds, labels)]
@@ -198,7 +200,8 @@ async def eval_mmlu(args) -> None:
             },
         }
         fout.write(json.dumps(value) + "\n")
-        
+
+
 def main(args):
     asyncio.run(eval_mmlu(args))
 

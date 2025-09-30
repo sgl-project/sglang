@@ -1,11 +1,11 @@
 import argparse
-import asyncio
 import ast
+import asyncio
 import json
 import os
 import re
 import time
-from typing import Any, List, Tuple
+from typing import Any, Tuple
 
 import numpy as np
 import openai
@@ -15,6 +15,7 @@ from sglang.test.test_utils import add_common_sglang_args_and_parse
 from sglang.utils import download_and_cache_file, read_jsonl
 
 INVALID = -9999999
+
 
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
@@ -26,6 +27,7 @@ def get_answer_value(answer_str):
     except SyntaxError:
         return INVALID
 
+
 def format_few_shot_examples(lines, k):
     messages = []
     for i in range(k):
@@ -33,7 +35,8 @@ def format_few_shot_examples(lines, k):
         answer = lines[i]["answer"]
         messages.append({"role": "user", "content": question})
         messages.append({"role": "assistant", "content": answer})
-    return messages 
+    return messages
+
 
 async def process_sample(
     client: Any, question: str, few_shot_examples: list, model: str
@@ -44,13 +47,14 @@ async def process_sample(
         messages=messages,
         temperature=0,
         max_tokens=512,
-        stop=["Question:", "\n\nQuestion"]
+        stop=["Question:", "\n\nQuestion"],
     )
     return (
         response.choices[0].message.content,
         response.usage.prompt_tokens,
-        response.usage.completion_tokens
+        response.usage.completion_tokens,
     )
+
 
 async def process_sample_with_semaphore(
     semaphore: asyncio.Semaphore,
@@ -62,6 +66,7 @@ async def process_sample_with_semaphore(
     async with semaphore:
         return await process_sample(client, question, few_shot_examples, model)
 
+
 async def eval_gsm8k(args) -> None:
     data_path = args.data_path
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
@@ -72,7 +77,7 @@ async def eval_gsm8k(args) -> None:
     few_shot_examples = format_few_shot_examples(lines, args.num_shots)
     questions = []
     labels = []
-    
+
     for i in range(args.num_questions):
         question = "Question: " + lines[i]["question"] + "\nAnswer:"
         label = get_answer_value(lines[i]["answer"])
@@ -86,9 +91,7 @@ async def eval_gsm8k(args) -> None:
     else:
         host = args.host.replace("http://", "").replace("https://", "")
         client = openai.AsyncOpenAI(
-            api_key="sk",
-            base_url=f"http://{host}:{args.port}/v1",
-            timeout=20 * 60 * 60
+            api_key="sk", base_url=f"http://{host}:{args.port}/v1", timeout=20 * 60 * 60
         )
         model = "default"
 
@@ -114,6 +117,7 @@ async def eval_gsm8k(args) -> None:
             for question in questions
         ]
         from tqdm.asyncio import tqdm_asyncio
+
         results = await tqdm_asyncio.gather(*tasks, desc="Processing")
         responses = [r[0] for r in results]
         prompt_tokens = [r[1] for r in results]
@@ -126,7 +130,7 @@ async def eval_gsm8k(args) -> None:
     invalid = np.mean(np.array(preds) == INVALID)
     num_output_tokens = sum(completion_tokens)
     output_throughput = num_output_tokens / latency
-        
+
     # Print results
     print(f"Accuracy: {acc:.3f}")
     print(f"Invalid: {invalid:.3f}")
@@ -148,6 +152,7 @@ async def eval_gsm8k(args) -> None:
             },
         }
         fout.write(json.dumps(value) + "\n")
+
 
 def main(args):
     asyncio.run(eval_gsm8k(args))
