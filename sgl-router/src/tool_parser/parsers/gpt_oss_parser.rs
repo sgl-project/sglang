@@ -7,7 +7,7 @@ use crate::tool_parser::{
     partial_json::PartialJson,
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamResult, StreamingParseResult, ToolCall},
 };
 
 /// GPT-OSS format parser for tool calls
@@ -126,6 +126,22 @@ impl ToolParser for GptOssParser {
         &self,
         chunk: &str,
         state: &mut ParseState,
+    ) -> ToolParserResult<StreamingParseResult> {
+        // Call the existing implementation and convert result
+        let result = self.parse_incremental_legacy(chunk, state).await?;
+        Ok(super::helpers::convert_stream_result(result))
+    }
+
+    fn detect_format(&self, text: &str) -> bool {
+        self.has_tool_markers(text)
+    }
+}
+
+impl GptOssParser {
+    async fn parse_incremental_legacy(
+        &self,
+        chunk: &str,
+        state: &mut ParseState,
     ) -> ToolParserResult<StreamResult> {
         state.buffer.push_str(chunk);
 
@@ -221,9 +237,5 @@ impl ToolParser for GptOssParser {
         }
 
         Ok(StreamResult::Incomplete)
-    }
-
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text) || text.contains("<|channel|>commentary")
     }
 }

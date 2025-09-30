@@ -6,7 +6,7 @@ use crate::tool_parser::{
     partial_json::PartialJson,
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamResult, StreamingParseResult, ToolCall},
 };
 
 /// Kimi K2 format parser for tool calls
@@ -143,6 +143,22 @@ impl ToolParser for KimiK2Parser {
         &self,
         chunk: &str,
         state: &mut ParseState,
+    ) -> ToolParserResult<StreamingParseResult> {
+        // Call the existing implementation and convert result
+        let result = self.parse_incremental_legacy(chunk, state).await?;
+        Ok(super::helpers::convert_stream_result(result))
+    }
+
+    fn detect_format(&self, text: &str) -> bool {
+        self.has_tool_markers(text)
+    }
+}
+
+impl KimiK2Parser {
+    async fn parse_incremental_legacy(
+        &self,
+        chunk: &str,
+        state: &mut ParseState,
     ) -> ToolParserResult<StreamResult> {
         state.buffer.push_str(chunk);
 
@@ -241,9 +257,5 @@ impl ToolParser for KimiK2Parser {
         }
 
         Ok(StreamResult::Incomplete)
-    }
-
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text) || text.contains("<|tool_call_begin|>")
     }
 }

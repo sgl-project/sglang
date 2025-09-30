@@ -1742,7 +1742,7 @@ pub struct StreamOptions {
 }
 
 /// Tool choice value for simple string options
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoiceValue {
     Auto,
@@ -1751,7 +1751,7 @@ pub enum ToolChoiceValue {
 }
 
 /// Tool choice for both Chat Completion and Responses APIs
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum ToolChoice {
     Value(ToolChoiceValue),
@@ -1775,13 +1775,13 @@ impl Default for ToolChoice {
 }
 
 /// Function choice specification for ToolChoice::Function
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct FunctionChoice {
     pub name: String,
 }
 
 /// Tool reference for ToolChoice::AllowedTools
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ToolReference {
     #[serde(rename = "type")]
     pub tool_type: String, // "function"

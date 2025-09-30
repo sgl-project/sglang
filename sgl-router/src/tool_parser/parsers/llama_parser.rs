@@ -7,7 +7,7 @@ use crate::tool_parser::{
     partial_json::PartialJson,
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamResult, StreamingParseResult, ToolCall},
 };
 
 /// Llama 3.2 format parser for tool calls
@@ -188,6 +188,22 @@ impl ToolParser for LlamaParser {
         &self,
         chunk: &str,
         state: &mut ParseState,
+    ) -> ToolParserResult<StreamingParseResult> {
+        // Call the existing implementation and convert result
+        let result = self.parse_incremental_legacy(chunk, state).await?;
+        Ok(super::helpers::convert_stream_result(result))
+    }
+
+    fn detect_format(&self, text: &str) -> bool {
+        self.has_python_tag(text) || text.contains('{')
+    }
+}
+
+impl LlamaParser {
+    async fn parse_incremental_legacy(
+        &self,
+        chunk: &str,
+        state: &mut ParseState,
     ) -> ToolParserResult<StreamResult> {
         state.buffer.push_str(chunk);
 
@@ -316,11 +332,5 @@ impl ToolParser for LlamaParser {
         }
 
         Ok(StreamResult::Incomplete)
-    }
-
-    fn detect_format(&self, text: &str) -> bool {
-        // Llama format if contains python_tag or starts with JSON object
-        text.contains("<|python_tag|>")
-            || (text.trim_start().starts_with('{') && text.contains(r#""name""#))
     }
 }

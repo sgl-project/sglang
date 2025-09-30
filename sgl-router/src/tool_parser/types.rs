@@ -21,7 +21,7 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-/// Streaming parse result
+/// Streaming parse result (legacy enum for backwards compatibility)
 #[derive(Debug, Clone)]
 pub enum StreamResult {
     /// Need more data to continue parsing
@@ -34,6 +34,67 @@ pub enum StreamResult {
     ToolComplete(ToolCall),
     /// Normal text (not part of tool call)
     NormalText(String),
+}
+
+/// Streaming parse result following vLLM/Python pattern
+/// Can return both normal text AND tool calls in the same response
+#[derive(Debug, Clone)]
+pub struct StreamingParseResult {
+    /// Normal text content (equivalent to Python's normal_text field)
+    pub normal_text: String,
+    /// Tool calls found during parsing (equivalent to Python's calls field)
+    pub tool_calls: Vec<ToolCallItem>,
+}
+
+impl StreamingParseResult {
+    /// Create a new empty result
+    pub fn new() -> Self {
+        Self {
+            normal_text: String::new(),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Create result with only normal text
+    pub fn with_normal_text(text: String) -> Self {
+        Self {
+            normal_text: text,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Create result with only tool calls
+    pub fn with_tool_calls(calls: Vec<ToolCallItem>) -> Self {
+        Self {
+            normal_text: String::new(),
+            tool_calls: calls,
+        }
+    }
+
+    /// Create result with both normal text and tool calls
+    pub fn with_both(text: String, calls: Vec<ToolCallItem>) -> Self {
+        Self {
+            normal_text: text,
+            tool_calls: calls,
+        }
+    }
+}
+
+impl Default for StreamingParseResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Tool call item for streaming (matching Python's ToolCallItem)
+#[derive(Debug, Clone)]
+pub struct ToolCallItem {
+    /// Tool index for this call
+    pub tool_index: usize,
+    /// Function name (None for argument-only updates)
+    pub name: Option<String>,
+    /// Function arguments as JSON string
+    pub parameters: String,
 }
 
 /// Token configuration for parsing

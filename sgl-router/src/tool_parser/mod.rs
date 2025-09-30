@@ -20,7 +20,7 @@ pub use errors::{ToolParserError, ToolParserResult};
 pub use registry::ParserRegistry;
 pub use state::{ParsePhase, ParseState};
 pub use traits::{PartialJsonParser, ToolParser};
-pub use types::{FunctionCall, PartialToolCall, StreamResult, ToolCall};
+pub use types::{FunctionCall, PartialToolCall, StreamResult, StreamingParseResult, ToolCall, ToolCallItem};
 
 // Re-export parsers for convenience
 pub use parsers::{

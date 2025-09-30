@@ -36,6 +36,22 @@ pub struct ParseState {
     pub tool_index: usize,
     /// Optional Harmony-specific streaming state (populated by token-aware parsers)
     pub harmony_stream: Option<HarmonyStreamState>,
+
+    // vLLM-style stateful streaming tracking (following Python detectors pattern)
+    /// Index of currently streaming tool call (-1 means no active tool)
+    /// Tracks which tool's arguments are currently being streamed
+    pub current_tool_id: i32,
+    /// Flag for whether current tool's name has been sent to client
+    /// Tool names are sent first with empty parameters, then arguments stream incrementally
+    pub current_tool_name_sent: bool,
+    /// Tracks raw JSON string content streamed to client for each tool's arguments
+    /// Critical for calculating remaining content when streaming ends
+    /// Each index corresponds to a tool_id (e.g., ['{"location": "San Francisco"', '{"temp": 72'])
+    pub streamed_args_for_tool: Vec<String>,
+    /// Stores complete tool call info (name and arguments) for each tool being parsed
+    /// Used for calculating incremental diffs between parsing calls
+    /// Format: [{"name": str, "arguments": dict}, ...]
+    pub prev_tool_call_arr: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl ParseState {
@@ -52,6 +68,10 @@ impl ParseState {
             escape_next: false,
             tool_index: 0,
             harmony_stream: None,
+            current_tool_id: -1,
+            current_tool_name_sent: false,
+            streamed_args_for_tool: Vec::new(),
+            prev_tool_call_arr: Vec::new(),
         }
     }
 
@@ -63,6 +83,10 @@ impl ParseState {
         self.in_string = false;
         self.escape_next = false;
         self.harmony_stream = None;
+        self.current_tool_id = -1;
+        self.current_tool_name_sent = false;
+        self.streamed_args_for_tool.clear();
+        self.prev_tool_call_arr.clear();
     }
 
     /// Process a single character for JSON parsing

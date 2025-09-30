@@ -19,7 +19,7 @@ use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamResult, StreamingParseResult, ToolCall},
 };
 
 static PYTHONIC_BLOCK_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -108,6 +108,27 @@ impl ToolParser for PythonicParser {
         &self,
         chunk: &str,
         state: &mut ParseState,
+    ) -> ToolParserResult<StreamingParseResult> {
+        // Call the existing implementation and convert result
+        let result = self.parse_incremental_legacy(chunk, state).await?;
+        Ok(super::helpers::convert_stream_result(result))
+    }
+
+    fn detect_format(&self, text: &str) -> bool {
+        let cleaned = Self::strip_special_tokens(text);
+        if pythonic_block_regex().is_match(&cleaned) {
+            return true;
+        }
+
+        false
+    }
+}
+
+impl PythonicParser {
+    async fn parse_incremental_legacy(
+        &self,
+        chunk: &str,
+        state: &mut ParseState,
     ) -> ToolParserResult<StreamResult> {
         state.buffer.push_str(chunk);
 
@@ -124,14 +145,6 @@ impl ToolParser for PythonicParser {
         Ok(StreamResult::Incomplete)
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        let cleaned = Self::strip_special_tokens(text);
-        if pythonic_block_regex().is_match(&cleaned) {
-            return true;
-        }
-
-        false
-    }
 }
 
 fn parse_python_expression(source: &str) -> ToolParserResult<Expr> {
