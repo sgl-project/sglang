@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.distributed import divide
 from sglang.srt.hf_transformers_utils import AutoConfig
+from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -17,7 +18,6 @@ from sglang.srt.lora.utils import (
     get_stacked_multiply,
     get_target_module_name,
 )
-from sglang.srt.lora.eviction_policy import get_eviction_policy
 
 logger = logging.getLogger(__name__)
 
@@ -200,23 +200,20 @@ class LoRAMemoryPool:
                     return buffer_id
 
             # 2. Memory pool is full, need to evict using policy
-            # Collect eviction candidates (not in current batch)
+            # Collect eviction candidates (not in current batch and not pinned)
             candidates = set()
-            pinned_uids = set()
-            
+
             for buffer_id in range(self.max_loras_per_batch):
                 uid = self.buffer_id_to_uid[buffer_id]
                 if uid not in cur_uids and uid is not None:
-                    candidates.add(uid)
                     lora_ref = lora_refs.get(uid)
-                    if lora_ref is not None and lora_ref.pinned:
-                        pinned_uids.add(uid)
+                    # Only add to candidates if not pinned
+                    if lora_ref is None or not lora_ref.pinned:
+                        candidates.add(uid)
 
             # Use eviction policy to select victim
-            victim_uid = self.eviction_policy.select_victim(
-                candidates, pinned_uids, lora_refs
-            )
-            
+            victim_uid = self.eviction_policy.select_victim(candidates)
+
             if victim_uid is None:
                 raise ValueError(
                     "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."
@@ -227,7 +224,9 @@ class LoRAMemoryPool:
             self.uid_to_buffer_id.pop(victim_uid)
             self.eviction_policy.remove(victim_uid)
             self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
-            logger.debug(f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}.")
+            logger.debug(
+                f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}."
+            )
             return victim_buffer_id
 
         # Mark all adapters in current batch as used (for LRU tracking)
