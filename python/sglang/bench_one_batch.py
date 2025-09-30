@@ -163,9 +163,9 @@ class BenchArgs:
             '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
         )
         parser.add_argument(
-            "--cuda-profiler", 
-            action="store_true", 
-            help="Use CUDA Profiler API for nsys profiling."
+            "--cuda-profiler",
+            action="store_true",
+            help="Use CUDA Profiler API for nsys profiling.",
         )
 
         parser.add_argument(
@@ -173,7 +173,7 @@ class BenchArgs:
             type=str,
             default=BenchArgs.cuda_profiler_stage,
             choices=["all", "prefill", "decode"],
-            help="Which stage to profile with CUDA profiler: all, prefill, or decode only."
+            help="Which stage to profile with CUDA profiler: all, prefill, or decode only.",
         )
 
     @classmethod
@@ -361,7 +361,9 @@ def _get_torch_profiler_output_dir():
     return os.environ.get("SGLANG_TORCH_PROFILER_DIR", ".")
 
 
-def _create_torch_profiler_filename(profile_filename_prefix, batch_size, input_len, output_len, stage):
+def _create_torch_profiler_filename(
+    profile_filename_prefix, batch_size, input_len, output_len, stage
+):
     """Create a torch profiler filename with proper directory handling."""
     output_dir = _get_torch_profiler_output_dir()
     filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_{stage}.trace.json.gz"
@@ -484,16 +486,18 @@ def latency_test_run_once(
     # Prefill
     if cuda_profiler:
         start_cuda_profiler(rank_print)
-        
+
     synchronize(device)
     tic = time.perf_counter()
     next_token_ids, _, batch = extend(reqs, model_runner)
     synchronize(device)
     prefill_latency = time.perf_counter() - tic
-    
+
     if cuda_profiler:
         stop_cuda_profiler(rank_print)
-        rank_print(f"CUDA profiler trace for prefill completed (batch={batch_size}, input={input_len}, output={output_len})")
+        rank_print(
+            f"CUDA profiler trace for prefill completed (batch={batch_size}, input={input_len}, output={output_len})"
+        )
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
     rank_print(
@@ -504,7 +508,9 @@ def latency_test_run_once(
 
     if profile:
         profiler.stop()
-        trace_filename = _create_torch_profiler_filename(profile_filename_prefix, batch_size, input_len, output_len, "prefill")
+        trace_filename = _create_torch_profiler_filename(
+            profile_filename_prefix, batch_size, input_len, output_len, "prefill"
+        )
         _save_profile_trace_results(profiler, trace_filename)
         rank_print(f"torch profiler chrome trace for prefill saved to {trace_filename}")
 
@@ -531,11 +537,13 @@ def latency_test_run_once(
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
         synchronize(device)
         latency = time.perf_counter() - tic
-        
+
         if cuda_profiler and i == output_len // 2:
             stop_cuda_profiler(rank_print)
-            rank_print(f"CUDA profiler trace for decode completed (batch={batch_size}, input={input_len}, output={output_len})")
-        
+            rank_print(
+                f"CUDA profiler trace for decode completed (batch={batch_size}, input={input_len}, output={output_len})"
+            )
+
         tot_latency += latency
         throughput = batch_size / latency
         decode_latencies.append(latency)
@@ -546,7 +554,9 @@ def latency_test_run_once(
 
         if profile and i == output_len // 2:
             profiler.stop()
-            trace_filename = _create_torch_profiler_filename(profile_filename_prefix, batch_size, input_len, output_len, "decode")
+            trace_filename = _create_torch_profiler_filename(
+                profile_filename_prefix, batch_size, input_len, output_len, "decode"
+            )
             _save_profile_trace_results(profiler, trace_filename)
             rank_print(
                 f"torch profiler chrome trace for decoding 1 token saved to {trace_filename}"
