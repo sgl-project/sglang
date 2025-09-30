@@ -127,6 +127,16 @@ impl SglangSchedulerClient {
         let sampling_params =
             Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
 
+        // logprob_start_len: position to start returning logprobs
+        // -1 = return all logprobs (both input and output)
+        // 0 = return from beginning
+        // N = skip first N tokens
+        let logprob_start = if body.return_logprob {
+            body.logprob_start_len.unwrap_or(0)
+        } else {
+            0
+        };
+
         let grpc_request = proto::GenerateRequest {
             request_id,
             tokenized: Some(proto::TokenizedInput {
@@ -135,8 +145,8 @@ impl SglangSchedulerClient {
             }),
             sampling_params: Some(sampling_params),
             return_logprob: body.return_logprob,
-            logprob_start_len: -1,
-            top_logprobs_num: 0,
+            logprob_start_len: logprob_start,
+            top_logprobs_num: 0, // We don't support top_logprobs in plain generate
             token_ids_logprob: vec![],
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,

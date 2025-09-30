@@ -39,7 +39,8 @@ fn default_generate_request() -> GenerateRequest {
         parameters: None,
         sampling_params: None,
         return_logprob: false,
-        // SGLang Extensions
+        logprob_start_len: None,
+        return_text_in_logprobs: false,
         lora_path: None,
         session_params: None,
         return_hidden_states: false,
