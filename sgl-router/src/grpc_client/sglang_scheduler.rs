@@ -128,11 +128,10 @@ impl SglangSchedulerClient {
             Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
 
         // logprob_start_len: position to start returning logprobs
-        // -1 = return all logprobs (both input and output)
-        // 0 = return from beginning
-        // N = skip first N tokens
+        // -1 = return all logprobs (both input and output) - same as chat
+        // Use -1 to match chat completion behavior which works correctly
         let logprob_start = if body.return_logprob {
-            body.logprob_start_len.unwrap_or(0)
+            body.logprob_start_len.unwrap_or(-1)
         } else {
             0
         };
