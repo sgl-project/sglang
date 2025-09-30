@@ -1974,19 +1974,23 @@ class Scheduler(
             TEST_RETRACT and batch.batch_size() > 10
         ):
             old_ratio = self.new_token_ratio
-
-            retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
-            num_retracted_reqs = len(retracted_reqs)
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                self.server_args
+            )
+            self.num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
+            for req in reqs_to_abort:
+                self.send_to_tokenizer.send_pyobj(
+                    AbortReq(req.rid, abort_reason=req.to_abort_message)
+                )
 
             logger.info(
                 "KV cache pool is full. Retract requests. "
-                f"#retracted_reqs: {num_retracted_reqs}, "
-                f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
+                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#aborted_retracted_reqs: {len(reqs_to_abort)}, "
+                f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
             )
-
             self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
-            self.total_retracted_reqs += num_retracted_reqs
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,

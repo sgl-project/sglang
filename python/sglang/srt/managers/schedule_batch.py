@@ -669,7 +669,7 @@ class Req:
             return
         assert stage.name in RequestStage.__members__, f"{stage=} is invalid"
         now = time.monotonic()
-        self.metrics_collector.observe_request_latency_seconds(
+        self.metrics_collector.observe_per_stage_req_latency(
             stage.value, now - self.last_tic
         )
         self.last_tic = now
@@ -1543,7 +1543,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ) / total_max_new_tokens
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio
+        return retracted_reqs, new_estimate_ratio, []
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
