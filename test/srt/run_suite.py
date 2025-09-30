@@ -125,7 +125,7 @@ suites = {
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vlm_input_format.py", 300),
-        TestFile("test_vision_openai_server_a.py", 655),
+        TestFile("test_vision_openai_server_a.py", 608),
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 85),
         TestFile("layers/attention/mamba/test_mamba_ssm.py", 85),
         TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 220),
