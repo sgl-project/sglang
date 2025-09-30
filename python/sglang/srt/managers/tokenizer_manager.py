@@ -62,10 +62,12 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    FirstTokenTimeUpdate,
     FreezeGCReq,
     GenerateReqInput,
     GetLoadReqInput,
     HealthCheckOutput,
+    Metrics,
     MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
@@ -348,6 +350,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     self._handle_batch_output,
                 ),
                 (AbortReq, self._handle_abort_req),
+                (FirstTokenTimeUpdate, self._handle_first_token_time_update),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -356,7 +359,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (
                     FreezeGCReq,
                     lambda x: None,
-                ),  # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
+                    # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
+                ),
                 (HealthCheckOutput, lambda x: None),
             ]
         )
@@ -1490,6 +1494,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 if self.server_args.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
+            # Add metrics field for timing information
+            metrics = Metrics(
+                arrival_time=state.created_time,
+                first_token_time=(
+                    state.first_token_time
+                    if state.first_token_time > 0.0
+                    else (state.finished_time if state.finished else time.time())
+                ),
+                finished_time=state.finished_time if state.finished else time.time(),
+            )
+            out_dict["metrics"] = metrics.to_dict()
+
             state.out_list.append(out_dict)
             state.event.set()
 
@@ -1757,6 +1773,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.session_futures[recv_obj.session_id].set_result(
             recv_obj.session_id if recv_obj.success else None
         )
+
+    def _handle_first_token_time_update(self, recv_obj: FirstTokenTimeUpdate):
+        """Handle first token time update from scheduler."""
+        if recv_obj.rid in self.rid_to_state:
+            state = self.rid_to_state[recv_obj.rid]
+            if state.first_token_time == 0.0:  # Only update if not already set
+                state.first_token_time = recv_obj.first_token_time
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.server_args.dp_size == 1:
