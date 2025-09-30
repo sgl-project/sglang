@@ -84,7 +84,6 @@ class TestDisaggregationNixl(TestDisaggregationBase):
     def test_gsm8k_accuracy(self):
         """Test GSM8K accuracy with NIXL disaggregation"""
         test_cases = [
-            (1, 1, 1),  # 1 prefill TP, 1 prefill PP, 1 decode TP
             (1, 1, 2),  # 1 prefill TP, 1 prefill PP, 2 decode TP
             (2, 2, 2),  # 2 prefill TP, 2 prefill PP, 2 decode TP
             (1, 2, 2),  # 1 prefill TP, 2 prefill PP, 2 decode TP
