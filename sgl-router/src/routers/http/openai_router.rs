@@ -449,6 +449,32 @@ impl OpenAIRouter {
                                     .await
                                 {
                                     Ok(mut resumed_json) => {
+                                        // Inject MCP output items (mcp_list_tools and mcp_call)
+                                        let server_label = original_body
+                                            .tools
+                                            .iter()
+                                            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                                            .and_then(|t| t.server_label.as_deref())
+                                            .unwrap_or("mcp");
+
+                                        if let Err(inject_err) = Self::inject_mcp_output_items(
+                                            &mut resumed_json,
+                                            mcp,
+                                            McpOutputItemsArgs {
+                                                tool_name: &tool_name,
+                                                args_json: &args_json_str,
+                                                output: &output_payload,
+                                                server_label,
+                                                success: call_ok,
+                                                error: call_error.as_deref(),
+                                            },
+                                        ) {
+                                            warn!(
+                                                "Failed to inject MCP output items: {}",
+                                                inject_err
+                                            );
+                                        }
+
                                         if !call_ok {
                                             if let Some(obj) = resumed_json.as_object_mut() {
                                                 let metadata_value =
@@ -1025,6 +1051,15 @@ struct ResumeWithToolArgs<'a> {
     original_body: &'a ResponsesRequest,
 }
 
+struct McpOutputItemsArgs<'a> {
+    tool_name: &'a str,
+    args_json: &'a str,
+    output: &'a str,
+    server_label: &'a str,
+    success: bool,
+    error: Option<&'a str>,
+}
+
 impl OpenAIRouter {
     fn extract_function_call(resp: &Value) -> Option<(String, String, String)> {
         let output = resp.get("output")?.as_array()?;
@@ -1113,6 +1148,117 @@ impl OpenAIRouter {
         let output_str = serde_json::to_string(&result)
             .map_err(|e| format!("Failed to serialize tool result: {}", e))?;
         Ok((server_name, output_str))
+    }
+
+    /// Generate a unique ID for MCP output items (similar to OpenAI format)
+    fn generate_mcp_id(prefix: &str) -> String {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..30).map(|_| rng.random()).collect();
+        let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        format!("{}_{}", prefix, hex_string)
+    }
+
+    /// Build an mcp_list_tools output item
+    fn build_mcp_list_tools_item(
+        mcp: &Arc<crate::mcp::McpClientManager>,
+        server_label: &str,
+    ) -> Value {
+        let tools = mcp.list_tools();
+        let tools_json: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters.clone().unwrap_or_else(|| json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    })),
+                    "annotations": {
+                        "read_only": false
+                    }
+                })
+            })
+            .collect();
+
+        json!({
+            "id": Self::generate_mcp_id("mcpl"),
+            "type": "mcp_list_tools",
+            "server_label": server_label,
+            "tools": tools_json
+        })
+    }
+
+    /// Build an mcp_call output item
+    fn build_mcp_call_item(
+        tool_name: &str,
+        arguments: &str,
+        output: &str,
+        server_label: &str,
+        success: bool,
+        error: Option<&str>,
+    ) -> Value {
+        json!({
+            "id": Self::generate_mcp_id("mcp"),
+            "type": "mcp_call",
+            "status": if success { "completed" } else { "failed" },
+            "approval_request_id": Value::Null,
+            "arguments": arguments,
+            "error": error,
+            "name": tool_name,
+            "output": output,
+            "server_label": server_label
+        })
+    }
+
+    /// Inject mcp_list_tools and mcp_call items into the response output array
+    fn inject_mcp_output_items(
+        response_json: &mut Value,
+        mcp: &Arc<crate::mcp::McpClientManager>,
+        args: McpOutputItemsArgs,
+    ) -> Result<(), String> {
+        let output_array = response_json
+            .get_mut("output")
+            .and_then(|v| v.as_array_mut())
+            .ok_or("missing output array")?;
+
+        // Build MCP output items
+        let list_tools_item = Self::build_mcp_list_tools_item(mcp, args.server_label);
+        let call_item = Self::build_mcp_call_item(
+            args.tool_name,
+            args.args_json,
+            args.output,
+            args.server_label,
+            args.success,
+            args.error,
+        );
+
+        // Insert mcp_list_tools at the beginning
+        let mut new_output = vec![list_tools_item];
+
+        // Add existing items, inserting mcp_call before the final message
+        let mut found_final_message = false;
+        for item in output_array.iter() {
+            let item_type = item.get("type").and_then(|v| v.as_str());
+
+            // Insert mcp_call right before the final message
+            if item_type == Some("message") && !found_final_message {
+                new_output.push(call_item.clone());
+                found_final_message = true;
+            }
+
+            new_output.push(item.clone());
+        }
+
+        // If no message found, append mcp_call at the end
+        if !found_final_message {
+            new_output.push(call_item);
+        }
+
+        *output_array = new_output;
+        Ok(())
     }
 
     async fn resume_with_tool_result(&self, args: ResumeWithToolArgs<'_>) -> Result<Value, String> {
