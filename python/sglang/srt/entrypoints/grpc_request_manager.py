@@ -86,6 +86,7 @@ class GrpcReqState:
 
     # Streaming state
     stream_finished: bool = False
+    input_logprobs_sent: bool = False  # Track if input logprobs were sent in streaming
 
     # Token accumulation (for non-streaming)
     output_ids: List[int] = dataclasses.field(default_factory=list)
@@ -119,16 +120,16 @@ class GrpcRequestManager:
         self.port_args = port_args
 
         # ZMQ Communication Setup (same pattern as TokenizerManager)
-        context = zmq.asyncio.Context(2)
+        self.context = zmq.asyncio.Context(2)
 
         # Socket for receiving outputs from scheduler
         self.recv_from_scheduler = get_zmq_socket(
-            context, zmq.PULL, port_args.detokenizer_ipc_name, bind=True
+            self.context, zmq.PULL, port_args.detokenizer_ipc_name, bind=True
         )
 
         # Socket for sending requests to scheduler
         self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, bind=True
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name, bind=True
         )
 
         # State Management (from TokenizerManager)
@@ -475,10 +476,69 @@ class GrpcRequestManager:
                 if self.gracefully_exit:
                     break
                 continue
+            except zmq.error.ZMQError as e:
+                # Socket closed or other ZMQ error - exit cleanly if shutting down
+                if self.gracefully_exit:
+                    logger.debug(f"ZMQ recv interrupted during shutdown: {e}")
+                    break
+                logger.error(
+                    f"ZMQ error in handle loop: {e}\n{get_exception_traceback()}"
+                )
+                break
             except Exception as e:
                 logger.error(f"Handle loop error: {e}\n{get_exception_traceback()}")
                 if self.gracefully_exit:
                     break
+
+    def _convert_logprob_style(
+        self,
+        state: GrpcReqState,
+        batch_out: BatchTokenIDOut,
+        batch_index: int,
+    ):
+        """
+        Convert and accumulate logprobs from batch output to state.
+        Follows the same logic as tokenizer_manager.convert_logprob_style.
+        """
+        # Early exit if no input logprobs at all
+        if batch_out.input_token_logprobs_val is None:
+            return
+
+        # Accumulate input token logprobs (only if list is non-empty)
+        if len(batch_out.input_token_logprobs_val) > 0:
+            state.input_token_logprobs_val.extend(
+                batch_out.input_token_logprobs_val[batch_index]
+            )
+            state.input_token_logprobs_idx.extend(
+                batch_out.input_token_logprobs_idx[batch_index]
+            )
+
+        # Always accumulate output token logprobs
+        state.output_token_logprobs_val.extend(
+            batch_out.output_token_logprobs_val[batch_index]
+        )
+        state.output_token_logprobs_idx.extend(
+            batch_out.output_token_logprobs_idx[batch_index]
+        )
+
+        # Handle top logprobs if requested
+        if state.obj.top_logprobs_num > 0:
+            # Accumulate input top logprobs (only if list is non-empty)
+            if len(batch_out.input_top_logprobs_val) > 0:
+                state.input_top_logprobs_val.extend(
+                    batch_out.input_top_logprobs_val[batch_index]
+                )
+                state.input_top_logprobs_idx.extend(
+                    batch_out.input_top_logprobs_idx[batch_index]
+                )
+
+            # Always accumulate output top logprobs
+            state.output_top_logprobs_val.extend(
+                batch_out.output_top_logprobs_val[batch_index]
+            )
+            state.output_top_logprobs_idx.extend(
+                batch_out.output_top_logprobs_idx[batch_index]
+            )
 
     async def _handle_batch_output(self, batch_out: BatchTokenIDOut):
         """Handle batch generation output from scheduler."""
@@ -522,19 +582,65 @@ class GrpcRequestManager:
                 },
             }
 
-            # Add logprobs if available
-            if batch_out.output_token_logprobs_val and i < len(
-                batch_out.output_token_logprobs_val
+            # Accumulate logprobs (following tokenizer_manager pattern)
+            if state.obj.return_logprob:
+                self._convert_logprob_style(state, batch_out, i)
+
+            # Send input logprobs based if available
+            if (
+                state.obj.return_logprob
+                and state.obj.logprob_start_len >= 0
+                and state.input_token_logprobs_val
             ):
-                output_data["logprobs"] = {
-                    "tokens": batch_out.output_token_logprobs_val[i],
-                    "top_logprobs": (
-                        batch_out.output_top_logprobs_val[i]
-                        if batch_out.output_top_logprobs_val
-                        and i < len(batch_out.output_top_logprobs_val)
-                        else None
-                    ),
-                }
+                if state.obj.stream and not state.input_logprobs_sent:
+                    # Streaming: send input logprobs once in first chunk that has them
+                    output_data["input_logprobs"] = {
+                        "token_logprobs_val": state.input_token_logprobs_val,
+                        "token_logprobs_idx": state.input_token_logprobs_idx,
+                        "top_logprobs_val": state.input_top_logprobs_val,
+                        "top_logprobs_idx": state.input_top_logprobs_idx,
+                    }
+                    state.input_logprobs_sent = True
+                elif not state.obj.stream and output_data["finished"]:
+                    # Non-streaming: send input logprobs in final chunk
+                    output_data["input_logprobs"] = {
+                        "token_logprobs_val": state.input_token_logprobs_val,
+                        "token_logprobs_idx": state.input_token_logprobs_idx,
+                        "top_logprobs_val": state.input_top_logprobs_val,
+                        "top_logprobs_idx": state.input_top_logprobs_idx,
+                    }
+
+            # Send output logprobs if available
+            if (
+                state.obj.return_logprob
+                and batch_out.output_token_logprobs_val
+                and i < len(batch_out.output_token_logprobs_val)
+            ):
+                if state.obj.stream:
+                    # For streaming: send incremental logprobs (only new tokens in this chunk)
+                    # NOTE: this is different than TokenizerManager, which always accumulates
+                    def get_part(attr_name):
+                        source_list = getattr(batch_out, attr_name, None)
+                        return (
+                            source_list[i]
+                            if source_list and i < len(source_list)
+                            else []
+                        )
+
+                    output_data["output_logprobs"] = {
+                        "token_logprobs_val": batch_out.output_token_logprobs_val[i],
+                        "token_logprobs_idx": get_part("output_token_logprobs_idx"),
+                        "top_logprobs_val": get_part("output_top_logprobs_val"),
+                        "top_logprobs_idx": get_part("output_top_logprobs_idx"),
+                    }
+                elif output_data["finished"]:
+                    # Non-streaming: send cumulative output logprobs in final chunk
+                    output_data["output_logprobs"] = {
+                        "token_logprobs_val": state.output_token_logprobs_val,
+                        "token_logprobs_idx": state.output_token_logprobs_idx,
+                        "top_logprobs_val": state.output_top_logprobs_val,
+                        "top_logprobs_idx": state.output_top_logprobs_idx,
+                    }
 
             # Update state for accumulation
             if output_data["token_ids"]:
@@ -644,8 +750,17 @@ class GrpcRequestManager:
         logger.info("Shutting down GrpcRequestManager")
         self.gracefully_exit = True
 
+        # Cancel all asyncio tasks FIRST - this will interrupt blocked recv() calls
+        for task in list(self.asyncio_tasks):
+            if not task.done():
+                task.cancel()
+
+        # Give tasks a moment to process cancellation
+        if self.asyncio_tasks:
+            await asyncio.gather(*list(self.asyncio_tasks), return_exceptions=True)
+
         # Cancel all pending requests
-        for rid, state in self.rid_to_state.items():
+        for rid, state in list(self.rid_to_state.items()):
             if not state.finished:
                 await state.out_queue.put(
                     {"error": "Server shutting down", "shutdown": True}
@@ -653,13 +768,12 @@ class GrpcRequestManager:
                 state.finished = True
                 state.event.set()
 
-        # Wait for tasks to complete
-        if self.asyncio_tasks:
-            await asyncio.gather(*list(self.asyncio_tasks), return_exceptions=True)
-
         # Close ZMQ sockets
         self.recv_from_scheduler.close()
         self.send_to_scheduler.close()
+
+        # Terminate the ZMQ context - this is critical for asyncio loop to exit cleanly
+        self.context.term()
 
         logger.info("GrpcRequestManager shutdown complete")
 
