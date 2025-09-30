@@ -162,6 +162,7 @@ class SamplingBatchInfo:
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,
                 penaltylib.BatchedPresencePenalizer,
+                penaltylib.BatchedRepetitionPenalizer,
             },
         )
 
