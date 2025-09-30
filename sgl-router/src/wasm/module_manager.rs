@@ -16,8 +16,8 @@ use wasmtime::Val;
 
 use crate::wasm::{
     config::WasmRuntimeConfig,
-    module::{WasmModule, WasmModuleAttachPoint, WasmModuleDescriptor, WasmModuleMeta},
     errors::{Result, WasmError, WasmManagerError, WasmModuleError},
+    module::{WasmModule, WasmModuleAttachPoint, WasmModuleDescriptor, WasmModuleMeta},
     runtime::WasmRuntime,
 };
 
@@ -64,9 +64,7 @@ impl WasmModuleManager {
 
     fn calculate_size_bytes(&self, file_path: &str) -> Result<u64> {
         let file = File::open(file_path).map_err(|e| WasmError::from(e))?;
-        let metadata = file
-            .metadata()
-            .map_err(|e| WasmError::from(e))?;
+        let metadata = file.metadata().map_err(|e| WasmError::from(e))?;
         Ok(metadata.len())
     }
 
@@ -75,9 +73,7 @@ impl WasmModuleManager {
         let mut hasher = Sha256::new();
         let mut buffer = [0; 1024];
         loop {
-            let bytes_read = file
-                .read(&mut buffer)
-                .map_err(|e| WasmError::from(e))?;
+            let bytes_read = file.read(&mut buffer).map_err(|e| WasmError::from(e))?;
             if bytes_read == 0 {
                 break;
             }
@@ -88,13 +84,22 @@ impl WasmModuleManager {
 
     fn validate_module_descriptor(&self, descriptor: WasmModuleDescriptor) -> Result<()> {
         if descriptor.name.is_empty() {
-            return Err(WasmModuleError::InvalidDescriptor("Module name cannot be empty".to_string()).into());
+            return Err(WasmModuleError::InvalidDescriptor(
+                "Module name cannot be empty".to_string(),
+            )
+            .into());
         }
         if descriptor.file_path.is_empty() {
-            return Err(WasmModuleError::InvalidDescriptor("Module file path cannot be empty".to_string()).into());
+            return Err(WasmModuleError::InvalidDescriptor(
+                "Module file path cannot be empty".to_string(),
+            )
+            .into());
         }
         if self.calculate_size_bytes(&descriptor.file_path)? == 0 {
-            return Err(WasmModuleError::ValidationFailed("Module file size cannot be 0".to_string()).into());
+            return Err(WasmModuleError::ValidationFailed(
+                "Module file size cannot be 0".to_string(),
+            )
+            .into());
         }
         Ok(())
     }
@@ -167,12 +172,19 @@ impl WasmModuleManager {
     }
 
     /// get modules by attach point
-    pub fn get_modules_by_attach_point(&self, attach_point: WasmModuleAttachPoint) -> Result<Vec<WasmModule>> {
+    pub fn get_modules_by_attach_point(
+        &self,
+        attach_point: WasmModuleAttachPoint,
+    ) -> Result<Vec<WasmModule>> {
         let modules = self
             .modules
             .read()
             .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
-        Ok(modules.values().filter(|module| module.module_meta.attach_points.contains_key(&attach_point)).cloned().collect())
+        Ok(modules
+            .values()
+            .filter(|module| module.module_meta.attach_points.contains_key(&attach_point))
+            .cloned()
+            .collect())
     }
 
     /// execute module function
@@ -195,8 +207,8 @@ impl WasmModuleManager {
                 .ok_or_else(|| WasmError::from(WasmManagerError::ModuleNotFound(module_uuid)))?
         };
 
-        let wasm_bytes = std::fs::read(&module.module_meta.file_path)
-            .map_err(|e| WasmError::from(e))?;
+        let wasm_bytes =
+            std::fs::read(&module.module_meta.file_path).map_err(|e| WasmError::from(e))?;
 
         let result = self
             .runtime
@@ -238,8 +250,8 @@ impl WasmModuleManager {
                 .ok_or_else(|| WasmError::from(WasmManagerError::ModuleNotFound(module_uuid)))?
         };
 
-        let wasm_bytes = std::fs::read(&module.module_meta.file_path)
-            .map_err(|e| WasmError::from(e))?;
+        let wasm_bytes =
+            std::fs::read(&module.module_meta.file_path).map_err(|e| WasmError::from(e))?;
 
         let result = self
             .runtime

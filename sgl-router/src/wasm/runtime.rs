@@ -95,15 +95,16 @@ impl WasmRuntime {
             response: response_tx,
         };
 
-        self.thread_pool
-            .sender
-            .send(task)
-            .await
-            .map_err(|e| WasmRuntimeError::CallFailed(format!("Failed to send task to thread pool: {}", e)))?;
+        self.thread_pool.sender.send(task).await.map_err(|e| {
+            WasmRuntimeError::CallFailed(format!("Failed to send task to thread pool: {}", e))
+        })?;
 
-        let result = response_rx
-            .await
-            .map_err(|e| WasmRuntimeError::CallFailed(format!("Failed to receive response from thread pool: {}", e)))?;
+        let result = response_rx.await.map_err(|e| {
+            WasmRuntimeError::CallFailed(format!(
+                "Failed to receive response from thread pool: {}",
+                e
+            ))
+        })?;
 
         // Record metrics
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
