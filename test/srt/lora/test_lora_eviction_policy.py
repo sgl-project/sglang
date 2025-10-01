@@ -17,9 +17,14 @@ Unit tests for LoRA eviction policies.
 Tests LRU, FIFO, and adapter pinning functionality.
 """
 
+import multiprocessing as mp
 import unittest
 
+import torch
+
 from sglang.srt.lora.eviction_policy import get_eviction_policy
+from sglang.test.runners import SRTRunner
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestLoRAEvictionPolicy(unittest.TestCase):
@@ -156,5 +161,88 @@ class TestLoRAEvictionPolicy(unittest.TestCase):
         print("LRU vs FIFO behavioral difference tests passed")
 
 
+class TestLoRAEvictionPolicyIntegration(CustomTestCase):
+    """Integration tests for LoRA eviction policies with SRTRunner."""
+
+    BASE_MODEL = "/workspace/models/llama3-1-8-b"
+    ADAPTER_PATH = "/workspace/adapters/llama_3_1_8B_adapter"
+    ADAPTER_NAMES = ["adapter_1", "adapter_2", "adapter_3"]  # 3 adapters, pool size 2
+    PROMPT = "What is artificial intelligence?"
+
+    def _run_eviction_test(self, eviction_policy: str, pinned: bool = False):
+        """Run eviction test with specified policy and adapters."""
+        print(f"\n{'='*60}")
+        print(f"Testing {eviction_policy.upper()} eviction policy (pinned={pinned})")
+        print(f"{'='*60}")
+
+        with SRTRunner(
+            self.BASE_MODEL,
+            torch_dtype=torch.float16,
+            model_type="generation",
+            lora_paths=None,  # Don't preload, dynamically load adapters
+            max_loras_per_batch=2,  # Pool size 2, will load 3 adapters
+            lora_backend="triton",
+            enable_lora=True,
+            max_lora_rank=256,
+            lora_target_modules=["all"],
+            lora_eviction_policy=eviction_policy,
+        ) as runner:
+            # Load all 3 adapters
+            # For pinned test: adapter_1 is pinned, adapter_2 will be evicted when loading adapter_3
+            # For normal test: eviction based on policy (LRU/FIFO)
+            for i, name in enumerate(self.ADAPTER_NAMES):
+                pin_flag = pinned and i == 0
+                print(f"\n  Loading adapter: {name} (pinned={pin_flag})")
+                runner.load_lora_adapter(
+                    lora_name=name, lora_path=self.ADAPTER_PATH, pinned=pin_flag
+                )
+                print(f"    Loaded successfully")
+
+            # Test all adapters to verify they work after eviction
+            print(f"\n--- Testing inference with eviction ---")
+            for adapter_name in self.ADAPTER_NAMES:
+                print(f"\n  Attempting inference with adapter: {adapter_name}")
+
+                try:
+                    output = runner.forward(
+                        [self.PROMPT],
+                        max_new_tokens=32,
+                        lora_paths=[adapter_name],
+                    )
+
+                    # Verify output is generated
+                    self.assertIsNotNone(output.output_strs[0])
+                    self.assertGreater(len(output.output_strs[0]), 0)
+                    print(f"    ✓ Success! Output: {output.output_strs[0][:50]}...")
+                except Exception as e:
+                    print(
+                        f"    ✗ Failed with error: {type(e).__name__}: {str(e)[:200]}"
+                    )
+                    raise
+
+        print(f"\n✓ {eviction_policy.upper()} test passed (pinned={pinned})")
+
+    def test_lru_eviction(self):
+        """Test LRU eviction policy with actual inference."""
+        self._run_eviction_test("lru", pinned=False)
+
+    def test_lru_eviction_with_pinning(self):
+        """Test LRU eviction policy with adapter pinning."""
+        self._run_eviction_test("lru", pinned=True)
+
+    def test_fifo_eviction(self):
+        """Test FIFO eviction policy with actual inference."""
+        self._run_eviction_test("fifo", pinned=False)
+
+    def test_fifo_eviction_with_pinning(self):
+        """Test FIFO eviction policy with adapter pinning."""
+        self._run_eviction_test("fifo", pinned=True)
+
+
 if __name__ == "__main__":
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
     unittest.main(verbosity=2)
