@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch.nn.functional as F
 
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
@@ -21,10 +22,10 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.speculative.eagle_utils import (
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
     assign_req_to_token_pool,
-    create_flashinfer_kv_indices_triton,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
@@ -42,7 +43,7 @@ elif is_hip():
 
 
 @dataclass
-class NgramVerifyInput:
+class NgramVerifyInput(SpecInput):
     def __init__(
         self,
         draft_token: torch.Tensor,
@@ -53,6 +54,7 @@ class NgramVerifyInput:
         retrive_next_sibling: torch.Tensor,
         draft_token_num: int,
     ):
+        super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
         self.custom_mask = tree_mask
         self.positions = positions
@@ -61,6 +63,9 @@ class NgramVerifyInput:
         self.retrive_next_sibling = retrive_next_sibling
         self.draft_token_num = draft_token_num
         self.device = self.custom_mask.device
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return self.draft_token_num, self.draft_token_num
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
         if batch.forward_mode.is_idle():
