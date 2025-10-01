@@ -1049,6 +1049,20 @@ class UpdateWeightsFromTensorReqOutput:
 
 
 @dataclass
+class UpdateWeightsFromIPCReqInput:
+    # ZMQ socket paths for each device UUID
+    zmq_handles: Dict[str, str]
+    # Whether to flush cache after weight update
+    flush_cache: bool = True
+
+
+@dataclass
+class UpdateWeightsFromIPCReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsSendGroupForRemoteInstanceReqInput:
     # The master address
     master_address: str
