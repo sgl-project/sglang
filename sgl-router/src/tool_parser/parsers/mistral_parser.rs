@@ -280,33 +280,6 @@ impl ToolParser for MistralParser {
     }
 
     fn detect_format(&self, text: &str) -> bool {
-        // Check if text contains Mistral-specific markers
-        if self.has_tool_markers(text) {
-            // Try to extract and validate the array
-            if let Some(json_array) = self.extract_json_array(text) {
-                // Check if it's valid JSON
-                if let Ok(value) = serde_json::from_str::<Value>(json_array) {
-                    // Check if it contains tool-like structures
-                    match value {
-                        Value::Array(ref arr) => arr.iter().any(|v| {
-                            v.as_object().is_some_and(|o| {
-                                o.contains_key("name") && o.contains_key("arguments")
-                            })
-                        }),
-                        Value::Object(ref obj) => {
-                            obj.contains_key("name") && obj.contains_key("arguments")
-                        }
-                        _ => false,
-                    }
-                } else {
-                    false
-                }
-            } else {
-                // Has markers but no complete array - might be streaming
-                true
-            }
-        } else {
-            false
-        }
+        self.has_tool_markers(text)
     }
 }
