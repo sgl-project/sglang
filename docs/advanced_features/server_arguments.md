@@ -113,6 +113,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--quantization` | The quantization method. | None |
 | `--quantization-param-path` | Path to the JSON file containing the KV cache scaling factors. This should generally be supplied, when KV cache dtype is FP8. Otherwise, KV cache scaling factors default to 1.0, which may cause accuracy issues. | None |
 | `--kv-cache-dtype` | Data type for kv cache storage. 'auto' will use model data type. 'fp8_e5m2' and 'fp8_e4m3' is supported for CUDA 11.8+. | auto |
+| `--enable-fp32-lm-head` | If set, the LM head outputs (logits) are in FP32. | False |
 
 ## Memory and scheduling
 
