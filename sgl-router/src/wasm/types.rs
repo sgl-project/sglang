@@ -3,6 +3,9 @@
 //! Provides generic input/output types for WASM component execution
 //! based on attach points.
 
+use wasmtime::component::ResourceTable;
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+
 use crate::wasm::{
     module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     spec::sgl::router::middleware_types,
@@ -18,10 +21,6 @@ pub enum WasmComponentInput {
     MiddlewareRequest(middleware_types::Request),
     /// Middleware OnResponse input
     MiddlewareResponse(middleware_types::Response),
-    // Future extensions can add more variants here:
-    // PolicyRequest(policy_types::PolicyRequest),
-    // FilterInput(filter_types::FilterInput),
-    // etc.
 }
 
 /// Generic output type from WASM component execution
@@ -32,10 +31,6 @@ pub enum WasmComponentInput {
 pub enum WasmComponentOutput {
     /// Middleware Action output
     MiddlewareAction(middleware_types::Action),
-    // Future extensions can add more variants here:
-    // PolicyAction(policy_types::PolicyAction),
-    // FilterAction(filter_types::FilterAction),
-    // etc.
 }
 
 impl WasmComponentInput {
@@ -117,6 +112,20 @@ impl FromComponentOutput for middleware_types::Action {
     fn from_component_output(output: &WasmComponentOutput) -> Option<&Self> {
         match output {
             WasmComponentOutput::MiddlewareAction(action) => Some(action),
+        }
+    }
+}
+
+pub struct WasiState {
+    pub ctx: WasiCtx,
+    pub table: ResourceTable,
+}
+
+impl WasiView for WasiState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
         }
     }
 }
