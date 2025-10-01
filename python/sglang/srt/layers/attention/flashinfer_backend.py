@@ -28,8 +28,8 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.ngram_utils import NgramVerifyInput
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
     is_flashinfer_available,
@@ -344,7 +344,7 @@ class FlashInferAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
@@ -451,7 +451,7 @@ class FlashInferAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
@@ -669,7 +669,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
@@ -684,7 +684,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
@@ -710,7 +710,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
@@ -760,7 +760,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
@@ -794,7 +794,7 @@ class FlashInferIndicesUpdaterDecode:
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
@@ -905,7 +905,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
@@ -921,7 +921,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
     ):
         if use_ragged:
@@ -959,7 +959,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
     ):
         for wrapper_id in range(2):
@@ -1006,7 +1006,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
     ):
         for wrapper_id in range(2):
@@ -1049,7 +1049,7 @@ class FlashInferIndicesUpdaterPrefill:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, NgramVerifyInput]],
+        spec_info: Optional[SpecInput],
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
     ):
@@ -1077,9 +1077,7 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
-            assert isinstance(
-                spec_info, (EagleDraftInput, EagleVerifyInput, NgramVerifyInput)
-            )
+            assert isinstance(spec_info, SpecInput)
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
@@ -1138,7 +1136,7 @@ class FlashInferMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -1202,7 +1200,7 @@ class FlashInferMultiStepDraftBackend:
         )
 
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
         indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()

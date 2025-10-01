@@ -1,8 +1,5 @@
 import logging
-import os
-import threading
-import time
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -15,7 +12,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_utils import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
 
