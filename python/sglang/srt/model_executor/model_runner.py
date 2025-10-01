@@ -60,7 +60,10 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+from sglang.srt.layers.attention.attention_registry import (
+    ATTENTION_BACKENDS,
+    attn_backend_wrapper,
+)
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -104,6 +107,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    trigger_init_weights_send_group_for_remote_instance_request,
+)
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.offloader import (
@@ -112,9 +118,6 @@ from sglang.srt.offloader import (
     set_offloader,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
-from sglang.srt.remote_instance_weight_loader_utils import (
-    trigger_init_weights_send_group_for_remote_instance_request,
-)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -177,6 +180,13 @@ SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
+
+
+if _is_npu:
+    import torch_npu
+
+    torch.npu.config.allow_internal_format = True
+    torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
 class RankZeroFilter(logging.Filter):
@@ -340,7 +350,6 @@ class ModelRunner:
         if self.is_hybrid_gdn:
             logger.warning("Hybrid GDN model detected, disable radix cache")
             self.server_args.disable_radix_cache = True
-            self.server_args.attention_backend = "hybrid_linear_attn"
             if self.server_args.max_mamba_cache_size is None:
                 if self.server_args.max_running_requests is not None:
                     self.server_args.max_mamba_cache_size = (
@@ -408,7 +417,7 @@ class ModelRunner:
 
         # Enable batch invariant mode
         if server_args.enable_deterministic_inference:
-            from batch_invariant_ops import enable_batch_invariant_mode
+            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
 
@@ -736,6 +745,10 @@ class ModelRunner:
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
+            tp_rank=self.tp_rank,
+            remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
+            remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
+            remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
@@ -1471,7 +1484,8 @@ class ModelRunner:
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
-                "Not enough memory. Please try to increase --mem-fraction-static."
+                f"Not enough memory. Please try to increase --mem-fraction-static. "
+                f"Current value: {self.server_args.mem_fraction_static=}"
             )
 
         # Initialize req_to_token_pool
@@ -1636,10 +1650,9 @@ class ModelRunner:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if _is_npu and self.server_args.attention_backend in [
-                "ascend",
-                "hybrid_linear_attn",
-            ]:
+            if _is_npu and (
+                self.server_args.attention_backend == "ascend" or self.is_hybrid_gdn
+            ):
                 self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1752,7 +1765,8 @@ class ModelRunner:
     def _get_attention_backend_from_str(self, backend_str: str):
         if backend_str not in ATTENTION_BACKENDS:
             raise ValueError(f"Invalid attention backend: {backend_str}")
-        return ATTENTION_BACKENDS[backend_str](self)
+        full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
+        return attn_backend_wrapper(self, full_attention_backend)
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"
@@ -2049,7 +2063,6 @@ class ModelRunner:
             )
 
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
-
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -2057,6 +2070,12 @@ class ModelRunner:
             forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
+            # For prefill, we only use the position of the last token.
+            (
+                forward_batch.positions
+                if forward_batch.forward_mode.is_decode()
+                else forward_batch.seq_lens - 1
+            ),
         )
         return next_token_ids
 

@@ -39,7 +39,7 @@ def parse_arguments(json_value):
 
 class Glm4MoeDetector(BaseFormatDetector):
     """
-    Detector for GLM-4.5 models.
+    Detector for GLM-4.5 and GLM-4.6 models.
     Assumes function call format:
       <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>北京</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>上海</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>
     """
@@ -53,7 +53,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.func_arg_regex = r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>"
 
     def has_tool_call(self, text: str) -> bool:
-        """Check if the text contains a glm-4.5 format tool call."""
+        """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
         return self.bot_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -102,7 +102,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
-        Streaming incremental parsing tool calls for GLM-4.5 format.
+        Streaming incremental parsing tool calls for GLM-4.5 and GLM-4.6 format.
         """
         self._buffer += new_text
         current_text = self._buffer
