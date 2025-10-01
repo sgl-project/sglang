@@ -5,3 +5,4 @@ pub mod module_manager;
 pub mod route;
 pub mod runtime;
 pub mod spec;
+pub mod types;

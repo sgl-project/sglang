@@ -4,11 +4,17 @@ use std::sync::{
 };
 
 use tokio::sync::oneshot;
-use wasmtime::{Config, Engine, Instance, Module, Store, Val};
+use wasmtime::{
+    component::{Component, Linker},
+    Config, Engine, Instance, Module, Store, Val,
+};
 
 use crate::wasm::{
     config::WasmRuntimeConfig,
-    errors::{Result, WasmRuntimeError},
+    errors::{Result, WasmError, WasmRuntimeError},
+    module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
+    spec::SglRouter,
+    types::{WasmComponentInput, WasmComponentOutput},
 };
 
 pub struct WasmRuntime {
@@ -32,11 +38,17 @@ pub struct WasmThreadPool {
 }
 
 pub enum WasmTask {
-    ExecuteWasmModule {
+    ExecuteModule {
         wasm_bytes: Vec<u8>,
         function_name: String,
         args: Vec<Val>,
         response: oneshot::Sender<Result<Vec<Val>>>,
+    },
+    ExecuteComponent {
+        wasm_bytes: Vec<u8>,
+        attach_point: WasmModuleAttachPoint,
+        input: WasmComponentInput,
+        response: oneshot::Sender<Result<WasmComponentOutput>>,
     },
 }
 
@@ -88,7 +100,7 @@ impl WasmRuntime {
         let start_time = std::time::Instant::now();
         let (response_tx, response_rx) = oneshot::channel();
 
-        let task = WasmTask::ExecuteWasmModule {
+        let task = WasmTask::ExecuteModule {
             wasm_bytes,
             function_name,
             args,
@@ -131,6 +143,49 @@ impl WasmRuntime {
         // use tokio::runtime::Handle::current() to execute in async context
         let handle = tokio::runtime::Handle::current();
         handle.block_on(self.execute_wasm_module_async(wasm_bytes, function_name, args))
+    }
+
+    /// Execute WASM component using WIT interface based on attach_point
+    pub async fn execute_component_async(
+        &self,
+        wasm_bytes: Vec<u8>,
+        attach_point: WasmModuleAttachPoint,
+        input: WasmComponentInput,
+    ) -> Result<WasmComponentOutput> {
+        let start_time = std::time::Instant::now();
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let task = WasmTask::ExecuteComponent {
+            wasm_bytes,
+            attach_point,
+            input,
+            response: response_tx,
+        };
+
+        self.thread_pool.sender.send(task).await.map_err(|e| {
+            WasmRuntimeError::CallFailed(format!("Failed to send task to thread pool: {}", e))
+        })?;
+
+        let result = response_rx.await.map_err(|e| {
+            WasmRuntimeError::CallFailed(format!(
+                "Failed to receive response from thread pool: {}",
+                e
+            ))
+        })?;
+
+        // Record metrics
+        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        self.total_executions.fetch_add(1, Ordering::Relaxed);
+        self.total_execution_time_ms
+            .fetch_add(execution_time_ms, Ordering::Relaxed);
+
+        if result.is_ok() {
+            self.successful_executions.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_executions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        result
     }
 
     /// Get current metrics
@@ -218,6 +273,8 @@ impl WasmThreadPool {
         // create independent wasmtime engine for each worker thread
         let mut wasmtime_config = Config::new();
         wasmtime_config.async_stack_size(config.max_stack_size);
+        wasmtime_config.async_support(true);
+        wasmtime_config.wasm_component_model(true); // Enable component model
 
         let engine = match Engine::new(&wasmtime_config) {
             Ok(engine) => {
@@ -245,7 +302,7 @@ impl WasmThreadPool {
             };
 
             match task {
-                WasmTask::ExecuteWasmModule {
+                WasmTask::ExecuteModule {
                     wasm_bytes,
                     function_name,
                     args,
@@ -262,6 +319,23 @@ impl WasmThreadPool {
 
                     // Record task metrics (we can't access pool metrics from here,
                     // but we can add them to the response if needed)
+                    let _ = response.send(result);
+                }
+                WasmTask::ExecuteComponent {
+                    wasm_bytes,
+                    attach_point,
+                    input,
+                    response,
+                } => {
+                    let result = Self::execute_component_in_worker(
+                        &engine,
+                        wasm_bytes,
+                        attach_point,
+                        input,
+                        &config,
+                    )
+                    .await;
+
                     let _ = response.send(result);
                 }
             }
@@ -302,6 +376,92 @@ impl WasmThreadPool {
         .map_err(|e| WasmRuntimeError::CallFailed(e.to_string()))?;
 
         Ok(results)
+    }
+
+    async fn execute_component_in_worker(
+        engine: &Engine,
+        wasm_bytes: Vec<u8>,
+        attach_point: WasmModuleAttachPoint,
+        input: WasmComponentInput,
+        _config: &WasmRuntimeConfig,
+    ) -> Result<WasmComponentOutput> {
+        // Compile component from bytes
+        let component = Component::new(engine, &wasm_bytes)
+            .map_err(|e| WasmRuntimeError::CompileFailed(e.to_string()))?;
+
+        // Create linker
+        let linker = Linker::new(engine);
+
+        // Create store
+        let mut store = Store::new(engine, ());
+
+        // Note: Timeout handling would need to be implemented differently for component model
+        // Component calls are synchronous in the wasmtime context
+
+        // Dispatch based on attach_point
+        let output = match attach_point {
+            WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnRequest) => {
+                // Extract Request input
+                let request = match input {
+                    WasmComponentInput::MiddlewareRequest(req) => req,
+                    _ => {
+                        return Err(WasmError::from(WasmRuntimeError::CallFailed(
+                            "Expected MiddlewareRequest input for OnRequest attach point"
+                                .to_string(),
+                        )));
+                    }
+                };
+
+                // Instantiate component
+                let bindings =
+                    SglRouter::instantiate(&mut store, &component, &linker).map_err(|e| {
+                        WasmError::from(WasmRuntimeError::InstanceCreateFailed(e.to_string()))
+                    })?;
+
+                // Call on-request
+                // Note: call_on_request returns Result directly (synchronous in wasmtime context)
+                let action_result = bindings
+                    .sgl_router_middleware_on_request()
+                    .call_on_request(&mut store, &request)
+                    .map_err(|e| WasmError::from(WasmRuntimeError::CallFailed(e.to_string())))?;
+
+                WasmComponentOutput::MiddlewareAction(action_result)
+            }
+            WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnResponse) => {
+                // Extract Response input
+                let response = match input {
+                    WasmComponentInput::MiddlewareResponse(resp) => resp,
+                    _ => {
+                        return Err(WasmError::from(WasmRuntimeError::CallFailed(
+                            "Expected MiddlewareResponse input for OnResponse attach point"
+                                .to_string(),
+                        )));
+                    }
+                };
+
+                // Instantiate component
+                let bindings =
+                    SglRouter::instantiate(&mut store, &component, &linker).map_err(|e| {
+                        WasmError::from(WasmRuntimeError::InstanceCreateFailed(e.to_string()))
+                    })?;
+
+                // Call on-response
+                // Note: call_on_response returns Result directly (synchronous in wasmtime context)
+                let action_result = bindings
+                    .sgl_router_middleware_on_response()
+                    .call_on_response(&mut store, &response)
+                    .map_err(|e| WasmError::from(WasmRuntimeError::CallFailed(e.to_string())))?;
+
+                WasmComponentOutput::MiddlewareAction(action_result)
+            }
+            WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnError) => {
+                return Err(WasmError::from(WasmRuntimeError::CallFailed(
+                    "OnError attach point not yet implemented".to_string(),
+                )));
+            }
+        };
+
+        Ok(output)
     }
 }
 
@@ -437,7 +597,6 @@ mod tests {
 
         assert_eq!(config.max_memory_pages, 1024);
         assert_eq!(config.max_execution_time_ms, 1000);
-        assert_eq!(config.enable_wasi, true);
         assert_eq!(config.max_stack_size, 1024 * 1024);
         assert!(config.thread_pool_size > 0);
         assert_eq!(config.module_cache_size, 10);
@@ -453,7 +612,6 @@ mod tests {
             config.max_execution_time_ms,
             cloned_config.max_execution_time_ms
         );
-        assert_eq!(config.enable_wasi, cloned_config.enable_wasi);
         assert_eq!(config.max_stack_size, cloned_config.max_stack_size);
         assert_eq!(config.thread_pool_size, cloned_config.thread_pool_size);
         assert_eq!(config.module_cache_size, cloned_config.module_cache_size);

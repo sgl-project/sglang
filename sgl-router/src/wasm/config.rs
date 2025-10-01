@@ -6,8 +6,6 @@ pub struct WasmRuntimeConfig {
     pub max_memory_pages: u32,
     /// Maximum execution time in milliseconds
     pub max_execution_time_ms: u64,
-    /// Enable WASI support
-    pub enable_wasi: bool,
     /// Maximum stack size in bytes
     pub max_stack_size: usize,
     /// Number of worker threads in the pool
@@ -24,9 +22,8 @@ impl Default for WasmRuntimeConfig {
             .max(1);
 
         Self {
-            max_memory_pages: 1024,      // 64MB
-            max_execution_time_ms: 1000, // 1 seconds
-            enable_wasi: true,
+            max_memory_pages: 1024,                     // 64MB
+            max_execution_time_ms: 1000,                // 1 seconds
             max_stack_size: 1024 * 1024,                // 1MB
             thread_pool_size: default_thread_pool_size, // based on cpu count
             module_cache_size: 10,                      // Cache up to 10 modules per worker
@@ -87,7 +84,6 @@ impl WasmRuntimeConfig {
     pub fn new(
         max_memory_pages: u32,
         max_execution_time_ms: u64,
-        enable_wasi: bool,
         max_stack_size: usize,
         thread_pool_size: usize,
         module_cache_size: usize,
@@ -95,7 +91,6 @@ impl WasmRuntimeConfig {
         let config = Self {
             max_memory_pages,
             max_execution_time_ms,
-            enable_wasi,
             max_stack_size,
             thread_pool_size,
             module_cache_size,
@@ -122,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_config_new_with_validation() {
-        let config = WasmRuntimeConfig::new(1024, 1000, true, 1024 * 1024, 2, 10);
+        let config = WasmRuntimeConfig::new(1024, 1000, 1024 * 1024, 2, 10);
         assert!(config.is_ok());
     }
 
@@ -131,7 +126,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 0,
             max_execution_time_ms: 1000,
-            enable_wasi: true,
             max_stack_size: 1024 * 1024,
             thread_pool_size: 2,
             module_cache_size: 10,
@@ -146,7 +140,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 65537, // Exceeds 4GB limit
             max_execution_time_ms: 1000,
-            enable_wasi: true,
             max_stack_size: 1024 * 1024,
             thread_pool_size: 2,
             module_cache_size: 10,
@@ -163,7 +156,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 1024,
             max_execution_time_ms: 0,
-            enable_wasi: true,
             max_stack_size: 1024 * 1024,
             thread_pool_size: 2,
             module_cache_size: 10,
@@ -180,7 +172,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 1024,
             max_execution_time_ms: 300001, // Exceeds 5 minutes
-            enable_wasi: true,
             max_stack_size: 1024 * 1024,
             thread_pool_size: 2,
             module_cache_size: 10,
@@ -197,7 +188,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 1024,
             max_execution_time_ms: 1000,
-            enable_wasi: true,
             max_stack_size: 32 * 1024, // Less than 64KB
             thread_pool_size: 2,
             module_cache_size: 10,
@@ -214,7 +204,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 1024,
             max_execution_time_ms: 1000,
-            enable_wasi: true,
             max_stack_size: 17 * 1024 * 1024, // Exceeds 16MB
             thread_pool_size: 2,
             module_cache_size: 10,
@@ -231,7 +220,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 1024,
             max_execution_time_ms: 1000,
-            enable_wasi: true,
             max_stack_size: 1024 * 1024,
             thread_pool_size: 0,
             module_cache_size: 10,
@@ -246,7 +234,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 1024,
             max_execution_time_ms: 1000,
-            enable_wasi: true,
             max_stack_size: 1024 * 1024,
             thread_pool_size: 129, // Exceeds 128
             module_cache_size: 10,
@@ -263,7 +250,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 1024,
             max_execution_time_ms: 1000,
-            enable_wasi: true,
             max_stack_size: 1024 * 1024,
             thread_pool_size: 2,
             module_cache_size: 0,
@@ -280,7 +266,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 1024,
             max_execution_time_ms: 1000,
-            enable_wasi: true,
             max_stack_size: 1024 * 1024,
             thread_pool_size: 2,
             module_cache_size: 1001, // Exceeds 1000
@@ -297,7 +282,6 @@ mod tests {
         let config = WasmRuntimeConfig {
             max_memory_pages: 1024,
             max_execution_time_ms: 1000,
-            enable_wasi: true,
             max_stack_size: 1024 * 1024,
             thread_pool_size: 2,
             module_cache_size: 10,
