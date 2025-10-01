@@ -366,7 +366,7 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--timeout-per-file",
         type=int,
-        default=1200 if not is_hip() else 2000,
+        default=1200 if not is_hip() else 3000,
         help="The time limit for running one file in seconds.",
     )
     arg_parser.add_argument(
