@@ -25,6 +25,7 @@ use crate::protocols::spec::{
     ResponsesGetParams, ResponsesRequest, StringOrArray, Tool, ToolCall, ToolChoice,
     ToolChoiceValue, Usage,
 };
+use crate::protocols::validation::ValidatableRequest;
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
 use crate::server::AppContext;
@@ -1094,6 +1095,7 @@ impl GrpcRouter {
             completion_tokens: total_completion_tokens,
             total_tokens: total_prompt_tokens + total_completion_tokens,
             completion_tokens_details: None,
+            prompt_tokens_details: None,
         };
 
         // Build final ChatCompletionResponse
@@ -1108,6 +1110,7 @@ impl GrpcRouter {
             choices,
             usage: Some(usage),
             system_fingerprint: None,
+            service_tier: None,
         };
 
         // Serialize and return JSON response
@@ -1505,7 +1508,12 @@ impl RouterTrait for GrpcRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_chat_impl(headers, body, model_id).await
+        let mut normalized_body = body.clone();
+        normalized_body.normalize_tool_choice();
+        if let Err(e) = normalized_body.validate() {
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+        self.route_chat_impl(headers, &normalized_body, model_id).await
     }
 
     async fn route_completion(

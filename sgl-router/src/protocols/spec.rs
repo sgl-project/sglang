@@ -416,7 +416,11 @@ impl ChatCompletionRequest {
     /// - "auto" is the default if tools are present
     pub fn normalize_tool_choice(&mut self) {
         if self.tool_choice.is_none() {
-            self.tool_choice = Some(if self.tools.is_some() {
+            let has_tools = self
+                .tools
+                .as_ref()
+                .map_or(false, |tools| !tools.is_empty());
+            self.tool_choice = Some(if has_tools {
                 ToolChoice::Value(ToolChoiceValue::Auto)
             } else {
                 ToolChoice::Value(ToolChoiceValue::None)
@@ -436,6 +440,8 @@ pub struct ChatCompletionResponse {
     pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 /// Response message structure for ChatCompletionResponse (different from request ChatMessage)
@@ -1837,10 +1843,17 @@ pub struct Usage {
     pub total_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompletionTokensDetails {
+    pub reasoning_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromptTokensDetails {
     pub reasoning_tokens: Option<u32>,
 }
 
@@ -2005,6 +2018,14 @@ pub struct GenerateRequest {
     /// Whether to return logprobs
     #[serde(default)]
     pub return_logprob: bool,
+
+    /// Length of logprobs to start from
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprob_start_len: Option<u32>,
+
+    /// Whether to return text in logprobs
+    #[serde(default)]
+    pub return_text_in_logprobs: bool,
 
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]

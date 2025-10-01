@@ -670,10 +670,11 @@ impl ChatCompletionRequest {
     /// Validate tool_choice according to OpenAI spec
     pub fn validate_tool_choice(&self) -> Result<(), ValidationError> {
         if let Some(tool_choice) = &self.tool_choice {
+            let has_tools = self.tools.as_ref().map_or(false, |tools| !tools.is_empty());
             match tool_choice {
                 ToolChoice::Value(choice) => {
-                    // If tools are not provided, only "none" is allowed
-                    if self.tools.is_none() && !matches!(choice, ToolChoiceValue::None) {
+                    // If tools are not provided (or empty), only "none" is allowed
+                    if !has_tools && !matches!(choice, ToolChoiceValue::None) {
                         return Err(ValidationError::InvalidValue {
                             parameter: "tool_choice".to_string(),
                             value: serde_json::to_string(choice).unwrap_or_default(),
@@ -684,7 +685,7 @@ impl ChatCompletionRequest {
                 }
                 ToolChoice::Function { .. } => {
                     // Function choice requires tools
-                    if self.tools.is_none() {
+                    if !has_tools {
                         return Err(ValidationError::InvalidValue {
                             parameter: "tool_choice".to_string(),
                             value: "function".to_string(),
@@ -695,7 +696,7 @@ impl ChatCompletionRequest {
                 }
                 ToolChoice::AllowedTools { tools: allowed, .. } => {
                     // AllowedTools requires tools
-                    if self.tools.is_none() {
+                    if !has_tools {
                         return Err(ValidationError::InvalidValue {
                             parameter: "tool_choice".to_string(),
                             value: "allowed_tools".to_string(),
@@ -1195,6 +1196,11 @@ mod tests {
             request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
             assert!(request.validate().is_err());
 
+            // Invalid: empty tools vector is treated as no tools
+            request.tools = Some(vec![]);
+            request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+            assert!(request.validate().is_err());
+
             // Valid: with tools, tool_choice auto
             request.tools = Some(vec![Tool {
                 tool_type: "function".to_string(),
@@ -1252,6 +1258,48 @@ mod tests {
                 }],
             });
             assert!(request.validate().is_err());
+        }
+
+        #[test]
+        fn test_tool_choice_normalization_defaults() {
+            use crate::protocols::spec::{Function, Tool};
+
+            // Case 1: No tools -> default should be None
+            let mut req = create_valid_chat_request();
+            req.tool_choice = None;
+            req.tools = None;
+            req.normalize_tool_choice();
+            assert!(matches!(
+                req.tool_choice,
+                Some(ToolChoice::Value(ToolChoiceValue::None))
+            ));
+
+            // Case 2: Empty tools vector -> treat as no tools -> default None
+            let mut req = create_valid_chat_request();
+            req.tool_choice = None;
+            req.tools = Some(vec![]);
+            req.normalize_tool_choice();
+            assert!(matches!(
+                req.tool_choice,
+                Some(ToolChoice::Value(ToolChoiceValue::None))
+            ));
+
+            // Case 3: With tools -> default should be Auto
+            let mut req = create_valid_chat_request();
+            req.tool_choice = None;
+            req.tools = Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "test_func".to_string(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]);
+            req.normalize_tool_choice();
+            assert!(matches!(
+                req.tool_choice,
+                Some(ToolChoice::Value(ToolChoiceValue::Auto))
+            ));
         }
 
         #[test]
