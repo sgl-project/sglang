@@ -10,16 +10,16 @@ on:
 jobs:
   publish-x86:
     if: github.repository == 'sgl-project/sglang'
-    environment: 'prod'
+    environment: "prod"
     strategy:
       matrix:
         variant:
-          - cuda_version: '12.6.1'
-            build_type: 'all'
-          - cuda_version: '12.8.1'
-            build_type: 'blackwell'
-          - cuda_version: '12.9.1'
-            build_type: 'blackwell'
+          - cuda_version: "12.6.1"
+            build_type: "all"
+          - cuda_version: "12.8.1"
+            build_type: "blackwell"
+          - cuda_version: "12.9.1"
+            build_type: "blackwell"
     runs-on: nvidia
     steps:
       - name: Delete huge unnecessary tools folder
@@ -82,13 +82,13 @@ jobs:
 
   publish-arm64:
     if: github.repository == 'sgl-project/sglang'
-    environment: 'prod'
+    environment: "prod"
     strategy:
       matrix:
         variant:
-          - cuda_version: '12.9.1'
-            build_type: 'blackwell_aarch'
-    runs-on: labubu
+          - cuda_version: "12.9.1"
+            build_type: "blackwell_aarch64"
+    runs-on: sgl-kernel-release-node-arm
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
