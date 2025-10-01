@@ -201,7 +201,7 @@ _is_cpu = is_cpu()
 @dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput]
-    pp_hidden_states_proxy_tensors: Optional[torch.Tensor]
+    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors]
     next_token_ids: Optional[List[int]]
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
@@ -1080,8 +1080,10 @@ class Scheduler(
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
+                        # FIXME(lsyin): remove this assert
+                        assert result.pp_hidden_states_proxy_tensors.tensors is not None
                         self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors,
+                            result.pp_hidden_states_proxy_tensors.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
 
@@ -2029,7 +2031,7 @@ class Scheduler(
                 ) = (
                     forward_batch_output.logits_output,
                     forward_batch_output.next_token_ids,
-                    forward_batch_output.pp_proxy_tensors.tensors,
+                    forward_batch_output.pp_proxy_tensors,
                     forward_batch_output.can_run_cuda_graph,
                 )
                 bid = model_worker_batch.bid
@@ -2069,6 +2071,7 @@ class Scheduler(
 
             ret = GenerationBatchResult(
                 logits_output=logits_output if self.pp_group.is_last_rank else None,
+                # TODO(lsyin): remove this if and all similar ifs
                 pp_hidden_states_proxy_tensors=(
                     pp_hidden_states_proxy_tensors
                     if not self.pp_group.is_last_rank
