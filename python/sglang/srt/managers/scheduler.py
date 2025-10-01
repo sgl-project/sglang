@@ -2018,23 +2018,32 @@ class Scheduler(
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
 
-                if self.pp_group.is_last_rank:
-                    logits_output, next_token_ids, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
-                    )
-                else:
-                    pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
-                    )
+                forward_batch_output = self.tp_worker.forward_batch_generation(
+                    model_worker_batch
+                )
+                (
+                    logits_output,
+                    next_token_ids,
+                    pp_hidden_states_proxy_tensors,
+                    can_run_cuda_graph,
+                ) = (
+                    forward_batch_output.logits_output,
+                    forward_batch_output.next_token_ids,
+                    forward_batch_output.pp_proxy_tensors,
+                    forward_batch_output.can_run_cuda_graph,
+                )
                 bid = model_worker_batch.bid
             else:
+                forward_batch_output = (
+                    self.draft_worker.forward_batch_speculative_generation(batch)
+                )
                 (
                     logits_output,
                     next_token_ids,
                     bid,
                     num_accepted_tokens,
                     can_run_cuda_graph,
-                ) = self.draft_worker.forward_batch_speculative_generation(batch)
+                ) = forward_batch_output
                 bs = batch.batch_size()
                 self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
                 self.spec_num_total_forward_ct += bs
@@ -2050,6 +2059,7 @@ class Scheduler(
                 extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
             else:
                 extend_input_len_per_req = None
+
             if batch.return_logprob:
                 extend_logprob_start_len_per_req = [
                     req.extend_logprob_start_len for req in batch.reqs
