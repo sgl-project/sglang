@@ -56,6 +56,7 @@ def create_aiter_backend(runner):
 def create_wave_backend(runner):
     try:
         from sglang.srt.layers.attention.wave_backend import WaveAttnBackend
+
         return WaveAttnBackend(runner)
     except ImportError as e:
         if "wave_lang" in str(e):

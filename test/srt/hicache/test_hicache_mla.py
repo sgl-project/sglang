@@ -13,9 +13,11 @@ from sglang.test.test_utils import (
 
 _is_hip = is_hip()
 if _is_hip:
-    hicache_args = ["--hicache-size", 200]
+    hicache_args = ["--hicache-size", 40]
+    mem_frac_args = ["--mem-fraction-static", 0.2]
 else:
     hicache_args = ["--hicache-ratio", 2]
+    mem_frac_args = []
 
 
 class TestHierarchicalMLA(CustomTestCase):
@@ -32,6 +34,7 @@ class TestHierarchicalMLA(CustomTestCase):
                 "--enable-hierarchical-cache",
             ]
             + hicache_args,
+            + mem_frac_args,
         )
 
     @classmethod
