@@ -101,5 +101,17 @@ class TestNgramSpeculativeDecodingFlashinfer(TestNgramSpeculativeDecodingBase):
         return DEFAULT_SERVER_ARGS + ["--attention-backend", "flashinfer"]
 
 
+class TestNgramSpeculativeDecodingPaged(TestNgramSpeculativeDecodingBase):
+
+    @classmethod
+    def get_server_args(cls):
+        return DEFAULT_SERVER_ARGS + [
+            "--attention-backend",
+            "flashinfer",
+            "--page-size",
+            "64",
+        ]
+
+
 if __name__ == "__main__":
     unittest.main()
