@@ -1261,12 +1261,6 @@ impl OpenAIRouter {
             "role": "user",
             "content": args.original_body.input.clone()
         });
-        // temp system message since currently only support 1 turn of mcp function call
-        let system_item = serde_json::json!({
-            "type": "message",
-            "role": "system",
-            "content": "please resume with the following tool result, and answer user's question directly, don't trigger any more tool calls"
-        });
 
         let func_item = serde_json::json!({
             "type": "function_call",
@@ -1283,7 +1277,7 @@ impl OpenAIRouter {
 
         obj.insert(
             "input".to_string(),
-            Value::Array(vec![user_item, system_item, func_item, tool_item]),
+            Value::Array(vec![user_item, func_item, tool_item]),
         );
 
         // Ensure non-streaming and no store to upstream
