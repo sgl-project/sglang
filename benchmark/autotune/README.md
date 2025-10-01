@@ -1,6 +1,6 @@
 # SGLang Auto-Tune Tool
 
-Auto-tune tool for finding optimal SGLang server configurations through systematic parameter search.
+Auto-tune tool for finding optimal SGLang server arguments through basic grid search.
 
 ## Overview
 
@@ -98,18 +98,27 @@ Example `config.json`:
 - `--output-dir`: Directory to save results (default: "autotune_results")
 - `--save-server-logs`: Save server stdout/stderr logs
 - `--server-log-dir`: Directory for server logs (default: "server_logs")
-- `--tail-server-logs`: Show real-time server logs during execution
+- `--visualize`: Generate grouped bar charts for benchmark metrics
+- `--verbose-benchmark`: Show real-time benchmark output (default: True)
+- `--quiet`: Suppress real-time benchmark output
 
 ### Timeout Configuration
 - `--server-timeout`: Server startup timeout in seconds (default: 120)
 - `--benchmark-timeout`: Benchmark run timeout in seconds (default: 600)
+
+### Advanced Options
+- `--no-restart`: Don't restart server between benchmark runs (default: restart between runs for accurate isolated results)
+- `--warmup-prompts`: Number of warmup prompts before benchmark (default: 10)
+- `--config`: Path to JSON configuration file (overrides other arguments)
 
 ## Output
 
 The tool generates:
 1. **CSV file** with detailed results for each configuration and request rate
 2. **JSON summary** with the best configurations for each metric
-3. **Console output** showing progress and results in real-time
+3. **Reproduction commands file** with exact commands to reproduce each run
+4. **Console output** showing progress and results in real-time
+5. **Visualization (optional)** grouped bar charts when using `--visualize`
 
 ### Metrics Tracked
 - **Token Throughput**: Input, output, and total tokens per second
@@ -120,12 +129,13 @@ The tool generates:
 
 ## Advanced Features
 
-### Parallel Testing
-The tool automatically tests configurations in sequence but benchmarks multiple request rates for each configuration.
+### Server Restart Behavior
+By default, the server restarts between each benchmark run to ensure isolated, accurate measurements. Use `--no-restart` to keep the server running across multiple benchmarks with the same configuration (faster but may have caching effects).
 
 ### Server Log Management
 - Use `--save-server-logs` to save all server logs for debugging
-- Use `--tail-server-logs` to see real-time server output during testing
+- Use `--verbose-benchmark` (default) to see real-time benchmark output during testing
+- Use `--quiet` to suppress real-time output
 - Logs are organized by configuration and timestamp
 
 ### Custom Datasets
@@ -167,6 +177,15 @@ python -m benchmark.autotune.tune_server_args \
   --request-rates 1 \
   --num-prompts 10 \
   --save-server-logs \
-  --tail-server-logs \
   --verbose-benchmark
+```
+
+### Visualize Results
+```bash
+python -m benchmark.autotune.tune_server_args \
+  --model-path meta-llama/Meta-Llama-3-8B \
+  --tp 2 \
+  --search-server-args '{"attention_backend": ["flashinfer", "triton"]}' \
+  --request-rates 1 4 8 16 \
+  --visualize
 ```
