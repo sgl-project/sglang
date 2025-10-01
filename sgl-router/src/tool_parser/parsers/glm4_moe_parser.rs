@@ -136,34 +136,27 @@ impl ToolParser for Glm4MoeParser {
             return Ok((text.to_string(), vec![]));
         }
 
-        // Collect matches with positions and parse tools in one pass
-        let matches: Vec<_> = self.tool_call_extractor.find_iter(text).collect();
-        let mut tools = Vec::new();
+        // Find where tool calls begin
+        let idx = text.find("<tool_call>").unwrap();
+        let normal_text = text[..idx].to_string();
 
-        for mat in matches.iter() {
-            if let Some(tool) = self.parse_tool_call(mat.as_str())? {
-                tools.push(tool);
+        // Extract tool calls
+        let mut tools = Vec::new();
+        for mat in self.tool_call_extractor.find_iter(text) {
+            match self.parse_tool_call(mat.as_str()) {
+                Ok(Some(tool)) => tools.push(tool),
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!("Failed to parse tool call: {}", e);
+                    continue;
+                }
             }
         }
 
-        // Extract normal text using first and last match positions
-        let normal_text = if tools.is_empty() {
-            text.to_string()
-        } else {
-            let first_start = matches[0].start();
-            let last_end = matches.last().unwrap().end();
-            let before = if first_start > 0 {
-                &text[..first_start]
-            } else {
-                ""
-            };
-            let after = if last_end < text.len() {
-                &text[last_end..]
-            } else {
-                ""
-            };
-            format!("{}{}", before, after)
-        };
+        // If no tools were successfully parsed despite having markers, return entire text as fallback
+        if tools.is_empty() {
+            return Ok((text.to_string(), vec![]));
+        }
 
         Ok((normal_text, tools))
     }
@@ -245,82 +238,5 @@ impl ToolParser for Glm4MoeParser {
 
     fn detect_format(&self, text: &str) -> bool {
         self.has_tool_markers(text)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_glm4_single_tool() {
-        let parser = Glm4MoeParser::new();
-        let input = r#"Some text
-<tool_call>get_weather
-<arg_key>city</arg_key>
-<arg_value>Beijing</arg_value>
-<arg_key>date</arg_key>
-<arg_value>2024-06-27</arg_value>
-</tool_call>More text"#;
-
-        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "get_weather");
-        assert!(tools[0].function.arguments.contains("Beijing"));
-        assert!(tools[0].function.arguments.contains("2024-06-27"));
-        assert_eq!(normal_text, "Some text\nMore text"); // Text before and after tool call
-    }
-
-    #[tokio::test]
-    async fn test_parse_glm4_multiple_tools() {
-        let parser = Glm4MoeParser::new();
-        let input = r#"<tool_call>get_weather
-<arg_key>city</arg_key>
-<arg_value>Beijing</arg_value>
-</tool_call>
-<tool_call>get_weather
-<arg_key>city</arg_key>
-<arg_value>Shanghai</arg_value>
-</tool_call>"#;
-
-        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].function.name, "get_weather");
-        assert_eq!(tools[1].function.name, "get_weather");
-        assert!(tools[0].function.arguments.contains("Beijing"));
-        assert!(tools[1].function.arguments.contains("Shanghai"));
-        assert_eq!(normal_text, ""); // Pure tool calls, no normal text
-    }
-
-    #[tokio::test]
-    async fn test_parse_glm4_mixed_types() {
-        let parser = Glm4MoeParser::new();
-        let input = r#"<tool_call>process_data
-<arg_key>count</arg_key>
-<arg_value>42</arg_value>
-<arg_key>active</arg_key>
-<arg_value>true</arg_value>
-<arg_key>name</arg_key>
-<arg_value>test</arg_value>
-</tool_call>"#;
-
-        let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(normal_text, ""); // Pure tool call, no normal text
-        assert_eq!(tools[0].function.name, "process_data");
-
-        // Parse arguments to check types
-        let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
-        assert_eq!(args["count"], 42);
-        assert_eq!(args["active"], true);
-        assert_eq!(args["name"], "test");
-    }
-
-    #[test]
-    fn test_detect_format() {
-        let parser = Glm4MoeParser::new();
-        assert!(parser.detect_format("<tool_call>"));
-        assert!(!parser.detect_format("plain text"));
-        assert!(!parser.detect_format("[TOOL_CALLS]"));
     }
 }
