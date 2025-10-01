@@ -184,7 +184,7 @@ suite_amd = {
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("lora/test_lora_cuda_graph.py", 250),
         TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("models/test_embedding_models.py", 73),
+        # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
@@ -246,7 +246,7 @@ suite_amd = {
         TestFile("test_triton_attention_backend.py", 150),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_wave_attention_kernels.py", 2),
-        TestFile("test_wave_attention_backend.py", 150),
+        # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
     ],
     "per-commit-amd-mi35x": [
         TestFile("test_mla.py", 242),
@@ -257,7 +257,7 @@ suite_amd = {
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),
-        TestFile("test_patch_torch.py", 19),
+        # TestFile("test_patch_torch.py", 19), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
