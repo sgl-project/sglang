@@ -4,7 +4,8 @@ use anyhow::{Error, Result};
 use tokenizers::tokenizer::Tokenizer as HfTokenizer;
 
 use super::chat_template::{
-    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateProcessor,
+    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
+    ChatTemplateProcessor,
 };
 use super::traits::{
     Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
@@ -24,7 +25,12 @@ pub struct HuggingFaceTokenizer {
 impl HuggingFaceTokenizer {
     /// Create a tokenizer from a HuggingFace tokenizer JSON file
     pub fn from_file(file_path: &str) -> Result<Self> {
-        Self::from_file_with_chat_template(file_path, None)
+        // Try to auto-discover chat template if not explicitly provided
+        let path = std::path::Path::new(file_path);
+        let chat_template_path = path
+            .parent()
+            .and_then(crate::tokenizer::factory::discover_chat_template_in_dir);
+        Self::from_file_with_chat_template(file_path, chat_template_path.as_deref())
     }
 
     /// Create a tokenizer from a HuggingFace tokenizer JSON file with an optional chat template
@@ -134,13 +140,35 @@ impl HuggingFaceTokenizer {
         None
     }
 
-    /// Load chat template from a .jinja file
+    /// Load chat template from a file (.jinja or .json containing Jinja)
     fn load_chat_template_from_file(template_path: &str) -> Result<Option<String>> {
         use std::fs;
 
         let content = fs::read_to_string(template_path)
             .map_err(|e| Error::msg(format!("Failed to read chat template file: {}", e)))?;
 
+        // Check if it's a JSON file containing a Jinja template
+        if template_path.ends_with(".json") {
+            // Parse JSON and extract the template string
+            let json_value: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| Error::msg(format!("Failed to parse chat_template.json: {}", e)))?;
+
+            if let Some(template_str) = json_value.as_str() {
+                return Ok(Some(template_str.to_string()));
+            } else if let Some(obj) = json_value.as_object() {
+                if let Some(template_value) = obj.get("chat_template") {
+                    if let Some(template_str) = template_value.as_str() {
+                        return Ok(Some(template_str.to_string()));
+                    }
+                }
+            }
+
+            return Err(Error::msg(
+                "chat_template.json does not contain a valid template",
+            ));
+        }
+
+        // Otherwise it's a plain .jinja file
         // Clean up the template (similar to Python implementation)
         let template = content.trim().replace("\\n", "\n");
 
@@ -165,16 +193,11 @@ impl HuggingFaceTokenizer {
     pub fn apply_chat_template(
         &self,
         messages: &[serde_json::Value],
-        add_generation_prompt: bool,
+        params: ChatTemplateParams,
     ) -> Result<String> {
         if let Some(ref template) = self.chat_template {
-            let processor = ChatTemplateProcessor::new(
-                template.clone(),
-                self.special_tokens.bos_token.clone(),
-                self.special_tokens.eos_token.clone(),
-            );
-
-            processor.apply_chat_template(messages, add_generation_prompt)
+            let processor = ChatTemplateProcessor::new(template.clone());
+            processor.apply_chat_template(messages, params)
         } else {
             Err(Error::msg(
                 "Cannot use chat template functions because tokenizer.chat_template is not set and no template \

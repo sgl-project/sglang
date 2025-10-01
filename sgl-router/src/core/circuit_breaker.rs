@@ -336,7 +336,6 @@ mod tests {
         };
         let cb = CircuitBreaker::with_config(config);
 
-        // Record failures up to threshold
         assert_eq!(cb.state(), CircuitState::Closed);
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Closed);
@@ -344,7 +343,6 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Closed);
         cb.record_failure();
 
-        // Circuit should now be open
         assert_eq!(cb.state(), CircuitState::Open);
         assert!(!cb.can_execute());
         assert_eq!(cb.failure_count(), 3);
@@ -359,14 +357,11 @@ mod tests {
         };
         let cb = CircuitBreaker::with_config(config);
 
-        // Open the circuit
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
 
-        // Wait for timeout
         thread::sleep(Duration::from_millis(150));
 
-        // Circuit should be half-open
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         assert!(cb.can_execute());
     }
@@ -381,20 +376,16 @@ mod tests {
         };
         let cb = CircuitBreaker::with_config(config);
 
-        // Open the circuit
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
 
-        // Wait for timeout
         thread::sleep(Duration::from_millis(100));
         assert_eq!(cb.state(), CircuitState::HalfOpen);
 
-        // Record successes
         cb.record_success();
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         cb.record_success();
 
-        // Circuit should now be closed
         assert_eq!(cb.state(), CircuitState::Closed);
         assert!(cb.can_execute());
     }
@@ -408,18 +399,14 @@ mod tests {
         };
         let cb = CircuitBreaker::with_config(config);
 
-        // Open the circuit
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
 
-        // Wait for timeout
         thread::sleep(Duration::from_millis(100));
         assert_eq!(cb.state(), CircuitState::HalfOpen);
 
-        // Record a failure in half-open state
         cb.record_failure();
 
-        // Circuit should reopen immediately
         assert_eq!(cb.state(), CircuitState::Open);
         assert!(!cb.can_execute());
     }
@@ -432,17 +419,14 @@ mod tests {
         };
         let cb = CircuitBreaker::with_config(config);
 
-        // Record some failures
         cb.record_failure();
         cb.record_failure();
         assert_eq!(cb.failure_count(), 2);
 
-        // Success should reset failure count
         cb.record_success();
         assert_eq!(cb.failure_count(), 0);
         assert_eq!(cb.success_count(), 1);
 
-        // Can now record more failures without opening
         cb.record_failure();
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Closed);
@@ -456,11 +440,9 @@ mod tests {
         };
         let cb = CircuitBreaker::with_config(config);
 
-        // Open the circuit
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
 
-        // Manual reset
         cb.reset();
         assert_eq!(cb.state(), CircuitState::Closed);
         assert_eq!(cb.failure_count(), 0);
@@ -505,7 +487,6 @@ mod tests {
         let cb2 = cb1.clone();
         assert_eq!(cb2.failure_count(), 1);
 
-        // Changes to cb1 affect cb2 (shared state)
         cb1.record_failure();
         assert_eq!(cb2.failure_count(), 2);
     }

@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use sglang_router_rs::protocols::spec;
+    use sglang_router_rs::tokenizer::chat_template::ChatTemplateParams;
     use sglang_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;
     use std::fs;
     use tempfile::TempDir;
@@ -56,7 +57,6 @@ mod tests {
         )
         .unwrap();
 
-        // Test that the custom template is used
         let messages = vec![
             spec::ChatMessage::User {
                 role: "user".to_string(),
@@ -79,9 +79,15 @@ mod tests {
             .map(|msg| serde_json::to_value(msg).unwrap())
             .collect();
 
-        let result = tokenizer.apply_chat_template(&json_messages, true).unwrap();
+        use sglang_router_rs::tokenizer::chat_template::ChatTemplateParams;
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+        let result = tokenizer
+            .apply_chat_template(&json_messages, params)
+            .unwrap();
 
-        // Verify the custom template format
         assert!(result.contains("<|user|>Hello"));
         assert!(result.contains("<|assistant|>Hi there"));
         assert!(result.ends_with("<|assistant|>"));
@@ -150,7 +156,7 @@ mod tests {
             .collect();
 
         let result = tokenizer
-            .apply_chat_template(&json_messages, false)
+            .apply_chat_template(&json_messages, ChatTemplateParams::default())
             .unwrap();
 
         // Should use CUSTOM template, not built-in
@@ -219,7 +225,7 @@ mod tests {
             .collect();
 
         let result = tokenizer
-            .apply_chat_template(&json_messages, false)
+            .apply_chat_template(&json_messages, ChatTemplateParams::default())
             .unwrap();
 
         assert!(result.starts_with("NEW:"));
