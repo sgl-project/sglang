@@ -1911,7 +1911,7 @@ class Scheduler(
 
         # Print stats
         if self.current_scheduler_metrics_enabled():
-            self.log_prefill_stats(adder, can_run_list, running_bs)
+            self.log_prefill_stats(adder, can_run_list, running_bs, None)
 
         for req in can_run_list:
             if req.time_stats.forward_entry_time == 0:
@@ -2790,12 +2790,6 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
-    # Config the process
-    setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
-    faulthandler.enable()
-    kill_itself_when_parent_died()
-    parent_process = psutil.Process().parent()
-
     # Generate the logger prefix
     prefix = ""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
@@ -2809,6 +2803,12 @@ def run_scheduler_process(
         prefix += f" EP{moe_ep_rank}"
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
+
+    # Config the process
+    setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
+    faulthandler.enable()
+    kill_itself_when_parent_died()
+    parent_process = psutil.Process().parent()
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
