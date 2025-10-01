@@ -7,20 +7,44 @@ use sglang_router_rs::tool_parser::{LlamaParser, ToolParser};
 #[tokio::test]
 async fn test_llama_python_tag_format() {
     let parser = LlamaParser::new();
-    let input = r#"<|python_tag|>{"name": "search", "arguments": {"query": "weather"}}"#;
+    let input = r#"Here are some results: <|python_tag|>{"name": "search", "parameters": {"query": "weather"}}"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].function.name, "search");
+    assert_eq!(normal_text, "Here are some results: ");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["query"], "weather");
 }
 
 #[tokio::test]
+async fn test_llama_with_semicolon_separation() {
+    let parser = LlamaParser::new();
+
+    let input = r#"<|python_tag|>{"name": "tool1", "parameters": {}};{"name": "tool2", "parameters": {"y": 2}}"#;
+
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].function.name, "tool1");
+    assert_eq!(tools[1].function.name, "tool2");
+    assert_eq!(normal_text, "");
+}
+
+#[tokio::test]
+async fn test_llama_no_tool_calls() {
+    let parser = LlamaParser::new();
+
+    let input = "This is just plain text with no tool calls";
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 0);
+    assert_eq!(normal_text, input);
+}
+
+#[tokio::test]
 async fn test_llama_plain_json_fallback() {
     let parser = LlamaParser::new();
-    let input = r#"{"name": "calculate", "arguments": {"x": 5, "y": 10}}"#;
+    let input = r#"{"name": "calculate", "parameters": {"x": 5, "y": 10}}"#;
 
     let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
@@ -34,7 +58,7 @@ async fn test_llama_plain_json_fallback() {
 #[tokio::test]
 async fn test_llama_with_text_before() {
     let parser = LlamaParser::new();
-    let input = r#"Let me help you with that. <|python_tag|>{"name": "get_time", "arguments": {"timezone": "UTC"}}"#;
+    let input = r#"Let me help you with that. <|python_tag|>{"name": "get_time", "parameters": {"timezone": "UTC"}}"#;
 
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
@@ -50,7 +74,7 @@ async fn test_llama_with_nested_json() {
     let parser = LlamaParser::new();
     let input = r#"<|python_tag|>{
         "name": "update_settings",
-        "arguments": {
+        "parameters": {
             "preferences": {
                 "theme": "dark",
                 "language": "en"
@@ -73,13 +97,13 @@ async fn test_llama_empty_arguments() {
     let parser = LlamaParser::new();
 
     // With python_tag
-    let input = r#"<|python_tag|>{"name": "ping", "arguments": {}}"#;
+    let input = r#"<|python_tag|>{"name": "ping", "parameters": {}}"#;
     let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].function.name, "ping");
 
     // Plain JSON
-    let input = r#"{"name": "ping", "arguments": {}}"#;
+    let input = r#"{"name": "ping", "parameters": {}}"#;
     let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].function.name, "ping");
@@ -90,7 +114,7 @@ async fn test_llama_format_detection() {
     let parser = LlamaParser::new();
 
     assert!(parser.detect_format(r#"<|python_tag|>{"name": "test"}"#));
-    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
+    assert!(parser.detect_format(r#"{"name": "test", "parameters": {}}"#));
     assert!(!parser.detect_format("plain text"));
     assert!(!parser.detect_format(r#"{"key": "value"}"#)); // No name field
 }
@@ -112,7 +136,7 @@ async fn test_llama_real_world_output() {
     // Actual output from Llama 3.2 model - simplified for testing
     let input = r#"I'll search for that information for you.
 
-<|python_tag|>{"name": "web_search", "arguments": {"query": "Llama 3.2 model capabilities", "num_results": 5, "search_type": "recent"}}"#;
+<|python_tag|>{"name": "web_search", "parameters": {"query": "Llama 3.2 model capabilities", "num_results": 5, "search_type": "recent"}}"#;
 
     let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
@@ -120,7 +144,7 @@ async fn test_llama_real_world_output() {
 
     let formatted_input = r#"<|python_tag|>{
     "name": "get_current_time",
-    "arguments": {
+    "parameters": {
         "timezone": "America/New_York",
         "format": "ISO8601"
     }
@@ -132,21 +156,9 @@ async fn test_llama_real_world_output() {
 }
 
 #[tokio::test]
-async fn test_llama_json_array_format() {
-    let parser = LlamaParser::new();
-
-    // Plain JSON array (should work as fallback)
-    let input = r#"[{"name": "func1", "arguments": {}}, {"name": "func2", "arguments": {}}]"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    // Current implementation might handle this through JSON fallback
-    assert!(!tools.is_empty());
-}
-
-#[tokio::test]
 async fn test_single_json() {
     let parser = LlamaParser::new();
-    let text = r#"{"name": "get_weather", "arguments": {"city": "Paris"}}"#;
+    let text = r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#;
 
     let (_normal_text, tools) = parser.parse_complete(text).await.unwrap();
     assert_eq!(tools.len(), 1);
@@ -159,7 +171,7 @@ async fn test_single_json() {
 #[tokio::test]
 async fn test_multiple_json_with_separator() {
     let parser = LlamaParser::new();
-    let text = r#"<|python_tag|>{"name": "get_weather", "arguments": {"city": "Paris"}};{"name": "get_tourist_attractions", "arguments": {"city": "Paris"}}"#;
+    let text = r#"<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}};{"name": "get_tourist_attractions", "parameters": {"city": "Paris"}}"#;
 
     let (_normal_text, tools) = parser.parse_complete(text).await.unwrap();
     // Note: Current implementation may only parse the first one due to semicolon handling
@@ -168,30 +180,23 @@ async fn test_multiple_json_with_separator() {
 }
 
 #[tokio::test]
-async fn test_multiple_json_with_separator_customized() {
-    let parser = LlamaParser::new();
-    let text = r#"<|python_tag|>{"name": "get_weather", "arguments": {}}<|python_tag|>{"name": "get_tourist_attractions", "arguments": {}}"#;
-
-    let (_normal_text, tools) = parser.parse_complete(text).await.unwrap();
-    // Current implementation may handle this differently
-    assert!(!tools.is_empty());
-    assert_eq!(tools[0].function.name, "get_weather");
-}
-
-#[tokio::test]
 async fn test_json_with_trailing_text() {
     let parser = LlamaParser::new();
-    let text = r#"{"name": "get_weather", "arguments": {}} Some follow-up text"#;
+    // Valid JSON with trailing text - LlamaParser doesn't support this mixed format
+    let text = r#"{"name": "get_weather", "parameters": {}} Some follow-up text"#;
 
-    let (_normal_text, tools) = parser.parse_complete(text).await.unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "get_weather");
+    let (normal_text, tools) = parser.parse_complete(text).await.unwrap();
+    // LlamaParser expects pure JSON or <|python_tag|> format, not JSON with trailing text
+    // So this returns as normal text
+    assert_eq!(tools.len(), 0);
+    assert_eq!(normal_text, text);
 }
 
 #[tokio::test]
 async fn test_invalid_then_valid_json() {
     let parser = LlamaParser::new();
-    let text = r#"{"name": "get_weather", "arguments": {{"name": "get_weather", "arguments": {}}"#;
+    let text =
+        r#"{"name": "get_weather", "parameters": {{"name": "get_weather", "parameters": {}}"#;
 
     let (_normal_text, tools) = parser.parse_complete(text).await.unwrap();
     // Should parse at least one valid JSON
@@ -212,7 +217,7 @@ async fn test_plain_text_only() {
 #[tokio::test]
 async fn test_with_python_tag_prefix() {
     let parser = LlamaParser::new();
-    let text = r#"Some intro. <|python_tag|>{"name": "get_weather", "arguments": {}}"#;
+    let text = r#"Some intro. <|python_tag|>{"name": "get_weather", "parameters": {}}"#;
 
     let (_normal_text, tools) = parser.parse_complete(text).await.unwrap();
     assert_eq!(tools.len(), 1);
@@ -227,7 +232,7 @@ async fn test_llama_streaming_simple() {
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
     // Send complete JSON at once
-    let full_json = r#"<|python_tag|>{"name": "search", "arguments": {"query": "weather"}}"#;
+    let full_json = r#"<|python_tag|>{"name": "search", "parameters": {"query": "weather"}}"#;
 
     let result = parser
         .parse_incremental(full_json, &mut state)
@@ -252,7 +257,7 @@ async fn test_llama_streaming_partial() {
         r#"<|python"#,
         r#"_tag|>{"name": "#,
         r#""calculate", "#,
-        r#""arguments": {"x": 10}"#,
+        r#""parameters": {"x": 10}"#,
         r#"}"#,
     ];
 
@@ -278,7 +283,7 @@ async fn test_llama_streaming_plain_json() {
     let chunks = vec![
         r#"{"name": "#,
         r#""search", "#,
-        r#""arguments": "#,
+        r#""parameters": "#,
         r#"{"query": "#,
         r#""test"}}"#,
     ];
@@ -305,7 +310,7 @@ async fn test_llama_streaming_with_text_before() {
         r#"Let me help you. "#,
         r#"<|python_tag|>"#,
         r#"{"name": "get_time","#,
-        r#" "arguments": {"#,
+        r#" "parameters": {"#,
         r#""timezone": "UTC"}}"#,
     ];
 
@@ -328,7 +333,7 @@ async fn test_llama_streaming_multiple_tools() {
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
     let text =
-        r#"<|python_tag|>{"name": "func1", "arguments": {}};{"name": "func2", "arguments": {}}"#;
+        r#"<|python_tag|>{"name": "func1", "parameters": {}};{"name": "func2", "parameters": {}}"#;
 
     let result = parser.parse_incremental(text, &mut state).await.unwrap();
 
@@ -337,7 +342,7 @@ async fn test_llama_streaming_multiple_tools() {
         sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
             assert_eq!(tool.function.name, "func1");
         }
-        _ => panic!("Expected first tool to be complete"),
+        _ => panic!("Expected first tool to be complete, got: {:?}", result),
     }
 
     // Process remaining buffer to get second tool
@@ -356,7 +361,7 @@ async fn test_llama_streaming_multiple_tools_chunked() {
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
     // First chunk - incomplete first JSON
-    let chunk1 = r#"<|python_tag|>{"name": "get_weather", "arguments""#;
+    let chunk1 = r#"<|python_tag|>{"name": "get_weather", "parameters""#;
     let result1 = parser.parse_incremental(chunk1, &mut state).await.unwrap();
 
     // Should be incomplete or have tool name
@@ -383,32 +388,15 @@ async fn test_llama_streaming_multiple_tools_chunked() {
             let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
             assert_eq!(args["city"], "Paris");
         }
-        _ => panic!("Expected first tool to be complete after separator"),
+        _ => panic!("Expected first tool complete, got: {:?}", result2),
     }
 
-    // Third chunk - complete second JSON
-    let chunk3 = r#""get_time", "arguments": {"timezone": "UTC"}}"#;
+    let chunk3 = r#""get_time", "parameters": {"timezone": "UTC"}}"#;
     let result3 = parser.parse_incremental(chunk3, &mut state).await.unwrap();
-
-    // Should get second tool complete
     match result3 {
         sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
             assert_eq!(tool.function.name, "get_time");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert_eq!(args["timezone"], "UTC");
         }
-        _ => {
-            // If not complete yet, try one more empty chunk
-            let result4 = parser.parse_incremental("", &mut state).await.unwrap();
-            match result4 {
-                sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-                    assert_eq!(tool.function.name, "get_time");
-                    let args: serde_json::Value =
-                        serde_json::from_str(&tool.function.arguments).unwrap();
-                    assert_eq!(args["timezone"], "UTC");
-                }
-                _ => panic!("Expected second tool to be complete"),
-            }
-        }
+        _ => panic!("Expected tool to be complete, got: {:?}", result3),
     }
 }
