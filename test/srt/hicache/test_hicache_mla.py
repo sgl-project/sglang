@@ -33,7 +33,7 @@ class TestHierarchicalMLA(CustomTestCase):
                 "--trust-remote-code",
                 "--enable-hierarchical-cache",
             ]
-            + hicache_args,
+            + hicache_args
             + mem_frac_args,
         )
 
