@@ -12,7 +12,7 @@ This section explains how to configure the request tracing and export the trace 
     pip install -e "python[tracing]"
 
     # or manually install the dependencies using pip
-    pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc
+    pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc opentelemetry-instrumentation-fastapi
     ```
 
 2. launch opentelemetry collector and jaeger

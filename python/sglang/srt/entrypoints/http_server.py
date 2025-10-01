@@ -29,7 +29,11 @@ import time
 from http import HTTPStatus
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.tracing.trace import (
+    instrument_fastapi,
+    process_tracing_init,
+    trace_set_thread_info,
+)
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -1181,6 +1185,9 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     if isinstance(ret, Response):
         return ret
     return ORJSONResponse({"predictions": ret})
+
+
+instrument_fastapi(app)
 
 
 def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
