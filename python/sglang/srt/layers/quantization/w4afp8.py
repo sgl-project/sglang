@@ -19,10 +19,6 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_npu, set_weight_attrs
 
-_is_npu = is_npu()
-if not _is_npu:
-    from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.ep_moe.layer import EPMoE
