@@ -1801,11 +1801,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 self.sampling_info.grammars = None
 
-        seq_lens_cpu = (
-            seq_lens_cpu_cache
-            if seq_lens_cpu_cache is not None
-            else self.seq_lens.cpu()
-        )
+        if self.forward_mode.is_decode_or_idle():
+            attention_backend_str = global_server_args_dict["decode_attention_backend"]
+        else:
+            attention_backend_str = global_server_args_dict["prefill_attention_backend"]
+        # Create seq_lens_cpu when needed
+        if (
+            not global_server_args_dict["use_mla_backend"]
+            and attention_backend_str == "flashinfer"
+        ):
+            # for meta-llama/Llama-3.2-11B-Vision-Instruct
+            seq_lens_cpu = None
+        else:
+            seq_lens_cpu = (
+                seq_lens_cpu_cache
+                if seq_lens_cpu_cache is not None
+                else self.seq_lens.cpu()
+            )
 
         global bid
         bid += 1
