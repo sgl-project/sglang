@@ -106,6 +106,7 @@ deadpool-postgres = "0.14.1"
 # wasm dependencies
 sha2 = "0.10"
 wasmtime = { version = "38.0", features = ["component-model", "async"] }
+wasmtime-wasi = "38.0"
 async-channel = "2.5"
 
 [build-dependencies]

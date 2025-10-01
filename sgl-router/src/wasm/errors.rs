@@ -1,6 +1,30 @@
+//! WASM Error Types
+//!
+//! Defines comprehensive error types for the WASM subsystem,
+//! including module, manager, and runtime errors.
+
+use std::fmt;
+
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, WasmError>;
+
+/// SHA256 hash wrapper for display purposes
+#[derive(Debug, Clone, Copy)]
+pub struct Sha256Hash(pub [u8; 32]);
+
+impl fmt::Display for Sha256Hash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let hex_string: String = self.0.iter().map(|b| format!("{:02x}", b)).collect();
+        write!(f, "{}", hex_string)
+    }
+}
+
+impl From<[u8; 32]> for Sha256Hash {
+    fn from(hash: [u8; 32]) -> Self {
+        Sha256Hash(hash)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum WasmError {
@@ -25,8 +49,8 @@ pub enum WasmModuleError {
     #[error("invalid module descriptor: {0}")]
     InvalidDescriptor(String),
 
-    #[error("module with same sha256 already exists: {0:?}")]
-    DuplicateSha256([u8; 32]),
+    #[error("module with same sha256 already exists: {0}")]
+    DuplicateSha256(Sha256Hash),
 
     #[error("module not found: {0}")]
     NotFound(uuid::Uuid),

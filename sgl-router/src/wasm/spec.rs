@@ -1,8 +1,16 @@
+//! WIT Bindings and Type Conversions
+//!
+//! Contains wasmtime component bindings generated from WIT definitions,
+//! and helper functions to convert between Axum HTTP types and WIT types.
+
+use axum::{body::Body, extract::Request};
 use serde::{Deserialize, Serialize};
 
 wasmtime::component::bindgen!({
     path: "src/wasm/wit",
     world: "sgl-router",
+    imports: { default: async | trappable },
+    exports: { default: async },
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,10 +114,6 @@ pub struct WitMiddlewareModifyAction {
     pub body_replace: Option<Vec<u8>>,
 }
 
-// Helper functions for converting from axum types to WIT types
-
-use axum::{body::Body, extract::Request};
-
 /// Convert axum Request to WIT Request
 ///
 /// This helper function extracts all necessary information from an axum Request
@@ -134,7 +138,7 @@ pub async fn build_wit_request_from_axum(
         }
     }
 
-    // Extract body (this consumes the request)
+    // TODO: Extract body (this consumes the request)
     let body = axum::body::to_bytes(request.into_body(), usize::MAX)
         .await
         .map_err(|e| format!("Failed to read request body: {}", e))?
@@ -148,9 +152,15 @@ pub async fn build_wit_request_from_axum(
         headers,
         body,
         request_id,
+        // SystemTime::duration_since only fails if the system time is before UNIX_EPOCH,
+        // which should never happen in normal operation. If it does, use 0 as fallback.
         now_epoch_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_else(|_| {
+                // Fallback to 0 if system time is invalid
+                // This should never occur in practice, but provides a safe fallback
+                std::time::Duration::from_millis(0)
+            })
             .as_millis() as u64,
     })
 }
@@ -176,7 +186,7 @@ pub async fn build_wit_response_from_axum(
         }
     }
 
-    // Extract body (this consumes the response)
+    // TODO: Extract body (this consumes the response)
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .map_err(|e| format!("Failed to read response body: {}", e))?

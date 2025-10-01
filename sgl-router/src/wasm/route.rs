@@ -1,3 +1,10 @@
+//! WASM HTTP API Routes
+//!
+//! Provides REST API endpoints for managing WASM modules:
+//! - POST /wasm - Add modules
+//! - DELETE /wasm/:uuid - Remove a module
+//! - GET /wasm - List all modules with metrics
+
 use std::sync::Arc;
 
 use axum::{
@@ -10,7 +17,8 @@ use uuid::Uuid;
 use crate::{
     server::AppState,
     wasm::module::{
-        WasmModuleAddRequest, WasmModuleAddResponse, WasmModuleAddResult, WasmModuleListResponse,
+        WasmMetrics, WasmModuleAddRequest, WasmModuleAddResponse, WasmModuleAddResult,
+        WasmModuleListResponse,
     },
 };
 
@@ -28,9 +36,8 @@ pub async fn add_wasm_module(
         if let Ok(module_uuid) = result {
             module.add_result = Some(WasmModuleAddResult::Success(module_uuid));
         } else {
-            module.add_result = Some(WasmModuleAddResult::Error(
-                result.err().unwrap().to_string(),
-            ));
+            // We know result is Err here, so unwrap_err() is safe
+            module.add_result = Some(WasmModuleAddResult::Error(result.unwrap_err().to_string()));
             status = StatusCode::BAD_REQUEST;
         }
     }
@@ -61,7 +68,21 @@ pub async fn list_wasm_modules(State(state): State<Arc<AppState>>) -> Response {
     };
     let modules = wasm_manager.get_modules();
     if let Ok(modules) = modules {
-        let response = WasmModuleListResponse { modules };
+        let (total, success, failed, total_time_ms, max_time_ms) = wasm_manager.get_metrics();
+        let average_execution_time_ms = if total > 0 {
+            Some(total_time_ms as f64 / total as f64)
+        } else {
+            None
+        };
+        let metrics = WasmMetrics {
+            total_executions: total,
+            successful_executions: success,
+            failed_executions: failed,
+            total_execution_time_ms: total_time_ms,
+            max_execution_time_ms: max_time_ms,
+            average_execution_time_ms,
+        };
+        let response = WasmModuleListResponse { modules, metrics };
         (StatusCode::OK, Json(response)).into_response()
     } else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();

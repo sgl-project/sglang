@@ -1,3 +1,8 @@
+//! WASM Runtime Configuration
+//!
+//! Defines configuration parameters for the WASM runtime,
+//! including memory limits, execution timeouts, and thread pool settings.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
