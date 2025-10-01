@@ -74,7 +74,7 @@ class TestTrace(CustomTestCase):
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-trace", "--oltp-traces-endpoint", "0.0.0.0:4317"],
+            other_args=["--enable-trace", "--otlp-traces-endpoint", "0.0.0.0:4317"],
         )
 
         try:
@@ -121,7 +121,7 @@ class TestTrace(CustomTestCase):
             model_path=model_path,
             random_seed=42,
             enable_trace=True,
-            oltp_traces_endpoint="localhost:4317",
+            otlp_traces_endpoint="localhost:4317",
         )
 
         try:
@@ -148,7 +148,7 @@ class TestTrace(CustomTestCase):
             model_path=model_path,
             random_seed=42,
             enable_trace=True,
-            oltp_traces_endpoint="localhost:4317",
+            otlp_traces_endpoint="localhost:4317",
             is_embedding=True,
         )
 
