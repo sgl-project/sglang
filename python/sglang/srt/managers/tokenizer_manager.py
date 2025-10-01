@@ -164,6 +164,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else None
         )
         self.crash_dump_folder = server_args.crash_dump_folder
+        self.enable_trace = server_args.enable_trace
 
         # Read model args
         self.model_path = server_args.model_path
@@ -381,23 +382,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # If it's a single value, add worker_id prefix
                 obj.rid = f"{self.worker_id}_{obj.rid}"
 
-        if obj.is_single:
-            bootstrap_room = (
-                obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
-            )
-            trace_req_start(obj.rid, bootstrap_room, ts=int(created_time * 1e9))
-            trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
-        else:
-            for i in range(len(obj.rid)):
-                bootstrap_room = (
-                    obj.bootstrap_room[i]
-                    if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
-                    else None
-                )
-                trace_req_start(obj.rid[i], bootstrap_room, ts=int(created_time * 1e9))
-                trace_slice_start(
-                    "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
-                )
+        if self.enable_trace:
+            self._trace_request_start(obj, created_time)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -1120,84 +1106,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             all_paused_requests = [r.num_paused_requests for r in result]
             return all_success, all_message, all_paused_requests
 
-    async def open_session(
-        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
-    ):
-        self.auto_create_handle_loop()
-
-        if obj.session_id is None:
-            obj.session_id = uuid.uuid4().hex
-        elif obj.session_id in self.session_futures:
-            return None
-
-        if self.server_args.tokenizer_worker_num > 1:
-            obj = MultiTokenizerWrapper(self.worker_id, obj)
-        self.send_to_scheduler.send_pyobj(obj)
-
-        self.session_futures[obj.session_id] = asyncio.Future()
-        session_id = await self.session_futures[obj.session_id]
-        del self.session_futures[obj.session_id]
-        return session_id
-
-    async def close_session(
-        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
-    ):
-        await self.send_to_scheduler.send_pyobj(obj)
-
-    def get_log_request_metadata(self):
-        max_length = None
-        skip_names = None
-        out_skip_names = None
-        if self.log_requests:
-            if self.log_requests_level == 0:
-                max_length = 1 << 30
-                skip_names = set(
-                    [
-                        "text",
-                        "input_ids",
-                        "input_embeds",
-                        "image_data",
-                        "audio_data",
-                        "lora_path",
-                        "sampling_params",
-                    ]
-                )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                        "embedding",
-                    ]
-                )
-            elif self.log_requests_level == 1:
-                max_length = 1 << 30
-                skip_names = set(
-                    [
-                        "text",
-                        "input_ids",
-                        "input_embeds",
-                        "image_data",
-                        "audio_data",
-                        "lora_path",
-                    ]
-                )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                        "embedding",
-                    ]
-                )
-            elif self.log_requests_level == 2:
-                max_length = 2048
-            elif self.log_requests_level == 3:
-                max_length = 1 << 30
-            else:
-                raise ValueError(
-                    f"Invalid --log-requests-level: {self.log_requests_level=}"
-                )
-        return max_length, skip_names, out_skip_names
-
     def configure_logging(self, obj: ConfigureLoggingReq):
         if obj.log_requests is not None:
             self.log_requests = obj.log_requests
@@ -1889,6 +1797,29 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             loads = await self.get_load_communicator(GetLoadReqInput())
             load_udpate_req = WatchLoadUpdateReq(loads=loads)
             self.send_to_scheduler.send_pyobj(load_udpate_req)
+
+    def _trace_request_start(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        created_time: Optional[float] = None,
+    ):
+        if obj.is_single:
+            bootstrap_room = (
+                obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
+            )
+            trace_req_start(obj.rid, bootstrap_room, ts=int(created_time * 1e9))
+            trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
+        else:
+            for i in range(len(obj.rid)):
+                bootstrap_room = (
+                    obj.bootstrap_room[i]
+                    if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
+                    else None
+                )
+                trace_req_start(obj.rid[i], bootstrap_room, ts=int(created_time * 1e9))
+                trace_slice_start(
+                    "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
+                )
 
 
 class ServerStatus(Enum):

@@ -157,10 +157,8 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.tracing.trace import (
     process_tracing_init,
-    trace_event,
     trace_set_proc_propagate_context,
     trace_set_thread_info,
-    trace_slice,
     trace_slice_batch,
     trace_slice_end,
     trace_slice_start,
@@ -901,10 +899,6 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
-                for req in batch.reqs:
-                    trace_event("schedule", req.rid)
-
-            if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -924,10 +918,6 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-
-            if batch:
-                for req in batch.reqs:
-                    trace_event("schedule", req.rid)
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -1193,10 +1183,13 @@ class Scheduler(
                 src=self.tp_group.ranks[0],
             )
 
-        for req in recv_reqs:
-            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
-                trace_set_proc_propagate_context(req.rid, req.trace_context)
-                trace_slice_start("", req.rid, anonymous=True)
+        if self.enable_trace:
+            for req in recv_reqs:
+                if isinstance(
+                    req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                ):
+                    trace_set_proc_propagate_context(req.rid, req.trace_context)
+                    trace_slice_start("", req.rid, anonymous=True)
 
         return recv_reqs
 

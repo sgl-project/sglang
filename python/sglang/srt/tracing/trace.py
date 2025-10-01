@@ -409,9 +409,11 @@ def trace_slice_start(
     ts: Optional[int] = None,
     anonymous: bool = False,
 ):
+    if not tracing_enabled:
+        return
 
     rid = str(rid)
-    if not tracing_enabled or rid not in reqs_context:
+    if rid not in reqs_context:
         return
 
     pid = threading.get_native_id()
@@ -517,10 +519,13 @@ trace_slice = trace_slice_end
 
 # Add event to the current slice on the same thread with the same rid.
 def trace_event(name: str, rid: str, ts: Optional[int] = None):
-    if not tracing_enabled or rid not in reqs_context:
+    if not tracing_enabled:
         return
 
     rid = str(rid)
+    if rid not in reqs_context:
+        return
+
     pid = threading.get_native_id()
     if pid not in reqs_context[rid].threads_context:
         return
@@ -539,10 +544,13 @@ def trace_event(name: str, rid: str, ts: Optional[int] = None):
 
 # Add attrs to the current slice on the same thread with the same rid.
 def trace_slice_add_attr(rid: str, attrs: Dict[str, Any]):
-    if not tracing_enabled or rid not in reqs_context:
+    if not tracing_enabled:
         return
 
     rid = str(rid)
+    if rid not in reqs_context:
+        return
+
     pid = threading.get_native_id()
     if pid not in reqs_context[rid].threads_context:
         return
