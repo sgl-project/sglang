@@ -210,7 +210,7 @@ class NGRAMWorker:
     def forward_batch_generation(self, batch: ScheduleBatch) -> ForwardBatchOutput:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
-        bid = model_worker_batch.bid
+        batch_id = model_worker_batch.batch_id
         num_accepted_tokens = 0
 
         if model_worker_batch.forward_mode.is_target_verify():
@@ -241,7 +241,7 @@ class NGRAMWorker:
         return ForwardBatchOutput(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
-            bid=bid,
+            batch_id=batch_id,
             num_accepted_tokens=num_accepted_tokens,
             can_run_cuda_graph=can_run_cuda_graph,
         )

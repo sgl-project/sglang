@@ -861,7 +861,7 @@ class Req:
 
 
 # Batch id
-bid = 0
+batch_id = 0
 
 
 @dataclasses.dataclass
@@ -1807,10 +1807,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else self.seq_lens.cpu()
         )
 
-        global bid
-        bid += 1
+        global batch_id
+        batch_id += 1
         return ModelWorkerBatch(
-            bid=bid,
+            batch_id=batch_id,
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
@@ -1931,7 +1931,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 @dataclasses.dataclass
 class ModelWorkerBatch:
     # The batch id
-    bid: int
+    batch_id: int
     # The forward mode
     forward_mode: ForwardMode
     # The input ids

@@ -205,14 +205,14 @@ class GenerationBatchResult:
     next_token_ids: Optional[List[int]]
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
-    bid: int
+    batch_id: int
     can_run_cuda_graph: bool
 
 
 @dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
-    bid: int
+    batch_id: int
 
 
 class Scheduler(
@@ -990,7 +990,7 @@ class Scheduler(
                     if self.cur_batch:
                         next_token_ids, bids[mb_id] = (
                             result.next_token_ids,
-                            result.bid,
+                            result.batch_id,
                         )
                         if self.cur_batch.return_logprob:
                             pp_outputs = PPProxyTensors(
@@ -1049,7 +1049,7 @@ class Scheduler(
                         extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
                             "extend_logprob_start_len_per_req", None
                         ),
-                        bid=bids[next_mb_id],
+                        batch_id=bids[next_mb_id],
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
@@ -1058,7 +1058,7 @@ class Scheduler(
                 # (not last rank)
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        bids[mb_id] = result.bid
+                        bids[mb_id] = result.batch_id
                     # carry the outputs to the next stage
                     # send the outputs from the last round to let the next stage worker run post processing
                     if pp_outputs:
@@ -2040,18 +2040,18 @@ class Scheduler(
                     forward_batch_output.pp_proxy_tensors,
                     forward_batch_output.can_run_cuda_graph,
                 )
-                bid = batch_or_worker_batch.bid
+                batch_id = batch_or_worker_batch.batch_id
             else:
                 (
                     logits_output,
                     next_token_ids,
-                    bid,
+                    batch_id,
                     num_accepted_tokens,
                     can_run_cuda_graph,
                 ) = (
                     forward_batch_output.logits_output,
                     forward_batch_output.next_token_ids,
-                    forward_batch_output.bid,
+                    forward_batch_output.batch_id,
                     forward_batch_output.num_accepted_tokens,
                     forward_batch_output.can_run_cuda_graph,
                 )
@@ -2089,14 +2089,14 @@ class Scheduler(
                 next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-                bid=bid,
+                batch_id=batch_id,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(
-                embeddings=embeddings, bid=model_worker_batch.bid
+                embeddings=embeddings, batch_id=model_worker_batch.batch_id
             )
         return ret
 

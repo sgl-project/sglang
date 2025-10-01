@@ -911,7 +911,7 @@ class ForwardBatchOutput:
     can_run_cuda_graph: bool = False
 
     # TODO(lsyin): remove it later
-    bid: Optional[int] = None
+    batch_id: Optional[int] = None
 
 
 def enable_num_token_non_padded(server_args):

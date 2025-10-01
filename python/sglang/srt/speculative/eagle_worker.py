@@ -435,7 +435,7 @@ class EAGLEWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            logits_output, next_token_ids, bid, seq_lens_cpu = (
+            logits_output, next_token_ids, batch_id, seq_lens_cpu = (
                 self.forward_target_extend(batch)
             )
             with self.draft_tp_context(self.draft_model_runner.tp_group):
@@ -445,7 +445,7 @@ class EAGLEWorker(TpModelWorker):
             return ForwardBatchOutput(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                bid=bid,
+                batch_id=batch_id,
                 num_accepted_tokens=0,
                 can_run_cuda_graph=False,
             )
@@ -469,7 +469,7 @@ class EAGLEWorker(TpModelWorker):
             return ForwardBatchOutput(
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
-                bid=model_worker_batch.bid,
+                batch_id=model_worker_batch.batch_id,
                 num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
                 can_run_cuda_graph=can_run_cuda_graph,
             )
@@ -503,7 +503,7 @@ class EAGLEWorker(TpModelWorker):
         Returns:
             logits_output: The output of logits. It will contain the full hidden states.
             next_token_ids: Next token ids generated.
-            bid: The model batch ID. Used for overlap schedule.
+            batch_id: The model batch ID. Used for overlap schedule.
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
@@ -519,7 +519,7 @@ class EAGLEWorker(TpModelWorker):
         return (
             logits_output,
             next_token_ids,
-            model_worker_batch.bid,
+            model_worker_batch.batch_id,
             model_worker_batch.seq_lens_cpu,
         )
 
