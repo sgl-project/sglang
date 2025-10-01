@@ -34,6 +34,8 @@ pub struct ParseState {
     pub escape_next: bool,
     /// Current tool index (for streaming)
     pub tool_index: usize,
+    /// Optional Harmony-specific streaming state (populated by token-aware parsers)
+    pub harmony_stream: Option<HarmonyStreamState>,
 }
 
 impl ParseState {
@@ -49,6 +51,7 @@ impl ParseState {
             in_string: false,
             escape_next: false,
             tool_index: 0,
+            harmony_stream: None,
         }
     }
 
@@ -59,6 +62,7 @@ impl ParseState {
         self.bracket_depth = 0;
         self.in_string = false;
         self.escape_next = false;
+        self.harmony_stream = None;
     }
 
     /// Process a single character for JSON parsing
@@ -178,4 +182,21 @@ impl Default for ParseState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Placeholder for Harmony streaming metadata captured during token-aware parsing.
+#[derive(Debug, Clone, Default)]
+pub struct HarmonyStreamState {
+    /// All tokens observed so far for the current assistant response.
+    pub tokens: Vec<u32>,
+    /// Number of tokens that have already been processed by the Harmony parser.
+    pub processed_tokens: usize,
+    /// Number of tool calls emitted downstream.
+    pub emitted_calls: usize,
+    /// Pending analysis-channel content awaiting flush into normal text output.
+    pub analysis_buffer: String,
+    /// Whether the tool name has been surfaced for the current call.
+    pub emitted_name: bool,
+    /// Whether arguments have been surfaced for the current call.
+    pub emitted_args: bool,
 }
