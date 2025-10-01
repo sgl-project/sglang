@@ -561,7 +561,7 @@ class EagleVerifyInput(SpecInput):
 
 
 @dataclass
-class EagleDraftInput:
+class EagleDraftInput(SpecInput):
     # The inputs for decode
     # shape: (b, topk)
     topk_p: torch.Tensor = None
@@ -590,6 +590,12 @@ class EagleDraftInput:
     seq_lens_for_draft_extend: torch.Tensor = None
     seq_lens_for_draft_extend_cpu: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
+
+    def __post_init__(self):
+        super().__init__(SpecInputType.EAGLE_DRAFT)
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return self.num_tokens_per_batch, self.num_tokens_for_logprob_per_batch
 
     def prepare_for_extend(self, batch: ScheduleBatch):
 
