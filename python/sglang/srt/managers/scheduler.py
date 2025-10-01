@@ -756,6 +756,7 @@ class Scheduler(
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,
+                    is_eagle=self.spec_algorithm.is_eagle(),
                 )
 
         if (

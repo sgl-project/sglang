@@ -13,6 +13,7 @@ class TestFile:
 
 suites = {
     "per-commit": [
+        TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
@@ -20,11 +21,9 @@ suites = {
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
         TestFile("lora/test_multi_lora_backend.py", 60),
-        TestFile("lora/test_lora_cuda_graph.py", 250),
         TestFile("lora/test_lora_update.py", 400),
         TestFile("lora/test_lora_qwen3.py", 97),
         TestFile("lora/test_lora_radix_cache.py", 100),
-        TestFile("lora/test_chunked_sgmv_backend.py", 30),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -51,7 +50,6 @@ suites = {
         TestFile("openai_server/features/test_reasoning_content.py", 89),
         TestFile("openai_server/function_call/test_openai_function_calling.py", 60),
         TestFile("openai_server/function_call/test_tool_choice.py", 226),
-        TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
         TestFile("openai_server/validation/test_matched_stop.py", 60),
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
@@ -61,6 +59,7 @@ suites = {
         TestFile("quant/test_int8_kernel.py", 8),
         TestFile("quant/test_triton_scaled_mm.py", 8),
         TestFile("quant/test_w8a8_quantization.py", 46),
+        TestFile("rl/test_fp32_lm_head.py", 30),
         TestFile("rl/test_update_weights_from_disk.py", 114),
         TestFile("rl/test_update_weights_from_tensor.py", 48),
         TestFile("test_abort.py", 51),
@@ -144,8 +143,6 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-8-gpu": [
-        # Disabled because it hangs on the CI.
-        # TestFile("ep/test_moe_ep.py", 181),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 800),
         TestFile("lora/test_lora_llama4.py", 600),
         TestFile("test_disaggregation.py", 499),

@@ -13,8 +13,9 @@ async fn test_deepseek_complete_parsing() {
 ```<｜tool▁call▁end｜><｜tool▁calls▁end｜>
 The weather in Tokyo is..."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me help you with that.\n");
     assert_eq!(tools[0].function.name, "get_weather");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
@@ -138,25 +139,6 @@ async fn test_deepseek_malformed_json_handling() {
     // Only the valid tool call should be parsed
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].function.name, "valid");
-}
-
-#[tokio::test]
-async fn test_normal_text_extraction() {
-    let parser = DeepSeekParser::new();
-
-    // Python extracts text before tool calls as normal_text
-    let input = r#"Let me help you with that.
-<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather
-```json
-{"location": "Tokyo"}
-```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "get_weather");
-
-    // TODO: Verify normal text extraction when parser returns it
-    // In Python: normal_text = "Let me help you with that."
 }
 
 #[tokio::test]

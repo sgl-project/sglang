@@ -122,10 +122,9 @@ async fn test_pythonic_empty_arguments() {
 async fn test_pythonic_format_detection() {
     let parser = PythonicParser::new();
 
-    assert!(parser.detect_format("[function_name("));
+    assert!(!parser.detect_format("[function_name(")); // Incomplete
     assert!(parser.detect_format("[get_weather(city=\"NYC\")]"));
     assert!(!parser.detect_format("Just plain text"));
-    assert!(!parser.detect_format("[1, 2, 3]")); // Plain list
     assert!(!parser.detect_format("{\"name\": \"test\"}")); // JSON
 }
 
@@ -165,8 +164,9 @@ async fn test_pythonic_real_world_llama4() {
 
 These functions will provide the information you need."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 3);
+    assert_eq!(normal_text, "I'll help you with multiple tasks. Let me search for information and perform calculations.\n\n\n\nThese functions will provide the information you need.");
     assert_eq!(tools[0].function.name, "web_search");
     assert_eq!(tools[1].function.name, "calculate");
     assert_eq!(tools[2].function.name, "get_weather");

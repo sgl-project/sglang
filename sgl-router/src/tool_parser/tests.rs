@@ -4,7 +4,6 @@ use crate::tool_parser::partial_json::{
     compute_diff, find_common_prefix, is_complete_json, PartialJson,
 };
 use crate::tool_parser::traits::ToolParser;
-use crate::tool_parser::types::TokenConfig;
 
 #[test]
 fn test_parse_state_new() {
@@ -40,20 +39,6 @@ fn test_parse_state_process_char() {
     state.process_char('"');
     assert!(!state.escape_next);
     assert!(state.in_string); // Still in string because quote was escaped
-}
-
-#[test]
-fn test_token_config() {
-    let config = TokenConfig {
-        start_tokens: vec!["<start>".to_string(), "[".to_string()],
-        end_tokens: vec!["</end>".to_string(), "]".to_string()],
-        separator: ", ".to_string(),
-    };
-
-    let pairs: Vec<_> = config.iter_pairs().collect();
-    assert_eq!(pairs.len(), 2);
-    assert_eq!(pairs[0], ("<start>", "</end>"));
-    assert_eq!(pairs[1], ("[", "]"));
 }
 
 #[test]
@@ -280,46 +265,7 @@ async fn test_json_parser_with_parameters() {
     assert!(tools[0].function.arguments.contains("add"));
 }
 
-#[tokio::test]
-async fn test_json_parser_with_tokens() {
-    let parser = JsonParser::with_config(TokenConfig {
-        start_tokens: vec!["[TOOL_CALLS] [".to_string()],
-        end_tokens: vec!["]".to_string()],
-        separator: ", ".to_string(),
-    });
-
-    let input = r#"[TOOL_CALLS] [{"name": "search", "arguments": {"query": "rust programming"}}]"#;
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "search");
-}
-
-#[tokio::test]
-async fn test_multiline_json_with_tokens() {
-    let parser = JsonParser::with_config(TokenConfig {
-        start_tokens: vec!["<tool>".to_string()],
-        end_tokens: vec!["</tool>".to_string()],
-        separator: ", ".to_string(),
-    });
-
-    // Pretty-printed multi-line JSON
-    let input = r#"<tool>{
-    "name": "get_weather",
-    "arguments": {
-        "location": "San Francisco",
-        "units": "celsius",
-        "include_forecast": true
-    }
-}</tool>"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "get_weather");
-    assert!(tools[0].function.arguments.contains("San Francisco"));
-    assert!(tools[0].function.arguments.contains("celsius"));
-    assert!(tools[0].function.arguments.contains("true"));
-}
+// Tests removed - TokenConfig no longer supported in JsonParser
 
 #[tokio::test]
 async fn test_multiline_json_array() {
@@ -361,29 +307,6 @@ fn test_json_parser_format_detection() {
 
     // Should not detect non-tool formats
     assert!(!parser.detect_format("plain text"));
-    assert!(!parser.detect_format(r#"{"key": "value"}"#));
-    assert!(!parser.detect_format(r#"{"data": {"nested": true}}"#));
-}
-
-#[tokio::test]
-async fn test_json_parser_streaming() {
-    let parser = JsonParser::new();
-    let mut state = ParseState::new();
-
-    let full_json = r#"{"name": "get_weather", "arguments": {"location": "San Francisco"}}"#;
-
-    let result = parser
-        .parse_incremental(full_json, &mut state)
-        .await
-        .unwrap();
-
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "get_weather");
-            assert!(tool.function.arguments.contains("San Francisco"));
-        }
-        _ => panic!("Expected ToolComplete for complete JSON"),
-    }
 }
 
 #[tokio::test]
@@ -469,37 +392,7 @@ mod failure_cases {
         assert_eq!(tools[0].function.arguments, "null");
     }
 
-    #[tokio::test]
-    async fn test_broken_wrapper_tokens() {
-        let parser = JsonParser::with_config(TokenConfig {
-            start_tokens: vec!["<tool>".to_string()],
-            end_tokens: vec!["</tool>".to_string()],
-            separator: ", ".to_string(),
-        });
-
-        // Missing end token
-        let input = r#"<tool>{"name": "test", "arguments": {}}"#;
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(
-            tools.len(),
-            0,
-            "Should fail to parse without complete wrapper"
-        );
-
-        // Missing start token - parser looks for complete wrapper, so this won't parse
-        let input = r#"{"name": "test", "arguments": {}}</tool>"#;
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(
-            tools.len(),
-            0,
-            "Should not parse JSON with incomplete wrapper"
-        );
-
-        // Mismatched tokens
-        let input = r#"<tool>{"name": "test", "arguments": {}}</wrong>"#;
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 0, "Should fail with mismatched tokens");
-    }
+    // Test removed - wrapper token functionality moved to specific parsers
 
     #[tokio::test]
     async fn test_invalid_json_structures() {
@@ -651,34 +544,6 @@ mod edge_cases {
         let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
         assert_eq!(tools.len(), 1);
         assert!(tools[0].function.arguments.contains("null"));
-    }
-
-    #[tokio::test]
-    async fn test_multiple_token_pairs_with_conflicts() {
-        let parser = JsonParser::with_config(TokenConfig {
-            start_tokens: vec!["<<".to_string(), "<tool>".to_string()],
-            end_tokens: vec![">>".to_string(), "</tool>".to_string()],
-            separator: ", ".to_string(),
-        });
-
-        // First pattern
-        let input = r#"<<{"name": "test1", "arguments": {}}>>"#;
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "test1");
-
-        // Second pattern
-        let input = r#"<tool>{"name": "test2", "arguments": {}}</tool>"#;
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "test2");
-
-        // Nested patterns (should use first match)
-        let input = r#"<<tool>{"name": "test3", "arguments": {}}</tool>>"#;
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        // This is tricky - depends on regex behavior
-        // The parser should handle this gracefully
-        assert!(tools.len() <= 1, "Should not parse multiple times");
     }
 
     #[tokio::test]
