@@ -168,10 +168,10 @@ __global__ void moe_sum_reduce_kernel(
   }
 }
 
-// -------------------- runtime-topk fallback kernels --------------------
+// -------------------- general-topk fallback kernels --------------------
 // small-token
 template <typename scalar_t>
-__global__ void moe_sum_reduce_kernel_runtime(
+__global__ void moe_sum_reduce_kernel_general(
     const scalar_t* __restrict__ x,
     scalar_t* __restrict__ y,
     const int64_t token_num,
@@ -197,7 +197,7 @@ __global__ void moe_sum_reduce_kernel_runtime(
 
 // warp-per-token
 template <typename scalar_t, int WARPS_PER_BLOCK>
-__global__ void moe_sum_reduce_kernel_warp_token_runtime(
+__global__ void moe_sum_reduce_kernel_warp_token_general(
     const scalar_t* __restrict__ x,
     scalar_t* __restrict__ y,
     const int64_t token_num,
@@ -339,8 +339,8 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
                 out_stride_token,
                 scale);
           } else {
-            // --- runtime-topk fallback ---
-            moe_sum_reduce_kernel_runtime<scalar_t_><<<grid, block, 0, stream>>>(
+            // --- general-topk fallback ---
+            moe_sum_reduce_kernel_general<scalar_t_><<<grid, block, 0, stream>>>(
                 input.data_ptr<scalar_t_>(),
                 output.data_ptr<scalar_t_>(),
                 token_num,
@@ -416,8 +416,8 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
                 out_stride_token,
                 scale);
           } else {
-            // --- runtime-topk fallback ---
-            moe_sum_reduce_kernel_warp_token_runtime<scalar_t_, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
+            // --- general-topk fallback ---
+            moe_sum_reduce_kernel_warp_token_general<scalar_t_, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
                 input.data_ptr<scalar_t_>(),
                 output.data_ptr<scalar_t_>(),
                 token_num,

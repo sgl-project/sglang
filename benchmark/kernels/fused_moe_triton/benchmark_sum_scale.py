@@ -14,10 +14,10 @@ def _moe_sum_reduce_kernel(
     output_ptr,
     output_stride_0,
     output_stride_1,
-    scale_ptr,
     token_num: int,
     topk_num: int,
     hidden_dim: int,
+    routed_scaling_factor: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
     NUM_STAGE: tl.constexpr,
@@ -37,19 +37,15 @@ def _moe_sum_reduce_kernel(
 
     base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
 
-    in_ty = input_ptr.dtype.element_ty
-    acc_ty = tl.float64 if in_ty == tl.float64 else tl.float32
-    accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=acc_ty)
-
+    accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
     for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
         tile = tl.load(
             base_ptrs + i * input_stride_1,
             mask=mask_token[:, None] & mask_dim[None, :],
-            other=0,
+            other=0.0,
         )
         accumulator += tile.to(tl.float32)
-    sf = tl.load(scale_ptr).to(acc_ty)
-    accumulator *= sf
+    accumulator *= routed_scaling_factor
 
     # -------- Write back --------
     store_ptrs = output_ptr + offs_token[:, None] * output_stride_0 + offs_dim[None, :]
@@ -80,19 +76,15 @@ def moe_sum_reduce_triton(
         triton.cdiv(hidden_dim, BLOCK_DIM),
     )
 
-    scale_dev = torch.tensor(
-        routed_scaling_factor, dtype=input.dtype, device=input.device
-    )
-
     _moe_sum_reduce_kernel[grid](
         input,
         *input.stride(),
         output,
         *output.stride(),
-        scale_dev,
         token_num=token_num,
         topk_num=topk_num,
         hidden_dim=hidden_dim,
+        routed_scaling_factor=routed_scaling_factor,
         BLOCK_M=BLOCK_M,
         BLOCK_DIM=BLOCK_DIM,
         NUM_STAGE=NUM_STAGE,
