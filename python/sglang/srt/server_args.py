@@ -22,6 +22,7 @@ import random
 import tempfile
 from typing import List, Literal, Optional, Union
 
+from sglang.srt.afd.afd_type import AFDRole
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
@@ -435,6 +436,24 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     sm_group_num: int = 3
+
+    # Mamba cache
+    max_mamba_cache_size: Optional[int] = None
+    mamba_ssm_dtype: str = "float32"
+
+    # For AFD
+    afd_role: Optional[AFDRole] = None
+    afd_transfer_backend: Literal["stepmesh"] = "stepmesh"
+    afd_ffn_addr: Optional[str] = None
+
+    # Deprecated arguments
+    enable_ep_moe: bool = False
+    enable_deepep_moe: bool = False
+    enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_cutedsl_moe: bool = False
+    enable_flashinfer_trtllm_moe: bool = False
+    enable_triton_kernel_moe: bool = False
+    enable_flashinfer_mxfp4_moe: bool = False
 
     def __post_init__(self):
         """
@@ -2736,6 +2755,30 @@ class ServerArgs:
             help="Enable deterministic inference mode with batch invariant ops.",
         )
 
+        # For AFD
+        parser.add_argument(
+            "--afd-role",
+            type=AFDRole,
+            choices=list(AFDRole),
+            default=ServerArgs.afd_role,
+            help="AFD role, i.e., `attn` or `ffn`.",
+        )
+
+        parser.add_argument(
+            "--afd-transfer-backend",
+            type=str,
+            choices=["stepmesh"],
+            default=ServerArgs.afd_transfer_backend,
+            help="Backend for AFD.",
+        )
+
+        parser.add_argument(
+            "--afd-ffn-addr",
+            type=str,
+            default=ServerArgs.afd_ffn_addr,
+            help="The host address (ip:port) for FFN (e.g., `192.168.0.2:25000`).",
+        )
+
         # Deprecated arguments
         parser.add_argument(
             "--enable-ep-moe",
@@ -2865,6 +2908,9 @@ class ServerArgs:
                 "lof",
             ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
 
+        # Check AFD
+        self.check_afd_server_args()
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
@@ -2953,6 +2999,31 @@ class ServerArgs:
                     16 <= self.max_lora_chunk_size <= 128
                     and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
+
+    def check_afd_server_args(self):
+        if self.afd_role is None:
+            return
+
+        # Either not compatible or temporarily unsupported.
+        assert self.disable_cuda_graph, "Cuda graph is not supported for AFD."
+        assert (
+            self.disable_overlap_schedule
+        ), "Overlap schedule is not supported for AFD."
+
+        assert self.nnodes == 1, "Multi-node distribution is not supported for AFD."
+        assert (
+            self.disaggregation_mode == "null"
+        ), "Disaggregation mode is not supported for AFD."
+        assert self.pp_size == 1, "PP is not supported for AFD."
+        if self.tp_size > 1:
+            assert (
+                self.enable_dp_attention
+            ), "DP attention must be enabled if tp_size > 1 for AFD"
+
+        assert self.moe_a2a_backend == "none", "MoE A2A is not compatible with AFD."
+        assert (
+            not self.enable_two_batch_overlap
+        ), "Two batch overlap is not compatible with AFD."
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
@@ -3111,6 +3182,9 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # The ipc filename for Attn-to-FFN forwarding
+    afd_ipc_name: Optional[str]
+
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
         if server_args.nccl_port is None:
@@ -3125,6 +3199,24 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
+        # always use TCP for AFD
+        afd_ipc_name = None
+        if server_args.afd_role is not None:
+            assert (
+                server_args.afd_ffn_addr is not None
+            ), "Please provide --afd-ffn-addr for AFD"
+            if server_args.afd_ffn_addr.startswith("["):  # ipv6 address
+                port_num, host = configure_ipv6(server_args.afd_ffn_addr)
+                afd_ffn_addr = (host, str(port_num))
+            else:
+                afd_ffn_addr = server_args.afd_ffn_addr.split(":")
+
+            assert (
+                len(afd_ffn_addr) == 2
+            ), "Please provide --afd-ffn-addr as host:port of FFN node"
+            afd_ffn_host, afd_ffn_port = afd_ffn_addr
+            afd_ipc_name = f"tcp://{afd_ffn_host}:{afd_ffn_port}"
+
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -3135,6 +3227,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=None,
+                afd_ipc_name=afd_ipc_name,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -3169,6 +3262,7 @@ class PortArgs:
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=None,
+                afd_ipc_name=afd_ipc_name,
             )
 
 
