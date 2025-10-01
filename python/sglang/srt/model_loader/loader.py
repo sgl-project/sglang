@@ -1464,12 +1464,25 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     load_config.remote_instance_weight_loader_seed_instance_service_port,
                     load_config.remote_instance_weight_loader_send_weights_group_ports,
                     instance_ip,
+                    model_config.is_draft_model,
                 ),
             )
             t.start()
 
         start_get_weights_tic = time.time()
         with set_default_torch_dtype(model_config.dtype):
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    # When quant methods need to process weights after loading
+                    # (for repacking, quantizing, etc), they expect parameters
+                    # to be on the global target device. This scope is for the
+                    # case where cpu offloading is used, where we will move the
+                    # parameters onto device for processing and back off after.
+                    target_device = torch.device(device_config.device)
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+
             for _, tensor in model.named_parameters():
                 torch.distributed.broadcast(
                     tensor.data,
@@ -1477,9 +1490,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     group=client._model_update_group,
                 )
             torch.cuda.synchronize()
+            post_load_weights(model, model_config)
 
-            if hasattr(model, "post_load_weights"):
-                model.post_load_weights()
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
