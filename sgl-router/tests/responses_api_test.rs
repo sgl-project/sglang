@@ -559,24 +559,36 @@ async fn test_multi_turn_loop_with_mcp() {
     let response = router.route_responses(None, &req, None).await;
 
     // Check status
-    assert_eq!(response.status(), axum::http::StatusCode::OK, "Request should succeed");
-    
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "Request should succeed"
+    );
+
     // Read the response body
     use axum::body::to_bytes;
     let response_body = response.into_body();
     let body_bytes = to_bytes(response_body, usize::MAX).await.unwrap();
     let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
 
-    println!("Multi-turn response: {}", serde_json::to_string_pretty(&response_json).unwrap());
+    println!(
+        "Multi-turn response: {}",
+        serde_json::to_string_pretty(&response_json).unwrap()
+    );
 
     // Verify the response structure
     assert_eq!(response_json["object"], "response");
     assert_eq!(response_json["status"], "completed");
     // Note: mock worker generates its own ID, so we just verify it exists
-    assert!(response_json["id"].is_string(), "Response should have an id");
+    assert!(
+        response_json["id"].is_string(),
+        "Response should have an id"
+    );
 
     // Check that output contains final message
-    let output = response_json["output"].as_array().expect("output should be array");
+    let output = response_json["output"]
+        .as_array()
+        .expect("output should be array");
     assert!(!output.is_empty(), "output should not be empty");
 
     // Find the final message with text
@@ -602,7 +614,9 @@ async fn test_multi_turn_loop_with_mcp() {
     assert!(has_final_text, "Should have final text output");
 
     // Verify tools are masked back to MCP format
-    let tools = response_json["tools"].as_array().expect("tools should be array");
+    let tools = response_json["tools"]
+        .as_array()
+        .expect("tools should be array");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["type"], "mcp");
     assert_eq!(tools[0]["server_label"], "mock");
@@ -718,27 +732,32 @@ async fn test_max_tool_calls_limit() {
 
     let response = router.route_responses(None, &req, None).await;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
-    
+
     use axum::body::to_bytes;
     let response_body = response.into_body();
     let body_bytes = to_bytes(response_body, usize::MAX).await.unwrap();
     let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
 
-    println!("Max calls response: {}", serde_json::to_string_pretty(&response_json).unwrap());
+    println!(
+        "Max calls response: {}",
+        serde_json::to_string_pretty(&response_json).unwrap()
+    );
 
     // With max_tool_calls=1, the mock returns a final answer after 1 call
     // So it completes normally without exceeding the limit
     assert_eq!(response_json["status"], "completed");
-    
+
     // Verify the basic response structure
     assert!(response_json["id"].is_string());
     assert_eq!(response_json["object"], "response");
-    
+
     // The response should have tools masked back to MCP format
-    let tools = response_json["tools"].as_array().expect("tools should be array");
+    let tools = response_json["tools"]
+        .as_array()
+        .expect("tools should be array");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["type"], "mcp");
-    
+
     // Note: To test actual limit exceeding, we would need a mock that keeps
     // calling tools indefinitely, which would hit max_iterations (safety limit)
 
