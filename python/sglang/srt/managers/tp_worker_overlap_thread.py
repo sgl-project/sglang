@@ -207,11 +207,11 @@ class TpModelWorkerClient:
         wait for the current batch to be launched. Used in overlap mode.
         """
         copy_done, logits_output, next_token_ids, can_run_cuda_graph = (
-            self.output_queue.get()
+            self.output_queue.get(timeout=10)
         )
 
         if launch_done is not None:
-            launch_done.wait()
+            launch_done.wait(timeout=10)
         copy_done.synchronize()
 
         if logits_output.next_token_logprobs is not None:
