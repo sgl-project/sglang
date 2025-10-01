@@ -707,7 +707,6 @@ class SchedulerOutputProcessorMixin:
                 and self.tp_rank == 0
                 and self.server_args.enable_request_time_stats_logging
             ):
-                print(f"{req.finished_reason=}")
                 req.log_time_stats()
 
         # Send to detokenizer
