@@ -20,6 +20,8 @@ from enum import Enum, IntEnum, auto
 from typing import List, Optional, Set, Union
 
 import torch
+from huggingface_hub import model_info
+from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 from transformers import PretrainedConfig
 
 from sglang.srt.hf_transformers_utils import (
@@ -71,6 +73,22 @@ class ModelConfig:
         self.quantization = quantization
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
+
+        # Get hf tags
+        self.hf_tags = []
+        try:
+            # Handle local paths
+            if not os.path.isdir(self.model_path):
+                info = model_info(self.model_path, revision=self.revision)
+                self.hf_tags = info.tags
+                print(f"{self.hf_tags=}")
+        except (GatedRepoError, RepositoryNotFoundError):
+            logger.warning(
+                f"Cannot find model info for '{self.model_path}'. "
+                "This may be a local path or a gated model."
+            )
+        except Exception as e:
+            logger.warning(f"Error getting model info for '{self.model_path}': {e}")
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
@@ -130,8 +148,10 @@ class ModelConfig:
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        self.is_multimodal = enable_multimodal and is_multimodal_model(
-            self.hf_config.architectures
+        self.is_multimodal = enable_multimodal and (
+            # is_multimodal_model(self.hf_config.architectures)
+            # or
+            self._has_multimodal_tag()
         )
         self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
             self.hf_config.architectures
@@ -166,6 +186,19 @@ class ModelConfig:
         self.image_token_id = getattr(
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
+
+    def _has_multimodal_tag(self) -> bool:
+        multimodal_tags = {
+            "multimodal",
+            "image-to-text",
+            "image-text-to-text",
+            "video-to-text",
+            "video-text-to-text",
+            "audio-to-text",
+            "audio-text-to-text",
+            "any-to-any",
+        }
+        return any(tag in multimodal_tags for tag in self.hf_tags)
 
     @staticmethod
     def from_server_args(
@@ -748,38 +781,12 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 multimodal_model_archs = [
     "CLIPModel",
-    "DeepseekVL2ForCausalLM",
-    "Gemma3ForConditionalGeneration",
-    "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
-    "LlavaLlamaForCausalLM",
-    "Llama4ForConditionalGeneration",
-    "LlavaMistralForCausalLM",
-    "LlavaQwenForCausalLM",
-    "LlavaForConditionalGeneration",
-    "LlavaVidForCausalLM",
-    "MiniCPMO",
-    "MiniCPMV",
     "Mistral3ForConditionalGeneration",
-    "MultiModalityCausalLM",
-    "MllamaForConditionalGeneration",
-    "Qwen2AudioForConditionalGeneration",
-    "Qwen2VLForConditionalGeneration",
-    "Qwen2_5_VLForConditionalGeneration",
-    "Qwen3VLForConditionalGeneration",
-    "Qwen3VLMoeForConditionalGeneration",
-    "KimiVLForConditionalGeneration",
-    "InternVLChatModel",
-    "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
-    "VILAForConditionalGeneration",
-    "Step3VLForConditionalGeneration",
-    "DotsVLMForCausalLM",
-    "DotsOCRForCausalLM",
-    "Sarashina2VisionForCausalLM",
 ]
 
 
