@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -422,9 +423,13 @@ class DecodePreallocQueue:
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
             decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
-            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
+
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            decode_req.req.time_stats.decode_transfer_queue_entry_time = (
+                time.perf_counter()
+            )
+            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -625,6 +630,7 @@ class DecodeTransferQueue:
                     decode_req.req.output_topk_p = output_topk_p
                     decode_req.req.output_topk_index = output_topk_index
                     decode_req.req.hidden_states_tensor = output_hidden_states
+
                 if decode_req.req.return_logprob:
                     decode_req.req.output_token_logprobs_val.append(
                         output_token_logprobs_val[0].item()
@@ -645,10 +651,17 @@ class DecodeTransferQueue:
 
                 if hasattr(decode_req.kv_receiver, "clear"):
                     decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+
+                indices_to_remove.add(i)
+                decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
                 # special handling for sampling_params.max_new_tokens == 1
                 if decode_req.req.sampling_params.max_new_tokens == 1:
                     # finish immediately
+                    decode_req.req.time_stats.forward_entry_time = (
+                        decode_req.req.time_stats.completion_time
+                    ) = time.perf_counter()
                     decode_req.req.check_finished()
                     self.scheduler.stream_output(
                         [decode_req.req], decode_req.req.return_logprob
@@ -656,8 +669,6 @@ class DecodeTransferQueue:
                     self.tree_cache.cache_finished_req(decode_req.req)
                 else:
                     transferred_reqs.append(decode_req.req)
-
-                indices_to_remove.add(i)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -876,6 +887,9 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
             return None
+
+        for req in can_run_list:
+            req.time_stats.forward_entry_time = time.perf_counter()
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

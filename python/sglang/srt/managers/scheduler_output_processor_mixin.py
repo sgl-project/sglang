@@ -91,7 +91,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
-                        req.time_stats.completion_time = time.time()
+                        req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -257,7 +257,7 @@ class SchedulerOutputProcessorMixin:
                 else:
                     self.tree_cache.cache_finished_req(req)
 
-                req.time_stats.completion_time = time.time()
+                req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -707,6 +707,7 @@ class SchedulerOutputProcessorMixin:
                 and self.tp_rank == 0
                 and self.server_args.enable_request_time_stats_logging
             ):
+                print(f"{req.finished_reason=}")
                 req.log_time_stats()
 
         # Send to detokenizer

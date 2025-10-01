@@ -41,7 +41,7 @@ import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -452,6 +453,7 @@ class Req:
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        disagg_mode: Optional[DisaggregationMode] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
@@ -628,10 +630,8 @@ class Req:
 
         # For metrics
         self.metrics_collector = metrics_collector
-        self.time_stats: TimeStats = TimeStats()
+        self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
         self.has_log_time_stats: bool = False
-        self.queue_time_start = None
-        self.queue_time_end = None
         self.last_tic = time.monotonic()
 
         # For disaggregation
@@ -668,9 +668,9 @@ class Req:
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
             return
-        assert stage.name in RequestStage.__members__, f"{stage=} is invalid"
+
         now = time.monotonic()
-        self.metrics_collector.observe_request_latency_seconds(
+        self.metrics_collector.observe_per_stage_req_latency(
             stage.value, now - self.last_tic
         )
         self.last_tic = now
@@ -834,10 +834,10 @@ class Req:
             return
 
         if self.bootstrap_room is not None:
-            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
+            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
         else:
-            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
-        logger.info(f"{prefix}: {self.time_stats}")
+            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
+        logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
     def set_finish_with_abort(self, error_msg: str):
@@ -1544,7 +1544,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ) / total_max_new_tokens
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio
+        return retracted_reqs, new_estimate_ratio, []
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]

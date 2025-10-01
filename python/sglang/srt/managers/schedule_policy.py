@@ -276,9 +276,13 @@ class SchedulePolicy:
     ) -> None:
         """Sorts the waiting queue based on the request priority then received titmestamp."""
         if schedule_low_priority_values_first:
-            waiting_queue.sort(key=lambda x: (x.priority, x.queue_time_start))
+            waiting_queue.sort(
+                key=lambda x: (x.priority, x.time_stats.wait_queue_entry_time)
+            )
         else:
-            waiting_queue.sort(key=lambda x: (-x.priority, x.queue_time_start))
+            waiting_queue.sort(
+                key=lambda x: (-x.priority, x.time_stats.wait_queue_entry_time)
+            )
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
@@ -642,12 +646,12 @@ class PrefillAdder:
         if server_args.schedule_low_priority_values_first:
             sorted_running_reqs = sorted(
                 self.running_batch.reqs,
-                key=lambda x: (-x.priority, -x.queue_time_start),
+                key=lambda x: (-x.priority, -x.time_stats.wait_queue_entry_time),
             )
         else:
             sorted_running_reqs = sorted(
                 self.running_batch.reqs,
-                key=lambda x: (x.priority, -x.queue_time_start),
+                key=lambda x: (x.priority, -x.time_stats.wait_queue_entry_time),
             )
         preemptible_reqs = []
         min_tokens_to_remove = (
