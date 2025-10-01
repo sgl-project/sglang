@@ -22,6 +22,8 @@ dirpath = os.path.dirname(__file__)
 with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
     LONG_PROMPT = f.read()
 
+DEFAULT_SAMPLING_SEED = 42
+
 
 @dataclasses.dataclass
 class BenchArgs:
@@ -286,5 +288,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
+
+    if args.sampling_seed is None:
+        args.sampling_seed = DEFAULT_SAMPLING_SEED
 
     test_deterministic(args)

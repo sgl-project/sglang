@@ -138,6 +138,10 @@ def add_grammar_backend_choices(choices):
     GRAMMAR_BACKEND_CHOICES.extend(choices)
 
 
+def add_deterministic_attention_backend_choices(choices):
+    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
