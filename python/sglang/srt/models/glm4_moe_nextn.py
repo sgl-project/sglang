@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-4.5 NextN Speculative Decoding."""
+"""Inference-only GLM-4.5, GLM-4.6 NextN Speculative Decoding."""
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -48,7 +48,7 @@ class Glm4MoeModelNextN(nn.Module):
         super().__init__()
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.warning(
-                "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 model."
+                "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 / GLM-4.6 model."
             )
             quant_config = None
 

@@ -1,15 +1,31 @@
 import itertools
+import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.testing
 from sgl_kernel import sgl_per_token_quant_fp8
-from vllm import _custom_ops as ops
+
+# Optional vLLM import
+try:
+    from vllm import _custom_ops as ops
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    ops = None
+    VLLM_AVAILABLE = False
 
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
+
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 # Get correct FP8 E4M3 maximum value
@@ -49,6 +65,9 @@ def torch_per_token_quant_fp8(
 def vllm_per_token_quant_fp8(
     input: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not VLLM_AVAILABLE:
+        # Fallback to SGLang implementation
+        return sglang_per_token_quant_fp8(input)
     return ops.scaled_fp8_quant(input, use_per_token_if_dynamic=True)
 
 
@@ -73,6 +92,17 @@ def calculate_diff(batch_size: int, seq_len: int, hidden_dim: int):
     torch_out, torch_scale = torch_per_token_quant_fp8(x)
     vllm_out, vllm_scale = vllm_per_token_quant_fp8(x)
     sglang_out, sglang_scale = sglang_per_token_quant_fp8(x)
+
+    if not VLLM_AVAILABLE:
+        print("⚠️ vLLM not available, skipping vLLM comparison")
+        # Only compare Torch vs SGLang
+        torch_sglang_scale_diff = torch.abs(torch_scale - sglang_scale).mean().item()
+        torch_sglang_out_diff = (
+            torch.abs(torch_out.float() - sglang_out.float()).mean().item()
+        )
+        print(f"Scale difference (Torch vs SGLang): {torch_sglang_scale_diff:.8f}")
+        print(f"Output difference (Torch vs SGLang): {torch_sglang_out_diff:.8f}")
+        return
 
     print(f"\n=== Comparison for hidden_dim={hidden_dim} ===")
 
@@ -125,9 +155,15 @@ def calculate_diff(batch_size: int, seq_len: int, hidden_dim: int):
     print(f"  VLLM vs SGLang:  {'✅' if vllm_sglang_match else '❌'}")
 
 
-batch_size_range = [16, 32, 64, 128]
-seq_len_range = [64, 128, 256, 512, 1024, 2048, 4096]
-hidden_dim_range = [1368, 2048, 4096]
+# CI environment uses simplified parameters
+if IS_CI:
+    batch_size_range = [16]  # Single batch size for CI
+    seq_len_range = [64]  # Single sequence length for CI
+    hidden_dim_range = [2048]  # Single hidden dimension for CI
+else:
+    batch_size_range = [16, 32, 64, 128]
+    seq_len_range = [64, 128, 256, 512, 1024, 2048, 4096]
+    hidden_dim_range = [1368, 2048, 4096]
 
 configs = list(itertools.product(batch_size_range, seq_len_range, hidden_dim_range))
 
@@ -137,9 +173,19 @@ configs = list(itertools.product(batch_size_range, seq_len_range, hidden_dim_ran
         x_names=["batch_size", "seq_len", "hidden_dim"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["torch", "vllm", "sglang"],
-        line_names=["Torch Reference", "VLLM", "SGL Kernel"],
-        styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+        line_vals=(
+            ["torch", "vllm", "sglang"] if VLLM_AVAILABLE else ["torch", "sglang"]
+        ),
+        line_names=(
+            ["Torch Reference", "VLLM", "SGL Kernel"]
+            if VLLM_AVAILABLE
+            else ["Torch Reference", "SGL Kernel"]
+        ),
+        styles=(
+            [("red", "-"), ("blue", "-"), ("green", "-")]
+            if VLLM_AVAILABLE
+            else [("red", "-"), ("green", "-")]
+        ),
         ylabel="us",
         plot_name="per-token-dynamic-quant-fp8-performance",
         args={},
@@ -156,21 +202,28 @@ def benchmark_quantization(batch_size, seq_len, hidden_dim, provider):
     if provider == "torch":
         fn = lambda: torch_per_token_quant_fp8(x.clone())
     elif provider == "vllm":
+        if not VLLM_AVAILABLE:
+            return (0, 0, 0)
         fn = lambda: vllm_per_token_quant_fp8(x.clone())
     elif provider == "sglang":
         fn = lambda: sglang_per_token_quant_fp8(x.clone())
 
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
 if __name__ == "__main__":
-    # Test various hidden dimensions for correctness
-    test_dims = [1368, 2048, 4096]
+    # Test various hidden dimensions for correctness - simplified for CI
+    if IS_CI:
+        test_dims = [2048]  # Single dimension for CI
+        batch_size, seq_len = 4, 64  # Smaller values for CI
+    else:
+        test_dims = [1368, 2048, 4096]
+        batch_size, seq_len = 4, 4096
 
     for dim in test_dims:
-        calculate_diff(batch_size=4, seq_len=4096, hidden_dim=dim)
+        calculate_diff(batch_size=batch_size, seq_len=seq_len, hidden_dim=dim)
 
     print("\n" + "=" * 60)
     print("Starting performance benchmark...")
