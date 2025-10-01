@@ -2017,12 +2017,18 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none():
-                model_worker_batch = batch.get_model_worker_batch()
 
-                forward_batch_output = self.tp_worker.forward_batch_generation(
-                    model_worker_batch
-                )
+            batch_or_worker_batch = batch
+
+            if self.spec_algorithm.is_none():
+                # FIXME(lsyin): remove this if and finally unify the abstraction
+                batch_or_worker_batch = batch.get_model_worker_batch()
+
+            forward_batch_output = self.tp_worker.forward_batch_generation(
+                batch_or_worker_batch
+            )
+
+            if self.spec_algorithm.is_none():
                 (
                     logits_output,
                     next_token_ids,
@@ -2034,9 +2040,8 @@ class Scheduler(
                     forward_batch_output.pp_proxy_tensors,
                     forward_batch_output.can_run_cuda_graph,
                 )
-                bid = model_worker_batch.bid
+                bid = batch_or_worker_batch.bid
             else:
-                forward_batch_output = self.draft_worker.forward_batch_generation(batch)
                 (
                     logits_output,
                     next_token_ids,
