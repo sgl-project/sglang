@@ -55,7 +55,7 @@
                 {%- endif %}
                 {%- set ns.is_first = true -%}
             {%- else %}
-                {{- '\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments'] + '\n' + '```' + '<｜tool▁call▁end｜>'}}
+                {{- '\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments']|tojson + '\n' + '```' + '<｜tool▁call▁end｜>'}}
             {%- endif %}
         {%- endfor %}
         {{- '<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}

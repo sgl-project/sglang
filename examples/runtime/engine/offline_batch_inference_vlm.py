@@ -7,7 +7,7 @@ import argparse
 import dataclasses
 
 import sglang as sgl
-from sglang.srt.conversation import chat_templates
+from sglang.srt.parser.conversation import chat_templates
 from sglang.srt.server_args import ServerArgs
 
 

@@ -24,20 +24,20 @@ import os
 import re
 from typing import Optional
 
-from sglang.srt.code_completion_parser import (
+from sglang.srt.parser.code_completion_parser import (
     CompletionTemplate,
     FimPosition,
     completion_template_exists,
     register_completion_template,
 )
-from sglang.srt.conversation import (
+from sglang.srt.parser.conversation import (
     Conversation,
     SeparatorStyle,
     chat_template_exists,
     get_conv_template_by_model_path,
     register_conv_template,
 )
-from sglang.srt.jinja_template_utils import detect_jinja_template_content_format
+from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
 
 logger = logging.getLogger(__name__)
 

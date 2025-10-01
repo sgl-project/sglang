@@ -61,6 +61,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -442,11 +443,9 @@ def latency_test_run_once(
 
     if profile:
         profiler.stop()
-        profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_prefill.trace.json.gz"
-        _save_profile_trace_results(profiler, profile_filename)
-        rank_print(
-            f"torch profiler chrome trace for prefill saved to {profile_filename}"
-        )
+        trace_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_prefill.trace.json.gz"
+        _save_profile_trace_results(profiler, trace_filename)
+        rank_print(f"torch profiler chrome trace for prefill saved to {trace_filename}")
 
     # Decode
     decode_latencies = []
@@ -478,10 +477,10 @@ def latency_test_run_once(
 
         if profile and i == output_len / 2:
             profiler.stop()
-            profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_decode.trace.json.gz"
-            _save_profile_trace_results(profiler, profile_filename)
+            trace_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_decode.trace.json.gz"
+            _save_profile_trace_results(profiler, trace_filename)
             rank_print(
-                f"torch profiler chrome trace for decoding 1 token saved to {profile_filename}"
+                f"torch profiler chrome trace for decoding 1 token saved to {trace_filename}"
             )
 
     # Record decode timing from 2nd output
@@ -509,6 +508,8 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
+    initialize_moe_config(server_args)
+
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)

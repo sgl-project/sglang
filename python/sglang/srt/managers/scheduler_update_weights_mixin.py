@@ -5,6 +5,8 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -40,6 +42,11 @@ class SchedulerUpdateWeightsMixin:
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success, message)
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        """Destroy the online model parameter update group."""
+        success, message = self.tp_worker.destroy_weights_update_group(recv_req)
+        return DestroyWeightsUpdateGroupReqOutput(success, message)
 
     def update_weights_from_distributed(
         self,
@@ -121,8 +128,15 @@ class SchedulerUpdateWeightsMixin:
         url = params["url"]
 
         worker = self.tp_worker.worker
-
         worker.model_runner.save_remote_model(url)
+
+        if self.draft_worker is not None:
+            draft_url = params.get("draft_url", None)
+            assert (
+                draft_url is not None
+            ), "draft_url must be provided when draft model is enabled"
+            draft_worker = self.draft_worker.worker
+            draft_worker.model_runner.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
         worker = self.tp_worker.worker

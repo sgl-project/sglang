@@ -291,7 +291,7 @@ class Llama4UnfoldConvolution(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.unfold(hidden_states)
-        hidden_states = hidden_states.permute(0, 2, 1)
+        hidden_states = hidden_states.permute(0, 2, 1).contiguous()
         hidden_states, _ = self.linear(hidden_states)
         return hidden_states
 
@@ -446,9 +446,20 @@ class Llama4ForConditionalGeneration(nn.Module):
         )
 
         if self.has_vision:
+            # TODO: make this more general
+            ignore_quant_layers = getattr(config, "quantization_config", {}).get(
+                "ignore", {}
+            )
+            if (
+                "model.layers.vision_model*" in ignore_quant_layers
+                and "model.layers.multi_modal_projector*" in ignore_quant_layers
+            ):
+                vision_quant_config = None
+            else:
+                vision_quant_config = quant_config
             self.vision_model = Llama4VisionModel(
                 config.vision_config,
-                quant_config=quant_config,
+                quant_config=vision_quant_config,
                 prefix=add_prefix("vision_model", prefix),
             )
 
@@ -560,7 +571,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             forward_batch=forward_batch,
             language_model=self.language_model,
             data_embedding_funcs={
-                Modality.IMAGE: self.get_image_feature,
+                Modality.IMAGE: image_embedding_func,
             },
             positions=positions,
         )
@@ -960,6 +971,31 @@ class Llama4ForConditionalGeneration(nn.Module):
 
     def set_embed(self, embed):
         return self.language_model.set_embed(embed)
+
+    def get_hidden_dim(self, module_name, layer_idx):
+        # return input_dim, output_dim
+        if module_name == "qkv_proj":
+            return (
+                self.config.hidden_size,
+                self.config.head_dim
+                * (
+                    self.config.num_attention_heads
+                    + self.config.num_key_value_heads * 2
+                ),
+            )
+        elif module_name == "o_proj":
+            return (
+                self.config.head_dim * self.config.num_attention_heads,
+                self.config.hidden_size,
+            )
+        elif module_name == "gate_up_proj":
+            return self.config.hidden_size, self.config.intermediate_size * 2
+        elif module_name == "down_proj":
+            decoder_layer = self.language_model.get_layers()[layer_idx]
+            intermediate_size = decoder_layer.get_intermediate_size()
+            return intermediate_size, self.config.hidden_size
+        else:
+            raise NotImplementedError()
 
 
 EntryClass = Llama4ForConditionalGeneration

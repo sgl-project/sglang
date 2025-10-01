@@ -18,7 +18,7 @@ from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
 from sglang.srt.utils import (
     format_tcp_address,
-    get_ip,
+    get_local_ip_auto,
     get_open_port,
     is_valid_ipv6_address,
 )
@@ -191,7 +191,9 @@ class MessageQueue:
         self.n_remote_reader = n_remote_reader
 
         if connect_ip is None:
-            connect_ip = get_ip() if n_remote_reader > 0 else "127.0.0.1"
+            connect_ip = (
+                get_local_ip_auto("0.0.0.0") if n_remote_reader > 0 else "127.0.0.1"
+            )
 
         context = Context()
 
