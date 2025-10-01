@@ -1168,7 +1168,7 @@ impl OpenAIRouter {
         server_label: &str,
     ) -> Vec<Value> {
         let mut mcp_call_items = Vec::new();
-        
+
         for item in conversation_history {
             if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
                 let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1208,7 +1208,7 @@ impl OpenAIRouter {
                 mcp_call_items.push(mcp_call_item);
             }
         }
-        
+
         mcp_call_items
     }
 
@@ -1271,11 +1271,9 @@ impl OpenAIRouter {
                 output_array.insert(0, list_tools_item);
 
                 // Add mcp_call items for executed calls using helper
-                let executed_items = Self::build_executed_mcp_call_items(
-                    &state.conversation_history,
-                    server_label,
-                );
-                
+                let executed_items =
+                    Self::build_executed_mcp_call_items(&state.conversation_history, server_label);
+
                 let mut insert_pos = 1;
                 for item in executed_items {
                     output_array.insert(insert_pos, item);
@@ -1377,18 +1375,24 @@ impl OpenAIRouter {
                     Some(user_max) => user_max.min(config.max_iterations),
                     None => config.max_iterations,
                 };
-                
+
                 if state.total_calls > effective_limit {
                     if let Some(user_max) = max_tool_calls {
                         if state.total_calls > user_max {
                             warn!("Reached user-specified max_tool_calls limit: {}", user_max);
                         } else {
-                            warn!("Reached safety max_iterations limit: {}", config.max_iterations);
+                            warn!(
+                                "Reached safety max_iterations limit: {}",
+                                config.max_iterations
+                            );
                         }
                     } else {
-                        warn!("Reached safety max_iterations limit: {}", config.max_iterations);
+                        warn!(
+                            "Reached safety max_iterations limit: {}",
+                            config.max_iterations
+                        );
                     }
-                    
+
                     return Self::build_incomplete_response(
                         response_json,
                         state,
