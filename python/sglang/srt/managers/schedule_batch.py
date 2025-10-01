@@ -655,9 +655,6 @@ class Req:
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
 
-        # For prefill loop count
-        self.prefill_loop_count = 0
-
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)

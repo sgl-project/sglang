@@ -3,6 +3,9 @@ from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.srt.metrics.collector import RadixCacheMetricsCollector
+from sglang.srt.server_args import ServerArgs
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 else:
@@ -30,6 +33,10 @@ class MatchResult(NamedTuple):
 
 class BasePrefixCache(ABC):
     """Cache can be indexed by either rid or key."""
+
+    metrics_collector: Optional[RadixCacheMetricsCollector] = (
+        None  # metrics collector for the cache
+    )
 
     @abstractmethod
     def reset(self):
@@ -107,3 +114,14 @@ class BasePrefixCache(ABC):
 
     def take_events(self):
         return []
+
+
+class BasePrefixCacheMetricsMixin:
+    def init_metrics(self: BasePrefixCache, server_args: Optional[ServerArgs] = None):
+        if server_args and server_args.enable_metrics:
+            engine_type = "unified"
+            labels = {
+                "model_name": server_args.served_model_name,
+                "engine_type": engine_type,
+            }
+            self.metrics_collector = RadixCacheMetricsCollector(labels=labels)

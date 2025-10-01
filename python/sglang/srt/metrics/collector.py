@@ -547,105 +547,6 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-        bucket_eviction_duration = get_histogram_conf_from_env(
-            "SGLANG_BUCKET_EVICTION_DURATION"
-        )
-        if bucket_eviction_duration is None:
-            bucket_eviction_duration = [
-                0.001,
-                0.002,
-                0.003,
-                0.004,
-                0.005,
-                0.006,
-                0.007,
-                0.008,
-                0.009,
-                0.01,
-                0.02,
-                0.03,
-                0.04,
-                0.05,
-                0.1,
-                0.2,
-                0.5,
-                1.0,
-            ]
-        bucket_load_back_duration = get_histogram_conf_from_env(
-            "SGLANG_BUCKET_LOAD_BACK_DURATION"
-        )
-        if bucket_load_back_duration is None:
-            bucket_load_back_duration = [
-                0.001,
-                0.002,
-                0.003,
-                0.004,
-                0.005,
-                0.006,
-                0.007,
-                0.008,
-                0.009,
-                0.01,
-                0.02,
-                0.03,
-                0.04,
-                0.05,
-                0.1,
-                0.2,
-                0.5,
-                1.0,
-            ]
-        bucket_chunked_prefill_loop_count = get_histogram_conf_from_env(
-            "SGLANG_BUCKET_CHUNKED_PREFILL_LOOP_COUNT"
-        )
-        if bucket_chunked_prefill_loop_count is None:
-            bucket_chunked_prefill_loop_count = [
-                1,
-                2,
-                3,
-                4,
-                5,
-                6,
-                7,
-                8,
-                9,
-                10,
-            ]
-        self.eviction_duration_seconds = Histogram(
-            name="sglang:eviction_duration_seconds",
-            documentation="Time taken to evict memory from GPU to CPU in seconds.",
-            labelnames=labels.keys(),
-            buckets=bucket_eviction_duration,
-        )
-
-        self.eviction_num_tokens = Counter(
-            name="sglang:evicted_tokens_total",
-            documentation="The number of tokens evicted from GPU to CPU.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-
-        self.load_back_duration_seconds = Histogram(
-            name="sglang:load_back_duration_seconds",
-            documentation="Time taken to load memory from CPU to GPU in seconds.",
-            labelnames=labels.keys(),
-            buckets=bucket_load_back_duration,
-        )
-
-        self.load_back_num_tokens = Counter(
-            name="sglang:load_back_tokens_total",
-            documentation="The number of tokens loaded from CPU to GPU.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-
-        self.chunked_prefill_loop_count = Histogram(
-            name="sglang:chunked_prefill_loop_count",
-            documentation="The bucket of chunked prefill loop count.",
-            labelnames=labels.keys(),
-            buckets=bucket_chunked_prefill_loop_count,
-        )
-
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -658,21 +559,6 @@ class SchedulerMetricsCollector:
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
-
-    def increment_eviction_num_tokens(self, num_tokens: int) -> None:
-        self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
-
-    def increment_load_back_num_tokens(self, num_tokens: int) -> None:
-        self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
-
-    def observe_eviction_duration(self, duration_seconds: float) -> None:
-        self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)
-
-    def observe_load_back_duration(self, duration_seconds: float) -> None:
-        self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
-
-    def observe_chunked_prefill_loop_count(self, count: int) -> None:
-        self.chunked_prefill_loop_count.labels(**self.labels).observe(count)
 
     def observe_request_latency_seconds(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
@@ -1130,3 +1016,100 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+
+
+class RadixCacheMetricsCollector:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+    ) -> None:
+        # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+        from prometheus_client import Counter, Histogram
+
+        self.labels = labels
+
+        bucket_eviction_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_EVICTION_DURATION"
+        )
+        if bucket_eviction_duration is None:
+            bucket_eviction_duration = [
+                0.001,
+                0.002,
+                0.003,
+                0.004,
+                0.005,
+                0.006,
+                0.007,
+                0.008,
+                0.009,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+        bucket_load_back_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_LOAD_BACK_DURATION"
+        )
+        if bucket_load_back_duration is None:
+            bucket_load_back_duration = [
+                0.001,
+                0.002,
+                0.003,
+                0.004,
+                0.005,
+                0.006,
+                0.007,
+                0.008,
+                0.009,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+        self.eviction_duration_seconds = Histogram(
+            name="sglang:eviction_duration_seconds",
+            documentation="Time taken to evict memory from GPU to CPU in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_eviction_duration,
+        )
+
+        self.eviction_num_tokens = Counter(
+            name="sglang:evicted_tokens_total",
+            documentation="The number of tokens evicted from GPU to CPU.",
+            labelnames=labels.keys(),
+        )
+
+        self.load_back_duration_seconds = Histogram(
+            name="sglang:load_back_duration_seconds",
+            documentation="Time taken to load memory from CPU to GPU in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_load_back_duration,
+        )
+
+        self.load_back_num_tokens = Counter(
+            name="sglang:load_back_tokens_total",
+            documentation="The number of tokens loaded from CPU to GPU.",
+            labelnames=labels.keys(),
+        )
+
+    def increment_eviction_num_tokens(self, num_tokens: int) -> None:
+        self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_load_back_num_tokens(self, num_tokens: int) -> None:
+        self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def observe_eviction_duration(self, duration_seconds: float) -> None:
+        self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_load_back_duration(self, duration_seconds: float) -> None:
+        self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)

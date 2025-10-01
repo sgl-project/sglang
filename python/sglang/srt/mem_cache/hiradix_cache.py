@@ -24,6 +24,7 @@ from sglang.srt.metrics.collector import (
     SchedulerMetricsCollector,
     StorageMetricsCollector,
 )
+from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ class HiRadixCache(RadixCache):
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
-        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
+        server_args: Optional[ServerArgs] = None,
     ):
 
         if hicache_io_backend == "direct":
@@ -110,8 +111,6 @@ class HiRadixCache(RadixCache):
             }
             self.metrics_collector = StorageMetricsCollector(labels=labels)
 
-        self.scheduler_metrics_collector = scheduler_metrics_collector
-
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
@@ -131,7 +130,7 @@ class HiRadixCache(RadixCache):
             page_size,
             disable=False,
             eviction_policy=eviction_policy,
-            scheduler_metrics_collector=scheduler_metrics_collector,
+            server_args=server_args,
         )
 
     def reset(self):
@@ -311,11 +310,11 @@ class HiRadixCache(RadixCache):
                 assert node.backuped
                 self._evict_backuped(node)
 
-        if num_evicted > 0 and self.scheduler_metrics_collector is not None:
-            self.scheduler_metrics_collector.observe_eviction_duration(
+        if num_evicted > 0 and self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(
                 time.perf_counter() - start_time
             )
-            self.scheduler_metrics_collector.increment_eviction_num_tokens(num_evicted)
+            self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
@@ -413,13 +412,11 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
-        if self.scheduler_metrics_collector is not None:
-            self.scheduler_metrics_collector.observe_load_back_duration(
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_load_back_duration(
                 time.perf_counter() - start_time
             )
-            self.scheduler_metrics_collector.increment_load_back_num_tokens(
-                len(device_indices)
-            )
+            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
         return device_indices
 

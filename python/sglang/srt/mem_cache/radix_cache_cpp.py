@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING, List, Optional, Set
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    BasePrefixCacheMetricsMixin,
+    MatchResult,
+)
 from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     IOHandle,
     RadixTreeCpp,
@@ -15,7 +19,7 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.metrics.collector import SchedulerMetricsCollector
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -24,7 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class RadixCacheCpp(BasePrefixCache):
+class RadixCacheCpp(BasePrefixCache, BasePrefixCacheMetricsMixin):
     def _merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
         """
         Merge a list of tensors into a single tensor.
@@ -54,7 +58,7 @@ class RadixCacheCpp(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         hicache_oracle: bool = False,
         enable_write_cancel: bool = False,
-        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
+        server_args: Optional[ServerArgs] = None,
     ):
         self.disable = disable
         self.enable_write_cancel = enable_write_cancel
@@ -78,7 +82,7 @@ class RadixCacheCpp(BasePrefixCache):
         self.page_size = page_size
 
         self.tp_group = tp_cache_group
-        self.scheduler_metrics_collector = scheduler_metrics_collector
+        self.init_metrics(server_args)
 
         if not use_hicache:
             self.tree = RadixTreeCpp(
@@ -146,11 +150,11 @@ class RadixCacheCpp(BasePrefixCache):
         evicted_device_indices = self.tree.evict(num_tokens)
         for indice in evicted_device_indices:
             self.token_to_kv_pool.free(indice)
-        if evicted_device_indices and self.scheduler_metrics_collector is not None:
-            self.scheduler_metrics_collector.observe_eviction_duration(
+        if evicted_device_indices and self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(
                 time.perf_counter() - start_time
             )
-            self.scheduler_metrics_collector.increment_eviction_num_tokens(num_tokens)
+            self.metrics_collector.increment_eviction_num_tokens(num_tokens)
 
     def evictable_size(self):
         return self.tree.evictable_size()

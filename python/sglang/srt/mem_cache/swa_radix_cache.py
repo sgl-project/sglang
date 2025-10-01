@@ -28,7 +28,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    BasePrefixCacheMetricsMixin,
+    MatchResult,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
@@ -36,7 +40,7 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
 )
-from sglang.srt.metrics.collector import SchedulerMetricsCollector
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -320,7 +324,7 @@ class LRUList:
             raise Exception(msg)
 
 
-class SWARadixCache(BasePrefixCache):
+class SWARadixCache(BasePrefixCache, BasePrefixCacheMetricsMixin):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -328,14 +332,14 @@ class SWARadixCache(BasePrefixCache):
         sliding_window_size: int,
         page_size: int,
         disable: bool = False,
-        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
+        server_args: Optional[ServerArgs] = None,
     ):
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
         self.disable = disable
-        self.scheduler_metrics_collector = scheduler_metrics_collector
+        self.init_metrics(server_args)
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -601,11 +605,11 @@ class SWARadixCache(BasePrefixCache):
 
         if (
             full_num_evicted > 0 or swa_num_evicted > 0
-        ) and self.scheduler_metrics_collector is not None:
-            self.scheduler_metrics_collector.observe_eviction_duration(
+        ) and self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(
                 time.perf_counter() - start_time
             )
-            self.scheduler_metrics_collector.increment_eviction_num_tokens(
+            self.metrics_collector.increment_eviction_num_tokens(
                 full_num_evicted + swa_num_evicted
             )
 

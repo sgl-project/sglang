@@ -306,13 +306,6 @@ class SchedulerOutputProcessorMixin:
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
-            if self.enable_metrics:
-                for req in batch.reqs:
-                    if req.prefill_loop_count > 0:
-                        self.metrics_collector.observe_chunked_prefill_loop_count(
-                            req.prefill_loop_count
-                        )
-                        req.prefill_loop_count = 0
 
     def add_input_logprob_return_values(
         self: Scheduler,

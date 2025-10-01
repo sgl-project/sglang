@@ -682,7 +682,6 @@ class Scheduler(
                 page_size=self.page_size,
             )
         else:
-            metric_collector = self.metrics_collector if self.enable_metrics else None
             if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -698,7 +697,7 @@ class Scheduler(
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
                     enable_kv_cache_events=self.enable_kv_cache_events,
-                    scheduler_metrics_collector=metric_collector,
+                    server_args=self.server_args,
                 )
             elif self.enable_hierarchical_cache:
                 self.tree_cache = HiRadixCache(
@@ -721,7 +720,7 @@ class Scheduler(
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                     model_name=server_args.served_model_name,
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
-                    scheduler_metrics_collector=metric_collector,
+                    server_args=self.server_args,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -736,6 +735,7 @@ class Scheduler(
                     sliding_window_size=self.sliding_window_size,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    server_args=self.server_args,
                 )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
@@ -752,6 +752,7 @@ class Scheduler(
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
                     eviction_policy=server_args.radix_eviction_policy,
+                    server_args=self.server_args,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -760,8 +761,8 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
-                    scheduler_metrics_collector=metric_collector,
                     eviction_policy=server_args.radix_eviction_policy,
+                    server_args=self.server_args,
                 )
 
         if (
@@ -1909,7 +1910,6 @@ class Scheduler(
             for req in can_run_list:
                 req.queue_time_end = time.perf_counter()
                 req.add_latency(RequestStage.PREFILL_WAITING)
-                req.prefill_loop_count += 1
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)

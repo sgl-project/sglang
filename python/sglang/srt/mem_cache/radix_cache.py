@@ -33,10 +33,14 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    BasePrefixCacheMetricsMixin,
+    MatchResult,
+)
 from sglang.srt.mem_cache.evict_policy import EvictionStrategy, LFUStrategy, LRUStrategy
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.metrics.collector import SchedulerMetricsCollector
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -160,7 +164,7 @@ def get_child_key(key: RadixKey, page_size: int = 1):
         return (key.extra_key, plain_key)
 
 
-class RadixCache(BasePrefixCache):
+class RadixCache(BasePrefixCache, BasePrefixCacheMetricsMixin):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -169,7 +173,7 @@ class RadixCache(BasePrefixCache):
         disable: bool = False,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
-        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
+        server_args: Optional[ServerArgs] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -177,7 +181,7 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
-        self.scheduler_metrics_collector = scheduler_metrics_collector
+        self.init_metrics(server_args)
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -411,11 +415,11 @@ class RadixCache(BasePrefixCache):
 
             self._record_remove_event(x)
 
-        if num_evicted > 0 and self.scheduler_metrics_collector is not None:
-            self.scheduler_metrics_collector.observe_eviction_duration(
+        if num_evicted > 0 and self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(
                 time.perf_counter() - start_time
             )
-            self.scheduler_metrics_collector.increment_eviction_num_tokens(num_evicted)
+            self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
