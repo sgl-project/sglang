@@ -267,6 +267,17 @@ class RadixCache(BasePrefixCache):
         """
         key.token_ids = self.key_convert_fn(key.token_ids)
 
+        def empty_match_result():
+            return MatchResult(
+                device_indices=torch.empty(
+                    (0,),
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+            )
+
         if self.disable or len(key) == 0:
             return empty_match_result()
 
