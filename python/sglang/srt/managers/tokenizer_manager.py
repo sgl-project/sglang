@@ -827,6 +827,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         for i in range(batch_size):
             if obj[i].input_ids is None:
                 return False
+            elif obj[i].text:
+                return False
+            elif obj[i].input_embeds is not None:
+                return False
+            elif self.is_generation and obj[i].contains_mm_input():
+                return False
+
         return True
 
     def _send_one_request(
