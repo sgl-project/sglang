@@ -31,7 +31,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, retry
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -64,12 +64,6 @@ class ModelConfig:
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
-        tp_rank: Optional[int] = None,
-        remote_instance_weight_loader_seed_instance_ip: Optional[str] = None,
-        remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None,
-        remote_instance_weight_loader_send_weights_group_ports: Optional[
-            List[int]
-        ] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -77,18 +71,6 @@ class ModelConfig:
         self.quantization = quantization
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
-
-        # TODO: remove these fields
-        self.tp_rank = tp_rank
-        self.remote_instance_weight_loader_seed_instance_ip = (
-            remote_instance_weight_loader_seed_instance_ip
-        )
-        self.remote_instance_weight_loader_seed_instance_service_port = (
-            remote_instance_weight_loader_seed_instance_service_port
-        )
-        self.remote_instance_weight_loader_send_weights_group_ports = (
-            remote_instance_weight_loader_send_weights_group_ports
-        )
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
@@ -204,9 +186,6 @@ class ModelConfig:
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
-            remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
-            remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
-            remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
             **kwargs,
         )
 
@@ -475,13 +454,31 @@ class ModelConfig:
                     from huggingface_hub import HfApi
 
                     hf_api = HfApi()
-                    if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
+
+                    def check_hf_quant_config():
+                        return hf_api.file_exists(
+                            self.model_path, "hf_quant_config.json"
+                        )
+
+                    # Retry HF API call up to 3 times
+                    file_exists = retry(
+                        check_hf_quant_config,
+                        max_retry=2,
+                        initial_delay=1.0,
+                        max_delay=5.0,
+                    )
+
+                    if file_exists:
                         quant_cfg = modelopt_quant_config
+
                 except huggingface_hub.errors.OfflineModeIsEnabled:
                     logger.warning(
                         "Offline mode is enabled, skipping hf_quant_config.json check"
                     )
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to check hf_quant_config.json: {self.model_path} {e}"
+                    )
 
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
@@ -781,6 +778,7 @@ multimodal_model_archs = [
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "DotsVLMForCausalLM",
+    "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
 ]
 

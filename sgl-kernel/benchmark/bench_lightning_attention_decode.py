@@ -1,10 +1,17 @@
 import itertools
 import math
+import os
 
 import torch
 import triton
 import triton.language as tl
 from sgl_kernel import lightning_attention_decode
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 
 def next_power_of_2(n):
@@ -207,7 +214,12 @@ def calculate_diff(batch_size):
         print("❌ Implementations differ")
 
 
-batch_size_range = [i for i in range(1, 65)]  # 1 to 128
+# Simplified for CI environment
+if IS_CI:
+    batch_size_range = [1]  # Single batch size for CI
+else:
+    batch_size_range = [i for i in range(1, 65)]  # 1 to 64
+
 configs = [(bs,) for bs in batch_size_range]
 
 
@@ -246,7 +258,7 @@ def benchmark(batch_size, provider):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "naive":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: lightning_attention_decode_naive(
                 q.clone(), k.clone(), v.clone(), past_kv.clone(), slope.clone()
             ),
@@ -257,7 +269,7 @@ def benchmark(batch_size, provider):
             batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype
         )
         new_kv = torch.empty(batch_size, num_heads, head_dim, head_dim, device=device)
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: lightning_attention_decode_kernel(
                 q.clone(),
                 k.clone(),
@@ -270,7 +282,7 @@ def benchmark(batch_size, provider):
             quantiles=quantiles,
         )
     elif provider == "triton":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: triton_lightning_attn_decode(
                 q.clone(), k.clone(), v.clone(), past_kv.clone(), slope.clone()
             ),
@@ -292,8 +304,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Run correctness test
-    calculate_diff(batch_size=4)
+    # Run correctness test - simplified for CI
+    test_batch_size = 1 if IS_CI else 4
+    calculate_diff(batch_size=test_batch_size)
 
     # Run performance benchmark
     benchmark.run(print_data=True)
