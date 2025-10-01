@@ -114,10 +114,9 @@ class SchedulerMetricsMixin:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"token usage: {token_usage:.2f}, "
 
-        num_new_seq = len(can_run_list)
         f = (
             f"Prefill batch. "
-            f"#new-seq: {num_new_seq}, "
+            f"#new-seq: {len(can_run_list)}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
             f"{token_usage_msg}"
@@ -185,7 +184,6 @@ class SchedulerMetricsMixin:
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
-        self.num_generated_tokens = 0
 
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
@@ -215,9 +213,7 @@ class SchedulerMetricsMixin:
             )
         else:
             num_used, token_usage, _, _ = self._get_token_info()
-            token_usage_msg = (
-                f"#token: {num_used}, " f"token usage: {token_usage:.2f}, "
-            )
+            token_usage_msg = f"#token: {num_used}, token usage: {token_usage:.2f}, "
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(

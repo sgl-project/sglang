@@ -1935,7 +1935,7 @@ class SignalHandler:
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):
         logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
+            f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
         self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())

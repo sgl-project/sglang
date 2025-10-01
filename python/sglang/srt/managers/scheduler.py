@@ -161,6 +161,7 @@ from sglang.srt.tracing.trace import (
     trace_set_proc_propagate_context,
     trace_set_thread_info,
     trace_slice,
+    trace_slice_batch,
     trace_slice_end,
     trace_slice_start,
 )
@@ -263,6 +264,7 @@ class Scheduler(
             server_args.enable_metrics_for_all_schedulers
         )
         self.enable_kv_cache_events = server_args.kv_events_config and tp_rank == 0
+        self.enable_trace = server_args.enable_trace
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -1276,6 +1278,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                disagg_mode=self.disaggregation_mode,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
@@ -1402,7 +1405,6 @@ class Scheduler(
                     req.set_finish_with_abort(error_msg)
 
         if add_to_grammar_queue:
-            req.queue_time_start = time.perf_counter()
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
@@ -1418,23 +1420,6 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _add_request_to_queue(self, req: Req):
-        req.queue_time_start = time.perf_counter()
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prefetch_kvcache(req)
-            self.disagg_prefill_bootstrap_queue.add(
-                req, self.model_config.num_key_value_heads
-            )
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.disagg_decode_prealloc_queue.add(req)
-        else:
-            self._set_or_validate_priority(req)
-            if self._abort_on_queued_limit(req):
-                return
-            self._prefetch_kvcache(req)
-            self.waiting_queue.append(req)
-            trace_slice_end("process req", req.rid, auto_next_anon=True)
-
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
@@ -1448,19 +1433,27 @@ class Scheduler(
                     req.rid, req.last_host_node, new_input_tokens, last_hash
                 )
 
-    def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_bootstrap_queue.extend(
-                reqs, self.model_config.num_key_value_heads
+    def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if self.disaggregation_mode == DisaggregationMode.NULL:
+            self._set_or_validate_priority(req)
+            if self._abort_on_queued_limit(req):
+                return
+            self._prefetch_kvcache(req)
+            self.waiting_queue.append(req)
+            req.time_stats.wait_queue_entry_time = time.perf_counter()
+            trace_slice_end("process req", req.rid, auto_next_anon=True)
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._prefetch_kvcache(req)
+            self.disagg_prefill_bootstrap_queue.add(
+                req, self.model_config.num_key_value_heads
             )
+            req.time_stats.prefill_bootstrap_queue_entry_time = time.perf_counter()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # If this is a decode server, we put the request to the decode pending prealloc queue
-            self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
+            self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
+            if not is_retracted:
+                req.time_stats.decode_prealloc_queue_entry_time = time.perf_counter()
         else:
-            for req in reqs:
-                self._set_or_validate_priority(req)
-                if not self._abort_on_queued_limit(req):
-                    self.waiting_queue.append(req)
+            raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
     def _set_or_validate_priority(self, req: Req):
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -1499,7 +1492,7 @@ class Scheduler(
             direction = 1 if self.schedule_low_priority_values_first else -1
             key_fn = lambda item: (
                 direction * item[1].priority,
-                item[1].queue_time_start,
+                item[1].time_stats.wait_queue_entry_time,
             )
             idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
             abort_existing_req = (
@@ -1901,7 +1894,6 @@ class Scheduler(
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
-                req.queue_time_end = time.perf_counter()
                 req.add_latency(RequestStage.PREFILL_WAITING)
 
         self.waiting_queue = [
@@ -1920,6 +1912,15 @@ class Scheduler(
         # Print stats
         if self.current_scheduler_metrics_enabled():
             self.log_prefill_stats(adder, can_run_list, running_bs)
+
+        for req in can_run_list:
+            if req.time_stats.forward_entry_time == 0:
+                # Avoid update chunked request many times
+                req.time_stats.forward_entry_time = time.perf_counter()
+                if self.enable_metrics:
+                    self.metrics_collector.observe_queue_time(
+                        req.time_stats.get_queueing_time(),
+                    )
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -2089,23 +2090,14 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
-            for req in batch.reqs:
-                trace_slice(
-                    "decode loop",
-                    req.rid,
-                    auto_next_anon=not req.finished(),
-                    thread_finish_flag=req.finished(),
-                )
+            if self.enable_trace:
+                trace_slice_batch("decode loop", batch.reqs)
 
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)
-            for req in batch.reqs:
-                trace_slice(
-                    "prefill",
-                    req.rid,
-                    auto_next_anon=not req.finished(),
-                    thread_finish_flag=req.finished(),
-                )
+            if self.enable_trace:
+                trace_slice_batch("prefill", batch.reqs)
+
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
@@ -2798,17 +2790,17 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
-    if server_args.enable_trace:
-        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
-        if server_args.disaggregation_mode == "null":
-            thread_label = "Scheduler"
-            trace_set_thread_info(thread_label, tp_rank, dp_rank)
+    # Config the process
+    setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
+    faulthandler.enable()
+    kill_itself_when_parent_died()
+    parent_process = psutil.Process().parent()
 
-    if (numa_node := server_args.numa_node) is not None:
-        numa_bind_to_node(numa_node[gpu_id])
-
-    # Generate the prefix
+    # Generate the logger prefix
     prefix = ""
+    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
+        # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
+        dp_rank = int(os.environ["SGLANG_DP_RANK"])
     if dp_rank is not None:
         prefix += f" DP{dp_rank}"
     if server_args.tp_size > 1:
@@ -2818,16 +2810,6 @@ def run_scheduler_process(
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
 
-    # Config the process
-    setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
-    faulthandler.enable()
-    kill_itself_when_parent_died()
-    parent_process = psutil.Process().parent()
-
-    # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
-    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-        dp_rank = int(os.environ["SGLANG_DP_RANK"])
-
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
@@ -2835,6 +2817,15 @@ def run_scheduler_process(
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+    if (numa_node := server_args.numa_node) is not None:
+        numa_bind_to_node(numa_node[gpu_id])
+
+    # Set up tracing
+    if server_args.enable_trace:
+        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "null":
+            thread_label = "Scheduler"
+            trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
     # Create a scheduler and run the event loop
     try:
