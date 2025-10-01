@@ -16,9 +16,10 @@ use wasmtime::Val;
 
 use crate::wasm::{
     config::WasmRuntimeConfig,
-    errors::{Result, WasmError, WasmManagerError, WasmModuleError, WasmRuntimeError},
+    errors::{Result, WasmError, WasmManagerError, WasmModuleError},
     module::{WasmModule, WasmModuleAttachPoint, WasmModuleDescriptor, WasmModuleMeta},
     runtime::WasmRuntime,
+    types::{WasmComponentInput, WasmComponentOutput},
 };
 
 pub struct WasmModuleManager {
@@ -282,6 +283,60 @@ impl WasmModuleManager {
 
     pub fn get_runtime(&self) -> &Arc<WasmRuntime> {
         &self.runtime
+    }
+
+    /// Execute WASM module using WIT component model based on attach_point
+    pub async fn execute_module_wit(
+        &self,
+        module_uuid: Uuid,
+        attach_point: WasmModuleAttachPoint,
+        input: WasmComponentInput,
+    ) -> Result<WasmComponentOutput> {
+        let start_time = std::time::Instant::now();
+
+        let module = {
+            let modules = self
+                .modules
+                .read()
+                .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+            modules
+                .get(&module_uuid)
+                .cloned()
+                .ok_or_else(|| WasmError::from(WasmManagerError::ModuleNotFound(module_uuid)))?
+        };
+
+        let wasm_bytes =
+            std::fs::read(&module.module_meta.file_path).map_err(|e| WasmError::from(e))?;
+
+        let result = self
+            .runtime
+            .execute_component_async(wasm_bytes, attach_point, input)
+            .await;
+
+        // Record metrics
+        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        self.total_executions.fetch_add(1, Ordering::Relaxed);
+        self.total_execution_time_ms
+            .fetch_add(execution_time_ms, Ordering::Relaxed);
+
+        if result.is_ok() {
+            self.successful_executions.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_executions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        result
+    }
+
+    /// Execute WASM module using WIT component model (sync version)
+    pub fn execute_module_wit_sync(
+        &self,
+        module_uuid: Uuid,
+        attach_point: WasmModuleAttachPoint,
+        input: WasmComponentInput,
+    ) -> Result<WasmComponentOutput> {
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(self.execute_module_wit(module_uuid, attach_point, input))
     }
 
     /// Get current metrics

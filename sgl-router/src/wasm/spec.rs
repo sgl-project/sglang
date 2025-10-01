@@ -105,3 +105,87 @@ pub struct WitMiddlewareModifyAction {
     #[serde(rename = "body-replace")]
     pub body_replace: Option<Vec<u8>>,
 }
+
+// Helper functions for converting from axum types to WIT types
+
+use axum::{body::Body, extract::Request};
+
+/// Convert axum Request to WIT Request
+///
+/// This helper function extracts all necessary information from an axum Request
+/// and converts it to the WIT Request type.
+pub async fn build_wit_request_from_axum(
+    request: Request<Body>,
+    request_id: String,
+) -> Result<sgl::router::middleware_types::Request, String> {
+    // Extract metadata before consuming the request
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let query = request.uri().query().unwrap_or("").to_string();
+
+    // Extract headers
+    let mut headers = Vec::new();
+    for (name, value) in request.headers() {
+        if let Ok(value_str) = value.to_str() {
+            headers.push(sgl::router::middleware_types::Header {
+                name: name.as_str().to_string(),
+                value: value_str.to_string(),
+            });
+        }
+    }
+
+    // Extract body (this consumes the request)
+    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+        .await
+        .map_err(|e| format!("Failed to read request body: {}", e))?
+        .to_vec();
+
+    // Build WIT Request
+    Ok(sgl::router::middleware_types::Request {
+        method,
+        path,
+        query,
+        headers,
+        body,
+        request_id,
+        now_epoch_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    })
+}
+
+/// Convert axum Response to WIT Response
+///
+/// This helper function extracts all necessary information from an axum Response
+/// and converts it to the WIT Response type.
+pub async fn build_wit_response_from_axum(
+    response: axum::response::Response<Body>,
+) -> Result<sgl::router::middleware_types::Response, String> {
+    // Extract status before consuming the response
+    let status = response.status().as_u16();
+
+    // Extract headers
+    let mut headers = Vec::new();
+    for (name, value) in response.headers() {
+        if let Ok(value_str) = value.to_str() {
+            headers.push(sgl::router::middleware_types::Header {
+                name: name.as_str().to_string(),
+                value: value_str.to_string(),
+            });
+        }
+    }
+
+    // Extract body (this consumes the response)
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|e| format!("Failed to read response body: {}", e))?
+        .to_vec();
+
+    // Build WIT Response
+    Ok(sgl::router::middleware_types::Response {
+        status,
+        headers,
+        body,
+    })
+}
