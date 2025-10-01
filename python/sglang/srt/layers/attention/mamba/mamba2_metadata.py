@@ -23,22 +23,33 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 @dataclass(kw_only=True)
-class Mamba2Metadata:
+class ForwardMetadata:
+    query_start_loc: torch.Tensor
+    mamba_cache_indices: torch.Tensor
+
+
+@dataclass(kw_only=True)
+class Mamba2Metadata(ForwardMetadata):
     """stable metadata across all mamba2 layers in the forward pass"""
 
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
-    query_start_loc: torch.Tensor
-    has_initial_states: torch.Tensor
-    prep_initial_states: bool
 
-    chunk_size: int
-    seq_idx: torch.Tensor
-    chunk_indices: torch.Tensor
-    chunk_offsets: torch.Tensor
+    @dataclass(kw_only=True, frozen=True)
+    class MixedMetadata:
+        has_initial_states: torch.Tensor
+        prep_initial_states: bool
 
-    seq_lens_cpu: list[int] | None
+        chunk_size: int
+        seq_idx: torch.Tensor
+        chunk_indices: torch.Tensor
+        chunk_offsets: torch.Tensor
+
+        extend_seq_lens_cpu: list[int]
+
+    mixed_metadata: MixedMetadata | None = None
+    """`mixed_metadata` is used for extend/mixed requests"""
 
     @staticmethod
     def _query_start_loc_to_chunk_indices_offsets(
@@ -124,72 +135,86 @@ class Mamba2Metadata:
 
         return chunk_indices, chunk_offsets
 
-    @classmethod
-    def prepare(
-        cls, forward_batch: ForwardBatch, *, chunk_size: int
+    @staticmethod
+    def prepare_decode(
+        query_start_loc: torch.Tensor,
+        mamba_cache_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
     ) -> "Mamba2Metadata":
-        seq_idx = None
-        chunk_indices, chunk_offsets = None, None
-        # Need flags to indicate if there are initial states
-        # currently we really only support the FlashAttention backend
+        """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
+        return Mamba2Metadata(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=mamba_cache_indices,
+            num_decodes=len(seq_lens),
+            num_prefills=0,
+            num_prefill_tokens=0,
+        )
+
+    @classmethod
+    def prepare_mixed(
+        cls,
+        query_start_loc: torch.Tensor,
+        mamba_cache_indices: torch.Tensor,
+        chunk_size: int,
+        forward_batch: ForwardBatch,
+    ) -> "Mamba2Metadata":
+        """This path cannot run with CUDA graph, as it contains extend requests."""
+        assert all(
+            x is not None
+            for x in (
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_seq_lens_cpu,
+                forward_batch.extend_num_tokens,
+            )
+        )
+
         has_initial_states = None
         prep_initial_states = False
-
-        # Compute seq_idx, chunk_indices and chunk_offsets for prefill only
-        # TODO: I think this might be right?
-        num_prefills = (
-            len(forward_batch.extend_seq_lens)
-            if forward_batch.extend_seq_lens is not None
-            else 0
-        )
-        num_prefill_tokens = forward_batch.extend_num_tokens or 0
+        num_prefills = len(forward_batch.extend_seq_lens)
+        num_prefill_tokens = forward_batch.extend_num_tokens
         num_decodes = len(forward_batch.seq_lens) - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
-        query_start_loc = forward_batch.query_start_loc(
-            device=str(forward_batch.seq_lens.device)
+
+        if context_lens_tensor is not None:
+            # precompute flag to avoid device syncs later in mamba2 layer
+            # forwards
+            # prep is only needed for mamba2 ssd prefill processing
+            has_initial_states = context_lens_tensor > 0
+            prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
+
+        query_start_loc = query_start_loc[: num_prefills + 1]
+        seq_idx = torch.repeat_interleave(
+            torch.arange(
+                num_prefills, dtype=torch.int32, device=query_start_loc.device
+            ),
+            query_start_loc.diff(),
+            output_size=num_prefill_tokens,
         )
-        seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        seq_idx.unsqueeze_(0)
 
-        if num_prefills > 0:
-            if context_lens_tensor is not None:
-                # precompute flag to avoid device syncs later in mamba2 layer
-                # forwards
-                # prep is only needed for mamba2 ssd prefill processing
-                has_initial_states = context_lens_tensor > 0
-                prep_initial_states = torch.any(
-                    has_initial_states[:num_prefills]
-                ).item()
-            assert query_start_loc is not None
-            query_start_loc = query_start_loc[: num_prefills + 1]
-            seq_idx = torch.repeat_interleave(
-                torch.arange(
-                    num_prefills, dtype=torch.int32, device=query_start_loc.device
-                ),
-                query_start_loc.diff(),
-                output_size=num_prefill_tokens,
-            )
-            seq_idx.unsqueeze_(0)
-
-            # We compute metadata for chunked prefill once at the top level model
-            # forward and reuse them in mamba layers. If not needed, they will be
-            # ignored inside mamba kernels.
-            if prep_initial_states:
-                chunk_indices, chunk_offsets = (
-                    cls._query_start_loc_to_chunk_indices_offsets(
-                        query_start_loc, chunk_size, num_prefill_tokens
-                    )
+        # We compute metadata for chunked prefill once at the top level model
+        # forward and reuse them in mamba layers. If not needed, they will be
+        # ignored inside mamba kernels.
+        if prep_initial_states:
+            chunk_indices, chunk_offsets = (
+                cls._query_start_loc_to_chunk_indices_offsets(
+                    query_start_loc, chunk_size, num_prefill_tokens
                 )
+            )
 
         return Mamba2Metadata(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=mamba_cache_indices,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
-            query_start_loc=query_start_loc,
-            has_initial_states=has_initial_states,
-            prep_initial_states=prep_initial_states,
-            chunk_size=chunk_size,
-            seq_idx=seq_idx,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            seq_lens_cpu=seq_lens_cpu,
+            mixed_metadata=cls.MixedMetadata(
+                has_initial_states=has_initial_states,
+                prep_initial_states=prep_initial_states,
+                chunk_size=chunk_size,
+                seq_idx=seq_idx,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ),
         )

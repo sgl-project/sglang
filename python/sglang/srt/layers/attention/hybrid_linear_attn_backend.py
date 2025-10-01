@@ -1,9 +1,10 @@
 from dataclasses import astuple, dataclass
 from functools import lru_cache
-from typing import Optional, Union
+from typing import Optional, TypeVar, Union
 
 import torch
 import torch.nn.functional as F
+from typing_extensions import Generic
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -18,6 +19,11 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+    ForwardMetadata,
+    Mamba2Metadata,
+)
+from sglang.srt.layers.attention.mamba.mamba2_mixer import Mamba2Mixer
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -48,15 +54,7 @@ elif is_npu():
     causal_conv1d_update = causal_conv1d_update_npu
 
 
-@dataclass
-class ForwardMetadata:
-    query_start_loc: Optional[torch.Tensor]
-    mamba_cache_indices: torch.Tensor
-
-
-class MambaAttnBackend(AttentionBackend):
-    """Attention backend using Mamba kernel."""
-
+class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -69,11 +67,43 @@ class MambaAttnBackend(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self.forward_metadata = self._forward_metadata(forward_batch)
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        self.forward_metadata = self._capture_metadata(
+            bs, req_pool_indices, forward_mode
+        )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        self.forward_metadata = self._replay_metadata(
+            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
+        )
+
+    def _forward_metadata(self, forward_batch: ForwardBatch):
         query_start_loc = forward_batch.query_start_loc(device=self.device)
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
-        self.forward_metadata = ForwardMetadata(
+        return ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
         )
@@ -103,15 +133,8 @@ class MambaAttnBackend(AttentionBackend):
             device=self.device,
         )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+    def _capture_metadata(
+        self, bs: int, req_pool_indices: torch.Tensor, forward_mode: ForwardMode
     ):
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
@@ -125,18 +148,15 @@ class MambaAttnBackend(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
-        self.forward_metadata = ForwardMetadata(
+        return ForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
         )
 
-    def init_forward_metadata_replay_cuda_graph(
+    def _replay_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
@@ -176,13 +196,17 @@ class MambaAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
-        self.forward_metadata = ForwardMetadata(
+        return ForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
         )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1  # Mamba attn does not use seq lens to index kv cache
+
+
+class GDNAttnBackend(MambaAttnBackendBase[ForwardMetadata]):
+    """Attention backend using Mamba kernel."""
 
     def forward_decode(
         self,
@@ -397,13 +421,87 @@ class MambaAttnBackend(AttentionBackend):
         return core_attn_out
 
 
+class Mamba2AttnBackend(MambaAttnBackendBase[Mamba2Metadata]):
+    """Attention backend wrapper for Mamba2Mixer kernels."""
+
+    ForwardMetadata = Mamba2Metadata
+
+    def __init__(self, model_runner: ModelRunner):
+        super().__init__(model_runner)
+        self.chunk_size = int(getattr(model_runner.server_args, "chunk_size", 256))
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        metadata = self._forward_metadata(forward_batch)
+        self.forward_metadata = Mamba2Metadata.prepare_mixed(
+            metadata.query_start_loc,
+            metadata.mamba_cache_indices,
+            self.chunk_size,
+            forward_batch,
+        )
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode)
+        self.forward_metadata = Mamba2Metadata.prepare_decode(
+            metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
+        )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        metadata = self._replay_metadata(
+            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
+        )
+        self.forward_metadata = Mamba2Metadata.prepare_decode(
+            metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
+        )
+
+    def forward(
+        self,
+        mixer: Mamba2Mixer,
+        layer_id: int,
+        *,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ):
+        assert isinstance(self.forward_metadata, Mamba2Metadata)
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        return mixer.forward(hidden_states, output, layer_cache, self.forward_metadata)
+
+    def forward_decode(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Mamba2AttnBackend's forward is called directly instead of through HybridLinearAttnBackend, as it supports mixed prefill and decode"
+        )
+
+    def forward_extend(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Mamba2AttnBackend's forward is called directly instead of through HybridLinearAttnBackend, as it supports mixed prefill and decode"
+        )
+
+
 class HybridLinearAttnBackend(AttentionBackend):
-    """Support different backends for prefill and decode."""
+    """Manages a full and linear attention backend"""
 
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
-        linear_attn_backend: MambaAttnBackend,
+        linear_attn_backend: MambaAttnBackendBase,
         full_attn_layers: list[int],
     ):
         self.full_attn_layers = full_attn_layers

@@ -13,12 +13,11 @@
 # ==============================================================================
 # Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/vllm/model_executor/layers/mamba/mamba_mixer2.py
 
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 from torch import nn
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -45,7 +44,7 @@ from .ssd_combined import mamba_chunk_scan_combined
 
 
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
-class Mamba2Mixer(CustomOp):
+class Mamba2Mixer(nn.Module):
     """
     Compute ∆, A, B, C, and D the state space parameters and compute
     the `contextualized_states`. A, D are input independent
@@ -243,34 +242,11 @@ class Mamba2Mixer(CustomOp):
 
         self.prefix = prefix
 
-    def forward_native(
-        self,
-        hidden_states: torch.Tensor,
-        output: torch.Tensor,
-        layer_cache: MambaPool.State,
-        layer_cache_indices: torch.Tensor,
-        metadata: Mamba2Metadata,
-    ):
-        pass
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
         layer_cache: MambaPool.State,
-        layer_cache_indices: torch.Tensor,
-        metadata: Mamba2Metadata,
-    ):
-        CustomOp.forward(
-            self, hidden_states, output, layer_cache, layer_cache_indices, metadata
-        )
-
-    def forward_cuda(
-        self,
-        hidden_states: torch.Tensor,
-        output: torch.Tensor,
-        layer_cache: MambaPool.State,
-        layer_cache_indices: torch.Tensor,
         metadata: Mamba2Metadata,
     ):
         # metadata contains metadata necessary for the mamba2 triton
@@ -279,15 +255,6 @@ class Mamba2Mixer(CustomOp):
         # stay the same and reused for all mamba layers in the same iteration
         conv_state = layer_cache.conv
         ssm_state = layer_cache.temporal
-        state_indices_tensor = layer_cache_indices
-        has_initial_states_p = metadata.has_initial_states
-        prep_initial_states = metadata.prep_initial_states
-        chunk_size = metadata.chunk_size
-        seq_idx_p = metadata.seq_idx
-        chunk_indices_p = metadata.chunk_indices
-        chunk_offsets_p = metadata.chunk_offsets
-        seq_lens_cpu_p = metadata.seq_lens_cpu
-
         groups_time_state_size = self.n_groups * self.ssm_state_size
 
         # 1. Gated MLP's linear projection
@@ -340,7 +307,7 @@ class Mamba2Mixer(CustomOp):
         )
         # Split along batch dimension
         state_indices_tensor_p, state_indices_tensor_d = torch.split(
-            state_indices_tensor,
+            metadata.mamba_cache_indices,
             [num_prefills, num_decodes],
             dim=0,
         )
@@ -366,19 +333,23 @@ class Mamba2Mixer(CustomOp):
 
         # Process prefill requests
         if has_prefill:
+            mixed_metadata = metadata.mixed_metadata
+            assert mixed_metadata is not None
             # 2. Convolution sequence transformation
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
+
+            has_initial_states_p = mixed_metadata.has_initial_states
             hidden_states_B_C_p = causal_conv1d_fn(
                 x,
                 conv_weights,
                 self.conv1d.bias,
                 conv_state,
                 query_start_loc_p,
-                seq_lens_cpu_p,
+                mixed_metadata.extend_seq_lens_cpu,
                 state_indices_tensor_p,
                 has_initial_states_p,
                 self.activation,
@@ -388,7 +359,7 @@ class Mamba2Mixer(CustomOp):
 
             # 3. State Space Model sequence transformation
             initial_states = None
-            if has_initial_states_p is not None and prep_initial_states:
+            if has_initial_states_p is not None and mixed_metadata.prep_initial_states:
                 # making a copy of the states
                 initial_states = torch.where(
                     has_initial_states_p[:num_prefills, None, None, None],
@@ -405,13 +376,13 @@ class Mamba2Mixer(CustomOp):
                 self.A,
                 B_p.view(1, num_prefill_tokens, self.n_groups // self.tp_size, -1),
                 C_p.view(1, num_prefill_tokens, self.n_groups // self.tp_size, -1),
-                chunk_size=chunk_size,
+                chunk_size=mixed_metadata.chunk_size,
                 D=self.D,
                 z=None,
                 dt_bias=self.dt_bias,
-                seq_idx=seq_idx_p,
-                chunk_indices=chunk_indices_p,
-                chunk_offsets=chunk_offsets_p,
+                seq_idx=mixed_metadata.seq_idx,
+                chunk_indices=mixed_metadata.chunk_indices,
+                chunk_offsets=mixed_metadata.chunk_offsets,
                 cu_seqlens=query_start_loc_p,
                 initial_states=initial_states,
                 return_varlen_states=True,

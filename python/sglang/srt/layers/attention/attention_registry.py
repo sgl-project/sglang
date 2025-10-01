@@ -1,6 +1,13 @@
 import logging
+from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
+
+
+if TYPE_CHECKING:
+    # evade circular imports
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
 
@@ -162,7 +169,7 @@ def create_dual_chunk_flash_attn_backend(runner):
     return DualChunkFlashAttentionBackend(runner)
 
 
-def attn_backend_wrapper(runner, full_attn_backend):
+def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
     """
     Wrapper for special models like hybrid GDN, so we don't
     need to change the code of the original attention backend.
@@ -185,11 +192,20 @@ def attn_backend_wrapper(runner, full_attn_backend):
             ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
         logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            GDNAttnBackend,
             HybridLinearAttnBackend,
-            MambaAttnBackend,
+            Mamba2AttnBackend,
         )
 
-        linear_attn_backend = MambaAttnBackend(runner)
+        if runner.is_hybrid_gdn:
+            linear_attn_backend = GDNAttnBackend(runner)
+        elif runner.is_nemotron_h:
+            linear_attn_backend = Mamba2AttnBackend(runner)
+        else:
+            raise ValueError(
+                "hybrid_linear_attn backend requires either hybrid GDN or NemotronH models."
+            )
+
         full_attn_layers = runner.model_config.hf_config.full_attention_layer_ids
         return HybridLinearAttnBackend(
             full_attn_backend, linear_attn_backend, full_attn_layers

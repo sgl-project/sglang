@@ -19,7 +19,6 @@ from typing import Union
 import torch
 from torch import nn
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -32,7 +31,7 @@ from sglang.srt.utils import set_weight_attrs
 
 
 # Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
-class Mixer2RMSNormGated(CustomOp):
+class Mixer2RMSNormGated(nn.Module):
 
     def __init__(
         self,
@@ -113,7 +112,7 @@ class Mixer2RMSNormGated(CustomOp):
 
         return self.weight * x.to(input_dtype)
 
-    def forward_cuda(
+    def forward(
         self,
         x: torch.Tensor,
         gate: torch.Tensor,
