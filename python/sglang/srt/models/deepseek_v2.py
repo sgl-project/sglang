@@ -188,7 +188,7 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "ascend",
-    "hip_attention"
+    "hip_attention",
 ]
 
 
@@ -298,6 +298,7 @@ def handle_flashinfer(attn, forward_batch):
 
 def handle_fa3(attn, forward_batch):
     return _handle_backend(attn, forward_batch, "fa3")
+
 
 def handle_hip_attention(attn, forward_batch):
     # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.

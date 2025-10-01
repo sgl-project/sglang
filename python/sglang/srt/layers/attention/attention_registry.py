@@ -191,6 +191,7 @@ def create_hybrid_linear_attn_backend(runner):
         full_attn_backend, linear_attn_backend, full_attn_layers
     )
 
+
 @register_attention_backend("hip_attention")
 def create_hip_attn_backend(runner):
     from sglang.srt.layers.attention.hip_attention import HiPAttentionBackend

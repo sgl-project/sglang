@@ -266,7 +266,7 @@ class ModelConfig:
                 if (
                     get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN")
                     or is_in_ci()  # FIXME: fix this special case
-                    or True # FIXME (ain): you should fix above condition...
+                    or True  # FIXME (ain): you should fix above condition...
                 ):
                     logger.warning(msg)
                     self.context_len = context_length

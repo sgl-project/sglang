@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 from torch import nn
 
-from sglang.srt.layers.rotary_embedding import RotaryEmbedding, DualChunkRotaryEmbedding
+from sglang.srt.layers.rotary_embedding import DualChunkRotaryEmbedding, RotaryEmbedding
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
