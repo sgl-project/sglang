@@ -437,6 +437,7 @@ class CudaGraphRunner:
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 record_shapes=True,
             )
+            torch.cuda.memory._record_memory_history()
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -485,6 +486,8 @@ class CudaGraphRunner:
                     save_gemlite_cache()
 
         if self.enable_profile_cuda_graph:
+            torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
+            torch.cuda.memory._record_memory_history(enabled=None)
             log_message = (
                 "Sorted by CUDA Time:\n"
                 + prof.key_averages(group_by_input_shape=True).table(
@@ -494,6 +497,7 @@ class CudaGraphRunner:
                 + prof.key_averages(group_by_input_shape=True).table(
                     sort_by="cpu_time_total", row_limit=10
                 )
+                + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
             )
             logger.info(log_message)
 
@@ -817,7 +821,7 @@ class CudaGraphRunner:
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
         ):
-            from sglang.srt.speculative.eagle_utils import EagleVerifyInput
+            from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
