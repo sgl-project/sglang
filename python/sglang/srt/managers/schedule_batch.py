@@ -860,10 +860,6 @@ class Req:
         )
 
 
-# Batch id
-batch_id = 0
-
-
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1807,10 +1803,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else self.seq_lens.cpu()
         )
 
-        global batch_id
-        batch_id += 1
         return ModelWorkerBatch(
-            batch_id=batch_id,
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
@@ -1930,8 +1923,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
 @dataclasses.dataclass
 class ModelWorkerBatch:
-    # The batch id
-    batch_id: int
     # The forward mode
     forward_mode: ForwardMode
     # The input ids

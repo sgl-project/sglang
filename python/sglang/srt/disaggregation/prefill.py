@@ -684,7 +684,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.running_mbs = [
             ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
         ]
-        batch_ids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
 
         # Either success or failed
@@ -756,10 +755,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # send the outputs to the next step
                 if self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        next_token_ids, batch_ids[mb_id] = (
-                            result.next_token_ids,
-                            result.batch_id,
-                        )
+                        next_token_ids = result.next_token_ids
                         pp_outputs = PPProxyTensors(
                             {
                                 "next_token_ids": next_token_ids,
@@ -796,7 +792,6 @@ class SchedulerDisaggregationPrefillMixin:
                         next_token_ids=next_pp_outputs["next_token_ids"],
                         extend_input_len_per_req=None,
                         extend_logprob_start_len_per_req=None,
-                        batch_id=batch_ids[next_mb_id],
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result_disagg_prefill(
@@ -813,8 +808,6 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # carry the outputs to the next stage
                 if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        batch_ids[mb_id] = result.batch_id
                     if pp_outputs:
                         # send the outputs from the last round to let the next stage worker run post processing
                         self.pp_group.send_tensor_dict(
