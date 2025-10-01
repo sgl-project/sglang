@@ -1801,7 +1801,7 @@ class ServerArgs:
             type=str,
             default="lru",
             choices=["lru", "fifo"],
-            help="LoRA adapter eviction policy when memory pool is full. 'fifo': First-In-First-Out (default for backward compatibility). 'lru': Least Recently Used (better cache efficiency).",
+            help="LoRA adapter eviction policy when memory pool is full. 'lru': Least Recently Used (default, better cache efficiency). 'fifo': First-In-First-Out.",
         )
         parser.add_argument(
             "--lora-backend",

@@ -93,7 +93,7 @@ class FIFOEvictionPolicy(EvictionPolicy):
         """Select the first inserted adapter from candidates."""
         # Iterate through insertion_order (oldest first) to find FIFO victim
         for uid in list(self.insertion_order.keys()):
-            if uid in candidates and uid is not None:
+            if uid in candidates:
                 logger.debug(f"Selected LoRA {uid} for eviction (FIFO)")
                 self.eviction_count += 1
                 return uid
