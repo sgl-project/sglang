@@ -310,7 +310,7 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if self.storage_backend_type in ["hf3fs", "mooncake"]:
+            if self.storage_backend_type in ["hf3fs", "mooncake", "eic"]:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
