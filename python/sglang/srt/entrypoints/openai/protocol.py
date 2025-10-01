@@ -681,6 +681,14 @@ class EmbeddingObject(BaseModel):
     embedding: List[float]
     index: int
     object: str = "embedding"
+    cache_hit_rate: Optional[float] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.cache_hit_rate is None:
+            data.pop("cache_hit_rate", None)
+        return data
 
 
 class EmbeddingResponse(BaseModel):
