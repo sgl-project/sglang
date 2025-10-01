@@ -6,7 +6,7 @@ use crate::tool_parser::{
     partial_json::PartialJson,
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+    types::{FunctionCall, StreamResult, StreamingParseResult, ToolCall},
 };
 
 /// Mistral format parser for tool calls
@@ -192,40 +192,9 @@ impl ToolParser for MistralParser {
         chunk: &str,
         state: &mut ParseState,
     ) -> ToolParserResult<StreamingParseResult> {
-        state.buffer.push_str(chunk);
-        let mut result = StreamingParseResult::new();
-
-        const BOT_TOKEN: &str = "[TOOL_CALLS] ";
-
-        // Phase 1: Check for normal text before tool markers
-        if !state.in_tool_section {
-            if let Some(token_pos) = state.buffer.find(BOT_TOKEN) {
-                if token_pos > 0 {
-                    result.normal_text = state.buffer.drain(..token_pos).collect();
-                    state.in_tool_section = true;
-                    return Ok(result);
-                }
-                state.in_tool_section = true;
-                // Remove the [TOOL_CALLS] token from buffer
-                state.buffer.drain(..BOT_TOKEN.len());
-            } else {
-                // Check if we might have a partial token at the end
-                if self.has_partial_token(&state.buffer) {
-                    return Ok(result);
-                }
-
-                // No tool marker, return as normal text
-                result.normal_text = std::mem::take(&mut state.buffer);
-                return Ok(result);
-            }
-        }
-
-        // Phase 2: Process tool calls array
-        if state.in_tool_section {
-            self.process_tool_array(state, &mut result)?;
-        }
-
-        Ok(result)
+        // Call the existing implementation and convert result
+        let result = self.parse_incremental_legacy(chunk, state).await?;
+        Ok(super::helpers::convert_stream_result(result))
     }
 
     fn detect_format(&self, text: &str) -> bool {
@@ -234,153 +203,95 @@ impl ToolParser for MistralParser {
 }
 
 impl MistralParser {
-    fn has_partial_token(&self, buffer: &str) -> bool {
-        const BOT_TOKEN: &str = "[TOOL_CALLS] ";
-        for i in 1..BOT_TOKEN.len().min(buffer.len()) {
-            if BOT_TOKEN.starts_with(&buffer[buffer.len() - i..]) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn process_tool_array(
+    async fn parse_incremental_legacy(
         &self,
+        chunk: &str,
         state: &mut ParseState,
-        result: &mut StreamingParseResult,
-    ) -> ToolParserResult<()> {
-        // Try to parse partial JSON array
-        match self.partial_json.parse_value(&state.buffer) {
-            Ok((value, consumed)) => {
-                if let Some(array) = value.as_array() {
-                    // Process each tool in the array
-                    for (idx, tool_value) in array.iter().enumerate() {
-                        self.process_single_tool(idx, tool_value, state, result)?;
-                    }
-                }
+    ) -> ToolParserResult<StreamResult> {
+        state.buffer.push_str(chunk);
 
-                // Check if we've consumed everything
-                if consumed == state.buffer.len() && state.buffer.ends_with(']') {
-                    // Tools complete, clear buffer
-                    state.buffer.clear();
-                    state.mode = crate::tool_parser::state::ParseMode::Complete;
-                }
-            }
-            Err(_) => {
-                // Incomplete JSON, try to extract partial tool info
-                self.try_extract_partial_tools(state, result)?;
+        // Check if we have the start marker
+        if !self.has_tool_markers(&state.buffer) {
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before [TOOL_CALLS] and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("[TOOL_CALLS]") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
             }
         }
 
-        Ok(())
-    }
+        // Try to extract complete JSON array
+        if let Some(json_array) = self.extract_json_array(&state.buffer) {
+            // Parse with partial JSON to handle incomplete content
+            match self.partial_json.parse_value(json_array) {
+                Ok((value, consumed)) => {
+                    // Check if we have a complete JSON structure
+                    if consumed == json_array.len() {
+                        // Complete JSON, parse tool calls
+                        let tools = if let Value::Array(arr) = value {
+                            let mut result = Vec::new();
+                            for (index, item) in arr.iter().enumerate() {
+                                if let Some(tool) = self.parse_single_object(item, index)? {
+                                    result.push(tool);
+                                }
+                            }
+                            result
+                        } else {
+                            vec![]
+                        };
 
-    fn process_single_tool(
-        &self,
-        index: usize,
-        tool_value: &Value,
-        state: &mut ParseState,
-        result: &mut StreamingParseResult,
-    ) -> ToolParserResult<()> {
-        // Ensure we have a partial tool entry
-        let partial = state.ensure_partial_tool(index);
+                        if !tools.is_empty() {
+                            // Clear buffer since we consumed everything
+                            state.buffer.clear();
 
-        // Extract and send tool name if not sent
-        if !partial.name_sent {
-            if let Some(name) = tool_value.get("name").and_then(|v| v.as_str()) {
-                partial.name = Some(name.to_string());
-                partial.id = Some(format!("mistral_call_{}", uuid::Uuid::new_v4()));
-                partial.name_sent = true;
-
-                result.tool_calls.push(ToolCallItem {
-                    tool_index: index,
-                    id: partial.id.clone(),
-                    name: partial.name.clone(),
-                    arguments_delta: String::new(),
-                });
-                return Ok(());
-            }
-        }
-
-        // Stream arguments
-        if partial.name_sent {
-            if let Some(args_value) = tool_value.get("arguments") {
-                let args_str = serde_json::to_string(args_value)?;
-
-                if args_str.len() > partial.streamed_arguments.len() {
-                    let delta = &args_str[partial.streamed_arguments.len()..];
-
-                    result.tool_calls.push(ToolCallItem {
-                        tool_index: index,
-                        id: None,
-                        name: None,
-                        arguments_delta: delta.to_string(),
-                    });
-
-                    partial.streamed_arguments = args_str;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn try_extract_partial_tools(
-        &self,
-        state: &mut ParseState,
-        result: &mut StreamingParseResult,
-    ) -> ToolParserResult<()> {
-        // Try to extract partial tool info using bracket counting
-        let mut in_string = false;
-        let mut escape = false;
-        let mut depth = 0;
-        let mut object_start = None;
-        let mut tool_index = 0;
-
-        // Clone buffer to avoid borrow issues
-        let buffer = state.buffer.clone();
-        for (i, ch) in buffer.char_indices() {
-            if escape {
-                escape = false;
-                continue;
-            }
-
-            match ch {
-                '\\' if in_string => escape = true,
-                '"' => in_string = !in_string,
-                '{' if !in_string => {
-                    if depth == 1 && object_start.is_none() {
-                        object_start = Some(i);
-                    }
-                    depth += 1;
-                }
-                '}' if !in_string => {
-                    depth -= 1;
-                    if depth == 1 && object_start.is_some() {
-                        // We have a complete object
-                        let obj_str = &buffer[object_start.unwrap()..=i];
-                        if let Ok(value) = serde_json::from_str::<Value>(obj_str) {
-                            self.process_single_tool(tool_index, &value, state, result)?;
-                            tool_index += 1;
+                            // Return the first tool (simplified for Phase 3)
+                            // Full multi-tool streaming will be implemented later
+                            if let Some(tool) = tools.into_iter().next() {
+                                return Ok(StreamResult::ToolComplete(tool));
+                            }
                         }
-                        object_start = None;
+                    } else {
+                        // Partial JSON - try to extract tool name for streaming
+                        if let Value::Array(arr) = value {
+                            if let Some(first_tool) = arr.first() {
+                                if let Some(name) = first_tool.get("name").and_then(|v| v.as_str())
+                                {
+                                    // Check if we've already sent the name
+                                    if !state.in_string {
+                                        state.in_string = true; // Use as flag for "name sent"
+                                        return Ok(StreamResult::ToolName {
+                                            index: 0,
+                                            name: name.to_string(),
+                                        });
+                                    }
+
+                                    // Check for arguments
+                                    if let Some(args) = first_tool.get("arguments") {
+                                        if let Ok(args_str) = serde_json::to_string(args) {
+                                            return Ok(StreamResult::ToolArguments {
+                                                index: 0,
+                                                arguments: args_str,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                '[' if !in_string => depth += 1,
-                ']' if !in_string => depth -= 1,
-                _ => {}
+                Err(_) => {
+                    // Failed to parse even as partial JSON
+                    // Keep buffering
+                }
             }
         }
 
-        // Try to process partial object if we have one
-        if let Some(start) = object_start {
-            let partial_obj = &buffer[start..];
-            if let Ok((value, _)) = self.partial_json.parse_value(partial_obj) {
-                self.process_single_tool(tool_index, &value, state, result)?;
-            }
-        }
-
-        Ok(())
+        Ok(StreamResult::Incomplete)
     }
-
 }

@@ -21,8 +21,22 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
+/// Streaming parse result (legacy enum for backwards compatibility)
+#[derive(Debug, Clone)]
+pub enum StreamResult {
+    /// Need more data to continue parsing
+    Incomplete,
+    /// Found a tool name (for streaming)
+    ToolName { index: usize, name: String },
+    /// Found incremental arguments (for streaming)
+    ToolArguments { index: usize, arguments: String },
+    /// Completed parsing a tool
+    ToolComplete(ToolCall),
+    /// Normal text (not part of tool call)
+    NormalText(String),
+}
 
-/// Streaming parse result
+/// Streaming parse result following vLLM/Python pattern
 /// Can return both normal text AND tool calls in the same response
 #[derive(Debug, Clone)]
 pub struct StreamingParseResult {
@@ -77,12 +91,10 @@ impl Default for StreamingParseResult {
 pub struct ToolCallItem {
     /// Tool index for this call
     pub tool_index: usize,
-    /// Tool ID (sent only on first chunk)
-    pub id: Option<String>,
-    /// Function name (sent only on first chunk)
+    /// Function name (None for argument-only updates)
     pub name: Option<String>,
-    /// Incremental arguments chunk
-    pub arguments_delta: String,
+    /// Function arguments as JSON string
+    pub parameters: String,
 }
 
 /// Token configuration for parsing
@@ -109,16 +121,14 @@ impl TokenConfig {
 /// Simple partial tool call for streaming
 #[derive(Debug, Clone)]
 pub struct PartialToolCall {
-    /// Tool index (for multiple concurrent tools)
-    pub index: usize,
     /// Tool name (if parsed)
     pub name: Option<String>,
-    /// Whether name has been emitted to stream
-    pub name_sent: bool,
     /// Buffer for accumulating arguments
     pub arguments_buffer: String,
+    /// Start position in the input buffer
+    pub start_position: usize,
+    /// Whether the name has been sent (for streaming)
+    pub name_sent: bool,
     /// Arguments already streamed
-    pub streamed_arguments: String,
-    /// Tool ID (generated once per tool)
-    pub id: Option<String>,
+    pub streamed_args: String,
 }

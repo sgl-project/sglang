@@ -7,7 +7,7 @@ use crate::tool_parser::{
     partial_json::PartialJson,
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+    types::{FunctionCall, StreamResult, StreamingParseResult, ToolCall},
 };
 
 /// GPT-OSS format parser for tool calls
@@ -127,40 +127,9 @@ impl ToolParser for GptOssParser {
         chunk: &str,
         state: &mut ParseState,
     ) -> ToolParserResult<StreamingParseResult> {
-        state.buffer.push_str(chunk);
-        let mut result = StreamingParseResult::new();
-
-        // Phase 1: Check for normal text before tool markers
-        if !state.in_tool_section {
-            if let Some(marker_pos) = state.buffer.find("<|channel|>commentary to=") {
-                if marker_pos > 0 {
-                    // Check for optional <|start|>assistant prefix
-                    let actual_start = if marker_pos >= "<|start|>assistant".len() &&
-                        &state.buffer[marker_pos - "<|start|>assistant".len()..marker_pos] == "<|start|>assistant" {
-                        marker_pos - "<|start|>assistant".len()
-                    } else {
-                        marker_pos
-                    };
-
-                    if actual_start > 0 {
-                        result.normal_text = state.buffer.drain(..actual_start).collect();
-                        state.in_tool_section = true;
-                        return Ok(result);
-                    }
-                }
-                state.in_tool_section = true;
-            } else if !self.has_partial_marker(&state.buffer) {
-                result.normal_text = std::mem::take(&mut state.buffer);
-                return Ok(result);
-            }
-        }
-
-        // Phase 2: Process tool calls
-        if state.in_tool_section {
-            self.process_tool_calls(state, &mut result)?;
-        }
-
-        Ok(result)
+        // Call the existing implementation and convert result
+        let result = self.parse_incremental_legacy(chunk, state).await?;
+        Ok(super::helpers::convert_stream_result(result))
     }
 
     fn detect_format(&self, text: &str) -> bool {
@@ -169,135 +138,104 @@ impl ToolParser for GptOssParser {
 }
 
 impl GptOssParser {
-    fn has_partial_marker(&self, buffer: &str) -> bool {
-        // Check if buffer ends with partial channel marker
-        let markers = ["<|", "<|chan", "<|channel", "<|channel|", "<|channel|>comm", "<|start", "<|start|"];
-        for marker in &markers {
-            if buffer.ends_with(marker) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn process_tool_calls(
+    async fn parse_incremental_legacy(
         &self,
+        chunk: &str,
         state: &mut ParseState,
-        result: &mut StreamingParseResult,
-    ) -> ToolParserResult<()> {
-        // Look for complete tool calls
-        let mut found_complete = false;
-        let buffer_clone = state.buffer.clone();
+    ) -> ToolParserResult<StreamResult> {
+        state.buffer.push_str(chunk);
 
-        for capture in self.function_call_extractor.captures_iter(&buffer_clone) {
-            if let (Some(func_match), Some(args_match)) = (capture.get(1), capture.get(2)) {
-                let func_name = func_match.as_str();
-                let args_json = args_match.as_str();
-
-                // Parse and emit complete tool
-                let index = state.partial_tools.len();
-                self.emit_tool_call(func_name, args_json, index, state, result)?;
-                found_complete = true;
-
-                // Remove processed content
-                let match_end = capture.get(0).unwrap().end();
-                state.buffer.drain(..match_end);
-            }
+        // Check for tool markers
+        if !self.has_tool_markers(&state.buffer) {
+            // No markers found, clear buffer and return
+            state.buffer.clear();
+            return Ok(StreamResult::Incomplete);
         }
 
-        if !found_complete {
-            // Try to extract partial tool info
-            self.try_extract_partial_tools(state, result)?;
-        }
+        // Try to match streaming pattern
+        if let Some(captures) = self.streaming_extractor.captures(&state.buffer) {
+            if let (Some(name_match), Some(args_match)) = (captures.get(1), captures.get(2)) {
+                let full_function_name = name_match.as_str();
+                let partial_args = args_match.as_str();
 
-        Ok(())
-    }
+                // Extract actual function name
+                let function_name = self.extract_function_name(full_function_name);
 
-    fn try_extract_partial_tools(
-        &self,
-        state: &mut ParseState,
-        result: &mut StreamingParseResult,
-    ) -> ToolParserResult<()> {
-        // Look for partial tool calls
-        let buffer = state.buffer.clone();
-        for capture in self.streaming_extractor.captures_iter(&buffer) {
-            if let Some(func_match) = capture.get(1) {
-                let func_name = func_match.as_str();
-                let index = state.partial_tools.len();
-
-                // Ensure we have partial tool entry
-                let partial = state.ensure_partial_tool(index);
-
-                // Send name if not sent
-                if !partial.name_sent {
-                    partial.name = Some(func_name.to_string());
-                    partial.id = Some(format!("gpt_oss_call_{}", uuid::Uuid::new_v4()));
-                    partial.name_sent = true;
-
-                    result.tool_calls.push(ToolCallItem {
-                        tool_index: index,
-                        id: partial.id.clone(),
-                        name: partial.name.clone(),
-                        arguments_delta: String::new(),
+                // Send function name if not sent yet
+                if !state.in_string {
+                    state.in_string = true; // Mark name as sent
+                    return Ok(StreamResult::ToolName {
+                        index: 0,
+                        name: function_name.clone(),
                     });
                 }
 
-                // Try to extract partial JSON arguments
-                if let Some(args_match) = capture.get(2) {
-                    let partial_json = args_match.as_str();
+                // Check if we have a complete function call
+                if let Some(complete_match) = self.function_call_extractor.captures(&state.buffer) {
+                    if let Some(args_match) = complete_match.get(2) {
+                        let args_content = args_match.as_str().trim();
 
-                    // Remove trailing <|call|> if present
-                    let partial_json = if partial_json.ends_with("<|call|>") {
-                        &partial_json[..partial_json.len() - "<|call|>".len()]
-                    } else {
-                        partial_json
-                    };
+                        // Parse JSON arguments
+                        let arguments = if args_content.is_empty() {
+                            "{}".to_string()
+                        } else {
+                            match serde_json::from_str::<Value>(args_content) {
+                                Ok(value) => serde_json::to_string(&value)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                                Err(_) => "{}".to_string(),
+                            }
+                        };
 
-                    // Try to parse with partial JSON parser
-                    if let Ok((value, _)) = self.partial_json.parse_value(partial_json) {
-                        let args_str = serde_json::to_string(&value)?;
+                        // Generate unique ID
+                        let id = format!("gpt_oss_call_{}", uuid::Uuid::new_v4());
 
-                        if args_str.len() > partial.streamed_arguments.len() {
-                            let delta = &args_str[partial.streamed_arguments.len()..];
+                        let tool = ToolCall {
+                            id,
+                            r#type: "function".to_string(),
+                            function: FunctionCall {
+                                name: function_name,
+                                arguments,
+                            },
+                        };
 
-                            result.tool_calls.push(ToolCallItem {
-                                tool_index: index,
-                                id: None,
-                                name: None,
-                                arguments_delta: delta.to_string(),
-                            });
+                        // Remove the processed part from buffer
+                        let complete_end = complete_match.get(0).unwrap().end();
+                        state.buffer.drain(..complete_end);
 
-                            partial.streamed_arguments = args_str;
+                        // Reset state for next tool
+                        state.in_string = false;
+
+                        return Ok(StreamResult::ToolComplete(tool));
+                    }
+                } else {
+                    // Try to parse partial JSON for streaming arguments
+                    if !partial_args.is_empty() {
+                        // Look for the end of JSON (before <|call|>)
+                        let json_part = if let Some(call_pos) = partial_args.find("<|call|>") {
+                            &partial_args[..call_pos]
+                        } else {
+                            partial_args
+                        };
+
+                        match self.partial_json.parse_value(json_part) {
+                            Ok((value, _consumed)) => {
+                                let args_str = serde_json::to_string(&value)
+                                    .unwrap_or_else(|_| "{}".to_string());
+
+                                return Ok(StreamResult::ToolArguments {
+                                    index: 0,
+                                    arguments: args_str,
+                                });
+                            }
+                            Err(_) => {
+                                // Can't parse yet, keep buffering
+                            }
                         }
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(StreamResult::Incomplete)
     }
-
-    fn emit_tool_call(
-        &self,
-        func_name: &str,
-        args_json: &str,
-        index: usize,
-        state: &mut ParseState,
-        result: &mut StreamingParseResult,
-    ) -> ToolParserResult<()> {
-        // Ensure we have partial tool entry
-        let partial = state.ensure_partial_tool(index);
-        partial.name = Some(func_name.to_string());
-        partial.id = Some(format!("gpt_oss_call_{}", uuid::Uuid::new_v4()));
-
-        result.tool_calls.push(ToolCallItem {
-            tool_index: index,
-            id: partial.id.clone(),
-            name: partial.name.clone(),
-            arguments_delta: args_json.to_string(),
-        });
-
-        Ok(())
-    }
-
 }

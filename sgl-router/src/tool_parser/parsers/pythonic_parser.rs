@@ -19,7 +19,7 @@ use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+    types::{FunctionCall, StreamResult, StreamingParseResult, ToolCall},
 };
 
 static PYTHONIC_BLOCK_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -109,37 +109,9 @@ impl ToolParser for PythonicParser {
         chunk: &str,
         state: &mut ParseState,
     ) -> ToolParserResult<StreamingParseResult> {
-        state.buffer.push_str(chunk);
-        let mut result = StreamingParseResult::new();
-
-        // Phase 1: Check for normal text before tool markers
-        if !state.in_tool_section {
-            // Look for start of pythonic tool call block
-            if let Some(block_start) = self.find_pythonic_block_start(&state.buffer) {
-                if block_start > 0 {
-                    result.normal_text = state.buffer.drain(..block_start).collect();
-                    state.in_tool_section = true;
-                    return Ok(result);
-                }
-                state.in_tool_section = true;
-            } else {
-                // Check if we might have a partial start
-                if self.has_partial_pythonic_start(&state.buffer) {
-                    return Ok(result);
-                }
-
-                // No tool calls, return as normal text
-                result.normal_text = std::mem::take(&mut state.buffer);
-                return Ok(result);
-            }
-        }
-
-        // Phase 2: Process pythonic tool calls
-        if state.in_tool_section {
-            self.process_pythonic_calls(state, &mut result)?;
-        }
-
-        Ok(result)
+        // Call the existing implementation and convert result
+        let result = self.parse_incremental_legacy(chunk, state).await?;
+        Ok(super::helpers::convert_stream_result(result))
     }
 
     fn detect_format(&self, text: &str) -> bool {
@@ -153,226 +125,25 @@ impl ToolParser for PythonicParser {
 }
 
 impl PythonicParser {
-    fn find_pythonic_block_start(&self, buffer: &str) -> Option<usize> {
-        // Look for pattern like "[function_name("
-        let mut in_string = false;
-        let mut escape = false;
-
-        for (i, ch) in buffer.char_indices() {
-            if escape {
-                escape = false;
-                continue;
-            }
-
-            match ch {
-                '\\' if in_string => escape = true,
-                '"' | '\'' => in_string = !in_string,
-                '[' if !in_string => {
-                    // Check if followed by a function name pattern
-                    let rest = &buffer[i + 1..];
-                    let trimmed = rest.trim_start();
-                    if trimmed.len() > 0 {
-                        let first_char = trimmed.chars().next().unwrap();
-                        if first_char.is_ascii_alphabetic() || first_char == '_' {
-                            // Likely a function name
-                            return Some(i);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    fn has_partial_pythonic_start(&self, buffer: &str) -> bool {
-        // Check if buffer ends with '[' potentially starting a tool call
-        buffer.trim_end().ends_with('[') ||
-        // Or ends with '[' followed by partial function name
-        buffer.chars().rev().take(20).any(|c| c == '[')
-    }
-
-    fn process_pythonic_calls(
+    async fn parse_incremental_legacy(
         &self,
+        chunk: &str,
         state: &mut ParseState,
-        result: &mut StreamingParseResult,
-    ) -> ToolParserResult<()> {
-        // Try to find complete pythonic block
-        if let Some(mat) = pythonic_block_regex().find(&state.buffer) {
-            let block = mat.as_str().to_string();
-            let mat_end = mat.end();
+    ) -> ToolParserResult<StreamResult> {
+        state.buffer.push_str(chunk);
 
-            // Parse the block
-            match self.parse_pythonic_block(&block) {
-                Ok(tools) => {
-                    for (idx, (name, args)) in tools.iter().enumerate() {
-                        self.emit_tool_call(name, args, idx, state, result)?;
-                    }
-
-                    // Remove processed block
-                    state.buffer.drain(..mat_end);
-
-                    // Check if there's more content
-                    if state.buffer.trim().is_empty() {
-                        state.mode = crate::tool_parser::state::ParseMode::Complete;
-                    }
-                }
-                Err(_) => {
-                    // Failed to parse, try partial extraction
-                    self.try_extract_partial_pythonic(state, result)?;
-                }
-            }
-        } else {
-            // No complete block, try partial extraction
-            self.try_extract_partial_pythonic(state, result)?;
-        }
-
-        Ok(())
-    }
-
-    fn parse_pythonic_block(&self, block: &str) -> ToolParserResult<Vec<(String, String)>> {
-        // Parse as Python expression
-        let ast = parse(block, Mode::Expression, "<tool>")
-            .map_err(|e| ToolParserError::ParsingFailed(format!("Python parse error: {}", e)))?;
-
-        let mut tools = Vec::new();
-
-        if let Mod::Expression(ref expr) = ast {
-            if let Expr::List(list) = expr.body.as_ref() {
-                for element in &list.elts {
-                    if let Expr::Call(call) = element {
-                        // Extract function name
-                        let name = if let Expr::Name(name) = call.func.as_ref() {
-                            name.id.to_string()
-                        } else {
-                            continue;
-                        };
-
-                        // Convert arguments to JSON
-                        let args_json = self.convert_call_args_to_json(call)?;
-                        let args_str = serde_json::to_string(&args_json)?;
-
-                        tools.push((name, args_str));
-                    }
+        let cleaned = Self::strip_special_tokens(&state.buffer);
+        if let Some((tool_calls_text, _)) = self.extract_tool_calls(&cleaned) {
+            if let Ok(tools) = self.parse_tool_call_block(&tool_calls_text) {
+                if let Some(tool) = tools.into_iter().next() {
+                    state.buffer.clear();
+                    return Ok(StreamResult::ToolComplete(tool));
                 }
             }
         }
 
-        Ok(tools)
+        Ok(StreamResult::Incomplete)
     }
-
-    fn try_extract_partial_pythonic(
-        &self,
-        state: &mut ParseState,
-        result: &mut StreamingParseResult,
-    ) -> ToolParserResult<()> {
-        // Try to extract partial function calls
-        // Pattern: function_name(partial_args
-        let pattern = r"([A-Za-z_]\w*)\s*\([^)]*";
-        let re = regex::Regex::new(pattern).unwrap();
-
-        let mut tool_index = 0;
-        let buffer = state.buffer.clone();
-        for mat in re.find_iter(&buffer) {
-            let text = mat.as_str();
-
-            // Extract function name
-            if let Some(paren_pos) = text.find('(') {
-                let func_name = text[..paren_pos].trim();
-
-                if !func_name.is_empty() {
-                    // Ensure we have partial tool entry
-                    let partial = state.ensure_partial_tool(tool_index);
-
-                    if !partial.name_sent {
-                        partial.name = Some(func_name.to_string());
-                        partial.id = Some(format!("pythonic_call_{}", uuid::Uuid::new_v4()));
-                        partial.name_sent = true;
-
-                        result.tool_calls.push(ToolCallItem {
-                            tool_index,
-                            id: partial.id.clone(),
-                            name: partial.name.clone(),
-                            arguments_delta: String::new(),
-                        });
-                    }
-
-                    // Try to extract partial arguments
-                    let args_start = paren_pos + 1;
-                    if args_start < text.len() {
-                        let partial_args = &text[args_start..];
-
-                        // Try to parse partial Python args and convert to JSON
-                        if !partial_args.trim().is_empty() {
-                            // For now, emit raw text as arguments
-                            // In production, would parse Python literals properly
-                            if partial_args.len() > partial.streamed_arguments.len() {
-                                let delta = &partial_args[partial.streamed_arguments.len()..];
-
-                                result.tool_calls.push(ToolCallItem {
-                                    tool_index,
-                                    id: None,
-                                    name: None,
-                                    arguments_delta: delta.to_string(),
-                                });
-
-                                partial.streamed_arguments.push_str(delta);
-                            }
-                        }
-                    }
-
-                    tool_index += 1;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn convert_call_args_to_json(&self, call: &rustpython_parser::ast::ExprCall) -> ToolParserResult<Value> {
-        if !call.args.is_empty() {
-            return Err(ToolParserError::ParsingFailed(
-                "Positional arguments are not supported in pythonic tool calls".to_string(),
-            ));
-        }
-
-        let mut arguments_map = Map::with_capacity(call.keywords.len());
-        for keyword in &call.keywords {
-            let arg_name = keyword.arg.as_ref().ok_or_else(|| {
-                ToolParserError::ParsingFailed(
-                    "pythonic tool calls do not support **kwargs".to_string(),
-                )
-            })?;
-            let value_json = expression_to_json(&keyword.value)?;
-            arguments_map.insert(arg_name.to_string(), value_json);
-        }
-
-        Ok(Value::Object(arguments_map))
-    }
-
-    fn emit_tool_call(
-        &self,
-        name: &str,
-        args: &str,
-        index: usize,
-        state: &mut ParseState,
-        result: &mut StreamingParseResult,
-    ) -> ToolParserResult<()> {
-        // Ensure we have partial tool entry
-        let partial = state.ensure_partial_tool(index);
-        partial.name = Some(name.to_string());
-        partial.id = Some(format!("pythonic_call_{}", uuid::Uuid::new_v4()));
-
-        result.tool_calls.push(ToolCallItem {
-            tool_index: index,
-            id: partial.id.clone(),
-            name: partial.name.clone(),
-            arguments_delta: args.to_string(),
-        });
-
-        Ok(())
-    }
-
 
 }
 

@@ -4,7 +4,7 @@ use crate::tool_parser::{
     errors::ToolParserResult,
     state::ParseState,
     traits::{TokenToolParser, ToolParser},
-    types::{StreamingParseResult, ToolCall},
+    types::{StreamResult, StreamingParseResult, ToolCall},
 };
 
 /// Placeholder for the Harmony-backed GPT-OSS parser.
@@ -30,11 +30,12 @@ impl ToolParser for GptOssHarmonyParser {
 
     async fn parse_incremental(
         &self,
-        _chunk: &str,
-        _state: &mut ParseState,
+        chunk: &str,
+        state: &mut ParseState,
     ) -> ToolParserResult<StreamingParseResult> {
-        // Temporary stub until the Harmony streaming pipeline is implemented.
-        Ok(StreamingParseResult::new())
+        // Call the existing implementation and convert result
+        let result = self.parse_incremental_legacy(chunk, state).await?;
+        Ok(super::helpers::convert_stream_result(result))
     }
 
     fn detect_format(&self, text: &str) -> bool {
@@ -45,6 +46,16 @@ impl ToolParser for GptOssHarmonyParser {
 }
 
 impl GptOssHarmonyParser {
+    async fn parse_incremental_legacy(
+        &self,
+        _chunk: &str,
+        _state: &mut ParseState,
+    ) -> ToolParserResult<StreamResult> {
+        // Temporary stub until the Harmony streaming pipeline is implemented.
+        Ok(StreamResult::Incomplete)
+    }
+
+
     fn as_token_parser(&self) -> Option<&dyn TokenToolParser> {
         Some(self)
     }
@@ -66,7 +77,7 @@ impl TokenToolParser for GptOssHarmonyParser {
         &self,
         _tokens: &[u32],
         _state: &mut ParseState,
-    ) -> ToolParserResult<StreamingParseResult> {
-        Ok(StreamingParseResult::new())
+    ) -> ToolParserResult<StreamResult> {
+        Ok(StreamResult::Incomplete)
     }
 }

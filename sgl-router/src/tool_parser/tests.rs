@@ -8,33 +8,37 @@ use crate::tool_parser::traits::ToolParser;
 #[test]
 fn test_parse_state_new() {
     let state = ParseState::new();
-    assert_eq!(state.mode, ParseMode::Scanning);
+    assert_eq!(state.phase, ParsePhase::Searching);
     assert_eq!(state.buffer, "");
-    assert!(state.partial_tools.is_empty());
-    assert_eq!(state.prefix_text, "");
-    assert!(!state.in_tool_section);
-    assert!(state.parser_state.is_empty());
+    assert_eq!(state.consumed, 0);
+    assert_eq!(state.bracket_depth, 0);
+    assert!(!state.in_string);
+    assert!(!state.escape_next);
 }
 
 #[test]
-fn test_parse_state_reset() {
+fn test_parse_state_process_char() {
     let mut state = ParseState::new();
 
-    // Modify state
-    state.buffer = "test".to_string();
-    state.mode = ParseMode::InToolCall;
-    state.in_tool_section = true;
-    state.prefix_text = "prefix".to_string();
+    state.process_char('{');
+    assert_eq!(state.bracket_depth, 1);
 
-    // Reset
-    state.reset();
+    state.process_char('}');
+    assert_eq!(state.bracket_depth, 0);
 
-    assert_eq!(state.buffer, "");
-    assert_eq!(state.mode, ParseMode::Scanning);
-    assert!(state.partial_tools.is_empty());
-    assert_eq!(state.prefix_text, "");
-    assert!(!state.in_tool_section);
-    assert!(state.parser_state.is_empty());
+    state.process_char('"');
+    assert!(state.in_string);
+
+    state.process_char('"');
+    assert!(!state.in_string);
+
+    state.process_char('"');
+    state.process_char('\\');
+    assert!(state.escape_next);
+
+    state.process_char('"');
+    assert!(!state.escape_next);
+    assert!(state.in_string); // Still in string because quote was escaped
 }
 
 #[test]
@@ -171,44 +175,45 @@ fn test_stream_result_variants() {
     // Test with tool name
     let tool_item = ToolCallItem {
         tool_index: 0,
-        id: Some("call-123".to_string()),
         name: Some("test".to_string()),
-        arguments_delta: String::new(),
+        parameters: String::new(),
     };
     let result = StreamingParseResult::with_tool_calls(vec![tool_item]);
     assert_eq!(result.tool_calls[0].tool_index, 0);
-    assert_eq!(result.tool_calls[0].id.as_ref().unwrap(), "call-123");
     assert_eq!(result.tool_calls[0].name.as_ref().unwrap(), "test");
 
-    // Test with arguments delta
+    // Test with complete tool
+    let tool = ToolCall {
+        id: "123".to_string(),
+        r#type: "function".to_string(),
+        function: FunctionCall {
+            name: "test".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
     let tool_item = ToolCallItem {
         tool_index: 0,
-        id: None,
-        name: None,
-        arguments_delta: r#"{"key": "value"}"#.to_string(),
+        name: Some(tool.function.name.clone()),
+        parameters: tool.function.arguments.clone(),
     };
     let result = StreamingParseResult::with_tool_calls(vec![tool_item]);
-    assert_eq!(result.tool_calls[0].arguments_delta, r#"{"key": "value"}"#);
+    assert_eq!(result.tool_calls[0].name.as_ref().unwrap(), "test");
+    assert_eq!(result.tool_calls[0].parameters, "{}");
 }
 
 #[test]
 fn test_partial_tool_call() {
     let mut partial = PartialToolCall {
-        index: 0,
         name: None,
-        name_sent: false,
         arguments_buffer: String::new(),
-        streamed_arguments: String::new(),
-        id: None,
+        start_position: 0,
+        name_sent: false,
+        streamed_args: String::new(),
     };
 
     // Set name
     partial.name = Some("test_function".to_string());
     assert_eq!(partial.name.as_ref().unwrap(), "test_function");
-
-    // Set ID
-    partial.id = Some("call-123".to_string());
-    assert_eq!(partial.id.as_ref().unwrap(), "call-123");
 
     // Append arguments
     partial.arguments_buffer.push_str(r#"{"key": "value"}"#);
@@ -216,9 +221,9 @@ fn test_partial_tool_call() {
 
     // Update streaming state
     partial.name_sent = true;
-    partial.streamed_arguments = r#"{"key": "#.to_string();
+    partial.streamed_args = r#"{"key": "#.to_string();
     assert!(partial.name_sent);
-    assert_eq!(partial.streamed_arguments, r#"{"key": "#);
+    assert_eq!(partial.streamed_args, r#"{"key": "#);
 }
 
 #[tokio::test]
@@ -569,12 +574,10 @@ mod edge_cases {
 
         if !result.tool_calls.is_empty() {
             let tool_call = &result.tool_calls[0];
-            if let Some(name) = &tool_call.name {
-                assert_eq!(name, "get_weather");
-            }
-            if !tool_call.arguments_delta.is_empty() {
+            assert_eq!(tool_call.name.as_ref().unwrap(), "get_weather");
+            if !tool_call.parameters.is_empty() {
                 let args: serde_json::Value =
-                    serde_json::from_str(&tool_call.arguments_delta).unwrap();
+                    serde_json::from_str(&tool_call.parameters).unwrap();
                 assert_eq!(args["location"], "SF");
             }
         } else if !result.normal_text.is_empty() {
@@ -598,10 +601,10 @@ mod edge_cases {
                 assert_eq!(name, "test");
             }
             // Arguments might be empty or partial
-            if !tool_call.arguments_delta.is_empty() && tool_call.arguments_delta != "{}"
-                && tool_call.arguments_delta != "null" {
+            if !tool_call.parameters.is_empty() && tool_call.parameters != "{}"
+                && tool_call.parameters != "null" {
                 // Validate it's valid JSON if present
-                let _: serde_json::Value = serde_json::from_str(&tool_call.arguments_delta).unwrap_or(serde_json::Value::Null);
+                let _: serde_json::Value = serde_json::from_str(&tool_call.parameters).unwrap_or(serde_json::Value::Null);
             }
         } else if !result.normal_text.is_empty() {
             // Parser might return text instead
@@ -732,7 +735,7 @@ mod stress_tests {
 }
 
 #[cfg(test)]
-mod streaming_tests {
+mod vllm_streaming_tests {
     use super::*;
 
     #[tokio::test]
@@ -744,20 +747,16 @@ mod streaming_tests {
         let chunk1 = r#"{"name": "get_weather""#;
         let result = parser.parse_incremental(chunk1, &mut state).await.unwrap();
 
-        // Should return tool name with id and empty arguments
-        if !result.tool_calls.is_empty() {
-            assert_eq!(result.tool_calls[0].tool_index, 0);
-            assert!(result.tool_calls[0].id.is_some());
-            assert_eq!(result.tool_calls[0].name.as_ref().unwrap(), "get_weather");
-            assert_eq!(result.tool_calls[0].arguments_delta, "");
-        }
+        // Should return tool name with empty parameters
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].tool_index, 0);
+        assert_eq!(result.tool_calls[0].name.as_ref().unwrap(), "get_weather");
+        assert_eq!(result.tool_calls[0].parameters, "");
         assert_eq!(result.normal_text, "");
 
         // State should track that name was sent
-        assert!(!state.partial_tools.is_empty());
-        if !state.partial_tools.is_empty() {
-            assert!(state.partial_tools[0].name_sent);
-        }
+        assert!(state.current_tool_name_sent);
+        assert_eq!(state.current_tool_id, 0);
     }
 
     #[tokio::test]
@@ -778,29 +777,21 @@ mod streaming_tests {
         if !result2.tool_calls.is_empty() {
             assert_eq!(result2.tool_calls[0].tool_index, 0);
             assert!(result2.tool_calls[0].name.is_none()); // No name for argument updates
-            assert!(result2.tool_calls[0].id.is_none()); // No ID for argument updates
-            assert!(!result2.tool_calls[0].arguments_delta.is_empty());
+            assert!(!result2.tool_calls[0].parameters.is_empty());
         }
 
         // Third chunk: complete the arguments
         let chunk3 = r#"test"}}"#;
         let result3 = parser.parse_incremental(chunk3, &mut state).await.unwrap();
 
-        // Should return remaining arguments or have completed the tool
-        // The exact behavior depends on the implementation
+        // Should return remaining arguments and reset for next tool
         if !result3.tool_calls.is_empty() {
-            // If we got tool calls, check for arguments
-            if !result3.tool_calls[0].arguments_delta.is_empty() {
-                assert!(result3.tool_calls[0].arguments_delta.contains("test") ||
-                        result3.tool_calls[0].arguments_delta.contains("query"));
-            }
-        } else {
-            // Tool might be complete and in state
-            assert!(!state.partial_tools.is_empty());
+            assert!(result3.tool_calls[0].parameters.contains("test"));
         }
 
-        // State should be ready for next tool
-        // Parser implementation may handle state differently
+        // State should be reset for next tool
+        assert_eq!(state.current_tool_id, 1);
+        assert!(!state.current_tool_name_sent);
     }
 
     #[tokio::test]
@@ -812,13 +803,11 @@ mod streaming_tests {
         let chunk = r#"Here is the weather: {"name": "get_weather", "arguments": {"location": "SF"}}"#;
         let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
 
-        // Should extract normal text first
+        // Should extract normal text and return tool
         assert!(!result.normal_text.is_empty());
         assert!(result.normal_text.contains("Here is the weather:"));
-
-        // Tool calls would come in subsequent processing since buffer contains the JSON
-        // The new implementation correctly separates normal text from tool processing
-        assert!(state.in_tool_section);
+        assert!(!result.tool_calls.is_empty());
+        assert_eq!(result.tool_calls[0].name.as_ref().unwrap(), "get_weather");
     }
 
     #[tokio::test]
@@ -831,13 +820,11 @@ mod streaming_tests {
         let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
 
         assert!(!result.tool_calls.is_empty());
-        if let Some(name) = &result.tool_calls[0].name {
-            assert_eq!(name, "calculate");
-        }
+        assert_eq!(result.tool_calls[0].name.as_ref().unwrap(), "calculate");
         // Parameters should be converted to arguments internally
-        if !result.tool_calls[0].arguments_delta.is_empty() {
-            assert!(result.tool_calls[0].arguments_delta.contains("10"));
-            assert!(result.tool_calls[0].arguments_delta.contains("20"));
+        if !result.tool_calls[0].parameters.is_empty() {
+            assert!(result.tool_calls[0].parameters.contains("10"));
+            assert!(result.tool_calls[0].parameters.contains("20"));
         }
     }
 
@@ -877,7 +864,7 @@ mod streaming_tests {
         assert!(!arg_calls.is_empty());
 
         // Concatenate all argument updates
-        let full_args: String = arg_calls.iter().map(|tc| tc.arguments_delta.as_str()).collect();
+        let full_args: String = arg_calls.iter().map(|tc| tc.parameters.as_str()).collect();
         assert!(full_args.contains("rust"));
         assert!(full_args.contains("10"));
     }
@@ -888,22 +875,26 @@ mod streaming_tests {
         let mut state = ParseState::new();
 
         // Verify initial state
-        assert_eq!(state.mode, ParseMode::Scanning);
-        assert!(state.partial_tools.is_empty());
-        assert!(state.buffer.is_empty());
+        assert_eq!(state.current_tool_id, -1);
+        assert!(!state.current_tool_name_sent);
+        assert!(state.streamed_args_for_tool.is_empty());
+        assert!(state.prev_tool_call_arr.is_empty());
 
         // Process first chunk
         let result1 = parser.parse_incremental(r#"{"name": "test""#, &mut state).await.unwrap();
-        // May or may not have tool calls depending on implementation
+        assert!(!result1.tool_calls.is_empty());
 
         // State should be updated
-        assert!(!state.buffer.is_empty() || !result1.tool_calls.is_empty());
+        assert_eq!(state.current_tool_id, 0);
+        assert!(state.current_tool_name_sent);
+        assert_eq!(state.streamed_args_for_tool.len(), 1);
 
         // Process second chunk
         let _result2 = parser.parse_incremental(r#", "arguments": {"x": 1}}"#, &mut state).await.unwrap();
 
-        // State should have processed the tool
-        // Exact behavior depends on parser implementation
+        // State should prepare for next tool
+        assert_eq!(state.current_tool_id, 1);
+        assert!(!state.current_tool_name_sent);
     }
 
     #[tokio::test]
@@ -925,15 +916,8 @@ mod streaming_tests {
             assert!(result.normal_text.contains("Some text here"));
         }
 
-        // Buffer should contain the partial JSON content or be empty if normal text was extracted
-        // The exact state depends on whether the parser extracted "Some text here" as normal text
-        if result.normal_text.contains("Some text here") {
-            // If normal text was extracted, buffer contains just the JSON start
-            assert!(state.buffer.contains("{\"name") || state.in_tool_section);
-        } else {
-            // If buffering, the entire content should be in buffer
-            assert!(!state.buffer.is_empty());
-        }
+        // Buffer should contain the partial content
+        assert!(!state.buffer.is_empty());
     }
 
     #[tokio::test]
@@ -953,13 +937,9 @@ mod streaming_tests {
         let complete = r#"{"name": "test", "arguments": {"x": 1}}"#;
         let result2 = parser.parse_incremental(complete, &mut state2).await.unwrap();
 
-        // Should return tool calls for complete JSON
-        // Check if we got tool information
-        if !result2.tool_calls.is_empty() {
-            if let Some(name) = &result2.tool_calls[0].name {
-                assert_eq!(name, "test");
-            }
-        }
+        // Should definitely return tool calls for complete JSON
+        assert!(!result2.tool_calls.is_empty());
+        assert_eq!(result2.tool_calls[0].name.as_ref().unwrap(), "test");
     }
 
     #[tokio::test]
@@ -979,10 +959,7 @@ mod streaming_tests {
         let result2 = parser.parse_incremental(valid_chunk, &mut state).await.unwrap();
 
         // Should process valid JSON normally
-        if !result2.tool_calls.is_empty() {
-            if let Some(name) = &result2.tool_calls[0].name {
-                assert_eq!(name, "valid");
-            }
-        }
+        assert!(!result2.tool_calls.is_empty());
+        assert_eq!(result2.tool_calls[0].name.as_ref().unwrap(), "valid");
     }
 }
