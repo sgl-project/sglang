@@ -207,9 +207,7 @@ class NGRAMWorker:
             batch_tokens.append(put_ids)
         self.ngram_cache.batch_put(batch_tokens)
 
-    def forward_batch_speculative_generation(
-        self, batch: ScheduleBatch
-    ) -> ForwardBatchOutput:
+    def forward_batch_generation(self, batch: ScheduleBatch) -> ForwardBatchOutput:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
         bid = model_worker_batch.bid

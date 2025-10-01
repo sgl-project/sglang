@@ -2036,9 +2036,7 @@ class Scheduler(
                 )
                 bid = model_worker_batch.bid
             else:
-                forward_batch_output = (
-                    self.draft_worker.forward_batch_speculative_generation(batch)
-                )
+                forward_batch_output = self.draft_worker.forward_batch_generation(batch)
                 (
                     logits_output,
                     next_token_ids,

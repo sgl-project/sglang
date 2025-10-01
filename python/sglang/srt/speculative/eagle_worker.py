@@ -422,9 +422,7 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
-    def forward_batch_speculative_generation(
-        self, batch: ScheduleBatch
-    ) -> ForwardBatchOutput:
+    def forward_batch_generation(self, batch: ScheduleBatch) -> ForwardBatchOutput:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
