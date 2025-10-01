@@ -1905,7 +1905,7 @@ class Scheduler(
 
         # Print stats
         if self.current_scheduler_metrics_enabled():
-            self.log_prefill_stats(adder, can_run_list, running_bs, None)
+            self.log_prefill_stats(adder, can_run_list, running_bs, 0)
 
         for req in can_run_list:
             if req.time_stats.forward_entry_time == 0:
