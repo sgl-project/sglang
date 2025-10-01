@@ -159,28 +159,18 @@ class Mamba2Metadata(ForwardMetadata):
         forward_batch: ForwardBatch,
     ) -> "Mamba2Metadata":
         """This path cannot run with CUDA graph, as it contains extend requests."""
-        assert all(
-            x is not None
-            for x in (
-                forward_batch.extend_seq_lens,
-                forward_batch.extend_seq_lens_cpu,
-                forward_batch.extend_num_tokens,
+        if forward_batch.extend_num_tokens is None:
+            return cls.prepare_decode(
+                query_start_loc, mamba_cache_indices, forward_batch.seq_lens
             )
-        )
-
-        has_initial_states = None
-        prep_initial_states = False
         num_prefills = len(forward_batch.extend_seq_lens)
         num_prefill_tokens = forward_batch.extend_num_tokens
         num_decodes = len(forward_batch.seq_lens) - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
-
-        if context_lens_tensor is not None:
-            # precompute flag to avoid device syncs later in mamba2 layer
-            # forwards
-            # prep is only needed for mamba2 ssd prefill processing
-            has_initial_states = context_lens_tensor > 0
-            prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
+        assert context_lens_tensor is not None
+        # precompute flag to avoid device syncs later
+        has_initial_states = context_lens_tensor > 0
+        prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = query_start_loc[: num_prefills + 1]
         seq_idx = torch.repeat_interleave(
@@ -195,6 +185,7 @@ class Mamba2Metadata(ForwardMetadata):
         # We compute metadata for chunked prefill once at the top level model
         # forward and reuse them in mamba layers. If not needed, they will be
         # ignored inside mamba kernels.
+        chunk_offsets, chunk_indices = None, None
         if prep_initial_states:
             chunk_indices, chunk_offsets = (
                 cls._query_start_loc_to_chunk_indices_offsets(

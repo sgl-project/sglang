@@ -98,16 +98,6 @@ class MambaAttnBackendBase(AttentionBackend):
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
 
-    def _forward_metadata(self, forward_batch: ForwardBatch):
-        query_start_loc = forward_batch.query_start_loc(device=self.device)
-        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
-            forward_batch.req_pool_indices
-        )
-        return ForwardMetadata(
-            query_start_loc=query_start_loc,
-            mamba_cache_indices=mamba_cache_indices,
-        )
-
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (
             max_num_tokens % max_bs == 0
@@ -131,6 +121,16 @@ class MambaAttnBackendBase(AttentionBackend):
             step=verify_step,
             dtype=torch.int32,
             device=self.device,
+        )
+
+    def _forward_metadata(self, forward_batch: ForwardBatch):
+        query_start_loc = forward_batch.query_start_loc(device=self.device)
+        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
+            forward_batch.req_pool_indices
+        )
+        return ForwardMetadata(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=mamba_cache_indices,
         )
 
     def _capture_metadata(
@@ -205,7 +205,7 @@ class MambaAttnBackendBase(AttentionBackend):
         return 1  # Mamba attn does not use seq lens to index kv cache
 
 
-class GDNAttnBackend(MambaAttnBackendBase[ForwardMetadata]):
+class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend using Mamba kernel."""
 
     def forward_decode(
@@ -421,10 +421,8 @@ class GDNAttnBackend(MambaAttnBackendBase[ForwardMetadata]):
         return core_attn_out
 
 
-class Mamba2AttnBackend(MambaAttnBackendBase[Mamba2Metadata]):
+class Mamba2AttnBackend(MambaAttnBackendBase):
     """Attention backend wrapper for Mamba2Mixer kernels."""
-
-    ForwardMetadata = Mamba2Metadata
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
