@@ -1,20 +1,10 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Tuple,
-    TypeAlias,
-    Union,
-    override,
-)
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias, Union
 
 import torch
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -38,10 +28,39 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.two_batch_overlap import global_server_args_dict
+from sglang.srt.utils import is_hip
+
+# from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+
+if sys.version_info >= (3, 12):
+    from typing import override
+else:
+
+    def override(func):
+        return func
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_hip = is_hip()
+
+if _is_hip:
+    try:
+        from aiter import (
+            flash_attn_varlen_func,
+            mha_batch_prefill_func,
+            paged_attention_ragged,
+        )
+        from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+    except ImportError:
+        print(
+            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+        )
+else:
+    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @dataclass(frozen=True)
@@ -163,7 +182,9 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
         assert self.use_nsa, "NSA backend only supports DeepSeek NSA"
-        self.nsa_kv_cache_store_fp8 = model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
+        self.nsa_kv_cache_store_fp8 = (
+            model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
+        )
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -179,6 +200,13 @@ class NativeSparseAttnBackend(AttentionBackend):
         NSA_DECODE_IMPL = model_runner.server_args.nsa_decode
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
+
+        if _is_hip:
+            max_bs = model_runner.req_to_token_pool.size
+
+            self.kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+            )
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -499,7 +527,9 @@ class NativeSparseAttnBackend(AttentionBackend):
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         # when store in fp8 and compute in fp8, no need to convert dtype
-        if not (NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 and self.nsa_kv_cache_store_fp8):
+        if not (
+            NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 and self.nsa_kv_cache_store_fp8
+        ):
             kv_cache = kv_cache.to(q.dtype)
 
         if q_rope is not None:
@@ -680,6 +710,18 @@ class NativeSparseAttnBackend(AttentionBackend):
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
+        elif NSA_DECODE_IMPL == "aiter":
+            if q_rope is not None:
+                q_all = torch.cat([q_nope, q_rope], dim=-1)
+            return self._forward_aiter(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                layer=layer,
+                metadata=metadata,
+                bs=forward_batch.batch_size,
+            )
+
         else:
             assert False, f"Unsupported {NSA_DECODE_IMPL = }"
 
@@ -802,6 +844,45 @@ class NativeSparseAttnBackend(AttentionBackend):
             sm_scale=sm_scale,
             d_v=v_head_dim,
         )
+
+    def _forward_aiter(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+        metadata: NSAMetadata,
+        bs: int,
+    ) -> torch.Tensor:
+        q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+
+        if layer.head_dim != layer.v_head_dim:
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+
+        kv_indptr = self.kv_indptr
+
+        non_minus1_mask = page_table_1 != -1
+        non_minus1_counts = non_minus1_mask.sum(dim=1)
+        kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
+
+        kv_indices = page_table_1[page_table_1 != -1]
+
+        mla_decode_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            kv_cache.view(-1, 1, 1, layer.head_dim),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            metadata.cu_seqlens_q,
+            kv_indptr,
+            kv_indices,
+            metadata.cu_seqlens_q,
+            metadata.max_seq_len_q,
+            layer.scaling,
+            layer.logit_cap,
+        )
+        # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
+        return o
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
