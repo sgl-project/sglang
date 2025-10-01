@@ -71,6 +71,7 @@ class ModelConfig:
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.modelopt_quant = modelopt_quant
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
 
@@ -186,6 +187,7 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            modelopt_quant=server_args.modelopt_quant,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
             **kwargs,
